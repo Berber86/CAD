@@ -1,0 +1,42 @@
+{
+  "api": {
+    "api_key": "",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4.1",
+    "temperature": 0.0,
+    "timeout_sec": 180,
+    "max_retries": 2,
+    "max_input_chars": 60000
+  },
+  "drawing": {
+    "base_scale": 16.0,
+    "base_text_height": 0.9,
+    "available_scales": [
+      10.0,
+      16.0,
+      20.0,
+      30.0
+    ],
+    "text_offset_factor": 1.5,
+    "street_offset_factor": 4.0,
+    "corner_label_gap_factor": 2.0,
+    "corner_distance_offset_factor": 1.7,
+    "long_side_threshold_ft": 40.0,
+    "char_width_factor": 0.62,
+    "space_width_factor": 0.45,
+    "max_label_fill_ratio": 0.9,
+    "max_stretch_spaces": 240,
+    "front_side_index": 0,
+    "degrees_as_control_code": true,
+    "text_style": "AI_BOUNDARY",
+    "zoom_extents": true
+  },
+  "layers": {
+    "property_line": "PROPERTY_LINE",
+    "boundary_text": "BOUNDARY_TEXT_AI"
+  },
+  "layer_colors": {
+    "property_line": 1,
+    "boundary_text": 3
+  }
+}

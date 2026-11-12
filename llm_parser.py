@@ -25,11 +25,18 @@ Python: 3.11+
 
 from __future__ import annotations
 
+import base64
 import copy
+import getpass
+import hashlib
+import hmac
 import json
 import math
 import os
+import platform
 import re
+import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
@@ -38,12 +45,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 __all__ = [
     "ConfigError",
+    "KeyProtectionError",
     "LegalDescriptionError",
     "LLMParseError",
     "PDFError",
     "CONFIG_PATH",
     "DEFAULT_CONFIG",
+    "ENV_PATH",
     "LOCAL_CONFIG_PATH",
+    "PROTECTED_KEY_PREFIX",
     "PROVIDER_ORDER",
     "PROVIDERS_CATALOG",
     "LegalDescription",
@@ -53,14 +63,19 @@ __all__ = [
     "bearing_label",
     "clean_provider_key",
     "dms_to_degrees",
+    "is_protected_key",
     "load_config",
+    "load_dotenv_dict",
     "make_strict_schema",
     "parse_legal_description",
     "parse_legal_description_full",
     "parse_with_regex",
+    "protect_api_key",
     "read_pdf_text",
     "resolve_api_target",
     "save_config",
+    "save_protected_env",
+    "unprotect_api_key",
 ]
 
 
@@ -85,12 +100,18 @@ class ConfigError(LegalDescriptionError):
     """config.json повреждён."""
 
 
+class KeyProtectionError(LegalDescriptionError):
+    """Защищённый API-ключ не удалось пересчитать (чужой ПК или неверный PIN)."""
+
+
 # ---------------------------------------------------------------------------
 # Конфигурация и каталог провайдеров (Hydra AI / OpenRouter / RouterAI)
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
 LOCAL_CONFIG_PATH = Path(__file__).resolve().with_name("config.local.json")
+ENV_PATH = Path(__file__).resolve().with_name(".env")
+PROTECTED_KEY_PREFIX = "tsai1:"
 
 PROVIDER_ORDER: tuple[str, ...] = ("hydra", "openrouter", "routerai")
 
@@ -197,17 +218,389 @@ def _deep_update(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def is_protected_key(value: str | None) -> bool:
+    """Проверяет, хранится ли ключ в защищённом (пересчитываемом) виде tsai1:…."""
+    return str(value or "").strip().startswith(PROTECTED_KEY_PREFIX)
+
+
 def clean_provider_key(provider: str, raw_key: str | None) -> str:
     """
     Очищает API-ключ провайдера.
 
     В contextual-chatbot ключ Hydra AI может храниться с суффиксом ``$$``
     (маркер Full Hydra Mode) — срезаем его, чтобы такой ключ работал без правок.
+    Защищённые токены ``tsai1:…`` возвращаются без модификации до момента пересчёта.
     """
     key = str(raw_key or "").strip()
+    if is_protected_key(key):
+        return key
     if provider.strip().lower() == "hydra" and key.endswith("$$"):
         key = key[:-2].strip()
     return key
+
+
+def _machine_fingerprint() -> bytes:
+    """
+    Аппаратно-системный отпечаток текущего ПК и учётной записи ОС (32 байта SHA-256).
+
+    Никогда не сохраняется в .json/.env и не попадает в git: украденные файлы
+    на компьютере злоумышленника имеют другой MachineGuid/machine-id и не
+    проходят проверку целостности HMAC / Windows DPAPI.
+    """
+    parts: list[str] = []
+    if sys.platform == "win32":  # pragma: no cover - Windows registry
+        try:
+            import winreg
+
+            access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+                0,
+                access,
+            ) as reg_key:
+                guid, _ = winreg.QueryValueEx(reg_key, "MachineGuid")
+                if guid:
+                    parts.append(str(guid).strip())
+        except Exception:  # noqa: BLE001
+            parts.append(os.environ.get("COMPUTERNAME", ""))
+        parts.append(os.environ.get("USERNAME", ""))
+    else:
+        for mid_path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+            if mid_path.exists():
+                try:
+                    mid = mid_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    mid = ""
+                if mid:
+                    parts.append(mid)
+                    break
+        if not parts:
+            parts.append(platform.node())
+        try:
+            parts.append(getpass.getuser())
+        except Exception:  # noqa: BLE001
+            parts.append(str(os.getuid()) if hasattr(os, "getuid") else "user")
+
+    parts.append(str(uuid.getnode()))
+    raw = "tsai-hw-v1|" + "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def _dpapi_protect(data: bytes, entropy: bytes) -> bytes | None:
+    """Дополнительная обёртка Windows DPAPI (привязка к учётной записи Windows)."""
+    if sys.platform != "win32":
+        return None
+    try:  # pragma: no cover - Windows Crypt32
+        import ctypes
+        import ctypes.wintypes
+
+        class _DataBlob(ctypes.Structure):
+            _fields_ = [
+                ("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char)),
+            ]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        crypt32.CryptProtectData.argtypes = [
+            ctypes.POINTER(_DataBlob),
+            ctypes.c_wchar_p,
+            ctypes.POINTER(_DataBlob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(_DataBlob),
+        ]
+        crypt32.CryptProtectData.restype = ctypes.wintypes.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        in_buf = ctypes.create_string_buffer(data, len(data))
+        ent_buf = ctypes.create_string_buffer(entropy, len(entropy))
+        in_blob = _DataBlob(len(data), in_buf)
+        ent_blob = _DataBlob(len(entropy), ent_buf)
+        out_blob = _DataBlob()
+
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(in_blob),
+            "TitleSurveyAI",
+            ctypes.byref(ent_blob),
+            None,
+            None,
+            0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dpapi_unprotect(data: bytes, entropy: bytes) -> bytes:
+    """Распаковка Windows DPAPI."""
+    if sys.platform != "win32":
+        raise KeyProtectionError(
+            "ключ защищён через Windows DPAPI и может быть пересчитан только на том же ПК Windows"
+        )
+    try:  # pragma: no cover - Windows Crypt32
+        import ctypes
+        import ctypes.wintypes
+
+        class _DataBlob(ctypes.Structure):
+            _fields_ = [
+                ("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char)),
+            ]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_DataBlob),
+            ctypes.c_void_p,
+            ctypes.POINTER(_DataBlob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(_DataBlob),
+        ]
+        crypt32.CryptUnprotectData.restype = ctypes.wintypes.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        in_buf = ctypes.create_string_buffer(data, len(data))
+        ent_buf = ctypes.create_string_buffer(entropy, len(entropy))
+        in_blob = _DataBlob(len(data), in_buf)
+        ent_blob = _DataBlob(len(entropy), ent_buf)
+        out_blob = _DataBlob()
+
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(in_blob),
+            None,
+            ctypes.byref(ent_blob),
+            None,
+            None,
+            0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            raise KeyProtectionError("Windows DPAPI отклонил расшифровку (чужой ПК/профиль или неверный PIN)")
+        try:
+            return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+    except KeyProtectionError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise KeyProtectionError(f"ошибка Windows DPAPI при пересчёте ключа: {exc}") from exc
+
+
+def _derive_protection_keys(provider: str, salt: bytes, secret: str) -> tuple[bytes, bytes]:
+    master = (
+        _machine_fingerprint()
+        + b"|"
+        + provider.strip().lower().encode("utf-8")
+        + b"|"
+        + str(secret or "").strip().encode("utf-8")
+    )
+    derived = hashlib.pbkdf2_hmac("sha256", master, salt, 200_000, dklen=64)
+    return derived[:32], derived[32:]
+
+
+def _xor_keystream(data: bytes, enc_key: bytes, salt: bytes) -> bytes:
+    out = bytearray(len(data))
+    offset = 0
+    counter = 0
+    while offset < len(data):
+        block = hmac.new(
+            enc_key, salt + counter.to_bytes(4, "big"), hashlib.sha256
+        ).digest()
+        chunk_len = min(len(block), len(data) - offset)
+        for idx in range(chunk_len):
+            out[offset + idx] = data[offset + idx] ^ block[idx]
+        offset += chunk_len
+        counter += 1
+    return bytes(out)
+
+
+def protect_api_key(
+    provider: str,
+    raw_key: str | None,
+    *,
+    secret: str = "",
+    unlock_secret: str | None = None,
+) -> str:
+    """
+    Преобразует реальный API-ключ в защищённый хранимый токен ``tsai1:…``.
+
+    В файлах (.json / .env) сохраняется только этот токен: он привязан к
+    аппаратному отпечатку ПК, Windows DPAPI (в Windows) и опциональному PIN-коду
+    в памяти, поэтому украденные конфиги бесполезны для злоумышленника.
+    """
+    cleaned = clean_provider_key(provider, raw_key)
+    if not cleaned:
+        return ""
+    if is_protected_key(cleaned):
+        # Уже защищённый токен: сначала раскрываем реальный ключ, чтобы не шифровать дважды.
+        prev_secret = secret if unlock_secret is None else unlock_secret
+        try:
+            cleaned = unprotect_api_key(provider, cleaned, secret=secret)
+        except KeyProtectionError:
+            if prev_secret != secret:
+                cleaned = unprotect_api_key(provider, cleaned, secret=prev_secret)
+            else:
+                raise
+
+    salt = os.urandom(16)
+    enc_key, mac_key = _derive_protection_keys(provider, salt, secret)
+    ciphertext = _xor_keystream(cleaned.encode("utf-8"), enc_key, salt)
+    tag = hmac.new(mac_key, b"tsai1:v1|" + salt + ciphertext, hashlib.sha256).digest()[:16]
+    payload = salt + tag + ciphertext
+
+    entropy = hashlib.sha256(
+        f"dpapi|{provider.strip().lower()}|{str(secret or '').strip()}".encode("utf-8")
+    ).digest()
+    dpapi_blob = _dpapi_protect(payload, entropy)
+    if dpapi_blob is not None:
+        b64 = base64.urlsafe_b64encode(dpapi_blob).decode("ascii").rstrip("=")
+        return f"{PROTECTED_KEY_PREFIX}dpapi:{b64}"
+
+    b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"{PROTECTED_KEY_PREFIX}v1:{b64}"
+
+
+def unprotect_api_key(provider: str, stored_key: str | None, *, secret: str = "") -> str:
+    """
+    Пересчитывает реальный API-ключ в оперативной памяти из хранимого ``tsai1:…``.
+    Обычные (незащищённые) строки возвращает после стандартной очистки.
+    """
+    token = str(stored_key or "").strip()
+    if not token:
+        return ""
+    if not is_protected_key(token):
+        return clean_provider_key(provider, token)
+
+    parts = token.split(":", 2)
+    if len(parts) != 3 or parts[1] not in {"v1", "dpapi"} or not parts[2]:
+        raise KeyProtectionError(f"повреждён формат защищённого ключа ({provider})")
+
+    scheme, b64_data = parts[1], parts[2]
+    padded = b64_data + "=" * (-len(b64_data) % 4)
+    try:
+        raw_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:  # noqa: BLE001
+        raise KeyProtectionError(f"повреждён защищённый ключ ({provider}): {exc}") from exc
+
+    if scheme == "dpapi":
+        entropy = hashlib.sha256(
+            f"dpapi|{provider.strip().lower()}|{str(secret or '').strip()}".encode("utf-8")
+        ).digest()
+        payload = _dpapi_unprotect(raw_bytes, entropy)
+    else:
+        payload = raw_bytes
+
+    if len(payload) <= 32:
+        raise KeyProtectionError(f"повреждён защищённый ключ ({provider}): слишком короткий блок")
+
+    salt, tag, ciphertext = payload[:16], payload[16:32], payload[32:]
+    enc_key, mac_key = _derive_protection_keys(provider, salt, secret)
+    expected_tag = hmac.new(
+        mac_key, b"tsai1:v1|" + salt + ciphertext, hashlib.sha256
+    ).digest()[:16]
+    if not hmac.compare_digest(tag, expected_tag):
+        raise KeyProtectionError(
+            f"не удалось пересчитать защищённый API-ключ ({provider}): "
+            "введите верный «Код пересчёта (PIN)» или вставьте ключ заново "
+            "(ключ привязан к конкретному ПК и PIN-коду)"
+        )
+    try:
+        real_key = _xor_keystream(ciphertext, enc_key, salt).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise KeyProtectionError(f"ошибка декодирования ключа ({provider})") from exc
+    return clean_provider_key(provider, real_key)
+
+
+def load_dotenv_dict(path: str | Path | None = None) -> dict[str, str]:
+    """Читает пары KEY=VALUE из .env (без записи открытых ключей в os.environ)."""
+    env_path = Path(path) if path is not None else ENV_PATH
+    if not env_path.exists():
+        return {}
+    result: dict[str, str] = {}
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if key:
+            result[key] = value
+    return result
+
+
+def save_protected_env(
+    keys_by_provider: dict[str, str],
+    *,
+    secret: str = "",
+    unlock_secret: str | None = None,
+    path: str | Path | None = None,
+) -> Path:
+    """
+    Сохраняет API-ключи провайдеров в .env ТОЛЬКО в защищённом виде ``tsai1:…``,
+    сохраняя прочие строки и комментарии существующего .env.
+    """
+    env_path = Path(path) if path is not None else ENV_PATH
+    env_updates: dict[str, str] = {}
+    for pid, raw_val in keys_by_provider.items():
+        p_cfg = PROVIDERS_CATALOG.get(pid, {})
+        env_name = str(p_cfg.get("env_key") or f"{pid.upper()}_API_KEY").strip()
+        val = str(raw_val or "").strip()
+        if val:
+            env_updates[env_name] = protect_api_key(
+                pid, val, secret=secret, unlock_secret=unlock_secret
+            )
+
+    existing_lines: list[str] = []
+    if env_path.exists():
+        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    written: set[str] = set()
+    output_lines: list[str] = []
+    if not existing_lines:
+        output_lines.append(
+            "# Защищённые API-ключи Title Survey AI (реальный ключ пересчитывается в RAM)"
+        )
+    for raw_line in existing_lines:
+        stripped = raw_line.strip()
+        check = stripped[7:].strip() if stripped.lower().startswith("export ") else stripped
+        if check and not check.startswith("#") and "=" in check:
+            k_name = check.split("=", 1)[0].strip()
+            if k_name in env_updates:
+                output_lines.append(f"{k_name}={env_updates[k_name]}")
+                written.add(k_name)
+                continue
+        output_lines.append(raw_line)
+
+    for k_name, protected_val in env_updates.items():
+        if k_name not in written:
+            output_lines.append(f"{k_name}={protected_val}")
+
+    env_path.write_text("\n".join(output_lines).rstrip() + "\n", encoding="utf-8")
+    return env_path
 
 
 def _read_json_dict(cfg_path: Path) -> dict[str, Any]:
@@ -222,12 +615,11 @@ def _read_json_dict(cfg_path: Path) -> dict[str, Any]:
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     """
-    Читает config.json (и config.local.json при чтении по умолчанию) и дополняет
-    значениями по умолчанию.
+    Читает config.json (а при вызове по умолчанию также config.local.json и .env)
+    и дополняет значениями по умолчанию.
 
-    Пустые API-ключи провайдеров подхватываются из окружения:
-    HYDRA_API_KEY, OPENROUTER_API_KEY, ROUTERAI_API_KEY, а общий `api.api_key` —
-    из ключа активного провайдера либо OPENAI_API_KEY / CAD_LLM_API_KEY.
+    Защищённые токены ``tsai1:…`` остаются в зашифрованном виде до вызова
+    ``resolve_api_target()``, где пересчитываются в реальный ключ в памяти.
     """
     cfg_path = Path(path) if path is not None else CONFIG_PATH
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -236,6 +628,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     if path is None and LOCAL_CONFIG_PATH.exists():
         _deep_update(cfg, _read_json_dict(LOCAL_CONFIG_PATH))
 
+    dotenv_vars = load_dotenv_dict() if path is None else {}
     api = cfg["api"]
     providers = api.setdefault("providers", copy.deepcopy(PROVIDERS_CATALOG))
     for pid, p_cfg in providers.items():
@@ -244,7 +637,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         raw_key = clean_provider_key(pid, p_cfg.get("api_key"))
         env_name = str(p_cfg.get("env_key") or "").strip()
         if not raw_key and env_name:
-            raw_key = clean_provider_key(pid, os.environ.get(env_name, ""))
+            raw_key = clean_provider_key(
+                pid, os.environ.get(env_name, "") or dotenv_vars.get(env_name, "")
+            )
         p_cfg["api_key"] = raw_key
 
     active_pid = str(api.get("provider") or "hydra").strip().lower()
@@ -256,7 +651,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         api["api_key"] = (
             active_key
             or os.environ.get("OPENAI_API_KEY", "").strip()
+            or dotenv_vars.get("OPENAI_API_KEY", "").strip()
             or os.environ.get("CAD_LLM_API_KEY", "").strip()
+            or dotenv_vars.get("CAD_LLM_API_KEY", "").strip()
         )
     return cfg
 
@@ -267,9 +664,10 @@ def resolve_api_target(
     provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
+    key_secret: str = "",
 ) -> dict[str, str]:
     """
-    Определяет итоговые параметры вызова LLM (провайдер, URL, модель, ключ).
+    Определяет итоговые параметры вызова LLM и пересчитывает защищённый ключ в RAM.
     """
     api_cfg = cfg.get("api", {})
     providers = api_cfg.get("providers") or {}
@@ -281,6 +679,7 @@ def resolve_api_target(
 
     provider_label = str(p_cfg.get("label") or provider_id or "LLM")
     env_key = str(p_cfg.get("env_key") or "").strip()
+    dotenv_vars = load_dotenv_dict()
 
     if provider is not None and provider_id != cfg_provider:
         base_url = str(p_cfg.get("base_url") or api_cfg.get("base_url") or "").strip()
@@ -305,16 +704,20 @@ def resolve_api_target(
         api_key
         or p_cfg.get("api_key")
         or (os.environ.get(env_key, "") if env_key else "")
+        or (dotenv_vars.get(env_key, "") if env_key else "")
         or api_cfg.get("api_key")
         or os.environ.get("OPENAI_API_KEY", "")
+        or dotenv_vars.get("OPENAI_API_KEY", "")
         or os.environ.get("CAD_LLM_API_KEY", "")
+        or dotenv_vars.get("CAD_LLM_API_KEY", "")
     )
+    real_key = unprotect_api_key(provider_id, raw_key, secret=key_secret)
     return {
         "provider": provider_id,
         "provider_label": provider_label,
         "base_url": base_url,
         "model": chosen_model,
-        "api_key": clean_provider_key(provider_id, raw_key),
+        "api_key": real_key,
         "env_key": env_key,
     }
 
@@ -864,12 +1267,15 @@ def _extract_with_llm(
     *,
     provider: str | None = None,
     model: str | None = None,
+    key_secret: str = "",
 ) -> tuple[LegalDescription, str, TokenUsage]:
     """
     Возвращает (Pydantic-модель, режим Structured Outputs, TokenUsage).
     """
     api_cfg = cfg["api"]
-    target = resolve_api_target(cfg, provider=provider, model=model, api_key=api_key)
+    target = resolve_api_target(
+        cfg, provider=provider, model=model, api_key=api_key, key_secret=key_secret
+    )
     model_name = target["model"]
     provider_id = target["provider"]
     provider_label = target["provider_label"]
@@ -1420,6 +1826,7 @@ def parse_legal_description_full(
     provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
+    key_secret: str = "",
     allow_regex_fallback: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> ParseOutcome:
@@ -1433,7 +1840,8 @@ def parse_legal_description_full(
     :param use_llm: False — сразу локальный regex-парсер.
     :param provider: ID провайдера ('hydra', 'openrouter', 'routerai').
     :param model: имя модели выбранного провайдера.
-    :param api_key: явный API-ключ (переопределяет ключ провайдера из конфига).
+    :param api_key: явный API-ключ или защищённый токен tsai1:….
+    :param key_secret: опциональный секретный код пересчёта (PIN в памяти).
     :param allow_regex_fallback: при ошибке LLM попробовать локальный regex-парсер
                  (по умолчанию выключено: для юридических описаний лучше явная
                  ошибка, чем геометрия с неверно прочитанными румбами).
@@ -1472,6 +1880,7 @@ def parse_legal_description_full(
                 progress=progress,
                 provider=provider,
                 model=model,
+                key_secret=key_secret,
             )
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")

@@ -62,23 +62,29 @@ from acad_builder import (
 )
 from llm_parser import (
     CONFIG_PATH,
+    ENV_PATH,
     LOCAL_CONFIG_PATH,
     PROVIDER_ORDER,
     PROVIDERS_CATALOG,
+    KeyProtectionError,
     LegalDescription,
     LegalDescriptionError,
     ParseOutcome,
     TokenUsage,
     clean_provider_key,
+    is_protected_key,
     load_config,
+    load_dotenv_dict,
     parse_legal_description_full,
+    protect_api_key,
     read_pdf_text,
     save_config,
+    save_protected_env,
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD (Prototype 1)"
-APP_GEOMETRY = "1040x930"
-VERSION = "0.2.0"
+APP_GEOMETRY = "1050x960"
+VERSION = "0.3.0"
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -121,8 +127,13 @@ def provider_entries(cfg: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def _stored_provider_keys() -> dict[str, str]:
-    """Читает ключи, реально записанные в config.json / config.local.json (без env)."""
+    """Читает ключи (обычно защищённые tsai1:…), записанные в .env / config.json."""
     stored: dict[str, str] = {}
+    dotenv_vars = load_dotenv_dict(ENV_PATH)
+    for pid, p_meta in PROVIDERS_CATALOG.items():
+        env_name = str(p_meta.get("env_key") or "").strip()
+        if env_name and dotenv_vars.get(env_name):
+            stored[pid] = clean_provider_key(pid, dotenv_vars[env_name])
     for path in (CONFIG_PATH, LOCAL_CONFIG_PATH):
         if not path.exists():
             continue
@@ -230,6 +241,9 @@ class SurveyApp(ctk.CTk):
         self.provider_key_entries: dict[str, Any] = {}
         self.provider_key_buttons: dict[str, Any] = {}
         self.provider_key_labels: dict[str, Any] = {}
+        # Секретный код пересчёта (PIN) живёт ТОЛЬКО в оперативной памяти — никогда не пишется на диск
+        self.key_secret_var = ctk.StringVar(value="")
+        self._last_valid_secret: str = ""
 
         self.scale_options = scale_options(self.config_data)
         self.scale_var = ctk.StringVar(
@@ -325,7 +339,7 @@ class SurveyApp(ctk.CTk):
 
         # Строка 2: поля ввода API-ключей каждого из трёх провайдеров
         keys_frame = ctk.CTkFrame(settings, fg_color="transparent")
-        keys_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 12))
+        keys_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 6))
         for col, pid in enumerate(self.provider_ids):
             keys_frame.grid_columnconfigure(col, weight=1)
             card = ctk.CTkFrame(keys_frame, fg_color="transparent")
@@ -371,6 +385,46 @@ class SurveyApp(ctk.CTk):
             self.provider_key_labels[pid] = lbl
             self.provider_key_entries[pid] = entry
             self.provider_key_buttons[pid] = btn
+
+        # Строка 3: защита ключей от кражи .json / .env (пересчёт реального ключа в RAM)
+        vault_row = ctk.CTkFrame(settings, fg_color="transparent")
+        vault_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 10))
+        vault_row.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            vault_row,
+            text="🔒 Код пересчёта (PIN в RAM, опц.):",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.key_secret_entry = ctk.CTkEntry(
+            vault_row,
+            textvariable=self.key_secret_var,
+            show="•",
+            width=195,
+            placeholder_text="не пишется в .json/.env",
+        )
+        self.key_secret_entry.grid(row=0, column=1, sticky="w")
+        self.secret_eye_button = ctk.CTkButton(
+            vault_row,
+            text="👁",
+            width=32,
+            command=self._toggle_secret_visibility,
+        )
+        self.secret_eye_button.grid(row=0, column=2, padx=(5, 12), sticky="w")
+        ctk.CTkLabel(
+            vault_row,
+            text="На диске хранится только токен tsai1:… (привязка к ПК + DPAPI + PIN)",
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+            text_color=("#8fa3b8", "#8fa3b8"),
+        ).grid(row=0, column=3, sticky="w")
+        self.save_env_button = ctk.CTkButton(
+            vault_row,
+            text="Защитить в .env",
+            width=145,
+            command=self._save_protected_env_clicked,
+        )
+        self.save_env_button.grid(row=0, column=4, padx=(10, 0), sticky="e")
 
         # Ввод описания -----------------------------------------------------
         input_frame = ctk.CTkFrame(self)
@@ -538,14 +592,16 @@ class SurveyApp(ctk.CTk):
         active = self._active_provider_id
         for pid, lbl in self.provider_key_labels.items():
             title = self._pid_to_label[pid]
+            val = str(self.provider_key_vars[pid].get() or "").strip()
+            lock = " 🔒" if is_protected_key(val) else ""
             if pid == active:
                 lbl.configure(
-                    text=f"API key — {title}  ● активен",
+                    text=f"API key — {title}{lock}  ● активен",
                     text_color=("#5dade2", "#5dade2"),
                 )
             else:
                 lbl.configure(
-                    text=f"API key — {title}",
+                    text=f"API key — {title}{lock}",
                     text_color=("#8fa3b8", "#8fa3b8"),
                 )
 
@@ -557,6 +613,12 @@ class SurveyApp(ctk.CTk):
         hidden = bool(entry.cget("show"))
         entry.configure(show="" if hidden else "•")
         button.configure(text="🙈" if hidden else "👁")
+
+    def _toggle_secret_visibility(self) -> None:
+        """Показывает/скрывает секретный PIN пересчёта ключей."""
+        hidden = bool(self.key_secret_entry.cget("show"))
+        self.key_secret_entry.configure(show="" if hidden else "•")
+        self.secret_eye_button.configure(text="🙈" if hidden else "👁")
 
     # -------------------------------------------------------------- helpers --
     def _on_close(self) -> None:
@@ -616,11 +678,15 @@ class SurveyApp(ctk.CTk):
         self.pdf_label.configure(text=f"PDF: {self.pdf_path.name} ({len(text):,} символов)")
         self._set_status(f"PDF загружен: {self.pdf_path.name}")
 
-    def _build_runtime_config(self) -> tuple[dict[str, Any], str, str, str | None]:
-        """Собирает актуальный конфиг из виджетов окна перед вызовом или сохранением."""
+    def _build_runtime_config(self) -> tuple[dict[str, Any], str, str, str | None, str]:
+        """
+        Собирает актуальный конфиг из виджетов окна перед вызовом или сохранением.
+        Возвращает (cfg, provider_id, model_name, raw_or_protected_key, key_secret).
+        """
         cfg = load_config()
         active_pid = self.current_provider_id()
         active_model = self.current_model()
+        key_secret = str(self.key_secret_var.get() or "")
         self._selected_models[active_pid] = active_model
 
         providers = cfg["api"].setdefault("providers", {})
@@ -644,25 +710,78 @@ class SurveyApp(ctk.CTk):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
         explicit_key = clean_provider_key(active_pid, self.provider_key_vars[active_pid].get())
-        return cfg, active_pid, active_model, (explicit_key or None)
+        return cfg, active_pid, active_model, (explicit_key or None), key_secret
 
     def _save_settings(self) -> None:
-        cfg, active_pid, active_model, _ = self._build_runtime_config()
-        # В файл пишем ровно те ключи, что введены в полях окна (не утекая переменными env)
-        for pid in self.provider_ids:
-            cfg["api"]["providers"][pid]["api_key"] = clean_provider_key(
-                pid, self.provider_key_vars[pid].get()
-            )
+        cfg, active_pid, active_model, _, key_secret = self._build_runtime_config()
+        # На диск записываются ТОЛЬКО защищённые токены tsai1:… (открытые ключи не хранятся)
+        protected_map: dict[str, str] = {}
+        try:
+            for pid in self.provider_ids:
+                raw_val = self.provider_key_vars[pid].get()
+                protected_val = protect_api_key(
+                    pid,
+                    raw_val,
+                    secret=key_secret,
+                    unlock_secret=self._last_valid_secret,
+                )
+                cfg["api"]["providers"][pid]["api_key"] = protected_val
+                protected_map[pid] = protected_val
+        except KeyProtectionError as exc:
+            self._set_status(str(exc), error=True)
+            return
+
         cfg["api"]["api_key"] = ""
         try:
             path = save_config(cfg)
         except OSError as exc:
             self._set_status(f"Не удалось сохранить config.json: {exc}", error=True)
             return
+
+        for pid, protected_val in protected_map.items():
+            if protected_val:
+                self.provider_key_vars[pid].set(protected_val)
+        self._last_valid_secret = key_secret
         self.config_data = load_config()
         self._refresh_height_label()
+        self._refresh_provider_highlights()
+        n_locked = sum(1 for v in protected_map.values() if v)
         self._set_status(
-            f"Настройки сохранены ({self._pid_to_label[active_pid]} / {active_model}): {path}"
+            f"Настройки сохранены ({self._pid_to_label[active_pid]} / {active_model}; "
+            f"защищено ключей tsai1: {n_locked}): {path}"
+        )
+
+    def _save_protected_env_clicked(self) -> None:
+        """Шифрует введённые/хранимые ключи провайдеров в файл .env (tsai1:…)."""
+        key_secret = str(self.key_secret_var.get() or "")
+        raw_map = {pid: self.provider_key_vars[pid].get() for pid in self.provider_ids}
+        if not any(str(v or "").strip() for v in raw_map.values()):
+            self._set_status(
+                "Введите хотя бы один API-ключ провайдера перед записью в .env.",
+                error=True,
+            )
+            return
+        try:
+            env_path = save_protected_env(
+                raw_map,
+                secret=key_secret,
+                unlock_secret=self._last_valid_secret,
+                path=ENV_PATH,
+            )
+        except (KeyProtectionError, OSError) as exc:
+            self._set_status(f"Не удалось записать защищённый .env: {exc}", error=True)
+            return
+
+        dotenv_after = load_dotenv_dict(env_path)
+        for pid in self.provider_ids:
+            env_name = str(self._provider_cfgs[pid].get("env_key") or "").strip()
+            if env_name and dotenv_after.get(env_name):
+                self.provider_key_vars[pid].set(dotenv_after[env_name])
+        self._last_valid_secret = key_secret
+        self.config_data = load_config()
+        self._refresh_provider_highlights()
+        self._set_status(
+            f"Защищённые ключи (tsai1:…) записаны в {env_path} — открытых ключей на диске нет"
         )
 
     def _show_log(self) -> None:
@@ -732,6 +851,7 @@ class SurveyApp(ctk.CTk):
         self.draw_button.configure(state="normal")
         self.parse_button.configure(state="normal")
         self.save_button.configure(state="normal")
+        self.save_env_button.configure(state="normal")
 
     def _start(self, parse_only: bool) -> None:
         if self._busy:
@@ -741,7 +861,7 @@ class SurveyApp(ctk.CTk):
             self._set_status("Вставьте текст Legal Description или загрузите PDF.", error=True)
             return
 
-        cfg, provider_id, model_name, api_key = self._build_runtime_config()
+        cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
         scale = self._current_scale()
         provider_title = self._pid_to_label.get(provider_id, provider_id)
@@ -750,6 +870,7 @@ class SurveyApp(ctk.CTk):
         self.draw_button.configure(state="disabled")
         self.parse_button.configure(state="disabled")
         self.save_button.configure(state="disabled")
+        self.save_env_button.configure(state="disabled")
         self.progress.start()
         if use_llm:
             self.tokens_var.set(
@@ -763,7 +884,17 @@ class SurveyApp(ctk.CTk):
 
         worker = threading.Thread(
             target=self._worker,
-            args=(text, cfg, provider_id, model_name, api_key, use_llm, scale, parse_only),
+            args=(
+                text,
+                cfg,
+                provider_id,
+                model_name,
+                api_key,
+                key_secret,
+                use_llm,
+                scale,
+                parse_only,
+            ),
             daemon=True,
         )
         worker.start()
@@ -775,6 +906,7 @@ class SurveyApp(ctk.CTk):
         provider_id: str,
         model_name: str,
         api_key: str | None,
+        key_secret: str,
         use_llm: bool,
         scale: float,
         parse_only: bool,
@@ -787,9 +919,12 @@ class SurveyApp(ctk.CTk):
                 provider=provider_id,
                 model=model_name,
                 api_key=api_key,
+                key_secret=key_secret,
                 allow_regex_fallback=False,
                 progress=lambda message: self._post("progress", message),
             )
+            if use_llm:
+                self._last_valid_secret = key_secret
             builder = AcadBuilder(cfg)
             plan = builder.plan(outcome.data, scale=scale)
             self._post(
@@ -810,6 +945,9 @@ class SurveyApp(ctk.CTk):
                 )
             result = builder.draw(outcome.data, scale=scale)
             self._post("parsed", (outcome, result))
+            self._post("done", None)
+        except KeyProtectionError as exc:
+            self._post("error", str(exc))
             self._post("done", None)
         except (LegalDescriptionError, AcadBuilderError) as exc:
             message = str(exc)

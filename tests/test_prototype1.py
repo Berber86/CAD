@@ -649,6 +649,81 @@ def test_providers_catalog_and_switching(monkeypatch):
     assert outcome.usage.completion_tokens == 194
 
 
+def test_key_protection_against_stolen_json_and_env(monkeypatch, tmp_path):
+    """
+    Даже если злоумышленник украл config.json и .env и знает исходный код,
+    пересчитать реальные API-ключи на чужом ПК (или без PIN) невозможно.
+    """
+    import hashlib
+
+    import llm_parser
+    from llm_parser import (
+        KeyProtectionError,
+        is_protected_key,
+        load_config,
+        load_dotenv_dict,
+        protect_api_key,
+        resolve_api_target,
+        save_protected_env,
+        unprotect_api_key,
+    )
+
+    owner_hw = hashlib.sha256(b"owner-windows-pc-guid-001").digest()
+    attacker_hw = hashlib.sha256(b"attacker-machine-guid-999").digest()
+    monkeypatch.setattr(llm_parser, "_machine_fingerprint", lambda: owner_hw)
+
+    real_or = "sk-or-v1-9876543210abcdefSECRET"
+    token = protect_api_key("openrouter", real_or, secret="7391")
+    assert is_protected_key(token)
+    assert real_or not in token and "SECRET" not in token
+
+    # Повторный вызов protect_api_key не создаёт двойного шифрования
+    token_again = protect_api_key("openrouter", token, secret="7391")
+    assert unprotect_api_key("openrouter", token_again, secret="7391") == real_or
+
+    # Без PIN или с неверным PIN даже на том же ПК ключ не раскрывается
+    with pytest.raises(KeyProtectionError):
+        unprotect_api_key("openrouter", token, secret="")
+    with pytest.raises(KeyProtectionError):
+        unprotect_api_key("openrouter", token, secret="0000")
+
+    # Записываем защищённый .env (с сохранением комментариев и сторонних переменных)
+    env_file = tmp_path / ".env"
+    env_file.write_text("# My env\nOTHER_VAR=keep_me\nOPENROUTER_API_KEY=plain_old\n", encoding="utf-8")
+    monkeypatch.setattr(llm_parser, "ENV_PATH", env_file)
+
+    save_protected_env(
+        {
+            "hydra": "hk-live-secret$$",
+            "openrouter": real_or,
+            "routerai": "rai-live-secret",
+        },
+        secret="7391",
+        path=env_file,
+    )
+    raw_env_text = env_file.read_text(encoding="utf-8")
+    assert "OTHER_VAR=keep_me" in raw_env_text
+    assert "hk-live-secret" not in raw_env_text
+    assert real_or not in raw_env_text
+    assert "rai-live-secret" not in raw_env_text
+    parsed_env = load_dotenv_dict(env_file)
+    assert is_protected_key(parsed_env["HYDRA_API_KEY"])
+    assert is_protected_key(parsed_env["OPENROUTER_API_KEY"])
+    assert is_protected_key(parsed_env["ROUTERAI_API_KEY"])
+
+    # На ПК владельца с верным PIN реальный ключ пересчитывается в RAM
+    cfg = load_config(tmp_path / "nonexistent.json")
+    resolved = resolve_api_target(cfg, provider="hydra", key_secret="7391")
+    assert resolved["api_key"] == "hk-live-secret"
+
+    # Симуляция кражи: злоумышленник запускает код со всеми украденными файлами на своём ПК
+    monkeypatch.setattr(llm_parser, "_machine_fingerprint", lambda: attacker_hw)
+    with pytest.raises(KeyProtectionError):
+        unprotect_api_key("openrouter", token, secret="7391")
+    with pytest.raises(KeyProtectionError):
+        resolve_api_target(cfg, provider="hydra", key_secret="7391")
+
+
 def test_llm_auth_error_fails_fast(monkeypatch):
     """При HTTP 401 код не делает 4 повторных вызова с заведомо неверным ключом."""
     import openai

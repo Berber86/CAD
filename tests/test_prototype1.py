@@ -512,8 +512,17 @@ class _FakeMessage:
 
 
 class _FakeCompletion:
-    def __init__(self, message):
+    def __init__(self, message, prompt_tokens=612, completion_tokens=194):
         self.choices = [type("Choice", (), {"message": message})()]
+        self.usage = type(
+            "Usage",
+            (),
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        )()
 
 
 class _FakeChat:
@@ -524,24 +533,31 @@ class _FakeChat:
         self.completions = self
 
     def parse(self, **_kwargs):
-        if self.mode in {"no-parse", "no-json-schema"}:
+        if self.mode in {"no-parse", "no-json-schema", "no-response-format"}:
             raise RuntimeError("parse is not supported by this provider")
         from llm_parser import LegalDescription
 
         return _FakeCompletion(_FakeMessage(parsed=LegalDescription.model_validate(_LLM_PAYLOAD)))
 
     def create(self, **kwargs):
-        fmt = (kwargs.get("response_format") or {}).get("type")
-        if self.mode == "no-json-schema" and fmt == "json_schema":
+        resp_fmt = kwargs.get("response_format")
+        fmt = (resp_fmt or {}).get("type")
+        if self.mode in {"no-json-schema", "no-response-format"} and fmt == "json_schema":
             raise RuntimeError("json_schema is not supported")
+        if self.mode == "no-response-format" and resp_fmt is not None:
+            raise RuntimeError("response_format is not supported by free model")
         text = json.dumps(_LLM_PAYLOAD)
         if fmt == "json_object":
             text = "```json\n" + text + "\n```"  # провайдер добавил разметку
+        elif resp_fmt is None:
+            # reasoning-модель вернула блок <think> с фигурными скобками перед JSON
+            text = "<think>Check {\"draft\": 1}</think>\n```json\n" + text + "\n```"
         return _FakeCompletion(_FakeMessage(content=text))
 
 
 class _FakeClient:
-    def __init__(self, mode):
+    def __init__(self, mode, **init_kwargs):
+        self.init_kwargs = init_kwargs
         self.chat = _FakeChat(mode)
         self.beta = type("Beta", (), {"chat": _FakeChat(mode)})()
 
@@ -552,6 +568,7 @@ class _FakeClient:
         ("structured", "structured-outputs"),
         ("no-parse", "json_schema"),
         ("no-json-schema", "json_object"),
+        ("no-response-format", "prompt-json"),
     ],
 )
 def test_llm_extraction_paths(monkeypatch, mode, expected_mode):
@@ -559,12 +576,111 @@ def test_llm_extraction_paths(monkeypatch, mode, expected_mode):
 
     from llm_parser import _extract_with_llm, load_config
 
-    monkeypatch.setattr(openai, "OpenAI", lambda *_a, **_kw: _FakeClient(mode))
+    monkeypatch.setattr(openai, "OpenAI", lambda *_a, **kw: _FakeClient(mode, **kw))
     cfg = load_config()
-    model, used_mode = _extract_with_llm("x" * 50, cfg, api_key="sk-test")
+    model, used_mode, usage = _extract_with_llm("x" * 50, cfg, api_key="sk-test")
     assert used_mode == expected_mode
     assert len(model.segments) == 4
     assert model.segments[0].bearing_label == 'N 75°20\'20" E'
+    assert usage.available is True
+    assert usage.prompt_tokens == 612
+    assert usage.completion_tokens == 194
+    assert usage.total_tokens == 806
+    assert "612" in usage.short_report() and "194" in usage.short_report()
+
+
+def test_providers_catalog_and_switching(monkeypatch):
+    """Все три провайдера (Hydra AI, OpenRouter, RouterAI) маршрутизируются со своими URL и ключами."""
+    import openai
+
+    from llm_parser import (
+        PROVIDER_ORDER,
+        clean_provider_key,
+        load_config,
+        parse_legal_description_full,
+        resolve_api_target,
+    )
+
+    assert PROVIDER_ORDER == ("hydra", "openrouter", "routerai")
+    assert clean_provider_key("hydra", "  hk-secret$$  ") == "hk-secret"
+
+    monkeypatch.setenv("HYDRA_API_KEY", "hk-env$$")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-env")
+    monkeypatch.setenv("ROUTERAI_API_KEY", "rai-env")
+    cfg = load_config()
+
+    hydra_t = resolve_api_target(cfg, provider="hydra")
+    assert hydra_t["base_url"] == "https://api.hydraai.ru/v1"
+    assert hydra_t["api_key"] == "hk-env"
+    assert hydra_t["model"] == "glm-5.2"
+
+    or_t = resolve_api_target(cfg, provider="openrouter")
+    assert or_t["base_url"] == "https://openrouter.ai/api/v1"
+    assert or_t["api_key"] == "or-env"
+    assert "nvidia/nemotron-3.5-super-vl:free" in cfg["api"]["providers"]["openrouter"]["models"]
+    assert "stepfun/step-3.5-flash:free" in cfg["api"]["providers"]["openrouter"]["models"]
+
+    rai_t = resolve_api_target(cfg, provider="routerai", model="google/gemini-2.5-pro")
+    assert rai_t["base_url"] == "https://routerai.ru/api/v1"
+    assert rai_t["api_key"] == "rai-env"
+    assert rai_t["model"] == "google/gemini-2.5-pro"
+
+    captured: list[dict] = []
+
+    def fake_openai(*_a, **kw):
+        captured.append(kw)
+        return _FakeClient("no-parse", **kw)
+
+    monkeypatch.setattr(openai, "OpenAI", fake_openai)
+    outcome = parse_legal_description_full(
+        text="x" * 60,
+        cfg=cfg,
+        use_llm=True,
+        provider="openrouter",
+        model="nvidia/nemotron-3-super-120b-a12b:free",
+    )
+    assert captured[-1]["base_url"] == "https://openrouter.ai/api/v1"
+    assert captured[-1]["api_key"] == "or-env"
+    assert outcome.provider == "openrouter"
+    assert outcome.provider_label == "OpenRouter"
+    assert outcome.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert outcome.usage is not None
+    assert outcome.usage.prompt_tokens == 612
+    assert outcome.usage.completion_tokens == 194
+
+
+def test_llm_auth_error_fails_fast(monkeypatch):
+    """При HTTP 401 код не делает 4 повторных вызова с заведомо неверным ключом."""
+    import openai
+
+    from llm_parser import LLMParseError, _extract_with_llm, load_config
+
+    calls = {"n": 0}
+
+    class AuthErr(Exception):
+        status_code = 401
+
+    class FailingChat:
+        def __init__(self):
+            self.completions = self
+
+        def parse(self, **_kw):
+            calls["n"] += 1
+            raise AuthErr("401 Unauthorized: invalid api key")
+
+        def create(self, **_kw):
+            calls["n"] += 1
+            raise AuthErr("401 Unauthorized")
+
+    class FailingClient:
+        def __init__(self):
+            self.chat = FailingChat()
+            self.beta = type("Beta", (), {"chat": FailingChat()})()
+
+    monkeypatch.setattr(openai, "OpenAI", lambda *_a, **_kw: FailingClient())
+    with pytest.raises(LLMParseError, match="авторизации"):
+        _extract_with_llm("x" * 50, load_config(), provider="routerai", api_key="bad-key")
+    assert calls["n"] == 1
 
 
 def test_llm_refusal_is_reported(monkeypatch):

@@ -43,10 +43,15 @@ __all__ = [
     "PDFError",
     "CONFIG_PATH",
     "DEFAULT_CONFIG",
+    "LOCAL_CONFIG_PATH",
+    "PROVIDER_ORDER",
+    "PROVIDERS_CATALOG",
     "LegalDescription",
     "ParseOutcome",
     "Segment",
+    "TokenUsage",
     "bearing_label",
+    "clean_provider_key",
     "dms_to_degrees",
     "load_config",
     "make_strict_schema",
@@ -54,6 +59,7 @@ __all__ = [
     "parse_legal_description_full",
     "parse_with_regex",
     "read_pdf_text",
+    "resolve_api_target",
     "save_config",
 ]
 
@@ -80,20 +86,77 @@ class ConfigError(LegalDescriptionError):
 
 
 # ---------------------------------------------------------------------------
-# Конфигурация
+# Конфигурация и каталог провайдеров (Hydra AI / OpenRouter / RouterAI)
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
+LOCAL_CONFIG_PATH = Path(__file__).resolve().with_name("config.local.json")
+
+PROVIDER_ORDER: tuple[str, ...] = ("hydra", "openrouter", "routerai")
+
+PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
+    "hydra": {
+        "label": "Hydra AI",
+        "base_url": "https://api.hydraai.ru/v1",
+        "api_key": "",
+        "env_key": "HYDRA_API_KEY",
+        "default_model": "glm-5.2",
+        "selected_model": "glm-5.2",
+        "models": [
+            "glm-5.2",
+            "hydra-gemini-pro",
+            "hydra-gemini-3-pro",
+            "hydra-gemini",
+        ],
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "env_key": "OPENROUTER_API_KEY",
+        "default_model": "nvidia/nemotron-3.5-super-vl:free",
+        "selected_model": "nvidia/nemotron-3.5-super-vl:free",
+        "models": [
+            "nvidia/nemotron-3.5-super-vl:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nvidia/nemotron-3-nano-30b-a3b:free",
+            "stepfun/step-3.5-flash:free",
+            "z-ai/glm-4.5-air:free",
+            "arcee-ai/trinity-large-preview:free",
+            "mistralai/devstral-2512:free",
+        ],
+    },
+    "routerai": {
+        "label": "RouterAI",
+        "base_url": "https://routerai.ru/api/v1",
+        "api_key": "",
+        "env_key": "ROUTERAI_API_KEY",
+        "default_model": "openai/gpt-4.1",
+        "selected_model": "openai/gpt-4.1",
+        "models": [
+            "openai/gpt-4.1",
+            "openai/gpt-4.1-mini",
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini",
+            "google/gemini-2.5-pro",
+            "google/gemini-2.5-flash",
+            "anthropic/claude-sonnet-4.5",
+            "deepseek/deepseek-chat",
+        ],
+    },
+}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "api": {
+        "provider": "hydra",
         "api_key": "",
-        "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4.1",
+        "base_url": "https://api.hydraai.ru/v1",
+        "model": "glm-5.2",
         "temperature": 0.0,
         "timeout_sec": 180,
         "max_retries": 2,
         "max_input_chars": 60000,
+        "providers": copy.deepcopy(PROVIDERS_CATALOG),
     },
     "drawing": {
         "base_scale": 16.0,
@@ -134,32 +197,126 @@ def _deep_update(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def clean_provider_key(provider: str, raw_key: str | None) -> str:
+    """
+    Очищает API-ключ провайдера.
+
+    В contextual-chatbot ключ Hydra AI может храниться с суффиксом ``$$``
+    (маркер Full Hydra Mode) — срезаем его, чтобы такой ключ работал без правок.
+    """
+    key = str(raw_key or "").strip()
+    if provider.strip().lower() == "hydra" and key.endswith("$$"):
+        key = key[:-2].strip()
+    return key
+
+
+def _read_json_dict(cfg_path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{cfg_path.name} повреждён ({exc}); путь: {cfg_path}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{cfg_path.name} должен содержать JSON-объект; путь: {cfg_path}")
+    return raw
+
+
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     """
-    Читает config.json и дополняет его значениями по умолчанию.
+    Читает config.json (и config.local.json при чтении по умолчанию) и дополняет
+    значениями по умолчанию.
 
-    Пустой `api.api_key` подхватывается из окружения:
-    OPENAI_API_KEY или CAD_LLM_API_KEY (удобно не хранить ключ в файле).
+    Пустые API-ключи провайдеров подхватываются из окружения:
+    HYDRA_API_KEY, OPENROUTER_API_KEY, ROUTERAI_API_KEY, а общий `api.api_key` —
+    из ключа активного провайдера либо OPENAI_API_KEY / CAD_LLM_API_KEY.
     """
     cfg_path = Path(path) if path is not None else CONFIG_PATH
-    raw: dict[str, Any] = {}
-    if cfg_path.exists():
-        try:
-            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"config.json повреждён ({exc}); путь: {cfg_path}") from exc
-        if not isinstance(raw, dict):
-            raise ConfigError(f"config.json должен содержать JSON-объект; путь: {cfg_path}")
     cfg = copy.deepcopy(DEFAULT_CONFIG)
-    _deep_update(cfg, raw)
+    if cfg_path.exists():
+        _deep_update(cfg, _read_json_dict(cfg_path))
+    if path is None and LOCAL_CONFIG_PATH.exists():
+        _deep_update(cfg, _read_json_dict(LOCAL_CONFIG_PATH))
 
     api = cfg["api"]
+    providers = api.setdefault("providers", copy.deepcopy(PROVIDERS_CATALOG))
+    for pid, p_cfg in providers.items():
+        if not isinstance(p_cfg, dict):
+            continue
+        raw_key = clean_provider_key(pid, p_cfg.get("api_key"))
+        env_name = str(p_cfg.get("env_key") or "").strip()
+        if not raw_key and env_name:
+            raw_key = clean_provider_key(pid, os.environ.get(env_name, ""))
+        p_cfg["api_key"] = raw_key
+
+    active_pid = str(api.get("provider") or "hydra").strip().lower()
+    active_key = ""
+    if isinstance(providers.get(active_pid), dict):
+        active_key = str(providers[active_pid].get("api_key") or "").strip()
+
     if not str(api.get("api_key") or "").strip():
         api["api_key"] = (
-            os.environ.get("OPENAI_API_KEY", "").strip()
+            active_key
+            or os.environ.get("OPENAI_API_KEY", "").strip()
             or os.environ.get("CAD_LLM_API_KEY", "").strip()
         )
     return cfg
+
+
+def resolve_api_target(
+    cfg: dict[str, Any],
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, str]:
+    """
+    Определяет итоговые параметры вызова LLM (провайдер, URL, модель, ключ).
+    """
+    api_cfg = cfg.get("api", {})
+    providers = api_cfg.get("providers") or {}
+    cfg_provider = str(api_cfg.get("provider") or "hydra").strip().lower()
+    provider_id = str(provider or cfg_provider or "hydra").strip().lower()
+    p_cfg = providers.get(provider_id) if isinstance(providers, dict) else None
+    if not isinstance(p_cfg, dict):
+        p_cfg = {}
+
+    provider_label = str(p_cfg.get("label") or provider_id or "LLM")
+    env_key = str(p_cfg.get("env_key") or "").strip()
+
+    if provider is not None and provider_id != cfg_provider:
+        base_url = str(p_cfg.get("base_url") or api_cfg.get("base_url") or "").strip()
+        chosen_model = str(
+            model
+            or p_cfg.get("selected_model")
+            or p_cfg.get("default_model")
+            or api_cfg.get("model")
+            or "glm-5.2"
+        ).strip()
+    else:
+        base_url = str(p_cfg.get("base_url") or api_cfg.get("base_url") or "").strip()
+        chosen_model = str(
+            model
+            or api_cfg.get("model")
+            or p_cfg.get("selected_model")
+            or p_cfg.get("default_model")
+            or "glm-5.2"
+        ).strip()
+
+    raw_key = (
+        api_key
+        or p_cfg.get("api_key")
+        or (os.environ.get(env_key, "") if env_key else "")
+        or api_cfg.get("api_key")
+        or os.environ.get("OPENAI_API_KEY", "")
+        or os.environ.get("CAD_LLM_API_KEY", "")
+    )
+    return {
+        "provider": provider_id,
+        "provider_label": provider_label,
+        "base_url": base_url,
+        "model": chosen_model,
+        "api_key": clean_provider_key(provider_id, raw_key),
+        "env_key": env_key,
+    }
 
 
 def save_config(cfg: dict[str, Any], path: str | Path | None = None) -> Path:
@@ -529,11 +686,69 @@ def _messages(text: str) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Работа с LLM
+# Работа с LLM и учёт токенов
 # ---------------------------------------------------------------------------
 
 
-def _make_client(api_cfg: dict[str, Any], api_key: str | None = None) -> Any:
+@dataclass(frozen=True)
+class TokenUsage:
+    """Статистика отправленных и полученных токенов за вызов LLM."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    provider: str = ""
+    provider_label: str = ""
+    model: str = ""
+    available: bool = True
+
+    def short_report(self) -> str:
+        target = " / ".join(
+            part for part in (self.provider_label or self.provider, self.model) if part
+        )
+        badge = f"  [{target}]" if target else ""
+        if not self.available:
+            return f"Токены за вызов: провайдер не вернул usage{badge}"
+        return (
+            f"Токены за вызов: ↑ ушло {self.prompt_tokens:,}  |  "
+            f"↓ пришло {self.completion_tokens:,}  |  "
+            f"всего {self.total_tokens:,}{badge}"
+        )
+
+
+def _extract_usage_counts(completion: Any) -> tuple[int, int, int] | None:
+    """Достаёт (prompt_tokens, completion_tokens, total_tokens) из ответа SDK."""
+    raw = (
+        completion.get("usage")
+        if isinstance(completion, dict)
+        else getattr(completion, "usage", None)
+    )
+    if raw is None:
+        return None
+
+    def _get(obj: Any, *names: str) -> int | None:
+        for name in names:
+            val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                return int(val)
+        return None
+
+    prompt = _get(raw, "prompt_tokens", "input_tokens")
+    completion_tok = _get(raw, "completion_tokens", "output_tokens")
+    total = _get(raw, "total_tokens")
+    if prompt is None and completion_tok is None and total is None:
+        return None
+    p_val = int(prompt or 0)
+    c_val = int(completion_tok or 0)
+    t_val = int(total) if total is not None and total > 0 else (p_val + c_val)
+    return p_val, c_val, t_val
+
+
+def _make_client(
+    api_cfg: dict[str, Any],
+    *,
+    target: dict[str, str],
+) -> Any:
     try:
         from openai import OpenAI
     except ImportError as exc:  # pragma: no cover
@@ -541,19 +756,34 @@ def _make_client(api_cfg: dict[str, Any], api_key: str | None = None) -> Any:
             "пакет openai не установлен. Выполните: pip install openai"
         ) from exc
 
-    key = (api_key or str(api_cfg.get("api_key") or "")).strip()
+    key = target["api_key"]
+    provider_label = target["provider_label"]
+    env_hint = f" (или переменную {target['env_key']})" if target.get("env_key") else ""
     if not key:
         raise LLMParseError(
-            "не задан API-ключ: впишите его в config.json (api.api_key) "
-            "или в поле «API key» в окне программы"
+            f"не задан API-ключ для провайдера {provider_label}: "
+            f"впишите его в поле «{provider_label}» в окне программы, "
+            f"в config.json{env_hint}"
         )
-    base_url = str(api_cfg.get("base_url") or "").strip() or None
+    base_url = target["base_url"] or None
     return OpenAI(
         api_key=key,
         base_url=base_url,
         timeout=float(api_cfg.get("timeout_sec") or 180),
         max_retries=int(api_cfg.get("max_retries") or 0),
+        default_headers={
+            "HTTP-Referer": "https://github.com/Berber86/CAD",
+            "X-Title": "Title Survey AI",
+        },
     )
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return True
+    msg = str(exc).lower()
+    return "401" in msg and ("unauthorized" in msg or "invalid api key" in msg or "auth" in msg)
 
 
 def _call_with_temperature(func: Callable[..., Any], **kwargs: Any) -> Any:
@@ -569,8 +799,12 @@ def _call_with_temperature(func: Callable[..., Any], **kwargs: Any) -> Any:
 
 
 def _json_from_text(raw: str) -> Any:
-    """Достаёт JSON-объект из ответа модели (снимает ```json-обёртки)."""
+    """Достаёт JSON-объект из ответа модели (снимает <think> и ```json-обёртки)."""
     text = raw.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in text.lower():
+        idx = text.lower().rfind("</think>")
+        text = text[idx + len("</think>") :].strip()
     fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL | re.IGNORECASE)
     if fence:
         text = fence.group(1).strip()
@@ -594,7 +828,7 @@ def make_strict_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
 
         return to_strict_json_schema(model_cls)
     except Exception:  # noqa: BLE001 - старые версии SDK
-        pass
+        raw_schema = copy.deepcopy(model_cls.model_json_schema())
 
     def walk(node: Any) -> Any:
         if isinstance(node, dict):
@@ -619,7 +853,7 @@ def make_strict_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
                 node.pop("default", None)
         return node
 
-    return walk(copy.deepcopy(model_cls.model_json_schema()))
+    return walk(raw_schema)
 
 
 def _extract_with_llm(
@@ -627,18 +861,50 @@ def _extract_with_llm(
     cfg: dict[str, Any],
     api_key: str | None = None,
     progress: Callable[[str], None] | None = None,
-) -> tuple[LegalDescription, str]:
-    """Возвращает (модель, название использованного режима Structured Outputs)."""
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> tuple[LegalDescription, str, TokenUsage]:
+    """
+    Возвращает (Pydantic-модель, режим Structured Outputs, TokenUsage).
+    """
     api_cfg = cfg["api"]
-    model_name = str(api_cfg.get("model") or "gpt-4.1")
+    target = resolve_api_target(cfg, provider=provider, model=model, api_key=api_key)
+    model_name = target["model"]
+    provider_id = target["provider"]
+    provider_label = target["provider_label"]
     temperature = api_cfg.get("temperature", 0.0)
-    client = _make_client(api_cfg, api_key=api_key)
+    client = _make_client(api_cfg, target=target)
     messages = _messages(text)
 
     if progress:
-        progress(f"Запрос к LLM: {model_name} …")
+        progress(f"Запрос к {provider_label}: {model_name} …")
 
     errors: list[str] = []
+    prompt_acc = 0
+    completion_acc = 0
+    total_acc = 0
+    saw_usage = False
+
+    def record_usage(completion_obj: Any) -> None:
+        nonlocal prompt_acc, completion_acc, total_acc, saw_usage
+        counts = _extract_usage_counts(completion_obj)
+        if counts is not None:
+            saw_usage = True
+            prompt_acc += counts[0]
+            completion_acc += counts[1]
+            total_acc += counts[2]
+
+    def build_usage() -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=prompt_acc,
+            completion_tokens=completion_acc,
+            total_tokens=total_acc,
+            provider=provider_id,
+            provider_label=provider_label,
+            model=model_name,
+            available=saw_usage,
+        )
 
     # 1) Самый надёжный путь: SDK сам строит strict-схему и валидирует ответ.
     try:
@@ -651,22 +917,27 @@ def _extract_with_llm(
                 response_format=LegalDescription,
                 temperature=temperature,
             )
+            record_usage(completion)
             message = completion.choices[0].message
             refusal = getattr(message, "refusal", None)
             if refusal:
                 raise LLMParseError(f"модель отказалась отвечать: {refusal}")
             parsed = getattr(message, "parsed", None)
             if parsed is not None:
-                return parsed, "structured-outputs"
+                return parsed, "structured-outputs", build_usage()
             raise LLMParseError("модель вернула пустой structured-ответ")
     except LLMParseError:
         raise
     except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            raise LLMParseError(
+                f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+            ) from exc
         errors.append(f"parse(): {exc}")
 
-    # 2) Ручная JSON-схема (совместимые провайдеры: vLLM, OpenRouter, LM Studio…)
+    # 2) Ручная JSON-схема (совместимые провайдеры: Hydra, OpenRouter, RouterAI…)
+    schema = make_strict_schema(LegalDescription)
     try:
-        schema = make_strict_schema(LegalDescription)
         completion = _call_with_temperature(
             client.chat.completions.create,
             model=model_name,
@@ -681,35 +952,80 @@ def _extract_with_llm(
                 },
             },
         )
+        record_usage(completion)
         content = completion.choices[0].message.content or ""
-        return LegalDescription.model_validate(_json_from_text(content)), "json_schema"
+        return (
+            LegalDescription.model_validate(_json_from_text(content)),
+            "json_schema",
+            build_usage(),
+        )
     except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            raise LLMParseError(
+                f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+            ) from exc
         errors.append(f"json_schema: {exc}")
 
-    # 3) Последняя попытка: обычный JSON-mode + инструкция со схемой.
+    schema_hint = json.dumps(schema, ensure_ascii=False)
+    guide = (
+        "Return ONLY a JSON object that validates against this JSON Schema:\n"
+        f"{schema_hint}"
+    )
+    guided_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + guide},
+        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
+    ]
+
+    # 3) Обычный JSON-mode + инструкция со схемой.
     try:
-        schema_hint = json.dumps(make_strict_schema(LegalDescription), ensure_ascii=False)
-        guide = (
-            "Return ONLY a JSON object that validates against this JSON Schema:\n"
-            f"{schema_hint}"
-        )
         completion = _call_with_temperature(
             client.chat.completions.create,
             model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + guide},
-                {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
-            ],
+            messages=guided_messages,
             temperature=temperature,
             response_format={"type": "json_object"},
         )
+        record_usage(completion)
         content = completion.choices[0].message.content or ""
-        return LegalDescription.model_validate(_json_from_text(content)), "json_object"
+        return (
+            LegalDescription.model_validate(_json_from_text(content)),
+            "json_object",
+            build_usage(),
+        )
     except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            raise LLMParseError(
+                f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+            ) from exc
         errors.append(f"json_object: {exc}")
 
+    # 4) Запрос без response_format — для бесплатных/reasoning-моделей OpenRouter/Hydra,
+    #    которые отклоняют параметр response_format целиком.
+    try:
+        completion = _call_with_temperature(
+            client.chat.completions.create,
+            model=model_name,
+            messages=guided_messages,
+            temperature=temperature,
+        )
+        record_usage(completion)
+        content = completion.choices[0].message.content or ""
+        return (
+            LegalDescription.model_validate(_json_from_text(content)),
+            "prompt-json",
+            build_usage(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            raise LLMParseError(
+                f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+            ) from exc
+        errors.append(f"prompt-json: {exc}")
+
     detail = " | ".join(errors[-3:])
-    raise LLMParseError(f"не удалось получить корректный JSON от LLM: {detail}")
+    raise LLMParseError(
+        f"не удалось получить корректный JSON от {provider_label} ({model_name}): {detail}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1404,11 @@ class ParseOutcome:
     data: LegalDescription
     source: str
     warnings: list[str] = field(default_factory=list)
+    usage: TokenUsage | None = None
+    provider: str = ""
+    provider_label: str = ""
+    model: str = ""
+    llm_mode: str = ""
 
 
 def parse_legal_description_full(
@@ -1096,6 +1417,8 @@ def parse_legal_description_full(
     cfg: dict[str, Any] | None = None,
     *,
     use_llm: bool = True,
+    provider: str | None = None,
+    model: str | None = None,
     api_key: str | None = None,
     allow_regex_fallback: bool = False,
     progress: Callable[[str], None] | None = None,
@@ -1108,6 +1431,9 @@ def parse_legal_description_full(
     :param pdf_path: путь к PDF.
     :param cfg: конфигурация (по умолчанию load_config()).
     :param use_llm: False — сразу локальный regex-парсер.
+    :param provider: ID провайдера ('hydra', 'openrouter', 'routerai').
+    :param model: имя модели выбранного провайдера.
+    :param api_key: явный API-ключ (переопределяет ключ провайдера из конфига).
     :param allow_regex_fallback: при ошибке LLM попробовать локальный regex-парсер
                  (по умолчанию выключено: для юридических описаний лучше явная
                  ошибка, чем геометрия с неверно прочитанными румбами).
@@ -1139,12 +1465,26 @@ def parse_legal_description_full(
     llm_error: Exception | None = None
     if use_llm:
         try:
-            model, mode = _extract_with_llm(
-                combined, cfg, api_key=api_key, progress=progress
+            parsed_model, mode, usage = _extract_with_llm(
+                combined,
+                cfg,
+                api_key=api_key,
+                progress=progress,
+                provider=provider,
+                model=model,
             )
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
-            return ParseOutcome(data=model, source="llm", warnings=warnings)
+            return ParseOutcome(
+                data=parsed_model,
+                source="llm",
+                warnings=warnings,
+                usage=usage,
+                provider=usage.provider,
+                provider_label=usage.provider_label,
+                model=usage.model,
+                llm_mode=mode,
+            )
         except Exception as exc:  # noqa: BLE001
             llm_error = exc
             if not allow_regex_fallback:
@@ -1153,13 +1493,13 @@ def parse_legal_description_full(
 
     if progress:
         progress("Локальный разбор текста (regex)…")
-    model, regex_warnings = parse_with_regex(combined)
+    parsed_model, regex_warnings = parse_with_regex(combined)
     warnings.extend(regex_warnings)
 
     if llm_error is not None:
         warnings.insert(0, "геометрия получена локальным парсером — проверьте размеры вручную")
     return ParseOutcome(
-        data=model,
+        data=parsed_model,
         source="llm" if not llm_error and use_llm else "regex",
         warnings=warnings,
     )

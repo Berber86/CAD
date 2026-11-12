@@ -1,12 +1,64 @@
 {
   "api": {
+    "provider": "hydra",
     "api_key": "",
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4.1",
+    "base_url": "https://api.hydraai.ru/v1",
+    "model": "glm-5.2",
     "temperature": 0.0,
     "timeout_sec": 180,
     "max_retries": 2,
-    "max_input_chars": 60000
+    "max_input_chars": 60000,
+    "providers": {
+      "hydra": {
+        "label": "Hydra AI",
+        "base_url": "https://api.hydraai.ru/v1",
+        "api_key": "",
+        "env_key": "HYDRA_API_KEY",
+        "default_model": "glm-5.2",
+        "selected_model": "glm-5.2",
+        "models": [
+          "glm-5.2",
+          "hydra-gemini-pro",
+          "hydra-gemini-3-pro",
+          "hydra-gemini"
+        ]
+      },
+      "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "env_key": "OPENROUTER_API_KEY",
+        "default_model": "nvidia/nemotron-3.5-super-vl:free",
+        "selected_model": "nvidia/nemotron-3.5-super-vl:free",
+        "models": [
+          "nvidia/nemotron-3.5-super-vl:free",
+          "nvidia/nemotron-3-super-120b-a12b:free",
+          "nvidia/nemotron-3-nano-30b-a3b:free",
+          "stepfun/step-3.5-flash:free",
+          "z-ai/glm-4.5-air:free",
+          "arcee-ai/trinity-large-preview:free",
+          "mistralai/devstral-2512:free"
+        ]
+      },
+      "routerai": {
+        "label": "RouterAI",
+        "base_url": "https://routerai.ru/api/v1",
+        "api_key": "",
+        "env_key": "ROUTERAI_API_KEY",
+        "default_model": "openai/gpt-4.1",
+        "selected_model": "openai/gpt-4.1",
+        "models": [
+          "openai/gpt-4.1",
+          "openai/gpt-4.1-mini",
+          "openai/gpt-4o",
+          "openai/gpt-4o-mini",
+          "google/gemini-2.5-pro",
+          "google/gemini-2.5-flash",
+          "anthropic/claude-sonnet-4.5",
+          "deepseek/deepseek-chat"
+        ]
+      }
+    }
   },
   "drawing": {
     "base_scale": 16.0,

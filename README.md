@@ -10,10 +10,10 @@ LLM → замкнутый контур участка с подписями с�
 
 | Файл | Что делает | Строк |
 | --- | --- | --- |
-| `config.json` | API, масштаб/высота текста, слои, коэффициенты отступов | 42 |
-| `llm_parser.py` | румбы/DMS, Pydantic-модели, LLM, PDF, локальный парсер | ~1180 |
+| `config.json` | 3 провайдера (Hydra AI / OpenRouter / RouterAI), модели, масштаб/высота текста, слои | 94 |
+| `llm_parser.py` | румбы/DMS, Pydantic-модели, маршрутизация провайдеров, учёт токенов, PDF, regex | ~1520 |
 | `acad_builder.py` | математика, невязка, раскладка подписей, ActiveX | ~1020 |
-| `main.py` | окно CustomTkinter, потоки, статус/невязка/лог | ~580 |
+| `main.py` | окно CustomTkinter, переключатель провайдеров/моделей/ключей, статус/невязка/токены | ~905 |
 
 ![пример](docs/preview-example.png)
 
@@ -24,10 +24,14 @@ docs/samples/example-1-metes-and-bounds.txt docs/preview-example.png`
 
 ## Возможности
 
-- **Парсинг Legal Description** через LLM с Structured Outputs (`pydantic`-схема →
-  строгий JSON, без «почти JSON»). Поддерживаются OpenAI и любые
-  OpenAI-совместимые провайдеры (`base_url`) — включая локальные (LM Studio, vLLM,
-  OpenRouter).
+- **Три LLM-провайдера с переключателем и выбором модели** (как в `contextual-chatbot`):
+  - **Hydra AI** (`https://api.hydraai.ru/v1`, `HYDRA_API_KEY`): `glm-5.2`, `hydra-gemini-pro`, `hydra-gemini-3-pro`, `hydra-gemini` (ключи с суффиксом `$$` очищаются автоматически);
+  - **OpenRouter** (`https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`): `nvidia/nemotron-3.5-super-vl:free`, `nvidia/nemotron-3-super-120b-a12b:free`, `nvidia/nemotron-3-nano-30b-a3b:free`, `stepfun/step-3.5-flash:free`, `z-ai/glm-4.5-air:free`, `arcee-ai/trinity-large-preview:free`, `mistralai/devstral-2512:free`;
+  - **RouterAI** (`https://routerai.ru/api/v1`, `ROUTERAI_API_KEY`): `openai/gpt-4.1`, `openai/gpt-4.1-mini`, `openai/gpt-4o`, `openai/gpt-4o-mini`, `google/gemini-2.5-pro`, `google/gemini-2.5-flash`, `anthropic/claude-sonnet-4.5`, `deepseek/deepseek-chat`.
+  В выпадающее поле модели (`CTkComboBox`) можно также вписать любую новую модель вручную.
+- **Отдельные поля ввода API-ключей** для каждого из трёх провайдеров (с кнопками показа/скрытия `👁` и сохранением в `config.json`).
+- **Учёт токенов за вызов и за сессию**: под строкой невязки выводится число ушедших (`prompt_tokens`), пришедших (`completion_tokens`) и суммарных токенов за вызов + накопленный счётчик за сессию для удобного сравнения моделей.
+- **Парсинг Legal Description** через Structured Outputs (`pydantic`-схема → строгий JSON, 4 уровня совместимости: `parse` → `json_schema` → `json_object` → `prompt-json` с очисткой `<think>`-блоков).
 - **PDF → текст** через PyMuPDF, с понятной ошибкой, если PDF — скан без текстового слоя.
 - **Локальный regex-парсер** как аварийный путь без API (выключатель «Использовать LLM»).
 - **Геодезическая математика**: перевод румбов (0° = север = +Y, 90° = восток = +X),

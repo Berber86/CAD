@@ -7,7 +7,11 @@ GUI (CustomTkinter) для Прототипа 1: Legal Description -> AutoCAD.
   * вставка текста Legal Description или загрузка PDF (PyMuPDF);
   * выбор масштаба 1"=10'/16'/20'/30' с пересчётом высоты текста
     0.9 * (scale / 16.0);
-  * ввод API-ключа / модели прямо в окне (ключ не пишется в config.json);
+  * переключатель между тремя LLM-провайдерами (Hydra AI / OpenRouter / RouterAI)
+    и выбор модели внутри каждого провайдера (либо ввод произвольной модели);
+  * отдельные поля ввода API-ключей для каждого из трёх провайдеров;
+  * отображение числа ушедших (prompt) и пришедших (completion) токенов за вызов
+    и накопленной статистики за сессию;
   * кнопка «Начертить участок в AutoCAD» — полилиния + подписи сторон,
     фасадная и пересекаемая улицы;
   * вывод невязки (Closure Error, ft), площади и предупреждений;
@@ -21,6 +25,8 @@ COM-вызовы AutoCAD выполняются в отдельном поток
 
 from __future__ import annotations
 
+import json
+import os
 import queue
 import sys
 import threading
@@ -39,7 +45,7 @@ if sys.platform == "win32":  # pragma: no cover - Windows only
         except Exception:  # noqa: BLE001
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:  # noqa: BLE001
-        pass
+        ctypes = None  # type: ignore[assignment]
 
 try:
     import customtkinter as ctk
@@ -55,9 +61,15 @@ from acad_builder import (
     DrawResult,
 )
 from llm_parser import (
+    CONFIG_PATH,
+    LOCAL_CONFIG_PATH,
+    PROVIDER_ORDER,
+    PROVIDERS_CATALOG,
     LegalDescription,
     LegalDescriptionError,
     ParseOutcome,
+    TokenUsage,
+    clean_provider_key,
     load_config,
     parse_legal_description_full,
     read_pdf_text,
@@ -65,8 +77,8 @@ from llm_parser import (
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD (Prototype 1)"
-APP_GEOMETRY = "1000x880"
-VERSION = "0.1.0"
+APP_GEOMETRY = "1040x930"
+VERSION = "0.2.0"
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -82,6 +94,51 @@ def default_scale(menu_values: list[str], cfg: dict[str, Any]) -> str:
         if scale_value(label) == base:
             return label
     return menu_values[0]
+
+
+def scale_value(label: str) -> float:
+    """'1\"=16\\'' -> 16.0"""
+    digits = "".join(char for char in label.split("=")[-1] if char.isdigit() or char == ".")
+    try:
+        return float(digits) or 16.0
+    except ValueError:
+        return 16.0
+
+
+def provider_entries(cfg: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Упорядоченный список (provider_id, provider_cfg) для переключателя в GUI."""
+    raw = cfg.get("api", {}).get("providers") or PROVIDERS_CATALOG
+    ordered_ids: list[str] = [pid for pid in PROVIDER_ORDER if pid in raw]
+    for extra_id in raw:
+        if extra_id not in ordered_ids:
+            ordered_ids.append(extra_id)
+    result: list[tuple[str, dict[str, Any]]] = []
+    for pid in ordered_ids:
+        entry = raw.get(pid)
+        if isinstance(entry, dict):
+            result.append((pid, entry))
+    return result
+
+
+def _stored_provider_keys() -> dict[str, str]:
+    """Читает ключи, реально записанные в config.json / config.local.json (без env)."""
+    stored: dict[str, str] = {}
+    for path in (CONFIG_PATH, LOCAL_CONFIG_PATH):
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        providers = (data.get("api") or {}).get("providers") if isinstance(data, dict) else None
+        if isinstance(providers, dict):
+            for pid, p_cfg in providers.items():
+                if isinstance(p_cfg, dict):
+                    val = clean_provider_key(pid, p_cfg.get("api_key"))
+                    if val:
+                        stored[pid] = val
+    return stored
+
 
 EXAMPLE_TEXT = (
     "BEING a tract of land situated in the City of Austin, Travis County, Texas, "
@@ -100,15 +157,6 @@ EXAMPLE_TEXT = (
 )
 
 
-def scale_value(label: str) -> float:
-    """'1\"=16\\'' -> 16.0"""
-    digits = "".join(char for char in label.split("=")[-1] if char.isdigit() or char == ".")
-    try:
-        return float(digits) or 16.0
-    except ValueError:
-        return 16.0
-
-
 class SurveyApp(ctk.CTk):
     """Главное окно приложения."""
 
@@ -119,31 +167,79 @@ class SurveyApp(ctk.CTk):
 
         self.title(f"{APP_TITLE}  v{VERSION}")
         self.geometry(APP_GEOMETRY)
-        self.minsize(900, 760)
+        self.minsize(940, 800)
 
         # Окно поверх остальных, но не модальное: в AutoCAD надо кликать.
         self.attributes("-topmost", True)
         self.after(400, lambda: self.attributes("-topmost", True))
-        # Кнопка закрытия: гасим фоновые события и завершаем процесс.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.config_data: dict[str, Any] = load_config()
         self.pdf_path: Path | None = None
         self.description: LegalDescription | None = None
         self.draw_result: DrawResult | None = None
+        self.last_usage: TokenUsage | None = None
+        self._session_llm_calls = 0
+        self._session_prompt_tokens = 0
+        self._session_completion_tokens = 0
         self._busy = False
+        self._closing = False
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        # Провайдеры и их модели
+        entries = provider_entries(self.config_data)
+        self.provider_ids: list[str] = [pid for pid, _ in entries]
+        self._provider_cfgs: dict[str, dict[str, Any]] = {pid: cfg for pid, cfg in entries}
+        self._label_to_pid: dict[str, str] = {}
+        self._pid_to_label: dict[str, str] = {}
+        self._provider_models: dict[str, list[str]] = {}
+        self._selected_models: dict[str, str] = {}
+
+        for pid, p_cfg in entries:
+            label = str(p_cfg.get("label") or pid)
+            self._label_to_pid[label] = pid
+            self._pid_to_label[pid] = label
+            models = [str(m) for m in (p_cfg.get("models") or []) if str(m).strip()]
+            default_m = str(p_cfg.get("selected_model") or p_cfg.get("default_model") or "")
+            if default_m and default_m not in models:
+                models.insert(0, default_m)
+            if not models:
+                models = [default_m or "glm-5.2"]
+            self._provider_models[pid] = models
+            self._selected_models[pid] = default_m or models[0]
+
+        initial_pid = str(self.config_data["api"].get("provider") or "hydra").strip().lower()
+        if initial_pid not in self._pid_to_label:
+            initial_pid = self.provider_ids[0]
+        top_model = str(self.config_data["api"].get("model") or "").strip()
+        if top_model:
+            self._selected_models[initial_pid] = top_model
+            if top_model not in self._provider_models[initial_pid]:
+                self._provider_models[initial_pid].insert(0, top_model)
+
+        self._active_provider_id: str = initial_pid
+        self.provider_labels: list[str] = [self._pid_to_label[pid] for pid in self.provider_ids]
+        self.provider_label_var = ctk.StringVar(value=self._pid_to_label[initial_pid])
+        self.model_var = ctk.StringVar(value=self._selected_models[initial_pid])
+
+        stored_keys = _stored_provider_keys()
+        self.provider_key_vars: dict[str, Any] = {
+            pid: ctk.StringVar(value=stored_keys.get(pid, ""))
+            for pid in self.provider_ids
+        }
+        self.provider_key_entries: dict[str, Any] = {}
+        self.provider_key_buttons: dict[str, Any] = {}
+        self.provider_key_labels: dict[str, Any] = {}
 
         self.scale_options = scale_options(self.config_data)
         self.scale_var = ctk.StringVar(
             value=default_scale(self.scale_options, self.config_data)
         )
-        self.key_var = ctk.StringVar(value="")
-        self.model_var = ctk.StringVar(value=str(self.config_data["api"].get("model", "gpt-4.1")))
         self.use_llm_var = ctk.BooleanVar(value=True)
 
         self._build_ui()
         self._refresh_height_label()
+        self._refresh_provider_highlights()
         self.after(120, self._drain_events)
 
     # ------------------------------------------------------------------ UI --
@@ -162,58 +258,119 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(12, 0))
         ctk.CTkLabel(
             header,
-            text="Legal Description → AutoCAD  •  Prototype 1",
+            text="Legal Description → AutoCAD  •  Hydra AI / OpenRouter / RouterAI",
             font=ctk.CTkFont(size=13),
             text_color=("#8fa3b8", "#8fa3b8"),
         ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 12))
         self.topmost_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(
-            header, text="Поверх всех окон", variable=self.topmost_var,
+            header,
+            text="Поверх всех окон",
+            variable=self.topmost_var,
             command=self._apply_topmost,
         ).grid(row=0, column=1, rowspan=2, padx=18, sticky="e")
 
         # Настройки ---------------------------------------------------------
         settings = ctk.CTkFrame(self)
         settings.grid(row=1, column=0, sticky="ew", padx=16, pady=(12, 0))
-        settings.grid_columnconfigure(1, weight=1)
-        settings.grid_columnconfigure(3, weight=1)
+        settings.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(settings, text="Масштаб:").grid(row=0, column=0, padx=(14, 8), pady=10, sticky="w")
+        # Строка 0: масштаб + высота текста + переключатель LLM/regex
+        scale_row = ctk.CTkFrame(settings, fg_color="transparent")
+        scale_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 6))
+        scale_row.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(scale_row, text="Масштаб:").grid(row=0, column=0, padx=(0, 8), sticky="w")
         self.scale_menu = ctk.CTkOptionMenu(
-            settings,
+            scale_row,
             values=self.scale_options,
             variable=self.scale_var,
-            width=130,
+            width=125,
             command=lambda _value: self._refresh_height_label(),
         )
-        self.scale_menu.grid(row=0, column=1, padx=(0, 16), pady=10, sticky="w")
+        self.scale_menu.grid(row=0, column=1, padx=(0, 14), sticky="w")
 
-        self.height_label = ctk.CTkLabel(settings, text="", anchor="w")
-        self.height_label.grid(row=0, column=2, columnspan=2, padx=(0, 14), pady=10, sticky="w")
-
-        ctk.CTkLabel(settings, text="Модель LLM:").grid(row=1, column=0, padx=(14, 8), pady=(0, 10), sticky="w")
-        ctk.CTkEntry(settings, textvariable=self.model_var).grid(
-            row=1, column=1, padx=(0, 16), pady=(0, 10), sticky="ew"
-        )
-
-        ctk.CTkLabel(settings, text="API key:").grid(row=1, column=2, padx=(0, 8), pady=(0, 10), sticky="e")
-        key_frame = ctk.CTkFrame(settings, fg_color="transparent")
-        key_frame.grid(row=1, column=3, padx=(0, 14), pady=(0, 10), sticky="ew")
-        key_frame.grid_columnconfigure(0, weight=1)
-        self.key_entry = ctk.CTkEntry(
-            key_frame, textvariable=self.key_var, show="•", placeholder_text="sk-… (или в config.json)"
-        )
-        self.key_entry.grid(row=0, column=0, sticky="ew")
-        self.key_button = ctk.CTkButton(
-            key_frame, text="👁", width=34, command=self._toggle_key_visibility
-        )
-        self.key_button.grid(row=0, column=1, padx=(6, 0))
+        self.height_label = ctk.CTkLabel(scale_row, text="", anchor="w")
+        self.height_label.grid(row=0, column=2, sticky="w")
 
         self.use_llm_switch = ctk.CTkSwitch(
-            settings, text="Использовать LLM (иначе — локальный разбор regex)",
+            scale_row,
+            text="Использовать LLM (иначе — локальный regex)",
             variable=self.use_llm_var,
         )
-        self.use_llm_switch.grid(row=2, column=0, columnspan=4, padx=14, pady=(0, 12), sticky="w")
+        self.use_llm_switch.grid(row=0, column=3, padx=(12, 0), sticky="e")
+
+        # Строка 1: переключатель провайдера + выбор/ввод модели
+        llm_row = ctk.CTkFrame(settings, fg_color="transparent")
+        llm_row.grid(row=1, column=0, sticky="ew", padx=14, pady=6)
+        llm_row.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(llm_row, text="Провайдер:").grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.provider_switch = ctk.CTkSegmentedButton(
+            llm_row,
+            values=self.provider_labels,
+            variable=self.provider_label_var,
+            command=self._on_provider_changed,
+        )
+        self.provider_switch.grid(row=0, column=1, padx=(0, 18), sticky="w")
+
+        ctk.CTkLabel(llm_row, text="Модель:").grid(row=0, column=2, padx=(0, 8), sticky="w")
+        self.model_combo = ctk.CTkComboBox(
+            llm_row,
+            values=self._provider_models[self._active_provider_id],
+            variable=self.model_var,
+            command=self._on_model_selected,
+        )
+        self.model_combo.grid(row=0, column=3, sticky="ew")
+
+        # Строка 2: поля ввода API-ключей каждого из трёх провайдеров
+        keys_frame = ctk.CTkFrame(settings, fg_color="transparent")
+        keys_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 12))
+        for col, pid in enumerate(self.provider_ids):
+            keys_frame.grid_columnconfigure(col, weight=1)
+            card = ctk.CTkFrame(keys_frame, fg_color="transparent")
+            card.grid(
+                row=0,
+                column=col,
+                sticky="ew",
+                padx=(0 if col == 0 else 8, 0 if col == len(self.provider_ids) - 1 else 8),
+            )
+            card.grid_columnconfigure(0, weight=1)
+
+            p_cfg = self._provider_cfgs[pid]
+            env_name = str(p_cfg.get("env_key") or "").strip()
+            has_env = bool(env_name and os.environ.get(env_name, "").strip())
+            placeholder = (
+                f"{env_name} (подхвачен из env)"
+                if has_env
+                else f"Ключ {self._pid_to_label[pid]} ({env_name or 'sk-…'})"
+            )
+
+            lbl = ctk.CTkLabel(
+                card,
+                text=f"API key — {self._pid_to_label[pid]}",
+                anchor="w",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
+            lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 3))
+            entry = ctk.CTkEntry(
+                card,
+                textvariable=self.provider_key_vars[pid],
+                show="•",
+                placeholder_text=placeholder,
+            )
+            entry.grid(row=1, column=0, sticky="ew")
+            btn = ctk.CTkButton(
+                card,
+                text="👁",
+                width=32,
+                command=lambda p=pid: self._toggle_key_visibility(p),
+            )
+            btn.grid(row=1, column=1, padx=(5, 0))
+
+            self.provider_key_labels[pid] = lbl
+            self.provider_key_entries[pid] = entry
+            self.provider_key_buttons[pid] = btn
 
         # Ввод описания -----------------------------------------------------
         input_frame = ctk.CTkFrame(self)
@@ -273,14 +430,15 @@ class SurveyApp(ctk.CTk):
         self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 0))
         self.progress.set(0)
 
-        # Статус ------------------------------------------------------------
+        # Статус, невязка и токены ------------------------------------------
         status_frame = ctk.CTkFrame(self)
         status_frame.grid(row=5, column=0, sticky="ew", padx=16, pady=(10, 14))
         status_frame.grid_columnconfigure(0, weight=1)
 
         metrics = ctk.CTkFrame(status_frame, fg_color="transparent")
-        metrics.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
-        metrics.grid_columnconfigure(3, weight=1)
+        metrics.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 8))
+        metrics.grid_columnconfigure(0, weight=1)
+
         self.status_var = ctk.StringVar(value="Готово. Загрузите PDF или вставьте текст.")
         self.status_label = ctk.CTkLabel(
             metrics,
@@ -288,9 +446,9 @@ class SurveyApp(ctk.CTk):
             anchor="w",
             font=ctk.CTkFont(size=13),
             justify="left",
-            wraplength=920,
+            wraplength=880,
         )
-        self.status_label.grid(row=0, column=0, columnspan=4, sticky="w")
+        self.status_label.grid(row=0, column=0, sticky="w")
 
         self.closure_var = ctk.StringVar(value="Closure Error: —")
         self.closure_label = ctk.CTkLabel(
@@ -299,11 +457,106 @@ class SurveyApp(ctk.CTk):
             anchor="w",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.closure_label.grid(row=1, column=0, sticky="w", pady=(6, 8))
+        self.closure_label.grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        self.tokens_var = ctk.StringVar(value="Токены за вызов: —")
+        self.tokens_label = ctk.CTkLabel(
+            metrics,
+            textvariable=self.tokens_var,
+            anchor="w",
+            font=ctk.CTkFont(size=13),
+            text_color=("#7ec8e3", "#7ec8e3"),
+        )
+        self.tokens_label.grid(row=2, column=0, sticky="w", pady=(3, 0))
 
         ctk.CTkButton(
             status_frame, text="Показать лог", width=120, command=self._show_log
-        ).grid(row=0, column=1, rowspan=2, padx=10, sticky="e")
+        ).grid(row=0, column=1, padx=10, sticky="e")
+
+    # --------------------------------------------------- провайдер / ключи --
+    @property
+    def key_entry(self) -> Any:
+        """Поле API-ключа активного провайдера."""
+        return self.provider_key_entries[self._active_provider_id]
+
+    @property
+    def key_button(self) -> Any:
+        """Кнопка показа/скрытия ключа активного провайдера."""
+        return self.provider_key_buttons[self._active_provider_id]
+
+    def current_provider_id(self) -> str:
+        label = str(self.provider_label_var.get() or "")
+        return self._label_to_pid.get(label, self._active_provider_id)
+
+    def current_model(self) -> str:
+        typed = str(self.model_var.get() or "").strip()
+        if not typed:
+            combo_val = str(self.model_combo.get() or "").strip()
+            typed = combo_val
+        if typed:
+            return typed
+        pid = self.current_provider_id()
+        return self._selected_models.get(pid) or self._provider_models[pid][0]
+
+    def select_provider(self, provider_or_label: str) -> None:
+        """Переключает активного провайдера по ID ('hydra') или подписи ('Hydra AI')."""
+        candidate = provider_or_label.strip()
+        pid = self._label_to_pid.get(candidate) or candidate.lower()
+        if pid not in self._pid_to_label:
+            raise ValueError(f"неизвестный провайдер: {provider_or_label!r}")
+        label = self._pid_to_label[pid]
+        self.provider_label_var.set(label)
+        self.provider_switch.set(label)
+        self._on_provider_changed(label)
+
+    def _on_provider_changed(self, selected_label: str) -> None:
+        new_pid = self._label_to_pid.get(selected_label)
+        if not new_pid:
+            return
+        # Сохраняем модель, выбранную/введённую у предыдущего провайдера
+        prev_model = str(self.model_var.get() or "").strip()
+        if prev_model:
+            self._selected_models[self._active_provider_id] = prev_model
+            if prev_model not in self._provider_models[self._active_provider_id]:
+                self._provider_models[self._active_provider_id].insert(0, prev_model)
+
+        self._active_provider_id = new_pid
+        models = self._provider_models[new_pid]
+        chosen = self._selected_models.get(new_pid) or models[0]
+        self.model_combo.configure(values=models)
+        self.model_var.set(chosen)
+        self.model_combo.set(chosen)
+        self._refresh_provider_highlights()
+
+    def _on_model_selected(self, chosen_model: str) -> None:
+        clean = str(chosen_model or "").strip()
+        if clean:
+            self.model_var.set(clean)
+            self._selected_models[self._active_provider_id] = clean
+
+    def _refresh_provider_highlights(self) -> None:
+        active = self._active_provider_id
+        for pid, lbl in self.provider_key_labels.items():
+            title = self._pid_to_label[pid]
+            if pid == active:
+                lbl.configure(
+                    text=f"API key — {title}  ● активен",
+                    text_color=("#5dade2", "#5dade2"),
+                )
+            else:
+                lbl.configure(
+                    text=f"API key — {title}",
+                    text_color=("#8fa3b8", "#8fa3b8"),
+                )
+
+    def _toggle_key_visibility(self, provider_id: str | None = None) -> None:
+        """Ключи по умолчанию скрыты; кнопка-«глаз» показывает/скрывает ключ провайдера."""
+        pid = provider_id or self._active_provider_id
+        entry = self.provider_key_entries[pid]
+        button = self.provider_key_buttons[pid]
+        hidden = bool(entry.cget("show"))
+        entry.configure(show="" if hidden else "•")
+        button.configure(text="🙈" if hidden else "👁")
 
     # -------------------------------------------------------------- helpers --
     def _on_close(self) -> None:
@@ -315,12 +568,6 @@ class SurveyApp(ctk.CTk):
 
     def _apply_topmost(self) -> None:
         self.attributes("-topmost", bool(self.topmost_var.get()))
-
-    def _toggle_key_visibility(self) -> None:
-        """Ключ по умолчанию скрыт; кнопка-«глаз» показывает/скрывает его."""
-        hidden = bool(self.key_entry.cget("show"))
-        self.key_entry.configure(show="" if hidden else "•")
-        self.key_button.configure(text="🙈" if hidden else "👁")
 
     def _current_scale(self) -> float:
         return scale_value(self.scale_var.get())
@@ -346,6 +593,7 @@ class SurveyApp(ctk.CTk):
         self.description = None
         self.draw_result = None
         self.closure_var.set("Closure Error: —")
+        self.tokens_var.set("Токены за вызов: —")
         self.status_var.set("Очищено.")
 
     def _load_pdf(self) -> None:
@@ -368,31 +616,64 @@ class SurveyApp(ctk.CTk):
         self.pdf_label.configure(text=f"PDF: {self.pdf_path.name} ({len(text):,} символов)")
         self._set_status(f"PDF загружен: {self.pdf_path.name}")
 
-    def _save_settings(self) -> None:
+    def _build_runtime_config(self) -> tuple[dict[str, Any], str, str, str | None]:
+        """Собирает актуальный конфиг из виджетов окна перед вызовом или сохранением."""
         cfg = load_config()
-        cfg["api"]["model"] = self.model_var.get().strip() or cfg["api"].get("model")
-        api_key = self.key_var.get().strip()
-        if api_key:
-            cfg["api"]["api_key"] = api_key
+        active_pid = self.current_provider_id()
+        active_model = self.current_model()
+        self._selected_models[active_pid] = active_model
+
+        providers = cfg["api"].setdefault("providers", {})
+        for pid in self.provider_ids:
+            p_cfg = providers.setdefault(pid, dict(self._provider_cfgs.get(pid, {})))
+            typed_key = clean_provider_key(pid, self.provider_key_vars[pid].get())
+            if typed_key:
+                p_cfg["api_key"] = typed_key
+            sel_model = self._selected_models.get(pid)
+            if sel_model:
+                p_cfg["selected_model"] = sel_model
+                models = [str(m) for m in (p_cfg.get("models") or [])]
+                if sel_model not in models:
+                    models.insert(0, sel_model)
+                    p_cfg["models"] = models
+
+        active_p_cfg = providers.get(active_pid, {})
+        cfg["api"]["provider"] = active_pid
+        cfg["api"]["model"] = active_model
+        if active_p_cfg.get("base_url"):
+            cfg["api"]["base_url"] = active_p_cfg["base_url"]
+
+        explicit_key = clean_provider_key(active_pid, self.provider_key_vars[active_pid].get())
+        return cfg, active_pid, active_model, (explicit_key or None)
+
+    def _save_settings(self) -> None:
+        cfg, active_pid, active_model, _ = self._build_runtime_config()
+        # В файл пишем ровно те ключи, что введены в полях окна (не утекая переменными env)
+        for pid in self.provider_ids:
+            cfg["api"]["providers"][pid]["api_key"] = clean_provider_key(
+                pid, self.provider_key_vars[pid].get()
+            )
+        cfg["api"]["api_key"] = ""
         try:
             path = save_config(cfg)
         except OSError as exc:
             self._set_status(f"Не удалось сохранить config.json: {exc}", error=True)
             return
-        self.config_data = cfg
+        self.config_data = load_config()
         self._refresh_height_label()
-        self._set_status(f"Настройки сохранены: {path}")
+        self._set_status(
+            f"Настройки сохранены ({self._pid_to_label[active_pid]} / {active_model}): {path}"
+        )
 
     def _show_log(self) -> None:
         window = ctk.CTkToplevel(self)
         window.title("Лог")
-        window.geometry("760x520")
+        window.geometry("780x540")
         window.attributes("-topmost", True)
         text = ctk.CTkTextbox(window, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
         text.pack(fill="both", expand=True, padx=10, pady=10)
         text.insert("1.0", self.log_text() or "Лог пуст.")
         text.insert("end", "\n\n--- Исходное описание ---\n" + self.text_box.get("1.0", "end"))
-        # CTkTextbox не принимает state через configure — переключаем внутренний Tk-виджет
         target = getattr(text, "_textbox", text)
         target.configure(state="disabled")
 
@@ -407,7 +688,9 @@ class SurveyApp(ctk.CTk):
 
     def _set_status(self, message: str, error: bool = False) -> None:
         self.status_var.set(message)
-        self.status_label.configure(text_color=("#ff8a80", "#ff8a80") if error else ("#d6e4f0", "#d6e4f0"))
+        self.status_label.configure(
+            text_color=("#ff8a80", "#ff8a80") if error else ("#d6e4f0", "#d6e4f0")
+        )
         self._log_line(message)
 
     # ------------------------------------------------------- асинхронные шаги --
@@ -418,28 +701,28 @@ class SurveyApp(ctk.CTk):
         """Tkinter-поток: забирает сообщения из рабочего потока."""
         if getattr(self, "_closing", False):
             return
-        try:
-            while True:
+        while not self._events.empty():
+            try:
                 kind, payload = self._events.get_nowait()
-                if kind == "progress":
-                    self._set_status(str(payload))
-                elif kind == "error":
+            except queue.Empty:
+                break
+            if kind == "progress":
+                self._set_status(str(payload))
+            elif kind == "error":
+                self._finish_busy()
+                self._set_status(str(payload), error=True)
+                self.closure_var.set("Closure Error: —")
+            elif kind == "parsed":
+                outcome, draw = payload
+                if draw:
+                    self._handle_draw_result(outcome, draw)
+                else:
                     self._finish_busy()
-                    self._set_status(str(payload), error=True)
-                    self.closure_var.set("Closure Error: —")
-                elif kind == "parsed":
-                    outcome, draw = payload
-                    if draw:
-                        self._handle_draw_result(outcome, draw)
-                    else:
-                        self._finish_busy()
-                        self._apply_parsed(outcome)
-                        self._set_status(self._parsed_summary(outcome))
-                        self.closure_var.set(self._closure_text(outcome))
-                elif kind == "done":
-                    self._finish_busy()
-        except queue.Empty:
-            pass
+                    self._apply_parsed(outcome)
+                    self._set_status(self._parsed_summary(outcome))
+                    self.closure_var.set(self._closure_text(outcome))
+            elif kind == "done":
+                self._finish_busy()
         self.after(120, self._drain_events)
 
     def _finish_busy(self) -> None:
@@ -458,25 +741,29 @@ class SurveyApp(ctk.CTk):
             self._set_status("Вставьте текст Legal Description или загрузите PDF.", error=True)
             return
 
-        cfg = load_config()
-        cfg["api"]["model"] = self.model_var.get().strip() or cfg["api"].get("model")
-        api_key = self.key_var.get().strip() or None
+        cfg, provider_id, model_name, api_key = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
         scale = self._current_scale()
+        provider_title = self._pid_to_label.get(provider_id, provider_id)
 
         self._busy = True
         self.draw_button.configure(state="disabled")
         self.parse_button.configure(state="disabled")
         self.save_button.configure(state="disabled")
         self.progress.start()
+        if use_llm:
+            self.tokens_var.set(
+                f"Токены за вызов: запрос к {provider_title} / {model_name}…"
+            )
         self._set_status("Разбираю описание…")
-        self._log_line(f"--- Новый запуск (масштаб 1\"={scale:g}', LLM={use_llm}) ---")
+        self._log_line(
+            f"--- Новый запуск (масштаб 1\"={scale:g}', "
+            f"режим={'LLM: ' + provider_title + ' / ' + model_name if use_llm else 'regex'}) ---"
+        )
 
-        # Текст из поля уже содержит содержимое PDF (если он загружался),
-        # поэтому pdf_path сюда не передаём, чтобы не дублировать.
         worker = threading.Thread(
             target=self._worker,
-            args=(text, cfg, api_key, use_llm, scale, parse_only),
+            args=(text, cfg, provider_id, model_name, api_key, use_llm, scale, parse_only),
             daemon=True,
         )
         worker.start()
@@ -485,6 +772,8 @@ class SurveyApp(ctk.CTk):
         self,
         text: str,
         cfg: dict[str, Any],
+        provider_id: str,
+        model_name: str,
         api_key: str | None,
         use_llm: bool,
         scale: float,
@@ -495,6 +784,8 @@ class SurveyApp(ctk.CTk):
                 text=text,
                 cfg=cfg,
                 use_llm=use_llm,
+                provider=provider_id,
+                model=model_name,
                 api_key=api_key,
                 allow_regex_fallback=False,
                 progress=lambda message: self._post("progress", message),
@@ -524,8 +815,9 @@ class SurveyApp(ctk.CTk):
             message = str(exc)
             if use_llm:
                 message += (
-                    "\n\nПодсказка: выключите выключатель «Использовать LLM», "
-                    "чтобы разобрать описание локально (regex), без обращения к API."
+                    "\n\nПодсказка: проверьте API-ключ выбранного провайдера "
+                    "или переключите провайдера/модель, либо выключите «Использовать LLM» "
+                    "для локального разбора (regex)."
                 )
             self._post("error", message)
             self._post("done", None)
@@ -535,14 +827,47 @@ class SurveyApp(ctk.CTk):
             self._post("done", None)
 
     # ------------------------------------------------------------- вывод --
+    def _format_tokens_line(self, outcome: ParseOutcome) -> str:
+        if outcome.source != "llm" or outcome.usage is None:
+            return "Токены за вызов: 0 (локальный разбор regex, без обращения к API)"
+        base = outcome.usage.short_report()
+        if self._session_llm_calls >= 2:
+            sess_total = self._session_prompt_tokens + self._session_completion_tokens
+            base += (
+                f"   •   Сессия ({self._session_llm_calls} выз.): "
+                f"↑ {self._session_prompt_tokens:,} / "
+                f"↓ {self._session_completion_tokens:,} "
+                f"(всего {sess_total:,})"
+            )
+        return base
+
     def _apply_parsed(self, outcome: ParseOutcome) -> None:
         self.description = outcome.data
+        self.last_usage = outcome.usage
+        if outcome.source == "llm" and outcome.usage is not None:
+            self._session_llm_calls += 1
+            if outcome.usage.available:
+                self._session_prompt_tokens += outcome.usage.prompt_tokens
+                self._session_completion_tokens += outcome.usage.completion_tokens
+            self._log_line(
+                f"[Токены] {outcome.provider_label or outcome.provider} / {outcome.model} "
+                f"({outcome.llm_mode}): ушло {outcome.usage.prompt_tokens:,}, "
+                f"пришло {outcome.usage.completion_tokens:,}, "
+                f"всего {outcome.usage.total_tokens:,}"
+            )
+        self.tokens_var.set(self._format_tokens_line(outcome))
         for warning in outcome.warnings:
             self._log_line(f"! {warning}")
 
     def _parsed_summary(self, outcome: ParseOutcome) -> str:
         data = outcome.data
-        source = "LLM" if outcome.source == "llm" else "локальный парсер"
+        if outcome.source == "llm":
+            tag = " · ".join(
+                p for p in (outcome.provider_label or outcome.provider, outcome.model) if p
+            )
+            source = f"LLM: {tag}" if tag else "LLM"
+        else:
+            source = "локальный парсер"
         parts = [
             f"Разобрано ({source}): сторон {len(data.segments)}, "
             f"периметр {data.perimeter_ft:,.2f} ft",

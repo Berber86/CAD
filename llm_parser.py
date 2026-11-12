@@ -39,7 +39,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -53,6 +53,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "ENV_PATH",
     "LOCAL_CONFIG_PATH",
+    "NYC_SAMPLES",
     "PROTECTED_KEY_PREFIX",
     "PROVIDER_ORDER",
     "PROVIDERS_CATALOG",
@@ -63,6 +64,7 @@ __all__ = [
     "bearing_label",
     "clean_provider_key",
     "dms_to_degrees",
+    "inspect_pdf",
     "is_protected_key",
     "load_config",
     "load_dotenv_dict",
@@ -72,6 +74,7 @@ __all__ = [
     "parse_with_regex",
     "protect_api_key",
     "read_pdf_text",
+    "render_pdf_pages_base64",
     "resolve_api_target",
     "save_config",
     "save_protected_env",
@@ -177,6 +180,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout_sec": 180,
         "max_retries": 2,
         "max_input_chars": 60000,
+        "vision_dpi": 220,
+        "vision_max_pages": 4,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
     },
     "drawing": {
@@ -188,6 +193,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "corner_label_gap_factor": 2.0,
         "corner_distance_offset_factor": 1.7,
         "long_side_threshold_ft": 40.0,
+        "stack_short_side_ft": 30.0,
+        "stacked_line_gap_factor": 1.45,
         "char_width_factor": 0.62,
         "space_width_factor": 0.45,
         "max_label_fill_ratio": 0.9,
@@ -778,8 +785,16 @@ def bearing_label(ns: str, degrees: int, minutes: int, seconds: float, ew: str) 
 # ---------------------------------------------------------------------------
 
 
+_FEET_INCHES_STR_RE = re.compile(
+    r"(?P<ft>\d+(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:and\s+)?"
+    r"(?P<in>\d+(?:\.\d+)?)(?:\s+(?P<fnum>\d+)\s*/\s*(?P<fden>\d+))?\s*"
+    r"(?:inches|inch|in\.?|\")",
+    re.IGNORECASE,
+)
+
+
 def _coerce_float(value: Any) -> float | None:
-    """'1,250.50 ft' -> 1250.5; '' / None -> None."""
+    """'1,250.50 ft' -> 1250.5; '13 feet 8 inches' -> 13.6667; '' / None -> None."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -789,6 +804,15 @@ def _coerce_float(value: Any) -> float | None:
     text = str(value).strip().replace(",", "").replace("\u00a0", " ")
     if not text or text in {"-", "—", "n/a", "N/A", "none", "null"}:
         return None
+    fi = _FEET_INCHES_STR_RE.search(text)
+    if fi:
+        feet = float(fi.group("ft"))
+        inches = float(fi.group("in"))
+        if fi.group("fnum") and fi.group("fden"):
+            den = float(fi.group("fden"))
+            if den > 0:
+                inches += float(fi.group("fnum")) / den
+        return feet + inches / 12.0
     match = re.search(r"-?\d+(?:\.\d+)?", text)
     if not match:
         raise ValueError(f"не удалось прочитать число из {value!r}")
@@ -810,6 +834,12 @@ class Segment(BaseModel):
     Румб задаётся компонентами (ns/degrees/minutes/seconds/ew) и подписью
     `bearing_label`, которая всегда пересчитывается в каноничный вид —
     так подпись гарантированно совпадает с геометрией.
+
+    Для участков Нью-Йорка (Queens/Brooklyn/Bronx/Manhattan), где стороны
+    описаны через «PARALLEL WITH …» / «AT RIGHT ANGLES TO …» / «INTERIOR ANGLE»
+    без компасного румба, геометрия всё равно хранится через вычисленный румб,
+    а `has_bearing=False` убирает искусственный DMS-румб с чертежа, оставляя
+    длину и `course_note` / `interior_angle`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -823,6 +853,24 @@ class Segment(BaseModel):
     bearing_label: str | None = Field(
         default=None,
         description='Готовая подпись румба, например N 75°20\'20" E',
+    )
+    has_bearing: bool = Field(
+        default=True,
+        description=(
+            "True, если в документе/на чертеже явно указан компасный румб (N/S deg E/W); "
+            "False, если направление задано относительно улиц (PARALLEL WITH / AT RIGHT ANGLES / вдоль улицы)"
+        ),
+    )
+    course_note: str | None = Field(
+        default=None,
+        description=(
+            "Текстовая пометка вдоль стороны без румба, например "
+            "'PARALLEL WITH QUEENS MIDTOWN EXPY' или 'AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY'"
+        ),
+    )
+    interior_angle: str | None = Field(
+        default=None,
+        description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
     )
 
     @field_validator("ns", "ew", mode="before")
@@ -860,10 +908,21 @@ class Segment(BaseModel):
             raise ValueError(f"длина стороны должна быть > 0, получено {number}")
         return number
 
-    @field_validator("bearing_label", mode="before")
+    @field_validator("bearing_label", "course_note", "interior_angle", mode="before")
     @classmethod
     def _normalize_label(cls, value: Any) -> str | None:
         return _clean_name(value)
+
+    @field_validator("has_bearing", mode="before")
+    @classmethod
+    def _normalize_has_bearing(cls, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "none"}
+        return bool(value)
 
     @model_validator(mode="after")
     def _finalize(self) -> "Segment":
@@ -893,12 +952,19 @@ class Segment(BaseModel):
 
 
 class LegalDescription(BaseModel):
-    """Результат разбора документа целиком."""
+    """Результат разбора документа целиком (Schedule A / Deed / Survey PDF)."""
 
     model_config = ConfigDict(extra="forbid")
 
     main_street: str = Field(
         description="Улица, на которую выходит фасад участка (fronting ...)"
+    )
+    main_street_note: str | None = Field(
+        default=None,
+        description=(
+            "Пояснение под названием фасадной улицы, например "
+            "'(38\\' WIDE ROADWAY EASEMENT)' или '(NOT MAPPED ON FINAL CITY PLAN)'"
+        ),
     )
     cross_street: str | None = Field(
         default=None,
@@ -906,15 +972,51 @@ class LegalDescription(BaseModel):
     )
     distance_to_corner_ft: float | None = Field(
         default=None,
-        description="Расстояние вдоль фасадной улицы до угла/пересечения, футы",
+        description=(
+            "Расстояние вдоль фасадной улицы до угла/пересечения, футы "
+            "(0 для углового участка; null если не указано)"
+        ),
     )
-    front_side: Literal["N", "S", "E", "W"] | None = Field(
+    tie_note: str | None = Field(
         default=None,
         description=(
-            "Сторона света, в которую смотрит фасадная граница (наружу участка). "
-            "Если участок «fronting the South side of Main Street», он лежит южнее "
-            "улицы, значит фасад смотрит на север -> N"
+            "Дополнительная подпись привязки к углу квартала (например, "
+            "'208.02\\' (DEED)' при многозвенной привязке COMMENCING AT)"
         ),
+    )
+    front_side: Literal["N", "S", "E", "W", "NE", "NW", "SE", "SW"] | None = Field(
+        default=None,
+        description=(
+            "Направление света (N/S/E/W/NE/NW/SE/SW), куда смотрит фасадная граница "
+            "(наружу от участка к улице). Если участок на South side улицы -> N; "
+            "если на Northwesterly side улицы -> SE"
+        ),
+    )
+    front_segment_index: int | None = Field(
+        default=None,
+        description=(
+            "0-based индекс элемента в segments, являющегося фасадной границей "
+            "вдоль main_street (null если неизвестно)"
+        ),
+    )
+    cross_street_side_index: int | None = Field(
+        default=None,
+        description=(
+            "Для углового участка: 0-based индекс элемента в segments, "
+            "выходящего на cross_street (null для рядового участка)"
+        ),
+    )
+    block_number: str | None = Field(
+        default=None,
+        description="Номер квартала (Block), например '3960' или '2366'",
+    )
+    lot_number: str | None = Field(
+        default=None,
+        description="Номер лота (Lot), например '129' или '59'",
+    )
+    borough_or_city: str | None = Field(
+        default=None,
+        description="Район/город/округ, например 'Staten Island, NY' или 'Queens, NY'",
     )
     segments: list[Segment] = Field(
         min_length=1,
@@ -926,9 +1028,17 @@ class LegalDescription(BaseModel):
     def _normalize_main_street(cls, value: Any) -> str:
         return _clean_name(value) or ""
 
-    @field_validator("cross_street", mode="before")
+    @field_validator(
+        "main_street_note",
+        "cross_street",
+        "tie_note",
+        "block_number",
+        "lot_number",
+        "borough_or_city",
+        mode="before",
+    )
     @classmethod
-    def _normalize_cross_street(cls, value: Any) -> str | None:
+    def _normalize_optional_text(cls, value: Any) -> str | None:
         return _clean_name(value)
 
     @field_validator("distance_to_corner_ft", mode="before")
@@ -936,12 +1046,36 @@ class LegalDescription(BaseModel):
     def _normalize_corner_distance(cls, value: Any) -> float | None:
         return _coerce_float(value)
 
+    @field_validator("front_segment_index", "cross_street_side_index", mode="before")
+    @classmethod
+    def _normalize_optional_index(cls, value: Any) -> int | None:
+        num = _coerce_float(value)
+        if num is None:
+            return None
+        idx = int(round(num))
+        return idx if idx >= 0 else None
+
     @field_validator("front_side", mode="before")
     @classmethod
     def _normalize_front_side(cls, value: Any) -> str | None:
         if value is None:
             return None
-        letter = str(value).strip().upper()[:1]
+        token = str(value).strip().upper()
+        if token in {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}:
+            return token
+        mapping = {
+            "NORTH": "N",
+            "SOUTH": "S",
+            "EAST": "E",
+            "WEST": "W",
+            "NORTHEAST": "NE",
+            "NORTHWEST": "NW",
+            "SOUTHEAST": "SE",
+            "SOUTHWEST": "SW",
+        }
+        if token in mapping:
+            return mapping[token]
+        letter = token[:1]
         return letter if letter in {"N", "S", "E", "W"} else None
 
     @field_validator("segments", mode="before")
@@ -956,7 +1090,7 @@ class LegalDescription(BaseModel):
             if item is None:
                 continue
             if isinstance(item, dict) and not any(
-                v not in (None, "", 0, 0.0) for v in item.values()
+                v not in (None, "", 0, 0.0, False) for v in item.values()
             ):
                 continue
             cleaned.append(item)
@@ -970,6 +1104,13 @@ class LegalDescription(BaseModel):
             raise ValueError(
                 f"для замкнутого участка нужно минимум 3 стороны, найдено {len(self.segments)}"
             )
+        if self.front_segment_index is not None and self.front_segment_index >= len(self.segments):
+            self.front_segment_index = None
+        if (
+            self.cross_street_side_index is not None
+            and self.cross_street_side_index >= len(self.segments)
+        ):
+            self.cross_street_side_index = None
         return self
 
     @property
@@ -981,17 +1122,11 @@ class LegalDescription(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Чтение PDF
+# Чтение и рендер PDF (текстовый слой + Vision PNG для векторных CAD/сканов)
 # ---------------------------------------------------------------------------
 
 
-def read_pdf_text(pdf_path: str | Path, max_pages: int = 0) -> str:
-    """
-    Извлекает текстовый слой PDF через PyMuPDF (fitz).
-
-    max_pages = 0 — читать все страницы. Сканы без OCR дадут пустой текст,
-    в этом случае поднимается PDFError с понятным сообщением.
-    """
+def _open_fitz_doc(pdf_path: str | Path) -> tuple[Any, Path]:
     path = Path(pdf_path)
     if not path.exists():
         raise PDFError(f"файл не найден: {path}")
@@ -1012,9 +1147,19 @@ def read_pdf_text(pdf_path: str | Path, max_pages: int = 0) -> str:
         doc = fitz.open(path)
     except Exception as exc:  # noqa: BLE001 - библиотека кидает разные типы
         raise PDFError(f"не удалось открыть PDF: {exc}") from exc
+    return doc, path
 
+
+def inspect_pdf(pdf_path: str | Path, max_pages: int = 0) -> dict[str, Any]:
+    """
+    Проверяет PDF без падения на векторных CAD-чертежах и сканах без текста.
+
+    Возвращает ``{"pages": int, "has_text": bool, "text": str}``.
+    """
+    doc, _ = _open_fitz_doc(pdf_path)
     try:
-        pages = range(len(doc)) if not max_pages else range(min(max_pages, len(doc)))
+        total_pages = len(doc)
+        pages = range(total_pages) if not max_pages else range(min(max_pages, total_pages))
         chunks: list[str] = []
         for index in pages:
             page = doc.load_page(index)
@@ -1024,67 +1169,131 @@ def read_pdf_text(pdf_path: str | Path, max_pages: int = 0) -> str:
     finally:
         doc.close()
 
-    result = "\n".join(chunks)
-    if len(result.strip()) < 20:
+    joined = "\n".join(chunks)
+    return {
+        "pages": total_pages,
+        "has_text": len(joined.strip()) >= 20,
+        "text": joined,
+    }
+
+
+def read_pdf_text(pdf_path: str | Path, max_pages: int = 0) -> str:
+    """
+    Извлекает текстовый слой PDF через PyMuPDF (fitz).
+
+    max_pages = 0 — читать все страницы. Векторные CAD-чертежи (SHX-шрифты в
+    кривых) и сканы без OCR не имеют текстового слоя — в этом случае
+    поднимается PDFError; для их разбора используйте ``render_pdf_pages_base64``
+    или ``parse_legal_description_full(..., use_llm=True)`` (режим Vision).
+    """
+    info = inspect_pdf(pdf_path, max_pages=max_pages)
+    if not info["has_text"]:
         raise PDFError(
-            "в PDF нет текстового слоя (вероятно, скан). Нужен OCR "
-            "(например, Tesseract) или вставка текста вручную."
+            "в PDF нет текстового слоя (векторный CAD-чертёж или скан). "
+            "Включите режим LLM с Vision-моделью или вставьте текст вручную."
         )
-    return result
+    return str(info["text"])
+
+
+def render_pdf_pages_base64(
+    pdf_path: str | Path,
+    *,
+    dpi: int = 220,
+    max_pages: int = 4,
+) -> list[str]:
+    """
+    Рендерит страницы PDF в PNG и возвращает список ``data:image/png;base64,...``
+    для отправки векторных CAD-чертежей (Title Survey) и сканов в Vision LLM.
+    """
+    doc, _ = _open_fitz_doc(pdf_path)
+    safe_dpi = max(96, min(int(dpi or 220), 350))
+    limit = len(doc) if not max_pages or max_pages <= 0 else min(int(max_pages), len(doc))
+    urls: list[str] = []
+    try:
+        for index in range(limit):
+            page = doc.load_page(index)
+            pix = page.get_pixmap(dpi=safe_dpi, alpha=False)
+            png_bytes = pix.tobytes("png")
+            encoded = base64.b64encode(png_bytes).decode("ascii")
+            urls.append(f"data:image/png;base64,{encoded}")
+    finally:
+        doc.close()
+    if not urls:
+        raise PDFError("PDF не содержит страниц для рендера")
+    return urls
 
 
 # ---------------------------------------------------------------------------
-# Промпт для LLM
+# Промпт для LLM (текст Schedule A / Deed + Vision-чертежи NYC Title Survey)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a senior land-survey technician in the USA.
-You convert a metes-and-bounds legal description (title survey) into strict JSON.
+SYSTEM_PROMPT = """You are a senior licensed New York / USA land-survey technician.
+You extract closed lot boundary geometry from a metes-and-bounds legal description (Schedule A / Deed) OR from an image of an existing Title / Architectural Survey plat into strict JSON.
 
-RULES
-1. Return every boundary call ("THENCE ...") as one element of `segments`,
-   in the exact order of traverse from Point of Beginning.
-   Do NOT include the closing call "to the Point of Beginning" twice: if the
-   last call returns to the POB, keep it (it closes the polygon) but do not repeat it.
-2. Bearings are quadrant bearings. Split them into:
-   ns ("N" or "S"), degrees (0..90), minutes (0..59), seconds (decimal),
-   ew ("E" or "W"), and also provide bearing_label in the canonical form
-   N 75°20'20" E (degree sign, two-digit minutes, double-quote seconds).
-3. `distance_ft` is the length of that side in decimal feet. Convert
-   feet-and-inches ("55' 6\"") to decimal feet (55.5). Never convert feet to metres.
-4. `main_street` — the street the lot fronts on ("fronting the North side of
-   Main Street", "lying on the South line of ..."). Use the street name only,
-   without "the", "North side of", etc.
-5. `cross_street` — the intersecting street from which the distance is measured
-   ("being 150.00 feet East of the East line of Oak Avenue"). None if absent.
-6. `distance_to_corner_ft` — that same distance to the corner/intersection, in feet.
-   None if absent.
-7. `front_side` — the compass direction the FRONT boundary faces, pointing
-   away from the lot. If the lot "fronts on the South side of Main Street" the lot
-   lies south of the street, so its front boundary faces NORTH -> "N".
-   If no side of the street is mentioned, use null.
-8. Curves: if the description contains a curve and gives chord bearing + chord
-   distance, use the CHORD as one straight segment. If only an arc is given with
-   a delta and radius, compute chord bearing and chord distance and use them;
-   note nothing else.
-9. If a call is "to a point", "to a stake", "to the POB" etc., those words are
-   not part of the distance and must be ignored.
-10. Never invent calls, streets or numbers. If something is truly absent, use null
-   (or "" for main_street). Do not return prose, markdown or comments.
-11. Distances given in varas or chains: convert to feet (1 vara = 2.77778 ft,
-    1 chain = 66 ft)."""
+CRITICAL SURVEY RULES
+1. LOT BOUNDARY vs. TIE LINES ("COMMENCING AT"):
+   - NEVER include tie/commencing calls from a distant street corner to the Point of Beginning (POB) in `segments`!
+   - Example: if a deed or survey shows 1–3 tie calls from an intersection (e.g. 510.52', 433.78', 208.02' from Mill Rd & New Dorp Ln, or 101.42', 17.49', 1542.23' from Arthur Kill Rd) leading TO the lot corner (POB), EXCLUDE those tie calls from `segments`.
+   - Put the immediate distance along `main_street` to the nearest corner into `distance_to_corner_ft` (use 0 for a corner lot), and put any compound tie or dual Deed/Tax-Map note (e.g. "208.02' (DEED) / 208.22' (T.M.)") into `tie_note`.
+2. IGNORE BUILDING & FENCE OFFSETS:
+   - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'") with lot boundary lines.
+   - When both "(DEED)" and "(T.M.)" / "(TAX MAP)" values appear, prefer the "(DEED)" / record survey dimension.
+3. QUADRANT BEARINGS vs. RELATIVE NYC COURSES (Queens / Brooklyn / Bronx / Manhattan):
+   - Every element of `segments` must represent one lot boundary side in continuous order around the parcel, forming a CLOSED polygon (sum of dX ≈ 0, sum of dY ≈ 0).
+   - When explicit quadrant bearings are given, split into `ns` ("N"/"S"), `degrees` (0..90), `minutes` (0..59), `seconds` (decimal), `ew` ("E"/"W"), `bearing_label` ("N 75°20'20\" E"), and set `has_bearing = true`.
+   - When NO compass bearings are printed (common in NYC surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
+     * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) and apply exact interior/right angles so the polygon closes mathematically;
+     * Set `has_bearing = false` on every course without an explicit compass bearing;
+     * Put exact directional notes printed on that side (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
+     * Put any printed vertex angle (e.g. `93°33'29.5"`) into `interior_angle` of that segment.
+4. DISTANCES:
+   - `distance_ft` is in decimal feet. Convert feet-and-inches ("13 feet 8 inches" -> 13.6667, "25' 10\"" -> 25.8333, "55' 6\"" -> 55.5), varas (×2.77778), or chains (×66) to decimal feet.
+5. STREETS, FRONTAGE & NYC METADATA:
+   - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
+   - `main_street_note`: parenthetical subtitle if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null.
+   - `front_segment_index`: 0-based index in `segments` of the lot boundary that fronts `main_street` (especially critical on narrow 13'–20' NYC townhouse lots!).
+   - `front_side`: compass direction ("N", "S", "E", "W") pointing OUTWARD from the lot toward `main_street`. If the lot is on the North/Northerly side of Main Street, the street is south of the lot -> "S".
+   - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
+   - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
+   - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
+6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only."""
 
 USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 \"\"\"
 {text}
 \"\"\"
 
-Extract the lot geometry exactly as described."""
+Extract the lot geometry and survey metadata into JSON."""
+
+VISION_USER_PROMPT = """Examine the attached survey / title document page(s) carefully.
+Read the exact lot boundary dimensions, bearings (or NYC relative notes like PARALLEL WITH / AT RIGHT ANGLES / interior corner angle), street names, street notes, corner tie distances, and Block/Lot numbers.
+Exclude COMMENCING / corner tie lines and building/fence offsets from `segments` — `segments` must contain ONLY the closed parcel boundary in continuous traverse order."""
 
 
-def _messages(text: str) -> list[dict[str, str]]:
+def _messages(
+    text: str,
+    image_data_urls: Sequence[str] | None = None,
+    *,
+    system_override: str | None = None,
+) -> list[dict[str, Any]]:
+    sys_content = system_override if system_override is not None else SYSTEM_PROMPT
+    if not image_data_urls:
+        return [
+            {"role": "system", "content": sys_content},
+            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
+        ]
+
+    prompt_parts = [VISION_USER_PROMPT]
+    if text and text.strip():
+        prompt_parts.append(f"ADDITIONAL NOTES / TEXT:\n\"\"\"\n{text.strip()}\n\"\"\"")
+    user_blocks: list[dict[str, Any]] = [
+        {"type": "text", "text": "\n\n".join(prompt_parts)}
+    ]
+    for url in image_data_urls:
+        user_blocks.append({"type": "image_url", "image_url": {"url": url}})
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": user_blocks},
     ]
 
 
@@ -1268,9 +1477,12 @@ def _extract_with_llm(
     provider: str | None = None,
     model: str | None = None,
     key_secret: str = "",
+    image_data_urls: Sequence[str] | None = None,
 ) -> tuple[LegalDescription, str, TokenUsage]:
     """
     Возвращает (Pydantic-модель, режим Structured Outputs, TokenUsage).
+    Поддерживает как текстовый разбор Schedule A/Deed, так и мультимодальный
+    Vision-разбор отрендеренных страниц PDF (image_data_urls).
     """
     api_cfg = cfg["api"]
     target = resolve_api_target(
@@ -1281,10 +1493,11 @@ def _extract_with_llm(
     provider_label = target["provider_label"]
     temperature = api_cfg.get("temperature", 0.0)
     client = _make_client(api_cfg, target=target)
-    messages = _messages(text)
+    messages = _messages(text, image_data_urls=image_data_urls)
 
     if progress:
-        progress(f"Запрос к {provider_label}: {model_name} …")
+        mode_tag = f" (Vision, {len(image_data_urls)} стр.)" if image_data_urls else ""
+        progress(f"Запрос к {provider_label}: {model_name}{mode_tag} …")
 
     errors: list[str] = []
     prompt_acc = 0
@@ -1377,10 +1590,11 @@ def _extract_with_llm(
         "Return ONLY a JSON object that validates against this JSON Schema:\n"
         f"{schema_hint}"
     )
-    guided_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + guide},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
-    ]
+    guided_messages = _messages(
+        text,
+        image_data_urls=image_data_urls,
+        system_override=SYSTEM_PROMPT + "\n\n" + guide,
+    )
 
     # 3) Обычный JSON-mode + инструкция со схемой.
     try:
@@ -1429,8 +1643,14 @@ def _extract_with_llm(
         errors.append(f"prompt-json: {exc}")
 
     detail = " | ".join(errors[-3:])
+    vision_hint = (
+        " (для PDF без текстового слоя убедитесь, что выбрана Vision-модель: "
+        "например hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)"
+        if image_data_urls
+        else ""
+    )
     raise LLMParseError(
-        f"не удалось получить корректный JSON от {provider_label} ({model_name}): {detail}"
+        f"не удалось получить корректный JSON от {provider_label} ({model_name}){vision_hint}: {detail}"
     )
 
 
@@ -1514,10 +1734,73 @@ def _parse_quadrant(ns: str, ew: str) -> tuple[str, str]:
 
 
 def _distance_after(chunk: str) -> float | None:
-    match = _DISTANCE_RE.search(chunk)
-    if not match:
-        return None
-    return float(match.group("num").replace(",", ""))
+    """
+    Читает длину стороны: сначала проверяет связку «13 feet 8 inches» / «13' 8"»,
+    затем явную пометку ``(DEED)``, затем обычное число в футах.
+    """
+    fi = _FEET_INCHES_STR_RE.search(chunk)
+    deed_match = re.search(
+        r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:'|′|ft\b\.?|feet\b|foot\b)\s*\(\s*DEED\s*\)",
+        chunk,
+        re.IGNORECASE,
+    )
+    plain = _DISTANCE_RE.search(chunk)
+    if fi and (not plain or fi.start() <= plain.start()):
+        feet = float(fi.group("ft"))
+        inches = float(fi.group("in"))
+        if fi.group("fnum") and fi.group("fden") and float(fi.group("fden")) > 0:
+            inches += float(fi.group("fnum")) / float(fi.group("fden"))
+        return feet + inches / 12.0
+    if deed_match and plain and deed_match.start() <= plain.start() + 30:
+        return float(deed_match.group("num").replace(",", ""))
+    if plain:
+        return float(plain.group("num").replace(",", ""))
+    return None
+
+
+def _has_min_courses(body: str, minimum: int = 3) -> bool:
+    if len(_bearing_matches(body)) >= minimum:
+        return True
+    return len(re.findall(r"\bTHENCE\b", body, flags=re.IGNORECASE)) >= minimum
+
+
+def _split_preamble_and_body(text: str) -> tuple[str, str]:
+    """
+    Отделяет многозвенную привязку ``COMMENCING AT … TO THE POINT OR PLACE OF BEGINNING``
+    (или ``distant the following … courses and distances … RUNNING THENCE``) от
+    собственно обхода границ участка, чтобы курсы привязки к углу квартала не
+    попадали в ``segments``.
+
+    Важно: в некоторых техасских deed'ах сам обход участка начинается со слова
+    ``COMMENCING at a point …`` и заканчивается единственным ``to the POINT OF BEGINNING``
+    в самом конце документа — поэтому отрезаем преамбулу ТОЛЬКО если после первого
+    ``BEGINNING`` действительно остаётся минимум 3 курса обхода участка.
+    """
+    commencing = re.search(
+        r"\bCOMMENCING\b.*?\bto\s+(?:the\s+)?(?:true\s+)?"
+        r"(?:point(?:\s+or\s+place)?\s+of\s+|place\s+of\s+)?BEGINNING\b[;,.:\s]*",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if commencing and _has_min_courses(text[commencing.end() :]):
+        return text[: commencing.end()], text[commencing.end() :]
+
+    multi_tie = re.search(
+        r"\b(?:distant|measured)\s+(?:the\s+)?following\s+(?:\w+\s+)?courses?\s+"
+        r"and\s+distances?\b.*?(?=\bRUNNING\s+THENCE\b)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if multi_tie and _has_min_courses(text[multi_tie.end() :]):
+        return text[: multi_tie.end()], text[multi_tie.end() :]
+
+    pob = re.search(r"\bBEGINNING\b", text, re.IGNORECASE)
+    if pob:
+        head = text[: pob.start()]
+        tail = text[pob.start() :]
+        if _bearing_matches(head) and _has_min_courses(tail):
+            return head, tail
+    return "", text
 
 
 def _bearing_matches(text: str) -> list[re.Match[str]]:
@@ -1529,10 +1812,178 @@ def _bearing_matches(text: str) -> list[re.Match[str]]:
     return []
 
 
+def _azimuth_to_quadrant_dict(azimuth_deg: float) -> dict[str, Any]:
+    """Переводит азимут 0..360° от севера по часовой стрелке в поля Segment."""
+    az = azimuth_deg % 360.0
+    if az <= 90.0:
+        ns, ew, angle = "N", "E", az
+    elif az <= 180.0:
+        ns, ew, angle = "S", "E", 180.0 - az
+    elif az < 270.0:
+        ns, ew, angle = "S", "W", az - 180.0
+    else:
+        ns, ew, angle = "N", "W", 360.0 - az
+    deg = int(angle + 1e-9)
+    rem_min = max(0.0, (angle - deg) * 60.0)
+    minutes = int(rem_min + 1e-9)
+    seconds = round(max(0.0, (rem_min - minutes) * 60.0), 2)
+    deg, minutes, seconds = _carry_dms(deg, minutes, seconds)
+    return {
+        "ns": ns,
+        "degrees": deg,
+        "minutes": minutes,
+        "seconds": seconds,
+        "ew": ew,
+    }
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+_CARDINAL_AZIMUTH: dict[str, float] = {
+    "north": 0.0,
+    "northerly": 0.0,
+    "northeast": 45.0,
+    "northeasterly": 45.0,
+    "east": 90.0,
+    "easterly": 90.0,
+    "southeast": 135.0,
+    "southeasterly": 135.0,
+    "south": 180.0,
+    "southerly": 180.0,
+    "southwest": 225.0,
+    "southwesterly": 225.0,
+    "west": 270.0,
+    "westerly": 270.0,
+    "northwest": 315.0,
+    "northwesterly": 315.0,
+}
+
+_INTERIOR_ANGLE_RE = re.compile(
+    r"interior\s+angle\s+of\s+"
+    r"(?P<deg>\d{1,3})\s*(?:°|deg(?:rees?)?\.?)\s*"
+    r"(?:(?P<min>\d{1,2})\s*(?:'|min(?:utes?)?\.?)\s*)?"
+    r"(?:(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|''|sec(?:onds?)?\.?))?",
+    re.IGNORECASE,
+)
+
+
+def _extract_course_note(clause: str) -> str | None:
+    parallel = re.search(
+        r"\bparallel\s+with\s+(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?"
+        r"(?P<target>[A-Za-z0-9 .'-]+?)(?:\s*\((?P<paren>[^)]+)\))?(?=\s*(?:,|;|\b\d|\bfeet\b|\bft\b))",
+        clause,
+        re.IGNORECASE,
+    )
+    if parallel:
+        label = (parallel.group("paren") or parallel.group("target") or "").strip(" ,;.")
+        if label:
+            return f"PARALLEL WITH {label.upper()}"
+    right_ang = re.search(
+        r"\b(?:at\s+right\s+angles\s+to|perpendicular\s+to)\s+"
+        r"(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?"
+        r"(?P<target>[A-Za-z0-9 .'-]+?)(?:\s*\((?P<paren>[^)]+)\))?(?=\s*(?:,|;|\b\d|\bfeet\b|\bft\b))",
+        clause,
+        re.IGNORECASE,
+    )
+    if right_ang:
+        label = (right_ang.group("paren") or right_ang.group("target") or "").strip(" ,;.")
+        if label:
+            return f"AT RIGHT ANGLES TO {label.upper()}"
+    return None
+
+
+def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Разбирает описания участков Нью-Йорка (Queens / Brooklyn / Bronx / Manhattan)
+    без компасных румбов — на кардинальных направлениях вдоль улиц, ``PARALLEL WITH``,
+    ``AT RIGHT ANGLES TO`` и внутренних углах (``interior angle of 93°33'29.5"``).
+    """
+    parts = re.split(r"\b(?:RUNNING\s+)?THENCE\b", text, flags=re.IGNORECASE)
+    if len(parts) < 4:
+        return [], []
+    clauses = parts[1:]
+
+    parsed_clauses: list[dict[str, Any]] = []
+    for clause in clauses:
+        dist = _distance_after(clause)
+        if dist is None:
+            continue
+        dir_match = re.search(
+            r"\b(north(?:east|west)?(?:erly)?|south(?:east|west)?(?:erly)?|"
+            r"east(?:erly)?|west(?:erly)?)\b",
+            clause,
+            re.IGNORECASE,
+        )
+        if not dir_match:
+            continue
+        nominal_az = _CARDINAL_AZIMUTH[dir_match.group(1).lower()]
+        ia_match = _INTERIOR_ANGLE_RE.search(clause)
+        ia_deg: float | None = None
+        ia_label: str | None = None
+        if ia_match:
+            d = int(ia_match.group("deg"))
+            m = int(ia_match.group("min") or 0)
+            s = float(ia_match.group("sec") or 0.0)
+            ia_deg = dms_to_degrees(d, m, s)
+            sec_str = _fmt_seconds(s)
+            ia_label = f'{d}°{m:02d}\'{sec_str}"' if s > 0 else f"{d}°{m:02d}'"
+        parsed_clauses.append(
+            {
+                "clause": clause,
+                "nominal_az": nominal_az,
+                "distance_ft": dist,
+                "ia_deg": ia_deg,
+                "ia_label": ia_label,
+                "right_angle": bool(
+                    re.search(r"\b(?:at\s+right\s+angles|perpendicular)\b", clause, re.IGNORECASE)
+                ),
+                "course_note": _extract_course_note(clause),
+            }
+        )
+
+    if len(parsed_clauses) < 3:
+        return [], []
+
+    # Замыкающий курс возвращается в POB вдоль базовой улицы; луч из POB внутрь
+    # участка направлен противоположно замыкающему курсу (+180°).
+    closing_az = parsed_clauses[-1]["nominal_az"]
+    baseline_ray = (closing_az + 180.0) % 360.0
+
+    segments: list[dict[str, Any]] = []
+    prev_az: float | None = None
+    for idx, item in enumerate(parsed_clauses):
+        nom = item["nominal_az"]
+        if item["ia_deg"] is not None:
+            ref_ray = baseline_ray if idx == 0 or prev_az is None else (prev_az + 180.0) % 360.0
+            cand_a = (ref_ray + item["ia_deg"]) % 360.0
+            cand_b = (ref_ray - item["ia_deg"]) % 360.0
+            az = cand_a if _angle_diff_deg(cand_a, nom) <= _angle_diff_deg(cand_b, nom) else cand_b
+        elif item["right_angle"] and prev_az is not None:
+            cand_a = (baseline_ray + 90.0) % 360.0
+            cand_b = (baseline_ray - 90.0) % 360.0
+            az = cand_a if _angle_diff_deg(cand_a, nom) <= _angle_diff_deg(cand_b, nom) else cand_b
+        else:
+            az = nom
+        prev_az = az
+        seg = _azimuth_to_quadrant_dict(az)
+        seg["distance_ft"] = item["distance_ft"]
+        seg["has_bearing"] = False
+        seg["course_note"] = item["course_note"]
+        seg["interior_angle"] = item["ia_label"]
+        segments.append(seg)
+
+    return segments, []
+
+
 def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     matches = _bearing_matches(text)
     if not matches:
+        rel_segments, rel_warnings = _segments_from_relative_nyc(text)
+        if rel_segments:
+            return rel_segments, rel_warnings
         return [], ["в тексте не найдено ни одного румба (N 45°00'00\" E) — формат не распознан"]
 
     raw_segments: list[dict[str, Any]] = []
@@ -1569,6 +2020,7 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
                 "seconds": seconds,
                 "ew": ew,
                 "distance_ft": distance,
+                "has_bearing": True,
             }
         )
 
@@ -1613,8 +2065,8 @@ def _clean_street_candidate(candidate: str) -> str | None:
     # Срезаем «the North side of», «East line of», «Southerly line of» с начала.
     while words:
         head = words[0].lower()
-        if head in {"the", "of", "a", "an"} or head in _DIRECTION_WORDS or head in {
-            "side", "line", "lines", "property", "said", "fronting",
+        if head in {"the", "of", "a", "an", "with", "by", "intersection", "corner", "formed"} or head in _DIRECTION_WORDS or head in {
+            "side", "line", "lines", "property", "said", "fronting", "along",
         }:
             words.pop(0)
         else:
@@ -1650,15 +2102,16 @@ _DIRECTION_WORDS = {
     "north", "south", "east", "west", "northeast", "northwest", "southeast",
     "southwest", "n", "s", "e", "w", "ne", "nw", "se", "sw",
     "northerly", "southerly", "easterly", "westerly",
+    "northeasterly", "northwesterly", "southeasterly", "southwesterly",
 }
 
 #: «fronting the South side of …», «along the North line of …», «fronts on …»
 _FRONT_RE = re.compile(
-    r"(?:fronting|fronts?|facing|faces|abuts?|abutting|along)\s+"
+    r"(?:fronting|fronts?|facing|faces|abuts?|abutting)\s+"
     r"(?:(?:the|a|an)\s+)?(?:(?:[A-Za-z]+ly|[A-Za-z]+)\s+)?"
     r"(?:side|line|lines|right[- ]of[- ]way)?\s*"
     r"(?:of|on|to)?\s*"
-    r"(?P<block>[^.;:0-9]{0,80}?(?:%s|%s)[^.;:]{0,20})"
+    r"(?P<block>[^.;:]{0,80}?(?:%s|%s)[^.;:]{0,20})"
     % (_STREET_SUFFIX, r"\b\d{1,4}\b"),
     re.IGNORECASE,
 )
@@ -1682,7 +2135,7 @@ def _street_from_block(block: str) -> str | None:
 
 
 def _front_direction(prefix: str) -> str | None:
-    """«fronts on the South side of» -> 'S' (направление, куда смотрит фасад)."""
+    """«fronts on the South side of» -> 'N' (направление наружу к улице)."""
     match = re.search(
         r"\b(?:the\s+)?([A-Za-z]+)\s+(?:side|line|lines|right[- ]of[- ]way)\b",
         prefix,
@@ -1692,32 +2145,192 @@ def _front_direction(prefix: str) -> str | None:
         return None
     word = match.group(1).lower()
     mapping = {
-        "north": "S", "south": "N", "east": "W", "west": "E",
-        "northerly": "N", "southerly": "S", "easterly": "E", "westerly": "W",
+        "north": "S",
+        "northerly": "S",
+        "south": "N",
+        "southerly": "N",
+        "east": "W",
+        "easterly": "W",
+        "west": "E",
+        "westerly": "E",
+        "northwest": "SE",
+        "northwesterly": "SE",
+        "northeast": "SW",
+        "northeasterly": "SW",
+        "southwest": "NE",
+        "southwesterly": "NE",
+        "southeast": "NW",
+        "southeasterly": "NW",
     }
     return mapping.get(word)
 
 
-def _extract_streets(text: str) -> tuple[str, str | None, float | None, "Literal['N','S','E','W'] | None", list[str]]:
-    """Возвращает (main_street, cross_street, distance_to_corner, front_side, warnings)."""
+def _extract_nyc_metadata(
+    full_text: str,
+    lot_body: str,
+    main_street: str,
+    cross_street: str | None,
+    distance_to_corner: float | None,
+    raw_segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Извлекает Block/Lot/Borough, примечания к улице и индексы примыкающих сторон."""
+    meta: dict[str, Any] = {
+        "main_street_note": None,
+        "tie_note": None,
+        "front_segment_index": None,
+        "cross_street_side_index": None,
+        "block_number": None,
+        "lot_number": None,
+        "borough_or_city": None,
+    }
+    blk = re.search(r"\bBlock\s*#?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
+    if blk:
+        meta["block_number"] = blk.group(1)
+    lot = re.search(r"\bLot\s*#?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
+    if lot:
+        meta["lot_number"] = lot.group(1)
+    boro = re.search(
+        r"\bBorough\s+(?:and\s+County\s+)?of\s+"
+        r"(Staten\s+Island|Queens|Brooklyn|Manhattan|Bronx|The\s+Bronx)\b",
+        full_text,
+        re.IGNORECASE,
+    )
+    if boro:
+        meta["borough_or_city"] = f"{boro.group(1).strip()}, NY"
+
+    if main_street:
+        note_re = re.compile(
+            re.escape(main_street) + r"\s*(\([^)]{3,80}\))",
+            re.IGNORECASE,
+        )
+        nm = note_re.search(full_text)
+        if nm:
+            meta["main_street_note"] = nm.group(1).strip().upper()
+
+    is_corner = distance_to_corner is not None and distance_to_corner <= 1e-6
+    clauses = re.split(r"\b(?:RUNNING\s+)?THENCE\b", lot_body, flags=re.IGNORECASE)[1:]
+    if len(clauses) == len(raw_segments):
+        for idx, clause in enumerate(clauses):
+            if (
+                main_street
+                and re.search(
+                    r"\balong\b[^.;]{0,50}?" + re.escape(main_street),
+                    clause,
+                    re.IGNORECASE,
+                )
+                and meta["front_segment_index"] is None
+            ):
+                meta["front_segment_index"] = idx
+            if (
+                is_corner
+                and cross_street
+                and re.search(
+                    r"\balong\b[^.;]{0,50}?" + re.escape(cross_street),
+                    clause,
+                    re.IGNORECASE,
+                )
+                and meta["cross_street_side_index"] is None
+            ):
+                meta["cross_street_side_index"] = idx
+
+    return meta
+
+
+def _extract_streets(
+    text: str,
+    *,
+    preamble: str = "",
+) -> tuple[
+    str,
+    str | None,
+    float | None,
+    "Literal['N','S','E','W'] | None",
+    str | None,
+    list[str],
+]:
+    """Возвращает (main_street, cross_street, distance_to_corner, front_side, tie_note, warnings)."""
     warnings: list[str] = []
     main_street = ""
     cross_street: str | None = None
     distance_to_corner: float | None = None
     front_side: str | None = None
+    tie_note: str | None = None
+    body = text[len(preamble) :] if preamble and text.startswith(preamble) else text
 
-    # 1. Фасадная улица и сторона света, куда смотрит фасад.
-    fronting = _FRONT_RE.search(text)
-    if fronting:
-        block = fronting.group("block")
-        # Вся фраза до названия улицы: «fronts on the South side of …»
-        prefix = text[fronting.start() : fronting.start("block")] + block
-        front_side = _front_direction(prefix)
-        main_street = _street_from_block(block) or ""
+    # 0. Угловой участок NYC: «BEGINNING at the corner formed by the intersection of
+    #    the northerly side of Borden Avenue ... with the easterly side of 63rd Street».
+    corner_pob = re.search(
+        r"\bBEGINNING\s+at\s+(?:a\s+point\s+at\s+|the\s+)?corner\s+formed\s+by\s+"
+        r"the\s+intersection\s+of\s+(?P<first>[^;]+?)\s+(?:with|and)\s+(?P<second>[^;:]+)",
+        body,
+        re.IGNORECASE,
+    )
+    if corner_pob:
+        s1 = _street_from_block(corner_pob.group("first"))
+        s2 = _street_from_block(corner_pob.group("second"))
+        if s1:
+            main_street = s1
+            front_side = _front_direction(corner_pob.group("first"))
+        if s2 and s2.lower() != main_street.lower():
+            cross_street = s2
+        distance_to_corner = 0.0
 
-    # 2. Общий случай: «... North line of Main Street» / «... side of Main Street».
+    # 1. Явная фраза «fronting / fronts on …» (сначала в теле участка, затем во всём тексте).
+    if not main_street:
+        fronting = _FRONT_RE.search(body) or _FRONT_RE.search(text)
+        if fronting:
+            src = body if fronting.string is body else text
+            block = fronting.group("block")
+            prefix = src[fronting.start() : fronting.start("block")] + block
+            front_side = _front_direction(prefix)
+            main_street = _street_from_block(block) or ""
+
+    # 2. Конец привязки COMMENCING: «... to (a point on) the northwesterly side of Dartmouth Loop ...,
+    #    the POINT OR PLACE OF BEGINNING».
+    if not main_street and preamble:
+        to_pob_street = re.search(
+            r"\bto\s+(?:a\s+point\s+on\s+)?(?P<prefix>(?:the\s+)?[A-Za-z]+\s+"
+            r"(?:side|line|right[- ]of[- ]way)\s+of\s+)(?P<block>[^,;:]{0,80})",
+            preamble,
+            re.IGNORECASE,
+        )
+        if to_pob_street:
+            front_side = _front_direction(to_pob_street.group("prefix"))
+            main_street = _street_from_block(to_pob_street.group("block")) or ""
+
+    # 3. «BEGINNING at a point on the northwesterly side of Dartmouth Loop …»
+    if not main_street:
+        pob_on = re.search(
+            r"\bBEGINNING\s+at\s+a\s+point\s+on\s+(?P<prefix>(?:the\s+)?[A-Za-z]+\s+"
+            r"(?:side|line|right[- ]of[- ]way)\s+of\s+)(?P<block>[^,;:]{0,80})",
+            text,
+            re.IGNORECASE,
+        )
+        if pob_on:
+            front_side = _front_direction(pob_on.group("prefix"))
+            main_street = _street_from_block(pob_on.group("block")) or ""
+
+    # 4. В теле участка: «along (the ... side of) <Street>».
+    if not main_street:
+        along_body = re.search(
+            r"\balong\s+(?P<prefix>(?:(?:the\s+)?(?:[A-Za-z]+\s+)?(?:side|line|right[- ]of[- ]way)\s+of\s+)?)"
+            r"(?P<block>[^,;:]{0,80})",
+            body,
+            re.IGNORECASE,
+        )
+        if along_body:
+            cand = _street_from_block(along_body.group("block"))
+            if cand:
+                front_side = front_side or _front_direction(along_body.group("prefix"))
+                main_street = cand
+
+    # 5. Общий случай: «... North line of Main Street» / первое упоминание улицы (сначала в body).
     if not main_street:
         side_of = re.search(
+            r"(?:side|line|lines|right[- ]of[- ]way)\s+(?:of|at)\s+(?:the\s+)?(?P<block>[^.;:]{0,80})",
+            body,
+            re.IGNORECASE,
+        ) or re.search(
             r"(?:side|line|lines|right[- ]of[- ]way)\s+(?:of|at)\s+(?:the\s+)?(?P<block>[^.;:]{0,80})",
             text,
             re.IGNORECASE,
@@ -1725,77 +2338,174 @@ def _extract_streets(text: str) -> tuple[str, str | None, float | None, "Literal
         if side_of:
             main_street = _street_from_block(side_of.group("block")) or ""
     if not main_street:
-        mentions = _street_mentions(text)
+        mentions = _street_mentions(body) or _street_mentions(text)
         if mentions:
             main_street = mentions[0][1]
 
-    # 3. Пересекаемая улица: «... feet East of the East line of Oak Avenue».
-    cross_patterns = [
-        r"(?:feet|ft|')\s+(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
-        r"(?:of|from)\s+the\s+(?:[A-Za-z]+\s+){0,2}?"
-        r"(?:line|right[- ]of[- ]way|centerline)\s+of\s+(?P<block>[^.;:]{0,80})",
-        r"(?:line|right[- ]of[- ]way)\s+of\s+(?P<block>[^.;:]{0,80})",
-    ]
-    for pattern in cross_patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            candidate = _street_from_block(match.group("block"))
-            if candidate and candidate.lower() != main_street.lower():
-                cross_street = candidate
+    # 6. Пересекаемая улица: «... feet East of the East line of Oak Avenue» или угол из COMMENCING.
+    if not cross_street:
+        cross_patterns = [
+            r"(?:feet|ft|')\s+(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
+            r"(?:of|from)\s+the\s+(?:[A-Za-z]+\s+){0,2}?"
+            r"(?:line|side|right[- ]of[- ]way|centerline|corner)\s+of\s+(?P<block>[^.;:]{0,80})",
+            r"\bintersection\s+of\s+(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?(?P<block>[^.;:]{0,80})",
+            r"(?:line|side|right[- ]of[- ]way)\s+of\s+(?P<block>[^.;:]{0,80})",
+        ]
+        for pattern in cross_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                candidate = _street_from_block(match.group("block"))
+                if candidate and candidate.lower() != main_street.lower():
+                    cross_street = candidate
+                    break
+            if cross_street:
                 break
-        if cross_street:
-            break
 
-    # 4. Расстояние до угла: «being 150.00 feet East of the East line of ...».
-    distance_match = re.search(
-        r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s+"
-        r"(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
-        r"(?:of|from)\s+the\s+",
-        text,
-        re.IGNORECASE,
-    )
-    if distance_match:
-        distance_to_corner = float(distance_match.group("num").replace(",", ""))
+    # 7. Расстояние до угла: обычное («150.00 feet East of ...») или последнее звено привязки COMMENCING.
+    if distance_to_corner is None:
+        distance_match = re.search(
+            r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s*"
+            r"(?:\([^)]*\)\s*)?"
+            r"(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
+            r"(?:of|from)\s+the\s+",
+            text,
+            re.IGNORECASE,
+        )
+        if distance_match:
+            distance_to_corner = float(distance_match.group("num").replace(",", ""))
+        elif preamble:
+            tie_dists = list(_DISTANCE_RE.finditer(preamble))
+            if tie_dists:
+                last_tie = float(tie_dists[-1].group("num").replace(",", ""))
+                distance_to_corner = last_tie
+                deed_vs_tm = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s*\(\s*DEED\s*\)"
+                    r"[^.;]{0,30}?(\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')?\s*\(\s*T\.?M\.?\s*\)",
+                    preamble,
+                    re.IGNORECASE,
+                )
+                if deed_vs_tm:
+                    distance_to_corner = float(deed_vs_tm.group(1).replace(",", ""))
+                    tie_note = f"{distance_to_corner:.2f}' (DEED) / {float(deed_vs_tm.group(2).replace(',', '')):.2f}' (T.M.)"
 
     if not main_street:
         warnings.append("фасадная улица не распознана — подпись улицы не будет нанесена")
     if cross_street and distance_to_corner is None:
         warnings.append("пересекаемая улица найдена, но расстояние до угла не распознано")
-    return main_street, cross_street, distance_to_corner, front_side, warnings
+    return main_street, cross_street, distance_to_corner, front_side, tie_note, warnings
 
 
 def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
     """
     Локальный разбор без LLM. Возвращает (модель, список предупреждений).
-    Бросает LegalDescriptionError, если геометрия не распознана.
+    Поддерживает:
+      * классические румбы DMS / десятичные градусы;
+      * футы с дюймами («13 feet 8 inches»);
+      * отсечение многозвенной привязки «COMMENCING AT … TO POB»;
+      * относительные курсы Нью-Йорка («PARALLEL WITH …», «AT RIGHT ANGLES TO …»,
+        «interior angle of 93°33'29.5"») без компасных румбов.
     """
     normalized = _normalize_legal_text(text)
-    raw_segments, warnings = _segments_from_regex(normalized)
+    preamble, lot_body = _split_preamble_and_body(normalized)
+    raw_segments, warnings = _segments_from_regex(lot_body)
     if not raw_segments:
         raise LegalDescriptionError(
-            "локальный парсер не нашёл сторон участка: " + ("; ".join(warnings) or "текст не распознан")
+            "локальный парсер не нашёл сторон участка: "
+            + ("; ".join(warnings) or "текст не распознан")
         )
     (
         main_street,
         cross_street,
         distance_to_corner,
         front_side,
+        tie_note,
         street_warnings,
-    ) = _extract_streets(normalized)
+    ) = _extract_streets(normalized, preamble=preamble)
     warnings.extend(street_warnings)
+
+    meta = _extract_nyc_metadata(
+        normalized,
+        lot_body,
+        main_street,
+        cross_street,
+        distance_to_corner,
+        raw_segments,
+    )
+    if tie_note and not meta.get("tie_note"):
+        meta["tie_note"] = tie_note
 
     try:
         model = LegalDescription.model_validate(
             {
                 "main_street": main_street,
+                "main_street_note": meta["main_street_note"],
                 "cross_street": cross_street,
                 "distance_to_corner_ft": distance_to_corner,
+                "tie_note": meta["tie_note"],
                 "front_side": front_side,
+                "front_segment_index": meta["front_segment_index"],
+                "cross_street_side_index": meta["cross_street_side_index"],
+                "block_number": meta["block_number"],
+                "lot_number": meta["lot_number"],
+                "borough_or_city": meta["borough_or_city"],
                 "segments": raw_segments,
             }
         )
     except Exception as exc:  # noqa: BLE001
-        raise LegalDescriptionError(f"локальный парсер вернул некорректные данные: {exc}") from exc
+        raise LegalDescriptionError(
+            f"локальный парсер вернул некорректные данные: {exc}"
+        ) from exc
     return model, warnings
+
+
+# ---------------------------------------------------------------------------
+# Эталонные реальные примеры NYC Title Survey (для кнопки «Пример» и тестов)
+# ---------------------------------------------------------------------------
+
+NYC_SAMPLES: dict[str, str] = {
+    "147 Dartmouth Loop (Staten Island)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough of Staten Island, County of Richmond, City and State of New York, "
+        "known as Block 3960 Lot 129:\n"
+        "COMMENCING at the corner formed by the intersection of the northeasterly side of "
+        "Mill Road (80' adopted) with the northwesterly side of New Dorp Lane; "
+        "THENCE N 34°55'50\" E along Mill Road 510.52 feet; "
+        "THENCE N 55°04'10\" W 433.78 feet; "
+        "THENCE S 33°58'44\" W 208.02 feet (DEED) / 208.22 feet (T.M.) to a point on the "
+        "northwesterly side of Dartmouth Loop (38' wide roadway easement), the POINT OR PLACE OF BEGINNING;\n"
+        "RUNNING THENCE S 33°58'44\" W along Dartmouth Loop, 14.00 feet;\n"
+        "THENCE N 56°01'16\" W part of the distance through a party wall, 125.00 feet;\n"
+        "THENCE N 33°58'44\" E, 14.00 feet;\n"
+        "THENCE S 56°01'16\" E part of the distance through a party wall, 125.00 feet "
+        "to the northwesterly side of Dartmouth Loop, the POINT OR PLACE OF BEGINNING."
+    ),
+    "283 Jamie Lane (Staten Island)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough of Staten Island, County of Richmond, City and State of New York, "
+        "known as Block 5744 Lot 112:\n"
+        "COMMENCING at the monumented intersection of Kenilworth Avenue and Arthur Kill Road (80' adopted); "
+        "THENCE S 73°57'40\" W 101.42 feet; "
+        "THENCE S 09°22'42\" E 17.49 feet; "
+        "THENCE S 04°43'12\" W 1,542.23 feet to the westerly side of Jamie Lane "
+        "(Not Mapped on Final City Plan), the POINT OR PLACE OF BEGINNING;\n"
+        "RUNNING THENCE S 07°13'39\" E along Jamie Lane, 13 feet 8 inches;\n"
+        "THENCE S 82°46'21\" W, 25 feet 10 inches;\n"
+        "THENCE N 07°13'39\" W, 13 feet 8 inches;\n"
+        "THENCE N 82°46'21\" E, 25 feet 10 inches to the POINT OR PLACE OF BEGINNING."
+    ),
+    "63-01 Borden Ave (Queens — без румбов)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough and County of Queens, City and State of New York, "
+        "known as Block 2366 Lot 59:\n"
+        "BEGINNING at the corner formed by the intersection of the northerly side of "
+        "Borden Avenue (Queens Midtown Expressway) with the easterly side of 63rd Street (60' wide);\n"
+        "RUNNING THENCE northerly along the easterly side of 63rd Street, 90.17 feet, "
+        "forming an interior angle of 93°33'29.5\" with the northerly side of Borden Avenue;\n"
+        "THENCE easterly parallel with Borden Avenue (Queens Midtown Expressway), 26.32 feet;\n"
+        "THENCE southerly at right angles to Borden Avenue (Queens Midtown Expressway), 90.00 feet;\n"
+        "THENCE westerly along the northerly side of Borden Avenue, 20.72 feet "
+        "to the corner, the point or place of BEGINNING."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1831,37 +2541,47 @@ def parse_legal_description_full(
     progress: Callable[[str], None] | None = None,
 ) -> ParseOutcome:
     """
-    Полный разбор: PDF/текст -> LLM (или regex) -> LegalDescription.
-
-    :param text: текст Legal Description; можно передать вместе с pdf_path —
-                 тогда PDF-текст добавляется к переданному.
-    :param pdf_path: путь к PDF.
-    :param cfg: конфигурация (по умолчанию load_config()).
-    :param use_llm: False — сразу локальный regex-парсер.
-    :param provider: ID провайдера ('hydra', 'openrouter', 'routerai').
-    :param model: имя модели выбранного провайдера.
-    :param api_key: явный API-ключ или защищённый токен tsai1:….
-    :param key_secret: опциональный секретный код пересчёта (PIN в памяти).
-    :param allow_regex_fallback: при ошибке LLM попробовать локальный regex-парсер
-                 (по умолчанию выключено: для юридических описаний лучше явная
-                 ошибка, чем геометрия с неверно прочитанными румбами).
-    :param progress: callback для сообщений о ходе работы (вызывается из
-                     рабочего потока — не трогайте в нём Tkinter).
+    Полный разбор: PDF (текстовый ИЛИ векторный/скан через Vision) / текст ->
+    LLM (или локальный парсер) -> LegalDescription.
     """
     from pathlib import Path as _Path
 
     cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
     warnings: list[str] = []
+    image_data_urls: list[str] = []
 
     pdf_text = ""
     if pdf_path:
+        p_name = _Path(pdf_path).name
         if progress:
-            progress(f"Читаю PDF: {_Path(pdf_path).name}")
-        pdf_text = read_pdf_text(pdf_path)
+            progress(f"Читаю PDF: {p_name}")
+        pdf_info = inspect_pdf(pdf_path)
+        if pdf_info["has_text"]:
+            pdf_text = str(pdf_info["text"])
+        elif use_llm:
+            dpi = int(cfg["api"].get("vision_dpi") or 220)
+            max_p = int(cfg["api"].get("vision_max_pages") or 4)
+            if progress:
+                progress(
+                    f"В PDF «{p_name}» нет текстового слоя — рендерю страницы ({dpi} DPI) для Vision LLM…"
+                )
+            image_data_urls = render_pdf_pages_base64(
+                pdf_path, dpi=dpi, max_pages=max_p
+            )
+            warnings.append(
+                f"PDF «{p_name}» без текстового слоя (векторный CAD/скан) — "
+                f"распознан через Vision LLM ({len(image_data_urls)} стр.)"
+            )
+        elif not (text and text.strip()):
+            raise PDFError(
+                f"в PDF «{p_name}» нет текстового слоя (векторный чертёж AutoCAD или скан). "
+                "Включите «Использовать LLM» и выберите Vision-модель "
+                "(например, hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+            )
 
     combined = "\n\n".join(part for part in (pdf_text, text or "") if part and part.strip())
     combined = _normalize_legal_text(combined).strip()
-    if len(combined) < 20:
+    if not image_data_urls and len(combined) < 20:
         raise LegalDescriptionError("текст Legal Description пуст или слишком короткий")
     max_chars = int(cfg["api"].get("max_input_chars") or 60000)
     if len(combined) > max_chars:
@@ -1881,12 +2601,13 @@ def parse_legal_description_full(
                 provider=provider,
                 model=model,
                 key_secret=key_secret,
+                image_data_urls=image_data_urls or None,
             )
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
             return ParseOutcome(
                 data=parsed_model,
-                source="llm",
+                source="llm-vision" if image_data_urls else "llm",
                 warnings=warnings,
                 usage=usage,
                 provider=usage.provider,
@@ -1896,7 +2617,7 @@ def parse_legal_description_full(
             )
         except Exception as exc:  # noqa: BLE001
             llm_error = exc
-            if not allow_regex_fallback:
+            if not allow_regex_fallback or image_data_urls:
                 raise
             warnings.append(f"LLM недоступна ({exc}); использую локальный парсер")
 

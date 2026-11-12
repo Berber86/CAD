@@ -64,6 +64,7 @@ from llm_parser import (
     CONFIG_PATH,
     ENV_PATH,
     LOCAL_CONFIG_PATH,
+    NYC_SAMPLES,
     PROVIDER_ORDER,
     PROVIDERS_CATALOG,
     KeyProtectionError,
@@ -72,19 +73,19 @@ from llm_parser import (
     ParseOutcome,
     TokenUsage,
     clean_provider_key,
+    inspect_pdf,
     is_protected_key,
     load_config,
     load_dotenv_dict,
     parse_legal_description_full,
     protect_api_key,
-    read_pdf_text,
     save_config,
     save_protected_env,
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD (Prototype 1)"
 APP_GEOMETRY = "1050x960"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -187,6 +188,7 @@ class SurveyApp(ctk.CTk):
 
         self.config_data: dict[str, Any] = load_config()
         self.pdf_path: Path | None = None
+        self._pdf_needs_vision: bool = False
         self.description: LegalDescription | None = None
         self.draw_result: DrawResult | None = None
         self.last_usage: TokenUsage | None = None
@@ -441,11 +443,24 @@ class SurveyApp(ctk.CTk):
         ctk.CTkButton(toolbar, text="Загрузить PDF", width=120, command=self._load_pdf).grid(
             row=0, column=1, padx=(12, 0)
         )
-        ctk.CTkButton(toolbar, text="Пример", width=90, command=self._insert_example).grid(
-            row=0, column=3, padx=(8, 0)
+        self._sample_presets: dict[str, str] = {
+            "Базовый пример (TX)": EXAMPLE_TEXT,
+            **NYC_SAMPLES,
+        }
+        self.sample_var = ctk.StringVar(value="Базовый пример (TX)")
+        self.sample_menu = ctk.CTkOptionMenu(
+            toolbar,
+            values=list(self._sample_presets.keys()),
+            variable=self.sample_var,
+            width=215,
+            command=self._on_sample_selected,
         )
-        ctk.CTkButton(toolbar, text="Очистить", width=90, command=self._clear_text).grid(
-            row=0, column=4, padx=(8, 0)
+        self.sample_menu.grid(row=0, column=3, padx=(8, 0))
+        ctk.CTkButton(toolbar, text="Пример", width=85, command=self._insert_example).grid(
+            row=0, column=4, padx=(6, 0)
+        )
+        ctk.CTkButton(toolbar, text="Очистить", width=85, command=self._clear_text).grid(
+            row=0, column=5, padx=(6, 0)
         )
         self.pdf_label = ctk.CTkLabel(
             toolbar, text="PDF не загружен", text_color=("#8fa3b8", "#8fa3b8")
@@ -642,15 +657,30 @@ class SurveyApp(ctk.CTk):
             text=f"высота текста = {base:g} × ({scale:g} / 16) = {height:.3f}"
         )
 
-    def _insert_example(self) -> None:
+    def _on_sample_selected(self, label: str) -> None:
+        sample = self._sample_presets.get(label)
+        if not sample:
+            return
         self.text_box.delete("1.0", "end")
-        self.text_box.insert("1.0", EXAMPLE_TEXT)
+        self.text_box.insert("1.0", sample)
         self.pdf_path = None
+        self._pdf_needs_vision = False
+        self.pdf_label.configure(text=f"Пример: {label}")
+        self._set_status(f"Подставлен пример: {label}")
+
+    def _insert_example(self) -> None:
+        selected = str(self.sample_var.get() or "")
+        sample = self._sample_presets.get(selected, EXAMPLE_TEXT)
+        self.text_box.delete("1.0", "end")
+        self.text_box.insert("1.0", sample)
+        self.pdf_path = None
+        self._pdf_needs_vision = False
         self.pdf_label.configure(text="Пример из буфера (PDF не загружен)")
 
     def _clear_text(self) -> None:
         self.text_box.delete("1.0", "end")
         self.pdf_path = None
+        self._pdf_needs_vision = False
         self.pdf_label.configure(text="PDF не загружен")
         self.description = None
         self.draw_result = None
@@ -662,21 +692,39 @@ class SurveyApp(ctk.CTk):
         from tkinter import filedialog
 
         path = filedialog.askopenfilename(
-            title="Выберите PDF с Legal Description",
+            title="Выберите PDF с Legal Description или чертёж Survey",
             filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
         )
         if not path:
             return
         try:
-            text = read_pdf_text(path)
+            info = inspect_pdf(path)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Не удалось прочитать PDF: {exc}", error=True)
             return
         self.pdf_path = Path(path)
-        self.text_box.delete("1.0", "end")
-        self.text_box.insert("1.0", text)
-        self.pdf_label.configure(text=f"PDF: {self.pdf_path.name} ({len(text):,} символов)")
-        self._set_status(f"PDF загружен: {self.pdf_path.name}")
+        if info["has_text"]:
+            text = str(info["text"])
+            self._pdf_needs_vision = False
+            self.text_box.delete("1.0", "end")
+            self.text_box.insert("1.0", text)
+            self.pdf_label.configure(
+                text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)"
+            )
+            self._set_status(f"PDF загружен: {self.pdf_path.name}")
+        else:
+            self._pdf_needs_vision = True
+            self.use_llm_var.set(True)
+            self.pdf_label.configure(
+                text=f"PDF Vision: {self.pdf_path.name} ({info['pages']} стр., без текста)",
+                text_color=("#f5b041", "#f5b041"),
+            )
+            self._set_status(
+                f"Загружен векторный/скан PDF без текстового слоя ({self.pdf_path.name}, "
+                f"{info['pages']} стр.) — включён режим Vision LLM. "
+                "Выберите мультимодальную модель (hydra-gemini-pro, "
+                "nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+            )
 
     def _build_runtime_config(self) -> tuple[dict[str, Any], str, str, str | None, str]:
         """
@@ -882,10 +930,12 @@ class SurveyApp(ctk.CTk):
             f"режим={'LLM: ' + provider_title + ' / ' + model_name if use_llm else 'regex'}) ---"
         )
 
+        vision_pdf = self.pdf_path if self._pdf_needs_vision else None
         worker = threading.Thread(
             target=self._worker,
             args=(
                 text,
+                vision_pdf,
                 cfg,
                 provider_id,
                 model_name,
@@ -902,6 +952,7 @@ class SurveyApp(ctk.CTk):
     def _worker(
         self,
         text: str,
+        vision_pdf: Path | None,
         cfg: dict[str, Any],
         provider_id: str,
         model_name: str,
@@ -914,6 +965,7 @@ class SurveyApp(ctk.CTk):
         try:
             outcome = parse_legal_description_full(
                 text=text,
+                pdf_path=vision_pdf,
                 cfg=cfg,
                 use_llm=use_llm,
                 provider=provider_id,
@@ -966,7 +1018,7 @@ class SurveyApp(ctk.CTk):
 
     # ------------------------------------------------------------- вывод --
     def _format_tokens_line(self, outcome: ParseOutcome) -> str:
-        if outcome.source != "llm" or outcome.usage is None:
+        if outcome.source not in {"llm", "llm-vision"} or outcome.usage is None:
             return "Токены за вызов: 0 (локальный разбор regex, без обращения к API)"
         base = outcome.usage.short_report()
         if self._session_llm_calls >= 2:
@@ -982,7 +1034,7 @@ class SurveyApp(ctk.CTk):
     def _apply_parsed(self, outcome: ParseOutcome) -> None:
         self.description = outcome.data
         self.last_usage = outcome.usage
-        if outcome.source == "llm" and outcome.usage is not None:
+        if outcome.source in {"llm", "llm-vision"} and outcome.usage is not None:
             self._session_llm_calls += 1
             if outcome.usage.available:
                 self._session_prompt_tokens += outcome.usage.prompt_tokens
@@ -999,24 +1051,43 @@ class SurveyApp(ctk.CTk):
 
     def _parsed_summary(self, outcome: ParseOutcome) -> str:
         data = outcome.data
-        if outcome.source == "llm":
+        if outcome.source in {"llm", "llm-vision"}:
+            prefix = "Vision LLM" if outcome.source == "llm-vision" else "LLM"
             tag = " · ".join(
                 p for p in (outcome.provider_label or outcome.provider, outcome.model) if p
             )
-            source = f"LLM: {tag}" if tag else "LLM"
+            source = f"{prefix}: {tag}" if tag else prefix
         else:
             source = "локальный парсер"
+        street_part = data.main_street or "—"
+        if data.main_street_note:
+            street_part += f" {data.main_street_note}"
         parts = [
             f"Разобрано ({source}): сторон {len(data.segments)}, "
             f"периметр {data.perimeter_ft:,.2f} ft",
-            f"Фасад: {data.main_street or '—'}",
+            f"Фасад: {street_part}",
         ]
+        if data.block_number or data.lot_number:
+            bl = " ".join(
+                p
+                for p in (
+                    f"Block {data.block_number}" if data.block_number else "",
+                    f"Lot {data.lot_number}" if data.lot_number else "",
+                )
+                if p
+            )
+            if data.borough_or_city:
+                bl += f" ({data.borough_or_city})"
+            parts.append(bl)
         if data.cross_street:
             distance = data.distance_to_corner_ft
-            parts.append(
-                f"Пересечение: {data.cross_street}"
-                + (f", {distance:.2f} ft до угла" if distance is not None else "")
-            )
+            if distance is not None and distance <= 1e-6:
+                parts.append(f"Угол с {data.cross_street}")
+            else:
+                parts.append(
+                    f"Пересечение: {data.cross_street}"
+                    + (f", {distance:.2f} ft до угла" if distance is not None else "")
+                )
         if outcome.warnings:
             parts.append(f"предупреждений: {len(outcome.warnings)} (см. лог)")
         return "  |  ".join(parts)

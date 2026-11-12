@@ -63,6 +63,8 @@ class _Widget:
         return self._kwargs.get(name)
 
     def insert(self, *args, **kwargs):
+        if len(args) >= 2:
+            self._value = str(self._value or "") + str(args[1])
         return None
 
     def get(self, *args, **kwargs):
@@ -72,6 +74,7 @@ class _Widget:
         return self._value
 
     def delete(self, *args, **kwargs):
+        self._value = ""
         return None
 
     def after(self, *args, **kwargs):
@@ -361,4 +364,60 @@ def test_gui_save_and_reload_roundtrip(gui, tmp_path, monkeypatch):
     cfg_rt3, _, _, _, secret3 = app2._build_runtime_config()
     assert resolve_api_target(cfg_rt3, provider="openrouter", key_secret=secret3)["api_key"] == "or-saved-plain"
     app2._on_close()
+
+
+def test_gui_nyc_presets_and_vision_pdf_flow(gui, tmp_path, monkeypatch):
+    """Проверка встроенных примеров NYC и загрузки векторного PDF без текстового слоя."""
+    pymupdf = pytest.importorskip("pymupdf")
+    from tkinter import filedialog
+
+    from llm_parser import ParseOutcome, TokenUsage, parse_with_regex
+
+    vec_pdf = tmp_path / "63-01_Borden_Ave.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=1008)
+    shape = page.new_shape()
+    shape.draw_rect(pymupdf.Rect(100, 150, 300, 500))
+    shape.finish(color=(0, 0, 0), width=1.0)
+    shape.commit()
+    doc.save(vec_pdf)
+    doc.close()
+
+    app = gui.SurveyApp()
+    app._on_sample_selected("63-01 Borden Ave (Queens — без румбов)")
+    sample_text = app.text_box.get("1.0", "end")
+    assert "Borden Avenue" in sample_text
+    desc, _ = parse_with_regex(sample_text)
+
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(vec_pdf))
+    app.use_llm_var.set(False)
+    app._load_pdf()
+    assert app._pdf_needs_vision is True
+    assert app.use_llm_var.get() is True
+    assert "PDF Vision:" in app.pdf_label.cget("text")
+
+    vision_outcome = ParseOutcome(
+        data=desc,
+        source="llm-vision",
+        usage=TokenUsage(
+            prompt_tokens=1850,
+            completion_tokens=240,
+            total_tokens=2090,
+            provider="hydra",
+            provider_label="Hydra AI",
+            model="hydra-gemini-pro",
+        ),
+        provider="hydra",
+        provider_label="Hydra AI",
+        model="hydra-gemini-pro",
+        llm_mode="json_schema",
+    )
+    app._apply_parsed(vision_outcome)
+    summary = app._parsed_summary(vision_outcome)
+    assert "Vision LLM: Hydra AI · hydra-gemini-pro" in summary
+    assert "Block 2366 Lot 59 (Queens, NY)" in summary
+    assert "Угол с 63rd Street" in summary
+    assert "1,850" in app.tokens_var.get()
+    app._on_close()
+
 

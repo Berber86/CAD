@@ -883,3 +883,226 @@ def test_insunits_warning_on_draw(monkeypatch):
     builder2._app, builder2._doc = app2, app2.doc
     result2 = builder2.draw(make_description(), scale=16.0)
     assert not any("INSUNITS" in warning for warning in result2.warnings)
+
+
+# ------------------------------------ реальные кейсы NYC Title Survey / PDF --
+
+
+def test_nyc_dartmouth_loop_commencing_tie_and_narrow_townhouse():
+    """
+    147 Dartmouth Loop, Staten Island (Block 3960, Lot 129):
+    многозвенная привязка COMMENCING (510.52' -> 433.78' -> 208.02' DEED / 208.22' T.M.)
+    не попадает в стороны таунхауса 14.00' × 125.00', узкий фасад 14.00' раскладывается
+    в 2 строки, а DARTMOUTH LOOP подписывается вдоль 14', а не вдоль стены 125'.
+    """
+    from llm_parser import NYC_SAMPLES
+
+    desc, warnings = parse_with_regex(NYC_SAMPLES["147 Dartmouth Loop (Staten Island)"])
+    assert warnings == []
+    assert len(desc.segments) == 4
+    assert [round(s.distance_ft, 2) for s in desc.segments] == [14.0, 125.0, 14.0, 125.0]
+    assert desc.main_street == "Dartmouth Loop"
+    assert desc.main_street_note == "(38' WIDE ROADWAY EASEMENT)"
+    assert desc.cross_street == "Mill Road"
+    assert desc.distance_to_corner_ft == pytest.approx(208.02)
+    assert desc.tie_note == "208.02' (DEED) / 208.22' (T.M.)"
+    assert desc.block_number == "3960"
+    assert desc.lot_number == "129"
+    assert desc.borough_or_city == "Staten Island, NY"
+
+    builder = AcadBuilder(load_config())
+    plan = builder.plan(desc, scale=16.0)
+    assert plan.closure.distance < 1e-5
+    assert plan.area_sqft == pytest.approx(14.0 * 125.0)
+    assert plan.warnings == []
+
+    by_kind = {item.kind: item for item in plan.items}
+    assert by_kind["side-1"].text == "14.00'"
+    assert by_kind["side-1-note"].text == 'S 33%%d58\'44" W'
+    assert "125.00'" in by_kind["side-2"].text and "side-2-note" not in by_kind
+    assert by_kind["main-street"].text == "DARTMOUTH LOOP"
+    assert by_kind["main-street-note"].text == "(38' WIDE ROADWAY EASEMENT)"
+    # Cross street ориентирована перпендикулярно фасадной улице
+    rot_diff = abs(by_kind["cross-street"].rotation - by_kind["main-street"].rotation)
+    assert rot_diff == pytest.approx(math.pi / 2.0, abs=1e-6)
+
+    # Даже без явного front_segment_index fallback по скалярному произведению
+    # (front_side == 'SE' для northwesterly side of Dartmouth Loop) выбирает
+    # узкий фасад 14', а не соседскую стену 125' при наклонной сетке!
+    assert desc.front_side == "SE"
+    desc_no_idx = desc.model_copy(update={"front_segment_index": None})
+    plan_no_idx = builder.plan(desc_no_idx, scale=16.0)
+    street_pt = next(i for i in plan_no_idx.items if i.kind == "main-street").point
+    side1_pt = next(i for i in plan_no_idx.items if i.kind == "side-1").point
+    side2_pt = next(i for i in plan_no_idx.items if i.kind == "side-2").point
+    assert math.dist(street_pt, side1_pt) < math.dist(street_pt, side2_pt)
+
+
+def test_nyc_jamie_lane_feet_inches_and_stacked_labels():
+    """
+    283 Jamie Lane, Staten Island (Block 5744, Lot 112):
+    перевод футов-дюймов (13'8" = 13.67', 25'10" = 25.83'), отсечение 3 звеньев
+    привязки от Arthur Kill Rd и двустрочная раскладка всех 4 узких сторон.
+    """
+    from llm_parser import NYC_SAMPLES
+
+    desc, warnings = parse_with_regex(NYC_SAMPLES["283 Jamie Lane (Staten Island)"])
+    assert warnings == []
+    assert len(desc.segments) == 4
+    assert desc.segments[0].distance_ft == pytest.approx(13.0 + 8.0 / 12.0)
+    assert desc.segments[1].distance_ft == pytest.approx(25.0 + 10.0 / 12.0)
+    assert desc.main_street == "Jamie Lane"
+    assert desc.main_street_note == "(NOT MAPPED ON FINAL CITY PLAN)"
+    assert desc.block_number == "5744"
+    assert desc.lot_number == "112"
+
+    plan = AcadBuilder(load_config()).plan(desc, scale=16.0)
+    assert plan.closure.distance < 1e-5
+    assert plan.warnings == []
+    for side_num in (1, 2, 3, 4):
+        inner = next(i for i in plan.items if i.kind == f"side-{side_num}")
+        outer = next(i for i in plan.items if i.kind == f"side-{side_num}-note")
+        assert point_in_polygon(inner.point, plan.vertices) is False
+        assert point_in_polygon(outer.point, plan.vertices) is False
+
+
+def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
+    """
+    63-01 Borden Avenue, Queens (Block 2366, Lot 59):
+    угловой участок без компасных румбов (interior angle 93°33'29.5",
+    PARALLEL WITH ..., AT RIGHT ANGLES TO ...), невязка < 0.01 ft,
+    подпись 63RD STREET вдоль боковой стороны и угол внутри вершины.
+    """
+    from llm_parser import NYC_SAMPLES
+
+    desc, warnings = parse_with_regex(
+        NYC_SAMPLES["63-01 Borden Ave (Queens — без румбов)"]
+    )
+    assert warnings == []
+    assert len(desc.segments) == 4
+    assert all(seg.has_bearing is False for seg in desc.segments)
+    assert desc.segments[0].interior_angle == '93°33\'29.5"'
+    assert desc.segments[1].course_note == "PARALLEL WITH QUEENS MIDTOWN EXPRESSWAY"
+    assert desc.segments[2].course_note == "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY"
+    assert desc.main_street == "Borden Avenue"
+    assert desc.cross_street == "63rd Street"
+    assert desc.distance_to_corner_ft == pytest.approx(0.0)
+    assert desc.front_segment_index == 3
+    assert desc.cross_street_side_index == 0
+
+    plan = AcadBuilder(load_config()).plan(desc, scale=16.0)
+    assert plan.closure.distance < 0.01
+    assert plan.warnings == []
+
+    by_kind = {item.kind: item for item in plan.items}
+    # На сторонах без румбов нет искусственных DMS-румбов вроде «N 90%%d00' E»
+    assert by_kind["side-1"].text == "90.17'"
+    assert by_kind["side-2"].text == "26.32'"
+    assert by_kind["side-2-note"].text == "PARALLEL WITH QUEENS MIDTOWN EXPRESSWAY"
+    assert by_kind["side-3"].text == "90.00'"
+    assert by_kind["side-3-note"].text == "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY"
+    assert by_kind["side-4"].text == "20.72'"
+    # Внутренний угол лежит внутри полигона у ЮЗ вершины
+    assert by_kind["angle-1"].text == '93%%d33\'29.5"'
+    assert point_in_polygon(by_kind["angle-1"].point, plan.vertices) is True
+    # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
+    assert by_kind["cross-street"].text == "63RD STREET"
+    assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
+    assert "cross-street-distance" not in by_kind
+
+
+def test_vector_pdf_vision_pipeline_renders_and_calls_multimodal_llm(tmp_path, monkeypatch):
+    """
+    Векторный CAD-PDF без текстового слоя (как реальные чертежи NYC Survey):
+    inspect_pdf сообщает has_text=False, render_pdf_pages_base64 рендерит PNG,
+    а parse_legal_description_full отправляет мультимодальный image_url-запрос в LLM.
+    """
+    pymupdf = pytest.importorskip("pymupdf")
+    import openai
+
+    from llm_parser import (
+        PDFError,
+        inspect_pdf,
+        parse_legal_description_full,
+        render_pdf_pages_base64,
+    )
+
+    vec_pdf = tmp_path / "vector_survey.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=1008)
+    shape = page.new_shape()
+    shape.draw_rect(pymupdf.Rect(120, 200, 320, 620))
+    shape.finish(color=(0, 0, 0), width=1.5)
+    shape.commit()
+    doc.save(vec_pdf)
+    doc.close()
+
+    info = inspect_pdf(vec_pdf)
+    assert info["pages"] == 1
+    assert info["has_text"] is False
+
+    urls = render_pdf_pages_base64(vec_pdf, dpi=144)
+    assert len(urls) == 1
+    assert urls[0].startswith("data:image/png;base64,iVBOR")
+
+    # Без LLM векторный PDF без текста даёт понятную ошибку с подсказкой про Vision
+    with pytest.raises(PDFError, match="Vision"):
+        parse_legal_description_full(pdf_path=vec_pdf, use_llm=False, cfg=load_config())
+
+    # С LLM формируется мультимодальный запрос с image_url
+    captured_messages: list[dict] = []
+
+    class VisionFakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+            class _Completions:
+                def create(_self, **ckwargs):
+                    captured_messages.extend(ckwargs["messages"])
+                    return type(
+                        "Resp",
+                        (),
+                        {
+                            "choices": [
+                                type(
+                                    "Choice",
+                                    (),
+                                    {
+                                        "message": type(
+                                            "Msg",
+                                            (),
+                                            {"content": json.dumps(_LLM_PAYLOAD)},
+                                        )()
+                                    },
+                                )()
+                            ],
+                            "usage": {
+                                "prompt_tokens": 1420,
+                                "completion_tokens": 210,
+                                "total_tokens": 1630,
+                            },
+                        },
+                    )()
+
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+            self.beta = None
+
+    monkeypatch.setattr(openai, "OpenAI", VisionFakeOpenAI)
+    outcome = parse_legal_description_full(
+        pdf_path=vec_pdf,
+        use_llm=True,
+        provider="hydra",
+        model="hydra-gemini-pro",
+        api_key="hk-vision-test",
+        cfg=load_config(),
+    )
+    assert outcome.source == "llm-vision"
+    assert outcome.usage is not None and outcome.usage.total_tokens == 1630
+    user_msg = next(m for m in captured_messages if m["role"] == "user")
+    assert isinstance(user_msg["content"], list)
+    assert any(
+        block.get("type") == "image_url"
+        and block["image_url"]["url"].startswith("data:image/png;base64,")
+        for block in user_msg["content"]
+    )
+

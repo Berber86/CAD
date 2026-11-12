@@ -8,6 +8,8 @@
     "timeout_sec": 180,
     "max_retries": 2,
     "max_input_chars": 60000,
+    "vision_dpi": 220,
+    "vision_max_pages": 4,
     "providers": {
       "hydra": {
         "label": "Hydra AI",
@@ -74,6 +76,8 @@
     "corner_label_gap_factor": 2.0,
     "corner_distance_offset_factor": 1.7,
     "long_side_threshold_ft": 40.0,
+    "stack_short_side_ft": 30.0,
+    "stacked_line_gap_factor": 1.45,
     "char_width_factor": 0.62,
     "space_width_factor": 0.45,
     "max_label_fill_ratio": 0.9,

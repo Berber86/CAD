@@ -92,6 +92,14 @@ class _Widget:
         if var is not None:
             var.set(value)
 
+    def select(self):
+        var = self._kwargs.get("variable")
+        if var is not None and "value" in self._kwargs:
+            var.set(self._kwargs["value"])
+        cmd = self._kwargs.get("command")
+        if callable(cmd):
+            cmd()
+
     def title(self, *args):
         return None
 
@@ -137,6 +145,8 @@ def _fake_modules() -> dict[str, types.ModuleType]:
         "CTkOptionMenu",
         "CTkComboBox",
         "CTkSegmentedButton",
+        "CTkRadioButton",
+        "CTkCheckBox",
         "CTkTextbox",
         "CTkProgressBar",
         "CTkSwitch",
@@ -152,6 +162,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     tkinter = types.ModuleType("tkinter")
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
+    filedialog.askopenfilenames = lambda **kwargs: ()
     tkinter.filedialog = filedialog
     return {"customtkinter": ctk, "tkinter": tkinter, "tkinter.filedialog": filedialog}
 
@@ -421,5 +432,91 @@ def test_gui_nyc_presets_and_vision_pdf_flow(gui, tmp_path, monkeypatch):
     assert "Угол с 63rd Street" in summary
     assert "1,850" in app.tokens_var.get()
     app._on_close()
+
+
+def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
+    """
+    Проверяет:
+      * переключатель CTkRadioButton «Основной участок» ↔ «Соседний участок»;
+      * кнопку «Добавить соседа на чертёж» (force_neighbor=True);
+      * пакетную загрузку нескольких файлов соседей (askopenfilenames) в единую СК от (0, 0).
+    """
+    import time
+    from tkinter import filedialog
+
+    from llm_parser import ASPENWALL_SAMPLES
+
+    app = gui.SurveyApp()
+    assert app.is_neighbor_mode() is False
+    assert app.draw_button.cget("text") == "Начертить участок в AutoCAD"
+
+    # Переключаем радиокнопку в режим «Соседний участок»
+    app.neighbor_lot_radio.select()
+    assert app.is_neighbor_mode() is True
+    assert app.draw_button.cget("text") == "Начертить соседа в AutoCAD"
+
+    # Возврат на основной участок по выбору пресета Aspenwall 420'
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    assert app.is_neighbor_mode() is False
+    assert app.draw_button.cget("text") == "Начертить участок в AutoCAD"
+
+    # Подменяем отрисовку AutoCAD для проверки force_neighbor и пакетного режима на Linux
+    drawn_calls: list[tuple[float, bool]] = []
+
+    def fake_draw(self_builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        from acad_builder import DrawResult
+
+        plan = self_builder.plan(
+            description, scale=scale, text_height=text_height, is_neighbor=is_neighbor, neighbor_label=neighbor_label
+        )
+        drawn_calls.append((description.distance_to_corner_ft, is_neighbor))
+        layers = {"neighbor_lot": "NEIGHBOR_LOT"} if is_neighbor else {"property_line": "PROPERTY_LINE", "boundary_text": "BOUNDARY_TEXT_AI"}
+        return DrawResult(plan=plan, text_count=len(plan.items), layers=layers)
+
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+
+    # 1) Нажимаем «Начертить участок в AutoCAD» (основной 420', regex)
+    app.use_llm_var.set(False)
+    app._start(parse_only=False)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert drawn_calls == [(420.0, False)]
+
+    # 2) Выбираем текст соседа и жмём «Добавить соседа на чертёж» (force_neighbor=True)
+    app.lot_role_var.set("main")
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    app._start(parse_only=False, force_neighbor=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert drawn_calls[-1] == (365.0, True)
+    assert "NEIGHBOR_LOT" in app.status_var.get()
+
+    # 3) Пакетная загрузка 2 файлов соседей (365' и 475')
+    f_left = tmp_path / "neighbor_365.txt"
+    f_right = tmp_path / "neighbor_475.txt"
+    f_left.write_text(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"], encoding="utf-8")
+    f_right.write_text(ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"], encoding="utf-8")
+    monkeypatch.setattr(
+        filedialog, "askopenfilenames", lambda **_: (str(f_left), str(f_right))
+    )
+    app._load_and_draw_neighbor_files()
+    for _ in range(50):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert drawn_calls[-2:] == [(365.0, True), (475.0, True)]
+    assert "обработано 2 уч. в слое NEIGHBOR_LOT" in app.status_var.get()
+    app._on_close()
+
 
 

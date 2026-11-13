@@ -327,13 +327,16 @@ class FakeEntity:
 class FakeModelSpace:
     def __init__(self):
         self.polylines = []
+        self.polyline_entities = []
         self.texts = []
         self.lines = []
         self.arcs = []
 
     def AddLightWeightPolyline(self, coordinates):
         self.polylines.append(list(coordinates))
-        return FakePolyline()
+        poly = FakePolyline()
+        self.polyline_entities.append(poly)
+        return poly
 
     def AddLine(self, start, end):
         item = FakeEntity(StartPoint=start, EndPoint=end)
@@ -1453,6 +1456,173 @@ def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monke
     )
     bowtie_plan = builder.plan(bowtie, scale=16.0)
     assert any("самопересекается" in w or "площадь" in w for w in bowtie_plan.warnings)
+
+
+# ------------------------- Привязка POB от (0, 0) и Neighbor Lots ----------
+
+
+def test_aspenwall_main_and_neighbor_lots_fit_wall_to_wall_from_street_corner():
+    """
+    Три участка на Aspenwall Street (365', 420', 475' восточнее угла 149th Street):
+      * замыкающий сегмент вдоль Aspenwall Street = S 75°20'20" W -> вектор от перекрёстка
+        к POB автоматически разворачивается на 180° в N 75°20'20" E;
+      * перекрёсток улиц лежит в (0.0, 0.0), линия привязки идёт от (0.0, 0.0) до POB;
+      * общая стена левого соседа (365'+55'=420') и основного участка (420'),
+        а также основного (420'+55'=475') и правого соседа (475') совпадают до 1e-9 ft.
+    """
+    from acad_builder import compute_pob_point
+    from llm_parser import ASPENWALL_SAMPLES
+
+    desc_left, w_left = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    desc_main, w_main = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    desc_right, w_right = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"])
+    assert w_left == [] and w_main == [] and w_right == []
+
+    for desc, expected_dist in ((desc_left, 365.0), (desc_main, 420.0), (desc_right, 475.0)):
+        assert desc.distance_to_corner_ft == pytest.approx(expected_dist)
+        assert desc.corner_to_pob_bearing is not None
+        assert desc.corner_to_pob_bearing.bearing_label == "N 75°20'20\" E"
+        assert desc.corner_to_pob_bearing.distance_ft == pytest.approx(expected_dist)
+        pob = compute_pob_point(desc)
+        assert math.hypot(*pob) == pytest.approx(expected_dist, abs=1e-9)
+
+    builder = AcadBuilder(load_config())
+    plan_left = builder.plan(desc_left, scale=16.0, is_neighbor=True)
+    plan_main = builder.plan(desc_main, scale=16.0, is_neighbor=False)
+    plan_right = builder.plan(desc_right, scale=16.0, is_neighbor=True)
+
+    # Правая стена левого соседа (v3 на улице, v2 в глубине) == левая стена основного (v0, v1)
+    assert math.dist(plan_left.vertices[3], plan_main.vertices[0]) == pytest.approx(0.0, abs=1e-9)
+    assert math.dist(plan_left.vertices[2], plan_main.vertices[1]) == pytest.approx(0.0, abs=1e-9)
+
+    # Правая стена основного (v3 на улице, v2 в глубине) == левая стена правого соседа (v0, v1)
+    assert math.dist(plan_main.vertices[3], plan_right.vertices[0]) == pytest.approx(0.0, abs=1e-9)
+    assert math.dist(plan_main.vertices[2], plan_right.vertices[1]) == pytest.approx(0.0, abs=1e-9)
+
+    # Выносная линия привязки основного участка идёт от перекрёстка (0.0, 0.0) до POB (420')
+    tie_line = next(ln for ln in plan_main.lines if ln.kind == "main-street-row-tie")
+    assert math.dist(tie_line.start, (0.0, 0.0)) == pytest.approx(0.0, abs=1e-9)
+    assert math.dist(tie_line.end, plan_main.pob) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(monkeypatch):
+    """
+    Совместная отрисовка основного участка (420') и двух соседей (365' и 475')
+    в один активный ModelSpace AutoCAD:
+      * основной участок — слой PROPERTY_LINE + BOUNDARY_TEXT_AI + STREET_ROW_AI;
+      * соседи — замкнутая полилиния в слое NEIGHBOR_LOT (acCyan = 4), БЕЗ подписей
+        сторон/углов/улиц, только 1 компактная метка внутри центроида полигона.
+    """
+    import acad_builder as module
+    from llm_parser import ASPENWALL_SAMPLES
+
+    monkeypatch.setattr(module, "_co_initialize", lambda: False)
+    monkeypatch.setattr(module, "_variant_points", lambda points: [c for p in points for c in p])
+    monkeypatch.setattr(module, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
+
+    builder = AcadBuilder(load_config())
+    app = FakeApp()
+    builder._app, builder._doc = app, app.doc
+
+    desc_main, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    desc_left, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    desc_right, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"])
+
+    res_main = builder.draw(desc_main, scale=16.0, is_neighbor=False)
+    main_texts_before = len(app.doc.ModelSpace.texts)
+    main_lines_before = len(app.doc.ModelSpace.lines)
+
+    res_left = builder.draw(desc_left, scale=16.0, is_neighbor=True)
+    res_right = builder.draw(desc_right, scale=16.0, is_neighbor=True)
+
+    space = app.doc.ModelSpace
+    assert len(space.polyline_entities) == 3
+    assert space.polyline_entities[0].Layer == "PROPERTY_LINE"
+    assert space.polyline_entities[1].Layer == "NEIGHBOR_LOT"
+    assert space.polyline_entities[2].Layer == "NEIGHBOR_LOT"
+    assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
+    assert res_main.is_neighbor is False
+    assert res_left.is_neighbor is True and res_right.is_neighbor is True
+
+    # Соседи не добавляют ни одной линии улицы и создают ровно по 1 тексту в центроиде
+    assert len(space.lines) == main_lines_before
+    assert res_left.text_count == 1
+    assert res_right.text_count == 1
+    assert len(space.texts) == main_texts_before + 2
+
+    neighbor_texts = space.texts[-2:]
+    assert [t.TextString for t in neighbor_texts] == [
+        "NEIGHBOR (365' from corner)",
+        "NEIGHBOR (475' from corner)",
+    ]
+    assert {t.Layer for t in neighbor_texts} == {"NEIGHBOR_LOT"}
+    assert point_in_polygon(res_left.plan.items[0].point, res_left.vertices) is True
+    assert point_in_polygon(res_right.plan.items[0].point, res_right.vertices) is True
+
+
+def test_corner_to_pob_bearing_inference_and_llm_repair_edge_cases():
+    """
+    Проверяет граничные случаи вычисления POB и центроида:
+      * угловой участок (distance_to_corner_ft=0.0) -> POB=(0,0), corner_to_pob_bearing=None;
+      * чистая модель LegalDescription без текста разворачивает замыкающий румб на 180°;
+      * _repair_llm_geometry исправляет неразвёрнутый LLM-румб при 'easterly from the corner';
+      * узкий таунхаус (14'×125') и Г-образный участок держат метку строго внутри полигона.
+    """
+    from acad_builder import compute_pob_point, polygon_centroid
+    from llm_parser import (
+        ASPENWALL_SAMPLES,
+        BoundarySegment,
+        LegalDescriptionData,
+        NYC_SAMPLES,
+        _repair_llm_geometry,
+    )
+
+    assert BoundarySegment is Segment
+    assert LegalDescriptionData is LegalDescription
+
+    # 1) Чистая модель без текста: замыкающая сторона S 75°20'20" W -> N 75°20'20" E
+    pure_nyc = LegalDescription(
+        main_street="Aspenwall Street",
+        cross_street="149th Street",
+        distance_to_corner_ft=420.0,
+        front_segment_index=3,
+        segments=[
+            Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=100.0),
+            Segment(ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=55.0),
+            Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.0),
+            Segment(ns="S", degrees=75, minutes=20, seconds=20, ew="W", distance_ft=55.0),
+        ],
+    )
+    assert pure_nyc.corner_to_pob_bearing is not None
+    assert pure_nyc.corner_to_pob_bearing.bearing_label == "N 75°20'20\" E"
+
+    # 2) Если LLM ошибочно вернула S 75°20'20" W при 'easterly from the corner', repair разворачивает
+    wrong_tie = Segment(ns="S", degrees=75, minutes=20, seconds=20, ew="W", distance_ft=420.0)
+    bad_llm = pure_nyc.model_copy(update={"corner_to_pob_bearing": wrong_tie})
+    repaired, notes = _repair_llm_geometry(
+        bad_llm, source_text=ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    )
+    assert repaired.corner_to_pob_bearing is not None
+    assert repaired.corner_to_pob_bearing.bearing_label == "N 75°20'20\" E"
+    assert any("corner_to_pob_bearing" in n for n in notes)
+
+    # 3) Угловой участок (63-01 Borden Ave): POB строго (0.0, 0.0)
+    corner_desc, _ = parse_with_regex(NYC_SAMPLES["63-01 Borden Ave (Queens — без румбов)"])
+    assert corner_desc.distance_to_corner_ft == pytest.approx(0.0)
+    assert corner_desc.corner_to_pob_bearing is None
+    assert compute_pob_point(corner_desc) == (0.0, 0.0)
+
+    # 4) Узкий таунхаус 14'×125' как сосед: метка поворачивается вдоль длинной стены 125'
+    th_desc, _ = parse_with_regex(NYC_SAMPLES["147 Dartmouth Loop (Staten Island)"])
+    th_plan = AcadBuilder(load_config()).plan(th_desc, scale=16.0, is_neighbor=True)
+    assert len(th_plan.items) == 1
+    assert point_in_polygon(th_plan.items[0].point, th_plan.vertices) is True
+
+    # 5) Г-образный сильно вогнутый участок: центроид гарантированно внутри контура
+    concave_l = [(0.0, 0.0), (100.0, 0.0), (100.0, 12.0), (12.0, 12.0), (12.0, 100.0), (0.0, 100.0)]
+    c_pt = polygon_centroid(concave_l)
+    assert point_in_polygon(c_pt, concave_l) is True
+
 
 
 

@@ -50,11 +50,13 @@ __all__ = [
     "build_side_label",
     "build_side_lines",
     "closure_error",
+    "compute_pob_point",
     "draw_legal_description",
     "estimate_text_width",
     "format_bearing",
     "format_distance",
     "point_in_polygon",
+    "polygon_centroid",
     "polygon_signed_area",
     "round_ft",
     "text_rotation",
@@ -208,6 +210,85 @@ def point_in_polygon(
                 inside = not inside
         j = i
     return inside
+
+
+def compute_pob_point(description: LegalDescription) -> tuple[float, float]:
+    """
+    Координаты точки начала (POB) относительно перекрёстка улиц (0.0, 0.0).
+
+    Если участок угловой (`distance_to_corner_ft == 0`), POB совпадает с `(0.0, 0.0)`.
+    Иначе от `(0.0, 0.0)` откладывается `distance_to_corner_ft` вдоль румба
+    `corner_to_pob_bearing` — благодаря этому основной и соседние участки
+    вдоль одной улицы встают в AutoCAD строго стенка к стенке.
+    """
+    dist = float(getattr(description, "distance_to_corner_ft", 0.0) or 0.0)
+    tie = getattr(description, "corner_to_pob_bearing", None)
+    if dist <= 1e-6 or tie is None:
+        return (0.0, 0.0)
+    return bearing_to_xy(
+        tie.ns,
+        tie.degrees,
+        tie.minutes,
+        tie.seconds,
+        tie.ew,
+        dist,
+    )
+
+
+def polygon_centroid(points: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    """
+    Геометрический центроид полигона (формула Грина / Шнуровки).
+    Для сильно вогнутых (Г-образных) участков, если центроид оказался снаружи,
+    подбирает ближайшую внутреннюю точку на секущей через среднюю линию.
+    """
+    count = len(points)
+    if count == 0:
+        return (0.0, 0.0)
+    if count < 3:
+        return (
+            sum(p[0] for p in points) / count,
+            sum(p[1] for p in points) / count,
+        )
+
+    area2 = 0.0
+    cx_acc = 0.0
+    cy_acc = 0.0
+    for i in range(count):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % count]
+        cross = x1 * y2 - x2 * y1
+        area2 += cross
+        cx_acc += (x1 + x2) * cross
+        cy_acc += (y1 + y2) * cross
+
+    if abs(area2) < 1e-9:
+        return (
+            sum(p[0] for p in points) / count,
+            sum(p[1] for p in points) / count,
+        )
+
+    cx = cx_acc / (3.0 * area2)
+    cy = cy_acc / (3.0 * area2)
+    if point_in_polygon((cx, cy), points):
+        return (cx, cy)
+
+    # Фолбэк для вогнутого участка: середина самой длинной горизонтальной хорды через cy.
+    xs_cross: list[float] = []
+    for i in range(count):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % count]
+        if (y1 > cy) != (y2 > cy):
+            xs_cross.append(x1 + (x2 - x1) * (cy - y1) / (y2 - y1))
+    xs_cross.sort()
+    best_pt = (cx, cy)
+    best_span = -1.0
+    for k in range(0, len(xs_cross) - 1, 2):
+        span = xs_cross[k + 1] - xs_cross[k]
+        mid_x = 0.5 * (xs_cross[k] + xs_cross[k + 1])
+        if span > best_span and point_in_polygon((mid_x, cy), points):
+            best_span = span
+            best_pt = (mid_x, cy)
+    return best_pt
 
 
 def _polygon_self_intersects(points: Sequence[tuple[float, float]]) -> bool:
@@ -571,10 +652,16 @@ class DrawPlan:
     arcs: list[ArcItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     ccw: bool = True
+    pob: tuple[float, float] = (0.0, 0.0)
+    is_neighbor: bool = False
 
     @property
     def area_sqft(self) -> float:
         return abs(polygon_signed_area(self.vertices))
+
+    @property
+    def centroid(self) -> tuple[float, float]:
+        return polygon_centroid(self.vertices)
 
 
 @dataclass
@@ -596,6 +683,14 @@ class DrawResult:
         return self.plan.vertices
 
     @property
+    def pob(self) -> tuple[float, float]:
+        return self.plan.pob
+
+    @property
+    def is_neighbor(self) -> bool:
+        return self.plan.is_neighbor
+
+    @property
     def area_sqft(self) -> float:
         return self.plan.area_sqft
 
@@ -612,12 +707,19 @@ class DrawResult:
         return len(self.plan.description.segments)
 
     def summary(self) -> str:
+        role_tag = " [СОСЕДНИЙ УЧАСТОК]" if self.is_neighbor else ""
+        layer_summary = (
+            f"Слой соседа: {self.layers.get('neighbor_lot', 'NEIGHBOR_LOT')}"
+            if self.is_neighbor
+            else f"Слои: {self.layers.get('property_line')} / {self.layers.get('boundary_text')}"
+        )
         lines = [
-            f'Масштаб 1"={self.scale:g}\', высота текста {self.text_height:.3f}',
+            f'Масштаб 1"={self.scale:g}\'{role_tag}, высота текста {self.text_height:.3f}',
+            f"POB от перекрёстка (0, 0): ({self.pob[0]:+.2f}, {self.pob[1]:+.2f}) ft",
             f"Сторон: {self.segment_count}, подписей создано: {self.text_count}, "
             f"площадь ≈ {self.area_sqft:,.0f} sq ft",
             self.closure.report(),
-            f"Слои: {self.layers.get('property_line')} / {self.layers.get('boundary_text')}",
+            layer_summary,
         ]
         for warning in list(self.plan.warnings) + list(self.warnings):
             lines.append(f"! {warning}")
@@ -1338,35 +1440,58 @@ class AcadBuilder:
                     )
                 return items, row_lines
 
-        # Рядовой участок: вдоль продолжения красной линии фасадной улицы выносится
-        # размер привязки («150.00' TO CORNER» или «208.02' (DEED) / 208.22' (T.M.)»),
-        # а за концом этого выносного участка проводится перпендикулярная линия
-        # пересекаемой улицы и крупная подпись cross-street — без взаимного перехлёста.
+        # Рядовой участок: привязка вдоль фасадной улицы от реального перекрёстка (0.0, 0.0)
+        # до ближайшего к углу конца фасадной границы (near_pt), либо компактная выноска
+        # при сверхдальней привязке (> max_full_tie_line_ft, напр. 1,542.23').
         tie_note = getattr(description, "tie_note", None)
-        has_tie_label = bool(tie_note) or description.distance_to_corner_ft is not None
+        dist_val = float(description.distance_to_corner_ft or 0.0)
+        has_tie_label = bool(tie_note) or dist_val > 1e-6
         dist_label = ""
         dist_width = 0.0
         if has_tie_label:
             dist_label = (
                 str(tie_note).upper()
                 if tie_note
-                else f"{format_distance(float(description.distance_to_corner_ft))} TO CORNER"
+                else f"{format_distance(dist_val)} TO CORNER"
             )
             dist_width = estimate_text_width(dist_label, text_height, cfg)
 
+        d_start = math.hypot(start[0], start[1])
+        d_end = math.hypot(end[0], end[1])
+        if d_start <= d_end + 1e-6:
+            near_pt, far_pt = start, end
+        else:
+            near_pt, far_pt = end, start
+
+        # Единичный вектор вдоль красной линии улицы ОТ near_pt В СТОРОНУ перекрёстка (0, 0).
+        if (-near_pt[0]) * ux + (-near_pt[1]) * uy >= 0.0:
+            tux, tuy = ux, uy
+        else:
+            tux, tuy = -ux, -uy
+        fux, fuy = -tux, -tuy
+
         gap = float(cfg.get("corner_label_gap_factor", 2.4)) * text_height
-        tie_span = (
+        min_tie_span = (
             max(dist_width + 9.0 * text_height, 18.0 * text_height)
             if has_tie_label
             else max(gap + 5.0 * text_height, 11.0 * text_height)
         )
-        corner_pt = (start[0] - ux * tie_span, start[1] - uy * tie_span)
+        d_near = math.hypot(near_pt[0], near_pt[1])
+        perp_origin_err = abs(near_pt[0] * nx + near_pt[1] * ny)
+        max_full_tie_ft = float(cfg.get("max_full_tie_line_ft", 800.0))
+
+        if perp_origin_err <= 1.5 and min_tie_span <= d_near <= max_full_tie_ft:
+            corner_pt = (0.0, 0.0)
+            tie_span = d_near
+        else:
+            tie_span = min_tie_span
+            corner_pt = (near_pt[0] + tux * tie_span, near_pt[1] + tuy * tie_span)
 
         if has_tie_label:
             tie_text_offset = float(cfg.get("corner_distance_offset_factor", 1.9)) * text_height
             tie_mid = (
-                start[0] - ux * (0.5 * tie_span) + nx * tie_text_offset,
-                start[1] - uy * (0.5 * tie_span) + ny * tie_text_offset,
+                near_pt[0] + tux * (0.5 * tie_span) + nx * tie_text_offset,
+                near_pt[1] + tuy * (0.5 * tie_span) + ny * tie_text_offset,
             )
             items.append(
                 TextItem(
@@ -1377,14 +1502,14 @@ class AcadBuilder:
                 )
             )
 
-        cross_along_shift = tie_span + 2.8 * text_height
+        cross_along_shift = 2.8 * text_height
         cross_normal_shift = 0.65 * street_offset
         items.append(
             TextItem(
                 text=description.cross_street.upper(),
                 point=(
-                    start[0] - ux * cross_along_shift + nx * cross_normal_shift,
-                    start[1] - uy * cross_along_shift + ny * cross_normal_shift,
+                    corner_pt[0] + tux * cross_along_shift + nx * cross_normal_shift,
+                    corner_pt[1] + tuy * cross_along_shift + ny * cross_normal_shift,
                 ),
                 rotation=text_rotation(angle + math.pi / 2.0),
                 kind="cross-street",
@@ -1397,14 +1522,14 @@ class AcadBuilder:
             row_lines.append(
                 LineItem(
                     start=corner_pt,
-                    end=start,
+                    end=near_pt,
                     kind="main-street-row-tie",
                 )
             )
             row_lines.append(
                 LineItem(
-                    start=end,
-                    end=(end[0] + ux * far_ext, end[1] + uy * far_ext),
+                    start=far_pt,
+                    end=(far_pt[0] + fux * far_ext, far_pt[1] + fuy * far_ext),
                     kind="main-street-row-2",
                 )
             )
@@ -1423,13 +1548,78 @@ class AcadBuilder:
             )
         return items, row_lines
 
+    def _neighbor_label_item(
+        self,
+        description: LegalDescription,
+        vertices: Sequence[tuple[float, float]],
+        text_height: float,
+        front_index: int | None,
+        neighbor_label: str | None = None,
+    ) -> TextItem:
+        """Компактная подпись соседнего участка строго в его геометрическом центроиде."""
+        cfg = self.drawing_cfg
+        if neighbor_label and str(neighbor_label).strip():
+            label = str(neighbor_label).strip()
+        else:
+            dist = float(description.distance_to_corner_ft or 0.0)
+            if dist > 1e-6:
+                d_str = (
+                    f"{int(round(dist))}'"
+                    if abs(dist - round(dist)) < 1e-3
+                    else format_distance(dist)
+                )
+                label = f"NEIGHBOR ({d_str} from corner)"
+            elif description.cross_street:
+                label = "NEIGHBOR (CORNER)"
+            else:
+                label = "NEIGHBOR"
+
+        center = polygon_centroid(vertices)
+        count = len(vertices)
+        longest_len = 0.0
+        longest_angle = 0.0
+        for idx in range(count):
+            p1 = vertices[idx]
+            p2 = vertices[(idx + 1) % count]
+            elen = math.dist(p1, p2)
+            if elen > longest_len:
+                longest_len = elen
+                longest_angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+
+        chosen_angle = longest_angle
+        chosen_span = longest_len
+        if front_index is not None and 0 <= front_index < count:
+            fp1 = vertices[front_index]
+            fp2 = vertices[(front_index + 1) % count]
+            front_len = math.dist(fp1, fp2)
+            raw_w = estimate_text_width(label, text_height, cfg)
+            if raw_w <= 0.82 * front_len:
+                chosen_angle = math.atan2(fp2[1] - fp1[1], fp2[0] - fp1[0])
+                chosen_span = front_len
+
+        lbl_h = text_height
+        est_w = estimate_text_width(label, lbl_h, cfg)
+        if chosen_span > 1e-6 and est_w > 0.82 * chosen_span:
+            lbl_h = max(0.35 * text_height, lbl_h * (0.82 * chosen_span / est_w))
+
+        return TextItem(
+            text=label,
+            point=center,
+            rotation=text_rotation(chosen_angle),
+            kind="neighbor-label",
+            height=lbl_h,
+        )
+
     def plan(
         self,
         description: LegalDescription,
         scale: float | None = None,
         text_height: float | None = None,
+        *,
+        is_neighbor: bool = False,
+        neighbor_label: str | None = None,
     ) -> DrawPlan:
-        """Считает геометрию и раскладку подписей, ничего не рисуя."""
+        """Считает геометрию от перекрёстка (0.0, 0.0) и раскладку подписей, ничего не рисуя."""
         cfg = self.drawing_cfg
         scale = float(scale if scale is not None else cfg.get("base_scale", 16.0))
         height = (
@@ -1438,8 +1628,9 @@ class AcadBuilder:
             else self.text_height_for_scale(scale, self.cfg)
         )
 
+        pob = compute_pob_point(description)
         segments = description.segments
-        traverse = build_polygon_points(segments)
+        traverse = build_polygon_points(segments, start=pob)
         if len(traverse) < 4:
             raise AcadDrawError(
                 f"для замкнутого участка нужно минимум 3 стороны, получено {len(segments)}"
@@ -1471,21 +1662,35 @@ class AcadBuilder:
         ccw = signed_area > 0.0
         self._front_warning = None
         front_index = self._front_side_index(description, vertices, ccw)
-        items, arcs, side_band_extra = self._side_items(
-            description, vertices, height, ccw, warnings, front_index=front_index
-        )
-        street_texts, row_lines = self._street_items(
-            description,
-            vertices,
-            height,
-            ccw,
-            warnings,
-            side_band_extra=side_band_extra,
-            front_index=front_index,
-        )
-        items.extend(street_texts)
-        if self._front_warning:
-            warnings.append(self._front_warning)
+
+        if is_neighbor:
+            items = [
+                self._neighbor_label_item(
+                    description,
+                    vertices,
+                    height,
+                    front_index=front_index,
+                    neighbor_label=neighbor_label,
+                )
+            ]
+            row_lines: list[LineItem] = []
+            arcs: list[ArcItem] = []
+        else:
+            items, arcs, side_band_extra = self._side_items(
+                description, vertices, height, ccw, warnings, front_index=front_index
+            )
+            street_texts, row_lines = self._street_items(
+                description,
+                vertices,
+                height,
+                ccw,
+                warnings,
+                side_band_extra=side_band_extra,
+                front_index=front_index,
+            )
+            items.extend(street_texts)
+            if self._front_warning:
+                warnings.append(self._front_warning)
 
         return DrawPlan(
             description=description,
@@ -1498,6 +1703,8 @@ class AcadBuilder:
             arcs=arcs,
             warnings=warnings,
             ccw=ccw,
+            pob=pob,
+            is_neighbor=bool(is_neighbor),
         )
 
     # -- подключение к AutoCAD ---------------------------------------------
@@ -1692,16 +1899,25 @@ class AcadBuilder:
         description: LegalDescription,
         scale: float | None = None,
         text_height: float | None = None,
+        *,
+        is_neighbor: bool = False,
+        neighbor_label: str | None = None,
     ) -> DrawResult:
-        """Планирует и рисует участок в активном документе AutoCAD."""
-        plan = self.plan(description, scale=scale, text_height=text_height)
+        """Планирует и рисует участок (основной или соседний) в активном документе AutoCAD."""
+        plan = self.plan(
+            description,
+            scale=scale,
+            text_height=text_height,
+            is_neighbor=is_neighbor,
+            neighbor_label=neighbor_label,
+        )
         warnings: list[str] = []
 
         drawing = self.drawing_cfg
+        layers_cfg = self.cfg.get("layers", {})
         line_layer_name, text_layer_name = self.layer_names()
-        street_row_layer_name = str(
-            self.cfg.get("layers", {}).get("street_row") or "STREET_ROW_AI"
-        )
+        street_row_layer_name = str(layers_cfg.get("street_row") or "STREET_ROW_AI")
+        neighbor_layer_name = str(layers_cfg.get("neighbor_lot") or "NEIGHBOR_LOT")
         colors = self.cfg.get("layer_colors", {})
 
         app, doc = self.connect()
@@ -1725,22 +1941,41 @@ class AcadBuilder:
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 
-            line_layer = self._ensure_layer(
-                doc, line_layer_name, int(colors.get("property_line", 1))
-            )
-            text_layer = self._ensure_layer(
-                doc, text_layer_name, int(colors.get("boundary_text", 3))
-            )
-            street_row_layer = text_layer
-            if plan.lines:
-                street_row_layer = self._ensure_layer(
-                    doc, street_row_layer_name, int(colors.get("street_row", 8))
-                )
-            if line_layer == "0":
-                warnings.append(f"слой {line_layer_name} недоступен — линия нарисована в слое 0")
-            if text_layer == "0":
-                warnings.append(f"слой {text_layer_name} недоступен — текст нарисован в слое 0")
             style = self._ensure_text_style(doc)
+
+            if is_neighbor:
+                neighbor_layer = self._ensure_layer(
+                    doc, neighbor_layer_name, int(colors.get("neighbor_lot", 4))
+                )
+                if neighbor_layer == "0":
+                    warnings.append(
+                        f"слой {neighbor_layer_name} недоступен — сосед нарисован в слое 0"
+                    )
+                poly_target_layer = neighbor_layer
+                text_target_layer = neighbor_layer
+                street_row_layer = neighbor_layer
+            else:
+                line_layer = self._ensure_layer(
+                    doc, line_layer_name, int(colors.get("property_line", 1))
+                )
+                text_layer = self._ensure_layer(
+                    doc, text_layer_name, int(colors.get("boundary_text", 3))
+                )
+                street_row_layer = text_layer
+                if plan.lines:
+                    street_row_layer = self._ensure_layer(
+                        doc, street_row_layer_name, int(colors.get("street_row", 8))
+                    )
+                if line_layer == "0":
+                    warnings.append(
+                        f"слой {line_layer_name} недоступен — линия нарисована в слое 0"
+                    )
+                if text_layer == "0":
+                    warnings.append(
+                        f"слой {text_layer_name} недоступен — текст нарисован в слое 0"
+                    )
+                poly_target_layer = line_layer
+                text_target_layer = text_layer
 
             if plan.lines and hasattr(model_space, "AddLine"):
                 for row_line in plan.lines:
@@ -1749,12 +1984,12 @@ class AcadBuilder:
                     except Exception as exc:  # noqa: BLE001
                         warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
 
-            polyline = self._add_polyline(model_space, plan.vertices, line_layer)
+            polyline = self._add_polyline(model_space, plan.vertices, poly_target_layer)
 
             if plan.arcs and hasattr(model_space, "AddArc"):
                 for arc_item in plan.arcs:
                     try:
-                        self._add_arc(model_space, arc_item, text_layer)
+                        self._add_arc(model_space, arc_item, text_target_layer)
                     except Exception as exc:  # noqa: BLE001
                         warnings.append(f"не удалось создать дугу угла ({arc_item.kind}): {exc}")
 
@@ -1762,7 +1997,7 @@ class AcadBuilder:
             for item in plan.items:
                 try:
                     self._add_text(
-                        model_space, item, plan.text_height, text_layer, style
+                        model_space, item, plan.text_height, text_target_layer, style
                     )
                     created += 1
                 except Exception as exc:  # noqa: BLE001
@@ -1795,12 +2030,15 @@ class AcadBuilder:
             except Exception:  # noqa: BLE001
                 pass
 
-            result_layers = {
-                "property_line": line_layer,
-                "boundary_text": text_layer,
-            }
-            if plan.lines:
-                result_layers["street_row"] = street_row_layer
+            if is_neighbor:
+                result_layers = {"neighbor_lot": poly_target_layer}
+            else:
+                result_layers = {
+                    "property_line": poly_target_layer,
+                    "boundary_text": text_target_layer,
+                }
+                if plan.lines:
+                    result_layers["street_row"] = street_row_layer
 
             return DrawResult(
                 plan=plan,
@@ -1823,6 +2061,15 @@ def draw_legal_description(
     cfg: dict[str, Any] | None = None,
     scale: float | None = None,
     text_height: float | None = None,
+    *,
+    is_neighbor: bool = False,
+    neighbor_label: str | None = None,
 ) -> DrawResult:
-    """Отрисовать участок, не создавая AcadBuilder вручную."""
-    return AcadBuilder(cfg).draw(description, scale=scale, text_height=text_height)
+    """Отрисовать участок (основной или соседний), не создавая AcadBuilder вручную."""
+    return AcadBuilder(cfg).draw(
+        description,
+        scale=scale,
+        text_height=text_height,
+        is_neighbor=is_neighbor,
+        neighbor_label=neighbor_label,
+    )

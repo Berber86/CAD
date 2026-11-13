@@ -45,8 +45,12 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "ASPENWALL_SAMPLES",
+    "BoundarySegment",
     "ConfigError",
     "KeyProtectionError",
+    "LegalDescription",
+    "LegalDescriptionData",
     "LegalDescriptionError",
     "LLMParseError",
     "PDFError",
@@ -58,13 +62,13 @@ __all__ = [
     "PROTECTED_KEY_PREFIX",
     "PROVIDER_ORDER",
     "PROVIDERS_CATALOG",
-    "LegalDescription",
     "ParseOutcome",
     "Segment",
     "TokenUsage",
     "bearing_label",
     "clean_provider_key",
     "dms_to_degrees",
+    "infer_corner_to_pob_bearing",
     "inspect_pdf",
     "is_protected_key",
     "load_config",
@@ -212,11 +216,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "property_line": "PROPERTY_LINE",
         "boundary_text": "BOUNDARY_TEXT_AI",
         "street_row": "STREET_ROW_AI",
+        "neighbor_lot": "NEIGHBOR_LOT",
     },
     "layer_colors": {
         "property_line": 1,
         "boundary_text": 3,
         "street_row": 8,
+        "neighbor_lot": 4,
     },
 }
 
@@ -1007,6 +1013,212 @@ class Segment(BaseModel):
         return self.distance_ft * math.sin(rad), self.distance_ft * math.cos(rad)
 
 
+BoundarySegment = Segment
+
+
+_CARDINAL_TO_AZIMUTH_DEG: dict[str, float] = {
+    "N": 0.0,
+    "NORTH": 0.0,
+    "NORTHERLY": 0.0,
+    "NORTHWARD": 0.0,
+    "NE": 45.0,
+    "NORTHEAST": 45.0,
+    "NORTHEASTERLY": 45.0,
+    "E": 90.0,
+    "EAST": 90.0,
+    "EASTERLY": 90.0,
+    "EASTWARD": 90.0,
+    "SE": 135.0,
+    "SOUTHEAST": 135.0,
+    "SOUTHEASTERLY": 135.0,
+    "S": 180.0,
+    "SOUTH": 180.0,
+    "SOUTHERLY": 180.0,
+    "SOUTHWARD": 180.0,
+    "SW": 225.0,
+    "SOUTHWEST": 225.0,
+    "SOUTHWESTERLY": 225.0,
+    "W": 270.0,
+    "WEST": 270.0,
+    "WESTERLY": 270.0,
+    "WESTWARD": 270.0,
+    "NW": 315.0,
+    "NORTHWEST": 315.0,
+    "NORTHWESTERLY": 315.0,
+}
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Кратчайшая угловая разница в градусах [0, 180]."""
+    diff = (a - b) % 360.0
+    return 360.0 - diff if diff > 180.0 else diff
+
+
+def _make_tie_segment_like(
+    seg: Segment,
+    *,
+    distance_ft: float,
+    flip_180: bool = False,
+) -> Segment:
+    ns_val: Literal["N", "S"] = (
+        ("S" if seg.ns == "N" else "N") if flip_180 else seg.ns
+    )
+    ew_val: Literal["E", "W"] = (
+        ("W" if seg.ew == "E" else "E") if flip_180 else seg.ew
+    )
+    return Segment(
+        ns=ns_val,
+        degrees=seg.degrees,
+        minutes=seg.minutes,
+        seconds=seg.seconds,
+        ew=ew_val,
+        distance_ft=max(float(distance_ft), 1e-6),
+        has_bearing=seg.has_bearing,
+        course_note=None,
+        interior_angle=None,
+    )
+
+
+def _select_front_segment_index_for_tie(
+    segments: Sequence[Segment],
+    *,
+    front_segment_index: int | None = None,
+    front_side: str | None = None,
+    pob_direction_az: float | None = None,
+) -> int:
+    """Определяет индекс фасадного сегмента вдоль main_street для привязки POB."""
+    n = len(segments)
+    if front_segment_index is not None and 0 <= front_segment_index < n:
+        return front_segment_index
+
+    if front_side and front_side.upper() in _CARDINAL_TO_AZIMUTH_DEG and n >= 3:
+        target_az = _CARDINAL_TO_AZIMUTH_DEG[front_side.upper()]
+        tx = math.sin(math.radians(target_az))
+        ty = math.cos(math.radians(target_az))
+        pts: list[tuple[float, float]] = [(0.0, 0.0)]
+        x, y = 0.0, 0.0
+        for s in segments:
+            dx, dy = s.vector
+            x += dx
+            y += dy
+            pts.append((x, y))
+        verts = pts[:-1]
+        area2 = sum(
+            verts[i][0] * verts[(i + 1) % n][1] - verts[(i + 1) % n][0] * verts[i][1]
+            for i in range(n)
+        )
+        ccw = area2 >= 0.0
+        best_idx = 0
+        best_dot = -2.0
+        for idx, s in enumerate(segments):
+            c_note = (s.course_note or "").upper()
+            if "PARALLEL WITH" in c_note or "AT RIGHT ANGLES" in c_note:
+                continue
+            dx, dy = s.vector
+            length = math.hypot(dx, dy)
+            if length < 1e-9:
+                continue
+            nx, ny = (dy / length, -dx / length) if ccw else (-dy / length, dx / length)
+            dot = nx * tx + ny * ty
+            if dot > best_dot:
+                best_dot = dot
+                best_idx = idx
+        if best_dot > -1.5:
+            return best_idx
+
+    if pob_direction_az is not None:
+        best_idx = 0
+        best_collinear = 181.0
+        for idx, s in enumerate(segments):
+            c_note = (s.course_note or "").upper()
+            if "PARALLEL WITH" in c_note or "AT RIGHT ANGLES" in c_note:
+                continue
+            d_same = _angle_diff_deg(s.azimuth_deg, pob_direction_az)
+            d_opp = _angle_diff_deg((s.azimuth_deg + 180.0) % 360.0, pob_direction_az)
+            collinear_err = min(d_same, d_opp)
+            if collinear_err < best_collinear - 1e-6 or (
+                abs(collinear_err - best_collinear) <= 1e-6 and idx == n - 1
+            ):
+                best_collinear = collinear_err
+                best_idx = idx
+        return best_idx
+
+    return 0
+
+
+def infer_corner_to_pob_bearing(
+    segments: Sequence[Segment],
+    *,
+    distance_to_corner_ft: float | None,
+    front_segment_index: int | None = None,
+    front_side: str | None = None,
+    pob_direction: str | float | None = None,
+    explicit_tie_segment: Segment | None = None,
+) -> Segment | None:
+    """
+    Вычисляет вектор привязки от перекрёстка улиц (0.0, 0.0) к точке начала участка (POB):
+      * Для углового участка (`distance_to_corner_ft <= 0`) возвращает `None`.
+      * Если в первом абзаце (COMMENCING AT) явно указан румб подхода к POB — берёт его.
+      * Если указано кардинальное направление («distant 420.00 feet easterly from the corner…») —
+        выбирает из `(front_seg, flip_180(front_seg))` румб вдоль `main_street`, сонаправленный ему.
+      * Иначе определяет знак геометрически по положению POB относительно середины фасада:
+        для замыкающего сегмента вдоль `main_street` (NYC: `S 75°20'20" W ... to POB`) разворачивает
+        румб строго на 180° (`N 75°20'20" E`), а для стартового сегмента от POB дальше от угла —
+        сохраняет направление фасадного сегмента.
+    """
+    if distance_to_corner_ft is None or distance_to_corner_ft <= 1e-6 or not segments:
+        return None
+    dist = float(distance_to_corner_ft)
+
+    if explicit_tie_segment is not None:
+        return _make_tie_segment_like(
+            explicit_tie_segment, distance_ft=dist, flip_180=False
+        )
+
+    pob_az: float | None = None
+    if isinstance(pob_direction, (int, float)):
+        pob_az = float(pob_direction) % 360.0
+    elif isinstance(pob_direction, str) and pob_direction.strip():
+        token = pob_direction.strip().upper()
+        pob_az = _CARDINAL_TO_AZIMUTH_DEG.get(token)
+
+    front_idx = _select_front_segment_index_for_tie(
+        segments,
+        front_segment_index=front_segment_index,
+        front_side=front_side,
+        pob_direction_az=pob_az,
+    )
+    front_seg = segments[front_idx]
+
+    if pob_az is not None:
+        diff_same = _angle_diff_deg(front_seg.azimuth_deg, pob_az)
+        diff_flip = _angle_diff_deg((front_seg.azimuth_deg + 180.0) % 360.0, pob_az)
+        return _make_tie_segment_like(
+            front_seg,
+            distance_ft=dist,
+            flip_180=(diff_flip + 1e-6 < diff_same),
+        )
+
+    x, y = 0.0, 0.0
+    start_x, start_y = 0.0, 0.0
+    for idx, seg in enumerate(segments):
+        if idx == front_idx:
+            start_x, start_y = x, y
+            break
+        dx, dy = seg.vector
+        x += dx
+        y += dy
+    fdx, fdy = front_seg.vector
+    mid_x = start_x + 0.5 * fdx
+    mid_y = start_y + 0.5 * fdy
+    dot_along_front = mid_x * fdx + mid_y * fdy
+    return _make_tie_segment_like(
+        front_seg,
+        distance_ft=dist,
+        flip_180=(dot_along_front < -1e-9),
+    )
+
+
 class LegalDescription(BaseModel):
     """Результат разбора документа целиком (Schedule A / Deed / Survey PDF)."""
 
@@ -1026,11 +1238,21 @@ class LegalDescription(BaseModel):
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
     )
-    distance_to_corner_ft: float | None = Field(
+    distance_to_corner_ft: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Расстояние вдоль фасадной улицы до угла/пересечения (0.0, 0.0), футы "
+            "(0.0 для углового участка или если привязка к углу отсутствует)"
+        ),
+    )
+    corner_to_pob_bearing: Segment | None = Field(
         default=None,
         description=(
-            "Расстояние вдоль фасадной улицы до угла/пересечения, футы "
-            "(0 для углового участка; null если не указано)"
+            "Румб и длина шага ОТ перекрёстка улиц (0.0, 0.0) К точке начала (POB) "
+            "вдоль main_street (null для углового участка distance_to_corner_ft == 0). "
+            "Если в преамбуле указано только направление ('distant 420 feet easterly from the corner'), "
+            "вычисляется по румбу main_street как противоположный на 180° замыкающему сегменту вдоль улицы."
         ),
     )
     tie_note: str | None = Field(
@@ -1079,6 +1301,29 @@ class LegalDescription(BaseModel):
         description="Стороны участка по порядку обхода (каждый call = один элемент)",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _preprocess_corner_tie(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        raw_dist = _coerce_float(data.get("distance_to_corner_ft"))
+        dist = raw_dist if raw_dist is not None and raw_dist > 0.0 else 0.0
+        tie = data.get("corner_to_pob_bearing")
+        if dist <= 1e-6:
+            if tie is not None:
+                return {**data, "corner_to_pob_bearing": None}
+            return data
+        if isinstance(tie, dict):
+            if not any(v not in (None, "", 0, 0.0, False) for v in tie.values()):
+                return {**data, "corner_to_pob_bearing": None}
+            tie_dist = _coerce_float(tie.get("distance_ft"))
+            if tie_dist is None or tie_dist <= 0.0:
+                return {
+                    **data,
+                    "corner_to_pob_bearing": {**tie, "distance_ft": dist},
+                }
+        return data
+
     @field_validator("main_street", mode="before")
     @classmethod
     def _normalize_main_street(cls, value: Any) -> str:
@@ -1099,8 +1344,11 @@ class LegalDescription(BaseModel):
 
     @field_validator("distance_to_corner_ft", mode="before")
     @classmethod
-    def _normalize_corner_distance(cls, value: Any) -> float | None:
-        return _coerce_float(value)
+    def _normalize_corner_distance(cls, value: Any) -> float:
+        num = _coerce_float(value)
+        if num is None or num < 0.0:
+            return 0.0
+        return float(num)
 
     @field_validator("front_segment_index", "cross_street_side_index", mode="before")
     @classmethod
@@ -1167,6 +1415,21 @@ class LegalDescription(BaseModel):
             and self.cross_street_side_index >= len(self.segments)
         ):
             self.cross_street_side_index = None
+
+        if self.distance_to_corner_ft <= 1e-6:
+            self.corner_to_pob_bearing = None
+        elif self.corner_to_pob_bearing is None:
+            self.corner_to_pob_bearing = infer_corner_to_pob_bearing(
+                self.segments,
+                distance_to_corner_ft=self.distance_to_corner_ft,
+                front_segment_index=self.front_segment_index,
+                front_side=self.front_side,
+            )
+        elif abs(self.corner_to_pob_bearing.distance_ft - self.distance_to_corner_ft) > 1e-6:
+            self.corner_to_pob_bearing = _make_tie_segment_like(
+                self.corner_to_pob_bearing,
+                distance_ft=self.distance_to_corner_ft,
+            )
         return self
 
     @property
@@ -1175,6 +1438,9 @@ class LegalDescription(BaseModel):
 
     def to_json(self, indent: int = 2) -> str:
         return self.model_dump_json(indent=indent)
+
+
+LegalDescriptionData = LegalDescription
 
 
 # ---------------------------------------------------------------------------
@@ -1299,10 +1565,11 @@ SYSTEM_PROMPT = """You are a senior licensed New York / USA land-survey technici
 You extract closed lot boundary geometry from a metes-and-bounds legal description (Schedule A / Deed) OR from an image of an existing Title / Architectural Survey plat into strict JSON.
 
 CRITICAL SURVEY RULES
-1. LOT BOUNDARY vs. TIE LINES ("COMMENCING AT"):
+1. LOT BOUNDARY vs. TIE LINES ("COMMENCING AT") & CORNER-TO-POB VECTOR:
    - NEVER include tie/commencing calls from a distant street corner to the Point of Beginning (POB) in `segments`!
    - Example: if a deed or survey shows 1–3 tie calls from an intersection (e.g. 510.52', 433.78', 208.02' from Mill Rd & New Dorp Ln, or 101.42', 17.49', 1542.23' from Arthur Kill Rd) leading TO the lot corner (POB), EXCLUDE those tie calls from `segments`.
-   - Put the immediate distance along `main_street` to the nearest corner into `distance_to_corner_ft` (use 0 for a corner lot), and put any compound tie or dual Deed/Tax-Map note (e.g. "208.02' (DEED) / 208.22' (T.M.)") into `tie_note`.
+   - Put the immediate distance along `main_street` from the street intersection `(0.0, 0.0)` to POB into `distance_to_corner_ft` (use `0.0` for a corner lot), and put any compound tie or dual Deed/Tax-Map note (e.g. "208.02' (DEED) / 208.22' (T.M.)") into `tie_note`.
+   - `corner_to_pob_bearing`: when `distance_to_corner_ft > 0`, provide the exact quadrant bearing (`ns`, `degrees`, `minutes`, `seconds`, `ew`) and `distance_ft = distance_to_corner_ft` pointing FROM the street corner `(0.0, 0.0)` TO `POB` along `main_street` (use `null` when `distance_to_corner_ft == 0`). If the opening paragraph only gives a word direction (e.g. "distant 420.00 feet easterly from the corner..."), take the exact DMS bearing of `main_street` and orient it toward POB — i.e., if the closing segment along `main_street` returning to POB is `S 75°20'20" W`, flip it by 180° to `N 75°20'20" E`!
 2. IGNORE BUILDING & FENCE OFFSETS:
    - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'") with lot boundary lines.
    - When both "(DEED)" and "(T.M.)" / "(TAX MAP)" values appear, prefer the "(DEED)" / record survey dimension.
@@ -1929,10 +2196,6 @@ def _azimuth_to_quadrant_dict(azimuth_deg: float) -> dict[str, Any]:
     }
 
 
-def _angle_diff_deg(a: float, b: float) -> float:
-    return abs((a - b + 180.0) % 360.0 - 180.0)
-
-
 _CARDINAL_AZIMUTH: dict[str, float] = {
     "north": 0.0,
     "northerly": 0.0,
@@ -2475,12 +2738,21 @@ def _extract_streets(
             main_street = mentions[0][1]
 
     # 6. Пересекаемая улица: «... feet East of the East line of Oak Avenue» или угол из COMMENCING.
+    _DIR_WORDS = (
+        r"(?:Northeasterly|Northwesterly|Southeasterly|Southwesterly|"
+        r"Northeast|Northwest|Southeast|Southwest|"
+        r"Northerly|Southerly|Easterly|Westerly|"
+        r"Northward|Southward|Eastward|Westward|"
+        r"East|West|North|South)"
+    )
     if not cross_street:
         cross_patterns = [
-            r"(?:feet|ft|')\s+(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
+            r"(?:feet|ft|')\s*" + _DIR_WORDS + r"?\s*"
             r"(?:of|from)\s+the\s+(?:[A-Za-z]+\s+){0,2}?"
             r"(?:line|side|right[- ]of[- ]way|centerline|corner)\s+of\s+(?P<block>[^.;:]{0,80})",
             r"\bintersection\s+of\s+(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?(?P<block>[^.;:]{0,80})",
+            r"\bintersection\s+of\s+[^.;:]{1,95}?\b(?:with|and)\s+"
+            r"(?:the\s+(?:[A-Za-z]+\s+){0,2}?(?:side|line|right[- ]of[- ]way)\s+of\s+)?(?P<block>[^.;:,]{1,80})",
             r"(?:line|side|right[- ]of[- ]way)\s+of\s+(?P<block>[^.;:]{0,80})",
         ]
         for pattern in cross_patterns:
@@ -2495,15 +2767,19 @@ def _extract_streets(
     # 7. Расстояние до угла: обычное («150.00 feet East of ...») или последнее звено привязки COMMENCING.
     if distance_to_corner is None:
         distance_match = re.search(
-            r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s*"
+            r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
+            r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
             r"(?:\([^)]*\)\s*)?"
-            r"(?:East|West|North|South|Easterly|Westerly|Northerly|Southerly)?\s*"
-            r"(?:of|from)\s+the\s+",
+            + _DIR_WORDS
+            + r"?\s*(?:of|from)\s+the\s+",
             text,
             re.IGNORECASE,
         )
         if distance_match:
-            distance_to_corner = float(distance_match.group("num").replace(",", ""))
+            feet_val = float(distance_match.group("num").replace(",", ""))
+            inch_raw = distance_match.group("inch")
+            inch_val = float(inch_raw) / 12.0 if inch_raw else 0.0
+            distance_to_corner = feet_val + inch_val
         elif preamble:
             tie_dists = list(_DISTANCE_RE.finditer(preamble))
             if tie_dists:
@@ -2524,6 +2800,63 @@ def _extract_streets(
     if cross_street and distance_to_corner is None:
         warnings.append("пересекаемая улица найдена, но расстояние до угла не распознано")
     return main_street, cross_street, distance_to_corner, front_side, tie_note, warnings
+
+
+def _extract_pob_tie_hint(
+    *,
+    preamble: str,
+    lot_body: str,
+    distance_to_corner: float | None,
+) -> tuple[str | None, Segment | None]:
+    """
+    Извлекает из преамбулы / первого абзаца до первого THENCE:
+      * словесное направление от перекрёстка к POB ('easterly', 'West', 'northeasterly', ...);
+      * явный румб последнего звена COMMENCING к POB (если указан в градусах).
+    """
+    if distance_to_corner is None or distance_to_corner <= 1e-6:
+        return None, None
+
+    explicit_seg: Segment | None = None
+    if preamble:
+        prem_segs, _ = _segments_from_regex(preamble)
+        if prem_segs:
+            last_raw = prem_segs[-1]
+            if last_raw.get("has_bearing", True) and abs(
+                float(last_raw.get("distance_ft", 0.0)) - float(distance_to_corner)
+            ) <= max(1.0, 0.02 * float(distance_to_corner)):
+                try:
+                    explicit_seg = Segment.model_validate(last_raw)
+                except Exception:  # noqa: BLE001
+                    explicit_seg = None
+
+    lot_intro = re.split(
+        r"\b(?:RUNNING\s+)?THENCE\b", lot_body, maxsplit=1, flags=re.IGNORECASE
+    )[0]
+    header_text = f"{preamble} {lot_intro}".strip()
+
+    dir_re_after_dist = re.compile(
+        r"\d[\d,]*(?:\.\d+)?\s*(?:feet|ft|')"
+        r"(?:\s*\d+(?:\.\d+)?\s*(?:inches|inch|in|\"))?\s*"
+        r"(?:\([^)]*\)\s*)?"
+        r"(?P<dir>northeasterly|northwesterly|southeasterly|southwesterly|"
+        r"northeast|northwest|southeast|southwest|"
+        r"northerly|southerly|easterly|westerly|"
+        r"northward|southward|eastward|westward|"
+        r"north|south|east|west)\s+"
+        r"(?:along\s+[^,;]{1,60}?\s+)?(?:of|from)\b",
+        re.IGNORECASE,
+    )
+    dir_re_before_dist = re.compile(
+        r"\b(?P<dir>northeasterly|northwesterly|southeasterly|southwesterly|"
+        r"northerly|southerly|easterly|westerly)\s+"
+        r"(?:along\s+[^,;]{1,60}?\s+)?"
+        r"(?:a\s+distance\s+of\s+|distant\s+)?"
+        r"\d[\d,]*(?:\.\d+)?\s*(?:feet|ft|')\s+(?:of|from)\b",
+        re.IGNORECASE,
+    )
+    m = dir_re_after_dist.search(header_text) or dir_re_before_dist.search(header_text)
+    pob_dir = m.group("dir").upper() if m else None
+    return pob_dir, explicit_seg
 
 
 def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
@@ -2565,6 +2898,21 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
     if tie_note and not meta.get("tie_note"):
         meta["tie_note"] = tie_note
 
+    pob_dir, explicit_tie = _extract_pob_tie_hint(
+        preamble=preamble,
+        lot_body=lot_body,
+        distance_to_corner=distance_to_corner,
+    )
+    validated_segs = [Segment.model_validate(s) for s in raw_segments]
+    corner_tie = infer_corner_to_pob_bearing(
+        validated_segs,
+        distance_to_corner_ft=distance_to_corner,
+        front_segment_index=meta["front_segment_index"],
+        front_side=front_side,
+        pob_direction=pob_dir,
+        explicit_tie_segment=explicit_tie,
+    )
+
     try:
         model = LegalDescription.model_validate(
             {
@@ -2572,6 +2920,7 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
                 "main_street_note": meta["main_street_note"],
                 "cross_street": cross_street,
                 "distance_to_corner_ft": distance_to_corner,
+                "corner_to_pob_bearing": corner_tie,
                 "tie_note": meta["tie_note"],
                 "front_side": front_side,
                 "front_segment_index": meta["front_segment_index"],
@@ -2579,7 +2928,7 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
                 "block_number": meta["block_number"],
                 "lot_number": meta["lot_number"],
                 "borough_or_city": meta["borough_or_city"],
-                "segments": raw_segments,
+                "segments": validated_segs,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -2592,6 +2941,48 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
 # ---------------------------------------------------------------------------
 # Эталонные реальные примеры NYC Title Survey (для кнопки «Пример» и тестов)
 # ---------------------------------------------------------------------------
+
+ASPENWALL_SAMPLES: dict[str, str] = {
+    "Aspenwall St — 420' (Основной участок)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough and County of Queens, City and State of New York, "
+        "known as Block 5012 Lot 28:\n"
+        "BEGINNING at a point on the southerly side of Aspenwall Street, distant 420.00 feet "
+        "easterly from the corner formed by the intersection of the southerly side of "
+        "Aspenwall Street with the easterly side of 149th Street;\n"
+        "RUNNING THENCE S 14°39'40\" E, 100.00 feet;\n"
+        "THENCE N 75°20'20\" E, 55.00 feet;\n"
+        "THENCE N 14°39'40\" W, 100.00 feet to the southerly side of Aspenwall Street;\n"
+        "THENCE S 75°20'20\" W along the southerly side of Aspenwall Street, 55.00 feet "
+        "to the point or place of BEGINNING."
+    ),
+    "Aspenwall St — 365' (Сосед слева)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough and County of Queens, City and State of New York, "
+        "known as Block 5012 Lot 26:\n"
+        "BEGINNING at a point on the southerly side of Aspenwall Street, distant 365.00 feet "
+        "easterly from the corner formed by the intersection of the southerly side of "
+        "Aspenwall Street with the easterly side of 149th Street;\n"
+        "RUNNING THENCE S 14°39'40\" E, 100.00 feet;\n"
+        "THENCE N 75°20'20\" E, 55.00 feet;\n"
+        "THENCE N 14°39'40\" W, 100.00 feet to the southerly side of Aspenwall Street;\n"
+        "THENCE S 75°20'20\" W along the southerly side of Aspenwall Street, 55.00 feet "
+        "to the point or place of BEGINNING."
+    ),
+    "Aspenwall St — 475' (Сосед справа)": (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being "
+        "in the Borough and County of Queens, City and State of New York, "
+        "known as Block 5012 Lot 30:\n"
+        "BEGINNING at a point on the southerly side of Aspenwall Street, distant 475.00 feet "
+        "easterly from the corner formed by the intersection of the southerly side of "
+        "Aspenwall Street with the easterly side of 149th Street;\n"
+        "RUNNING THENCE S 14°39'40\" E, 100.00 feet;\n"
+        "THENCE N 75°20'20\" E, 55.00 feet;\n"
+        "THENCE N 14°39'40\" W, 100.00 feet to the southerly side of Aspenwall Street;\n"
+        "THENCE S 75°20'20\" W along the southerly side of Aspenwall Street, 55.00 feet "
+        "to the point or place of BEGINNING."
+    ),
+}
 
 NYC_SAMPLES: dict[str, str] = {
     "147 Dartmouth Loop (Staten Island)": (
@@ -2724,6 +3115,7 @@ def _repair_llm_geometry(
     model: LegalDescription,
     *,
     from_vision: bool = False,
+    source_text: str = "",
 ) -> tuple[LegalDescription, list[str]]:
     """
     Упреждающая санитарная проверка ответа LLM / Vision-разбора чертежа:
@@ -2733,7 +3125,8 @@ def _repair_llm_geometry(
          (или в произвольном порядке сторон) и контур разомкнут (> 0.5 ft), проверяет,
          существует ли перестановка/разворот румбов на 180°, дающий точное замыкание
          (<= 0.05 ft) простого многоугольника без самопересечений. Реальные ошибки длин
-         в deed'е (например 130' вместо 120') не маскируются, т.к. не дают <= 0.05 ft.
+         в deed'е (например 130' вместо 120') не маскируются, т.к. не дают <= 0.05 ft;
+      4) сверяет вектор привязки corner_to_pob_bearing с направлением к POB вдоль main_street.
     """
     notes: list[str] = []
     updates: dict[str, Any] = {}
@@ -2749,7 +3142,6 @@ def _repair_llm_geometry(
 
     if (
         model.cross_street_side_index is not None
-        and model.distance_to_corner_ft is not None
         and model.distance_to_corner_ft > 0.5
     ):
         updates["cross_street_side_index"] = None
@@ -2800,6 +3192,39 @@ def _repair_llm_geometry(
                 f"скорректирован порядок/направление обхода сторон по замыканию контура "
                 f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
             )
+
+    if model.distance_to_corner_ft > 1e-6:
+        eff_segs = updates.get("segments", model.segments)
+        eff_f_idx = updates.get("front_segment_index", model.front_segment_index)
+        pob_dir: str | None = None
+        explicit_tie: Segment | None = None
+        if source_text.strip():
+            preamble, lot_body = _split_preamble_and_body(source_text)
+            pob_dir, explicit_tie = _extract_pob_tie_hint(
+                preamble=preamble,
+                lot_body=lot_body,
+                distance_to_corner=model.distance_to_corner_ft,
+            )
+        expected_tie = infer_corner_to_pob_bearing(
+            eff_segs,
+            distance_to_corner_ft=model.distance_to_corner_ft,
+            front_segment_index=eff_f_idx,
+            front_side=model.front_side,
+            pob_direction=pob_dir,
+            explicit_tie_segment=explicit_tie,
+        )
+        cur_tie = model.corner_to_pob_bearing
+        if expected_tie is not None:
+            if cur_tie is None or "segments" in updates or "front_segment_index" in updates:
+                updates["corner_to_pob_bearing"] = expected_tie
+            elif (
+                (pob_dir is not None or explicit_tie is not None)
+                and _angle_diff_deg(cur_tie.azimuth_deg, expected_tie.azimuth_deg) > 120.0
+            ):
+                updates["corner_to_pob_bearing"] = expected_tie
+                notes.append(
+                    "развёрнут румб привязки corner_to_pob_bearing по направлению от угла к POB"
+                )
 
     if updates:
         model = model.model_copy(update=updates)
@@ -2889,7 +3314,9 @@ def parse_legal_description_full(
                 image_data_urls=image_data_urls or None,
             )
             parsed_model, repair_notes = _repair_llm_geometry(
-                parsed_model, from_vision=bool(image_data_urls)
+                parsed_model,
+                from_vision=bool(image_data_urls),
+                source_text=combined,
             )
             warnings.extend(repair_notes)
             if mode != "structured-outputs":

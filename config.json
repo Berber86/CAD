@@ -93,11 +93,13 @@
   "layers": {
     "property_line": "PROPERTY_LINE",
     "boundary_text": "BOUNDARY_TEXT_AI",
-    "street_row": "STREET_ROW_AI"
+    "street_row": "STREET_ROW_AI",
+    "neighbor_lot": "NEIGHBOR_LOT"
   },
   "layer_colors": {
     "property_line": 1,
     "boundary_text": 3,
-    "street_row": 8
+    "street_row": 8,
+    "neighbor_lot": 4
   }
 }

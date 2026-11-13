@@ -59,8 +59,10 @@ from acad_builder import (
     AcadBuilderError,
     AcadConnectionError,
     DrawResult,
+    compute_pob_point,
 )
 from llm_parser import (
+    ASPENWALL_SAMPLES,
     CONFIG_PATH,
     ENV_PATH,
     LOCAL_CONFIG_PATH,
@@ -85,8 +87,8 @@ from llm_parser import (
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD (Prototype 1)"
-APP_GEOMETRY = "1050x960"
-VERSION = "0.4.0"
+APP_GEOMETRY = "1080x980"
+VERSION = "0.5.0"
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -437,16 +439,26 @@ class SurveyApp(ctk.CTk):
 
         toolbar = ctk.CTkFrame(input_frame, fg_color="transparent")
         toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        toolbar.grid_columnconfigure(2, weight=1)
+        toolbar.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(
             toolbar, text="Legal Description", font=ctk.CTkFont(size=14, weight="bold")
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(toolbar, text="Загрузить PDF", width=120, command=self._load_pdf).grid(
-            row=0, column=1, padx=(12, 0)
+        ctk.CTkButton(toolbar, text="Загрузить PDF", width=118, command=self._load_pdf).grid(
+            row=0, column=1, padx=(10, 0)
         )
+        self.batch_neighbors_button = ctk.CTkButton(
+            toolbar,
+            text="Пакет соседей…",
+            width=132,
+            fg_color=("#1b6b7a", "#1b6b7a"),
+            hover_color=("#238799", "#238799"),
+            command=self._load_and_draw_neighbor_files,
+        )
+        self.batch_neighbors_button.grid(row=0, column=2, padx=(6, 0))
         self._sample_presets: dict[str, str] = {
             "Базовый пример (TX)": EXAMPLE_TEXT,
             **NYC_SAMPLES,
+            **ASPENWALL_SAMPLES,
         }
         self.sample_var = ctk.StringVar(value="Базовый пример (TX)")
         self.sample_menu = ctk.CTkOptionMenu(
@@ -456,17 +468,38 @@ class SurveyApp(ctk.CTk):
             width=215,
             command=self._on_sample_selected,
         )
-        self.sample_menu.grid(row=0, column=3, padx=(8, 0))
-        ctk.CTkButton(toolbar, text="Пример", width=85, command=self._insert_example).grid(
-            row=0, column=4, padx=(6, 0)
-        )
-        ctk.CTkButton(toolbar, text="Очистить", width=85, command=self._clear_text).grid(
+        self.sample_menu.grid(row=0, column=4, padx=(8, 0))
+        ctk.CTkButton(toolbar, text="Пример", width=80, command=self._insert_example).grid(
             row=0, column=5, padx=(6, 0)
+        )
+        ctk.CTkButton(toolbar, text="Очистить", width=80, command=self._clear_text).grid(
+            row=0, column=6, padx=(6, 0)
         )
         self.pdf_label = ctk.CTkLabel(
             toolbar, text="PDF не загружен", text_color=("#8fa3b8", "#8fa3b8")
         )
-        self.pdf_label.grid(row=0, column=2, sticky="e", padx=12)
+        self.pdf_label.grid(row=0, column=3, sticky="e", padx=10)
+
+        # Переключатель режима: Основной участок vs Соседний участок (NEIGHBOR_LOT)
+        role_bar = ctk.CTkFrame(input_frame, fg_color="transparent")
+        role_bar.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+        self.lot_role_var = ctk.StringVar(value="main")
+        self.main_lot_radio = ctk.CTkRadioButton(
+            role_bar,
+            text="Основной участок (с подписями границ)",
+            variable=self.lot_role_var,
+            value="main",
+            command=self._on_lot_role_changed,
+        )
+        self.main_lot_radio.grid(row=0, column=0, sticky="w", padx=(0, 18))
+        self.neighbor_lot_radio = ctk.CTkRadioButton(
+            role_bar,
+            text="Соседний участок (только контур в слое NEIGHBOR_LOT)",
+            variable=self.lot_role_var,
+            value="neighbor",
+            command=self._on_lot_role_changed,
+        )
+        self.neighbor_lot_radio.grid(row=0, column=1, sticky="w")
 
         self.text_box = ctk.CTkTextbox(input_frame, wrap="word", font=ctk.CTkFont(size=13))
         self.text_box.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -479,7 +512,7 @@ class SurveyApp(ctk.CTk):
         self.parse_button = ctk.CTkButton(
             actions,
             text="Разобрать описание",
-            width=190,
+            width=175,
             command=lambda: self._start(parse_only=True),
         )
         self.parse_button.grid(row=0, column=0, sticky="w")
@@ -490,11 +523,22 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold"),
             command=lambda: self._start(parse_only=False),
         )
-        self.draw_button.grid(row=0, column=1, padx=12, sticky="ew")
-        self.save_button = ctk.CTkButton(
-            actions, text="Сохранить настройки", width=170, command=self._save_settings
+        self.draw_button.grid(row=0, column=1, padx=(10, 6), sticky="ew")
+        self.add_neighbor_button = ctk.CTkButton(
+            actions,
+            text="Добавить соседа на чертёж",
+            height=42,
+            width=215,
+            fg_color=("#1b6b7a", "#1b6b7a"),
+            hover_color=("#238799", "#238799"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self._start(parse_only=False, force_neighbor=True),
         )
-        self.save_button.grid(row=0, column=2, sticky="e")
+        self.add_neighbor_button.grid(row=0, column=2, padx=(6, 10), sticky="e")
+        self.save_button = ctk.CTkButton(
+            actions, text="Сохранить настройки", width=165, command=self._save_settings
+        )
+        self.save_button.grid(row=0, column=3, sticky="e")
 
         self.progress = ctk.CTkProgressBar(self, mode="indeterminate")
         self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 0))
@@ -658,6 +702,16 @@ class SurveyApp(ctk.CTk):
             text=f"высота текста = {base:g} × ({scale:g} / 16) = {height:.3f}"
         )
 
+    def is_neighbor_mode(self) -> bool:
+        """True, если в переключателе выбран режим «Соседний участок»."""
+        return str(self.lot_role_var.get() or "main") == "neighbor"
+
+    def _on_lot_role_changed(self) -> None:
+        if self.is_neighbor_mode():
+            self.draw_button.configure(text="Начертить соседа в AutoCAD")
+        else:
+            self.draw_button.configure(text="Начертить участок в AutoCAD")
+
     def _on_sample_selected(self, label: str) -> None:
         sample = self._sample_presets.get(label)
         if not sample:
@@ -666,6 +720,11 @@ class SurveyApp(ctk.CTk):
         self.text_box.insert("1.0", sample)
         self.pdf_path = None
         self._pdf_needs_vision = False
+        if "Сосед" in label:
+            self.lot_role_var.set("neighbor")
+        elif "Основной" in label:
+            self.lot_role_var.set("main")
+        self._on_lot_role_changed()
         self.pdf_label.configure(
             text=f"Пример: {label}",
             text_color=("#8fa3b8", "#8fa3b8"),
@@ -904,20 +963,168 @@ class SurveyApp(ctk.CTk):
                     self._apply_parsed(outcome)
                     self._set_status(self._parsed_summary(outcome))
                     self.closure_var.set(self._closure_text(outcome))
+            elif kind == "batch_neighbors":
+                items_done, batch_errors = payload
+                self._finish_busy()
+                self.batch_neighbor_results = items_done
+                for out, res in items_done:
+                    self._apply_parsed(out)
+                    if res is not None:
+                        self.draw_result = res
+                msg_parts = [
+                    f"Пакет соседей: обработано {len(items_done)} уч. в слое NEIGHBOR_LOT"
+                ]
+                if batch_errors:
+                    msg_parts.append(f"ошибок: {len(batch_errors)} (см. лог)")
+                    for err_line in batch_errors:
+                        self._log_line(f"! {err_line}")
+                self._set_status("  |  ".join(msg_parts), error=bool(batch_errors and not items_done))
+                if items_done:
+                    last_out, last_res = items_done[-1]
+                    self.closure_var.set(
+                        last_res.closure.short_report()
+                        if last_res is not None
+                        else self._closure_text(last_out)
+                    )
             elif kind == "done":
                 self._finish_busy()
         self.after(120, self._drain_events)
+
+    def _set_controls_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.draw_button.configure(state=state)
+        self.add_neighbor_button.configure(state=state)
+        self.batch_neighbors_button.configure(state=state)
+        self.parse_button.configure(state=state)
+        self.save_button.configure(state=state)
+        self.save_env_button.configure(state=state)
 
     def _finish_busy(self) -> None:
         self._busy = False
         self.progress.stop()
         self.progress.set(0)
-        self.draw_button.configure(state="normal")
-        self.parse_button.configure(state="normal")
-        self.save_button.configure(state="normal")
-        self.save_env_button.configure(state="normal")
+        self._set_controls_busy(False)
 
-    def _start(self, parse_only: bool) -> None:
+    def _load_and_draw_neighbor_files(self) -> None:
+        """Пакетная загрузка нескольких PDF/TXT соседних участков и дорисовка в AutoCAD от (0, 0)."""
+        if self._busy:
+            return
+        from tkinter import filedialog
+
+        paths = filedialog.askopenfilenames(
+            title="Выберите файлы соседних участков (PDF или TXT) для слоя NEIGHBOR_LOT",
+            filetypes=[
+                ("PDF и текстовые описания", "*.pdf *.txt"),
+                ("PDF", "*.pdf"),
+                ("Текст", "*.txt"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        file_list = [Path(p) for p in paths if str(p).strip()]
+        if not file_list:
+            return
+
+        cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
+        use_llm = bool(self.use_llm_var.get())
+        scale = self._current_scale()
+        provider_title = self._pid_to_label.get(provider_id, provider_id)
+
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(
+            f"Пакетная отрисовка соседей: выбрано файлов — {len(file_list)}…"
+        )
+        self._log_line(
+            f"--- Пакет соседей ({len(file_list)} файл., масштаб 1\"={scale:g}', "
+            f"режим={'LLM: ' + provider_title + ' / ' + model_name if use_llm else 'regex'}) ---"
+        )
+        worker = threading.Thread(
+            target=self._batch_neighbors_worker,
+            args=(
+                file_list,
+                cfg,
+                provider_id,
+                model_name,
+                api_key,
+                key_secret,
+                use_llm,
+                scale,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    def _batch_neighbors_worker(
+        self,
+        file_list: list[Path],
+        cfg: dict[str, Any],
+        provider_id: str,
+        model_name: str,
+        api_key: str | None,
+        key_secret: str,
+        use_llm: bool,
+        scale: float,
+    ) -> None:
+        done_items: list[tuple[ParseOutcome, DrawResult | None]] = []
+        errors: list[str] = []
+        builder = AcadBuilder(cfg)
+        total = len(file_list)
+        for idx, fpath in enumerate(file_list, start=1):
+            try:
+                self._post(
+                    "progress",
+                    f"[{idx}/{total}] Разбираю соседний участок: {fpath.name}…",
+                )
+                if fpath.suffix.lower() == ".pdf":
+                    outcome = parse_legal_description_full(
+                        pdf_path=fpath,
+                        cfg=cfg,
+                        use_llm=use_llm,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                else:
+                    raw_txt = fpath.read_text(encoding="utf-8", errors="replace")
+                    outcome = parse_legal_description_full(
+                        text=raw_txt,
+                        cfg=cfg,
+                        use_llm=use_llm,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                if use_llm:
+                    self._last_valid_secret = key_secret
+
+                if sys.platform != "win32":
+                    raise AcadConnectionError(
+                        "Отрисовка возможна только в Windows с запущенным AutoCAD "
+                        f"(текущая ОС: {sys.platform})"
+                    )
+                self._post(
+                    "progress",
+                    f"[{idx}/{total}] Рисую соседа «{fpath.name}» в слое NEIGHBOR_LOT…",
+                )
+                draw_res = builder.draw(
+                    outcome.data, scale=scale, is_neighbor=True
+                )
+                done_items.append((outcome, draw_res))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{fpath.name}: {exc}")
+        self._post("batch_neighbors", (done_items, errors))
+        self._post("done", None)
+
+    def _start(self, parse_only: bool, *, force_neighbor: bool = False) -> None:
         if self._busy:
             return
         text = self.text_box.get("1.0", "end").strip()
@@ -928,21 +1135,20 @@ class SurveyApp(ctk.CTk):
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
         scale = self._current_scale()
+        is_neighbor = bool(force_neighbor or self.is_neighbor_mode())
         provider_title = self._pid_to_label.get(provider_id, provider_id)
 
         self._busy = True
-        self.draw_button.configure(state="disabled")
-        self.parse_button.configure(state="disabled")
-        self.save_button.configure(state="disabled")
-        self.save_env_button.configure(state="disabled")
+        self._set_controls_busy(True)
         self.progress.start()
         if use_llm:
             self.tokens_var.set(
                 f"Токены за вызов: запрос к {provider_title} / {model_name}…"
             )
-        self._set_status("Разбираю описание…")
+        role_note = "соседний участок (NEIGHBOR_LOT)" if is_neighbor else "основной участок"
+        self._set_status(f"Разбираю описание ({role_note})…")
         self._log_line(
-            f"--- Новый запуск (масштаб 1\"={scale:g}', "
+            f"--- Новый запуск ({role_note}, масштаб 1\"={scale:g}', "
             f"режим={'LLM: ' + provider_title + ' / ' + model_name if use_llm else 'regex'}) ---"
         )
 
@@ -960,6 +1166,7 @@ class SurveyApp(ctk.CTk):
                 use_llm,
                 scale,
                 parse_only,
+                is_neighbor,
             ),
             daemon=True,
         )
@@ -977,6 +1184,7 @@ class SurveyApp(ctk.CTk):
         use_llm: bool,
         scale: float,
         parse_only: bool,
+        is_neighbor: bool = False,
     ) -> None:
         try:
             outcome = parse_legal_description_full(
@@ -994,10 +1202,13 @@ class SurveyApp(ctk.CTk):
             if use_llm:
                 self._last_valid_secret = key_secret
             builder = AcadBuilder(cfg)
-            plan = builder.plan(outcome.data, scale=scale)
+            plan = builder.plan(
+                outcome.data, scale=scale, is_neighbor=is_neighbor
+            )
             self._post(
                 "progress",
                 f"Готово ({outcome.source}): сторон {len(outcome.data.segments)}, "
+                f"POB ({plan.pob[0]:+.2f}, {plan.pob[1]:+.2f}) ft, "
                 f"Closure Error {plan.closure.distance:.3f} ft",
             )
             if parse_only:
@@ -1005,13 +1216,20 @@ class SurveyApp(ctk.CTk):
                 self._post("done", None)
                 return
 
-            self._post("progress", "Рисую в AutoCAD…")
+            self._post(
+                "progress",
+                "Добавляю соседа в AutoCAD (слой NEIGHBOR_LOT)…"
+                if is_neighbor
+                else "Рисую основной участок в AutoCAD…",
+            )
             if sys.platform != "win32":
                 raise AcadConnectionError(
                     "Отрисовка возможна только в Windows с запущенным AutoCAD "
                     f"(текущая ОС: {sys.platform})"
                 )
-            result = builder.draw(outcome.data, scale=scale)
+            result = builder.draw(
+                outcome.data, scale=scale, is_neighbor=is_neighbor
+            )
             self._post("parsed", (outcome, result))
             self._post("done", None)
         except KeyProtectionError as exc:
@@ -1106,12 +1324,19 @@ class SurveyApp(ctk.CTk):
             parts.append(bl)
         if data.cross_street:
             distance = data.distance_to_corner_ft
-            if distance is not None and distance <= 1e-6:
-                parts.append(f"Угол с {data.cross_street}")
+            if distance <= 1e-6:
+                parts.append(f"Угол с {data.cross_street} (POB 0.00, 0.00)")
             else:
+                pob_x, pob_y = compute_pob_point(data)
+                tie_lbl = (
+                    f" по {data.corner_to_pob_bearing.bearing_label}"
+                    if data.corner_to_pob_bearing is not None
+                    and data.corner_to_pob_bearing.has_bearing
+                    else ""
+                )
                 parts.append(
-                    f"Пересечение: {data.cross_street}"
-                    + (f", {distance:.2f} ft до угла" if distance is not None else "")
+                    f"Пересечение: {data.cross_street}, {distance:.2f} ft{tie_lbl} "
+                    f"→ POB ({pob_x:+.2f}, {pob_y:+.2f})"
                 )
         if outcome.warnings:
             parts.append(f"предупреждений: {len(outcome.warnings)} (см. лог)")

@@ -68,8 +68,10 @@ from acad_builder import (
     AcadConnectionError,
     DrawPlan,
     DrawResult,
+    NeighborVerificationReport,
     compute_pob_point,
     format_distance,
+    verify_with_neighbors,
 )
 from llm_parser import (
     ASPENWALL_SAMPLES,
@@ -106,7 +108,7 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1180x880"
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # Палитра Dark CAD Studio (высокий контраст, спокойные инженерные акценты)
 THEME: dict[str, str] = {
@@ -275,6 +277,7 @@ class SurveyApp(ctk.CTk):
         self._preview_main_plan: DrawPlan | None = None
         self._preview_neighbor_plans: list[DrawPlan] = []
         self._last_active_plan: DrawPlan | None = None
+        self._neighbor_report: NeighborVerificationReport | None = None
 
         # Провайдеры и их модели
         entries = provider_entries(self.config_data)
@@ -1050,6 +1053,18 @@ class SurveyApp(ctk.CTk):
         )
         self.neighbor_lot_radio.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=7)
 
+        self.verify_neighbors_button = ctk.CTkButton(
+            role_bar,
+            text="🔍 Сверка с соседями",
+            width=162,
+            height=28,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._on_verify_neighbors_clicked,
+        )
+        self.verify_neighbors_button.grid(row=0, column=3, sticky="e", padx=(4, 4), pady=6)
+
         self.batch_neighbors_button = ctk.CTkButton(
             role_bar,
             text="📂 Пакет соседей…",
@@ -1060,7 +1075,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._load_and_draw_neighbor_files,
         )
-        self.batch_neighbors_button.grid(row=0, column=3, sticky="e", padx=8, pady=6)
+        self.batch_neighbors_button.grid(row=0, column=4, sticky="e", padx=(2, 8), pady=6)
 
         self.text_box = ctk.CTkTextbox(
             input_frame,
@@ -1775,10 +1790,99 @@ class SurveyApp(ctk.CTk):
         self._refresh_auto_orient_warning()
         self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
 
+    def _refresh_neighbor_verify_button(self) -> None:
+        if not hasattr(self, "verify_neighbors_button"):
+            return
+        rep = self._neighbor_report
+        if rep is None or not rep.pair_reports:
+            self.verify_neighbors_button.configure(
+                text="🔍 Сверка с соседями",
+                fg_color=THEME["btn_secondary"],
+                hover_color=THEME["btn_secondary_hover"],
+            )
+            return
+        if rep.overall_status == "ok":
+            self.verify_neighbors_button.configure(
+                text=rep.short_badge(),
+                fg_color="#059669",
+                hover_color="#047857",
+            )
+        elif rep.overall_status == "warn":
+            self.verify_neighbors_button.configure(
+                text=rep.short_badge(),
+                fg_color="#d97706",
+                hover_color="#b45309",
+            )
+        else:
+            self.verify_neighbors_button.configure(
+                text=rep.short_badge(),
+                fg_color="#dc2626",
+                hover_color="#b91c1c",
+            )
+
+    def _recompute_neighbor_verification(self) -> NeighborVerificationReport | None:
+        if self._preview_main_plan is None or not self._preview_neighbor_plans:
+            self._neighbor_report = None
+            self._refresh_neighbor_verify_button()
+            return None
+        self._neighbor_report = verify_with_neighbors(
+            self._preview_main_plan, self._preview_neighbor_plans
+        )
+        self._refresh_neighbor_verify_button()
+        return self._neighbor_report
+
+    def _append_neighbor_verification_to_status(self) -> None:
+        """
+        Если в сцене присутствуют и основной участок, и хотя бы один сосед,
+        добавляет результат сверки в статус и журнал (а при расхождении подсвечивает!).
+        """
+        rep = self._neighbor_report
+        if rep is None or not rep.pair_reports:
+            return
+        cur = str(self.status_var.get() or "").strip()
+        if not rep.has_issues:
+            self._log_line(rep.headline())
+            if rep.headline() not in cur:
+                self.status_var.set(f"{cur}  |  {rep.headline()}" if cur else rep.headline())
+            return
+
+        # Собираем первую ключевую диагностическую подсказку для мгновенного показа юзеру
+        first_hint = ""
+        for pr in rep.pair_reports:
+            if pr.status == "ok":
+                continue
+            for ec in pr.shared_edges:
+                if ec.status != "ok" and ec.diagnoses:
+                    first_hint = (
+                        f"Сосед #{pr.neighbor_index} (сторона #{ec.main_seg_index} ↔ "
+                        f"#{ec.neighbor_seg_index}): {ec.diagnoses[0]}"
+                    )
+                    break
+            if not first_hint and pr.findings:
+                first_hint = f"Сосед #{pr.neighbor_index}: {pr.findings[0]}"
+            if first_hint:
+                break
+
+        alert_parts: list[str] = []
+        if rep.headline() not in cur:
+            alert_parts.append(rep.headline())
+        if first_hint and first_hint not in cur:
+            alert_parts.append(f"   ↳ {first_hint}")
+        self._log_line(rep.format_report())
+        if alert_parts:
+            block = "\n".join(alert_parts)
+            new_status = f"{cur}\n{block}" if cur else block
+            self.status_var.set(new_status)
+        self.status_label.configure(
+            text_color=THEME["err"] if rep.overall_status == "error" else THEME["warn"]
+        )
+
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
         self._preview_neighbor_plans.clear()
         self._last_active_plan = None
+        self._neighbor_report = None
+        self._refresh_neighbor_verify_button()
         self._render_empty_inspector()
 
     def _record_plan_for_preview(self, plan: DrawPlan, *, warnings: list[str] | None = None) -> None:
@@ -1796,6 +1900,7 @@ class SurveyApp(ctk.CTk):
         else:
             self._preview_main_plan = plan
 
+        self._recompute_neighbor_verification()
         self.preview_mode_var.set("📐 Схема CAD")
         self.preview_mode_switch.set("📐 Схема CAD")
         self._set_inspector_text(self._build_inspector_report(plan, extra_warnings=warnings))
@@ -1860,6 +1965,17 @@ class SurveyApp(ctk.CTk):
             lines.append("Геодезические пояснения:")
             for n_line in notes_all:
                 lines.append(f"  • {n_line}")
+
+        if self._neighbor_report is not None and self._neighbor_report.pair_reports:
+            lines.append("")
+            lines.append("═" * 46)
+            lines.append("🔍 СВЕРКА С СОСЕДНИМИ УЧАСТКАМИ")
+            lines.append("═" * 46)
+            lines.append(
+                self._neighbor_report.format_report(
+                    compact=not self._neighbor_report.has_issues
+                )
+            )
         return "\n".join(lines)
 
     def _draw_source_visual_on_canvas(self, canvas: Any, w: int, h: int) -> None:
@@ -2128,6 +2244,47 @@ class SurveyApp(ctk.CTk):
                     fill=THEME["sky"],
                     font=("Segoe UI", 9, "bold"),
                 )
+
+        # 5. Индикация сверки общих границ с соседями поверх схемы
+        if self._neighbor_report is not None and self._neighbor_report.pair_reports:
+            for pr in self._neighbor_report.pair_reports:
+                for ec in pr.shared_edges:
+                    mx1, my1 = to_screen(ec.main_line[0])
+                    mx2, my2 = to_screen(ec.main_line[1])
+                    mid_x, mid_y = 0.5 * (mx1 + mx2), 0.5 * (my1 + my2)
+                    if ec.status == "ok":
+                        canvas.create_text(
+                            mid_x,
+                            mid_y + 9,
+                            text="✓ межа",
+                            fill=THEME["ok"],
+                            font=("Segoe UI", 8, "bold"),
+                        )
+                    else:
+                        hl_color = (
+                            THEME["err"] if ec.status == "error" else THEME["warn"]
+                        )
+                        nx1, ny1 = to_screen(ec.neighbor_line[0])
+                        nx2, ny2 = to_screen(ec.neighbor_line[1])
+                        canvas.create_line(
+                            nx1, ny1, nx2, ny2, fill=hl_color, width=3, dash=(5, 3)
+                        )
+                        tag_parts: list[str] = []
+                        if ec.angle_diff_arcsec > 1.0:
+                            tag_parts.append(f"Δ∠{ec.angle_diff_dms}")
+                        if ec.abs_length_diff_ft > 0.015:
+                            tag_parts.append(f"ΔL{ec.abs_length_diff_ft:.2f}'")
+                        if not tag_parts:
+                            tag_parts.append(
+                                f"сдвиг {max(ec.lateral_offset_start_ft, ec.lateral_offset_end_ft):.2f}'"
+                            )
+                        canvas.create_text(
+                            mid_x,
+                            mid_y + 11,
+                            text="⚠ " + " ".join(tag_parts),
+                            fill=hl_color,
+                            font=("Consolas", 8, "bold"),
+                        )
 
         # Стрелка на Север в правом верхнем углу схемы
         nx_c, ny_c = w - 20, 26
@@ -2591,6 +2748,7 @@ class SurveyApp(ctk.CTk):
                             is_neighbor=self.is_neighbor_mode(),
                         )
                         self._record_plan_for_preview(plan, warnings=outcome.warnings)
+                        self._append_neighbor_verification_to_status()
                         self._update_closure_badge(
                             plan.closure.short_report(), plan.closure.distance
                         )
@@ -2619,6 +2777,7 @@ class SurveyApp(ctk.CTk):
                     "  |  ".join(msg_parts),
                     error=bool(batch_errors and not items_done),
                 )
+                self._append_neighbor_verification_to_status()
                 if items_done:
                     last_out, last_res = items_done[-1]
                     if last_res is not None:
@@ -2627,6 +2786,36 @@ class SurveyApp(ctk.CTk):
                         )
                     else:
                         self._update_closure_badge(self._closure_text(last_out), None)
+            elif kind == "verify_neighbors_done":
+                plans_done, verify_errors, open_popup = payload
+                self._finish_busy()
+                for out, nb_plan in plans_done:
+                    self._apply_parsed(out)
+                    self._record_plan_for_preview(nb_plan, warnings=out.warnings)
+                if verify_errors:
+                    for err_line in verify_errors:
+                        self._log_line(f"! {err_line}")
+                if self._neighbor_report is not None and self._neighbor_report.pair_reports:
+                    rep = self._neighbor_report
+                    self._set_status(
+                        rep.headline(),
+                        error=(rep.overall_status == "error"),
+                        warn=(rep.overall_status == "warn"),
+                    )
+                    if rep.has_issues:
+                        # Показываем первую конкретную причину прямо в статусе
+                        self._append_neighbor_verification_to_status()
+                    if self._preview_main_plan is not None:
+                        self._set_inspector_text(
+                            self._build_inspector_report(self._preview_main_plan)
+                        )
+                    if open_popup:
+                        self._open_neighbor_report_window()
+                elif verify_errors:
+                    self._set_status(
+                        f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
+                        error=True,
+                    )
             elif kind == "done":
                 self._finish_busy()
         self.after(120, self._drain_events)
@@ -2635,6 +2824,7 @@ class SurveyApp(ctk.CTk):
         state = "disabled" if busy else "normal"
         self.draw_button.configure(state=state)
         self.add_neighbor_button.configure(state=state)
+        self.verify_neighbors_button.configure(state=state)
         self.batch_neighbors_button.configure(state=state)
         self.parse_button.configure(state=state)
         self.save_button.configure(state=state)
@@ -2645,6 +2835,290 @@ class SurveyApp(ctk.CTk):
         self.progress.stop()
         self.progress.set(0)
         self._set_controls_busy(False)
+
+    def _open_neighbor_report_window(self) -> None:
+        """Открывает отдельное окно подробного акта сверки с соседними участками."""
+        rep = self._neighbor_report
+        if rep is None or not rep.pair_reports:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Акт геодезической сверки с соседями — Title Survey AI")
+        win.geometry("880x620")
+        win.configure(fg_color=THEME["bg_root"])
+        win.attributes("-topmost", True)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        head_color = (
+            THEME["ok"]
+            if rep.overall_status == "ok"
+            else (THEME["err"] if rep.overall_status == "error" else THEME["warn"])
+        )
+        header_frame = ctk.CTkFrame(
+            win,
+            fg_color=THEME["bg_card"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        header_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        header_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header_frame,
+            text=rep.headline(),
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=head_color,
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=10)
+
+        ctk.CTkButton(
+            header_frame,
+            text="➕ Добавить ещё файлы соседей…",
+            width=210,
+            height=28,
+            fg_color=THEME["btn_neighbor"],
+            hover_color=THEME["btn_neighbor_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: (win.destroy(), self._pick_and_verify_neighbor_files()),
+        ).grid(row=0, column=1, padx=(6, 10), pady=8)
+
+        report_box = ctk.CTkTextbox(
+            win,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        report_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        full_text = rep.format_report(compact=False)
+        report_box.insert("1.0", full_text)
+        target = getattr(report_box, "_textbox", report_box)
+        target.configure(state="disabled")
+
+        btn_bar = ctk.CTkFrame(win, fg_color="transparent")
+        btn_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        btn_bar.grid_columnconfigure(0, weight=1)
+
+        def _copy_report() -> None:
+            clip_fn = getattr(self, "clipboard_clear", None)
+            append_fn = getattr(self, "clipboard_append", None)
+            if callable(clip_fn) and callable(append_fn):
+                clip_fn()
+                append_fn(full_text)
+            self._set_status("Акт сверки с соседями скопирован в буфер обмена.")
+
+        ctk.CTkButton(
+            btn_bar,
+            text="📋 Скопировать акт сверки",
+            width=190,
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            command=_copy_report,
+        ).grid(row=0, column=1, padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="Закрыть",
+            width=110,
+            height=30,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            command=win.destroy,
+        ).grid(row=0, column=2)
+
+    def _on_verify_neighbors_clicked(self) -> None:
+        """
+        Запускает или открывает интеллектуальную сверку с соседними участками
+        (без обязательного открытия AutoCAD).
+        """
+        if self._busy:
+            return
+        # Если основной участок ещё не в сцене, но в поле есть текст и мы в режиме основного лота —
+        # пробуем быстро собрать его офлайн для сверки
+        if self._preview_main_plan is None:
+            if self.description is not None and not self.is_neighbor_mode():
+                try:
+                    self._preview_main_plan = AcadBuilder(self.config_data).plan(
+                        self.description,
+                        scale=self._current_scale(),
+                        is_neighbor=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not self.is_neighbor_mode():
+                raw_txt = self.text_box.get("1.0", "end").strip()
+                if len(raw_txt) >= 20:
+                    try:
+                        desc_quick, warns_quick = parse_with_regex(raw_txt)
+                        plan_quick = AcadBuilder(self.config_data).plan(
+                            desc_quick,
+                            scale=self._current_scale(),
+                            is_neighbor=False,
+                        )
+                        self._record_plan_for_preview(plan_quick, warnings=warns_quick)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        if self._preview_main_plan is None:
+            self._set_status(
+                "Сначала разберите основной участок («Проверить» или «Начертить»), "
+                "чтобы было с чем сверять соседние участки.",
+                error=True,
+            )
+            return
+
+        if not self._preview_neighbor_plans:
+            self._pick_and_verify_neighbor_files()
+            return
+
+        rep = self._recompute_neighbor_verification()
+        if rep is not None:
+            self.preview_mode_var.set("📐 Схема CAD")
+            self.preview_mode_switch.set("📐 Схема CAD")
+            self._set_inspector_text(self._build_inspector_report(self._preview_main_plan))
+            self._redraw_preview_canvas()
+            self._set_status(
+                rep.headline(),
+                error=(rep.overall_status == "error"),
+                warn=(rep.overall_status == "warn"),
+            )
+            if rep.has_issues:
+                self._append_neighbor_verification_to_status()
+            self._open_neighbor_report_window()
+
+    def _pick_and_verify_neighbor_files(self) -> None:
+        """Выбирает файлы соседей (PDF / фото JPG / TXT) и сверяет их с основным участком без AutoCAD."""
+        if self._busy:
+            return
+        from tkinter import filedialog
+
+        ext_glob = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
+        paths = filedialog.askopenfilenames(
+            title="Выберите файлы соседних участков для сверки границ (PDF, фото JPG/PNG/TIFF или TXT)",
+            filetypes=[
+                ("PDF, фото чертежей и описания", f"*.pdf {ext_glob} *.txt"),
+                ("PDF", "*.pdf"),
+                ("Фотографии чертежей", ext_glob),
+                ("Текст", "*.txt"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        file_list = [Path(p) for p in paths if str(p).strip()]
+        if not file_list:
+            return
+
+        cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
+        use_llm = bool(self.use_llm_var.get())
+        if any(is_image_file(p) for p in file_list) and not use_llm:
+            use_llm = True
+            self.use_llm_var.set(True)
+            self._refresh_consensus_rows()
+        scale = self._current_scale()
+        has_visual = any(
+            is_image_file(p) or p.suffix.lower() == ".pdf" for p in file_list
+        )
+        do_auto_orient = self._consume_one_shot_auto_orient(has_visual)
+
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(
+            f"Сверка с соседями: разбираю {len(file_list)} файл. соседних участков…"
+        )
+        worker = threading.Thread(
+            target=self._verify_neighbors_only_worker,
+            args=(
+                file_list,
+                cfg,
+                provider_id,
+                model_name,
+                api_key,
+                key_secret,
+                use_llm,
+                scale,
+                do_auto_orient,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    def _verify_neighbors_only_worker(
+        self,
+        file_list: list[Path],
+        cfg: dict[str, Any],
+        provider_id: str,
+        model_name: str,
+        api_key: str | None,
+        key_secret: str,
+        use_llm: bool,
+        scale: float,
+        do_auto_orient: bool = False,
+    ) -> None:
+        plans_done: list[tuple[ParseOutcome, DrawPlan]] = []
+        errors: list[str] = []
+        builder = AcadBuilder(cfg)
+        total = len(file_list)
+        do_enhance = bool(cfg.get("api", {}).get("vision_enhance_scans", True))
+        for idx, fpath in enumerate(file_list, start=1):
+            try:
+                self._post(
+                    "progress",
+                    f"[{idx}/{total}] Сверка с соседями — читаю {fpath.name}…",
+                )
+                if is_image_file(fpath):
+                    outcome = parse_legal_description_full(
+                        image_paths=[fpath],
+                        cfg=cfg,
+                        enhance_scan=do_enhance,
+                        auto_orient=do_auto_orient,
+                        use_llm=True,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                elif fpath.suffix.lower() == ".pdf":
+                    outcome = parse_legal_description_full(
+                        pdf_path=fpath,
+                        cfg=cfg,
+                        enhance_scan=do_enhance,
+                        auto_orient=do_auto_orient,
+                        use_llm=use_llm,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                else:
+                    raw_txt = fpath.read_text(encoding="utf-8", errors="replace")
+                    outcome = parse_legal_description_full(
+                        text=raw_txt,
+                        cfg=cfg,
+                        use_llm=use_llm,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                if use_llm or is_image_file(fpath):
+                    self._last_valid_secret = key_secret
+                nb_plan = builder.plan(outcome.data, scale=scale, is_neighbor=True)
+                plans_done.append((outcome, nb_plan))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{fpath.name}: {exc}")
+        self._post("verify_neighbors_done", (plans_done, errors, True))
+        self._post("done", None)
 
     def _load_and_draw_neighbor_files(self) -> None:
         """Пакетная загрузка нескольких PDF / JPG / TXT соседних участков и дорисовка в AutoCAD от (0, 0)."""
@@ -3518,6 +3992,7 @@ class SurveyApp(ctk.CTk):
         if outcome.warnings:
             summary_text += "\n" + "\n".join(f"• {w}" for w in outcome.warnings)
         self._set_status(summary_text)
+        self._append_neighbor_verification_to_status()
         self._update_closure_badge(
             result.closure.short_report(), result.closure.distance
         )

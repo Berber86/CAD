@@ -994,6 +994,75 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
     app._on_close()
 
 
+def test_gui_neighbor_verification_button_alerts_canvas_and_report_modal(
+    gui, monkeypatch, tmp_path
+):
+    """
+    Проверяет сквозную работу «🔍 Сверка с соседями» в GUI без открытого AutoCAD:
+      * выбор пресета основного участка 420' -> нажатие «🔍 Сверка с соседями»;
+      * выбор двух файлов соседей: левый 365' (чистый) и правый 475' с ошибкой секунд
+        (40" -> 49" на общей меже) и опечаткой длины (100.00' -> 108.00' на общей меже);
+      * автоматическое оповещение юзера в статусной строке, блоке правой ведомости,
+        бейдже кнопки и визуальной подсветке на preview_canvas («✓ межа» и «⚠ Δ∠…»).
+    """
+    import time
+    from tkinter import filedialog
+
+    from llm_parser import ASPENWALL_SAMPLES
+
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    assert app._preview_main_plan is not None
+    assert app.verify_neighbors_button.cget("text") == "🔍 Сверка с соседями"
+
+    # Левый сосед — эталонный, правый сосед — с секундной ошибкой 40"->49" и длиной 108.00'
+    nb_left_txt = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    nb_right_broken_txt = (
+        ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"]
+        .replace('S 14°39\'40" E, 100.00 feet', 'S 14°39\'49" E, 108.00 feet')
+        .replace('N 14°39\'40" W, 100.00 feet', 'N 14°39\'49" W, 108.00 feet')
+    )
+    f_left = tmp_path / "nb_365_clean.txt"
+    f_right = tmp_path / "nb_475_typo.txt"
+    f_left.write_text(nb_left_txt, encoding="utf-8")
+    f_right.write_text(nb_right_broken_txt, encoding="utf-8")
+
+    monkeypatch.setattr(
+        filedialog, "askopenfilenames", lambda **_: (str(f_left), str(f_right))
+    )
+    app._on_verify_neighbors_clicked()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app._neighbor_report is not None
+    assert app._neighbor_report.has_issues is True
+    assert "⚠ расх." in app.verify_neighbors_button.cget("text")
+
+    status_txt = app.status_var.get()
+    assert "обнаружено расхождение" in status_txt
+    assert ("0 ↔ 9" in status_txt) or ("0 ↔ 8" in status_txt) or ("секунд" in status_txt)
+
+    insp_txt = app.inspector_box.get("1.0", "end")
+    assert "🔍 СВЕРКА С СОСЕДНИМИ УЧАСТКАМИ" in insp_txt
+    assert "0 ↔ 9" in insp_txt  # секунды 40" против 49"
+    assert "0 ↔ 8" in insp_txt  # длина 100.00' против 108.00'
+
+    canvas_texts = [
+        it[2].get("text", "") for it in app.preview_canvas.items if it[0] == "text"
+    ]
+    assert any("✓ межа" in t for t in canvas_texts)
+    assert any("⚠ " in t and "ΔL8.00'" in t for t in canvas_texts)
+
+    # Повторный клик при уже загруженных соседях открывает модальный акт без перезапроса файлов
+    app._on_verify_neighbors_clicked()
+    app._on_close()
+
+
+
 
 
 

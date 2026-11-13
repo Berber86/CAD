@@ -2216,6 +2216,180 @@ def test_photo_pdf_page_range_and_ai_auto_orient_prepass(tmp_path, monkeypatch):
     assert not any("Автоповорот ИИ" in w for w in outcome_default.warnings)
 
 
+# ------------------------- Интеллектуальная сверка с соседями (v0.9.0) ------
+
+
+def test_neighbor_verification_clean_wall_to_wall_and_polygon_intersection():
+    """
+    Проверяет:
+      * на идеальной тройке участков Aspenwall St (365' + 420' + 475') сверка с обоими
+        соседями выдаёт overall_status == 'ok', 0 ошибок, 0 предупреждений и 2 общие межи;
+      * точное вычисление площади пересечения 2D-полигонов (в т.ч. невыпуклого L-участка).
+    """
+    from acad_builder import polygon_intersection_area, verify_with_neighbors
+    from llm_parser import ASPENWALL_SAMPLES
+
+    builder = AcadBuilder(load_config())
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    dl, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    dr, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"])
+
+    pm = builder.plan(dm, scale=16.0, is_neighbor=False)
+    pl = builder.plan(dl, scale=16.0, is_neighbor=True)
+    pr = builder.plan(dr, scale=16.0, is_neighbor=True)
+
+    rep = verify_with_neighbors(pm, [pl, pr])
+    assert rep.overall_status == "ok"
+    assert rep.has_issues is False
+    assert rep.error_count == 0 and rep.warning_count == 0
+    assert rep.total_shared_edges == 2
+    assert "✓ норма" in rep.short_badge()
+    for pair in rep.pair_reports:
+        assert pair.status == "ok"
+        assert pair.overlap_area_sqft == 0.0
+        assert len(pair.shared_edges) == 1
+        ec = pair.shared_edges[0]
+        assert ec.angle_diff_arcsec == pytest.approx(0.0, abs=1e-4)
+        assert ec.abs_length_diff_ft == pytest.approx(0.0, abs=1e-6)
+
+    # Проверка площади 2D-пересечения невыпуклого Г-образного полигона и прямоугольника
+    l_shape = [(0, 0), (60, 0), (60, 20), (20, 20), (20, 60), (0, 60)]
+    rect = [(10, 10), (40, 10), (40, 50), (10, 50)]
+    # Внутри L-фигуры лежит полоса [10..20]×[10..50] (400) + [20..40]×[10..20] (200) = 600 sq ft
+    assert polygon_intersection_area(l_shape, rect) == pytest.approx(600.0, abs=1e-4)
+
+
+def test_neighbor_verification_intelligent_diagnostics_all_heuristics():
+    """
+    Комплексный тест интеллектуальных эвристик «Сверки с соседями»:
+      1) ошибка OCR в секундах румба (40" -> 48": SECONDS_ONLY_DIFF + «0 ↔ 8»);
+      2) опечатка перевёрнутой цифры в минутах (39' -> 36': MINUTES_DIFF + «9 ↔ 6»)
+         и в градусах (14° -> 19°: DEGREES_TYPO + «4 ↔ 9»);
+      3) перепутана буква квадранта (E -> W: QUADRANT_LETTER_TYPO + виновник 'neighbor');
+      4) путаница «дюймы ↔ десятые фута» (100.50' = 100'-6" vs 100.60': FEET_INCHES_CONFUSION)
+         и перестановка соседних цифр в длине (105.00' vs 150.00': «05 ↔ 50»);
+      5) систематический поворот базиса румбов (+0°18'00" по всем сторонам: DATUM_ROTATION);
+      6) параллельная щель Gore (1.50') и параллельный заступ Overlap (150.00 sq ft);
+      7) кросс-проверка замкнутости при ошибке в НАШЕМ участке (likely_culprit == 'main').
+    """
+    from acad_builder import verify_with_neighbors
+    from llm_parser import ASPENWALL_SAMPLES
+
+    builder = AcadBuilder(load_config())
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    dl, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    dr, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"])
+    pm = builder.plan(dm, scale=16.0, is_neighbor=False)
+
+    # 1) Разница только в секундах (40" vs 48" -> OCR 0↔8, без ложной тревоги Overlap)
+    dl_sec = dl.model_copy(deep=True)
+    s3 = dl_sec.segments[2]
+    dl_sec.segments[2] = Segment(
+        ns=s3.ns, degrees=s3.degrees, minutes=s3.minutes, seconds=48.0, ew=s3.ew, distance_ft=s3.distance_ft
+    )
+    rep1 = verify_with_neighbors(pm, [builder.plan(dl_sec, scale=16.0, is_neighbor=True)])
+    ec1 = rep1.pair_reports[0].shared_edges[0]
+    assert "SECONDS_ONLY_DIFF" in ec1.issue_codes
+    assert any("0 ↔ 8" in d for d in ec1.diagnoses)
+    assert rep1.pair_reports[0].overlap_area_sqft == 0.0
+
+    # 2) Опечатка в минутах (39' -> 36' = 9↔6) и в градусах (14° -> 19° = 4↔9)
+    dl_min = dl.model_copy(deep=True)
+    dl_min.segments[2] = Segment(
+        ns=s3.ns, degrees=s3.degrees, minutes=36, seconds=s3.seconds, ew=s3.ew, distance_ft=s3.distance_ft
+    )
+    ec2_m = verify_with_neighbors(pm, [builder.plan(dl_min, scale=16.0, is_neighbor=True)]).pair_reports[0].shared_edges[0]
+    assert "MINUTES_DIFF" in ec2_m.issue_codes
+    assert any("9 ↔ 6" in d for d in ec2_m.diagnoses)
+
+    dl_deg = dl.model_copy(deep=True)
+    dl_deg.segments[2] = Segment(
+        ns=s3.ns, degrees=19, minutes=s3.minutes, seconds=s3.seconds, ew=s3.ew, distance_ft=s3.distance_ft
+    )
+    ec2_d = verify_with_neighbors(pm, [builder.plan(dl_deg, scale=16.0, is_neighbor=True)]).pair_reports[0].shared_edges[0]
+    assert "DEGREES_TYPO" in ec2_d.issue_codes
+    assert any("4 ↔ 9" in d for d in ec2_d.diagnoses)
+
+    # 3) Зеркальная опечатка буквы квадранта (W вместо E у правого соседа)
+    dr_flip = dr.model_copy(deep=True)
+    r1 = dr_flip.segments[0]
+    dr_flip.segments[0] = Segment(
+        ns=r1.ns, degrees=r1.degrees, minutes=r1.minutes, seconds=r1.seconds, ew="W", distance_ft=r1.distance_ft
+    )
+    ec3 = verify_with_neighbors(pm, [builder.plan(dr_flip, scale=16.0, is_neighbor=True)]).pair_reports[0].shared_edges[0]
+    assert "QUADRANT_LETTER_TYPO" in ec3.issue_codes
+    assert ec3.likely_culprit == "neighbor"
+    assert any("«W» вместо ожидаемого «E»" in d for d in ec3.diagnoses)
+
+    # 4) Путаница «дюймы ↔ десятые фута» (100.50' vs 100.60') и перестановка цифр длины (105 vs 150)
+    dm_1005 = dm.model_copy(deep=True)
+    dm_1005.segments[0] = Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=100.50)
+    dm_1005.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.50)
+    dl_1006 = dl.model_copy(deep=True)
+    dl_1006.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.60)
+    ec4_fi = verify_with_neighbors(
+        builder.plan(dm_1005, scale=16.0), [builder.plan(dl_1006, scale=16.0, is_neighbor=True)]
+    ).pair_reports[0].shared_edges[0]
+    assert "FEET_INCHES_CONFUSION" in ec4_fi.issue_codes
+    assert any("100'-6\"" in d for d in ec4_fi.diagnoses)
+
+    dm_105 = dm.model_copy(deep=True)
+    dm_105.segments[0] = Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=105.0)
+    dm_105.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=105.0)
+    dl_150 = dl.model_copy(deep=True)
+    dl_150.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=150.0)
+    ec4_tr = verify_with_neighbors(
+        builder.plan(dm_105, scale=16.0), [builder.plan(dl_150, scale=16.0, is_neighbor=True)]
+    ).pair_reports[0].shared_edges[0]
+    assert "LENGTH_DIGIT_TYPO" in ec4_tr.issue_codes
+    assert any("05 ↔ 50" in d for d in ec4_tr.diagnoses)
+
+    # 5) Систематический поворот базиса румбов (+0°18'00" по всем 4 сторонам соседа)
+    dr_rot = dr.model_copy(deep=True)
+    dr_rot.segments = [
+        Segment(ns="S", degrees=14, minutes=21, seconds=40, ew="E", distance_ft=100.0),
+        Segment(ns="N", degrees=75, minutes=38, seconds=20, ew="E", distance_ft=55.0),
+        Segment(ns="N", degrees=14, minutes=21, seconds=40, ew="W", distance_ft=100.0),
+        Segment(ns="S", degrees=75, minutes=38, seconds=20, ew="W", distance_ft=55.0),
+    ]
+    rep5 = verify_with_neighbors(pm, [builder.plan(dr_rot, scale=16.0, is_neighbor=True)])
+    pr5 = rep5.pair_reports[0]
+    assert pr5.datum_rotation_arcsec == pytest.approx(1080.0, abs=1.0)
+    assert "DATUM_ROTATION" in pr5.shared_edges[0].issue_codes
+
+    # 6) Параллельная щель Gore (363.5' -> 1.50') и параллельный Overlap (366.5' -> 150 sq ft)
+    dl_gore = dl.model_copy(deep=True)
+    dl_gore.distance_to_corner_ft = 363.5
+    dl_gore.corner_to_pob_bearing = Segment(ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=363.5)
+    dl_over = dl.model_copy(deep=True)
+    dl_over.distance_to_corner_ft = 366.5
+    dl_over.corner_to_pob_bearing = Segment(ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=366.5)
+    rep6 = verify_with_neighbors(
+        pm,
+        [
+            builder.plan(dl_gore, scale=16.0, is_neighbor=True),
+            builder.plan(dl_over, scale=16.0, is_neighbor=True),
+        ],
+    )
+    assert rep6.pair_reports[0].overlap_area_sqft == 0.0
+    assert "PARALLEL_SHIFT" in rep6.pair_reports[0].shared_edges[0].issue_codes
+    assert any("Gore" in d for d in rep6.pair_reports[0].shared_edges[0].diagnoses)
+    assert rep6.pair_reports[1].overlap_area_sqft == pytest.approx(150.0, abs=0.1)
+    assert any("Overlap" in d for d in rep6.pair_reports[1].shared_edges[0].diagnoses)
+
+    # 7) Кросс-проверка замкнутости при опечатке В НАШЕМ основном участке (103' вместо 100')
+    dm_bad = dm.model_copy(deep=True)
+    dm_bad.segments[0] = Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=103.0)
+    rep7 = verify_with_neighbors(
+        builder.plan(dm_bad, scale=16.0, is_neighbor=False),
+        [builder.plan(dl, scale=16.0, is_neighbor=True)],
+    )
+    ec7 = rep7.pair_reports[0].shared_edges[0]
+    assert ec7.likely_culprit == "main"
+    assert any("НАШЕМ описании" in d for d in ec7.diagnoses)
+
+
+
 
 
 

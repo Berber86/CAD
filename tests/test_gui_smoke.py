@@ -39,10 +39,18 @@ class _Widget:
         self._value = var.get() if var is not None else (self._values[0] if self._values else "")
 
     def grid(self, *args, **kwargs):
+        self._gridded = True
+        return self
+
+    def grid_remove(self, *args, **kwargs):
+        self._gridded = False
         return self
 
     def pack(self, *args, **kwargs):
         return self
+
+    def pack_forget(self, *args, **kwargs):
+        return None
 
     def configure(self, **kwargs):
         self._kwargs.update(kwargs)
@@ -517,6 +525,161 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
     assert drawn_calls[-2:] == [(365.0, True), (475.0, True)]
     assert "обработано 2 уч. в слое NEIGHBOR_LOT" in app.status_var.get()
     app._on_close()
+
+
+def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_path):
+    """
+    Проверяет полный цикл 2–3 независимых проходов LLM в GUI:
+      1) переключение 1 / 2 / 3 проходов и выбор любых провайдеров/моделей (в т.ч. одинаковых);
+      2) случай полного совпадения ответов (2/2 проходов) -> без конфликта;
+      3) случай расхождения ответов -> сигнализация конфликта + окно сравнения +
+         кнопка «Попробуй разобраться ещё раз» с инъекцией спорного места -> модели сходятся;
+      4) ручное решение конфликта человеком («Прав Проход #2») -> отрисовка в AutoCAD.
+    """
+    import time
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, TokenUsage, parse_with_regex
+
+    cfg_file = tmp_path / "config.json"
+    local_file = tmp_path / "config.local.json"
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(llm_parser, "ENV_PATH", env_file)
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(gui, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(gui, "ENV_PATH", env_file)
+
+    app = gui.SurveyApp()
+    assert app.current_passes_count() == 1
+    app.select_passes(3)
+    assert app.current_passes_count() == 3
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    app.select_pass3_target("RouterAI", "openai/gpt-4.1")
+    app.provider_key_vars["hydra"].set("sk-hydra-test")
+    app.provider_key_vars["openrouter"].set("sk-or-test")
+    app.provider_key_vars["routerai"].set("sk-rai-test")
+    app._save_settings()
+
+    saved_cfg = llm_parser.load_config()
+    assert saved_cfg["api"]["consensus"]["passes"] == 3
+    assert saved_cfg["api"]["consensus"]["pass2_provider"] == "openrouter"
+    assert saved_cfg["api"]["consensus"]["pass3_provider"] == "routerai"
+
+    # Переключаем в режим 2 проходов (одна и та же модель или две разные)
+    app.select_passes(2)
+    app.select_provider("Hydra AI")
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    sample_text = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample_text)
+    app.use_llm_var.set(True)
+
+    clean_desc, _ = parse_with_regex(sample_text)
+    # Вариант с расхождением привязки POB (425' вместо 420')
+    alt_desc = clean_desc.model_copy(update={"distance_to_corner_ft": 425.0})
+
+    call_log: list[tuple[str, str, str | None]] = []
+
+    # --- Сценарий А: оба прохода сразу согласны ---
+    def fake_extract_agree(text, cfg, api_key=None, progress=None, *, provider=None, model=None, key_secret="", image_data_urls=None, focus_instruction=None):
+        call_log.append((str(provider), str(model), focus_instruction))
+        u = TokenUsage(prompt_tokens=120, completion_tokens=60, total_tokens=180, provider=str(provider), provider_label=str(provider), model=str(model))
+        return clean_desc, "structured-outputs", u
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract_agree)
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app.pending_conflict is None
+    assert len(call_log) == 2
+    assert "Консенсус 2/2" in app.status_var.get()
+    assert app._session_llm_calls == 2
+
+    # --- Сценарий Б: проходы расходятся -> жмём «Попробуй разобраться ещё раз» ---
+    call_log.clear()
+
+    def fake_extract_conflict_then_converge(text, cfg, api_key=None, progress=None, *, provider=None, model=None, key_secret="", image_data_urls=None, focus_instruction=None):
+        call_log.append((str(provider), str(model), focus_instruction))
+        u = TokenUsage(prompt_tokens=150, completion_tokens=70, total_tokens=220, provider=str(provider), provider_label=str(provider), model=str(model))
+        # В раунде #1 OpenRouter ошибается (425.00'), а в раунде #2 с фокусным промптом исправляется (420.00')!
+        if focus_instruction is None and provider == "openrouter":
+            return alt_desc, "structured-outputs", u
+        return clean_desc, "structured-outputs", u
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract_conflict_then_converge)
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    # Конфликт зафиксирован и показан пользователю!
+    assert app.pending_conflict is not None
+    assert app.conflict_window is not None
+    assert "Расстояние от перекрёстка улиц до POB" in app.status_var.get()
+    assert "420.00'" in app.status_var.get() and "425.00'" in app.status_var.get()
+
+    # Пользователь жмёт «Попробуй разобраться ещё раз»
+    app.retry_conflict_resolution()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app.pending_conflict is None
+    assert len(call_log) == 4  # 2 вызова в раунде #1 + 2 вызова в раунде #2
+    assert call_log[2][2] is not None and "CRITICAL RE-VERIFICATION TASK" in call_log[2][2]
+    assert "Расстояние от перекрёстка улиц до POB" in call_log[2][2]
+    assert "Конфликт разрешён на повторной проверке" in app.status_var.get()
+    assert app.description is not None
+    assert app.description.distance_to_corner_ft == pytest.approx(420.0)
+
+    # --- Сценарий В: конфликт при нажатии «Начертить в AutoCAD» -> человек выбирает Проход #1 ---
+    drawn_distances: list[float] = []
+
+    def fake_draw(self_builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        from acad_builder import DrawResult
+
+        plan = self_builder.plan(description, scale=scale)
+        drawn_distances.append(description.distance_to_corner_ft)
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE", "boundary_text": "BOUNDARY_TEXT_AI"})
+
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app.provider_key_vars["hydra"].set("sk-hydra-test")
+    app.provider_key_vars["openrouter"].set("sk-or-test")
+
+    app._start(parse_only=False)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    # Пока конфликт не разрешён — в AutoCAD ничего не нарисовано!
+    assert drawn_distances == []
+    assert app.pending_conflict is not None
+
+    # Человек посмотрел в документ и нажал «Прав Проход #1» (420.00')
+    app.resolve_conflict_with_pass(1)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app.pending_conflict is None
+    assert drawn_distances == [pytest.approx(420.0)]
+    assert "Конфликт проходов разрешён человеком" in app.status_var.get()
+    app._on_close()
+
 
 
 

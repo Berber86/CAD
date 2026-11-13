@@ -1829,6 +1829,152 @@ def test_open_gap_placement_regular_and_two_street_corner_lots():
     assert plan_corner.boundary_lines[3].end == pytest.approx(plan_corner.boundary_lines[0].start, abs=1e-9)
 
 
+# ---------------------------------------------------------------------------
+# 2–3 независимых прохода LLM, сравнение ответов и повторный арбитраж
+# ---------------------------------------------------------------------------
+
+
+def test_compare_legal_descriptions_ignores_cosmetics_and_catches_real_diffs():
+    """
+    Сравнение 2–3 ответов LLM:
+      * НЕ даёт ложных конфликтов на сокращениях улиц ('Aspenwall St.' vs 'ASPENWALL STREET')
+        и на эквивалентных осевых румбах ('N 0°00' E' vs 'N 0°00' W');
+      * Ловит расхождения в длине стороны, угле/румбе, числе сторон, привязке POB и смене улицы.
+    """
+    from llm_parser import ParseOutcome, compare_legal_descriptions
+
+    d_a = LegalDescription(
+        main_street="Aspenwall St.",
+        cross_street="63rd Ave",
+        distance_to_corner_ft=100.0,
+        segments=[
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=90.0),
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=25.0),
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=90.0),
+            Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=25.0),
+        ],
+    )
+    d_b_cosmetic = LegalDescription(
+        main_street="ASPENWALL STREET (60' WIDE)",
+        cross_street="63rd Avenue",
+        distance_to_corner_ft=100.0,
+        segments=[
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=90.0),
+            Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=25.0),
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=90.0),
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=25.0),
+        ],
+    )
+    agreed, diffs = compare_legal_descriptions(
+        [ParseOutcome(data=d_a, source="llm"), ParseOutcome(data=d_b_cosmetic, source="llm")]
+    )
+    assert agreed is True
+    assert diffs == []
+
+    # Реальное отличие в длине стороны №2 (25.00' vs 28.00') и румбе стороны №1 (0° vs 1°)
+    d_c_diff = d_a.model_copy(
+        update={
+            "segments": [
+                Segment(ns="N", degrees=1, minutes=0, seconds=0, ew="E", distance_ft=90.0),
+                Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=28.0),
+                Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=90.0),
+                Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=25.0),
+            ]
+        }
+    )
+    agreed2, diffs2 = compare_legal_descriptions(
+        [ParseOutcome(data=d_a, source="llm"), ParseOutcome(data=d_c_diff, source="llm")]
+    )
+    assert agreed2 is False
+    field_ids = {item.field_id for item in diffs2}
+    assert "segments[0].bearing" in field_ids
+    assert "segments[1].distance_ft" in field_ids
+
+
+def test_multipass_3_models_parallel_and_prompt_injected_arbitration(monkeypatch):
+    """
+    Проверяет 3 независимых параллельных вызова (как с разными провайдерами, так и с
+    одинаковой моделью), суммирование токенов, отчёт о конфликте и повторный вызов
+    «Попробуй разобраться ещё раз» с инъекцией фокуса на спорный момент.
+    """
+    import copy
+    import llm_parser
+    from llm_parser import (
+        ASPENWALL_SAMPLES,
+        PassTarget,
+        TokenUsage,
+        build_discrepancy_focus_prompt,
+        load_config,
+        parse_with_regex,
+        recheck_consensus_discrepancies,
+        run_multipass_consensus,
+    )
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    clean_desc, _ = parse_with_regex(sample)
+    # Проход #3 в 1-м раунде расходится по ширине участка (60' вместо 55' на обеих сторонах,
+    # чтобы это не было одиночной опечаткой, а стало настоящим спором между моделями!)
+    wide_segs = list(clean_desc.segments)
+    wide_segs[1] = wide_segs[1].model_copy(update={"distance_ft": 60.0})
+    wide_segs[3] = wide_segs[3].model_copy(update={"distance_ft": 60.0})
+    disputed_desc = clean_desc.model_copy(update={"segments": wide_segs})
+
+    cfg = copy.deepcopy(load_config())
+    cfg["api"]["providers"]["hydra"]["api_key"] = "sk-h"
+    cfg["api"]["providers"]["openrouter"]["api_key"] = "sk-o"
+    cfg["api"]["providers"]["routerai"]["api_key"] = "sk-r"
+
+    targets = [
+        PassTarget(pass_index=1, provider="hydra", model="glm-5.2"),
+        PassTarget(pass_index=2, provider="hydra", model="glm-5.2"),  # та же самая модель!
+        PassTarget(pass_index=3, provider="routerai", model="openai/gpt-4.1"),
+    ]
+
+    seen_prompts: list[tuple[str, str, str | None]] = []
+
+    def fake_extract(text, cfg_arg, api_key=None, progress=None, *, provider=None, model=None, key_secret="", image_data_urls=None, focus_instruction=None):
+        seen_prompts.append((str(provider), str(model), focus_instruction))
+        usage = TokenUsage(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            provider=str(provider),
+            provider_label=str(provider),
+            model=str(model),
+        )
+        if focus_instruction is None and provider == "routerai":
+            return disputed_desc, "structured-outputs", usage
+        return clean_desc, "structured-outputs", usage
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
+
+    # Раунд #1: 3 параллельных вызова -> конфликт в сторонах №2 и №4 (55.00' vs 60.00')
+    res_r1 = run_multipass_consensus(text=sample, cfg=cfg, targets=targets)
+    assert res_r1.agreed is False
+    assert res_r1.round_number == 1
+    assert len(res_r1.pass_outcomes) == 3
+    assert res_r1.total_usage.total_tokens == 450  # 3 * 150
+    report = res_r1.discrepancy_report()
+    assert "Сторона №2 — длина" in report
+    assert "55.00'" in report and "60.00'" in report
+
+    # Проверяем промпт-инъекцию для арбитража
+    focus = build_discrepancy_focus_prompt(res_r1)
+    assert "ARBITRATION ROUND #2" in focus
+    assert "Сторона №2 — длина" in focus
+    assert "Сторона №4 — длина" in focus
+
+    # Раунд #2 («Попробуй разобраться ещё раз»): все 3 модели получают фокусный промпт и сходятся!
+    res_r2 = recheck_consensus_discrepancies(res_r1, cfg=cfg)
+    assert res_r2.agreed is True
+    assert res_r2.round_number == 2
+    assert res_r2.total_usage.total_tokens == 900  # 450 (раунд #1) + 450 (раунд #2)
+    assert any("Конфликт разрешён на повторной проверке" in w for w in res_r2.selected_outcome.warnings)
+    assert len(seen_prompts) == 6
+    assert all(p[2] is not None and "Сторона №2 — длина" in p[2] for p in seen_prompts[3:])
+
+
+
 
 
 

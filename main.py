@@ -69,6 +69,7 @@ from llm_parser import (
     NYC_SAMPLES,
     PROVIDER_ORDER,
     PROVIDERS_CATALOG,
+    ConsensusResult,
     KeyProtectionError,
     LLMParseError,
     LegalDescription,
@@ -82,13 +83,15 @@ from llm_parser import (
     load_dotenv_dict,
     parse_legal_description_full,
     protect_api_key,
+    recheck_consensus_discrepancies,
+    run_multipass_consensus,
     save_config,
     save_protected_env,
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD (Prototype 1)"
-APP_GEOMETRY = "1080x980"
-VERSION = "0.5.0"
+APP_GEOMETRY = "1080x1020"
+VERSION = "0.6.0"
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -256,9 +259,43 @@ class SurveyApp(ctk.CTk):
         )
         self.use_llm_var = ctk.BooleanVar(value=True)
 
+        # Настройки 2–3 независимых проходов LLM (консенсус / арбитраж)
+        cons_cfg = self.config_data["api"].get("consensus") or {}
+        init_passes = max(1, min(3, int(cons_cfg.get("passes") or 1)))
+        self.passes_options = ["1 проход", "2 прохода", "3 прохода"]
+        self.passes_label_var = ctk.StringVar(value=self.passes_options[init_passes - 1])
+
+        p2_pid = str(cons_cfg.get("pass2_provider") or "openrouter").strip().lower()
+        if p2_pid not in self._pid_to_label:
+            p2_pid = self.provider_ids[min(1, len(self.provider_ids) - 1)]
+        p2_model = str(
+            cons_cfg.get("pass2_model") or self._selected_models[p2_pid]
+        ).strip()
+        if p2_model and p2_model not in self._provider_models[p2_pid]:
+            self._provider_models[p2_pid].insert(0, p2_model)
+        self._pass2_pid: str = p2_pid
+        self.pass2_provider_label_var = ctk.StringVar(value=self._pid_to_label[p2_pid])
+        self.pass2_model_var = ctk.StringVar(value=p2_model or self._provider_models[p2_pid][0])
+
+        p3_pid = str(cons_cfg.get("pass3_provider") or "routerai").strip().lower()
+        if p3_pid not in self._pid_to_label:
+            p3_pid = self.provider_ids[min(2, len(self.provider_ids) - 1)]
+        p3_model = str(
+            cons_cfg.get("pass3_model") or self._selected_models[p3_pid]
+        ).strip()
+        if p3_model and p3_model not in self._provider_models[p3_pid]:
+            self._provider_models[p3_pid].insert(0, p3_model)
+        self._pass3_pid: str = p3_pid
+        self.pass3_provider_label_var = ctk.StringVar(value=self._pid_to_label[p3_pid])
+        self.pass3_model_var = ctk.StringVar(value=p3_model or self._provider_models[p3_pid][0])
+
+        self.pending_conflict: dict[str, Any] | None = None
+        self.conflict_window: Any | None = None
+
         self._build_ui()
         self._refresh_height_label()
         self._refresh_provider_highlights()
+        self._refresh_consensus_rows()
         self.after(120, self._drain_events)
 
     # ------------------------------------------------------------------ UI --
@@ -319,7 +356,7 @@ class SurveyApp(ctk.CTk):
         )
         self.use_llm_switch.grid(row=0, column=3, padx=(12, 0), sticky="e")
 
-        # Строка 1: переключатель провайдера + выбор/ввод модели
+        # Строка 1: переключатель провайдера + выбор/ввод модели (Проход #1)
         llm_row = ctk.CTkFrame(settings, fg_color="transparent")
         llm_row.grid(row=1, column=0, sticky="ew", padx=14, pady=6)
         llm_row.grid_columnconfigure(3, weight=1)
@@ -342,9 +379,91 @@ class SurveyApp(ctk.CTk):
         )
         self.model_combo.grid(row=0, column=3, sticky="ew")
 
-        # Строка 2: поля ввода API-ключей каждого из трёх провайдеров
+        # Строка 2: переключатель режима 1 / 2 / 3 независимых проходов LLM
+        consensus_row = ctk.CTkFrame(settings, fg_color="transparent")
+        consensus_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(2, 4))
+        consensus_row.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            consensus_row,
+            text="Режим сверки LLM:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.passes_switch = ctk.CTkSegmentedButton(
+            consensus_row,
+            values=self.passes_options,
+            variable=self.passes_label_var,
+            command=self._on_passes_changed,
+        )
+        self.passes_switch.grid(row=0, column=1, padx=(0, 14), sticky="w")
+        self.consensus_hint_label = ctk.CTkLabel(
+            consensus_row,
+            text="1 проход — одиночный вызов; 2–3 прохода — параллельная сверка моделей и арбитраж",
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+            text_color=("#8fa3b8", "#8fa3b8"),
+        )
+        self.consensus_hint_label.grid(row=0, column=2, sticky="w")
+
+        # Строка 3: независимый Проход #2 (показывается при 2 или 3 проходах)
+        self.pass2_row = ctk.CTkFrame(settings, fg_color="transparent")
+        self.pass2_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 4))
+        self.pass2_row.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(
+            self.pass2_row,
+            text="Проход #2:",
+            text_color=("#5dade2", "#5dade2"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.pass2_provider_switch = ctk.CTkSegmentedButton(
+            self.pass2_row,
+            values=self.provider_labels,
+            variable=self.pass2_provider_label_var,
+            command=self._on_pass2_provider_changed,
+        )
+        self.pass2_provider_switch.grid(row=0, column=1, padx=(0, 18), sticky="w")
+        ctk.CTkLabel(self.pass2_row, text="Модель #2:").grid(
+            row=0, column=2, padx=(0, 8), sticky="w"
+        )
+        self.pass2_model_combo = ctk.CTkComboBox(
+            self.pass2_row,
+            values=self._provider_models[self._pass2_pid],
+            variable=self.pass2_model_var,
+            command=lambda val: self.pass2_model_var.set(str(val or "").strip()),
+        )
+        self.pass2_model_combo.grid(row=0, column=3, sticky="ew")
+
+        # Строка 4: независимый Проход #3 (показывается при 3 проходах)
+        self.pass3_row = ctk.CTkFrame(settings, fg_color="transparent")
+        self.pass3_row.grid(row=4, column=0, sticky="ew", padx=14, pady=(2, 4))
+        self.pass3_row.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(
+            self.pass3_row,
+            text="Проход #3:",
+            text_color=("#48c9b0", "#48c9b0"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.pass3_provider_switch = ctk.CTkSegmentedButton(
+            self.pass3_row,
+            values=self.provider_labels,
+            variable=self.pass3_provider_label_var,
+            command=self._on_pass3_provider_changed,
+        )
+        self.pass3_provider_switch.grid(row=0, column=1, padx=(0, 18), sticky="w")
+        ctk.CTkLabel(self.pass3_row, text="Модель #3:").grid(
+            row=0, column=2, padx=(0, 8), sticky="w"
+        )
+        self.pass3_model_combo = ctk.CTkComboBox(
+            self.pass3_row,
+            values=self._provider_models[self._pass3_pid],
+            variable=self.pass3_model_var,
+            command=lambda val: self.pass3_model_var.set(str(val or "").strip()),
+        )
+        self.pass3_model_combo.grid(row=0, column=3, sticky="ew")
+
+        # Строка 5: поля ввода API-ключей каждого из трёх провайдеров
         keys_frame = ctk.CTkFrame(settings, fg_color="transparent")
-        keys_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 6))
+        keys_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=(4, 6))
         for col, pid in enumerate(self.provider_ids):
             keys_frame.grid_columnconfigure(col, weight=1)
             card = ctk.CTkFrame(keys_frame, fg_color="transparent")
@@ -391,9 +510,9 @@ class SurveyApp(ctk.CTk):
             self.provider_key_entries[pid] = entry
             self.provider_key_buttons[pid] = btn
 
-        # Строка 3: защита ключей от кражи .json / .env (пересчёт реального ключа в RAM)
+        # Строка 6: защита ключей от кражи .json / .env (пересчёт реального ключа в RAM)
         vault_row = ctk.CTkFrame(settings, fg_color="transparent")
-        vault_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 10))
+        vault_row.grid(row=6, column=0, sticky="ew", padx=14, pady=(2, 10))
         vault_row.grid_columnconfigure(3, weight=1)
 
         ctk.CTkLabel(
@@ -544,9 +663,80 @@ class SurveyApp(ctk.CTk):
         self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 0))
         self.progress.set(0)
 
+        # Панель разрешения конфликта между проходами LLM (показывается при расхождении)
+        self.conflict_bar = ctk.CTkFrame(self, fg_color=("#3d2b1f", "#3d2b1f"))
+        self.conflict_bar.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.conflict_bar.grid_columnconfigure(0, weight=1)
+
+        self.conflict_title_var = ctk.StringVar(
+            value="⚠ Обнаружено расхождение между проходами LLM!"
+        )
+        self.conflict_title_label = ctk.CTkLabel(
+            self.conflict_bar,
+            textvariable=self.conflict_title_var,
+            anchor="w",
+            justify="left",
+            wraplength=1010,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=("#ffcc80", "#ffcc80"),
+        )
+        self.conflict_title_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
+
+        conflict_btns = ctk.CTkFrame(self.conflict_bar, fg_color="transparent")
+        conflict_btns.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+
+        self.retry_conflict_button = ctk.CTkButton(
+            conflict_btns,
+            text="🔄 Попробуй разобраться ещё раз",
+            fg_color=("#c06c1a", "#c06c1a"),
+            hover_color=("#db7f23", "#db7f23"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.retry_conflict_resolution,
+        )
+        self.retry_conflict_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
+
+        self.pick_pass1_button = ctk.CTkButton(
+            conflict_btns,
+            text="Прав Проход #1",
+            width=155,
+            fg_color=("#246b4b", "#246b4b"),
+            hover_color=("#2d865e", "#2d865e"),
+            command=lambda: self.resolve_conflict_with_pass(1),
+        )
+        self.pick_pass1_button.grid(row=0, column=1, padx=(0, 6), sticky="w")
+
+        self.pick_pass2_button = ctk.CTkButton(
+            conflict_btns,
+            text="Прав Проход #2",
+            width=155,
+            fg_color=("#246b4b", "#246b4b"),
+            hover_color=("#2d865e", "#2d865e"),
+            command=lambda: self.resolve_conflict_with_pass(2),
+        )
+        self.pick_pass2_button.grid(row=0, column=2, padx=(0, 6), sticky="w")
+
+        self.pick_pass3_button = ctk.CTkButton(
+            conflict_btns,
+            text="Прав Проход #3",
+            width=155,
+            fg_color=("#246b4b", "#246b4b"),
+            hover_color=("#2d865e", "#2d865e"),
+            command=lambda: self.resolve_conflict_with_pass(3),
+        )
+        self.pick_pass3_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
+
+        self.open_conflict_details_button = ctk.CTkButton(
+            conflict_btns,
+            text="Подробное сравнение…",
+            width=170,
+            command=self._open_conflict_dialog,
+        )
+        self.open_conflict_details_button.grid(row=0, column=4, sticky="w")
+        self.conflict_bar.grid_remove()
+
         # Статус, невязка и токены ------------------------------------------
         status_frame = ctk.CTkFrame(self)
-        status_frame.grid(row=5, column=0, sticky="ew", padx=16, pady=(10, 14))
+        status_frame.grid(row=6, column=0, sticky="ew", padx=16, pady=(10, 14))
         status_frame.grid_columnconfigure(0, weight=1)
 
         metrics = ctk.CTkFrame(status_frame, fg_color="transparent")
@@ -622,6 +812,112 @@ class SurveyApp(ctk.CTk):
         self.provider_label_var.set(label)
         self.provider_switch.set(label)
         self._on_provider_changed(label)
+
+    def current_passes_count(self) -> int:
+        """Возвращает выбранное число независимых проходов LLM: 1, 2 или 3."""
+        raw = str(self.passes_label_var.get() or "1 проход").strip()
+        for ch in raw:
+            if ch in ("1", "2", "3"):
+                return int(ch)
+        return 1
+
+    def select_passes(self, count: int) -> None:
+        """Программно переключает режим 1 / 2 / 3 проходов LLM."""
+        clamped = max(1, min(3, int(count)))
+        label = self.passes_options[clamped - 1]
+        self.passes_label_var.set(label)
+        self.passes_switch.set(label)
+        self._on_passes_changed(label)
+
+    def _on_passes_changed(self, _selected_label: str = "") -> None:
+        self._refresh_consensus_rows()
+
+    def _refresh_consensus_rows(self) -> None:
+        count = self.current_passes_count()
+        if count >= 2:
+            self.pass2_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 4))
+        else:
+            self.pass2_row.grid_remove()
+        if count >= 3:
+            self.pass3_row.grid(row=4, column=0, sticky="ew", padx=14, pady=(2, 4))
+        else:
+            self.pass3_row.grid_remove()
+
+    def current_pass2_provider_id(self) -> str:
+        lbl = str(self.pass2_provider_label_var.get() or "")
+        return self._label_to_pid.get(lbl, self._pass2_pid)
+
+    def current_pass2_model(self) -> str:
+        typed = str(self.pass2_model_var.get() or "").strip()
+        if not typed:
+            typed = str(self.pass2_model_combo.get() or "").strip()
+        pid = self.current_pass2_provider_id()
+        return typed or self._selected_models.get(pid) or self._provider_models[pid][0]
+
+    def current_pass3_provider_id(self) -> str:
+        lbl = str(self.pass3_provider_label_var.get() or "")
+        return self._label_to_pid.get(lbl, self._pass3_pid)
+
+    def current_pass3_model(self) -> str:
+        typed = str(self.pass3_model_var.get() or "").strip()
+        if not typed:
+            typed = str(self.pass3_model_combo.get() or "").strip()
+        pid = self.current_pass3_provider_id()
+        return typed or self._selected_models.get(pid) or self._provider_models[pid][0]
+
+    def _on_pass2_provider_changed(self, selected_label: str) -> None:
+        new_pid = self._label_to_pid.get(selected_label)
+        if not new_pid:
+            return
+        self._pass2_pid = new_pid
+        models = self._provider_models[new_pid]
+        chosen = self._selected_models.get(new_pid) or models[0]
+        self.pass2_model_combo.configure(values=models)
+        self.pass2_model_var.set(chosen)
+        self.pass2_model_combo.set(chosen)
+
+    def _on_pass3_provider_changed(self, selected_label: str) -> None:
+        new_pid = self._label_to_pid.get(selected_label)
+        if not new_pid:
+            return
+        self._pass3_pid = new_pid
+        models = self._provider_models[new_pid]
+        chosen = self._selected_models.get(new_pid) or models[0]
+        self.pass3_model_combo.configure(values=models)
+        self.pass3_model_var.set(chosen)
+        self.pass3_model_combo.set(chosen)
+
+    def select_pass2_target(
+        self, provider_or_label: str, model: str | None = None
+    ) -> None:
+        cand = provider_or_label.strip()
+        pid = self._label_to_pid.get(cand) or cand.lower()
+        if pid not in self._pid_to_label:
+            raise ValueError(f"неизвестный провайдер: {provider_or_label!r}")
+        lbl = self._pid_to_label[pid]
+        self.pass2_provider_label_var.set(lbl)
+        self.pass2_provider_switch.set(lbl)
+        self._on_pass2_provider_changed(lbl)
+        if model and model.strip():
+            m = model.strip()
+            self.pass2_model_var.set(m)
+            self.pass2_model_combo.set(m)
+
+    def select_pass3_target(
+        self, provider_or_label: str, model: str | None = None
+    ) -> None:
+        cand = provider_or_label.strip()
+        pid = self._label_to_pid.get(cand) or cand.lower()
+        if pid not in self._pid_to_label:
+            raise ValueError(f"неизвестный провайдер: {provider_or_label!r}")
+        lbl = self._pid_to_label[pid]
+        self.pass3_provider_label_var.set(lbl)
+        self.pass3_provider_switch.set(lbl)
+        self._on_pass3_provider_changed(lbl)
+        if model and model.strip():
+            m = model.strip()
+            self.pass3_model_var.set(m)
+            self.pass3_model_combo.set(m)
 
     def _on_provider_changed(self, selected_label: str) -> None:
         new_pid = self._label_to_pid.get(selected_label)
@@ -832,6 +1128,24 @@ class SurveyApp(ctk.CTk):
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
+        p2_pid = self.current_pass2_provider_id()
+        p2_model = self.current_pass2_model()
+        p3_pid = self.current_pass3_provider_id()
+        p3_model = self.current_pass3_model()
+        for extra_pid, extra_m in ((p2_pid, p2_model), (p3_pid, p3_model)):
+            if extra_pid in providers and extra_m:
+                m_list = [str(m) for m in (providers[extra_pid].get("models") or [])]
+                if extra_m not in m_list:
+                    m_list.insert(0, extra_m)
+                    providers[extra_pid]["models"] = m_list
+        cfg["api"]["consensus"] = {
+            "passes": self.current_passes_count(),
+            "pass2_provider": p2_pid,
+            "pass2_model": p2_model,
+            "pass3_provider": p3_pid,
+            "pass3_model": p3_model,
+        }
+
         explicit_key = clean_provider_key(active_pid, self.provider_key_vars[active_pid].get())
         return cfg, active_pid, active_model, (explicit_key or None), key_secret
 
@@ -955,14 +1269,26 @@ class SurveyApp(ctk.CTk):
                 self._set_status(str(payload), error=True)
                 self.closure_var.set("Closure Error: —")
             elif kind == "parsed":
-                outcome, draw = payload
+                self._dismiss_conflict_ui()
+                if len(payload) == 4:
+                    outcome, draw, pre_counted, round_usages = payload
+                    if round_usages:
+                        self._record_round_usages(round_usages)
+                elif len(payload) == 3:
+                    outcome, draw, pre_counted = payload
+                else:
+                    outcome, draw = payload
+                    pre_counted = False
                 if draw:
-                    self._handle_draw_result(outcome, draw)
+                    self._handle_draw_result(outcome, draw, already_counted=pre_counted)
                 else:
                     self._finish_busy()
-                    self._apply_parsed(outcome)
+                    self._apply_parsed(outcome, already_counted=pre_counted)
                     self._set_status(self._parsed_summary(outcome))
                     self.closure_var.set(self._closure_text(outcome))
+            elif kind == "conflict":
+                self._finish_busy()
+                self._present_conflict(payload)
             elif kind == "batch_neighbors":
                 items_done, batch_errors = payload
                 self._finish_busy()
@@ -1132,8 +1458,10 @@ class SurveyApp(ctk.CTk):
             self._set_status("Вставьте текст Legal Description или загрузите PDF.", error=True)
             return
 
+        self._dismiss_conflict_ui()
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
+        passes_count = self.current_passes_count() if use_llm else 1
         scale = self._current_scale()
         is_neighbor = bool(force_neighbor or self.is_neighbor_mode())
         provider_title = self._pid_to_label.get(provider_id, provider_id)
@@ -1142,14 +1470,23 @@ class SurveyApp(ctk.CTk):
         self._set_controls_busy(True)
         self.progress.start()
         if use_llm:
-            self.tokens_var.set(
-                f"Токены за вызов: запрос к {provider_title} / {model_name}…"
-            )
+            if passes_count >= 2:
+                self.tokens_var.set(
+                    f"Токены за вызов: параллельный запрос ({passes_count} независимых прохода LLM)…"
+                )
+            else:
+                self.tokens_var.set(
+                    f"Токены за вызов: запрос к {provider_title} / {model_name}…"
+                )
         role_note = "соседний участок (NEIGHBOR_LOT)" if is_neighbor else "основной участок"
-        self._set_status(f"Разбираю описание ({role_note})…")
+        mode_desc = (
+            f"LLM ({passes_count} прох., базовый: {provider_title} / {model_name})"
+            if (use_llm and passes_count >= 2)
+            else (f"LLM: {provider_title} / {model_name}" if use_llm else "regex")
+        )
+        self._set_status(f"Разбираю описание ({role_note}, {mode_desc})…")
         self._log_line(
-            f"--- Новый запуск ({role_note}, масштаб 1\"={scale:g}', "
-            f"режим={'LLM: ' + provider_title + ' / ' + model_name if use_llm else 'regex'}) ---"
+            f"--- Новый запуск ({role_note}, масштаб 1\"={scale:g}', режим={mode_desc}) ---"
         )
 
         vision_pdf = self.pdf_path if self._pdf_needs_vision else None
@@ -1187,20 +1524,61 @@ class SurveyApp(ctk.CTk):
         is_neighbor: bool = False,
     ) -> None:
         try:
-            outcome = parse_legal_description_full(
-                text=text,
-                pdf_path=vision_pdf,
-                cfg=cfg,
-                use_llm=use_llm,
-                provider=provider_id,
-                model=model_name,
-                api_key=api_key,
-                key_secret=key_secret,
-                allow_regex_fallback=False,
-                progress=lambda message: self._post("progress", message),
+            passes_count = (
+                int((cfg.get("api", {}).get("consensus") or {}).get("passes") or 1)
+                if use_llm
+                else 1
             )
-            if use_llm:
+            if use_llm and passes_count >= 2:
+                consensus = run_multipass_consensus(
+                    text=text,
+                    pdf_path=vision_pdf,
+                    cfg=cfg,
+                    passes=passes_count,
+                    primary_provider=provider_id,
+                    primary_model=model_name,
+                    primary_api_key=api_key,
+                    key_secret=key_secret,
+                    progress=lambda message: self._post("progress", message),
+                )
                 self._last_valid_secret = key_secret
+                if not consensus.agreed:
+                    self._post(
+                        "conflict",
+                        {
+                            "consensus": consensus,
+                            "cfg": cfg,
+                            "key_secret": key_secret,
+                            "scale": scale,
+                            "parse_only": parse_only,
+                            "is_neighbor": is_neighbor,
+                        },
+                    )
+                    self._post("done", None)
+                    return
+                outcome = consensus.selected_outcome
+                round_usages: list[TokenUsage | None] = [
+                    o.usage for o in consensus.pass_outcomes
+                ]
+                pre_counted = True
+            else:
+                outcome = parse_legal_description_full(
+                    text=text,
+                    pdf_path=vision_pdf,
+                    cfg=cfg,
+                    use_llm=use_llm,
+                    provider=provider_id,
+                    model=model_name,
+                    api_key=api_key,
+                    key_secret=key_secret,
+                    allow_regex_fallback=False,
+                    progress=lambda message: self._post("progress", message),
+                )
+                if use_llm:
+                    self._last_valid_secret = key_secret
+                round_usages = []
+                pre_counted = False
+
             builder = AcadBuilder(cfg)
             plan = builder.plan(
                 outcome.data, scale=scale, is_neighbor=is_neighbor
@@ -1212,7 +1590,7 @@ class SurveyApp(ctk.CTk):
                 f"Closure Error {plan.closure.distance:.3f} ft",
             )
             if parse_only:
-                self._post("parsed", (outcome, None))
+                self._post("parsed", (outcome, None, pre_counted, round_usages))
                 self._post("done", None)
                 return
 
@@ -1230,7 +1608,7 @@ class SurveyApp(ctk.CTk):
             result = builder.draw(
                 outcome.data, scale=scale, is_neighbor=is_neighbor
             )
-            self._post("parsed", (outcome, result))
+            self._post("parsed", (outcome, result, pre_counted, round_usages))
             self._post("done", None)
         except KeyProtectionError as exc:
             self._post("error", str(exc))
@@ -1259,6 +1637,290 @@ class SurveyApp(ctk.CTk):
             self._post("error", f"Непредвиденная ошибка: {exc}\n{detail}")
             self._post("done", None)
 
+    # ---------------------------------------- разрешение конфликта проходов --
+    def _record_round_usages(self, usages: list[TokenUsage | None]) -> None:
+        for u in usages:
+            if u is None:
+                continue
+            self._session_llm_calls += 1
+            if u.available:
+                self._session_prompt_tokens += u.prompt_tokens
+                self._session_completion_tokens += u.completion_tokens
+            self._log_line(
+                f"[Токены прохода] {u.provider_label or u.provider} / {u.model}: "
+                f"ушло {u.prompt_tokens:,}, пришло {u.completion_tokens:,}, "
+                f"всего {u.total_tokens:,}"
+            )
+
+    def _dismiss_conflict_ui(self) -> None:
+        self.pending_conflict = None
+        try:
+            self.conflict_bar.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+        win = getattr(self, "conflict_window", None)
+        self.conflict_window = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _present_conflict(self, conflict_ctx: dict[str, Any]) -> None:
+        consensus: ConsensusResult = conflict_ctx["consensus"]
+        self.pending_conflict = conflict_ctx
+        self._record_round_usages([o.usage for o in consensus.pass_outcomes])
+        self.last_usage = consensus.total_usage
+        self.tokens_var.set(self._format_tokens_line(consensus.selected_outcome))
+
+        n_passes = len(consensus.pass_outcomes)
+        labels = consensus.pass_labels_map()
+        short_diffs = "  |  ".join(
+            d.summary(labels) for d in consensus.discrepancies[:2]
+        )
+        if len(consensus.discrepancies) > 2:
+            short_diffs += f"  (+ещё {len(consensus.discrepancies) - 2})"
+        self.conflict_title_var.set(
+            f"⚠ Ответы {n_passes} нейросетей разошлись (раунд #{consensus.round_number}): "
+            f"{short_diffs}"
+        )
+        self.pick_pass1_button.configure(
+            text=f"✅ Прав Проход #1 ({consensus.pass_outcomes[0].model})"
+        )
+        if n_passes >= 2:
+            self.pick_pass2_button.configure(
+                text=f"✅ Прав Проход #2 ({consensus.pass_outcomes[1].model})"
+            )
+            self.pick_pass2_button.grid(row=0, column=2, padx=(0, 6), sticky="w")
+        if n_passes >= 3:
+            self.pick_pass3_button.configure(
+                text=f"✅ Прав Проход #3 ({consensus.pass_outcomes[2].model})"
+            )
+            self.pick_pass3_button.grid(row=0, column=3, padx=(0, 8), sticky="w")
+        else:
+            self.pick_pass3_button.grid_remove()
+
+        self.conflict_bar.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.closure_var.set(
+            "Closure Error по проходам:  "
+            + "   |   ".join(
+                f"#{i}: {consensus.pass_closure_ft(i):.4f} ft"
+                for i in range(1, n_passes + 1)
+            )
+        )
+        self._set_status(consensus.discrepancy_report(), error=True)
+        self._open_conflict_dialog()
+
+    def _open_conflict_dialog(self) -> None:
+        """Открывает/обновляет окно детального сравнения ответов моделей и выбора решения."""
+        if not self.pending_conflict:
+            return
+        consensus: ConsensusResult = self.pending_conflict["consensus"]
+        old_win = getattr(self, "conflict_window", None)
+        if old_win is not None:
+            try:
+                old_win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Сверка ответов LLM — раунд #{consensus.round_number}")
+        win.geometry("860x560")
+        win.attributes("-topmost", True)
+        self.conflict_window = win
+
+        ctk.CTkLabel(
+            win,
+            text=(
+                f"Ответы {len(consensus.pass_outcomes)} независимых проходов разошлись "
+                f"(раунд #{consensus.round_number})"
+            ),
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=("#ffcc80", "#ffcc80"),
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+
+        ctk.CTkLabel(
+            win,
+            text=(
+                "Проверьте спорный фрагмент в документе и укажите, какая модель права, "
+                "или нажмите «Попробуй разобраться ещё раз» — модели получат задание "
+                "прицельно перепроверить именно спорные места."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        box = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        box.insert("1.0", consensus.discrepancy_report())
+        target_tb = getattr(box, "_textbox", box)
+        target_tb.configure(state="disabled")
+
+        btn_bar = ctk.CTkFrame(win, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="🔄 Попробуй разобраться ещё раз",
+            fg_color=("#c06c1a", "#c06c1a"),
+            hover_color=("#db7f23", "#db7f23"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.retry_conflict_resolution,
+        ).pack(side="left", padx=(0, 10))
+
+        for p_idx in range(1, len(consensus.pass_outcomes) + 1):
+            err_ft = consensus.pass_closure_ft(p_idx)
+            mdl = consensus.pass_outcomes[p_idx - 1].model
+            ctk.CTkButton(
+                btn_bar,
+                text=f"✅ Прав Проход #{p_idx} ({mdl}, {err_ft:.3f}')",
+                fg_color=("#246b4b", "#246b4b"),
+                hover_color=("#2d865e", "#2d865e"),
+                command=lambda idx=p_idx: self.resolve_conflict_with_pass(idx),
+            ).pack(side="left", padx=(0, 6))
+
+    def resolve_conflict_with_pass(self, pass_index: int) -> None:
+        """Человек вручную выбирает, какой из проходов (#1, #2 или #3) прав."""
+        if self._busy or not self.pending_conflict:
+            return
+        ctx = dict(self.pending_conflict)
+        consensus: ConsensusResult = ctx["consensus"]
+        outcome = consensus.resolve_with_pass(pass_index)
+        self._dismiss_conflict_ui()
+        self._complete_resolved_outcome(outcome, ctx, pre_counted=True)
+
+    def retry_conflict_resolution(self) -> None:
+        """Кнопка «Попробуй разобраться ещё раз»: повторный вызов с фокусом на спорных местах."""
+        if self._busy or not self.pending_conflict:
+            return
+        ctx = dict(self.pending_conflict)
+        consensus: ConsensusResult = ctx["consensus"]
+        next_round = consensus.round_number + 1
+
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(
+            f"Повторная проверка спорных мест (раунд #{next_round}): "
+            "отправлен прицельный запрос моделям…"
+        )
+        self._log_line(
+            f"--- Повторный арбитраж спорных мест (раунд #{next_round}, "
+            f"проходов: {len(consensus.pass_outcomes)}) ---"
+        )
+        worker = threading.Thread(
+            target=self._retry_conflict_worker,
+            args=(ctx,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _retry_conflict_worker(self, ctx: dict[str, Any]) -> None:
+        consensus: ConsensusResult = ctx["consensus"]
+        cfg: dict[str, Any] = ctx["cfg"]
+        key_secret: str = ctx["key_secret"]
+        scale: float = ctx["scale"]
+        parse_only: bool = ctx["parse_only"]
+        is_neighbor: bool = ctx["is_neighbor"]
+        try:
+            new_consensus = recheck_consensus_discrepancies(
+                consensus,
+                cfg,
+                key_secret=key_secret,
+                progress=lambda msg: self._post("progress", msg),
+            )
+            if not new_consensus.agreed:
+                updated_ctx = dict(ctx)
+                updated_ctx["consensus"] = new_consensus
+                self._post("conflict", updated_ctx)
+                self._post("done", None)
+                return
+
+            # Модели пришли к единому мнению!
+            round_usages = [o.usage for o in new_consensus.pass_outcomes]
+            self._post("progress", "✓ Модели сошлись во мнении! Завершаю построение…")
+            outcome = new_consensus.selected_outcome
+            self._finalize_worker_outcome(
+                outcome,
+                cfg=cfg,
+                scale=scale,
+                parse_only=parse_only,
+                is_neighbor=is_neighbor,
+                pre_counted=True,
+                round_usages=round_usages,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._post("error", f"Ошибка повторного разбора спорных мест: {exc}")
+            self._post("done", None)
+
+    def _complete_resolved_outcome(
+        self,
+        outcome: ParseOutcome,
+        ctx: dict[str, Any],
+        *,
+        pre_counted: bool = True,
+    ) -> None:
+        parse_only = bool(ctx["parse_only"])
+        if parse_only:
+            self._apply_parsed(outcome, already_counted=pre_counted)
+            self._set_status(self._parsed_summary(outcome))
+            self.closure_var.set(self._closure_text(outcome))
+            return
+
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        worker = threading.Thread(
+            target=self._finalize_worker_outcome,
+            args=(outcome,),
+            kwargs={
+                "cfg": ctx["cfg"],
+                "scale": ctx["scale"],
+                "parse_only": False,
+                "is_neighbor": ctx["is_neighbor"],
+                "pre_counted": pre_counted,
+                "round_usages": None,
+            },
+            daemon=True,
+        )
+        worker.start()
+
+    def _finalize_worker_outcome(
+        self,
+        outcome: ParseOutcome,
+        *,
+        cfg: dict[str, Any],
+        scale: float,
+        parse_only: bool,
+        is_neighbor: bool,
+        pre_counted: bool = True,
+        round_usages: list[TokenUsage | None] | None = None,
+    ) -> None:
+        try:
+            builder = AcadBuilder(cfg)
+            builder.plan(outcome.data, scale=scale, is_neighbor=is_neighbor)
+            if parse_only:
+                self._post("parsed", (outcome, None, pre_counted, round_usages or []))
+                self._post("done", None)
+                return
+            if sys.platform != "win32":
+                raise AcadConnectionError(
+                    "Отрисовка возможна только в Windows с запущенным AutoCAD "
+                    f"(текущая ОС: {sys.platform})"
+                )
+            result = builder.draw(outcome.data, scale=scale, is_neighbor=is_neighbor)
+            self._post("parsed", (outcome, result, pre_counted, round_usages or []))
+            self._post("done", None)
+        except (LegalDescriptionError, AcadBuilderError) as exc:
+            self._post("error", str(exc))
+            self._post("done", None)
+        except Exception as exc:  # noqa: BLE001
+            detail = traceback.format_exc(limit=6)
+            self._post("error", f"Непредвиденная ошибка: {exc}\n{detail}")
+            self._post("done", None)
+
     # ------------------------------------------------------------- вывод --
     def _format_tokens_line(self, outcome: ParseOutcome) -> str:
         if outcome.source not in {"llm", "llm-vision"} or outcome.usage is None:
@@ -1274,10 +1936,16 @@ class SurveyApp(ctk.CTk):
             )
         return base
 
-    def _apply_parsed(self, outcome: ParseOutcome) -> None:
+    def _apply_parsed(
+        self, outcome: ParseOutcome, *, already_counted: bool = False
+    ) -> None:
         self.description = outcome.data
         self.last_usage = outcome.usage
-        if outcome.source in {"llm", "llm-vision"} and outcome.usage is not None:
+        if (
+            not already_counted
+            and outcome.source in {"llm", "llm-vision"}
+            and outcome.usage is not None
+        ):
             self._session_llm_calls += 1
             if outcome.usage.available:
                 self._session_prompt_tokens += outcome.usage.prompt_tokens
@@ -1363,9 +2031,15 @@ class SurveyApp(ctk.CTk):
             return "Closure Error: —"
         return plan.closure.short_report()
 
-    def _handle_draw_result(self, outcome: ParseOutcome, result: DrawResult) -> None:
+    def _handle_draw_result(
+        self,
+        outcome: ParseOutcome,
+        result: DrawResult,
+        *,
+        already_counted: bool = False,
+    ) -> None:
         self.draw_result = result
-        self._apply_parsed(outcome)
+        self._apply_parsed(outcome, already_counted=already_counted)
         for info_note in result.plan.notes:
             self._log_line(f"• {info_note}")
         summary_text = result.summary()

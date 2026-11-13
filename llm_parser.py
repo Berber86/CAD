@@ -42,18 +42,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Sequence
 
+import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
     "ASPENWALL_SAMPLES",
     "BoundarySegment",
     "ConfigError",
+    "ConsensusResult",
+    "DiscrepancyItem",
     "KeyProtectionError",
     "LegalDescription",
     "LegalDescriptionData",
     "LegalDescriptionError",
     "LLMParseError",
     "PDFError",
+    "PassTarget",
     "CONFIG_PATH",
     "DEFAULT_CONFIG",
     "ENV_PATH",
@@ -66,7 +70,10 @@ __all__ = [
     "Segment",
     "TokenUsage",
     "bearing_label",
+    "build_discrepancy_focus_prompt",
+    "build_pass_targets",
     "clean_provider_key",
+    "compare_legal_descriptions",
     "dms_to_degrees",
     "infer_corner_to_pob_bearing",
     "inspect_pdf",
@@ -79,8 +86,10 @@ __all__ = [
     "parse_with_regex",
     "protect_api_key",
     "read_pdf_text",
+    "recheck_consensus_discrepancies",
     "render_pdf_pages_base64",
     "resolve_api_target",
+    "run_multipass_consensus",
     "save_config",
     "save_protected_env",
     "unprotect_api_key",
@@ -188,6 +197,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vision_dpi": 220,
         "vision_max_pages": 4,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
+        "consensus": {
+            "passes": 1,
+            "pass2_provider": "openrouter",
+            "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
+            "pass3_provider": "routerai",
+            "pass3_model": "openai/gpt-4.1",
+        },
     },
     "drawing": {
         "base_scale": 16.0,
@@ -1630,17 +1646,23 @@ def _messages(
     image_data_urls: Sequence[str] | None = None,
     *,
     system_override: str | None = None,
+    focus_instruction: str | None = None,
 ) -> list[dict[str, Any]]:
     sys_content = system_override if system_override is not None else SYSTEM_PROMPT
     if not image_data_urls:
+        user_text = USER_PROMPT_TEMPLATE.format(text=text)
+        if focus_instruction and focus_instruction.strip():
+            user_text += f"\n\n{focus_instruction.strip()}"
         return [
             {"role": "system", "content": sys_content},
-            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
+            {"role": "user", "content": user_text},
         ]
 
     prompt_parts = [VISION_USER_PROMPT]
     if text and text.strip():
         prompt_parts.append(f"ADDITIONAL NOTES / TEXT:\n\"\"\"\n{text.strip()}\n\"\"\"")
+    if focus_instruction and focus_instruction.strip():
+        prompt_parts.append(focus_instruction.strip())
     user_blocks: list[dict[str, Any]] = [
         {"type": "text", "text": "\n\n".join(prompt_parts)}
     ]
@@ -1855,11 +1877,13 @@ def _extract_with_llm(
     model: str | None = None,
     key_secret: str = "",
     image_data_urls: Sequence[str] | None = None,
+    focus_instruction: str | None = None,
 ) -> tuple[LegalDescription, str, TokenUsage]:
     """
     Возвращает (Pydantic-модель, режим Structured Outputs, TokenUsage).
     Поддерживает как текстовый разбор Schedule A/Deed, так и мультимодальный
-    Vision-разбор отрендеренных страниц PDF (image_data_urls).
+    Vision-разбор отрендеренных страниц PDF (image_data_urls), а также инъекцию
+    фокусного задания (focus_instruction) для повторной проверки спорных мест.
     """
     api_cfg = cfg["api"]
     target = resolve_api_target(
@@ -1870,7 +1894,11 @@ def _extract_with_llm(
     provider_label = target["provider_label"]
     temperature = api_cfg.get("temperature", 0.0)
     client = _make_client(api_cfg, target=target)
-    messages = _messages(text, image_data_urls=image_data_urls)
+    messages = _messages(
+        text,
+        image_data_urls=image_data_urls,
+        focus_instruction=focus_instruction,
+    )
 
     if progress:
         mode_tag = f" (Vision, {len(image_data_urls)} стр.)" if image_data_urls else ""
@@ -3627,26 +3655,20 @@ def _repair_llm_geometry(
     return model, notes
 
 
-def parse_legal_description_full(
-    text: str | None = None,
-    pdf_path: str | Path | None = None,
-    cfg: dict[str, Any] | None = None,
+def _prepare_parse_input(
+    text: str | None,
+    pdf_path: str | Path | None,
+    cfg: dict[str, Any],
     *,
-    use_llm: bool = True,
-    provider: str | None = None,
-    model: str | None = None,
-    api_key: str | None = None,
-    key_secret: str = "",
-    allow_regex_fallback: bool = False,
+    use_llm: bool,
     progress: Callable[[str], None] | None = None,
-) -> ParseOutcome:
+) -> tuple[str, list[str], list[str]]:
     """
-    Полный разбор: PDF (текстовый ИЛИ векторный/скан через Vision) / текст ->
-    LLM (или локальный парсер) -> LegalDescription.
+    Читает/рендерит PDF один раз и подготавливает ``(combined_text, image_data_urls, warnings)``.
+    При многопроходном режиме избавляет от повторного рендера страниц PDF в каждом потоке.
     """
     from pathlib import Path as _Path
 
-    cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
     warnings: list[str] = []
     image_data_urls: list[str] = []
 
@@ -3695,6 +3717,31 @@ def parse_legal_description_full(
             f"текст длиннее {max_chars} символов — обрезан до {max_chars} для запроса"
         )
         combined = combined[:max_chars]
+    return combined, image_data_urls, warnings
+
+
+def parse_legal_description_full(
+    text: str | None = None,
+    pdf_path: str | Path | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    use_llm: bool = True,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    key_secret: str = "",
+    allow_regex_fallback: bool = False,
+    progress: Callable[[str], None] | None = None,
+    focus_instruction: str | None = None,
+) -> ParseOutcome:
+    """
+    Полный разбор: PDF (текстовый ИЛИ векторный/скан через Vision) / текст ->
+    LLM (или локальный парсер) -> LegalDescription.
+    """
+    cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
+    combined, image_data_urls, warnings = _prepare_parse_input(
+        text, pdf_path, cfg, use_llm=use_llm, progress=progress
+    )
 
     llm_error: Exception | None = None
     if use_llm:
@@ -3708,6 +3755,7 @@ def parse_legal_description_full(
                 model=model,
                 key_secret=key_secret,
                 image_data_urls=image_data_urls or None,
+                focus_instruction=focus_instruction,
             )
             parsed_model, repair_notes = _repair_llm_geometry(
                 parsed_model,
@@ -3757,3 +3805,602 @@ def parse_legal_description(
     return parse_legal_description_full(
         text=text, pdf_path=pdf_path, cfg=cfg, **kwargs
     ).data
+
+
+# ---------------------------------------------------------------------------
+# Многопроходный независимый консенсус (2–3 прохода LLM) и разрешение конфликтов
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PassTarget:
+    """Конфигурация одного независимого прохода LLM (провайдер + модель)."""
+
+    pass_index: int
+    provider: str
+    model: str
+    api_key: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscrepancyItem:
+    """Описание одного конкретного расхождения между ответами проходов LLM."""
+
+    field_id: str
+    title: str
+    values_by_pass: dict[int, str]
+
+    def summary(self, pass_labels: dict[int, str] | None = None) -> str:
+        parts: list[str] = []
+        for p_idx in sorted(self.values_by_pass):
+            p_name = (
+                pass_labels[p_idx]
+                if pass_labels and p_idx in pass_labels
+                else f"Проход #{p_idx}"
+            )
+            parts.append(f"{p_name}: «{self.values_by_pass[p_idx]}»")
+        return f"{self.title}  →  " + "   vs   ".join(parts)
+
+
+@dataclass
+class ConsensusResult:
+    """Результат параллельного запуска 2–3 независимых проходов LLM."""
+
+    agreed: bool
+    pass_outcomes: list[ParseOutcome]
+    pass_targets: list[PassTarget]
+    discrepancies: list[DiscrepancyItem]
+    selected_outcome: ParseOutcome
+    total_usage: TokenUsage
+    round_number: int = 1
+    prepared_text: str = ""
+    prepared_images: list[str] = field(default_factory=list)
+    base_warnings: list[str] = field(default_factory=list)
+
+    def pass_label(self, pass_index: int) -> str:
+        """Короткое человекочитаемое имя прохода (1-based)."""
+        idx0 = pass_index - 1
+        if 0 <= idx0 < len(self.pass_outcomes):
+            out = self.pass_outcomes[idx0]
+            prov = out.provider_label or out.provider
+            mdl = out.model
+            badge = " / ".join(p for p in (prov, mdl) if p)
+            return f"Проход #{pass_index} ({badge})" if badge else f"Проход #{pass_index}"
+        return f"Проход #{pass_index}"
+
+    def pass_labels_map(self) -> dict[int, str]:
+        return {i + 1: self.pass_label(i + 1) for i in range(len(self.pass_outcomes))}
+
+    def pass_closure_ft(self, pass_index: int) -> float:
+        idx0 = pass_index - 1
+        if 0 <= idx0 < len(self.pass_outcomes):
+            err, _ = _trace_closure_and_validity(self.pass_outcomes[idx0].data.segments)
+            return err
+        return 0.0
+
+    def discrepancy_report(self) -> str:
+        """Подробная русскоязычная сводка расхождений между проходами."""
+        n = len(self.pass_outcomes)
+        if self.agreed:
+            return f"✓ Консенсус {n}/{n} проходов (раунд #{self.round_number}): ответы полностью совпали."
+        labels = self.pass_labels_map()
+        lines = [
+            f"⚠ Обнаружено расхождение между {n} независимыми проходами LLM "
+            f"(раунд #{self.round_number}, спорных пунктов: {len(self.discrepancies)}):"
+        ]
+        for idx, item in enumerate(self.discrepancies, start=1):
+            lines.append(f"  {idx}. {item.summary(labels)}")
+        lines.append("")
+        lines.append("Невязка контура по каждому проходу:")
+        for p_i in range(1, n + 1):
+            out = self.pass_outcomes[p_i - 1]
+            err = self.pass_closure_ft(p_i)
+            lines.append(
+                f"  • {labels[p_i]}: сторон {len(out.data.segments)}, "
+                f"периметр {out.data.perimeter_ft:.2f} ft, невязка {err:.4f} ft"
+            )
+        lines.append("")
+        lines.append(
+            "Взгляните на исходный документ и выберите правую модель, "
+            "либо нажмите «Попробуй разобраться ещё раз» для прицельной перепроверки спорных мест."
+        )
+        return "\n".join(lines)
+
+    def resolve_with_pass(self, pass_index: int, *, reason: str = "") -> ParseOutcome:
+        """Формирует итоговый ParseOutcome на базе выбранного человеком прохода."""
+        idx0 = pass_index - 1
+        if not (0 <= idx0 < len(self.pass_outcomes)):
+            raise ValueError(f"некорректный номер прохода: {pass_index}")
+        chosen = self.pass_outcomes[idx0]
+        label = self.pass_label(pass_index)
+        note = (
+            reason.strip()
+            if reason.strip()
+            else f"Конфликт проходов разрешён человеком: выбран {label}"
+        )
+        merged_warnings = [note, *chosen.warnings]
+        return ParseOutcome(
+            data=chosen.data,
+            source=chosen.source,
+            warnings=merged_warnings,
+            usage=self.total_usage,
+            provider=chosen.provider,
+            provider_label=chosen.provider_label,
+            model=chosen.model,
+            llm_mode=chosen.llm_mode,
+        )
+
+
+_STREET_SUFFIX_CANON: dict[str, str] = {
+    "st": "street",
+    "str": "street",
+    "ave": "avenue",
+    "av": "avenue",
+    "blvd": "boulevard",
+    "rd": "road",
+    "dr": "drive",
+    "ln": "lane",
+    "pl": "place",
+    "ct": "court",
+    "pkwy": "parkway",
+    "expy": "expressway",
+    "expwy": "expressway",
+    "hwy": "highway",
+    "lp": "loop",
+}
+
+
+def _canonical_street_key(name: str | None) -> str:
+    """Нормализует имя улицы для сравнения (Aspenwall St. == ASPENWALL STREET)."""
+    if not name:
+        return ""
+    cleaned = re.sub(r"\([^)]*\)", " ", name.lower())
+    tokens = re.findall(r"[a-z0-9]+", cleaned)
+    norm = [_STREET_SUFFIX_CANON.get(tok, tok) for tok in tokens]
+    return " ".join(norm)
+
+
+def compare_legal_descriptions(
+    outcomes: Sequence[ParseOutcome],
+) -> tuple[bool, list[DiscrepancyItem]]:
+    """
+    Геодезическое сравнение 2–3 ответов LLM:
+      * отсекает чисто косметическую разницу ('St.' vs 'Street', 'N 0°00' E' vs 'N 0°00' W');
+      * фиксирует малейшее расхождение в числе сторон, румбе/угле (до 0.0002° ≈ 0.7"),
+        длине стороны (> 0.005 ft), привязке POB (> 0.01 ft) и названиях улиц.
+    """
+    n = len(outcomes)
+    if n <= 1:
+        return True, []
+
+    discrepancies: list[DiscrepancyItem] = []
+    datas = [o.data for o in outcomes]
+
+    # 1. Названия улиц (main_street / cross_street)
+    main_keys = [_canonical_street_key(d.main_street) for d in datas]
+    if len(set(main_keys)) > 1:
+        discrepancies.append(
+            DiscrepancyItem(
+                field_id="main_street",
+                title="Фасадная улица (main_street)",
+                values_by_pass={i + 1: (datas[i].main_street or "—") for i in range(n)},
+            )
+        )
+
+    cross_keys = [_canonical_street_key(d.cross_street) for d in datas]
+    if len(set(cross_keys)) > 1:
+        discrepancies.append(
+            DiscrepancyItem(
+                field_id="cross_street",
+                title="Пересекаемая улица (cross_street)",
+                values_by_pass={i + 1: (datas[i].cross_street or "—") for i in range(n)},
+            )
+        )
+
+    # 2. Привязка POB от перекрёстка улиц
+    dists_corner = [float(d.distance_to_corner_ft or 0.0) for d in datas]
+    if max(dists_corner) - min(dists_corner) > 0.01:
+        discrepancies.append(
+            DiscrepancyItem(
+                field_id="distance_to_corner_ft",
+                title="Расстояние от перекрёстка улиц до POB",
+                values_by_pass={i + 1: f"{dists_corner[i]:.2f}'" for i in range(n)},
+            )
+        )
+    elif max(dists_corner) > 0.01:
+        ties = [d.corner_to_pob_bearing for d in datas]
+        present_ties = [t for t in ties if t is not None]
+        if len(present_ties) >= 2:
+            base_az = present_ties[0].azimuth_deg
+            if any(_angle_diff_deg(base_az, t.azimuth_deg) > 1e-3 for t in present_ties[1:]):
+                discrepancies.append(
+                    DiscrepancyItem(
+                        field_id="corner_to_pob_bearing",
+                        title="Направление от перекрёстка к POB",
+                        values_by_pass={
+                            i + 1: (ties[i].bearing_label if ties[i] is not None else "—")
+                            for i in range(n)
+                        },
+                    )
+                )
+
+    # 3. Число сторон участка
+    seg_counts = [len(d.segments) for d in datas]
+    if len(set(seg_counts)) > 1:
+        discrepancies.append(
+            DiscrepancyItem(
+                field_id="segment_count",
+                title="Число сторон участка",
+                values_by_pass={i + 1: f"{seg_counts[i]} стор." for i in range(n)},
+            )
+        )
+        return False, discrepancies
+
+    # 4. Поэлементное сравнение каждой стороны (направление + длина + внутренний угол)
+    seg_len = seg_counts[0]
+    for s_idx in range(seg_len):
+        segs_i = [d.segments[s_idx] for d in datas]
+        base_az = segs_i[0].azimuth_deg
+        if any(_angle_diff_deg(base_az, s.azimuth_deg) > 2e-4 for s in segs_i[1:]):
+            discrepancies.append(
+                DiscrepancyItem(
+                    field_id=f"segments[{s_idx}].bearing",
+                    title=f"Сторона №{s_idx + 1} — направление/румб",
+                    values_by_pass={i + 1: segs_i[i].bearing_label for i in range(n)},
+                )
+            )
+
+        s_dists = [s.distance_ft for s in segs_i]
+        if max(s_dists) - min(s_dists) > 0.005:
+            discrepancies.append(
+                DiscrepancyItem(
+                    field_id=f"segments[{s_idx}].distance_ft",
+                    title=f"Сторона №{s_idx + 1} — длина",
+                    values_by_pass={i + 1: f"{s_dists[i]:.2f}'" for i in range(n)},
+                )
+            )
+
+        int_angles = [
+            (s.interior_angle or "").strip() for s in segs_i if (s.interior_angle or "").strip()
+        ]
+        if len(int_angles) == n and len(set(int_angles)) > 1:
+            discrepancies.append(
+                DiscrepancyItem(
+                    field_id=f"segments[{s_idx}].interior_angle",
+                    title=f"Сторона №{s_idx + 1} — внутренний угол",
+                    values_by_pass={
+                        i + 1: (segs_i[i].interior_angle or "—") for i in range(n)
+                    },
+                )
+            )
+
+    return len(discrepancies) == 0, discrepancies
+
+
+def build_discrepancy_focus_prompt(consensus: ConsensusResult) -> str:
+    """
+    Строит промпт-инъекцию для повторного арбитражного вызова моделей:
+    перечисляет ВСЕ конкретные спорные места и невязки предыдущего раунда и даёт
+    жёсткое задание перепроверить первоисточник именно в этих точках.
+    """
+    next_round = consensus.round_number + 1
+    labels = consensus.pass_labels_map()
+    bullet_lines: list[str] = []
+    for idx, item in enumerate(consensus.discrepancies, start=1):
+        bullet_lines.append(f"  {idx}) {item.summary(labels)}")
+
+    closure_lines: list[str] = []
+    for p_i in range(1, len(consensus.pass_outcomes) + 1):
+        err = consensus.pass_closure_ft(p_i)
+        closure_lines.append(f"  - {labels[p_i]}: невязка контура = {err:.4f} ft")
+
+    disputed_block = "\n".join(bullet_lines) if bullet_lines else "  (общая проверка геометрии)"
+    closure_block = "\n".join(closure_lines)
+    return (
+        f"CRITICAL RE-VERIFICATION TASK (ARBITRATION ROUND #{next_round}):\n"
+        "Independent readings of this exact document disagreed ONLY on the following specific item(s):\n"
+        f"{disputed_block}\n\n"
+        "Closure error of each previous reading:\n"
+        f"{closure_block}\n\n"
+        "INSTRUCTIONS FOR THIS RE-CHECK:\n"
+        "1. Focus specifically on the disputed item(s) above in the original source text / survey image.\n"
+        "2. Re-read every character and digit at the disputed spot with extreme care: verify quadrant "
+        "letters (N vs S, E vs W), degree/minute/second digits, and distance digits (watch for visually "
+        "similar glyphs: 3 vs 8, 8 vs 0, 1 vs 7, 5 vs 6, 0 vs 6, 0 vs 9).\n"
+        "3. Cross-check against opposite parallel sides, perpendicular 90° corners, and total polygon "
+        "vector closure (∑ΔX = 0, ∑ΔY = 0).\n"
+        "4. Do NOT average values — return the exact reading supported by the document and geometry, "
+        "and briefly explain your verification of the disputed point in Russian in `anomaly_note`."
+    )
+
+
+def build_pass_targets(
+    cfg: dict[str, Any],
+    *,
+    primary_provider: str | None = None,
+    primary_model: str | None = None,
+    primary_api_key: str | None = None,
+    passes: int | None = None,
+) -> list[PassTarget]:
+    """Собирает список из 1, 2 или 3 целей независимых проходов LLM из настроек."""
+    api_cfg = cfg.get("api", {})
+    cons_cfg = api_cfg.get("consensus") or {}
+    count = int(passes if passes is not None else (cons_cfg.get("passes") or 1))
+    count = max(1, min(3, count))
+
+    p1_prov = str(primary_provider or api_cfg.get("provider") or "hydra").strip().lower()
+    providers_map = api_cfg.get("providers") or {}
+    p1_default_model = (
+        (providers_map.get(p1_prov) or {}).get("selected_model")
+        or api_cfg.get("model")
+        or "glm-5.2"
+    )
+    p1_model = str(primary_model or p1_default_model).strip()
+    targets = [
+        PassTarget(
+            pass_index=1,
+            provider=p1_prov,
+            model=p1_model,
+            api_key=primary_api_key,
+        )
+    ]
+    if count >= 2:
+        p2_prov = str(cons_cfg.get("pass2_provider") or p1_prov).strip().lower()
+        p2_def = (providers_map.get(p2_prov) or {}).get("selected_model") or p1_model
+        p2_model = str(cons_cfg.get("pass2_model") or p2_def).strip()
+        p2_key = primary_api_key if p2_prov == p1_prov else None
+        targets.append(
+            PassTarget(pass_index=2, provider=p2_prov, model=p2_model, api_key=p2_key)
+        )
+    if count >= 3:
+        p3_prov = str(cons_cfg.get("pass3_provider") or p1_prov).strip().lower()
+        p3_def = (providers_map.get(p3_prov) or {}).get("selected_model") or p1_model
+        p3_model = str(cons_cfg.get("pass3_model") or p3_def).strip()
+        p3_key = primary_api_key if p3_prov == p1_prov else None
+        targets.append(
+            PassTarget(pass_index=3, provider=p3_prov, model=p3_model, api_key=p3_key)
+        )
+    return targets
+
+
+def _combine_usages(
+    usages: Sequence[TokenUsage | None],
+    *,
+    label_summary: str = "",
+) -> TokenUsage:
+    valid = [u for u in usages if u is not None]
+    if not valid:
+        return TokenUsage(available=False, provider_label=label_summary)
+    p_sum = sum(u.prompt_tokens for u in valid)
+    c_sum = sum(u.completion_tokens for u in valid)
+    t_sum = sum(u.total_tokens for u in valid)
+    any_avail = any(u.available for u in valid)
+    if len(valid) == 1 and not label_summary:
+        return valid[0]
+    return TokenUsage(
+        prompt_tokens=p_sum,
+        completion_tokens=c_sum,
+        total_tokens=t_sum,
+        provider=valid[0].provider,
+        provider_label=label_summary or f"{len(valid)} прох.",
+        model="",
+        available=any_avail,
+    )
+
+
+def run_multipass_consensus(
+    text: str | None = None,
+    pdf_path: str | Path | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    targets: Sequence[PassTarget] | None = None,
+    passes: int | None = None,
+    primary_provider: str | None = None,
+    primary_model: str | None = None,
+    primary_api_key: str | None = None,
+    key_secret: str = "",
+    progress: Callable[[str], None] | None = None,
+    focus_instruction: str | None = None,
+    prior_usage: TokenUsage | None = None,
+    round_number: int = 1,
+    prepared_input: tuple[str, list[str], list[str]] | None = None,
+) -> ConsensusResult:
+    """
+    Выполняет 2 или 3 независимых параллельных вызова LLM (по одному на каждый PassTarget),
+    сравнивает геометрию и метаданные и возвращает ``ConsensusResult``.
+    """
+    cfg_copy = copy.deepcopy(cfg) if cfg is not None else load_config()
+    pass_targets = (
+        list(targets)
+        if targets is not None
+        else build_pass_targets(
+            cfg_copy,
+            primary_provider=primary_provider,
+            primary_model=primary_model,
+            primary_api_key=primary_api_key,
+            passes=passes,
+        )
+    )
+    if not pass_targets:
+        raise LLMParseError("не задано ни одного прохода LLM")
+
+    if prepared_input is not None:
+        combined, image_data_urls, base_warnings = (
+            prepared_input[0],
+            list(prepared_input[1]),
+            list(prepared_input[2]),
+        )
+    else:
+        combined, image_data_urls, base_warnings = _prepare_parse_input(
+            text, pdf_path, cfg_copy, use_llm=True, progress=progress
+        )
+
+    # Предварительно проверяем наличие ключей для всех выбранных провайдеров,
+    # чтобы выдать понятную ошибку с номером прохода до старта потоков.
+    for pt in pass_targets:
+        resolved = resolve_api_target(
+            cfg_copy,
+            provider=pt.provider,
+            model=pt.model,
+            api_key=pt.api_key,
+            key_secret=key_secret,
+        )
+        if not resolved["api_key"]:
+            p_lbl = resolved["provider_label"]
+            env_hint = f" (или {resolved['env_key']})" if resolved.get("env_key") else ""
+            raise LLMParseError(
+                f"Проход #{pt.pass_index} ({p_lbl} / {resolved['model']}): "
+                f"не задан API-ключ для провайдера {p_lbl}{env_hint}"
+            )
+
+    n_passes = len(pass_targets)
+    if progress:
+        round_tag = f" [повторный арбитраж, раунд #{round_number}]" if round_number > 1 else ""
+        progress(
+            f"Параллельный запуск {n_passes} независимых проходов LLM{round_tag}…"
+        )
+
+    def _run_single_pass(pt: PassTarget) -> ParseOutcome:
+        def _pass_progress(msg: str) -> None:
+            if progress:
+                progress(f"[Проход #{pt.pass_index}] {msg}")
+
+        parsed_model, mode, usage = _extract_with_llm(
+            combined,
+            cfg_copy,
+            api_key=pt.api_key,
+            progress=_pass_progress,
+            provider=pt.provider,
+            model=pt.model,
+            key_secret=key_secret,
+            image_data_urls=image_data_urls or None,
+            focus_instruction=focus_instruction,
+        )
+        parsed_model, repair_notes = _repair_llm_geometry(
+            parsed_model,
+            from_vision=bool(image_data_urls),
+            source_text=combined,
+        )
+        p_warnings = list(base_warnings) + list(repair_notes)
+        if mode != "structured-outputs":
+            p_warnings.append(
+                f"Проход #{pt.pass_index}: провайдер не поддержал Structured Outputs ({mode})"
+            )
+        return ParseOutcome(
+            data=parsed_model,
+            source="llm-vision" if image_data_urls else "llm",
+            warnings=p_warnings,
+            usage=usage,
+            provider=usage.provider,
+            provider_label=usage.provider_label,
+            model=usage.model,
+            llm_mode=mode,
+        )
+
+    outcomes_by_index: dict[int, ParseOutcome] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_passes) as pool:
+        future_map = {
+            pool.submit(_run_single_pass, pt): pt for pt in pass_targets
+        }
+        for fut in concurrent.futures.as_completed(future_map):
+            pt = future_map[fut]
+            try:
+                outcomes_by_index[pt.pass_index] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                raise LLMParseError(
+                    f"Проход #{pt.pass_index} ({pt.provider} / {pt.model}): {exc}"
+                ) from exc
+
+    ordered_outcomes = [outcomes_by_index[pt.pass_index] for pt in pass_targets]
+    agreed, discrepancies = compare_legal_descriptions(ordered_outcomes)
+
+    usage_items: list[TokenUsage | None] = [o.usage for o in ordered_outcomes]
+    if prior_usage is not None:
+        usage_items.insert(0, prior_usage)
+    badge_summary = " + ".join(
+        f"#{i + 1}:{o.model or o.provider}" for i, o in enumerate(ordered_outcomes)
+    )
+    if round_number > 1:
+        badge_summary += f" (раунд #{round_number})"
+    total_usage = _combine_usages(usage_items, label_summary=badge_summary)
+
+    first = ordered_outcomes[0]
+    if agreed and n_passes >= 2:
+        if round_number > 1:
+            consensus_banner = (
+                f"✓ Конфликт разрешён на повторной проверке (раунд #{round_number}): "
+                f"все {n_passes} прохода сошлись во мнении!"
+            )
+        else:
+            consensus_banner = (
+                f"✓ Консенсус {n_passes}/{n_passes} независимых проходов LLM: "
+                "ответы полностью совпали"
+            )
+        # Склеиваем уникальные пояснения со всех проходов без дублей
+        merged_warns: list[str] = [consensus_banner]
+        for out in ordered_outcomes:
+            for w in out.warnings:
+                if w not in merged_warns:
+                    merged_warns.append(w)
+        selected = ParseOutcome(
+            data=first.data,
+            source=first.source,
+            warnings=merged_warns,
+            usage=total_usage,
+            provider=first.provider,
+            provider_label=f"Консенсус {n_passes}/{n_passes}",
+            model=", ".join(o.model for o in ordered_outcomes if o.model),
+            llm_mode=first.llm_mode,
+        )
+    else:
+        selected = ParseOutcome(
+            data=first.data,
+            source=first.source,
+            warnings=list(first.warnings),
+            usage=total_usage,
+            provider=first.provider,
+            provider_label=first.provider_label,
+            model=first.model,
+            llm_mode=first.llm_mode,
+        )
+
+    return ConsensusResult(
+        agreed=agreed,
+        pass_outcomes=ordered_outcomes,
+        pass_targets=pass_targets,
+        discrepancies=discrepancies,
+        selected_outcome=selected,
+        total_usage=total_usage,
+        round_number=round_number,
+        prepared_text=combined,
+        prepared_images=image_data_urls,
+        base_warnings=base_warnings,
+    )
+
+
+def recheck_consensus_discrepancies(
+    consensus: ConsensusResult,
+    cfg: dict[str, Any] | None = None,
+    *,
+    key_secret: str = "",
+    progress: Callable[[str], None] | None = None,
+) -> ConsensusResult:
+    """
+    Повторный параллельный вызов тех же проходов («Попробуй разобраться ещё раз»)
+    с инъекцией в промпт задания сосредоточиться именно на спорных пунктах.
+    """
+    focus_prompt = build_discrepancy_focus_prompt(consensus)
+    return run_multipass_consensus(
+        cfg=cfg,
+        targets=consensus.pass_targets,
+        key_secret=key_secret,
+        progress=progress,
+        focus_instruction=focus_prompt,
+        prior_usage=consensus.total_usage,
+        round_number=consensus.round_number + 1,
+        prepared_input=(
+            consensus.prepared_text,
+            consensus.prepared_images,
+            consensus.base_warnings,
+        ),
+    )

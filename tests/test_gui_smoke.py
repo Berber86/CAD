@@ -142,6 +142,40 @@ class _Widget:
         return []
 
 
+class _FakeCanvas(_Widget):
+    """Заглушка tkinter.Canvas для тестирования живого CAD-предпросмотра."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.items: list[tuple[str, tuple, dict]] = []
+        self._bindings: dict[str, object] = {}
+
+    def delete(self, tag):
+        if tag == "all":
+            self.items.clear()
+
+    def winfo_width(self):
+        return 460
+
+    def winfo_height(self):
+        return 280
+
+    def bind(self, event_name, callback):
+        self._bindings[event_name] = callback
+
+    def create_line(self, *coords, **kwargs):
+        self.items.append(("line", coords, dict(kwargs)))
+        return len(self.items)
+
+    def create_oval(self, *coords, **kwargs):
+        self.items.append(("oval", coords, dict(kwargs)))
+        return len(self.items)
+
+    def create_text(self, *coords, **kwargs):
+        self.items.append(("text", coords, dict(kwargs)))
+        return len(self.items)
+
+
 def _fake_modules() -> dict[str, types.ModuleType]:
     ctk = types.ModuleType("customtkinter")
     for name in (
@@ -168,6 +202,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     ctk.BooleanVar = _Var
 
     tkinter = types.ModuleType("tkinter")
+    tkinter.Canvas = _FakeCanvas
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
     filedialog.askopenfilenames = lambda **kwargs: ()
@@ -679,6 +714,113 @@ def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_p
     assert drawn_distances == [pytest.approx(420.0)]
     assert "Конфликт проходов разрешён человеком" in app.status_var.get()
     app._on_close()
+
+
+def test_gui_studio_ux_drawer_preview_canvas_and_inspector(gui, monkeypatch, tmp_path):
+    """
+    Проверяет UX редизайна Dark CAD Studio (v0.7.0):
+      * автооткрытие и автосворачивание ящика API-ключей + счётчик ключей;
+      * переключение «ИИ-разбор (LLM)» <-> локальный офлайн-парсер (Regex-бейдж);
+      * живой векторный CAD-предпросмотр от (0, 0) (основной лот + сосед + GAP-маркер)
+        и структурированную ведомость сторон в правой панели.
+    """
+    import llm_parser
+    from acad_builder import AcadBuilder
+    from llm_parser import LegalDescription, Segment
+
+    cfg_file = tmp_path / "config.json"
+    local_file = tmp_path / "config.local.json"
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(llm_parser, "ENV_PATH", env_file)
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(gui, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(gui, "ENV_PATH", env_file)
+    for env_var in ("HYDRA_API_KEY", "OPENROUTER_API_KEY", "ROUTERAI_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    app = gui.SurveyApp()
+    # При чистом запуске без ключей ящик API-ключей открыт сразу
+    assert app._keys_drawer_open is True
+    assert "Ввести API-ключи" in app.keys_toggle_button.cget("text")
+
+    # После сохранения ключа ящик автоматически сворачивается, освобождая рабочее поле
+    app.provider_key_vars["hydra"].set("sk-hydra-studio")
+    app._save_settings()
+    assert app._keys_drawer_open is False
+    assert "готовы (1)" in app.keys_toggle_button.cget("text")
+
+    app.toggle_keys_drawer()
+    assert app._keys_drawer_open is True
+    app.toggle_keys_drawer()
+    assert app._keys_drawer_open is False
+
+    # Выключение ИИ-разбора показывает понятный индикатор локального Regex-режима
+    app.select_passes(3)
+    assert app.pass2_row._gridded is True
+    assert app.pass3_row._gridded is True
+    app.use_llm_var.set(False)
+    app._on_use_llm_toggled()
+    assert app.pass2_row._gridded is False
+    assert app.pass3_row._gridded is False
+    assert app.regex_mode_badge._gridded is True
+    app.use_llm_var.set(True)
+    app._on_use_llm_toggled()
+    assert app.regex_mode_badge._gridded is False
+    assert app.pass3_row._gridded is True
+
+    # Выбор примеров основного и соседнего участков мгновенно строит живую схему от (0, 0)
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    assert app._preview_main_plan is not None
+    inspector_txt = app.inspector_box.get()
+    assert "ОСНОВНОЙ УЧАСТОК" in inspector_txt
+    assert "Стороны контура (4 отр. LINE)" in inspector_txt
+    assert app.closure_label.cget("text_color") == gui.THEME["ok"]
+
+    app._on_sample_selected("Aspenwall St — 365' (Сосед слева)")
+    assert len(app._preview_neighbor_plans) == 1
+    assert app.preview_canvas is not None
+    canvas_texts = [
+        item[2].get("text", "")
+        for item in app.preview_canvas.items
+        if item[0] == "text"
+    ]
+    assert "(0,0)" in canvas_texts
+    assert "POB" in canvas_texts
+    assert "СОСЕД" in canvas_texts
+    assert "#1" in canvas_texts and "#4" in canvas_texts
+
+    # Участок с открытым гэпом рисует маркер GAP на схеме и подсвечивает невязку янтарным цветом
+    gap_desc = LegalDescription(
+        main_street="Oak Ave",
+        cross_street="1st St",
+        distance_to_corner_ft=50.0,
+        segments=[
+            Segment(ns="N", degrees=90, ew="E", distance_ft=100.0),
+            Segment(ns="S", degrees=0, ew="E", distance_ft=50.0),
+            Segment(ns="S", degrees=90, ew="W", distance_ft=99.65),
+            Segment(ns="N", degrees=0, ew="W", distance_ft=50.0),
+        ],
+    )
+    gap_plan = AcadBuilder(app.config_data).plan(gap_desc)
+    app._record_plan_for_preview(gap_plan)
+    app._update_closure_badge(gap_plan.closure.short_report(), gap_plan.closure.distance)
+    gap_texts = [
+        item[2].get("text", "")
+        for item in app.preview_canvas.items
+        if item[0] == "text"
+    ]
+    assert any(t.startswith("GAP ") for t in gap_texts)
+    assert app.closure_label.cget("text_color") == gui.THEME["warn"]
+
+    # Сброс сцены очищает предпросмотр и ведомость
+    app._clear_preview_scene()
+    assert app._preview_main_plan is None
+    assert app._preview_neighbor_plans == []
+    assert "Ведомость участка пока пуста" in app.inspector_box.get()
+    app._on_close()
+
 
 
 

@@ -1062,6 +1062,69 @@ def test_gui_neighbor_verification_button_alerts_canvas_and_report_modal(
     app._on_close()
 
 
+def test_gui_lot_suspicion_signal_on_closed_skewed_rectangle(gui) -> None:
+    """GUI сразу сигнализирует о подозрительном «почти прямоугольнике», даже когда Closure Error = 0.000 ft!"""
+    import time
+    from llm_parser import ASPENWALL_SAMPLES
+
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+
+    # 1) Эталонный прямоугольник — зелёный значок «🔎 Форма: прямоугольник ✓»
+    clean_txt = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", clean_txt)
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app._last_suspicion_report is not None
+    assert app._last_suspicion_report.is_suspicious is False
+    assert "прямоугольник ✓" in app.suspicion_badge_button.cget("text")
+
+    # 2) Скошенный «почти прямоугольник» с ошибкой заёма 1' (14°40'40" вместо 14°39'40" на обеих боковых межах):
+    # Closure Error идеально равен 0.000 ft, но углы 89°59'00" / 90°01'00"!
+    skewed_txt = clean_txt.replace("S 14°39'40\" E", "S 14°40'40\" E").replace(
+        "N 14°39'40\" W", "N 14°40'40\" W"
+    )
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", skewed_txt)
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert "0.000 ft" in app.closure_var.get()
+    assert app._last_suspicion_report is not None
+    assert app._last_suspicion_report.is_suspicious is True
+    assert "Подозрительно" in app.suspicion_badge_button.cget("text")
+    assert app.suspicion_badge_button.cget("fg_color") == "#dc2626"
+
+    # Сигнал сразу виден и в нижней строке статуса, и в инспекторе, и на холсте предпросмотра
+    status_txt = app.status_var.get()
+    assert "Подозрительная геометрия участка" in status_txt
+    assert "почти прямоугольник" in status_txt
+
+    insp_txt = app.inspector_box.get("1.0", "end")
+    assert "89°59'00\"" in insp_txt
+    assert "заёма 1 минуты" in insp_txt
+
+    canvas_texts = [
+        it[2].get("text", "") for it in app.preview_canvas.items if it[0] == "text"
+    ]
+    assert "⚠ #1" in canvas_texts
+
+    # Открытие окна диагностики геометрии работает без ошибок
+    app._open_lot_suspicion_window()
+    app._on_close()
+
+
+
 
 
 

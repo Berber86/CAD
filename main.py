@@ -68,6 +68,7 @@ from acad_builder import (
     AcadConnectionError,
     DrawPlan,
     DrawResult,
+    LotSuspicionReport,
     NeighborVerificationReport,
     compute_pob_point,
     format_distance,
@@ -108,7 +109,7 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1180x880"
-VERSION = "0.9.0"
+VERSION = "0.9.5"
 
 # Палитра Dark CAD Studio (высокий контраст, спокойные инженерные акценты)
 THEME: dict[str, str] = {
@@ -278,6 +279,7 @@ class SurveyApp(ctk.CTk):
         self._preview_neighbor_plans: list[DrawPlan] = []
         self._last_active_plan: DrawPlan | None = None
         self._neighbor_report: NeighborVerificationReport | None = None
+        self._last_suspicion_report: LotSuspicionReport | None = None
 
         # Провайдеры и их модели
         entries = provider_entries(self.config_data)
@@ -1318,7 +1320,7 @@ class SurveyApp(ctk.CTk):
 
         kpi_bar = ctk.CTkFrame(status_frame, fg_color="transparent")
         kpi_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
-        kpi_bar.grid_columnconfigure(1, weight=1)
+        kpi_bar.grid_columnconfigure(2, weight=1)
 
         self.closure_var = ctk.StringVar(value="Closure Error: —")
         self.closure_label = ctk.CTkLabel(
@@ -1328,7 +1330,21 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=THEME["text_main"],
         )
-        self.closure_label.grid(row=0, column=0, sticky="w", padx=(0, 16))
+        self.closure_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        self.suspicion_badge_button = ctk.CTkButton(
+            kpi_bar,
+            text="🔎 Форма: —",
+            width=190,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._open_lot_suspicion_window,
+        )
+        self.suspicion_badge_button.grid(row=0, column=1, sticky="w", padx=(0, 14))
 
         self.tokens_var = ctk.StringVar(value="Токены за вызов: —")
         self.tokens_label = ctk.CTkLabel(
@@ -1338,7 +1354,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=THEME["sky"],
         )
-        self.tokens_label.grid(row=0, column=1, sticky="w")
+        self.tokens_label.grid(row=0, column=2, sticky="w")
 
         ctk.CTkButton(
             kpi_bar,
@@ -1350,7 +1366,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_card"],
             command=self._show_log,
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=3, sticky="e")
 
         self.status_var = ctk.StringVar(
             value="Готово. Загрузите PDF, выберите пример или вставьте текст Legal Description."
@@ -1877,16 +1893,155 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["err"] if rep.overall_status == "error" else THEME["warn"]
         )
 
+    def _refresh_suspicion_badge(self) -> None:
+        if not hasattr(self, "suspicion_badge_button"):
+            return
+        rep = self._last_suspicion_report
+        if rep is None:
+            self.suspicion_badge_button.configure(
+                text="🔎 Форма: —",
+                fg_color=THEME["btn_secondary"],
+                hover_color=THEME["btn_secondary_hover"],
+            )
+            return
+        if not rep.is_suspicious:
+            self.suspicion_badge_button.configure(
+                text=rep.short_badge(),
+                fg_color="#059669",
+                hover_color="#047857",
+            )
+        elif rep.status == "error":
+            self.suspicion_badge_button.configure(
+                text=rep.short_badge(),
+                fg_color="#dc2626",
+                hover_color="#b91c1c",
+            )
+        else:
+            self.suspicion_badge_button.configure(
+                text=rep.short_badge(),
+                fg_color="#d97706",
+                hover_color="#b45309",
+            )
+
+    def _append_suspicion_to_status(self, plan: DrawPlan | None = None) -> None:
+        """Если в геометрии только что построенного участка найдена подозрительность — сразу пишет юзеру."""
+        target_plan = plan or self._last_active_plan
+        rep = target_plan.suspicion if target_plan is not None else self._last_suspicion_report
+        if rep is None or not rep.is_suspicious:
+            return
+        cur = str(self.status_var.get() or "").strip()
+        first_it = rep.items[0]
+        alert_parts: list[str] = []
+        if rep.headline() not in cur:
+            alert_parts.append(rep.headline())
+        first_line = f"   ↳ {first_it.title}: {first_it.detail}"
+        if first_it.title not in cur:
+            alert_parts.append(first_line)
+        self._log_line(rep.format_report())
+        if alert_parts:
+            block = "\n".join(alert_parts)
+            self.status_var.set(f"{cur}\n{block}" if cur else block)
+        self.status_label.configure(
+            text_color=THEME["err"] if rep.status == "error" else THEME["warn"]
+        )
+
+    def _open_lot_suspicion_window(self) -> None:
+        """Открывает модальное окно диагностики геометрии и подозрительности активного участка."""
+        rep = self._last_suspicion_report
+        if rep is None:
+            self._set_status(
+                "Сначала разберите участок, чтобы проверить его геометрию на подозрительность."
+            )
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Диагностика геометрии участка — Title Survey AI")
+        win.geometry("860x560")
+        win.configure(fg_color=THEME["bg_root"])
+        win.attributes("-topmost", True)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        head_color = (
+            THEME["ok"]
+            if not rep.is_suspicious
+            else (THEME["err"] if rep.status == "error" else THEME["warn"])
+        )
+        head_card = ctk.CTkFrame(
+            win,
+            fg_color=THEME["bg_card"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        head_card.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        ctk.CTkLabel(
+            head_card,
+            text=rep.headline(),
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=head_color,
+            anchor="w",
+            justify="left",
+            wraplength=810,
+        ).pack(fill="x", padx=12, pady=10)
+
+        box = ctk.CTkTextbox(
+            win,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        full_txt = rep.format_report()
+        box.insert("1.0", full_txt)
+        target = getattr(box, "_textbox", box)
+        target.configure(state="disabled")
+
+        foot = ctk.CTkFrame(win, fg_color="transparent")
+        foot.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        foot.grid_columnconfigure(0, weight=1)
+
+        def _copy_diag() -> None:
+            clip_fn = getattr(self, "clipboard_clear", None)
+            append_fn = getattr(self, "clipboard_append", None)
+            if callable(clip_fn) and callable(append_fn):
+                clip_fn()
+                append_fn(full_txt)
+            self._set_status("Отчёт проверки геометрии скопирован в буфер обмена.")
+
+        ctk.CTkButton(
+            foot,
+            text="📋 Скопировать диагностику",
+            width=195,
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            command=_copy_diag,
+        ).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            foot,
+            text="Закрыть",
+            width=110,
+            height=30,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            command=win.destroy,
+        ).grid(row=0, column=2)
+
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
         self._preview_neighbor_plans.clear()
         self._last_active_plan = None
         self._neighbor_report = None
+        self._last_suspicion_report = None
         self._refresh_neighbor_verify_button()
+        self._refresh_suspicion_badge()
         self._render_empty_inspector()
 
     def _record_plan_for_preview(self, plan: DrawPlan, *, warnings: list[str] | None = None) -> None:
         self._last_active_plan = plan
+        self._last_suspicion_report = plan.suspicion
+        self._refresh_suspicion_badge()
         if plan.is_neighbor:
             # Обновляем соседа с тем же POB или добавляем нового в общую сцену от (0, 0)
             replaced = False
@@ -1949,6 +2104,9 @@ class SurveyApp(ctk.CTk):
             f"  Периметр:  {desc.perimeter_ft:,.2f} ft   |   "
             f"Невязка: {plan.closure.distance:.4f} ft"
         )
+        if plan.suspicion is not None:
+            lines.append("")
+            lines.append(plan.suspicion.format_report())
         lines.append("")
         lines.append(f"Стороны контура ({len(plan.boundary_lines)} отр. LINE):")
         for idx, seg in enumerate(desc.segments, start=1):
@@ -2190,16 +2348,36 @@ class SurveyApp(ctk.CTk):
             seg_color = (
                 THEME["cad_neighbor"] if focus_plan.is_neighbor else THEME["cad_prop"]
             )
+            susp_map: dict[int, str] = {}
+            if focus_plan.suspicion is not None and focus_plan.suspicion.is_suspicious:
+                for s_item in focus_plan.suspicion.items:
+                    col = THEME["err"] if s_item.severity == "error" else THEME["warn"]
+                    for s_idx in s_item.segment_indices:
+                        if s_idx not in susp_map or s_item.severity == "error":
+                            susp_map[s_idx] = col
+
             for idx, bl in enumerate(focus_plan.boundary_lines, start=1):
                 x1, y1 = to_screen(bl.start)
                 x2, y2 = to_screen(bl.end)
+                if idx in susp_map:
+                    canvas.create_line(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        fill=susp_map[idx],
+                        width=4.5,
+                        dash=(5, 3),
+                    )
                 canvas.create_line(x1, y1, x2, y2, fill=seg_color, width=2.4)
                 mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+                lbl_txt = f"⚠ #{idx}" if idx in susp_map else f"#{idx}"
+                lbl_col = susp_map.get(idx, THEME["text_main"])
                 canvas.create_text(
                     mx,
                     my - 7,
-                    text=f"#{idx}",
-                    fill=THEME["text_main"],
+                    text=lbl_txt,
+                    fill=lbl_col,
                     font=("Consolas", 8, "bold"),
                 )
 
@@ -2396,6 +2574,8 @@ class SurveyApp(ctk.CTk):
         self.description = None
         self.draw_result = None
         self._last_active_plan = None
+        self._last_suspicion_report = None
+        self._refresh_suspicion_badge()
         self.preview_mode_var.set("📐 Схема CAD")
         self.preview_mode_switch.set("📐 Схема CAD")
         self._update_closure_badge("Closure Error: —", None)
@@ -2748,6 +2928,7 @@ class SurveyApp(ctk.CTk):
                             is_neighbor=self.is_neighbor_mode(),
                         )
                         self._record_plan_for_preview(plan, warnings=outcome.warnings)
+                        self._append_suspicion_to_status(plan)
                         self._append_neighbor_verification_to_status()
                         self._update_closure_badge(
                             plan.closure.short_report(), plan.closure.distance
@@ -2777,6 +2958,9 @@ class SurveyApp(ctk.CTk):
                     "  |  ".join(msg_parts),
                     error=bool(batch_errors and not items_done),
                 )
+                for _out, res in items_done:
+                    if res is not None:
+                        self._append_suspicion_to_status(res.plan)
                 self._append_neighbor_verification_to_status()
                 if items_done:
                     last_out, last_res = items_done[-1]
@@ -3992,6 +4176,7 @@ class SurveyApp(ctk.CTk):
         if outcome.warnings:
             summary_text += "\n" + "\n".join(f"• {w}" for w in outcome.warnings)
         self._set_status(summary_text)
+        self._append_suspicion_to_status(result.plan)
         self._append_neighbor_verification_to_status()
         self._update_closure_badge(
             result.closure.short_report(), result.closure.distance

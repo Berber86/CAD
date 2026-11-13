@@ -2389,6 +2389,186 @@ def test_neighbor_verification_intelligent_diagnostics_all_heuristics():
     assert any("НАШЕМ описании" in d for d in ec7.diagnoses)
 
 
+def test_lot_suspicion_clean_presets_and_oblique_parallelogram() -> None:
+    """Все штатные пресеты (прямоугольники, прямоугольная трапеция Borden Ave) и честный параллелограмм — без ложных тревог."""
+    from llm_parser import ASPENWALL_SAMPLES, NYC_SAMPLES, Segment, load_config, parse_with_regex
+    from acad_builder import AcadBuilder
+
+    builder = AcadBuilder(load_config())
+    for name, txt in {**NYC_SAMPLES, **ASPENWALL_SAMPLES}.items():
+        desc, _ = parse_with_regex(txt)
+        plan = builder.plan(desc, scale=16.0)
+        assert plan.suspicion is not None, name
+        assert plan.suspicion.is_suspicious is False, f"{name}: {plan.suspicion.format_report()}"
+        assert plan.suspicion.status == "ok"
+
+    # Честный косой параллелограмм (углы 70° и 110°, далеко от 90° — не должен считаться «почти прямоугольником»)
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    d_para = dm.model_copy(deep=True)
+    d_para.distance_to_corner_ft = 0.0
+    d_para.corner_to_pob_bearing = None
+    d_para.segments = [
+        Segment(ns="N", degrees=20, minutes=0, seconds=0, ew="E", distance_ft=120.0),
+        Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=60.0),
+        Segment(ns="S", degrees=20, minutes=0, seconds=0, ew="W", distance_ft=120.0),
+        Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=60.0),
+    ]
+    p_para = builder.plan(d_para, scale=16.0)
+    assert p_para.suspicion is not None
+    assert p_para.suspicion.shape_kind == "параллелограмм"
+    assert p_para.suspicion.is_suspicious is False
+
+
+def test_lot_suspicion_almost_rectangle_and_euclid_laws() -> None:
+    """Ловит скошенный в 0.000' «почти прямоугольник», нарушение теорем Евклида и Пифагора у трапеции."""
+    from llm_parser import ASPENWALL_SAMPLES, Segment, load_config, parse_with_regex
+    from acad_builder import AcadBuilder
+
+    builder = AcadBuilder(load_config())
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+
+    # 1) Скошенный «почти прямоугольник», замкнутый в 0.000' (ошибка заёма 1' при вычитании из 90°)
+    d_borrow = dm.model_copy(deep=True)
+    d_borrow.segments = [
+        Segment(ns="S", degrees=14, minutes=40, seconds=40, ew="E", distance_ft=100.0),
+        Segment(ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=55.0),
+        Segment(ns="N", degrees=14, minutes=40, seconds=40, ew="W", distance_ft=100.0),
+        Segment(ns="S", degrees=75, minutes=20, seconds=20, ew="W", distance_ft=55.0),
+    ]
+    p_borrow = builder.plan(d_borrow, scale=16.0)
+    assert p_borrow.closure.distance < 1e-6  # невязка нулевая, но участок кривой!
+    assert p_borrow.suspicion is not None and p_borrow.suspicion.is_suspicious is True
+    codes_b = {it.code for it in p_borrow.suspicion.items}
+    assert "ALMOST_RECTANGLE_SKEW" in codes_b
+    assert "заёма 1 минуты" in p_borrow.suspicion.format_report()
+
+    # 2) Прямая теорема Евклида: стороны попарно равны (100/100 и 55/55), но #1 и #3 не параллельны на 25"
+    d_euc1 = dm.model_copy(deep=True)
+    d_euc1.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=15, ew="W", distance_ft=100.0)
+    p_euc1 = builder.plan(d_euc1, scale=16.0)
+    assert p_euc1.suspicion is not None and p_euc1.suspicion.is_suspicious is True
+    codes_e1 = {it.code for it in p_euc1.suspicion.items}
+    assert "EUCLID_EQUAL_SIDES_NOT_PARALLEL" in codes_e1
+    assert "секундах" in p_euc1.suspicion.format_report()
+
+    # 3) Обратная теорема Евклида: углы все ровно 90°, но парные стороны 100.00' против 100.05' (100' 6")
+    d_euc2 = dm.model_copy(deep=True)
+    d_euc2.segments[0] = Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=100.5)
+    d_euc2.segments[2] = Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.05)
+    p_euc2 = builder.plan(d_euc2, scale=16.0)
+    assert p_euc2.suspicion is not None and p_euc2.suspicion.is_suspicious is True
+    codes_e2 = {it.code for it in p_euc2.suspicion.items}
+    assert "EUCLID_PARALLEL_SIDES_UNEQUAL_LENGTH" in codes_e2
+    assert "дюймы" in p_euc2.suspicion.format_report()
+
+    # 4) Прямоугольная трапеция с ошибкой в длине косой стороны (нарушение Пифагора):
+    # основания 100' и 110' по N/S, перпендикуляр 80' по E, косая 88' вместо √(80²+10²)=80.62'
+    d_trap = dm.model_copy(deep=True)
+    d_trap.distance_to_corner_ft = 0.0
+    d_trap.corner_to_pob_bearing = None
+    d_trap.segments = [
+        Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),
+        Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=80.0),
+        Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=110.0),
+        Segment(ns="N", degrees=82, minutes=52, seconds=30, ew="W", distance_ft=88.0),
+    ]
+    p_trap = builder.plan(d_trap, scale=16.0)
+    assert p_trap.suspicion is not None
+    assert "TRAPEZOID_PYTHAGORAS_MISMATCH" in {it.code for it in p_trap.suspicion.items}
+
+    # 5) Непарный 4-угольник с подозрительно «почти параллельными» противоположными сторонами (расхождение 0°12'00")
+    d_alm = dm.model_copy(deep=True)
+    d_alm.distance_to_corner_ft = 0.0
+    d_alm.corner_to_pob_bearing = None
+    d_alm.segments = [
+        Segment(ns="N", degrees=10, minutes=0, seconds=0, ew="E", distance_ft=100.0),
+        Segment(ns="S", degrees=80, minutes=0, seconds=0, ew="E", distance_ft=60.0),
+        Segment(ns="S", degrees=10, minutes=12, seconds=0, ew="W", distance_ft=105.0),
+        Segment(ns="N", degrees=75, minutes=0, seconds=0, ew="W", distance_ft=61.0),
+    ]
+    p_alm = builder.plan(d_alm, scale=16.0)
+    assert p_alm.suspicion is not None
+    assert "ALMOST_PARALLEL_OPPOSITE_SIDES" in {it.code for it in p_alm.suspicion.items}
+
+
+def test_lot_suspicion_angle_sum_and_primitive_bugs() -> None:
+    """Ловит невязку суммы углов -> 360°, потерю десятичной точки, бантик, иглу 180°, дубль стороны и излом POB."""
+    from llm_parser import ASPENWALL_SAMPLES, Segment, load_config, parse_with_regex
+    from acad_builder import AcadBuilder
+
+    builder = AcadBuilder(load_config())
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+
+    # 1) Явные внутренние углы суммируются в 359°58'30" вместо 360°00'00"
+    d_ang = dm.model_copy(deep=True)
+    d_ang.segments[0] = Segment(
+        ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=100.0, interior_angle="90°00'00\""
+    )
+    d_ang.segments[1] = Segment(
+        ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=55.0, interior_angle="89°58'30\""
+    )
+    d_ang.segments[2] = Segment(
+        ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.0, interior_angle="90°00'00\""
+    )
+    d_ang.segments[3] = Segment(
+        ns="S", degrees=75, minutes=20, seconds=20, ew="W", distance_ft=55.0, interior_angle="90°00'00\""
+    )
+    p_ang = builder.plan(d_ang, scale=16.0)
+    assert p_ang.suspicion is not None and p_ang.suspicion.is_suspicious is True
+    assert "EXPLICIT_ANGLE_SUM_MISMATCH" in {it.code for it in p_ang.suspicion.items}
+    assert "359°58'30\"" in p_ang.suspicion.format_report()
+
+    # 2) Потеря десятичной точки: 10000' вместо 100.00' (нарушение неравенства многоугольника)
+    d_dec = dm.model_copy(deep=True)
+    d_dec.segments[0] = Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=10000.0)
+    p_dec = builder.plan(d_dec, scale=16.0)
+    assert p_dec.suspicion is not None
+    assert "POLYGON_INEQUALITY_VIOLATION" in {it.code for it in p_dec.suspicion.items}
+    assert "100.00'" in p_dec.suspicion.format_report()
+
+    # 3) Самопересечение «песочные часы» (диагональный перехлёст несмежных сторон)
+    d_cross = dm.model_copy(deep=True)
+    d_cross.distance_to_corner_ft = 0.0
+    d_cross.corner_to_pob_bearing = None
+    d_cross.segments = [
+        Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),
+        Segment(ns="S", degrees=45, minutes=0, seconds=0, ew="E", distance_ft=141.42),
+        Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),
+        Segment(ns="S", degrees=45, minutes=0, seconds=0, ew="W", distance_ft=141.42),
+    ]
+    p_cross = builder.plan(d_cross, scale=16.0)
+    assert p_cross.suspicion is not None
+    assert "SELF_INTERSECTING_CONTOUR" in {it.code for it in p_cross.suspicion.items}
+
+    # 4) Разворот на 180° назад («игла») + дубликат подряд идущей стороны + микроизлом ~180° + микросегмент
+    d_bugs = dm.model_copy(deep=True)
+    d_bugs.segments = [
+        Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=50.0),
+        Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=50.0),  # дубликат!
+        Segment(ns="N", degrees=75, minutes=20, seconds=20, ew="E", distance_ft=54.8),
+        Segment(ns="N", degrees=75, minutes=10, seconds=20, ew="E", distance_ft=0.20),  # микроизлом ~180° + микросегмент
+        Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100.0),
+        Segment(ns="S", degrees=14, minutes=39, seconds=40, ew="E", distance_ft=10.0),  # разворот 180° назад!
+        Segment(ns="S", degrees=75, minutes=20, seconds=20, ew="W", distance_ft=55.0),
+    ]
+    p_bugs = builder.plan(d_bugs, scale=16.0)
+    bug_codes = {it.code for it in p_bugs.suspicion.items}
+    assert "DUPLICATE_CONSECUTIVE_SEGMENT" in bug_codes
+    assert "ALMOST_STRAIGHT_180_BEND" in bug_codes
+    assert "TINY_ARTIFACT_SEGMENT" in bug_codes
+    assert "SPIKE_BACKTRACK_180" in bug_codes
+
+    # 5) Излом линии фасадной улицы в точке POB (привязка от угла улицы и возврат по фасаду расходятся на 0°15'00")
+    d_kink = dm.model_copy(deep=True)
+    d_kink.corner_to_pob_bearing = Segment(
+        ns="N", degrees=75, minutes=5, seconds=20, ew="E", distance_ft=420.0
+    )
+    p_kink = builder.plan(d_kink, scale=16.0)
+    assert p_kink.suspicion is not None
+    assert "POB_STREET_LINE_KINK" in {it.code for it in p_kink.suspicion.items}
+
+
+
 
 
 

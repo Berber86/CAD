@@ -42,11 +42,14 @@ __all__ = [
     "DrawPlan",
     "DrawResult",
     "LineItem",
+    "LotSuspicionReport",
     "NeighborPairReport",
     "NeighborVerificationReport",
     "SharedEdgeCheck",
+    "SuspicionItem",
     "TextItem",
     "AcadBuilder",
+    "audit_lot_suspicion",
     "bearing_azimuth_deg",
     "bearing_to_xy",
     "build_boundary_lines",
@@ -937,6 +940,7 @@ class DrawPlan:
     gap_vertex_index: int | None = None
     gap_points: tuple[tuple[float, float], tuple[float, float]] | None = None
     gap_corner_label: str = ""
+    suspicion: LotSuspicionReport | None = None
 
     @property
     def area_sqft(self) -> float:
@@ -2055,7 +2059,7 @@ class AcadBuilder:
             if self._front_warning:
                 warnings.append(self._front_warning)
 
-        return DrawPlan(
+        plan_obj = DrawPlan(
             description=description,
             scale=scale,
             text_height=height,
@@ -2074,6 +2078,8 @@ class AcadBuilder:
             gap_points=gap_points,
             gap_corner_label=gap_corner_label,
         )
+        plan_obj.suspicion = audit_lot_suspicion(plan_obj)
+        return plan_obj
 
     # -- подключение к AutoCAD ---------------------------------------------
     def connect(self) -> tuple[Any, Any]:
@@ -3772,4 +3778,719 @@ def verify_with_neighbors(
         warning_count=warn_total,
         error_count=err_total,
     )
+
+
+# ---------------------------------------------------------------------------
+# Проверка на подозрительность каждого создаваемого участка (Lot Suspicion Audit)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SuspicionItem:
+    """Отдельный сигнал подозрительности геометрии контура участка."""
+
+    code: str
+    severity: str  # "warn" | "error"
+    title: str
+    detail: str
+    segment_indices: list[int] = field(default_factory=list)  # 1-based индексы сторон
+
+
+@dataclass
+class LotSuspicionReport:
+    """Итоговый отчёт аудита подозрительности геометрии одиночного участка."""
+
+    shape_kind: str
+    status: str = "ok"  # "ok" | "warn" | "error"
+    interior_angles_deg: list[float] = field(default_factory=list)
+    expected_angle_sum_deg: float = 360.0
+    actual_angle_sum_deg: float = 360.0
+    angle_sum_diff_arcsec: float = 0.0
+    items: list[SuspicionItem] = field(default_factory=list)
+
+    @property
+    def is_suspicious(self) -> bool:
+        return self.status in ("warn", "error") and bool(self.items)
+
+    @property
+    def error_count(self) -> int:
+        return sum(1 for it in self.items if it.severity == "error")
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for it in self.items if it.severity != "error")
+
+    def short_badge(self) -> str:
+        if not self.is_suspicious:
+            return f"🔎 Форма: {self.shape_kind} ✓"
+        n = len(self.items)
+        icon = "🚨" if self.status == "error" else "⚠"
+        return f"🔎 {icon} Подозрительно ({n}): {self.shape_kind}"
+
+    def headline(self) -> str:
+        exp_dms = format_dms_angle(self.expected_angle_sum_deg, use_control_code=False)
+        act_dms = format_dms_angle(self.actual_angle_sum_deg, use_control_code=False)
+        if not self.is_suspicious:
+            return (
+                f"🔎 Проверка геометрии: {self.shape_kind} "
+                f"(сумма углов {act_dms}) — подозрительных искажений нет ✓"
+            )
+        n = len(self.items)
+        icon = "🚨" if self.status == "error" else "⚠"
+        sum_note = ""
+        if abs(self.angle_sum_diff_arcsec) >= 1.5:
+            sign = "+" if self.angle_sum_diff_arcsec >= 0 else "-"
+            sum_note = (
+                f", сумма углов {act_dms} вместо {exp_dms} "
+                f"({sign}{_format_arcsec_dms(self.angle_sum_diff_arcsec)})"
+            )
+        return (
+            f"{icon} Подозрительная геометрия участка [{self.shape_kind}{sum_note}]: "
+            f"найдено сигналов — {n}!"
+        )
+
+    def format_report(self) -> str:
+        lines: list[str] = [self.headline()]
+        if self.interior_angles_deg:
+            ang_list = ", ".join(
+                f"∠{idx}={format_dms_angle(a, use_control_code=False)}"
+                for idx, a in enumerate(self.interior_angles_deg, start=1)
+            )
+            lines.append(f"  Углы вершин: {ang_list}")
+        for it in self.items:
+            mark = "🚨" if it.severity == "error" else "⚠"
+            segs_tag = (
+                f" [стороны: {', '.join(f'#{s}' for s in it.segment_indices)}]"
+                if it.segment_indices
+                else ""
+            )
+            lines.append(f"  {mark} {it.title}{segs_tag}: {it.detail}")
+        return "\n".join(lines)
+
+
+def _compare_opposite_dms_hint(seg_a: Segment, seg_b: Segment) -> str | None:
+    """
+    Для двух противоположных сторон (которые в замкнутом обходе идут навстречу друг другу)
+    проверяет характерные опечатки одной цифры в градусах/минутах/секундах или квадранте.
+    """
+    if not (getattr(seg_a, "has_bearing", True) and getattr(seg_b, "has_bearing", True)):
+        return None
+    exp_ns = "S" if seg_a.ns == "N" else "N"
+    exp_ew = "W" if seg_a.ew == "E" else "E"
+    if seg_b.ns != exp_ns or seg_b.ew != exp_ew:
+        if (
+            seg_a.degrees == seg_b.degrees
+            and abs(seg_a.minutes - seg_b.minutes) <= 2
+        ):
+            return (
+                f"численный угол совпадает ({seg_a.degrees}°{seg_a.minutes:02d}'), "
+                f"но перепутана буква квадранта ({seg_b.bearing_label} против {seg_a.bearing_label})"
+            )
+        return None
+    if seg_a.degrees == seg_b.degrees and seg_a.minutes == seg_b.minutes:
+        sa = f"{int(round(seg_a.seconds)):02d}"
+        sb = f"{int(round(seg_b.seconds)):02d}"
+        typo = _detect_digit_typo(sa, sb)
+        if typo:
+            return f"разница только в секундах ({sa}\" против {sb}\"): {typo}"
+        return f"разница только в секундах ({sa}\" против {sb}\") при равных {seg_a.degrees}°{seg_a.minutes:02d}'"
+    if seg_a.degrees == seg_b.degrees and abs(seg_a.seconds - seg_b.seconds) <= 2.0:
+        ma = f"{seg_a.minutes:02d}"
+        mb = f"{seg_b.minutes:02d}"
+        typo = _detect_digit_typo(ma, mb)
+        if typo:
+            return f"разница только в минутах ({ma}' против {mb}'): {typo}"
+    if seg_a.minutes == seg_b.minutes and abs(seg_a.seconds - seg_b.seconds) <= 2.0:
+        da = f"{seg_a.degrees:02d}"
+        db = f"{seg_b.degrees:02d}"
+        typo = _detect_digit_typo(da, db)
+        if typo:
+            return f"минуты и секунды совпадают, а в градусах ({seg_a.degrees}° против {seg_b.degrees}°): {typo}"
+    return None
+
+
+def audit_lot_suspicion(plan: DrawPlan) -> LotSuspicionReport:
+    """
+    Проверяет создаваемый участок на геометрическую подозрительность и примитивные баги:
+      * сумма внутренних углов стремится к ``(N - 2) * 180°`` (напр. 360°), но не равна ей ровно;
+      * «почти прямоугольник» (в т.ч. замкнутый в 0.000 ft скошенный прямоугольник из-за ошибки
+        заёма минуты/градуса при вычитании румба из 90°: 60' вместо 59', 90° вместо 89°);
+      * «почти параллелограмм» — нарушение прямой и обратной теорем Евклида:
+          - противоположные стороны попарно равны по длине, но их углы не параллельны;
+          - противоположные стороны строго параллельны, но их длины расходятся;
+      * прямоугольная трапеция с нарушением теоремы Пифагора и «почти параллельные» бока;
+      * примитивные баги: самопересечение («песочные часы»), разворот на 180° назад («игла»),
+        дубликат подряд идущей стороны, нарушение неравенства многоугольника (потеря десятичной
+        точки 10000' вместо 100.00'), путаница дюймов и десятых фута (100.50' vs 100.60'),
+        излом фасадной улицы в точке POB.
+    """
+    segs = list(plan.description.segments)
+    lines = list(plan.boundary_lines)
+    n = len(segs)
+    expected_sum = max(1, n - 2) * 180.0
+    if n < 3 or len(lines) != n:
+        return LotSuspicionReport(
+            shape_kind="незамкнутый набор сегментов",
+            status="error",
+            expected_angle_sum_deg=180.0,
+            actual_angle_sum_deg=0.0,
+            angle_sum_diff_arcsec=-180.0 * 3600.0,
+            items=[
+                SuspicionItem(
+                    code="TOO_FEW_SEGMENTS",
+                    severity="error",
+                    title="Недостаточно сторон",
+                    detail=f"Для замкнутого участка нужно минимум 3 стороны, получено: {n}.",
+                )
+            ],
+        )
+
+    items: list[SuspicionItem] = []
+
+    # 1. Единичные векторы сторон (по паспортным румбам/курсам) и длины
+    unit_vecs: list[tuple[float, float]] = []
+    lengths: list[float] = []
+    azimuths_deg: list[float] = []
+    for i in range(n):
+        dx = lines[i].end[0] - lines[i].start[0]
+        dy = lines[i].end[1] - lines[i].start[1]
+        vec_len = math.hypot(dx, dy)
+        s_len = float(segs[i].distance_ft)
+        lengths.append(s_len)
+        if vec_len > 1e-9:
+            ux, uy = dx / vec_len, dy / vec_len
+        else:
+            ux, uy = 1.0, 0.0
+        unit_vecs.append((ux, uy))
+        azimuths_deg.append(math.degrees(math.atan2(ux, uy)) % 360.0)
+
+    # 2. Внутренние углы в вершинах 0..n-1 (на стыке стороны i-1 и стороны i)
+    interior_angles: list[float] = []
+    for i in range(n):
+        u_prev = unit_vecs[(i - 1) % n]
+        u_curr = unit_vecs[i]
+        cross_z = u_prev[0] * u_curr[1] - u_prev[1] * u_curr[0]
+        dot_v = max(-1.0, min(1.0, u_prev[0] * u_curr[0] + u_prev[1] * u_curr[1]))
+        turn_deg = math.degrees(math.atan2(cross_z, dot_v))
+        if not plan.ccw:
+            turn_deg = -turn_deg
+        ang = (180.0 - turn_deg) % 360.0
+        if abs(ang - 360.0) < 1e-7:
+            ang = 0.0
+        interior_angles.append(ang)
+
+    # 3. Проверка суммы внутренних углов:
+    #    (а) по явно подписанным на чертеже/в тексте interior_angle / AT RIGHT ANGLES;
+    #    (б) по угловой невязке возврата разомкнутого хода в начальную точку POB.
+    explicit_vertex_angles: dict[int, float] = {}
+    for idx, seg in enumerate(segs):
+        ia_raw = getattr(seg, "interior_angle", None)
+        if ia_raw:
+            parsed_ia = _parse_dms_angle_deg(str(ia_raw))
+            if parsed_ia is not None and 0.0 < parsed_ia < 360.0:
+                v_a = idx % n
+                v_b = (idx + 1) % n
+                chosen_v = (
+                    v_b
+                    if abs(interior_angles[v_b] - parsed_ia) + 0.02
+                    < abs(interior_angles[v_a] - parsed_ia)
+                    else v_a
+                )
+                explicit_vertex_angles[chosen_v] = parsed_ia
+        elif not getattr(seg, "has_bearing", True) and seg.course_note:
+            cn = str(seg.course_note).upper()
+            if "RIGHT ANGLE" in cn or "PERPENDICULAR" in cn:
+                explicit_vertex_angles.setdefault(idx % n, 90.0)
+
+    actual_sum_deg = expected_sum
+    sum_diff_arcsec = 0.0
+
+    if explicit_vertex_angles:
+        combined_angles = [
+            explicit_vertex_angles.get(v_i, interior_angles[v_i]) for v_i in range(n)
+        ]
+        sum_exp = sum(combined_angles)
+        diff_exp_sec = (sum_exp - expected_sum) * 3600.0
+        if abs(diff_exp_sec) >= 1.5:
+            actual_sum_deg = sum_exp
+            sum_diff_arcsec = diff_exp_sec
+            sev = "error" if abs(diff_exp_sec) > 60.0 else "warn"
+            sign = "+" if diff_exp_sec >= 0 else "-"
+            near_note = (
+                f"стремится к {int(expected_sum)}°, но не равна {int(expected_sum)}° ровно"
+                if abs(diff_exp_sec) <= 5.0 * 3600.0
+                else f"резко отличается от теоретических {int(expected_sum)}°"
+            )
+            items.append(
+                SuspicionItem(
+                    code="EXPLICIT_ANGLE_SUM_MISMATCH",
+                    severity=sev,
+                    title=f"Невязка суммы углов ({format_dms_angle(sum_exp, use_control_code=False)})",
+                    detail=(
+                        f"Сумма внутренних углов {n}-угольника {near_note}: "
+                        f"{format_dms_angle(sum_exp, use_control_code=False)} вместо "
+                        f"{int(expected_sum)}°00'00\" (отклонение {sign}{_format_arcsec_dms(diff_exp_sec)}). "
+                        "Вероятна ошибка чтения минут/секунд одного из углов на чертеже."
+                    ),
+                    segment_indices=sorted(v + 1 for v in explicit_vertex_angles),
+                )
+            )
+
+    # Угловая невязка разомкнутого хода относительно фактического направления возврата в POB
+    if sum_diff_arcsec == 0.0 and plan.closure.distance > 0.02 and n >= 3:
+        # Строим последовательную цепь от 0 до n-1 без переноса гэпа:
+        px, py = 0.0, 0.0
+        for i in range(n - 1):
+            px += unit_vecs[i][0] * lengths[i]
+            py += unit_vecs[i][1] * lengths[i]
+        # Истинный вектор от конца предпоследней стороны (px, py) обратно в старт (0, 0):
+        to_origin_len = math.hypot(-px, -py)
+        if to_origin_len > 1.0:
+            ux_true, uy_true = -px / to_origin_len, -py / to_origin_len
+            ux_deed, uy_deed = unit_vecs[n - 1]
+            cross_c = ux_true * uy_deed - uy_true * ux_deed
+            dot_c = max(-1.0, min(1.0, ux_true * ux_deed + uy_true * uy_deed))
+            closing_err_deg = math.degrees(math.atan2(cross_c, dot_c))
+            if not plan.ccw:
+                closing_err_deg = -closing_err_deg
+            closing_err_sec = closing_err_deg * 3600.0
+            if 2.0 <= abs(closing_err_sec) <= 5.0 * 3600.0:
+                actual_sum_deg = expected_sum + closing_err_deg
+                sum_diff_arcsec = closing_err_sec
+                sign = "+" if closing_err_sec >= 0 else "-"
+                items.append(
+                    SuspicionItem(
+                        code="TRAVERSE_ANGLE_SUM_DRIFT",
+                        severity="error" if abs(closing_err_sec) > 120.0 else "warn",
+                        title="Сумма поворотов хода не замыкается в 360° на точке POB",
+                        detail=(
+                            f"По отношению к начальной точке POB сумма внутренних углов стремится к "
+                            f"{int(expected_sum)}°, но составляет "
+                            f"{format_dms_angle(actual_sum_deg, use_control_code=False)} "
+                            f"(отклонение замыкающего направления {sign}{_format_arcsec_dms(closing_err_sec)}, "
+                            f"линейный разрыв {plan.closure.distance:.3f}')."
+                        ),
+                        segment_indices=[n],
+                    )
+                )
+
+    # 4. Классификация и глубокая проверка 4-угольников (прямоугольник / параллелограмм / трапеция)
+    shape_kind = f"{n}-угольник"
+    if n == 3:
+        shape_kind = "треугольный участок"
+    elif n == 6 and all(
+        min(abs(a - 90.0), abs(a - 270.0)) * 3600.0 <= 20.0 for a in interior_angles
+    ):
+        shape_kind = "Г-образный (ортогональный 6-угольник)"
+
+    if n == 4:
+        opp_ang_13_sec = abs(_signed_axis_diff_arcsec(azimuths_deg[0], azimuths_deg[2]))
+        opp_ang_24_sec = abs(_signed_axis_diff_arcsec(azimuths_deg[1], azimuths_deg[3]))
+        opp_len_13 = abs(lengths[0] - lengths[2])
+        opp_len_24 = abs(lengths[1] - lengths[3])
+        dev90_sec = [abs(a - 90.0) * 3600.0 for a in interior_angles]
+        max_dev90_sec = max(dev90_sec)
+        min_dev90_sec = min(dev90_sec)
+
+        lengths_paired_exact = opp_len_13 <= 0.02 and opp_len_24 <= 0.02
+        lengths_paired_near = opp_len_13 <= max(1.5, 0.02 * max(lengths[0], lengths[2])) and (
+            opp_len_24 <= max(1.5, 0.02 * max(lengths[1], lengths[3]))
+        )
+        angles_parallel_exact = opp_ang_13_sec <= 2.5 and opp_ang_24_sec <= 2.5
+
+        # Определяем архетип 4-угольника
+        if max_dev90_sec <= 2.5 and lengths_paired_exact:
+            shape_kind = (
+                "квадрат"
+                if abs(lengths[0] - lengths[1]) <= 0.02
+                else "прямоугольник"
+            )
+        elif max_dev90_sec <= 5400.0 and lengths_paired_near:
+            shape_kind = "почти прямоугольник"
+        elif angles_parallel_exact and lengths_paired_exact:
+            shape_kind = "параллелограмм"
+        elif (
+            opp_ang_13_sec <= 5400.0
+            and opp_ang_24_sec <= 5400.0
+            and lengths_paired_near
+        ):
+            shape_kind = "почти параллелограмм"
+        elif (opp_ang_13_sec <= 10.0) ^ (opp_ang_24_sec <= 10.0):
+            shape_kind = (
+                "прямоугольная трапеция" if min_dev90_sec <= 10.0 else "трапеция"
+            )
+        else:
+            shape_kind = "четырёхугольник"
+
+        # 4А. «Почти прямоугольник» с углами ~90° (включая замкнутый в 0.000' параллелограмм со скосом!)
+        if 2.5 < max_dev90_sec <= 5400.0 and lengths_paired_near:
+            # Проверим классическую арифметическую ошибку вычитания румба из 90° (60' вместо 59' или 90° вместо 89°)
+            borrow_note = ""
+            if any(abs(d - 60.0) <= 1.5 for d in dev90_sec):
+                borrow_note = (
+                    " Отклонение ровно в 0°01'00\" — классическая ошибка заёма 1 минуты "
+                    "при вычитании румба из 90° (вычли минуты из 60' вместо 59' при наличии секунд)!"
+                )
+            elif any(abs(d - 3600.0) <= 3.0 for d in dev90_sec):
+                borrow_note = (
+                    " Отклонение ровно в 1°00'00\" — классическая ошибка заёма 1 градуса "
+                    "при вычитании румба из 90° (вычли градусы из 90° вместо 89° при наличии минут)!"
+                )
+            skewed_verts = [
+                f"∠{idx + 1}={format_dms_angle(interior_angles[idx], use_control_code=False)}"
+                for idx, d in enumerate(dev90_sec)
+                if d > 2.5
+            ]
+            closed_note = (
+                " Контур при этом замкнулся в 0.000' только потому, что одинаково скошены сразу обе противоположные стороны!"
+                if (plan.closure.distance <= 0.005 and angles_parallel_exact)
+                else ""
+            )
+            items.append(
+                SuspicionItem(
+                    code="ALMOST_RECTANGLE_SKEW",
+                    severity="error" if max_dev90_sec >= 60.0 else "warn",
+                    title="Подозрительный «почти прямоугольник» (углы близки к 90°, но не 90° ровно)",
+                    detail=(
+                        f"Противоположные стороны почти/точно попарно равны "
+                        f"({lengths[0]:.2f}'/{lengths[2]:.2f}' и {lengths[1]:.2f}'/{lengths[3]:.2f}'), "
+                        f"а углы отклоняются от прямого 90°00'00\" на {_format_arcsec_dms(max_dev90_sec)} "
+                        f"({', '.join(skewed_verts)}).{borrow_note}{closed_note}"
+                    ),
+                    segment_indices=[
+                        idx + 1 for idx, d in enumerate(dev90_sec) if d > 2.5
+                    ],
+                )
+            )
+
+        # 4Б. Прямая теорема Евклида: стороны попарно равны (L1==L3 и L2==L4), но не параллельны!
+        if lengths_paired_exact and (opp_ang_13_sec > 2.5 or opp_ang_24_sec > 2.5):
+            bad_pairs: list[str] = []
+            bad_segs: list[int] = []
+            if opp_ang_13_sec > 2.5:
+                dms_hint = _compare_opposite_dms_hint(segs[0], segs[2])
+                extra_h = f" ({dms_hint})" if dms_hint else ""
+                bad_pairs.append(
+                    f"стороны #1 и #3 равны по {lengths[0]:.2f}', но расходятся по углу на "
+                    f"{_format_arcsec_dms(opp_ang_13_sec)}{extra_h}"
+                )
+                bad_segs.extend([1, 3])
+            if opp_ang_24_sec > 2.5:
+                dms_hint = _compare_opposite_dms_hint(segs[1], segs[3])
+                extra_h = f" ({dms_hint})" if dms_hint else ""
+                bad_pairs.append(
+                    f"стороны #2 и #4 равны по {lengths[1]:.2f}', но расходятся по углу на "
+                    f"{_format_arcsec_dms(opp_ang_24_sec)}{extra_h}"
+                )
+                bad_segs.extend([2, 4])
+            # Чтобы сумма соседних углов была видна наглядно:
+            adj_sum_12 = interior_angles[0] + interior_angles[1]
+            adj_note = ""
+            if abs(adj_sum_12 - 180.0) * 3600.0 > 2.5:
+                adj_note = (
+                    f" Сумма соседних углов ∠1+∠2 равна "
+                    f"{format_dms_angle(adj_sum_12, use_control_code=False)} вместо 180°00'00\"."
+                )
+            items.append(
+                SuspicionItem(
+                    code="EUCLID_EQUAL_SIDES_NOT_PARALLEL",
+                    severity="error" if max(opp_ang_13_sec, opp_ang_24_sec) > 60.0 else "warn",
+                    title="Противоположные стороны попарно равны, но не параллельны",
+                    detail=(
+                        "По теореме Евклида выпуклый четырёхугольник с попарно равными "
+                        "противоположными сторонами обязан иметь строго параллельные стороны, однако: "
+                        + "; ".join(bad_pairs)
+                        + "."
+                        + adj_note
+                    ),
+                    segment_indices=bad_segs,
+                )
+            )
+
+        # 4В. Обратная теорема Евклида: обе пары сторон строго параллельны, но длины не равны!
+        if angles_parallel_exact and (opp_len_13 > 0.02 or opp_len_24 > 0.02):
+            len_issues: list[str] = []
+            len_segs: list[int] = []
+            fig_nom = "прямоугольник" if max_dev90_sec <= 5.0 else "параллелограмм"
+            fig_lbl = "прямоугольника" if max_dev90_sec <= 5.0 else "параллелограмма"
+            for i_a, i_b, diff_l in ((0, 2, opp_len_13), (1, 3, opp_len_24)):
+                if diff_l <= 0.02:
+                    continue
+                la, lb = lengths[i_a], lengths[i_b]
+                fi_hint = _check_feet_inches_confusion(la, lb)
+                typo_hint = _detect_digit_typo(f"{la:.2f}", f"{lb:.2f}")
+                cause = ""
+                if fi_hint:
+                    cause = f" — {fi_hint}"
+                elif typo_hint:
+                    cause = f" — {typo_hint}"
+                len_issues.append(
+                    f"#{i_a + 1} ({la:.2f}') против #{i_b + 1} ({lb:.2f}'), разница {diff_l:.2f}'{cause}"
+                )
+                len_segs.extend([i_a + 1, i_b + 1])
+            items.append(
+                SuspicionItem(
+                    code="EUCLID_PARALLEL_SIDES_UNEQUAL_LENGTH",
+                    severity="error" if max(opp_len_13, opp_len_24) > 0.10 else "warn",
+                    title=f"Углы образуют строгий {fig_nom}, но парные стороны разной длины",
+                    detail=(
+                        f"У {fig_lbl} обе пары противоположных сторон строго параллельны, "
+                        f"поэтому их длины обязаны совпадать, однако: " + "; ".join(len_issues) + "."
+                    ),
+                    segment_indices=len_segs,
+                )
+            )
+
+        # 4Г. Для трапеций / непарных 4-угольников: подозрительно «почти параллельная» пара (2"..45')
+        if not lengths_paired_exact:
+            for i_a, i_b, ang_sec in ((0, 2, opp_ang_13_sec), (1, 3, opp_ang_24_sec)):
+                if 2.5 < ang_sec <= 2700.0:
+                    dms_h = _compare_opposite_dms_hint(segs[i_a], segs[i_b])
+                    hint_tail = f" ({dms_h})" if dms_h else ""
+                    items.append(
+                        SuspicionItem(
+                            code="ALMOST_PARALLEL_OPPOSITE_SIDES",
+                            severity="warn",
+                            title=f"Стороны #{i_a + 1} и #{i_b + 1} подозрительно близки к параллельным",
+                            detail=(
+                                f"Направления противоположных сторон #{i_a + 1} и #{i_b + 1} расходятся "
+                                f"всего на {_format_arcsec_dms(ang_sec)}{hint_tail} — "
+                                "проверьте, не должны ли эти межи быть строго параллельны."
+                            ),
+                            segment_indices=[i_a + 1, i_b + 1],
+                        )
+                    )
+
+        # 4Д. Теорема Пифагора для прямоугольной трапеции (когда параллельна ровно одна пара сторон)
+        for base_a, base_b, leg_perp, leg_slant in (
+            ((0, 2, 3, 1), (0, 2, 1, 3), (1, 3, 0, 2), (1, 3, 2, 0))
+            if not angles_parallel_exact
+            else ()
+        ):
+            pair_sec = opp_ang_13_sec if {base_a, base_b} == {0, 2} else opp_ang_24_sec
+            if pair_sec > 8.0:
+                continue
+            # Проверяем, что leg_perp перпендикулярен параллельным основаниям base_a и base_b
+            dot_perp = abs(
+                unit_vecs[base_a][0] * unit_vecs[leg_perp][0]
+                + unit_vecs[base_a][1] * unit_vecs[leg_perp][1]
+            )
+            if dot_perp > math.sin(math.radians(8.0 / 3600.0)):
+                continue
+            b1, b2 = lengths[base_a], lengths[base_b]
+            if abs(b1 - b2) <= 0.03:
+                continue  # это уже прямоугольник, проверенный выше
+            h_perp = lengths[leg_perp]
+            s_deed = lengths[leg_slant]
+            s_pyth = math.hypot(h_perp, b1 - b2)
+            if abs(s_deed - s_pyth) > 0.04:
+                items.append(
+                    SuspicionItem(
+                        code="TRAPEZOID_PYTHAGORAS_MISMATCH",
+                        severity="error" if abs(s_deed - s_pyth) > 0.15 else "warn",
+                        title="Косая сторона прямоугольной трапеции не бьётся по Пифагору",
+                        detail=(
+                            f"Стороны #{base_a + 1} ({b1:.2f}') и #{base_b + 1} ({b2:.2f}') параллельны, "
+                            f"а сторона #{leg_perp + 1} ({h_perp:.2f}') им перпендикулярна. По теореме Пифагора "
+                            f"замыкающая сторона #{leg_slant + 1} обязана равняться "
+                            f"√({h_perp:.2f}² + {abs(b1 - b2):.2f}²) = {s_pyth:.2f}', "
+                            f"но указано {s_deed:.2f}' (разница {s_deed - s_pyth:+.2f}')!"
+                        ),
+                        segment_indices=[leg_slant + 1],
+                    )
+                )
+            break
+
+    # 5. Универсальные проверки на примитивные баги для любого N-угольника
+
+    # 5.1 Нарушение неравенства многоугольника (одна сторона >= суммы остальных -> потеря точки 10000' вместо 100.00')
+    total_perim = sum(lengths)
+    for idx, side_l in enumerate(lengths):
+        rest = total_perim - side_l
+        if rest > 0.0 and side_l >= rest - 1e-4:
+            dec_hint = ""
+            for div in (100.0, 10.0):
+                scaled = side_l / div
+                if 0.15 * (rest / max(1, n - 1)) <= scaled <= 2.5 * (rest / max(1, n - 1)):
+                    dec_hint = (
+                        f" Очень похоже на потерю десятичной точки: "
+                        f"возможно, имелось в виду {scaled:.2f}' вместо {side_l:.2f}'!"
+                    )
+                    break
+            items.append(
+                SuspicionItem(
+                    code="POLYGON_INEQUALITY_VIOLATION",
+                    severity="error",
+                    title=f"Сторона #{idx + 1} длиннее суммы всех остальных сторон участка",
+                    detail=(
+                        f"Длина стороны #{idx + 1} ({side_l:.2f}') превышает или равна сумме остальных "
+                        f"{n - 1} сторон ({rest:.2f}') — такой многоугольник геометрически невозможен!{dec_hint}"
+                    ),
+                    segment_indices=[idx + 1],
+                )
+            )
+
+    # 5.2 Самопересечение несмежных сторон («песочные часы» / «бабочка»)
+    if n >= 4:
+        for i in range(n):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                if _segments_proper_intersect(
+                    lines[i].start, lines[i].end, lines[j].start, lines[j].end
+                ):
+                    items.append(
+                        SuspicionItem(
+                            code="SELF_INTERSECTING_CONTOUR",
+                            severity="error",
+                            title="Самопересечение контура («песочные часы»)",
+                            detail=(
+                                f"Сторона #{i + 1} пересекает несмежную сторону #{j + 1}! "
+                                "Проверьте порядок обхода сторон в описании и буквы квадрантов (N/S, E/W)."
+                            ),
+                            segment_indices=[i + 1, j + 1],
+                        )
+                    )
+                    break
+
+    # 5.3 Схлопывание («игла» 180° назад), дубликат подряд и подозрительный микроизлом ~180°
+    for v_i in range(n):
+        prev_i = (v_i - 1) % n
+        curr_i = v_i
+        ang_v = interior_angles[v_i]
+        if ang_v < 3.0 or ang_v > 357.0:
+            items.append(
+                SuspicionItem(
+                    code="SPIKE_BACKTRACK_180",
+                    severity="error",
+                    title=f"Разворот границы почти на 180° назад («игла» между #{prev_i + 1} и #{curr_i + 1})",
+                    detail=(
+                        f"Между сторонами #{prev_i + 1} и #{curr_i + 1} внутренний угол составляет "
+                        f"{format_dms_angle(ang_v, use_control_code=False)} — линия возвращается сама по себе! "
+                        "Вероятно перепутан румб на противоположный или пропущена сторона."
+                    ),
+                    segment_indices=[prev_i + 1, curr_i + 1],
+                )
+            )
+        elif abs(ang_v - 180.0) <= 0.5 and abs(lengths[prev_i] - lengths[curr_i]) <= 0.02:
+            items.append(
+                SuspicionItem(
+                    code="DUPLICATE_CONSECUTIVE_SEGMENT",
+                    severity="error",
+                    title=f"Подозрение на дубликат стороны (#{prev_i + 1} и #{curr_i + 1})",
+                    detail=(
+                        f"Две подряд идущие стороны #{prev_i + 1} и #{curr_i + 1} имеют одинаковое "
+                        f"направление и одинаковую длину ({lengths[curr_i]:.2f}') — "
+                        "возможно, одна и та же сторона была прочитана или вставлена дважды!"
+                    ),
+                    segment_indices=[prev_i + 1, curr_i + 1],
+                )
+            )
+        elif 3.0 / 3600.0 < abs(ang_v - 180.0) <= 1.2:
+            items.append(
+                SuspicionItem(
+                    code="ALMOST_STRAIGHT_180_BEND",
+                    severity="warn",
+                    title=f"Подозрительный микроизлом почти прямой межи (#{prev_i + 1} → #{curr_i + 1})",
+                    detail=(
+                        f"Внутренний угол между сторонами #{prev_i + 1} и #{curr_i + 1} равен "
+                        f"{format_dms_angle(ang_v, use_control_code=False)} (отклонение "
+                        f"{_format_arcsec_dms(abs(ang_v - 180.0) * 3600.0)} от прямой 180°) — "
+                        "проверьте, реальная ли это точка излома или опечатка в румбе."
+                    ),
+                    segment_indices=[prev_i + 1, curr_i + 1],
+                )
+            )
+
+    # 5.4 Микросегмент-артефакт и вырожденная площадь («сплющенный» полигон)
+    sorted_lens = sorted(lengths)
+    median_len = sorted_lens[len(sorted_lens) // 2]
+    if median_len >= 20.0:
+        for idx, side_l in enumerate(lengths):
+            if side_l < 0.50:
+                items.append(
+                    SuspicionItem(
+                        code="TINY_ARTIFACT_SEGMENT",
+                        severity="warn",
+                        title=f"Аномально короткий сегмент #{idx + 1} ({side_l:.2f}')",
+                        detail=(
+                            f"Сторона #{idx + 1} имеет длину всего {side_l:.2f}' ({side_l * 12.0:.1f}\") "
+                            f"при типичной длине сторон {median_len:.1f}' — убедитесь, что это не артефакт распознавания."
+                        ),
+                        segment_indices=[idx + 1],
+                    )
+                )
+
+    max_len = max(lengths)
+    area = plan.area_sqft
+    if max_len >= 20.0 and not any(it.code == "POLYGON_INEQUALITY_VIOLATION" for it in items):
+        eff_thickness = (2.0 * area) / max_len
+        if eff_thickness < 1.2:
+            items.append(
+                SuspicionItem(
+                    code="DEGENERATE_SLIVER_AREA",
+                    severity="error",
+                    title="Вырожденная площадь контура (участок «сплющен»)",
+                    detail=(
+                        f"Расчётная площадь составляет всего {area:.1f} sq ft при длине стороны "
+                        f"{max_len:.1f}' (эффективная ширина < {eff_thickness:.2f}'). "
+                        "Проверьте квадранты румбов и полноту списка сторон!"
+                    ),
+                )
+            )
+
+    # 5.5 Соосность линии привязки POB от угла улицы и самой фасадной стороны
+    desc = plan.description
+    tie_seg = desc.corner_to_pob_bearing
+    if (
+        tie_seg is not None
+        and getattr(tie_seg, "has_bearing", True)
+        and desc.distance_to_corner_ft > 1.0
+    ):
+        az_tie = bearing_azimuth_deg(
+            tie_seg.ns, tie_seg.degrees, tie_seg.minutes, tie_seg.seconds, tie_seg.ew
+        )
+        # Находим сторону, проходящую через POB (начало #1, конец #N или front_segment_index) и идущую вдоль улицы
+        cand_front: list[int] = []
+        if desc.front_segment_index is not None and 0 <= desc.front_segment_index < n:
+            cand_front.append(desc.front_segment_index)
+        for idx_pob in (0, n - 1):
+            if idx_pob not in cand_front:
+                cand_front.append(idx_pob)
+        for f_idx in cand_front:
+            kink_sec = abs(_signed_axis_diff_arcsec(az_tie, azimuths_deg[f_idx]))
+            if 2.5 < kink_sec <= 3.0 * 3600.0:
+                items.append(
+                    SuspicionItem(
+                        code="POB_STREET_LINE_KINK",
+                        severity="warn",
+                        title="Подозрительный излом линии фасадной улицы в точке POB",
+                        detail=(
+                            f"Привязка от угла улицы идёт по румбу {tie_seg.bearing_label}, "
+                            f"а примыкающая к POB сторона #{f_idx + 1} имеет направление "
+                            f"{_segment_display_bearing(segs[f_idx], lines[f_idx])} "
+                            f"(расхождение {_format_arcsec_dms(kink_sec)})."
+                        ),
+                        segment_indices=[f_idx + 1],
+                    )
+                )
+                break
+
+    if any(it.severity == "error" for it in items):
+        overall_status = "error"
+    elif items:
+        overall_status = "warn"
+    else:
+        overall_status = "ok"
+
+    return LotSuspicionReport(
+        shape_kind=shape_kind,
+        status=overall_status,
+        interior_angles_deg=interior_angles,
+        expected_angle_sum_deg=expected_sum,
+        actual_angle_sum_deg=actual_sum_deg,
+        angle_sum_diff_arcsec=sum_diff_arcsec,
+        items=items,
+    )
+
 

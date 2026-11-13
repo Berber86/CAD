@@ -1974,6 +1974,233 @@ def test_multipass_3_models_parallel_and_prompt_injected_arbitration(monkeypatch
     assert all(p[2] is not None and "Сторона №2 — длина" in p[2] for p in seen_prompts[3:])
 
 
+def test_1980s_jpg_exif_rotation_scan_enhancer_and_fractional_inches(tmp_path):
+    """
+    Стресс-тест конвейера под архивные чертежи 1980-х годов:
+      1) нормализация смартфонного EXIF Orientation=6 (кадр лёжа на боку) + ручной поворот 90°/180°;
+      2) пакет из 4 крупных .jpg — адаптивный ресайз ≤2200 px, улучшение контраста синьки и JPEG 4:4:4;
+      3) дробные дюймы 80-х ('25\\'-6 1/2\"', '100\\' 3-1/4\"', '50\\'-1/2\"', '25\\'-6½\"');
+      4) автоисправление перевёрнутой опечатки цифр 6↔9 (60.00' vs 90.00') с русским пояснением.
+    """
+    import base64
+    import io
+
+    PIL_Image = pytest.importorskip("PIL.Image")
+    from llm_parser import (
+        Segment,
+        parse_with_regex,
+        prepare_survey_image_bytes,
+        render_image_files_base64,
+    )
+
+    # 1. Имитируем смартфонное фото портретного листа 400×600, сохранённое боком (600×400) с EXIF Orientation=6
+    # В «сыром» буфере при Orientation=6 (90° CW при показе) будущий левый верхний угол находится в левом нижнем углу (x=0..30, y=370..400).
+    raw_cam = PIL_Image.new("RGB", (600, 400), (210, 205, 185))
+    for x in range(30):
+        for y in range(370, 400):
+            raw_cam.putpixel((x, y), (220, 20, 20))
+    exif = raw_cam.getexif()
+    exif[0x0112] = 6  # Rotate 90 CW
+    exif_jpg = tmp_path / "survey_1984_phone.jpg"
+    raw_cam.save(exif_jpg, format="JPEG", quality=95, exif=exif.tobytes())
+
+    out_bytes, mime, meta = prepare_survey_image_bytes(
+        exif_jpg, rotation_deg=0, enhance_scan=True, output_format="jpeg"
+    )
+    assert mime == "image/jpeg"
+    assert meta["exif_transposed"] is True
+    assert (meta["width"], meta["height"]) == (400, 600)
+    upright = PIL_Image.open(io.BytesIO(out_bytes))
+    r_tl, g_tl, b_tl = upright.getpixel((10, 10))
+    assert r_tl > 180 and g_tl < 70 and b_tl < 70  # красная метка встала точно в левый верхний угол!
+
+    # Поворот +90° по часовой стрелке переводит метку из левого верхнего в правый верхний угол (600×400)
+    rot90_bytes, _, meta90 = prepare_survey_image_bytes(
+        exif_jpg, rotation_deg=90, enhance_scan=False, output_format="png"
+    )
+    assert (meta90["width"], meta90["height"]) == (600, 400)
+    im90 = PIL_Image.open(io.BytesIO(rot90_bytes))
+    r_tr, g_tr, _ = im90.getpixel((590, 10))
+    assert r_tr > 180 and g_tr < 70
+
+    # 2. Пакет из 4 крупных (3200×2400) фотографий старой синьки — адаптивное сжатие ≤2200 px
+    bundle: list = []
+    for i in range(4):
+        p = tmp_path / f"diazo_1982_part_{i + 1}.jpg"
+        big = PIL_Image.new("RGB", (3200, 2400), (175, 185, 205))
+        big.save(p, format="JPEG", quality=90)
+        bundle.append(p)
+
+    urls, notes = render_image_files_base64(bundle, rotation_deg=[0, 90, 180, 270], enhance_scan=True)
+    assert len(urls) == 4
+    assert all(u.startswith("data:image/jpeg;base64,") for u in urls)
+    assert any("поворот +180°" in n for n in notes)
+    b0 = base64.b64decode(urls[0].split(",", 1)[1])
+    im_b0 = PIL_Image.open(io.BytesIO(b0))
+    assert max(im_b0.size) <= 2200
+
+    # 3. Дробные дюймы в стиле 1980-х ('25'-6 1/2"', '100' 3-1/4"', '25'-6½"')
+    seg_frac = Segment(ns="N", degrees=90, ew="E", distance_ft="25'-6 1/2\"")
+    assert seg_frac.distance_ft == pytest.approx(25.0 + 6.5 / 12.0, abs=1e-4)
+    seg_vulgar = Segment(ns="N", degrees=0, ew="E", distance_ft="100' 3-1/4\"")
+    assert seg_vulgar.distance_ft == pytest.approx(100.0 + 3.25 / 12.0, abs=1e-4)
+
+    deed_80s = (
+        "BEGINNING at the corner formed by the intersection of the northerly side of "
+        "84th Avenue with the easterly side of 164th Street;\n"
+        "RUNNING THENCE N 00°00'00\" E along 164th Street, 100' 3-1/4\";\n"
+        "THENCE N 90°00'00\" E, 25'-6½\";\n"
+        "THENCE S 00°00'00\" W, 100' 3-1/4\";\n"
+        "THENCE S 90°00'00\" W along 84th Avenue, 25'-6 1/2\" to the point of BEGINNING."
+    )
+    parsed_80s, _ = parse_with_regex(deed_80s)
+    assert parsed_80s.segments[0].distance_ft == pytest.approx(100.270833, abs=1e-4)
+    assert parsed_80s.segments[1].distance_ft == pytest.approx(25.541667, abs=1e-4)
+
+    # 4. Перевёрнутая опечатка цифр 6↔9 в длине тыльной стороны (90.00' вместо 60.00')
+    deed_inverted_6_9 = (
+        "BEGINNING at a point on the southerly side of Maple Road, distant 120.00 feet "
+        "easterly from the corner of Maple Road and 1st Street;\n"
+        "THENCE S 00°00'00\" E, 100.00 feet;\n"
+        "THENCE N 90°00'00\" E, 90.00 feet;\n"
+        "THENCE N 00°00'00\" W, 100.00 feet to the southerly side of Maple Road;\n"
+        "THENCE S 90°00'00\" W along Maple Road, 60.00 feet to the point of BEGINNING."
+    )
+    fixed_6_9, warns_6_9 = parse_with_regex(deed_inverted_6_9)
+    assert fixed_6_9.segments[1].distance_ft == pytest.approx(60.0)
+    assert any("9→6" in w and "90.00' → 60.00'" in w for w in warns_6_9)
+
+
+def test_photo_pdf_page_range_and_ai_auto_orient_prepass(tmp_path, monkeypatch):
+    """
+    Проверяет многостраничный PDF-альбом из фотографий старых чертежей:
+      * выбор конкретных страниц (pdf_pages='2, 4' из 5);
+      * ИИ-автоповорот (auto_orient=True): предпроход по превью 768 px определяет,
+        что стр. #2 перевёрнута вверх ногами (+180°), а стр. #4 лежит на боку (+90°),
+        и физически переворачивает full-res кадры ДО основного геометрического чтения!
+    """
+    import base64
+    import io
+    import openai
+
+    pymupdf = pytest.importorskip("pymupdf")
+    PIL_Image = pytest.importorskip("PIL.Image")
+    from llm_parser import (
+        PDFError,
+        inspect_pdf,
+        load_config,
+        parse_legal_description_full,
+        parse_page_range,
+    )
+
+    assert parse_page_range("2, 4-5", 6) == [1, 3, 4]
+    assert parse_page_range("все", 5, max_pages=2) == [0, 1, 2, 3, 4]
+    with pytest.raises(PDFError):
+        parse_page_range("1-9", 5)
+
+    # Собираем 5-страничный фото-PDF, где стр. 2 перевёрнута на 180° (красная шапка снизу!),
+    # а стр. 4 имеет альбомный формат 800×500 (нужен поворот +90° CW -> станет 500×800).
+    album_pdf = tmp_path / "archive_1981_album.pdf"
+    doc = pymupdf.open()
+    for p_i in range(5):
+        if p_i == 1:  # Страница №2 (0-based 1): вверх ногами — шапка снизу!
+            im = PIL_Image.new("RGB", (500, 800), (235, 232, 220))
+            for x in range(500):
+                for y in range(760, 800):
+                    im.putpixel((x, y), (225, 25, 25))
+            pw, ph = 500, 800
+        elif p_i == 3:  # Страница №4 (0-based 3): на боку (800×500)
+            im = PIL_Image.new("RGB", (800, 500), (230, 235, 225))
+            pw, ph = 800, 500
+        else:
+            im = PIL_Image.new("RGB", (500, 700), (240, 240, 240))
+            pw, ph = 500, 700
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=92)
+        page = doc.new_page(width=pw, height=ph)
+        page.insert_image(pymupdf.Rect(0, 0, pw, ph), stream=buf.getvalue())
+    doc.save(album_pdf)
+    doc.close()
+
+    info = inspect_pdf(album_pdf)
+    assert info["pages"] == 5
+    assert info["has_raster_images"] is True
+
+    calls: list[list[dict]] = []
+
+    class AutoOrientFakeOpenAI:
+        def __init__(self, **kwargs):
+            class _Completions:
+                def create(_self, **ckwargs):
+                    msgs = ckwargs["messages"]
+                    calls.append(msgs)
+                    user_blocks = msgs[-1]["content"]
+                    prompt_txt = user_blocks[0]["text"]
+                    if "CLOCKWISE rotation in degrees" in prompt_txt:
+                        # Предпроход автоповорота: проверяем, что присланы именно 2 компактных превью ≤768 px
+                        img_blocks = [b for b in user_blocks if b.get("type") == "image_url"]
+                        assert len(img_blocks) == 2
+                        for ib in img_blocks:
+                            raw_t = base64.b64decode(ib["image_url"]["url"].split(",", 1)[1])
+                            assert max(PIL_Image.open(io.BytesIO(raw_t)).size) <= 768
+                        payload = {
+                            "rotations": [
+                                {"index": 1, "clockwise_deg": 180, "reason": "upside-down title block"},
+                                {"index": 2, "clockwise_deg": 90, "reason": "sideways landscape scan"},
+                            ]
+                        }
+                        tok = {"prompt_tokens": 240, "completion_tokens": 30, "total_tokens": 270}
+                    else:
+                        payload = _LLM_PAYLOAD
+                        tok = {"prompt_tokens": 1300, "completion_tokens": 200, "total_tokens": 1500}
+                    return type(
+                        "Resp",
+                        (),
+                        {
+                            "choices": [
+                                type(
+                                    "Choice",
+                                    (),
+                                    {"message": type("Msg", (), {"content": json.dumps(payload)})()},
+                                )()
+                            ],
+                            "usage": tok,
+                        },
+                    )()
+
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+            self.beta = None
+
+    monkeypatch.setattr(openai, "OpenAI", AutoOrientFakeOpenAI)
+    outcome = parse_legal_description_full(
+        pdf_path=album_pdf,
+        pdf_pages="2, 4",
+        auto_orient=True,
+        use_llm=True,
+        provider="routerai",
+        model="google/gemini-2.5-pro",
+        api_key="rk-test-orient",
+        cfg=load_config(),
+    )
+
+    assert len(calls) == 2
+    assert outcome.usage is not None and outcome.usage.total_tokens == 1770
+    assert any("Автоповорот ИИ" in w and "#1 → +180°" in w and "#2 → +90°" in w for w in outcome.warnings)
+
+    # Убеждаемся, что во второй (основной) вызов модель получила УЖЕ ПЕРЕВЁРНУТЫЕ ПРЯМО изображения!
+    main_user_blocks = calls[1][-1]["content"]
+    main_imgs = [b["image_url"]["url"] for b in main_user_blocks if b.get("type") == "image_url"]
+    assert len(main_imgs) == 2
+
+    im1_after = PIL_Image.open(io.BytesIO(base64.b64decode(main_imgs[0].split(",", 1)[1])))
+    r_top, g_top, b_top = im1_after.getpixel((im1_after.width // 2, 10))
+    assert r_top > 180 and g_top < 80 and b_top < 80  # красная шапка теперь СВЕРХУ!
+
+    im2_after = PIL_Image.open(io.BytesIO(base64.b64decode(main_imgs[1].split(",", 1)[1])))
+    assert im2_after.height > im2_after.width  # было 800×500 (на боку), стало портретным 500×800!
+
+
+
 
 
 

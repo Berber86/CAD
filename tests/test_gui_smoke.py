@@ -822,6 +822,131 @@ def test_gui_studio_ux_drawer_preview_canvas_and_inspector(gui, monkeypatch, tmp
     app._on_close()
 
 
+def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
+    gui, monkeypatch, tmp_path
+):
+    """
+    Проверяет полный GUI-сценарий для фотографий старых чертежей 80-х годов:
+      * выбор связки из 2 .jpg файлов через кнопку «📷 Фото (JPG)…»;
+      * предпросмотр в режиме «🖼 Исходник», листание кадров 1/2 -> 2/2 и ручной поворот +180°;
+      * передачу связки фото, индивидуальных углов поворота [0, 180], фильтра 80-х и
+        ИИ-автоповорота в 2-проходный консенсус;
+      * пакетную отрисовку соседнего участка из .jpg фотографии.
+    """
+    import time
+    from tkinter import filedialog
+
+    PIL_Image = pytest.importorskip("PIL.Image")
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, TokenUsage, parse_with_regex
+
+    cfg_file = tmp_path / "config.json"
+    local_file = tmp_path / "config.local.json"
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(llm_parser, "ENV_PATH", env_file)
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(gui, "LOCAL_CONFIG_PATH", local_file)
+    monkeypatch.setattr(gui, "ENV_PATH", env_file)
+
+    jpg1 = tmp_path / "survey_1983_overview.jpg"
+    jpg2 = tmp_path / "survey_1983_closeup_upside_down.jpg"
+    PIL_Image.new("RGB", (900, 1200), (205, 200, 180)).save(jpg1, format="JPEG")
+    PIL_Image.new("RGB", (800, 600), (195, 205, 215)).save(jpg2, format="JPEG")
+
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("sk-hydra-photo")
+    app.provider_key_vars["openrouter"].set("sk-or-photo")
+
+    monkeypatch.setattr(
+        filedialog, "askopenfilenames", lambda **_: (str(jpg1), str(jpg2))
+    )
+    app._load_images()
+
+    assert len(app.image_paths) == 2
+    assert app.visual_bar._gridded is True
+    assert app.preview_mode_var.get() == "🖼 Исходник"
+    assert "Фото Vision: 2 файл." in app.pdf_label.cget("text")
+
+    # Проверяем HUD предпросмотра первого кадра, затем переходим ко второму и поворачиваем на 180°
+    hud_texts_1 = [
+        it[2].get("text", "") for it in app.preview_canvas.items if it[0] == "text"
+    ]
+    assert any("ФОТО 1/2: survey_1983_overview.jpg" in t for t in hud_texts_1)
+
+    app.step_visual_frame(1)
+    app.rotate_visual(180)
+    assert app._visual_rotations == [0, 180]
+    hud_texts_2 = [
+        it[2].get("text", "") for it in app.preview_canvas.items if it[0] == "text"
+    ]
+    assert any("ФОТО 2/2" in t and "+180°" in t for t in hud_texts_2)
+
+    # Запускаем 2-проходный разбор связки фотографий
+    app.select_passes(2)
+    clean_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    orient_called: list[int] = []
+    seen_image_counts: list[int] = []
+
+    def fake_detect_orient(urls, cfg, **kwargs):
+        orient_called.append(len(urls))
+        return [0, 0], TokenUsage(prompt_tokens=180, completion_tokens=20, total_tokens=200, provider="hydra", provider_label="Hydra AI", model="glm-5.2")
+
+    def fake_extract(text, cfg, api_key=None, progress=None, *, provider=None, model=None, key_secret="", image_data_urls=None, focus_instruction=None):
+        seen_image_counts.append(len(image_data_urls or []))
+        u = TokenUsage(prompt_tokens=900, completion_tokens=110, total_tokens=1010, provider=str(provider), provider_label=str(provider), model=str(model))
+        return clean_desc, "structured-outputs", u
+
+    monkeypatch.setattr(llm_parser, "detect_visual_orientations_llm", fake_detect_orient)
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
+
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert orient_called == [2]
+    assert seen_image_counts == [2, 2]
+    # После успешного разбора предпросмотр автоматически переключается на CAD-схему!
+    assert app.preview_mode_var.get() == "📐 Схема CAD"
+    assert app.description is not None and len(app.description.segments) == 4
+
+    # Проверяем пакет соседей с .jpg фотографией соседа
+    neighbor_jpg = tmp_path / "neighbor_1983_365.jpg"
+    PIL_Image.new("RGB", (700, 900), (210, 210, 200)).save(neighbor_jpg, format="JPEG")
+    neighbor_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+
+    def fake_extract_neighbor(text, cfg, api_key=None, progress=None, *, provider=None, model=None, key_secret="", image_data_urls=None, focus_instruction=None):
+        u = TokenUsage(prompt_tokens=800, completion_tokens=100, total_tokens=900, provider=str(provider), provider_label=str(provider), model=str(model))
+        return neighbor_desc, "structured-outputs", u
+
+    def fake_draw(self_builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        from acad_builder import DrawResult
+
+        plan = self_builder.plan(description, scale=scale, is_neighbor=is_neighbor)
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"neighbor_lot": "NEIGHBOR_LOT"})
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract_neighbor)
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(neighbor_jpg),))
+
+    app._load_and_draw_neighbor_files()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert "обработано 1 уч. в слое NEIGHBOR_LOT" in app.status_var.get()
+    assert len(app._preview_neighbor_plans) == 1
+    app._on_close()
+
+
+
 
 
 

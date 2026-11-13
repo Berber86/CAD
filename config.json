@@ -9,7 +9,9 @@
     "max_retries": 2,
     "max_input_chars": 60000,
     "vision_dpi": 220,
-    "vision_max_pages": 4,
+    "vision_max_pages": 8,
+    "vision_enhance_scans": true,
+    "vision_auto_orient": true,
     "providers": {
       "hydra": {
         "label": "Hydra AI",

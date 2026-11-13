@@ -30,6 +30,7 @@ import copy
 import getpass
 import hashlib
 import hmac
+import io
 import itertools
 import json
 import math
@@ -51,6 +52,7 @@ __all__ = [
     "ConfigError",
     "ConsensusResult",
     "DiscrepancyItem",
+    "IMAGE_EXTENSIONS",
     "KeyProtectionError",
     "LegalDescription",
     "LegalDescriptionData",
@@ -74,19 +76,25 @@ __all__ = [
     "build_pass_targets",
     "clean_provider_key",
     "compare_legal_descriptions",
+    "detect_visual_orientations_llm",
     "dms_to_degrees",
+    "enhance_archival_scan",
     "infer_corner_to_pob_bearing",
     "inspect_pdf",
+    "is_image_file",
     "is_protected_key",
     "load_config",
     "load_dotenv_dict",
     "make_strict_schema",
     "parse_legal_description",
     "parse_legal_description_full",
+    "parse_page_range",
     "parse_with_regex",
+    "prepare_survey_image_bytes",
     "protect_api_key",
     "read_pdf_text",
     "recheck_consensus_discrepancies",
+    "render_image_files_base64",
     "render_pdf_pages_base64",
     "resolve_api_target",
     "run_multipass_consensus",
@@ -195,7 +203,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_retries": 2,
         "max_input_chars": 60000,
         "vision_dpi": 220,
-        "vision_max_pages": 4,
+        "vision_max_pages": 8,
+        "vision_enhance_scans": True,
+        "vision_auto_orient": True,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
         "consensus": {
             "passes": 1,
@@ -816,34 +826,59 @@ def bearing_label(ns: str, degrees: int, minutes: int, seconds: float, ew: str) 
 # ---------------------------------------------------------------------------
 
 
+_VULGAR_FRACTIONS: dict[str, str] = {
+    "½": " 1/2",
+    "¼": " 1/4",
+    "¾": " 3/4",
+    "⅛": " 1/8",
+    "⅜": " 3/8",
+    "⅝": " 5/8",
+    "⅞": " 7/8",
+}
+
 _FEET_INCHES_STR_RE = re.compile(
-    r"(?P<ft>\d+(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:and\s+)?"
-    r"(?P<in>\d+(?:\.\d+)?)(?:\s+(?P<fnum>\d+)\s*/\s*(?P<fden>\d+))?\s*"
-    r"(?:inches|inch|in\.?|\")",
+    r"(?P<ft>\d+(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:-\s*|and\s+)?"
+    r"(?:"
+    r"(?P<in>\d+(?:\.\d+)?)(?:[\s-]+(?P<fnum>\d+)\s*/\s*(?P<fden>\d+))?"
+    r"|(?P<pnum>\d+)\s*/\s*(?P<pden>\d+)"
+    r")\s*(?:inches|inch|in\.?|\")",
     re.IGNORECASE,
 )
 
 
+def _replace_vulgar_fractions(text: str) -> str:
+    for glyph, ascii_frac in _VULGAR_FRACTIONS.items():
+        if glyph in text:
+            text = text.replace(glyph, ascii_frac)
+    return text
+
+
+def _feet_inches_match_to_ft(fi: re.Match[str]) -> float:
+    feet = float(fi.group("ft"))
+    inches = float(fi.group("in")) if fi.group("in") is not None else 0.0
+    if fi.group("fnum") and fi.group("fden") and float(fi.group("fden")) > 0:
+        inches += float(fi.group("fnum")) / float(fi.group("fden"))
+    elif fi.group("pnum") and fi.group("pden") and float(fi.group("pden")) > 0:
+        inches += float(fi.group("pnum")) / float(fi.group("pden"))
+    return feet + inches / 12.0
+
+
 def _coerce_float(value: Any) -> float | None:
-    """'1,250.50 ft' -> 1250.5; '13 feet 8 inches' -> 13.6667; '' / None -> None."""
+    """'1,250.50 ft' -> 1250.5; '25\\'-6 1/2\"' -> 25.5417; '' / None -> None."""
     if value is None:
         return None
     if isinstance(value, bool):
         raise ValueError("ожидалось число, получено bool")
     if isinstance(value, (int, float)):
         return float(value)
-    text = str(value).strip().replace(",", "").replace("\u00a0", " ")
+    text = _replace_vulgar_fractions(
+        str(value).strip().replace(",", "").replace("\u00a0", " ")
+    )
     if not text or text in {"-", "—", "n/a", "N/A", "none", "null"}:
         return None
     fi = _FEET_INCHES_STR_RE.search(text)
     if fi:
-        feet = float(fi.group("ft"))
-        inches = float(fi.group("in"))
-        if fi.group("fnum") and fi.group("fden"):
-            den = float(fi.group("fden"))
-            if den > 0:
-                inches += float(fi.group("fnum")) / den
-        return feet + inches / 12.0
+        return _feet_inches_match_to_ft(fi)
     match = re.search(r"-?\d+(?:\.\d+)?", text)
     if not match:
         raise ValueError(f"не удалось прочитать число из {value!r}")
@@ -1473,8 +1508,369 @@ LegalDescriptionData = LegalDescription
 
 
 # ---------------------------------------------------------------------------
-# Чтение и рендер PDF (текстовый слой + Vision PNG для векторных CAD/сканов)
+# Чтение и рендер PDF и фотоархивов чертежей (JPG/PNG/TIFF/WEBP + 1980s scans)
 # ---------------------------------------------------------------------------
+
+IMAGE_EXTENSIONS: tuple[str, ...] = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+)
+
+
+def is_image_file(path: str | Path) -> bool:
+    """True, если путь указывает на растровый файл чертежа/фотографии."""
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def parse_page_range(
+    spec: str | Sequence[int] | None,
+    total_pages: int,
+    *,
+    max_pages: int = 8,
+) -> list[int]:
+    """
+    Разбирает выбор страниц PDF (1-based строка вроде ``'1'``, ``'2-5'``,
+    ``'1, 3, 6-7'``, ``'все'`` / ``'all'``) в список 0-based индексов страниц.
+    """
+    if total_pages <= 0:
+        raise PDFError("PDF не содержит страниц")
+    if spec is None:
+        cap = total_pages if max_pages <= 0 else min(total_pages, int(max_pages))
+        return list(range(cap))
+
+    if isinstance(spec, str):
+        cleaned = spec.strip().lower()
+        if cleaned in ("", "auto", "авто"):
+            cap = total_pages if max_pages <= 0 else min(total_pages, int(max_pages))
+            return list(range(cap))
+        if cleaned in ("all", "все", "всё", "*"):
+            return list(range(total_pages))
+
+        indices: list[int] = []
+        seen: set[int] = set()
+        for raw_part in re.split(r"[,;]+", cleaned):
+            part = raw_part.strip()
+            if not part:
+                continue
+            range_m = re.fullmatch(r"(\d+)\s*(?:-|\.\.|–|—)\s*(\d+)", part)
+            if range_m:
+                start_p = int(range_m.group(1))
+                end_p = int(range_m.group(2))
+                if start_p > end_p:
+                    start_p, end_p = end_p, start_p
+                if start_p < 1 or end_p > total_pages:
+                    raise PDFError(
+                        f"диапазон страниц «{part}» выходит за пределы PDF (всего страниц: {total_pages})"
+                    )
+                for p1 in range(start_p, end_p + 1):
+                    idx0 = p1 - 1
+                    if idx0 not in seen:
+                        seen.add(idx0)
+                        indices.append(idx0)
+                continue
+            if part.isdigit():
+                p1 = int(part)
+                if not (1 <= p1 <= total_pages):
+                    raise PDFError(
+                        f"страница {p1} вне диапазона документа (всего страниц: {total_pages})"
+                    )
+                idx0 = p1 - 1
+                if idx0 not in seen:
+                    seen.add(idx0)
+                    indices.append(idx0)
+                continue
+            raise PDFError(
+                f"некорректный выбор страниц PDF: «{spec}» (пример: «1», «2-4» или «все»)"
+            )
+        if not indices:
+            raise PDFError("не выбрана ни одна страница PDF")
+        return indices
+
+    indices_seq: list[int] = []
+    seen_seq: set[int] = set()
+    for p_raw in spec:
+        p1 = int(p_raw)
+        if not (1 <= p1 <= total_pages):
+            raise PDFError(
+                f"страница {p1} вне диапазона документа (всего страниц: {total_pages})"
+            )
+        idx0 = p1 - 1
+        if idx0 not in seen_seq:
+            seen_seq.add(idx0)
+            indices_seq.append(idx0)
+    if not indices_seq:
+        raise PDFError("не выбрана ни одна страница PDF")
+    return indices_seq
+
+
+def _adaptive_max_side_px(item_count: int, requested_max_px: int | None = None) -> int:
+    """Адаптивно выбирает макс. сторону кадра, чтобы пачка фото не вызвала HTTP 413."""
+    if requested_max_px is not None and requested_max_px > 0:
+        return max(768, int(requested_max_px))
+    if item_count <= 2:
+        return 2800
+    if item_count <= 4:
+        return 2200
+    return 1800
+
+
+def _normalize_rotation_list(
+    rotation_deg: int | Sequence[int], count: int
+) -> list[int]:
+    if isinstance(rotation_deg, (int, float)):
+        val = int(round(float(rotation_deg))) % 360
+        return [val] * count
+    rots = [int(round(float(r))) % 360 for r in rotation_deg]
+    if len(rots) < count:
+        fill = rots[-1] if rots else 0
+        rots.extend([fill] * (count - len(rots)))
+    return rots[:count]
+
+
+def enhance_archival_scan(pil_img: Any) -> Any:
+    """
+    Мягкое геодезическое улучшение фотографий старых чертежей (синьки 1980-х,
+    выцветшая калька, карандаш/трафарет Leroy, цветные штампы):
+      * переводит в чистый RGB на белой подложке;
+      * растягивает уровни по общей яркости (единая LUT для R/G/B без искажения цветов!);
+      * умеренно повышает контраст и микрорезкость штрихов/цифр (UnsharpMask),
+        не съедая десятичные точки и штрихи минут/секунд.
+    """
+    from PIL import Image, ImageEnhance, ImageFilter
+
+    if pil_img.mode in ("RGBA", "LA") or (
+        pil_img.mode == "P" and "transparency" in pil_img.info
+    ):
+        rgba = pil_img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        rgb = bg
+    elif pil_img.mode != "RGB":
+        rgb = pil_img.convert("RGB")
+    else:
+        rgb = pil_img
+
+    gray_hist = rgb.convert("L").histogram()
+    total_px = sum(gray_hist) or 1
+    cut = int(total_px * 0.004)
+    lo = 0
+    acc = 0
+    for val, cnt in enumerate(gray_hist):
+        acc += cnt
+        if acc > cut:
+            lo = val
+            break
+    hi = 255
+    acc = 0
+    for val in range(255, -1, -1):
+        acc += gray_hist[val]
+        if acc > cut:
+            hi = val
+            break
+
+    if hi - lo >= 25 and (lo > 12 or hi < 245):
+        span = float(hi - lo)
+        lut = [
+            max(0, min(255, int(round(6.0 + (i - lo) * 246.0 / span))))
+            for i in range(256)
+        ]
+        leveled = rgb.point(lut * 3)
+    else:
+        leveled = rgb
+
+    contrasted = ImageEnhance.Contrast(leveled).enhance(1.15)
+    sharpened = contrasted.filter(
+        ImageFilter.UnsharpMask(radius=1.2, percent=135, threshold=2)
+    )
+    return sharpened
+
+
+def _rotate_pil_clockwise(pil_img: Any, clockwise_deg: int) -> Any:
+    from PIL import Image
+
+    deg = int(clockwise_deg) % 360
+    if deg == 0:
+        return pil_img
+    if deg == 90:
+        return pil_img.transpose(Image.Transpose.ROTATE_270)
+    if deg == 180:
+        return pil_img.transpose(Image.Transpose.ROTATE_180)
+    if deg == 270:
+        return pil_img.transpose(Image.Transpose.ROTATE_90)
+    return pil_img.rotate(
+        -deg,
+        resample=Image.Resampling.BICUBIC,
+        expand=True,
+        fillcolor=(255, 255, 255),
+    )
+
+
+def prepare_survey_image_bytes(
+    source: str | Path | bytes,
+    *,
+    rotation_deg: int = 0,
+    max_side_px: int = 2800,
+    enhance_scan: bool = True,
+    output_format: Literal["jpeg", "png"] = "jpeg",
+    jpeg_quality: int = 88,
+) -> tuple[bytes, str, dict[str, Any]]:
+    """
+    Открывает фото/скан чертежа (JPG/PNG/TIFF/WEBP/BMP или сырые байты),
+    исправляет EXIF-ориентацию со смартфона, поворачивает по часовой стрелке на
+    ``rotation_deg``, масштабирует до ``max_side_px``, опционально повышает
+    читаемость старых чертежей 80-х и кодирует в JPEG 4:4:4 (или PNG).
+
+    Возвращает ``(image_bytes, mime_type, metadata_dict)``.
+    """
+    if isinstance(source, (str, Path)):
+        src_path = Path(source)
+        if not src_path.exists():
+            raise PDFError(f"файл изображения не найден: {src_path}")
+        raw_bytes = src_path.read_bytes()
+        src_name = src_path.name
+    else:
+        raw_bytes = bytes(source)
+        src_name = "memory"
+
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:  # pragma: no cover - резервный путь через PyMuPDF без Pillow
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz  # type: ignore[no-redef]
+        pix = fitz.Pixmap(raw_bytes)
+        if pix.alpha:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        png_b = pix.tobytes("png")
+        return png_b, "image/png", {
+            "name": src_name,
+            "width": pix.width,
+            "height": pix.height,
+            "exif_transposed": False,
+            "exif_orientation": 1,
+            "rotation_deg": int(rotation_deg) % 360,
+        }
+
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.load()
+    except Exception as exc:  # noqa: BLE001
+        raise PDFError(f"не удалось прочитать изображение «{src_name}»: {exc}") from exc
+
+    exif_orient = 1
+    try:
+        exif_data = img.getexif()
+        if exif_data:
+            exif_orient = int(exif_data.get(0x0112, 1) or 1)
+    except Exception:  # noqa: BLE001
+        exif_orient = 1
+
+    exif_transposed = False
+    if exif_orient not in (0, 1):
+        try:
+            img = ImageOps.exif_transpose(img)
+            exif_transposed = True
+        except Exception:  # noqa: BLE001
+            exif_transposed = False
+
+    rot_cw = int(rotation_deg) % 360
+    if rot_cw != 0:
+        img = _rotate_pil_clockwise(img, rot_cw)
+
+    safe_max = max(512, int(max_side_px or 2800))
+    w0, h0 = img.size
+    if max(w0, h0) > safe_max:
+        ratio = safe_max / float(max(w0, h0))
+        new_size = (max(1, int(round(w0 * ratio))), max(1, int(round(h0 * ratio))))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    if enhance_scan:
+        img = enhance_archival_scan(img)
+    elif img.mode != "RGB":
+        if img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info
+        ):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[3])
+            img = bg
+        else:
+            img = img.convert("RGB")
+
+    out_buf = io.BytesIO()
+    if output_format == "png":
+        img.save(out_buf, format="PNG", optimize=True)
+        mime = "image/png"
+    else:
+        img.save(
+            out_buf,
+            format="JPEG",
+            quality=max(60, min(96, int(jpeg_quality))),
+            subsampling=0,
+            optimize=True,
+        )
+        mime = "image/jpeg"
+
+    w_fin, h_fin = img.size
+    return out_buf.getvalue(), mime, {
+        "name": src_name,
+        "width": w_fin,
+        "height": h_fin,
+        "exif_transposed": exif_transposed,
+        "exif_orientation": exif_orient,
+        "rotation_deg": rot_cw,
+    }
+
+
+def render_image_files_base64(
+    image_paths: Sequence[str | Path],
+    *,
+    rotation_deg: int | Sequence[int] = 0,
+    max_side_px: int | None = None,
+    enhance_scan: bool = True,
+    output_format: Literal["jpeg", "png"] = "jpeg",
+) -> tuple[list[str], list[str]]:
+    """
+    Готовит список фотографий/сканов чертежей (``.jpg/.png/.tif/.webp/.bmp``)
+    к отправке в Vision LLM: EXIF-автоповорот, пользовательский поворот,
+    улучшение контраста старых чертежей 80-х и компактное кодирование base64.
+
+    Возвращает ``(data_urls, info_notes)``.
+    """
+    paths = [Path(p) for p in image_paths]
+    if not paths:
+        raise PDFError("не передано ни одного файла изображения")
+
+    target_max_px = _adaptive_max_side_px(len(paths), max_side_px)
+    rots = _normalize_rotation_list(rotation_deg, len(paths))
+    urls: list[str] = []
+    notes: list[str] = []
+
+    for idx, img_path in enumerate(paths):
+        rot_i = rots[idx]
+        img_bytes, mime, meta = prepare_survey_image_bytes(
+            img_path,
+            rotation_deg=rot_i,
+            max_side_px=target_max_px,
+            enhance_scan=enhance_scan,
+            output_format=output_format,
+        )
+        encoded = base64.b64encode(img_bytes).decode("ascii")
+        urls.append(f"data:{mime};base64,{encoded}")
+        applied_tags: list[str] = []
+        if meta.get("exif_transposed"):
+            applied_tags.append(f"EXIF-ориентация #{meta['exif_orientation']} → прямо")
+        if rot_i:
+            applied_tags.append(f"поворот +{rot_i}°")
+        if applied_tags:
+            notes.append(f"Фото «{img_path.name}»: {', '.join(applied_tags)}")
+    return urls, notes
 
 
 def _open_fitz_doc(pdf_path: str | Path) -> tuple[Any, Path]:
@@ -1505,9 +1901,11 @@ def inspect_pdf(pdf_path: str | Path, max_pages: int = 0) -> dict[str, Any]:
     """
     Проверяет PDF без падения на векторных CAD-чертежах и сканах без текста.
 
-    Возвращает ``{"pages": int, "has_text": bool, "text": str}``.
+    Возвращает ``{"pages": int, "has_text": bool, "has_legal_text": bool,
+    "has_raster_images": bool, "text": str}``.
     """
     doc, _ = _open_fitz_doc(pdf_path)
+    has_raster_images = False
     try:
         total_pages = len(doc)
         pages = range(total_pages) if not max_pages else range(min(max_pages, total_pages))
@@ -1517,6 +1915,11 @@ def inspect_pdf(pdf_path: str | Path, max_pages: int = 0) -> dict[str, Any]:
             text = page.get_text("text") or ""
             if text.strip():
                 chunks.append(text)
+            try:
+                if page.get_images(full=False):
+                    has_raster_images = True
+            except Exception:  # noqa: BLE001
+                pass
     finally:
         doc.close()
 
@@ -1527,6 +1930,7 @@ def inspect_pdf(pdf_path: str | Path, max_pages: int = 0) -> dict[str, Any]:
         "pages": total_pages,
         "has_text": has_text,
         "has_legal_text": has_legal_text,
+        "has_raster_images": has_raster_images,
         "text": joined,
     }
 
@@ -1553,32 +1957,77 @@ def render_pdf_pages_base64(
     pdf_path: str | Path,
     *,
     dpi: int = 220,
-    max_pages: int = 4,
+    max_pages: int = 8,
     max_side_px: int = 3200,
+    pages: str | Sequence[int] | None = None,
+    rotation_deg: int | Sequence[int] = 0,
+    enhance_scan: bool = False,
+    output_format: Literal["png", "jpeg", "auto"] = "png",
 ) -> list[str]:
     """
-    Рендерит страницы PDF в PNG и возвращает список ``data:image/png;base64,...``
-    для отправки векторных CAD-чертежей (Title Survey) и сканов в Vision LLM.
-    Для крупноформатных листов (ARCH C/D/E: 18"×24", 24"×36", 36"×48") адаптивно
-    ограничивает DPI по ``max_side_px``, исключая переполнение памяти и HTTP 413.
+    Рендерит выбранные страницы PDF в base64 data-URL для Vision LLM.
+
+    * Для чисто векторных CAD-PDF в режиме ``output_format='png'`` или ``'auto'``
+      отдаёт чёткий lossless PNG (``data:image/png;base64,...``).
+    * Для PDF-альбомов с вшитыми растровыми фото старых чертежей (``page.get_images()``)
+      в режиме ``output_format='auto'`` включает фильтр контраста/резкости 80-х
+      и компактное сжатие ``JPEG 4:4:4``, исключая ошибку HTTP 413 на пачке фото.
     """
     doc, _ = _open_fitz_doc(pdf_path)
     safe_dpi = max(96, min(int(dpi or 220), 350))
-    safe_max_px = max(1200, int(max_side_px or 3200))
-    limit = len(doc) if not max_pages or max_pages <= 0 else min(int(max_pages), len(doc))
     urls: list[str] = []
     try:
-        for index in range(limit):
+        total_pages = len(doc)
+        page_indices = parse_page_range(pages, total_pages, max_pages=max_pages)
+        rots = _normalize_rotation_list(rotation_deg, len(page_indices))
+        eff_max_px = (
+            max(1200, int(max_side_px))
+            if len(page_indices) <= 2
+            else min(max(1200, int(max_side_px)), _adaptive_max_side_px(len(page_indices)))
+        )
+
+        for pos, index in enumerate(page_indices):
             page = doc.load_page(index)
             rect = page.rect
             max_inches = max(float(rect.width), float(rect.height)) / 72.0
             effective_dpi = safe_dpi
             if max_inches > 0:
-                effective_dpi = min(safe_dpi, max(72, int(safe_max_px / max_inches)))
+                effective_dpi = min(safe_dpi, max(72, int(eff_max_px / max_inches)))
             pix = page.get_pixmap(dpi=effective_dpi, alpha=False)
-            png_bytes = pix.tobytes("png")
-            encoded = base64.b64encode(png_bytes).decode("ascii")
-            urls.append(f"data:image/png;base64,{encoded}")
+            raw_png = pix.tobytes("png")
+
+            rot_i = rots[pos]
+            has_raster = False
+            if output_format == "auto":
+                try:
+                    has_raster = bool(page.get_images(full=False))
+                except Exception:  # noqa: BLE001
+                    has_raster = False
+
+            use_photo_pipeline = (
+                output_format == "jpeg"
+                or (output_format == "auto" and has_raster)
+                or rot_i != 0
+                or (enhance_scan and has_raster)
+            )
+            if not use_photo_pipeline:
+                encoded = base64.b64encode(raw_png).decode("ascii")
+                urls.append(f"data:image/png;base64,{encoded}")
+            else:
+                target_fmt: Literal["jpeg", "png"] = (
+                    "jpeg"
+                    if (output_format == "jpeg" or (output_format == "auto" and has_raster))
+                    else "png"
+                )
+                processed_bytes, mime, _ = prepare_survey_image_bytes(
+                    raw_png,
+                    rotation_deg=rot_i,
+                    max_side_px=eff_max_px,
+                    enhance_scan=bool(enhance_scan and (has_raster or output_format == "jpeg")),
+                    output_format=target_fmt,
+                )
+                encoded = base64.b64encode(processed_bytes).decode("ascii")
+                urls.append(f"data:{mime};base64,{encoded}")
     finally:
         doc.close()
     if not urls:
@@ -1587,41 +2036,53 @@ def render_pdf_pages_base64(
 
 
 # ---------------------------------------------------------------------------
-# Промпт для LLM (текст Schedule A / Deed + Vision-чертежи NYC Title Survey)
+# Промпт для LLM (текст Schedule A / Deed + Vision-чертежи + архивные фото 80-х)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a senior licensed New York / USA land-survey technician.
-You extract closed lot boundary geometry from a metes-and-bounds legal description (Schedule A / Deed) OR from an image of an existing Title / Architectural Survey plat into strict JSON.
+You extract closed lot boundary geometry from a metes-and-bounds legal description (Schedule A / Deed) OR from one or more images/photos of an existing Title / Architectural Survey plat (including faded 1970s–1980s diazo blueprints, sepia/linen copies, Leroy-stenciled or hand-drafted plats, and randomly rotated camera photos) into strict JSON.
 
 CRITICAL SURVEY RULES
+0. ROTATED / UPSIDE-DOWN PHOTOS & NORTH ARROW ORIENTATION (MANDATORY FOR IMAGES):
+   - Attached photos of old surveys may be tilted, sideways (90° / 270°), or completely upside-down (180°)!
+   - STEP A: First determine which way the drawing is oriented by reading the Title Block, surveyor seal, and street names right-side up.
+   - STEP B: Locate the drawn NORTH ARROW ("N", star, or half-barb arrow) on the plat! NEVER assume the top edge of the camera photo is North. Determine `front_side` and any relative NYC street directions strictly with respect to the drawn North Arrow (and printed quadrant bearings if present).
+   - STEP C: When multiple photos of the SAME survey are attached (e.g., an overview photo + close-ups of boundary calls or North arrow), synthesize them: use the overview for global topology/streets/North arrow and the sharpest close-up for exact digits!
+   - STEP D: On rotated or upside-down 1980s lettering, double-check inverted digits (`6` <-> `9`, e.g., `60.00'` vs `90.00'`, `16'` vs `19'`, `68°` vs `89°`) and faded blueprint/handwritten glyphs (`3` <-> `8`, `5` <-> `6`, `1` <-> `7`, `0` <-> `8`). Verify against opposite lot sides and polygon closure!
 1. LOT BOUNDARY vs. TIE LINES ("COMMENCING AT") & CORNER-TO-POB VECTOR:
    - NEVER include tie/commencing calls from a distant street corner to the Point of Beginning (POB) in `segments`!
    - Example: if a deed or survey shows 1–3 tie calls from an intersection (e.g. 510.52', 433.78', 208.02' from Mill Rd & New Dorp Ln, or 101.42', 17.49', 1542.23' from Arthur Kill Rd) leading TO the lot corner (POB), EXCLUDE those tie calls from `segments`.
    - Put the immediate distance along `main_street` from the street intersection `(0.0, 0.0)` to POB into `distance_to_corner_ft` (use `0.0` for a corner lot), and put any compound tie or dual Deed/Tax-Map note (e.g. "208.02' (DEED) / 208.22' (T.M.)") into `tie_note`.
    - `corner_to_pob_bearing`: when `distance_to_corner_ft > 0`, provide the exact quadrant bearing (`ns`, `degrees`, `minutes`, `seconds`, `ew`) and `distance_ft = distance_to_corner_ft` pointing FROM the street corner `(0.0, 0.0)` TO `POB` along `main_street` (use `null` when `distance_to_corner_ft == 0`). If the opening paragraph only gives a word direction (e.g. "distant 420.00 feet easterly from the corner..."), take the exact DMS bearing of `main_street` and orient it toward POB — i.e., if the closing segment along `main_street` returning to POB is `S 75°20'20" W`, flip it by 180° to `N 75°20'20" E`!
 2. IGNORE BUILDING & FENCE OFFSETS:
-   - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'") with lot boundary lines.
-   - When both "(DEED)" and "(T.M.)" / "(TAX MAP)" values appear, prefer the "(DEED)" / record survey dimension.
+   - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'", "GARAGE", "SHED") with lot boundary lines.
+   - When both "(DEED)" / "(REC.)" and "(T.M.)" / "(TAX MAP)" / "(MEAS.)" values appear, prefer the measured survey boundary or "(DEED)" record dimension consistently around the closed loop.
 3. QUADRANT BEARINGS, RELATIVE NYC COURSES & TYPO EVALUATION:
    - Every element of `segments` represents one lot boundary side in continuous loop order around the parcel. On survey plats, orient each bearing's N/S and E/W letters along your chosen CW/CCW loop direction.
    - DO NOT alter small 0.01-ft rounding gaps (e.g. 0.003–0.015 ft on oblique trapezoids) — preserve exact record numbers; our CAD geometry engine handles analytical right-trapezoid closure and open rounding gaps automatically.
    - HOWEVER, act as a thinking surveyor when a LARGE closure gap (> 0.1 ft) appears: check whether it is caused by an OBVIOUS TYPO or visual OCR digit confusion:
      * Quadrant letter typo (`N` <-> `S` or `E` <-> `W`), OR
-     * Digit confusion (`3` <-> `8`, `8` <-> `0`, `1` <-> `7`, `5` <-> `6`, `0` <-> `6`, `0` <-> `9`) in `degrees`, `minutes`, `seconds`, or `distance_ft` (compare against opposite parallel/perpendicular sides, building dimensions, and lot frontage).
+     * Digit confusion (`6` <-> `9`, `3` <-> `8`, `8` <-> `0`, `1` <-> `7`, `5` <-> `6`, `0` <-> `6`, `0` <-> `9`) in `degrees`, `minutes`, `seconds`, or `distance_ft` (compare against opposite parallel/perpendicular sides, building dimensions, and lot frontage).
      If an obvious typo is identified and fixing it cleanly closes the parcel, output the corrected value AND explain clearly in Russian in `anomaly_note` what was written in the source and what typo was corrected. If NO obvious typo can be determined with confidence, keep all printed lengths and angles strictly verbatim and set `anomaly_note` to `null` (or describe the unresolved discrepancy in `anomaly_note` without altering `segments`).
    - When explicit quadrant bearings are given, split into `ns` ("N"/"S"), `degrees` (0..90), `minutes` (0..59), `seconds` (decimal), `ew` ("E"/"W"), `bearing_label` ("N 75°20'20\" E"), and set `has_bearing = true`.
-   - When NO compass bearings are printed (common in NYC surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
-     * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) and apply exact printed interior/right angles without inventing compass labels;
+   - When NO compass bearings are printed (common in NYC & 1980s surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
+     * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) according to the North Arrow, and apply exact printed interior/right angles without inventing compass labels;
      * Set `has_bearing = false` on every course without an explicit compass bearing;
      * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
      * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
-4. DISTANCES:
-   - `distance_ft` is in decimal feet. Convert feet-and-inches ("13 feet 8 inches" -> 13.6667, "25' 10\"" -> 25.8333, "55' 6\"" -> 55.5), varas (×2.77778), or chains (×66) to decimal feet.
+4. DISTANCES (INCLUDING 1980s FRACTIONAL INCHES):
+   - `distance_ft` is in decimal feet. Convert all feet-and-inches and fractional inches accurately:
+     * "13 feet 8 inches" -> 13.6667
+     * "25' 10\"" -> 25.8333, "55'-6\"" -> 55.5
+     * "25'-6 1/2\"" -> 25 + 6.5/12 = 25.5417
+     * "100' 3-1/4\"" -> 100 + 3.25/12 = 100.2708
+     * "50'-0 3/4\"" -> 50 + 0.75/12 = 50.0625
+     * varas (×2.77778) or chains (×66) -> decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
    - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
    - `main_street_note`: parenthetical subtitle if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
-   - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street`. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
+   - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
@@ -1634,11 +2095,11 @@ USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 
 Extract the lot geometry and survey metadata into JSON."""
 
-VISION_USER_PROMPT = """Examine the attached survey / title document page(s) carefully.
-1. Read the exact lot boundary dimensions and bearings (or NYC relative notes like PARALLEL WITH ... / AT RIGHT ANGLES TO ...). Pay extra visual attention to lookalike digits (3 vs 8, 8 vs 0, 1 vs 7, 5 vs 6).
-2. Check inside the lot corners for any printed interior angle (such as 93°33'29.5") and put it in `interior_angle`!
-3. Read street names, street subtitles in parentheses, corner tie distances, and Block/Lot/Borough.
-4. Walk the parcel boundary in continuous loop order, excluding COMMENCING / corner tie lines and building/fence offsets from `segments`. If you spot and fix an obvious typo or OCR digit confusion, explain it in Russian in `anomaly_note`."""
+VISION_USER_PROMPT = """Examine the attached survey / title document image(s) carefully (note: photos may be 1980s blueprints/hand-drafted plats at an arbitrary rotation or tilt, or multiple close-up shots of the same survey).
+1. ORIENTATION & NORTH ARROW FIRST: Check if any image is rotated (90°/180°/270° or tilted), locate the Title Block and the drawn NORTH ARROW ("N"), and establish true North before reading directions. Never assume the top of the photo is North!
+2. EXACT BOUNDARY CALLS & 1980s GLYPHS: Read lot boundary dimensions (including fractional inches like `25'-6 1/2"` -> `25.5417`) and bearings (or NYC relative notes like `PARALLEL WITH ...` / `AT RIGHT ANGLES TO ...`). Watch carefully for upside-down `6` vs `9` and faded/handwritten `3` vs `8`, `5` vs `6`, `1` vs `7`, `0` vs `8`.
+3. INTERIOR ANGLES & STREETS: Check inside every parcel corner for printed interior angles (such as `93°33'29.5"`) -> `interior_angle`. Read street names, subtitles in parentheses, corner tie distances (`distance_to_corner_ft`), and Block/Lot/Borough.
+4. CLOSED LOOP & MULTI-PHOTO CHECK: If multiple photos of the same lot are attached, cross-reference overview and close-ups. Walk the parcel boundary in continuous loop order, excluding COMMENCING / corner tie lines and building/fence offsets from `segments`. If you spot and fix an obvious typo or OCR digit confusion, explain it in Russian in `anomaly_note`."""
 
 
 def _messages(
@@ -2119,7 +2580,8 @@ _STOP_WORDS = {
 
 
 def _normalize_legal_text(text: str) -> str:
-    """Приводит типографику к единому виду (градусы, минуты, секунды)."""
+    """Приводит типографику к единому виду (градусы, минуты, секунды, дроби дюймов)."""
+    text = _replace_vulgar_fractions(text)
     replacements = {
         "\u00ba": "°", "\u02da": "°", "\u00b0": "°",
         "\u2032": "'", "\u2019": "'", "\u2018": "'", "\u02b9": "'",
@@ -2140,7 +2602,7 @@ def _parse_quadrant(ns: str, ew: str) -> tuple[str, str]:
 
 def _distance_after(chunk: str) -> float | None:
     """
-    Читает длину стороны: сначала проверяет связку «13 feet 8 inches» / «13' 8"»,
+    Читает длину стороны: сначала проверяет связку «13 feet 8 inches» / «25'-6 1/2"»,
     затем явную пометку ``(DEED)``, затем обычное число в футах.
     """
     fi = _FEET_INCHES_STR_RE.search(chunk)
@@ -2151,11 +2613,7 @@ def _distance_after(chunk: str) -> float | None:
     )
     plain = _DISTANCE_RE.search(chunk)
     if fi and (not plain or fi.start() <= plain.start()):
-        feet = float(fi.group("ft"))
-        inches = float(fi.group("in"))
-        if fi.group("fnum") and fi.group("fden") and float(fi.group("fden")) > 0:
-            inches += float(fi.group("fnum")) / float(fi.group("fden"))
-        return feet + inches / 12.0
+        return _feet_inches_match_to_ft(fi)
     if deed_match and plain and deed_match.start() <= plain.start() + 30:
         return float(deed_match.group("num").replace(",", ""))
     if plain:
@@ -3171,9 +3629,12 @@ _LOOKALIKE_DIGIT_PAIRS: set[frozenset[str]] = {
     frozenset(("5", "6")),
     frozenset(("0", "6")),
     frozenset(("0", "9")),
+    frozenset(("6", "9")),
     frozenset(("1", "4")),
     frozenset(("2", "7")),
+    frozenset(("2", "5")),
     frozenset(("3", "5")),
+    frozenset(("5", "9")),
     frozenset(("6", "8")),
     frozenset(("8", "9")),
 }
@@ -3655,50 +4116,299 @@ def _repair_llm_geometry(
     return model, notes
 
 
+ORIENTATION_DETECT_PROMPT = """Examine the attached survey / blueprint image(s), numbered 1..N in the order attached.
+Some archival 1980s survey photos or scans may be sideways (90° or 270°) or completely upside-down (180°).
+For EACH image index 1..N, determine the CLOCKWISE rotation in degrees (ONLY 0, 90, 180, or 270) that MUST be applied so that the main Title Block, surveyor stamp, street names, and printed notes become upright and readable right-side up (0 = already upright).
+Return STRICT JSON ONLY in this exact format:
+{"rotations": [{"index": 1, "clockwise_deg": 0, "reason": "short note"}]}"""
+
+
+def _shrink_data_url_thumbnail(data_url: str, *, max_side_px: int = 768) -> str:
+    """Создаёт компактное превью (≤768 px) из data-URL для быстрого автоопределения поворота."""
+    if "," not in data_url:
+        return data_url
+    _, b64 = data_url.split(",", 1)
+    try:
+        raw = base64.b64decode(b64)
+        thumb_bytes, mime, _ = prepare_survey_image_bytes(
+            raw,
+            rotation_deg=0,
+            max_side_px=max_side_px,
+            enhance_scan=False,
+            output_format="jpeg",
+            jpeg_quality=78,
+        )
+        return f"data:{mime};base64,{base64.b64encode(thumb_bytes).decode('ascii')}"
+    except Exception:  # noqa: BLE001
+        return data_url
+
+
+def _rotate_data_url_clockwise(data_url: str, clockwise_deg: int) -> str:
+    """Поворачивает уже отрендеренный full-res data-URL на 90°/180°/270° без повторного фильтра."""
+    deg = int(clockwise_deg) % 360
+    if deg == 0 or "," not in data_url:
+        return data_url
+    header, b64 = data_url.split(",", 1)
+    raw = base64.b64decode(b64)
+    fmt: Literal["png", "jpeg"] = "png" if "image/png" in header.lower() else "jpeg"
+    rot_bytes, mime, _ = prepare_survey_image_bytes(
+        raw,
+        rotation_deg=deg,
+        max_side_px=4096,
+        enhance_scan=False,
+        output_format=fmt,
+        jpeg_quality=90,
+    )
+    return f"data:{mime};base64,{base64.b64encode(rot_bytes).decode('ascii')}"
+
+
+def detect_visual_orientations_llm(
+    image_data_urls: Sequence[str],
+    cfg: dict[str, Any],
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    key_secret: str = "",
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[int], TokenUsage | None]:
+    """
+    Быстрый предпроход Vision LLM по компактным превью (768 px): определяет для
+    каждого фото/страницы угол поворота по часовой стрелке ``0 / 90 / 180 / 270``,
+    нужный чтобы поставить перевёрнутый чертёж прямо перед чтением мелких цифр.
+    """
+    n_imgs = len(image_data_urls)
+    if n_imgs == 0:
+        return [], None
+
+    api_cfg = cfg.get("api", {})
+    target = resolve_api_target(
+        cfg,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        key_secret=key_secret,
+    )
+    client = _make_client(api_cfg, target=target)
+    if progress:
+        progress(
+            f"Автоопределение поворота ({n_imgs} изобр.) через {target['provider_label']} / {target['model']}…"
+        )
+
+    thumbs = [_shrink_data_url_thumbnail(u, max_side_px=768) for u in image_data_urls]
+    content_blocks: list[dict[str, Any]] = [
+        {"type": "text", "text": ORIENTATION_DETECT_PROMPT}
+    ]
+    for th in thumbs:
+        content_blocks.append({"type": "image_url", "image_url": {"url": th}})
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a precise document orientation detector for land survey blueprints. Reply with JSON only.",
+        },
+        {"role": "user", "content": content_blocks},
+    ]
+
+    try:
+        try:
+            completion = _call_with_temperature(
+                client.chat.completions.create,
+                model=target["model"],
+                messages=messages,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+        except Exception as inner_exc:  # noqa: BLE001
+            if _is_auth_error(inner_exc):
+                raise
+            completion = _call_with_temperature(
+                client.chat.completions.create,
+                model=target["model"],
+                messages=messages,
+                temperature=0.0,
+            )
+    except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            raise LLMParseError(f"ошибка авторизации API при автоповороте: {exc}") from exc
+        return [0] * n_imgs, None
+
+    counts = _extract_usage_counts(completion)
+    usage = (
+        TokenUsage(
+            prompt_tokens=counts[0],
+            completion_tokens=counts[1],
+            total_tokens=counts[2],
+            provider=target["provider"],
+            provider_label=target["provider_label"],
+            model=target["model"],
+            available=True,
+        )
+        if counts is not None
+        else TokenUsage(
+            provider=target["provider"],
+            provider_label=target["provider_label"],
+            model=target["model"],
+            available=False,
+        )
+    )
+
+    try:
+        raw_content = completion.choices[0].message.content or ""
+        parsed = _json_from_text(raw_content)
+    except Exception:  # noqa: BLE001
+        return [0] * n_imgs, usage
+
+    result_rots = [0] * n_imgs
+    items = None
+    if isinstance(parsed, dict):
+        items = parsed.get("rotations")
+        if items is None and "clockwise_deg" in parsed:
+            items = [parsed]
+    elif isinstance(parsed, list):
+        items = parsed
+
+    if isinstance(items, list):
+        for pos, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                continue
+            raw_idx = entry.get("index", pos + 1)
+            try:
+                idx0 = int(raw_idx) - 1
+            except (TypeError, ValueError):
+                idx0 = pos
+            if not (0 <= idx0 < n_imgs):
+                idx0 = pos if pos < n_imgs else -1
+            if idx0 < 0:
+                continue
+            try:
+                deg = int(round(float(entry.get("clockwise_deg", 0)))) % 360
+            except (TypeError, ValueError):
+                deg = 0
+            # Привязываем к ближайшему кратному 90° (0, 90, 180, 270)
+            snapped = min((0, 90, 180, 270), key=lambda c: min((deg - c) % 360, (c - deg) % 360))
+            result_rots[idx0] = snapped
+
+    return result_rots, usage
+
+
 def _prepare_parse_input(
     text: str | None,
     pdf_path: str | Path | None,
     cfg: dict[str, Any],
     *,
     use_llm: bool,
+    image_paths: Sequence[str | Path] | None = None,
+    pdf_pages: str | Sequence[int] | None = None,
+    rotation_deg: int | Sequence[int] = 0,
+    enhance_scan: bool | None = None,
+    auto_orient: bool = False,
+    orient_provider: str | None = None,
+    orient_model: str | None = None,
+    orient_api_key: str | None = None,
+    key_secret: str = "",
     progress: Callable[[str], None] | None = None,
-) -> tuple[str, list[str], list[str]]:
+) -> tuple[str, list[str], list[str], TokenUsage | None]:
     """
-    Читает/рендерит PDF один раз и подготавливает ``(combined_text, image_data_urls, warnings)``.
-    При многопроходном режиме избавляет от повторного рендера страниц PDF в каждом потоке.
+    Читает/рендерит PDF или пачку фотографий (``.jpg/.png/.tif/.webp/.bmp``) один раз
+    и подготавливает ``(combined_text, image_data_urls, warnings, orient_usage)``.
+    При многопроходном режиме избавляет от повторного рендера и автоповорота в каждом потоке.
     """
     from pathlib import Path as _Path
 
     warnings: list[str] = []
     image_data_urls: list[str] = []
+    orient_usage: TokenUsage | None = None
+    do_enhance = (
+        bool(cfg.get("api", {}).get("vision_enhance_scans", True))
+        if enhance_scan is None
+        else bool(enhance_scan)
+    )
+
+    # Удобный ярлык: если в pdf_path передали одиночный .jpg/.png/.tif — перенаправляем в image_paths
+    eff_image_paths: list[Path] = [Path(p) for p in (image_paths or [])]
+    eff_pdf_path: Path | None = _Path(pdf_path) if pdf_path else None
+    if eff_pdf_path is not None and is_image_file(eff_pdf_path):
+        eff_image_paths.insert(0, eff_pdf_path)
+        eff_pdf_path = None
+
+    if eff_image_paths:
+        if not use_llm:
+            names = ", ".join(p.name for p in eff_image_paths[:3])
+            raise PDFError(
+                f"файлы изображений ({names}) не содержат текстового слоя. "
+                "Включите «ИИ-разбор (LLM)» и выберите Vision-модель "
+                "(например, hydra-gemini-pro, google/gemini-2.5-pro или openai/gpt-4.1)."
+            )
+        if progress:
+            progress(
+                f"Подготавливаю фото чертежей ({len(eff_image_paths)} файл., "
+                f"{'улучшение контраста 80-х вкл.' if do_enhance else 'без фильтра'})…"
+            )
+        img_urls, img_notes = render_image_files_base64(
+            eff_image_paths,
+            rotation_deg=rotation_deg,
+            enhance_scan=do_enhance,
+            output_format="jpeg",
+        )
+        image_data_urls.extend(img_urls)
+        warnings.extend(img_notes)
+        warnings.append(
+            f"Загружено фото/сканов чертежа для Vision LLM: {len(img_urls)} шт. "
+            f"({', '.join(p.name for p in eff_image_paths[:4])}"
+            f"{'…' if len(eff_image_paths) > 4 else ''})"
+        )
 
     pdf_text = ""
-    if pdf_path:
-        p_name = _Path(pdf_path).name
+    if eff_pdf_path is not None:
+        p_name = eff_pdf_path.name
         if progress:
             progress(f"Читаю PDF: {p_name}")
-        pdf_info = inspect_pdf(pdf_path)
-        if pdf_info["has_text"]:
+        pdf_info = inspect_pdf(eff_pdf_path)
+        # Если явно запрошен диапазон страниц или поворот на фото-PDF — идём через Vision
+        explicit_pages = pdf_pages is not None and str(pdf_pages).strip() != ""
+        has_rot = (
+            (isinstance(rotation_deg, (int, float)) and int(rotation_deg) % 360 != 0)
+            or (
+                not isinstance(rotation_deg, (int, float))
+                and any(int(r) % 360 != 0 for r in rotation_deg)
+            )
+        )
+        if pdf_info["has_text"] and not explicit_pages:
             pdf_text = str(pdf_info["text"])
-        if not pdf_info.get("has_legal_text", pdf_info["has_text"]):
+        if (
+            not pdf_info.get("has_legal_text", pdf_info["has_text"])
+            or explicit_pages
+            or (has_rot and pdf_info.get("has_raster_images"))
+        ):
             if use_llm:
                 dpi = int(cfg["api"].get("vision_dpi") or 220)
-                max_p = int(cfg["api"].get("vision_max_pages") or 4)
+                max_p = int(cfg["api"].get("vision_max_pages") or 8)
                 reason = (
                     "нет текстового слоя"
                     if not pdf_info["has_text"]
-                    else "чертёж Survey без текстового обхода румбов"
+                    else (
+                        f"выбраны страницы ({pdf_pages})"
+                        if explicit_pages
+                        else "чертёж Survey без текстового обхода румбов"
+                    )
                 )
                 if progress:
                     progress(
                         f"PDF «{p_name}» ({reason}) — рендерю страницы ({dpi} DPI) для Vision LLM…"
                     )
-                image_data_urls = render_pdf_pages_base64(
-                    pdf_path, dpi=dpi, max_pages=max_p
+                pdf_urls = render_pdf_pages_base64(
+                    eff_pdf_path,
+                    dpi=dpi,
+                    max_pages=max_p,
+                    pages=pdf_pages,
+                    rotation_deg=rotation_deg,
+                    enhance_scan=do_enhance,
+                    output_format="auto",
                 )
+                image_data_urls.extend(pdf_urls)
                 warnings.append(
                     f"PDF «{p_name}» ({reason}) — "
-                    f"распознан через Vision LLM ({len(image_data_urls)} стр.)"
+                    f"распознан через Vision LLM ({len(pdf_urls)} стр.)"
                 )
             elif not pdf_info["has_text"] and not (text and text.strip()):
                 raise PDFError(
@@ -3706,6 +4416,30 @@ def _prepare_parse_input(
                     "Включите «Использовать LLM» и выберите Vision-модель "
                     "(например, hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
                 )
+
+    # Опциональный ИИ-автоповорот перевёрнутых (90°/180°/270°) архивных фото/страниц
+    if use_llm and auto_orient and image_data_urls:
+        detected_rots, orient_usage = detect_visual_orientations_llm(
+            image_data_urls,
+            cfg,
+            provider=orient_provider,
+            model=orient_model,
+            api_key=orient_api_key,
+            key_secret=key_secret,
+            progress=progress,
+        )
+        rotated_labels: list[str] = []
+        for idx, deg_cw in enumerate(detected_rots):
+            if deg_cw in (90, 180, 270):
+                image_data_urls[idx] = _rotate_data_url_clockwise(
+                    image_data_urls[idx], deg_cw
+                )
+                rotated_labels.append(f"#{idx + 1} → +{deg_cw}°")
+        if rotated_labels:
+            warnings.append(
+                "🧭 Автоповорот ИИ выровнял перевёрнутые изображения перед чтением размеров: "
+                + ", ".join(rotated_labels)
+            )
 
     combined = "\n\n".join(part for part in (pdf_text, text or "") if part and part.strip())
     combined = _normalize_legal_text(combined).strip()
@@ -3717,7 +4451,7 @@ def _prepare_parse_input(
             f"текст длиннее {max_chars} символов — обрезан до {max_chars} для запроса"
         )
         combined = combined[:max_chars]
-    return combined, image_data_urls, warnings
+    return combined, image_data_urls, warnings, orient_usage
 
 
 def parse_legal_description_full(
@@ -3725,6 +4459,11 @@ def parse_legal_description_full(
     pdf_path: str | Path | None = None,
     cfg: dict[str, Any] | None = None,
     *,
+    image_paths: Sequence[str | Path] | None = None,
+    pdf_pages: str | Sequence[int] | None = None,
+    rotation_deg: int | Sequence[int] = 0,
+    enhance_scan: bool | None = None,
+    auto_orient: bool = False,
     use_llm: bool = True,
     provider: str | None = None,
     model: str | None = None,
@@ -3735,12 +4474,25 @@ def parse_legal_description_full(
     focus_instruction: str | None = None,
 ) -> ParseOutcome:
     """
-    Полный разбор: PDF (текстовый ИЛИ векторный/скан через Vision) / текст ->
+    Полный разбор: PDF / пачка фото чертежей (JPG/PNG/TIFF/WEBP) / текст ->
     LLM (или локальный парсер) -> LegalDescription.
     """
     cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
-    combined, image_data_urls, warnings = _prepare_parse_input(
-        text, pdf_path, cfg, use_llm=use_llm, progress=progress
+    combined, image_data_urls, warnings, orient_usage = _prepare_parse_input(
+        text,
+        pdf_path,
+        cfg,
+        use_llm=use_llm,
+        image_paths=image_paths,
+        pdf_pages=pdf_pages,
+        rotation_deg=rotation_deg,
+        enhance_scan=enhance_scan,
+        auto_orient=auto_orient,
+        orient_provider=provider,
+        orient_model=model,
+        orient_api_key=api_key,
+        key_secret=key_secret,
+        progress=progress,
     )
 
     llm_error: Exception | None = None
@@ -3757,6 +4509,16 @@ def parse_legal_description_full(
                 image_data_urls=image_data_urls or None,
                 focus_instruction=focus_instruction,
             )
+            if orient_usage is not None and usage is not None:
+                usage = TokenUsage(
+                    prompt_tokens=orient_usage.prompt_tokens + usage.prompt_tokens,
+                    completion_tokens=orient_usage.completion_tokens + usage.completion_tokens,
+                    total_tokens=orient_usage.total_tokens + usage.total_tokens,
+                    provider=usage.provider,
+                    provider_label=usage.provider_label,
+                    model=usage.model,
+                    available=usage.available or orient_usage.available,
+                )
             parsed_model, repair_notes = _repair_llm_geometry(
                 parsed_model,
                 from_vision=bool(image_data_urls),
@@ -4103,10 +4865,11 @@ def build_discrepancy_focus_prompt(consensus: ConsensusResult) -> str:
         "Closure error of each previous reading:\n"
         f"{closure_block}\n\n"
         "INSTRUCTIONS FOR THIS RE-CHECK:\n"
-        "1. Focus specifically on the disputed item(s) above in the original source text / survey image.\n"
+        "1. Focus specifically on the disputed item(s) above in the original source text / survey image "
+        "(first verify drawing orientation & North Arrow).\n"
         "2. Re-read every character and digit at the disputed spot with extreme care: verify quadrant "
-        "letters (N vs S, E vs W), degree/minute/second digits, and distance digits (watch for visually "
-        "similar glyphs: 3 vs 8, 8 vs 0, 1 vs 7, 5 vs 6, 0 vs 6, 0 vs 9).\n"
+        "letters (N vs S, E vs W), degree/minute/second digits, fractional inches (1/2\", 1/4\", 3/4\"), "
+        "and distance digits (watch for upside-down 6 vs 9 and faded 3 vs 8, 8 vs 0, 1 vs 7, 5 vs 6, 0 vs 6, 0 vs 9).\n"
         "3. Cross-check against opposite parallel sides, perpendicular 90° corners, and total polygon "
         "vector closure (∑ΔX = 0, ∑ΔY = 0).\n"
         "4. Do NOT average values — return the exact reading supported by the document and geometry, "
@@ -4193,6 +4956,11 @@ def run_multipass_consensus(
     pdf_path: str | Path | None = None,
     cfg: dict[str, Any] | None = None,
     *,
+    image_paths: Sequence[str | Path] | None = None,
+    pdf_pages: str | Sequence[int] | None = None,
+    rotation_deg: int | Sequence[int] = 0,
+    enhance_scan: bool | None = None,
+    auto_orient: bool = False,
     targets: Sequence[PassTarget] | None = None,
     passes: int | None = None,
     primary_provider: str | None = None,
@@ -4224,19 +4992,8 @@ def run_multipass_consensus(
     if not pass_targets:
         raise LLMParseError("не задано ни одного прохода LLM")
 
-    if prepared_input is not None:
-        combined, image_data_urls, base_warnings = (
-            prepared_input[0],
-            list(prepared_input[1]),
-            list(prepared_input[2]),
-        )
-    else:
-        combined, image_data_urls, base_warnings = _prepare_parse_input(
-            text, pdf_path, cfg_copy, use_llm=True, progress=progress
-        )
-
     # Предварительно проверяем наличие ключей для всех выбранных провайдеров,
-    # чтобы выдать понятную ошибку с номером прохода до старта потоков.
+    # чтобы выдать понятную ошибку с номером прохода до старта рендера и потоков.
     for pt in pass_targets:
         resolved = resolve_api_target(
             cfg_copy,
@@ -4252,6 +5009,32 @@ def run_multipass_consensus(
                 f"Проход #{pt.pass_index} ({p_lbl} / {resolved['model']}): "
                 f"не задан API-ключ для провайдера {p_lbl}{env_hint}"
             )
+
+    orient_usage: TokenUsage | None = None
+    if prepared_input is not None:
+        combined, image_data_urls, base_warnings = (
+            prepared_input[0],
+            list(prepared_input[1]),
+            list(prepared_input[2]),
+        )
+    else:
+        p1 = pass_targets[0]
+        combined, image_data_urls, base_warnings, orient_usage = _prepare_parse_input(
+            text,
+            pdf_path,
+            cfg_copy,
+            use_llm=True,
+            image_paths=image_paths,
+            pdf_pages=pdf_pages,
+            rotation_deg=rotation_deg,
+            enhance_scan=enhance_scan,
+            auto_orient=auto_orient,
+            orient_provider=p1.provider,
+            orient_model=p1.model,
+            orient_api_key=p1.api_key,
+            key_secret=key_secret,
+            progress=progress,
+        )
 
     n_passes = len(pass_targets)
     if progress:
@@ -4315,6 +5098,8 @@ def run_multipass_consensus(
     agreed, discrepancies = compare_legal_descriptions(ordered_outcomes)
 
     usage_items: list[TokenUsage | None] = [o.usage for o in ordered_outcomes]
+    if orient_usage is not None:
+        usage_items.insert(0, orient_usage)
     if prior_usage is not None:
         usage_items.insert(0, prior_usage)
     badge_summary = " + ".join(

@@ -75,6 +75,7 @@ from llm_parser import (
     ASPENWALL_SAMPLES,
     CONFIG_PATH,
     ENV_PATH,
+    IMAGE_EXTENSIONS,
     LOCAL_CONFIG_PATH,
     NYC_SAMPLES,
     PROVIDER_ORDER,
@@ -88,11 +89,14 @@ from llm_parser import (
     TokenUsage,
     clean_provider_key,
     inspect_pdf,
+    is_image_file,
     is_protected_key,
     load_config,
     load_dotenv_dict,
     parse_legal_description_full,
+    parse_page_range,
     parse_with_regex,
+    prepare_survey_image_bytes,
     protect_api_key,
     recheck_consensus_discrepancies,
     run_multipass_consensus,
@@ -102,7 +106,7 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1180x880"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Палитра Dark CAD Studio (высокий контраст, спокойные инженерные акценты)
 THEME: dict[str, str] = {
@@ -242,7 +246,21 @@ class SurveyApp(ctk.CTk):
 
         self.config_data: dict[str, Any] = load_config()
         self.pdf_path: Path | None = None
+        self.image_paths: list[Path] = []
         self._pdf_needs_vision: bool = False
+        self._pdf_total_pages: int = 0
+        self._visual_rotations: list[int] = []
+        self._visual_cursor: int = 0
+        self._tk_photo_ref: Any | None = None
+        self.pdf_pages_var = ctk.StringVar(value="")
+        self.enhance_scan_var = ctk.BooleanVar(
+            value=bool(self.config_data["api"].get("vision_enhance_scans", True))
+        )
+        self.auto_orient_var = ctk.BooleanVar(
+            value=bool(self.config_data["api"].get("vision_auto_orient", True))
+        )
+        self.preview_modes = ["📐 Схема CAD", "🖼 Исходник"]
+        self.preview_mode_var = ctk.StringVar(value=self.preview_modes[0])
         self.description: LegalDescription | None = None
         self.draw_result: DrawResult | None = None
         self.last_usage: TokenUsage | None = None
@@ -764,7 +782,7 @@ class SurveyApp(ctk.CTk):
         workspace.grid_columnconfigure(1, weight=42)
         workspace.grid_rowconfigure(0, weight=1)
 
-        # --- Левая колонка: 1. Исходное описание / PDF ----------------------
+        # --- Левая колонка: 1. Исходное описание / PDF / Фото чертежа -------
         input_frame = ctk.CTkFrame(
             workspace,
             fg_color=THEME["bg_card"],
@@ -774,14 +792,14 @@ class SurveyApp(ctk.CTk):
         )
         input_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         input_frame.grid_columnconfigure(0, weight=1)
-        input_frame.grid_rowconfigure(3, weight=1)
+        input_frame.grid_rowconfigure(4, weight=1)
 
         doc_header = ctk.CTkFrame(input_frame, fg_color="transparent")
         doc_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
         doc_header.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             doc_header,
-            text="1. Исходный документ (Deed / Schedule A / Survey PDF)",
+            text="1. Исходный документ (PDF / Фото чертежа JPG / Текст)",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=THEME["text_main"],
         ).grid(row=0, column=0, sticky="w")
@@ -795,18 +813,30 @@ class SurveyApp(ctk.CTk):
 
         toolbar = ctk.CTkFrame(input_frame, fg_color="transparent")
         toolbar.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 6))
-        toolbar.grid_columnconfigure(1, weight=1)
+        toolbar.grid_columnconfigure(2, weight=1)
 
         ctk.CTkButton(
             toolbar,
-            text="📄 Загрузить PDF…",
-            width=142,
+            text="📄 PDF…",
+            width=96,
             height=32,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._load_pdf,
         ).grid(row=0, column=0, sticky="w")
+
+        self.load_images_button = ctk.CTkButton(
+            toolbar,
+            text="📷 Фото (JPG)…",
+            width=126,
+            height=32,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._load_images,
+        )
+        self.load_images_button.grid(row=0, column=1, padx=(6, 0), sticky="w")
 
         self._sample_presets: dict[str, str] = {
             "Базовый пример (TX)": EXAMPLE_TEXT,
@@ -818,38 +848,152 @@ class SurveyApp(ctk.CTk):
             toolbar,
             values=list(self._sample_presets.keys()),
             variable=self.sample_var,
-            width=235,
+            width=215,
             height=32,
             fg_color=THEME["btn_secondary"],
             button_color=THEME["btn_secondary_hover"],
             button_hover_color=THEME["btn_primary"],
             command=self._on_sample_selected,
         )
-        self.sample_menu.grid(row=0, column=2, padx=(8, 0), sticky="e")
+        self.sample_menu.grid(row=0, column=3, padx=(8, 0), sticky="e")
 
         ctk.CTkButton(
             toolbar,
             text="Пример",
-            width=74,
+            width=68,
             height=32,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             border_width=1,
             border_color=THEME["border_card"],
             command=self._insert_example,
-        ).grid(row=0, column=3, padx=(6, 0), sticky="e")
+        ).grid(row=0, column=4, padx=(6, 0), sticky="e")
 
         ctk.CTkButton(
             toolbar,
             text="Очистить",
-            width=82,
+            width=76,
             height=32,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             border_width=1,
             border_color=THEME["border_card"],
             command=self._clear_text,
-        ).grid(row=0, column=4, padx=(6, 0), sticky="e")
+        ).grid(row=0, column=5, padx=(6, 0), sticky="e")
+
+        # Панель подготовки архивных фото 80-х и повёрнутых сканов (раскрывается автоматически)
+        self.visual_bar = ctk.CTkFrame(
+            input_frame,
+            fg_color=THEME["warn_bg"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["warn_border"],
+        )
+        self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.visual_bar.grid_columnconfigure(6, weight=1)
+
+        self.prev_visual_button = ctk.CTkButton(
+            self.visual_bar,
+            text="◀",
+            width=28,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            command=lambda: self.step_visual_frame(-1),
+        )
+        self.prev_visual_button.grid(row=0, column=0, padx=(8, 3), pady=5)
+
+        self.visual_pos_label = ctk.CTkLabel(
+            self.visual_bar,
+            text="Кадр 1/1 · 0°",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["warn"],
+        )
+        self.visual_pos_label.grid(row=0, column=1, padx=3, pady=5)
+
+        self.next_visual_button = ctk.CTkButton(
+            self.visual_bar,
+            text="▶",
+            width=28,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            command=lambda: self.step_visual_frame(1),
+        )
+        self.next_visual_button.grid(row=0, column=2, padx=(3, 8), pady=5)
+
+        self.rot_ccw_button = ctk.CTkButton(
+            self.visual_bar,
+            text="⟲ -90°",
+            width=58,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self.rotate_visual(-90),
+        )
+        self.rot_ccw_button.grid(row=0, column=3, padx=2, pady=5)
+
+        self.rot_cw_button = ctk.CTkButton(
+            self.visual_bar,
+            text="⟳ +90°",
+            width=58,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self.rotate_visual(90),
+        )
+        self.rot_cw_button.grid(row=0, column=4, padx=2, pady=5)
+
+        self.rot_180_button = ctk.CTkButton(
+            self.visual_bar,
+            text="⇅ 180°",
+            width=56,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self.rotate_visual(180),
+        )
+        self.rot_180_button.grid(row=0, column=5, padx=(2, 8), pady=5)
+
+        self.pdf_pages_box = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
+        self.pdf_pages_box.grid(row=0, column=6, sticky="w", padx=(0, 6), pady=5)
+        ctk.CTkLabel(
+            self.pdf_pages_box,
+            text="Стр.:",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_main"],
+        ).grid(row=0, column=0, padx=(0, 4))
+        self.pdf_pages_entry = ctk.CTkEntry(
+            self.pdf_pages_box,
+            textvariable=self.pdf_pages_var,
+            width=78,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            placeholder_text="1-8 / все",
+        )
+        self.pdf_pages_entry.grid(row=0, column=1)
+
+        self.enhance_scan_switch = ctk.CTkSwitch(
+            self.visual_bar,
+            text="Чёткость 80-х",
+            variable=self.enhance_scan_var,
+            font=ctk.CTkFont(size=11),
+            command=self._redraw_preview_canvas,
+        )
+        self.enhance_scan_switch.grid(row=0, column=7, padx=(4, 8), pady=5, sticky="e")
+
+        self.auto_orient_switch = ctk.CTkSwitch(
+            self.visual_bar,
+            text="🧭 Автоповорот ИИ",
+            variable=self.auto_orient_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.auto_orient_switch.grid(row=0, column=8, padx=(0, 10), pady=5, sticky="e")
+        self.visual_bar.grid_remove()
 
         # Плашка выбора роли участка на чертеже + пакет соседей
         role_bar = ctk.CTkFrame(
@@ -859,7 +1003,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        role_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        role_bar.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
         role_bar.grid_columnconfigure(2, weight=1)
 
         self.lot_role_var = ctk.StringVar(value="main")
@@ -904,10 +1048,10 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_main"],
             font=ctk.CTkFont(size=13),
         )
-        self.text_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.text_box.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.text_box.insert("1.0", "")
 
-        # --- Правая колонка: 2. Живой CAD-предпросмотр + ведомость сторон ---
+        # --- Правая колонка: 2. Живой CAD-предпросмотр / Исходник + ведомость ---
         preview_card = ctk.CTkFrame(
             workspace,
             fg_color=THEME["bg_card"],
@@ -925,21 +1069,31 @@ class SurveyApp(ctk.CTk):
         prev_header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             prev_header,
-            text="2. Схема участка от (0, 0) и ведомость сторон",
+            text="2. Предпросмотр и ведомость",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=THEME["text_main"],
         ).grid(row=0, column=0, sticky="w")
+        self.preview_mode_switch = ctk.CTkSegmentedButton(
+            prev_header,
+            values=self.preview_modes,
+            variable=self.preview_mode_var,
+            height=26,
+            selected_color=THEME["btn_primary"],
+            selected_hover_color=THEME["btn_primary_hover"],
+            command=self._on_preview_mode_changed,
+        )
+        self.preview_mode_switch.grid(row=0, column=1, padx=(6, 6), sticky="e")
         self.reset_scene_button = ctk.CTkButton(
             prev_header,
-            text="Сбросить схему",
-            width=114,
+            text="Сбросить",
+            width=82,
             height=26,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11),
             command=self._clear_preview_scene,
         )
-        self.reset_scene_button.grid(row=0, column=1, sticky="e")
+        self.reset_scene_button.grid(row=0, column=2, sticky="e")
 
         canvas_wrap = ctk.CTkFrame(
             preview_card,
@@ -1464,6 +1618,78 @@ class SurveyApp(ctk.CTk):
         self._set_inspector_text(hint)
         self._redraw_preview_canvas()
 
+    def _on_preview_mode_changed(self, _mode_label: str = "") -> None:
+        self._redraw_preview_canvas()
+
+    def _set_preview_mode(self, mode_label: str) -> None:
+        if mode_label in self.preview_modes:
+            self.preview_mode_var.set(mode_label)
+            self.preview_mode_switch.set(mode_label)
+            self._redraw_preview_canvas()
+
+    def _has_visual_source(self) -> bool:
+        return bool(self.image_paths) or bool(self.pdf_path and self._pdf_needs_vision)
+
+    def _visual_frame_count(self) -> int:
+        if self.image_paths:
+            return len(self.image_paths)
+        if self.pdf_path and self._pdf_needs_vision:
+            return max(1, int(self._pdf_total_pages or 1))
+        return 0
+
+    def _current_visual_rotation(self) -> int:
+        if not self._visual_rotations:
+            return 0
+        idx = max(0, min(self._visual_cursor, len(self._visual_rotations) - 1))
+        return int(self._visual_rotations[idx]) % 360
+
+    def rotate_visual(self, delta_clockwise_deg: int) -> None:
+        """Поворачивает текущий выбранный кадр (фото или страницу PDF) на ±90° / 180°."""
+        total = self._visual_frame_count()
+        if total <= 0:
+            return
+        while len(self._visual_rotations) < total:
+            self._visual_rotations.append(0)
+        idx = max(0, min(self._visual_cursor, total - 1))
+        self._visual_rotations[idx] = (
+            int(self._visual_rotations[idx]) + int(delta_clockwise_deg)
+        ) % 360
+        self._refresh_visual_bar()
+        self._set_preview_mode("🖼 Исходник")
+
+    def step_visual_frame(self, delta: int) -> None:
+        """Листает загруженные фотографии или страницы PDF в предпросмотре."""
+        total = self._visual_frame_count()
+        if total <= 1:
+            return
+        self._visual_cursor = (self._visual_cursor + int(delta)) % total
+        self._refresh_visual_bar()
+        self._set_preview_mode("🖼 Исходник")
+
+    def _refresh_visual_bar(self) -> None:
+        if not hasattr(self, "visual_bar"):
+            return
+        if not self._has_visual_source():
+            self.visual_bar.grid_remove()
+            return
+        total = self._visual_frame_count()
+        while len(self._visual_rotations) < total:
+            self._visual_rotations.append(0)
+        self._visual_cursor = max(0, min(self._visual_cursor, total - 1))
+        rot = self._current_visual_rotation()
+        kind = "Фото" if self.image_paths else "Стр."
+        self.visual_pos_label.configure(
+            text=f"{kind} {self._visual_cursor + 1}/{total} · +{rot}°"
+        )
+        nav_state = "normal" if total > 1 else "disabled"
+        self.prev_visual_button.configure(state=nav_state)
+        self.next_visual_button.configure(state=nav_state)
+        if self.pdf_path and not self.image_paths and total > 1:
+            self.pdf_pages_box.grid(row=0, column=6, sticky="w", padx=(0, 6), pady=5)
+        else:
+            self.pdf_pages_box.grid_remove()
+        self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
         self._preview_neighbor_plans.clear()
@@ -1485,6 +1711,8 @@ class SurveyApp(ctk.CTk):
         else:
             self._preview_main_plan = plan
 
+        self.preview_mode_var.set("📐 Схема CAD")
+        self.preview_mode_switch.set("📐 Схема CAD")
         self._set_inspector_text(self._build_inspector_report(plan, extra_warnings=warnings))
         self._redraw_preview_canvas()
 
@@ -1549,6 +1777,107 @@ class SurveyApp(ctk.CTk):
                 lines.append(f"  • {n_line}")
         return "\n".join(lines)
 
+    def _draw_source_visual_on_canvas(self, canvas: Any, w: int, h: int) -> None:
+        """Рендерит загруженное фото/страницу PDF в режиме «🖼 Исходник» с учётом EXIF, поворота и фильтра 80-х."""
+        if not self._has_visual_source():
+            canvas.create_text(
+                w / 2,
+                h / 2,
+                text="Исходное изображение не загружено.\nНажмите «📷 Фото (JPG)…» или «📄 PDF…»",
+                fill=THEME["text_dim"],
+                font=("Segoe UI", 10),
+                justify="center",
+            )
+            return
+
+        total = self._visual_frame_count()
+        idx = max(0, min(self._visual_cursor, total - 1))
+        rot_cw = self._current_visual_rotation()
+        do_enhance = bool(self.enhance_scan_var.get())
+
+        raw_source: Path | bytes | None = None
+        frame_title = ""
+        try:
+            if self.image_paths:
+                img_p = self.image_paths[idx]
+                raw_source = img_p
+                frame_title = f"ФОТО {idx + 1}/{total}: {img_p.name}"
+            elif self.pdf_path is not None:
+                try:
+                    import pymupdf as fitz
+                except ImportError:
+                    import fitz  # type: ignore[no-redef]
+                doc = fitz.open(self.pdf_path)
+                try:
+                    page_i = min(idx, max(0, len(doc) - 1))
+                    pix = doc.load_page(page_i).get_pixmap(dpi=130, alpha=False)
+                    raw_source = pix.tobytes("png")
+                    frame_title = f"PDF СТР. {page_i + 1}/{len(doc)}: {self.pdf_path.name}"
+                finally:
+                    doc.close()
+
+            if raw_source is None:
+                return
+
+            preview_max = max(240, min(w - 16, h - 32))
+            img_bytes, _mime, meta = prepare_survey_image_bytes(
+                raw_source,
+                rotation_deg=rot_cw,
+                max_side_px=preview_max,
+                enhance_scan=do_enhance,
+                output_format="png",
+            )
+            rendered_bitmap = False
+            create_img_fn = getattr(canvas, "create_image", None)
+            if callable(create_img_fn):
+                try:
+                    import io as _io
+                    from PIL import Image, ImageTk
+
+                    pil_im = Image.open(_io.BytesIO(img_bytes))
+                    tk_im = ImageTk.PhotoImage(pil_im)
+                    self._tk_photo_ref = tk_im
+                    create_img_fn(w / 2, h / 2 + 8, image=tk_im, anchor="center")
+                    rendered_bitmap = True
+                except Exception:  # noqa: BLE001
+                    rendered_bitmap = False
+
+            exif_tag = " · EXIF✓" if meta.get("exif_transposed") else ""
+            enh_tag = "80s+" if do_enhance else "RAW"
+            hud = (
+                f"{frame_title}  |  {meta['width']}×{meta['height']}  |  "
+                f"+{rot_cw}°{exif_tag}  |  {enh_tag}"
+            )
+            canvas.create_text(
+                8,
+                8,
+                text=hud,
+                anchor="nw",
+                fill=THEME["warn"],
+                font=("Consolas", 8, "bold"),
+            )
+            if not rendered_bitmap:
+                canvas.create_text(
+                    w / 2,
+                    h / 2 + 6,
+                    text=(
+                        f"{frame_title}\n"
+                        f"Размер превью: {meta['width']}×{meta['height']} px, поворот +{rot_cw}°"
+                    ),
+                    fill=THEME["text_main"],
+                    font=("Segoe UI", 10),
+                    justify="center",
+                )
+        except Exception as exc:  # noqa: BLE001
+            canvas.create_text(
+                w / 2,
+                h / 2,
+                text=f"Не удалось построить превью кадра:\n{exc}",
+                fill=THEME["err"],
+                font=("Segoe UI", 10),
+                justify="center",
+            )
+
     def _redraw_preview_canvas(self) -> None:
         canvas = self.preview_canvas
         if canvas is None:
@@ -1561,6 +1890,10 @@ class SurveyApp(ctk.CTk):
             return
         if w < 40 or h < 40:
             w, h = 420, 250
+
+        if str(self.preview_mode_var.get() or "") == "🖼 Исходник":
+            self._draw_source_visual_on_canvas(canvas, w, h)
+            return
 
         plans: list[DrawPlan] = []
         if self._preview_main_plan is not None:
@@ -1767,14 +2100,24 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    def _reset_visual_sources(self) -> None:
+        self.pdf_path = None
+        self.image_paths = []
+        self._pdf_needs_vision = False
+        self._pdf_total_pages = 0
+        self._visual_rotations = []
+        self._visual_cursor = 0
+        self._tk_photo_ref = None
+        self.pdf_pages_var.set("")
+        self._refresh_visual_bar()
+
     def _on_sample_selected(self, label: str) -> None:
         sample = self._sample_presets.get(label)
         if not sample:
             return
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", sample)
-        self.pdf_path = None
-        self._pdf_needs_vision = False
+        self._reset_visual_sources()
         if "Сосед" in label:
             self.lot_role_var.set("neighbor")
         elif "Основной" in label:
@@ -1792,8 +2135,7 @@ class SurveyApp(ctk.CTk):
         sample = self._sample_presets.get(selected, EXAMPLE_TEXT)
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", sample)
-        self.pdf_path = None
-        self._pdf_needs_vision = False
+        self._reset_visual_sources()
         self.pdf_label.configure(
             text=f"Пример: {selected or 'базовый'}",
             text_color=THEME["sky"],
@@ -1803,8 +2145,7 @@ class SurveyApp(ctk.CTk):
     def _clear_text(self) -> None:
         self._dismiss_conflict_ui()
         self.text_box.delete("1.0", "end")
-        self.pdf_path = None
-        self._pdf_needs_vision = False
+        self._reset_visual_sources()
         self.pdf_label.configure(
             text="PDF не загружен",
             text_color=THEME["text_muted"],
@@ -1812,32 +2153,100 @@ class SurveyApp(ctk.CTk):
         self.description = None
         self.draw_result = None
         self._last_active_plan = None
+        self.preview_mode_var.set("📐 Схема CAD")
+        self.preview_mode_switch.set("📐 Схема CAD")
         self._update_closure_badge("Closure Error: —", None)
         self.tokens_var.set("Токены за вызов: —")
-        self._set_status("Поле описания очищено.")
+        self._set_status("Поле описания и визуальные файлы очищены.")
         self._render_empty_inspector()
+
+    def _apply_loaded_images(self, paths: list[Path]) -> None:
+        """Активирует набор загруженных фотографий (.jpg/.png/.tif/.webp/.bmp) для Vision LLM."""
+        if not paths:
+            return
+        self._reset_visual_sources()
+        self.text_box.delete("1.0", "end")
+        self.image_paths = list(paths)
+        self._visual_rotations = [0] * len(paths)
+        self._visual_cursor = 0
+        self.use_llm_var.set(True)
+        self._refresh_consensus_rows()
+        self._refresh_visual_bar()
+
+        if len(paths) == 1:
+            badge = f"Фото Vision: {paths[0].name}"
+        else:
+            badge = f"Фото Vision: {len(paths)} файл. ({paths[0].name} + ещё {len(paths) - 1})"
+        self.pdf_label.configure(text=badge, text_color=THEME["warn"])
+        self._set_preview_mode("🖼 Исходник")
+        self._set_status(
+            f"Загружено фото чертежа ({len(paths)} шт.) — включён режим Vision LLM "
+            "(автоисправление EXIF, фильтр чёткости 80-х и 🧭 Автоповорот ИИ готовы). "
+            "При необходимости поверните кадры кнопками ⟲/⟳/180°."
+        )
+
+    def _load_images(self) -> None:
+        """Выбор одной или нескольких фотографий старого чертежа (.jpg/.png/.tif/.webp/.bmp)."""
+        from tkinter import filedialog
+
+        ext_glob = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
+        selected = filedialog.askopenfilenames(
+            title="Выберите одну или несколько фотографий чертежа (JPG / PNG / TIFF / WEBP)",
+            filetypes=[
+                ("Фотографии и сканы чертежей", ext_glob),
+                ("PDF и изображения", f"*.pdf {ext_glob}"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        chosen = [Path(p) for p in selected if str(p).strip()]
+        if not chosen:
+            return
+        img_only = [p for p in chosen if is_image_file(p)]
+        if img_only:
+            self._apply_loaded_images(img_only)
+            return
+        if chosen[0].suffix.lower() == ".pdf":
+            self._open_single_pdf(chosen[0])
 
     def _load_pdf(self) -> None:
         from tkinter import filedialog
 
+        ext_glob = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
         path = filedialog.askopenfilename(
-            title="Выберите PDF с Legal Description или чертёж Survey",
-            filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
+            title="Выберите PDF или фото с Legal Description / чертежом Survey",
+            filetypes=[
+                ("PDF и фото чертежей", f"*.pdf {ext_glob}"),
+                ("PDF", "*.pdf"),
+                ("Фотографии", ext_glob),
+                ("Все файлы", "*.*"),
+            ],
         )
         if not path:
             return
+        chosen = Path(path)
+        if is_image_file(chosen):
+            self._apply_loaded_images([chosen])
+            return
+        self._open_single_pdf(chosen)
+
+    def _open_single_pdf(self, chosen: Path) -> None:
         try:
-            info = inspect_pdf(path)
+            info = inspect_pdf(chosen)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Не удалось прочитать PDF: {exc}", error=True)
             return
-        self.pdf_path = Path(path)
+        self._reset_visual_sources()
+        self.pdf_path = chosen
+        self._pdf_total_pages = int(info.get("pages") or 1)
         has_legal_text = bool(info.get("has_legal_text", info["has_text"]))
         if has_legal_text:
             text = str(info["text"])
             self._pdf_needs_vision = False
             self.text_box.delete("1.0", "end")
             self.text_box.insert("1.0", text)
+            self._refresh_visual_bar()
             self.pdf_label.configure(
                 text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)",
                 text_color=THEME["ok"],
@@ -1846,18 +2255,29 @@ class SurveyApp(ctk.CTk):
         else:
             self.text_box.delete("1.0", "end")
             self._pdf_needs_vision = True
+            self._visual_rotations = [0] * max(1, self._pdf_total_pages)
             self.use_llm_var.set(True)
             self._refresh_consensus_rows()
-            tag_detail = "чертёж Survey" if info["has_text"] else "без текста"
+            self._refresh_visual_bar()
+            has_photos = bool(info.get("has_raster_images"))
+            tag_detail = (
+                "фото/скан"
+                if has_photos
+                else ("чертёж Survey" if info["has_text"] else "без текста")
+            )
             self.pdf_label.configure(
                 text=f"PDF Vision: {self.pdf_path.name} ({info['pages']} стр., {tag_detail})",
                 text_color=THEME["warn"],
             )
+            self._set_preview_mode("🖼 Исходник")
+            pages_hint = (
+                " Для выбора отдельных листов укажите диапазон в поле «Стр.:» (напр. 1-4 или все)."
+                if int(info["pages"]) > 1
+                else ""
+            )
             self._set_status(
-                f"Загружен чертёж/скан PDF ({self.pdf_path.name}, "
-                f"{info['pages']} стр.) — включён режим Vision LLM. "
-                "Выберите мультимодальную модель (hydra-gemini-pro, "
-                "nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+                f"Загружен чертёж/фото-PDF ({self.pdf_path.name}, "
+                f"{info['pages']} стр., {tag_detail}) — включён режим Vision LLM.{pages_hint}"
             )
 
     def _build_runtime_config(self) -> tuple[dict[str, Any], str, str, str | None, str]:
@@ -1888,6 +2308,8 @@ class SurveyApp(ctk.CTk):
         active_p_cfg = providers.get(active_pid, {})
         cfg["api"]["provider"] = active_pid
         cfg["api"]["model"] = active_model
+        cfg["api"]["vision_enhance_scans"] = bool(self.enhance_scan_var.get())
+        cfg["api"]["vision_auto_orient"] = bool(self.auto_orient_var.get())
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
@@ -2137,16 +2559,18 @@ class SurveyApp(ctk.CTk):
         self._set_controls_busy(False)
 
     def _load_and_draw_neighbor_files(self) -> None:
-        """Пакетная загрузка нескольких PDF/TXT соседних участков и дорисовка в AutoCAD от (0, 0)."""
+        """Пакетная загрузка нескольких PDF / JPG / TXT соседних участков и дорисовка в AutoCAD от (0, 0)."""
         if self._busy:
             return
         from tkinter import filedialog
 
+        ext_glob = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
         paths = filedialog.askopenfilenames(
-            title="Выберите файлы соседних участков (PDF или TXT) для слоя NEIGHBOR_LOT",
+            title="Выберите файлы соседних участков (PDF, фото JPG/PNG/TIFF или TXT) для слоя NEIGHBOR_LOT",
             filetypes=[
-                ("PDF и текстовые описания", "*.pdf *.txt"),
+                ("PDF, фото чертежей и описания", f"*.pdf {ext_glob} *.txt"),
                 ("PDF", "*.pdf"),
+                ("Фотографии чертежей", ext_glob),
                 ("Текст", "*.txt"),
                 ("Все файлы", "*.*"),
             ],
@@ -2159,6 +2583,10 @@ class SurveyApp(ctk.CTk):
 
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
+        if any(is_image_file(p) for p in file_list) and not use_llm:
+            use_llm = True
+            self.use_llm_var.set(True)
+            self._refresh_consensus_rows()
         scale = self._current_scale()
         provider_title = self._pid_to_label.get(provider_id, provider_id)
 
@@ -2203,16 +2631,34 @@ class SurveyApp(ctk.CTk):
         errors: list[str] = []
         builder = AcadBuilder(cfg)
         total = len(file_list)
+        do_enhance = bool(cfg.get("api", {}).get("vision_enhance_scans", True))
+        do_auto_orient = bool(cfg.get("api", {}).get("vision_auto_orient", True))
         for idx, fpath in enumerate(file_list, start=1):
             try:
                 self._post(
                     "progress",
                     f"[{idx}/{total}] Разбираю соседний участок: {fpath.name}…",
                 )
-                if fpath.suffix.lower() == ".pdf":
+                if is_image_file(fpath):
+                    outcome = parse_legal_description_full(
+                        image_paths=[fpath],
+                        cfg=cfg,
+                        enhance_scan=do_enhance,
+                        auto_orient=do_auto_orient,
+                        use_llm=True,
+                        provider=provider_id,
+                        model=model_name,
+                        api_key=api_key,
+                        key_secret=key_secret,
+                        allow_regex_fallback=False,
+                        progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
+                    )
+                elif fpath.suffix.lower() == ".pdf":
                     outcome = parse_legal_description_full(
                         pdf_path=fpath,
                         cfg=cfg,
+                        enhance_scan=do_enhance,
+                        auto_orient=do_auto_orient,
                         use_llm=use_llm,
                         provider=provider_id,
                         model=model_name,
@@ -2234,7 +2680,7 @@ class SurveyApp(ctk.CTk):
                         allow_regex_fallback=False,
                         progress=lambda msg, i=idx: self._post("progress", f"[{i}/{total}] {msg}"),
                     )
-                if use_llm:
+                if use_llm or is_image_file(fpath):
                     self._last_valid_secret = key_secret
 
                 if sys.platform != "win32":
@@ -2259,8 +2705,11 @@ class SurveyApp(ctk.CTk):
         if self._busy:
             return
         text = self.text_box.get("1.0", "end").strip()
-        if not text and not self.pdf_path:
-            self._set_status("Вставьте текст Legal Description или загрузите PDF.", error=True)
+        if not text and not self.pdf_path and not self.image_paths:
+            self._set_status(
+                "Вставьте текст Legal Description или загрузите PDF / фото чертежа.",
+                error=True,
+            )
             return
 
         self._dismiss_conflict_ui()
@@ -2270,6 +2719,38 @@ class SurveyApp(ctk.CTk):
         scale = self._current_scale()
         is_neighbor = bool(force_neighbor or self.is_neighbor_mode())
         provider_title = self._pid_to_label.get(provider_id, provider_id)
+
+        vision_images = list(self.image_paths)
+        pdf_pages_spec = str(self.pdf_pages_var.get() or "").strip() or None
+        vision_pdf = (
+            self.pdf_path
+            if (self.pdf_path and (self._pdf_needs_vision or pdf_pages_spec))
+            else None
+        )
+        do_enhance = bool(self.enhance_scan_var.get())
+        do_auto_orient = bool(self.auto_orient_var.get()) and bool(
+            vision_images or vision_pdf
+        )
+
+        # Сопоставляем ручные углы поворота выбранным фото или страницам PDF
+        rotations: list[int] = list(self._visual_rotations)
+        if vision_pdf and not vision_images and self._pdf_total_pages > 0:
+            try:
+                max_p = int(cfg["api"].get("vision_max_pages") or 8)
+                sel_indices = parse_page_range(
+                    pdf_pages_spec, self._pdf_total_pages, max_pages=max_p
+                )
+                rotations = [
+                    (
+                        self._visual_rotations[i]
+                        if 0 <= i < len(self._visual_rotations)
+                        else 0
+                    )
+                    for i in sel_indices
+                ]
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(str(exc), error=True)
+                return
 
         self._busy = True
         self._set_controls_busy(True)
@@ -2294,12 +2775,16 @@ class SurveyApp(ctk.CTk):
             f"--- Новый запуск ({role_note}, масштаб 1\"={scale:g}', режим={mode_desc}) ---"
         )
 
-        vision_pdf = self.pdf_path if self._pdf_needs_vision else None
         worker = threading.Thread(
             target=self._worker,
             args=(
                 text,
                 vision_pdf,
+                vision_images,
+                pdf_pages_spec,
+                rotations or 0,
+                do_enhance,
+                do_auto_orient,
                 cfg,
                 provider_id,
                 model_name,
@@ -2318,6 +2803,11 @@ class SurveyApp(ctk.CTk):
         self,
         text: str,
         vision_pdf: Path | None,
+        vision_images: list[Path],
+        pdf_pages_spec: str | None,
+        rotation_spec: int | list[int],
+        do_enhance: bool,
+        do_auto_orient: bool,
         cfg: dict[str, Any],
         provider_id: str,
         model_name: str,
@@ -2338,6 +2828,11 @@ class SurveyApp(ctk.CTk):
                 consensus = run_multipass_consensus(
                     text=text,
                     pdf_path=vision_pdf,
+                    image_paths=vision_images or None,
+                    pdf_pages=pdf_pages_spec,
+                    rotation_deg=rotation_spec,
+                    enhance_scan=do_enhance,
+                    auto_orient=do_auto_orient,
                     cfg=cfg,
                     passes=passes_count,
                     primary_provider=provider_id,
@@ -2370,6 +2865,11 @@ class SurveyApp(ctk.CTk):
                 outcome = parse_legal_description_full(
                     text=text,
                     pdf_path=vision_pdf,
+                    image_paths=vision_images or None,
+                    pdf_pages=pdf_pages_spec,
+                    rotation_deg=rotation_spec,
+                    enhance_scan=do_enhance,
+                    auto_orient=do_auto_orient,
                     cfg=cfg,
                     use_llm=use_llm,
                     provider=provider_id,
@@ -2420,11 +2920,11 @@ class SurveyApp(ctk.CTk):
             self._post("done", None)
         except LLMParseError as exc:
             message = str(exc)
-            if vision_pdf is not None:
+            if vision_pdf is not None or vision_images:
                 message += (
                     "\n\nПодсказка: проверьте API-ключ выбранного провайдера и убедитесь, "
-                    "что выбрана мультимодальная Vision-модель (hydra-gemini-pro, "
-                    "nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+                    "что выбрана сильная мультимодальная Vision-модель (hydra-gemini-3-pro, "
+                    "google/gemini-2.5-pro, openai/gpt-4.1 или nvidia/nemotron-3.5-super-vl:free)."
                 )
             elif use_llm:
                 message += (

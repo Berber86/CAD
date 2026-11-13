@@ -879,6 +879,56 @@ class Segment(BaseModel):
         description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _preprocess_segment_raw(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        item = dict(data)
+
+        # Нормализация кардинальных сокращений от LLM (напр. ns="E", degrees=0 -> N 90° E)
+        raw_ns = str(item.get("ns") or "").strip().upper()[:1]
+        raw_ew = str(item.get("ew") or "").strip().upper()[:1]
+        deg_f = _coerce_float(item.get("degrees"))
+        min_f = _coerce_float(item.get("minutes"))
+        sec_f = _coerce_float(item.get("seconds"))
+        if raw_ns in {"E", "W"} and (deg_f is None or abs(deg_f) < 1e-9):
+            item["ns"] = "N"
+            item["ew"] = raw_ns
+            deg_f = 90.0
+            item["degrees"] = 90
+        elif raw_ns in {"N", "S"} and raw_ew in {"N", "S"} and (deg_f is None or abs(deg_f) < 1e-9):
+            item["ew"] = "E"
+
+        # Раскладываем дробные градусы/минуты (напр. degrees=75.5 -> 75°30'00")
+        if deg_f is not None:
+            m_val = min_f if min_f is not None else 0.0
+            s_val = sec_f if sec_f is not None else 0.0
+            deg_frac = abs(deg_f) - int(abs(deg_f))
+            if deg_frac > 1e-7 and abs(m_val) < 1e-9 and abs(s_val) < 1e-9:
+                sign_d = -1 if deg_f < 0 else 1
+                whole_d = int(abs(deg_f))
+                rem_m = (abs(deg_f) - whole_d) * 60.0
+                whole_m = int(rem_m + 1e-9)
+                rem_s = max(0.0, (rem_m - whole_m) * 60.0)
+                deg_f = float(sign_d * whole_d)
+                m_val = float(whole_m)
+                s_val = round(rem_s, 2)
+            else:
+                min_frac = abs(m_val) - int(abs(m_val))
+                if min_frac > 1e-7 and abs(s_val) < 1e-9:
+                    whole_m = int(abs(m_val))
+                    rem_s = (abs(m_val) - whole_m) * 60.0
+                    m_val = float(-whole_m if m_val < 0 else whole_m)
+                    s_val = round(rem_s, 2)
+
+            if deg_f >= 0 and m_val >= 0 and s_val >= 0:
+                c_deg, c_min, c_sec = _carry_dms(int(round(deg_f)), int(round(m_val)), s_val)
+                item["degrees"] = c_deg
+                item["minutes"] = c_min
+                item["seconds"] = c_sec
+        return item
+
     @field_validator("ns", "ew", mode="before")
     @classmethod
     def _normalize_quadrant(cls, value: Any) -> str:
@@ -933,8 +983,8 @@ class Segment(BaseModel):
     @model_validator(mode="after")
     def _finalize(self) -> "Segment":
         d, m, s = _carry_dms(self.degrees, self.minutes, self.seconds)
-        if d > 90:
-            raise ValueError("градусы румба не могут превышать 90")
+        if d > 90 or (d == 90 and (m > 0 or s > 0)):
+            raise ValueError("угол румба не может превышать 90°00'00\"")
         self.degrees, self.minutes, self.seconds = d, m, s
         self.bearing_label = bearing_label(self.ns, d, m, s, self.ew)
         return self
@@ -1176,9 +1226,12 @@ def inspect_pdf(pdf_path: str | Path, max_pages: int = 0) -> dict[str, Any]:
         doc.close()
 
     joined = "\n".join(chunks)
+    has_text = len(joined.strip()) >= 20
+    has_legal_text = bool(has_text and _has_min_courses(_normalize_legal_text(joined)))
     return {
         "pages": total_pages,
-        "has_text": len(joined.strip()) >= 20,
+        "has_text": has_text,
+        "has_legal_text": has_legal_text,
         "text": joined,
     }
 
@@ -1206,19 +1259,28 @@ def render_pdf_pages_base64(
     *,
     dpi: int = 220,
     max_pages: int = 4,
+    max_side_px: int = 3200,
 ) -> list[str]:
     """
     Рендерит страницы PDF в PNG и возвращает список ``data:image/png;base64,...``
     для отправки векторных CAD-чертежей (Title Survey) и сканов в Vision LLM.
+    Для крупноформатных листов (ARCH C/D/E: 18"×24", 24"×36", 36"×48") адаптивно
+    ограничивает DPI по ``max_side_px``, исключая переполнение памяти и HTTP 413.
     """
     doc, _ = _open_fitz_doc(pdf_path)
     safe_dpi = max(96, min(int(dpi or 220), 350))
+    safe_max_px = max(1200, int(max_side_px or 3200))
     limit = len(doc) if not max_pages or max_pages <= 0 else min(int(max_pages), len(doc))
     urls: list[str] = []
     try:
         for index in range(limit):
             page = doc.load_page(index)
-            pix = page.get_pixmap(dpi=safe_dpi, alpha=False)
+            rect = page.rect
+            max_inches = max(float(rect.width), float(rect.height)) / 72.0
+            effective_dpi = safe_dpi
+            if max_inches > 0:
+                effective_dpi = min(safe_dpi, max(72, int(safe_max_px / max_inches)))
+            pix = page.get_pixmap(dpi=effective_dpi, alpha=False)
             png_bytes = pix.tobytes("png")
             encoded = base64.b64encode(png_bytes).decode("ascii")
             urls.append(f"data:image/png;base64,{encoded}")
@@ -1418,8 +1480,19 @@ def _call_with_temperature(func: Callable[..., Any], **kwargs: Any) -> Any:
         raise
 
 
+def _unwrap_llm_payload(obj: Any) -> Any:
+    """Снимает лишнюю обёртку вроде ``[{"main_street": ...}]`` или ``{"result": {...}}``."""
+    if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], dict):
+        obj = obj[0]
+    if isinstance(obj, dict) and "segments" not in obj:
+        for val in obj.values():
+            if isinstance(val, dict) and "segments" in val:
+                return val
+    return obj
+
+
 def _json_from_text(raw: str) -> Any:
-    """Достаёт JSON-объект из ответа модели (снимает <think> и ```json-обёртки)."""
+    """Достаёт JSON-объект из ответа модели (снимает <think>, ```json и фигурные скобки в прозе)."""
     text = raw.strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     if "</think>" in text.lower():
@@ -1429,11 +1502,22 @@ def _json_from_text(raw: str) -> Any:
     if fence:
         text = fence.group(1).strip()
     try:
-        return json.loads(text)
+        return _unwrap_llm_payload(json.loads(text))
     except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text, idx)
+                unwrapped = _unwrap_llm_payload(parsed)
+                if isinstance(unwrapped, dict):
+                    return unwrapped
+            except json.JSONDecodeError:
+                continue
         start, end = text.find("{"), text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start : end + 1])
+            return _unwrap_llm_payload(json.loads(text[start : end + 1]))
         raise
 
 
@@ -1958,22 +2042,62 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
     # участка направлен противоположно замыкающему курсу (+180°).
     closing_az = parsed_clauses[-1]["nominal_az"]
     baseline_ray = (closing_az + 180.0) % 360.0
+    street_azimuths: dict[str, float] = {}
+    closing_along = re.search(
+        r"\balong\s+(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?(?P<st>[^,;:(]+)",
+        parsed_clauses[-1]["clause"],
+        re.IGNORECASE,
+    )
+    if closing_along:
+        st_name = (_street_from_block(closing_along.group("st")) or "").lower()
+        if st_name:
+            street_azimuths[st_name] = baseline_ray
 
     segments: list[dict[str, Any]] = []
     prev_az: float | None = None
     for idx, item in enumerate(parsed_clauses):
         nom = item["nominal_az"]
+        clause_str = item["clause"]
+        ref_street_az: float | None = None
+        rel_target = re.search(
+            r"\b(?:parallel\s+with|at\s+right\s+angles\s+to|perpendicular\s+to)\s+"
+            r"(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?(?P<st>[^,;:(]+)",
+            clause_str,
+            re.IGNORECASE,
+        )
+        if rel_target:
+            target_name = (_street_from_block(rel_target.group("st")) or "").lower()
+            if target_name and target_name in street_azimuths:
+                ref_street_az = street_azimuths[target_name]
+
         if item["ia_deg"] is not None:
             ref_ray = baseline_ray if idx == 0 or prev_az is None else (prev_az + 180.0) % 360.0
             cand_a = (ref_ray + item["ia_deg"]) % 360.0
             cand_b = (ref_ray - item["ia_deg"]) % 360.0
             az = cand_a if _angle_diff_deg(cand_a, nom) <= _angle_diff_deg(cand_b, nom) else cand_b
-        elif item["right_angle"] and prev_az is not None:
-            cand_a = (baseline_ray + 90.0) % 360.0
-            cand_b = (baseline_ray - 90.0) % 360.0
+        elif item["right_angle"]:
+            base_ref = ref_street_az if ref_street_az is not None else baseline_ray
+            candidates_ra = [(base_ref + 90.0) % 360.0, (base_ref - 90.0) % 360.0]
+            if ref_street_az is None and prev_az is not None:
+                candidates_ra.extend([(prev_az + 90.0) % 360.0, (prev_az - 90.0) % 360.0])
+            az = min(candidates_ra, key=lambda c: _angle_diff_deg(c, nom))
+        elif ref_street_az is not None:
+            cand_a = ref_street_az % 360.0
+            cand_b = (ref_street_az + 180.0) % 360.0
             az = cand_a if _angle_diff_deg(cand_a, nom) <= _angle_diff_deg(cand_b, nom) else cand_b
         else:
             az = nom
+
+        along_match = re.search(
+            r"\balong\s+(?:the\s+(?:[A-Za-z]+\s+){0,2}?side\s+of\s+)?(?P<st>[^,;:(]+)",
+            clause_str,
+            re.IGNORECASE,
+        )
+        if along_match:
+            along_name = (_street_from_block(along_match.group("st")) or "").lower()
+            if along_name:
+                street_azimuths[along_name] = az
+
         prev_az = az
         seg = _azimuth_to_quadrant_dict(az)
         seg["distance_ft"] = item["distance_ft"]
@@ -2713,26 +2837,32 @@ def parse_legal_description_full(
         pdf_info = inspect_pdf(pdf_path)
         if pdf_info["has_text"]:
             pdf_text = str(pdf_info["text"])
-        elif use_llm:
-            dpi = int(cfg["api"].get("vision_dpi") or 220)
-            max_p = int(cfg["api"].get("vision_max_pages") or 4)
-            if progress:
-                progress(
-                    f"В PDF «{p_name}» нет текстового слоя — рендерю страницы ({dpi} DPI) для Vision LLM…"
+        if not pdf_info.get("has_legal_text", pdf_info["has_text"]):
+            if use_llm:
+                dpi = int(cfg["api"].get("vision_dpi") or 220)
+                max_p = int(cfg["api"].get("vision_max_pages") or 4)
+                reason = (
+                    "нет текстового слоя"
+                    if not pdf_info["has_text"]
+                    else "чертёж Survey без текстового обхода румбов"
                 )
-            image_data_urls = render_pdf_pages_base64(
-                pdf_path, dpi=dpi, max_pages=max_p
-            )
-            warnings.append(
-                f"PDF «{p_name}» без текстового слоя (векторный CAD/скан) — "
-                f"распознан через Vision LLM ({len(image_data_urls)} стр.)"
-            )
-        elif not (text and text.strip()):
-            raise PDFError(
-                f"в PDF «{p_name}» нет текстового слоя (векторный чертёж AutoCAD или скан). "
-                "Включите «Использовать LLM» и выберите Vision-модель "
-                "(например, hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
-            )
+                if progress:
+                    progress(
+                        f"PDF «{p_name}» ({reason}) — рендерю страницы ({dpi} DPI) для Vision LLM…"
+                    )
+                image_data_urls = render_pdf_pages_base64(
+                    pdf_path, dpi=dpi, max_pages=max_p
+                )
+                warnings.append(
+                    f"PDF «{p_name}» ({reason}) — "
+                    f"распознан через Vision LLM ({len(image_data_urls)} стр.)"
+                )
+            elif not pdf_info["has_text"] and not (text and text.strip()):
+                raise PDFError(
+                    f"в PDF «{p_name}» нет текстового слоя (векторный чертёж AutoCAD или скан). "
+                    "Включите «Использовать LLM» и выберите Vision-модель "
+                    "(например, hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+                )
 
     combined = "\n\n".join(part for part in (pdf_text, text or "") if part and part.strip())
     combined = _normalize_legal_text(combined).strip()

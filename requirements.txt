@@ -4,7 +4,7 @@
 openai>=1.50,<3          # Structured Outputs (client.beta.chat.completions.parse)
 pydantic>=2.7,<3         # строгая схема ответа LLM
 customtkinter>=5.2       # GUI
-pywin32>=306             # win32com.client / pythoncom (только Windows)
+pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (только Windows)
 pymupdf>=1.24            # извлечение текста из PDF
 # dev
 pytest>=8.0

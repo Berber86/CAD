@@ -68,6 +68,7 @@ from llm_parser import (
     PROVIDER_ORDER,
     PROVIDERS_CATALOG,
     KeyProtectionError,
+    LLMParseError,
     LegalDescription,
     LegalDescriptionError,
     ParseOutcome,
@@ -665,7 +666,10 @@ class SurveyApp(ctk.CTk):
         self.text_box.insert("1.0", sample)
         self.pdf_path = None
         self._pdf_needs_vision = False
-        self.pdf_label.configure(text=f"Пример: {label}")
+        self.pdf_label.configure(
+            text=f"Пример: {label}",
+            text_color=("#8fa3b8", "#8fa3b8"),
+        )
         self._set_status(f"Подставлен пример: {label}")
 
     def _insert_example(self) -> None:
@@ -675,13 +679,19 @@ class SurveyApp(ctk.CTk):
         self.text_box.insert("1.0", sample)
         self.pdf_path = None
         self._pdf_needs_vision = False
-        self.pdf_label.configure(text="Пример из буфера (PDF не загружен)")
+        self.pdf_label.configure(
+            text="Пример из буфера (PDF не загружен)",
+            text_color=("#8fa3b8", "#8fa3b8"),
+        )
 
     def _clear_text(self) -> None:
         self.text_box.delete("1.0", "end")
         self.pdf_path = None
         self._pdf_needs_vision = False
-        self.pdf_label.configure(text="PDF не загружен")
+        self.pdf_label.configure(
+            text="PDF не загружен",
+            text_color=("#8fa3b8", "#8fa3b8"),
+        )
         self.description = None
         self.draw_result = None
         self.closure_var.set("Closure Error: —")
@@ -703,24 +713,30 @@ class SurveyApp(ctk.CTk):
             self._set_status(f"Не удалось прочитать PDF: {exc}", error=True)
             return
         self.pdf_path = Path(path)
-        if info["has_text"]:
+        has_legal_text = bool(info.get("has_legal_text", info["has_text"]))
+        if has_legal_text:
             text = str(info["text"])
             self._pdf_needs_vision = False
             self.text_box.delete("1.0", "end")
             self.text_box.insert("1.0", text)
             self.pdf_label.configure(
-                text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)"
+                text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)",
+                text_color=("#8fa3b8", "#8fa3b8"),
             )
             self._set_status(f"PDF загружен: {self.pdf_path.name}")
         else:
+            # Обязательно очищаем поле текста от предыдущего примера/документа,
+            # чтобы чужое описание не примешивалось к Vision-запросу нового PDF.
+            self.text_box.delete("1.0", "end")
             self._pdf_needs_vision = True
             self.use_llm_var.set(True)
+            tag_detail = "чертёж Survey" if info["has_text"] else "без текста"
             self.pdf_label.configure(
-                text=f"PDF Vision: {self.pdf_path.name} ({info['pages']} стр., без текста)",
+                text=f"PDF Vision: {self.pdf_path.name} ({info['pages']} стр., {tag_detail})",
                 text_color=("#f5b041", "#f5b041"),
             )
             self._set_status(
-                f"Загружен векторный/скан PDF без текстового слоя ({self.pdf_path.name}, "
+                f"Загружен чертёж/скан PDF ({self.pdf_path.name}, "
                 f"{info['pages']} стр.) — включён режим Vision LLM. "
                 "Выберите мультимодальную модель (hydra-gemini-pro, "
                 "nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
@@ -1001,15 +1017,24 @@ class SurveyApp(ctk.CTk):
         except KeyProtectionError as exc:
             self._post("error", str(exc))
             self._post("done", None)
-        except (LegalDescriptionError, AcadBuilderError) as exc:
+        except LLMParseError as exc:
             message = str(exc)
-            if use_llm:
+            if vision_pdf is not None:
+                message += (
+                    "\n\nПодсказка: проверьте API-ключ выбранного провайдера и убедитесь, "
+                    "что выбрана мультимодальная Vision-модель (hydra-gemini-pro, "
+                    "nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
+                )
+            elif use_llm:
                 message += (
                     "\n\nПодсказка: проверьте API-ключ выбранного провайдера "
                     "или переключите провайдера/модель, либо выключите «Использовать LLM» "
                     "для локального разбора (regex)."
                 )
             self._post("error", message)
+            self._post("done", None)
+        except (LegalDescriptionError, AcadBuilderError) as exc:
+            self._post("error", str(exc))
             self._post("done", None)
         except Exception as exc:  # noqa: BLE001
             detail = traceback.format_exc(limit=6)

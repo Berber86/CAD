@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -209,6 +210,31 @@ def point_in_polygon(
     return inside
 
 
+def _polygon_self_intersects(points: Sequence[tuple[float, float]]) -> bool:
+    """Проверяет пересечение несмежных рёбер замкнутого контура (восьмёрка/бант)."""
+    def ccw_turn(
+        p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]
+    ) -> float:
+        return (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+
+    n = len(points)
+    if n < 4:
+        return False
+    for i in range(n):
+        a1, a2 = points[i], points[(i + 1) % n]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            b1, b2 = points[j], points[(j + 1) % n]
+            d1 = ccw_turn(a1, a2, b1)
+            d2 = ccw_turn(a1, a2, b2)
+            d3 = ccw_turn(b1, b2, a1)
+            d4 = ccw_turn(b1, b2, a2)
+            if (d1 * d2 < -1e-6) and (d3 * d4 < -1e-6):
+                return True
+    return False
+
+
 def polyline_length(
     points: Sequence[tuple[float, float]], closed: bool = True
 ) -> float:
@@ -333,9 +359,9 @@ def text_rotation(line_angle_rad: float) -> float:
 def estimate_text_width(text: str, text_height: float, cfg: dict[str, Any]) -> float:
     """
     Оценка ширины DBTEXT в единицах чертежа (для растяжки и проверок).
-    Учитывает, что управляющий код ``%%d`` в AutoCAD рендерится одним символом ``°``.
+    Учитывает, что управляющий код ``%%d`` / ``%%D`` в AutoCAD рендерится одним символом ``°``.
     """
-    display = text.replace("%%d", "°").replace("%%p", "±").replace("%%c", "Ø")
+    display = re.sub(r"%%[dpc]", "°", str(text), flags=re.IGNORECASE)
     char_factor = float(cfg.get("char_width_factor", 0.62))
     space_factor = float(cfg.get("space_width_factor", 0.45))
     width = 0.0
@@ -603,7 +629,7 @@ class DrawResult:
 # ---------------------------------------------------------------------------
 
 
-def _co_initialize() -> None:
+def _co_initialize() -> bool:
     try:
         import pythoncom
     except ImportError as exc:  # pragma: no cover - Windows only
@@ -612,7 +638,17 @@ def _co_initialize() -> None:
         ) from exc
     try:
         pythoncom.CoInitialize()
+        return True
     except Exception:  # noqa: BLE001 - уже инициализирован в этом потоке
+        return False
+
+
+def _co_uninitialize() -> None:
+    try:
+        import pythoncom
+
+        pythoncom.CoUninitialize()
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -691,6 +727,8 @@ class AcadBuilder:
         self.cfg = cfg if cfg is not None else load_config()
         self._app: Any | None = None
         self._doc: Any | None = None
+        self._com_thread_id: int | None = None
+        self._com_owned: bool = False
         self._unit_warning: str | None = None
         self._unit_code: int | None = None
         self._front_warning: str | None = None
@@ -803,6 +841,13 @@ class AcadBuilder:
         count = len(points)
         curr = points[vertex_index % count]
         _, bis_angle, _, _, _ = self._vertex_interior_angle_info(vertex_index, points)
+        for factor in (1.0, 0.72, 0.5, 0.32, 0.16):
+            cand = (
+                curr[0] + math.cos(bis_angle) * (step * factor),
+                curr[1] + math.sin(bis_angle) * (step * factor),
+            )
+            if point_in_polygon(cand, points):
+                return cand
         return (
             curr[0] + math.cos(bis_angle) * step,
             curr[1] + math.sin(bis_angle) * step,
@@ -958,6 +1003,14 @@ class AcadBuilder:
                 curr[0] + math.cos(bis_angle) * text_step,
                 curr[1] + math.sin(bis_angle) * text_step,
             )
+            for factor in (1.0, 0.75, 0.55, 0.38, 0.22):
+                cand = (
+                    curr[0] + math.cos(bis_angle) * (text_step * factor),
+                    curr[1] + math.sin(bis_angle) * (text_step * factor),
+                )
+                if point_in_polygon(cand, points):
+                    ia_point = cand
+                    break
             items.append(
                 TextItem(
                     text=ia_text,
@@ -1405,7 +1458,17 @@ class AcadBuilder:
                 "невязка больше 5 ft — проверьте румбы и длины в исходном описании"
             )
 
-        ccw = polygon_signed_area(vertices) > 0.0
+        signed_area = polygon_signed_area(vertices)
+        if abs(signed_area) < 0.5:
+            warnings.append(
+                "площадь контура близка к нулю — проверьте направления и длины сторон"
+            )
+        elif _polygon_self_intersects(vertices):
+            warnings.append(
+                "контур самопересекается — проверьте порядок обхода и знаки румбов"
+            )
+
+        ccw = signed_area > 0.0
         self._front_warning = None
         front_index = self._front_side_index(description, vertices, ccw)
         items, arcs, side_band_extra = self._side_items(
@@ -1444,16 +1507,24 @@ class AcadBuilder:
 
         Если приложение/документ были внедрены снаружи (тесты, повторная
         отрисовка), соединение переиспользуется, а проверка единиц чертежа
-        всё равно выполняется.
+        всё равно выполняется. При вызове из другого потока COM-прокси
+        переподключается в текущем потоке, чтобы избежать RPC_E_WRONG_THREAD.
         """
+        cur_tid = threading.get_ident()
         if self._app is not None and self._doc is not None:
-            if self._unit_warning is None:
-                self._warn_about_units(self._doc)
-            return self._app, self._doc
-        _co_initialize()
+            if not self._com_owned or self._com_thread_id == cur_tid:
+                if self._unit_warning is None:
+                    self._warn_about_units(self._doc)
+                return self._app, self._doc
+            self._app = None
+            self._doc = None
+
+        co_inited = _co_initialize()
         try:
             import win32com.client
         except ImportError as exc:  # pragma: no cover
+            if co_inited:
+                _co_uninitialize()
             raise AcadConnectionError(
                 "pywin32 не установлен. В Windows выполните: pip install pywin32"
             ) from exc
@@ -1461,6 +1532,8 @@ class AcadBuilder:
         try:
             app = win32com.client.GetActiveObject(ACAD_PROGID)
         except Exception as exc:  # noqa: BLE001
+            if co_inited:
+                _co_uninitialize()
             raise AcadConnectionError(
                 "Не удалось подключиться к запущенному AutoCAD.\n"
                 "1) Откройте AutoCAD и нужный DWG (не стартовый экран);\n"
@@ -1471,14 +1544,20 @@ class AcadBuilder:
         try:
             doc = app.ActiveDocument
         except Exception as exc:  # noqa: BLE001
+            if co_inited:
+                _co_uninitialize()
             raise AcadConnectionError(
                 "AutoCAD запущен, но активный документ недоступен — откройте DWG."
             ) from exc
         if doc is None:
+            if co_inited:
+                _co_uninitialize()
             raise AcadConnectionError(
                 "AutoCAD запущен, но активный документ недоступен — откройте DWG."
             )
         self._app, self._doc = app, doc
+        self._com_thread_id = cur_tid
+        self._com_owned = bool(co_inited)
         self._warn_about_units(doc)
         return app, doc
 
@@ -1499,17 +1578,19 @@ class AcadBuilder:
 
     # -- слои и стиль -------------------------------------------------------
     def _ensure_layer(self, doc: Any, name: str, color: int) -> str:
-        def layer_names() -> list[str]:
-            return [str(layer.Name) for layer in doc.Layers]
-
-        if name not in layer_names():
+        layer = None
+        try:
+            layer = doc.Layers.Item(name)
+        except Exception:  # noqa: BLE001
             try:
-                _com_retry(doc.Layers.Add, name)
-            except AcadDrawError:
-                pass  # слой мог быть создан параллельно
-        if name not in layer_names():
+                layer = _com_retry(doc.Layers.Add, name)
+            except Exception:  # noqa: BLE001
+                try:
+                    layer = doc.Layers.Item(name)
+                except Exception:  # noqa: BLE001
+                    return "0"
+        if layer is None:
             return "0"
-        layer = doc.Layers.Item(name)
         try:
             layer.LayerOn = True
             layer.Freeze = False
@@ -1523,12 +1604,27 @@ class AcadBuilder:
         style_name = str(self.drawing_cfg.get("text_style") or "AI_BOUNDARY")
         try:
             styles = doc.TextStyles
-            if style_name not in [str(style.Name) for style in styles]:
-                styles.Add(style_name)
             try:
-                # Romans — стандартный чертёжный шрифт для подписей линий.
-                styles.Item(style_name).SetFont("romans.shx", "", 0.0, 1.0, 0.0)
-            except Exception:  # noqa: BLE001 - шрифта может не быть в системе
+                style_obj = styles.Item(style_name)
+            except Exception:  # noqa: BLE001
+                style_obj = _com_retry(styles.Add, style_name)
+            # В AutoCAD ActiveX SHX-шрифт задаётся свойством fontFile (SetFont — только для TrueType).
+            try:
+                style_obj.fontFile = "romans.shx"
+                try:
+                    style_obj.BigFontFile = ""
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                try:
+                    style_obj.SetFont("romans.shx", False, False, 0, 0)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                # Сбрасываем фиксированную высоту стиля в 0.0, чтобы работала высота из AddText.
+                style_obj.Height = 0.0
+                style_obj.Width = 1.0
+            except Exception:  # noqa: BLE001
                 pass
             return style_name
         except Exception:  # noqa: BLE001
@@ -1609,98 +1705,117 @@ class AcadBuilder:
         colors = self.cfg.get("layer_colors", {})
 
         app, doc = self.connect()
-        # Предупреждение о единицах чертежа появляется именно при подключении.
-        if self._unit_warning:
-            warnings.append(self._unit_warning)
         try:
-            model_space = doc.ModelSpace
-        except Exception as exc:  # noqa: BLE001
-            raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
+            # Предупреждение о единицах чертежа появляется именно при подключении.
+            if self._unit_warning:
+                warnings.append(self._unit_warning)
 
-        line_layer = self._ensure_layer(
-            doc, line_layer_name, int(colors.get("property_line", 1))
-        )
-        text_layer = self._ensure_layer(
-            doc, text_layer_name, int(colors.get("boundary_text", 3))
-        )
-        street_row_layer = text_layer
-        if plan.lines:
-            street_row_layer = self._ensure_layer(
-                doc, street_row_layer_name, int(colors.get("street_row", 8))
-            )
-        if line_layer == "0":
-            warnings.append(f"слой {line_layer_name} недоступен — линия нарисована в слое 0")
-        if text_layer == "0":
-            warnings.append(f"слой {text_layer_name} недоступен — текст нарисован в слое 0")
-        style = self._ensure_text_style(doc)
-
-        if plan.lines and hasattr(model_space, "AddLine"):
-            for row_line in plan.lines:
-                try:
-                    self._add_line(model_space, row_line, street_row_layer)
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
-
-        polyline = self._add_polyline(model_space, plan.vertices, line_layer)
-
-        if plan.arcs and hasattr(model_space, "AddArc"):
-            for arc_item in plan.arcs:
-                try:
-                    self._add_arc(model_space, arc_item, text_layer)
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(f"не удалось создать дугу угла ({arc_item.kind}): {exc}")
-
-        created = 0
-        for item in plan.items:
+            # Если в AutoCAD открыта вкладка листа (PaperSpace, ActiveSpace == 0),
+            # переключаемся в ModelSpace (1), чтобы ZoomExtents показал нарисованный контур.
             try:
-                self._add_text(
-                    model_space, item, plan.text_height, text_layer, style
+                if getattr(doc, "ActiveSpace", 1) == 0 and not getattr(doc, "MSpace", False):
+                    doc.ActiveSpace = 1
+            except Exception:  # noqa: BLE001
+                warnings.append(
+                    "активен лист PaperSpace — переключитесь на вкладку Model в AutoCAD"
                 )
-                created += 1
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"не удалось создать текст «{item.text}»: {exc}")
 
-        if drawing.get("zoom_extents", True):
-            zoomed = False
             try:
-                _com_retry(app.ZoomExtents)
-                zoomed = True
-            except Exception:  # noqa: BLE001 - зум не критичен
+                model_space = doc.ModelSpace
+            except Exception as exc:  # noqa: BLE001
+                raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
+
+            line_layer = self._ensure_layer(
+                doc, line_layer_name, int(colors.get("property_line", 1))
+            )
+            text_layer = self._ensure_layer(
+                doc, text_layer_name, int(colors.get("boundary_text", 3))
+            )
+            street_row_layer = text_layer
+            if plan.lines:
+                street_row_layer = self._ensure_layer(
+                    doc, street_row_layer_name, int(colors.get("street_row", 8))
+                )
+            if line_layer == "0":
+                warnings.append(f"слой {line_layer_name} недоступен — линия нарисована в слое 0")
+            if text_layer == "0":
+                warnings.append(f"слой {text_layer_name} недоступен — текст нарисован в слое 0")
+            style = self._ensure_text_style(doc)
+
+            if plan.lines and hasattr(model_space, "AddLine"):
+                for row_line in plan.lines:
+                    try:
+                        self._add_line(model_space, row_line, street_row_layer)
+                    except Exception as exc:  # noqa: BLE001
+                        warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
+
+            polyline = self._add_polyline(model_space, plan.vertices, line_layer)
+
+            if plan.arcs and hasattr(model_space, "AddArc"):
+                for arc_item in plan.arcs:
+                    try:
+                        self._add_arc(model_space, arc_item, text_layer)
+                    except Exception as exc:  # noqa: BLE001
+                        warnings.append(f"не удалось создать дугу угла ({arc_item.kind}): {exc}")
+
+            created = 0
+            for item in plan.items:
                 try:
-                    doc.SendCommand("_.ZOOM\n_E\n")
+                    self._add_text(
+                        model_space, item, plan.text_height, text_layer, style
+                    )
+                    created += 1
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"не удалось создать текст «{item.text}»: {exc}")
+
+            if drawing.get("zoom_extents", True):
+                zoomed = False
+                try:
+                    _com_retry(app.ZoomExtents)
                     zoomed = True
-                except Exception:  # noqa: BLE001
-                    warnings.append("не удалось выполнить Zoom Extents")
+                except Exception:  # noqa: BLE001 - зум не критичен
+                    try:
+                        doc.SendCommand("_.ZOOM\n_E\n")
+                        zoomed = True
+                    except Exception:  # noqa: BLE001
+                        warnings.append("не удалось выполнить Zoom Extents")
 
-            # Отступ вокруг чертежа (acZoomScaledRelative = 1), чтобы нижняя
-            # плавающая командная строка и ViewCube в AutoCAD не перекрывали подписи.
-            margin_scale = float(drawing.get("zoom_margin_scale", 0.84) or 1.0)
-            if zoomed and 0.1 < margin_scale < 0.999 and hasattr(app, "ZoomScaled"):
-                try:
-                    _com_retry(app.ZoomScaled, margin_scale, 1)
-                except Exception:  # noqa: BLE001
-                    pass
+                # Отступ вокруг чертежа (acZoomScaledRelative = 1), чтобы нижняя
+                # плавающая командная строка и ViewCube в AutoCAD не перекрывали подписи.
+                margin_scale = float(drawing.get("zoom_margin_scale", 0.84) or 1.0)
+                if zoomed and 0.1 < margin_scale < 0.999 and hasattr(app, "ZoomScaled"):
+                    try:
+                        _com_retry(app.ZoomScaled, margin_scale, 1)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-        handle: str | None = None
-        try:
-            handle = str(polyline.Handle)
-        except Exception:  # noqa: BLE001
-            pass
+            handle: str | None = None
+            try:
+                handle = str(polyline.Handle)
+            except Exception:  # noqa: BLE001
+                pass
 
-        result_layers = {
-            "property_line": line_layer,
-            "boundary_text": text_layer,
-        }
-        if plan.lines:
-            result_layers["street_row"] = street_row_layer
+            result_layers = {
+                "property_line": line_layer,
+                "boundary_text": text_layer,
+            }
+            if plan.lines:
+                result_layers["street_row"] = street_row_layer
 
-        return DrawResult(
-            plan=plan,
-            text_count=created,
-            layers=result_layers,
-            handle=handle,
-            warnings=warnings,
-        )
+            return DrawResult(
+                plan=plan,
+                text_count=created,
+                layers=result_layers,
+                handle=handle,
+                warnings=warnings,
+            )
+        finally:
+            if self._com_owned:
+                self._app = None
+                self._doc = None
+                self._com_owned = False
+                self._com_thread_id = None
+                _co_uninitialize()
 
 
 def draw_legal_description(

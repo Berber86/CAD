@@ -395,6 +395,8 @@ def test_gui_nyc_presets_and_vision_pdf_flow(gui, tmp_path, monkeypatch):
     assert app._pdf_needs_vision is True
     assert app.use_llm_var.get() is True
     assert "PDF Vision:" in app.pdf_label.cget("text")
+    # Старый текст примера очищен, чтобы не загрязнять Vision-запрос другого участка
+    assert app.text_box.get("1.0", "end").strip() == ""
 
     vision_outcome = ParseOutcome(
         data=desc,

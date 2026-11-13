@@ -1297,3 +1297,162 @@ def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
     assert untouched.segments[0].distance_ft == 130.0
 
 
+def test_segment_decimal_degrees_carry_cardinal_and_strict_90_bound():
+    """
+    Ревизия валидатора Segment:
+      * дробные градусы (75.5 -> 75°30') и минуты (20.5 -> 20'30") не теряют точность;
+      * перенос minutes=60 / 59.999" не падает на Field(le=59);
+      * кардинальная запись LLM ns='E', degrees=0 приводится к N 90°00' E;
+      * невозможный квадрантный румб > 90°00'00" (напр. N 90°30' E) отклоняется.
+    """
+    s_dec = Segment(ns="N", degrees=75.5, minutes=0, seconds=0, ew="E", distance_ft=100.0)
+    assert (s_dec.degrees, s_dec.minutes, s_dec.seconds) == (75, 30, 0.0)
+
+    s_min = Segment(ns="S", degrees=12, minutes=20.5, seconds=0, ew="W", distance_ft=50.0)
+    assert (s_min.degrees, s_min.minutes, s_min.seconds) == (12, 20, 30.0)
+
+    s_carry = Segment(ns="N", degrees=14, minutes=59, seconds=59.999, ew="E", distance_ft=40.0)
+    assert (s_carry.degrees, s_carry.minutes, s_carry.seconds) == (15, 0, 0.0)
+
+    s_card = Segment(ns="E", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=25.0)
+    assert s_card.bearing_label == "N 90°00' E"
+
+    with pytest.raises(Exception):
+        Segment(ns="N", degrees=90, minutes=30, seconds=0, ew="E", distance_ft=100.0)
+
+
+def test_json_from_text_handles_prose_braces_and_wrapper_objects():
+    from llm_parser import _json_from_text
+
+    raw = (
+        "Step {1}: inspect boundary calls.\n"
+        '{"result": {"main_street": "Main St", "segments": [{"ns": "N", "degrees": 0, '
+        '"minutes": 0, "seconds": 0, "ew": "E", "distance_ft": 10}]}}'
+    )
+    parsed = _json_from_text(raw)
+    assert parsed["main_street"] == "Main St"
+    assert len(parsed["segments"]) == 1
+
+
+def test_large_sheet_arch_d_pdf_clamps_vision_dpi_and_hybrid_titleblock_uses_vision(
+    tmp_path, monkeypatch
+):
+    """
+    1) Лист ARCH D (24"x36" = 1728x2592 pt) адаптивно ограничивает разрешение <= 3200 px;
+    2) Гибридный CAD-PDF со штампом TrueType (has_text=True, has_legal_text=False)
+       отправляется в Vision LLM вместе с отрендеренным чертежом, а не падает на штампе.
+    """
+    import base64
+    pymupdf = pytest.importorskip("pymupdf")
+    import openai
+    from llm_parser import inspect_pdf, parse_legal_description_full, render_pdf_pages_base64
+
+    arch_d = tmp_path / "arch_d_survey.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=1728, height=2592)  # 24" x 36"
+    page.insert_text(
+        (72, 72),
+        "ARCHITECTURAL SURVEY CERTIFIED TO TITLE COMPANY SCALE 1 INCH = 16 FEET",
+        fontsize=12,
+    )
+    shape = page.new_shape()
+    shape.draw_rect(pymupdf.Rect(300, 400, 900, 1800))
+    shape.finish(color=(0, 0, 0), width=2.0)
+    shape.commit()
+    doc.save(arch_d)
+    doc.close()
+
+    info = inspect_pdf(arch_d)
+    assert info["has_text"] is True
+    assert info["has_legal_text"] is False
+
+    urls = render_pdf_pages_base64(arch_d, dpi=220)
+    png_raw = base64.b64decode(urls[0].split(",", 1)[1])
+    pix = pymupdf.Pixmap(png_raw)
+    assert max(pix.width, pix.height) <= 3250
+
+    class HybridVisionOpenAI:
+        def __init__(self, **kwargs):
+            class _Completions:
+                def create(_self, **ckwargs):
+                    return type(
+                        "Resp",
+                        (),
+                        {
+                            "choices": [
+                                type(
+                                    "Choice",
+                                    (),
+                                    {"message": type("Msg", (), {"content": json.dumps(_LLM_PAYLOAD)})()},
+                                )()
+                            ],
+                            "usage": {"prompt_tokens": 900, "completion_tokens": 180, "total_tokens": 1080},
+                        },
+                    )()
+
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+            self.beta = None
+
+    monkeypatch.setattr(openai, "OpenAI", HybridVisionOpenAI)
+    outcome = parse_legal_description_full(
+        pdf_path=arch_d,
+        use_llm=True,
+        provider="hydra",
+        model="hydra-gemini-pro",
+        api_key="hk-hybrid",
+        cfg=load_config(),
+    )
+    assert outcome.source == "llm-vision"
+
+
+def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monkeypatch):
+    """
+    1) Косой параллелограмм в Queens с «parallel with 63rd Street» замыкается в < 0.01 ft;
+    2) AcadBuilder.draw выставляет fontFile='romans.shx', Height=0.0 и переключает
+       PaperSpace (ActiveSpace=0) в ModelSpace (ActiveSpace=1);
+    3) Самопересекающийся контур («восьмёрка») выдаёт явное предупреждение в plan().
+    """
+    import acad_builder as module
+
+    skewed_text = (
+        "BEGINNING at the corner formed by the intersection of the northerly side of "
+        "Borden Avenue with the easterly side of 63rd Street;\n"
+        "RUNNING THENCE northerly along the easterly side of 63rd Street, 90.17 feet, "
+        "forming an interior angle of 93°33'29.5\" with the northerly side of Borden Avenue;\n"
+        "THENCE easterly parallel with Borden Avenue, 25.00 feet;\n"
+        "THENCE southerly parallel with 63rd Street, 90.17 feet;\n"
+        "THENCE westerly along the northerly side of Borden Avenue, 25.00 feet "
+        "to the point or place of BEGINNING."
+    )
+    desc, _ = parse_with_regex(skewed_text)
+    builder = AcadBuilder(load_config())
+    plan = builder.plan(desc, scale=16.0)
+    assert plan.closure.distance < 0.01
+
+    monkeypatch.setattr(module, "_co_initialize", lambda: False)
+    monkeypatch.setattr(module, "_variant_points", lambda points: [c for p in points for c in p])
+    monkeypatch.setattr(module, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
+
+    app = FakeApp()
+    app.doc.ActiveSpace = 0  # имитация открытого листа Layout / PaperSpace
+    builder._app, builder._doc = app, app.doc
+    builder.draw(desc, scale=16.0)
+    assert app.doc.ActiveSpace == 1
+    style = app.doc.TextStyles.Item("AI_BOUNDARY")
+    assert getattr(style, "fontFile", None) == "romans.shx"
+    assert getattr(style, "Height", None) == 0.0
+
+    bowtie = LegalDescription(
+        main_street="Bowtie Rd",
+        segments=[
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=50.0),
+            Segment(ns="S", degrees=45, minutes=0, seconds=0, ew="E", distance_ft=70.71),
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=50.0),
+            Segment(ns="S", degrees=45, minutes=0, seconds=0, ew="W", distance_ft=70.71),
+        ],
+    )
+    bowtie_plan = builder.plan(bowtie, scale=16.0)
+    assert any("самопересекается" in w or "площадь" in w for w in bowtie_plan.warnings)
+
+
+

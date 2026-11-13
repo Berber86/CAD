@@ -1,13 +1,19 @@
 @echo off
-rem Запуск прототипа на Windows: py -3.11 run.bat
+rem Запуск прототипа на Windows (Python 3.11+)
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
 
-where py >nul 2>nul
-if errorlevel 1 (
-    set "PY=python"
-) else (
+py -3.11 -V >nul 2>nul
+if not errorlevel 1 (
     set "PY=py -3.11"
+) else (
+    py -3 -V >nul 2>nul
+    if not errorlevel 1 (
+        set "PY=py -3"
+    ) else (
+        set "PY=python"
+    )
 )
 
 if not exist ".venv\Scripts\python.exe" (

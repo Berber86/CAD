@@ -1,0 +1,118 @@
+{
+  "api": {
+    "provider": "hydra",
+    "api_key": "",
+    "base_url": "https://api.hydraai.ru/v1",
+    "model": "glm-5.2",
+    "temperature": 0.0,
+    "timeout_sec": 180,
+    "max_retries": 2,
+    "max_input_chars": 60000,
+    "vision_dpi": 220,
+    "vision_max_pages": 8,
+    "vision_enhance_scans": true,
+    "vision_auto_orient": false,
+    "ask_on_doubt": true,
+    "providers": {
+      "hydra": {
+        "label": "Hydra AI",
+        "base_url": "https://api.hydraai.ru/v1",
+        "api_key": "",
+        "env_key": "HYDRA_API_KEY",
+        "default_model": "glm-5.2",
+        "selected_model": "glm-5.2",
+        "models": [
+          "glm-5.2",
+          "hydra-gemini-pro",
+          "hydra-gemini-3-pro",
+          "hydra-gemini"
+        ]
+      },
+      "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "env_key": "OPENROUTER_API_KEY",
+        "default_model": "nvidia/nemotron-3.5-super-vl:free",
+        "selected_model": "nvidia/nemotron-3.5-super-vl:free",
+        "models": [
+          "nvidia/nemotron-3.5-super-vl:free",
+          "nvidia/nemotron-3-super-120b-a12b:free",
+          "nvidia/nemotron-3-nano-30b-a3b:free",
+          "stepfun/step-3.5-flash:free",
+          "z-ai/glm-4.5-air:free",
+          "arcee-ai/trinity-large-preview:free",
+          "mistralai/devstral-2512:free"
+        ]
+      },
+      "routerai": {
+        "label": "RouterAI",
+        "base_url": "https://routerai.ru/api/v1",
+        "api_key": "",
+        "env_key": "ROUTERAI_API_KEY",
+        "default_model": "openai/gpt-4.1",
+        "selected_model": "openai/gpt-4.1",
+        "models": [
+          "openai/gpt-4.1",
+          "openai/gpt-4.1-mini",
+          "openai/gpt-4o",
+          "openai/gpt-4o-mini",
+          "google/gemini-2.5-pro",
+          "google/gemini-2.5-flash",
+          "anthropic/claude-sonnet-4.5",
+          "deepseek/deepseek-chat"
+        ]
+      }
+    },
+    "consensus": {
+      "passes": 1,
+      "pass2_provider": "openrouter",
+      "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
+      "pass3_provider": "routerai",
+      "pass3_model": "openai/gpt-4.1"
+    }
+  },
+  "drawing": {
+    "base_scale": 16.0,
+    "base_text_height": 0.9,
+    "available_scales": [
+      10.0,
+      16.0,
+      20.0,
+      30.0
+    ],
+    "text_offset_factor": 1.8,
+    "street_offset_factor": 6.5,
+    "street_height_factor": 1.9,
+    "corner_label_gap_factor": 2.4,
+    "corner_distance_offset_factor": 1.9,
+    "long_side_threshold_ft": 40.0,
+    "stack_short_side_ft": 30.0,
+    "stacked_line_gap_factor": 1.9,
+    "char_width_factor": 0.7,
+    "space_width_factor": 0.75,
+    "max_label_fill_ratio": 0.72,
+    "max_stretch_spaces": 65,
+    "front_side_index": 0,
+    "degrees_as_control_code": true,
+    "text_style": "AI_BOUNDARY",
+    "draw_street_extensions": true,
+    "property_as_lines": true,
+    "leave_gap_open": true,
+    "rounding_gap_tolerance_ft": 0.015,
+    "zoom_extents": true,
+    "zoom_margin_scale": 0.84
+  },
+  "layers": {
+    "property_line": "PROPERTY_LINE",
+    "boundary_text": "BOUNDARY_TEXT_AI",
+    "street_row": "STREET_ROW_AI",
+    "neighbor_lot": "NEIGHBOR_LOT"
+  },
+  "layer_colors": {
+    "property_line": 1,
+    "boundary_text": 3,
+    "street_row": 8,
+    "neighbor_lot": 4
+  }
+}

@@ -141,6 +141,17 @@ class _Widget:
     def winfo_children(self):
         return []
 
+    def bind_all(self, event_name, callback):
+        if not hasattr(self, "_global_bindings"):
+            self._global_bindings = {}
+        self._global_bindings[event_name] = callback
+
+    def clipboard_clear(self):
+        self._clipboard = ""
+
+    def clipboard_append(self, text):
+        self._clipboard = str(getattr(self, "_clipboard", "") or "") + str(text)
+
 
 class _FakeCanvas(_Widget):
     """Заглушка tkinter.Canvas для тестирования живого CAD-предпросмотра."""
@@ -1273,10 +1284,104 @@ def test_gui_ask_on_doubt_checkbox_prevents_silent_54_to_56_and_supports_focus_r
     app._on_close()
 
 
+def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
+    gui, tmp_path, monkeypatch
+):
+    """v1.0 Studio UI: зум/панорама/наведение на холсте, масштабная линейка, буфер обмена и хоткеи."""
+    import time
+    from PIL import Image
 
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setattr(
+        gui,
+        "load_config",
+        lambda path=cfg_path: __import__("llm_parser").load_config(path),
+    )
+    monkeypatch.setattr(
+        gui,
+        "save_config",
+        lambda data, path=cfg_path: __import__("llm_parser").save_config(data, path),
+    )
 
+    app = gui.SurveyApp()
+    assert gui.VERSION == "1.0.0"
+    assert gui.APP_GEOMETRY == "1280x900"
+    assert "<Control-Return>" in app._global_bindings
+    assert "<F5>" in app._global_bindings
+    assert "<Control-o>" in app._global_bindings
+    assert "<Control-i>" in app._global_bindings
+    assert "<Control-s>" in app._global_bindings
 
+    # 1. Выбираем встроенный участок Aspenwall -> строится CAD-схема с сеткой и масштабной линейкой
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    assert app._last_world_transform is not None
+    canvas_texts = [item[2].get("text", "") for item in app.preview_canvas.items if item[0] == "text"]
+    assert any(t.endswith(" ft") for t in canvas_texts)
 
+    # 2. Зум колесом мыши и перетаскивание ЛКМ
+    ev_wheel = types.SimpleNamespace(delta=120, x=230, y=140)
+    app.preview_canvas._bindings["<MouseWheel>"](ev_wheel)
+    app.preview_canvas._bindings["<MouseWheel>"](ev_wheel)
+    assert app._canvas_zoom > 1.4
+    assert "×" in app.zoom_reset_button.cget("text")
 
+    app.preview_canvas._bindings["<ButtonPress-1>"](types.SimpleNamespace(x=100, y=100))
+    app.preview_canvas._bindings["<B1-Motion>"](types.SimpleNamespace(x=135, y=120))
+    app.preview_canvas._bindings["<ButtonRelease-1>"](types.SimpleNamespace(x=135, y=120))
+    assert app._canvas_pan_x != 0.0
+    assert app._canvas_pan_y != 0.0
 
+    # 3. Наведение курсора точно на середину стороны #1 -> живые координаты XY и подсветка стороны #1
+    cx_w, cy_w, eff_scale, cw, ch = app._last_world_transform
+    bl1 = app._preview_main_plan.boundary_lines[0]
+    mid_wx = 0.5 * (bl1.start[0] + bl1.end[0])
+    mid_wy = 0.5 * (bl1.start[1] + bl1.end[1])
+    sx_mid = cw * 0.5 + app._canvas_pan_x + (mid_wx - cx_w) * eff_scale
+    sy_mid = ch * 0.5 + app._canvas_pan_y - (mid_wy - cy_w) * eff_scale
 
+    app.preview_canvas._bindings["<Motion>"](types.SimpleNamespace(x=sx_mid, y=sy_mid))
+    assert app._hovered_seg_idx == 1
+    assert app._hover_world_pt is not None
+    hover_texts = [item[2].get("text", "") for item in app.preview_canvas.items if item[0] == "text"]
+    assert any("XY (" in t and "#1:" in t for t in hover_texts)
+
+    app.preview_canvas._bindings["<Leave>"](types.SimpleNamespace())
+    assert app._hovered_seg_idx is None
+
+    # Двойной клик возвращает масштаб 1:1
+    app.preview_canvas._bindings["<Double-Button-1>"](types.SimpleNamespace())
+    assert app._canvas_zoom == pytest.approx(1.0)
+    assert app._canvas_pan_x == pytest.approx(0.0)
+    assert app.zoom_reset_button.cget("text") == "1:1"
+
+    # 4. Копирование ведомости в буфер обмена одной кнопкой
+    copied = app.copy_inspector_report()
+    assert "ASPENWALL" in copied.upper()
+    assert getattr(app, "_clipboard", "") == copied
+    assert "буфер обмена" in app.status_var.get()
+
+    # 5. Лупа в режиме «🖼 Исходник» повышает разрешение рендера архивного фото 80-х
+    photo_p = tmp_path / "scan_80s.jpg"
+    Image.new("RGB", (1600, 1200), color=(235, 232, 220)).save(photo_p, format="JPEG")
+    app.image_paths = [photo_p]
+    app._visual_rotations = [0]
+    app._refresh_visual_bar()
+    app._set_preview_mode("🖼 Исходник")
+    app.zoom_viewport(2.0, pivot_x=200, pivot_y=140)
+    src_texts = [item[2].get("text", "") for item in app.preview_canvas.items if item[0] == "text"]
+    assert any("200%" in t for t in src_texts)
+
+    # 6. Памятка клавиш и хоткей Ctrl+Return (офлайн-проверка без обращения к LLM)
+    app._open_shortcuts_window()
+    assert app.shortcuts_window is not None
+    app._reset_visual_sources()
+    app.use_llm_var.set(False)
+    app._on_use_llm_toggled()
+    app._global_bindings["<Control-Return>"]()
+    for _ in range(30):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.01)
+    assert app._preview_main_plan is not None
+    app._on_close()

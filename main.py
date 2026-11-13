@@ -110,32 +110,35 @@ from llm_parser import (
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
-APP_GEOMETRY = "1180x880"
+APP_GEOMETRY = "1280x900"
 VERSION = "1.0.0"
 
-# Палитра Dark CAD Studio (высокий контраст, спокойные инженерные акценты)
+# Палитра Dark CAD Studio v1.0 (высокий контраст, инженерная сетка, чистые акценты)
 THEME: dict[str, str] = {
-    "bg_root": "#0c131d",
-    "bg_header": "#111b28",
-    "bg_card": "#152030",
-    "bg_inset": "#0f1824",
-    "bg_editor": "#0a1018",
-    "border_card": "#24354c",
-    "border_subtle": "#1d2c40",
+    "bg_root": "#0a111a",
+    "bg_header": "#0f1926",
+    "bg_card": "#131f2f",
+    "bg_inset": "#0d1622",
+    "bg_editor": "#080e16",
+    "border_card": "#23354d",
+    "border_subtle": "#1a2a3e",
     "border_active": "#3b82f6",
-    "text_main": "#e6eef8",
-    "text_muted": "#8da2bb",
-    "text_dim": "#647a94",
+    "text_main": "#eaf1fb",
+    "text_muted": "#93a8c1",
+    "text_dim": "#637994",
     "btn_primary": "#2563eb",
     "btn_primary_hover": "#1d4ed8",
     "btn_neighbor": "#0d9488",
     "btn_neighbor_hover": "#0f766e",
-    "btn_secondary": "#1f2f44",
-    "btn_secondary_hover": "#2b405b",
+    "btn_secondary": "#1c2c40",
+    "btn_secondary_hover": "#283d58",
     "btn_amber": "#c26a16",
     "btn_amber_hover": "#d97706",
     "btn_emerald": "#1f6f50",
     "btn_emerald_hover": "#278762",
+    "badge_v1_bg": "#0f2d24",
+    "badge_v1_border": "#1f6f50",
+    "badge_v1_fg": "#34d399",
     "ok": "#34d399",
     "ok_bg": "#102a22",
     "warn": "#fbbf24",
@@ -143,10 +146,12 @@ THEME: dict[str, str] = {
     "warn_border": "#854d0e",
     "err": "#f87171",
     "sky": "#7dd3fc",
+    "cad_grid": "#132235",
     "cad_prop": "#f87171",
     "cad_neighbor": "#22d3ee",
     "cad_street": "#475569",
     "cad_tie": "#fbbf24",
+    "cad_hover": "#fde047",
 }
 
 
@@ -242,7 +247,7 @@ class SurveyApp(ctk.CTk):
 
         self.title(f"{APP_TITLE}  v{VERSION}")
         self.geometry(APP_GEOMETRY)
-        self.minsize(980, 760)
+        self.minsize(1100, 760)
 
         # Окно поверх остальных, но не модальное: в AutoCAD удобно кликать параллельно.
         self.attributes("-topmost", True)
@@ -377,9 +382,18 @@ class SurveyApp(ctk.CTk):
 
         self.pending_conflict: dict[str, Any] | None = None
         self.conflict_window: Any | None = None
+        self.shortcuts_window: Any | None = None
         self.preview_canvas: Any | None = None
+        self._canvas_zoom: float = 1.0
+        self._canvas_pan_x: float = 0.0
+        self._canvas_pan_y: float = 0.0
+        self._drag_origin: tuple[int, int] | None = None
+        self._hovered_seg_idx: int | None = None
+        self._hover_world_pt: tuple[float, float] | None = None
+        self._last_world_transform: tuple[float, float, float, int, int] | None = None
 
         self._build_ui()
+        self._bind_studio_shortcuts()
         self._refresh_height_label()
         self._refresh_provider_highlights()
         self._refresh_keys_drawer()
@@ -413,13 +427,13 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             brand_box,
-            text=f"v{VERSION}",
+            text=f"v{VERSION} · STUDIO",
             font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color=THEME["btn_secondary"],
+            fg_color=THEME["badge_v1_bg"],
             corner_radius=6,
-            padx=7,
+            padx=8,
             pady=2,
-            text_color=THEME["sky"],
+            text_color=THEME["badge_v1_fg"],
         ).grid(row=0, column=1, sticky="w", padx=(8, 0))
         ctk.CTkLabel(
             brand_box,
@@ -439,7 +453,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_card"],
         )
-        scale_pill.grid(row=0, column=0, padx=(0, 10), sticky="e")
+        scale_pill.grid(row=0, column=0, padx=(0, 8), sticky="e")
         ctk.CTkLabel(
             scale_pill,
             text="Масштаб:",
@@ -479,7 +493,21 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.toggle_keys_drawer,
         )
-        self.keys_toggle_button.grid(row=0, column=1, padx=(0, 12))
+        self.keys_toggle_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.shortcuts_button = ctk.CTkButton(
+            header_tools,
+            text="⌨ Клавиши",
+            height=34,
+            width=102,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=12),
+            command=self._open_shortcuts_window,
+        )
+        self.shortcuts_button.grid(row=0, column=2, padx=(0, 10))
 
         self.topmost_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(
@@ -488,7 +516,7 @@ class SurveyApp(ctk.CTk):
             variable=self.topmost_var,
             font=ctk.CTkFont(size=12),
             command=self._apply_topmost,
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=3, sticky="e")
 
         # 1. Сворачиваемый ящик API-ключей, PIN и сохранения настроек --------
         self.keys_drawer = ctk.CTkFrame(
@@ -624,7 +652,7 @@ class SurveyApp(ctk.CTk):
         )
         self.save_button.grid(row=0, column=5, sticky="e")
 
-        # 2. Компактная карточка ИИ-движка и 1–3 независимых проходов --------
+        # 2. Карточка ИИ-движка, консенсуса 1–3 проходов и политики сомнений --
         ai_card = ctk.CTkFrame(
             self,
             fg_color=THEME["bg_card"],
@@ -636,7 +664,7 @@ class SurveyApp(ctk.CTk):
         ai_card.grid_columnconfigure(0, weight=1)
 
         llm_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        llm_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(9, 8))
+        llm_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(9, 4))
         llm_row.grid_columnconfigure(4, weight=1)
 
         self.use_llm_switch = ctk.CTkSwitch(
@@ -683,27 +711,41 @@ class SurveyApp(ctk.CTk):
             button_hover_color=THEME["btn_secondary_hover"],
             command=self._on_model_selected,
         )
-        self.model_combo.grid(row=0, column=4, padx=(0, 14), sticky="ew")
+        self.model_combo.grid(row=0, column=4, sticky="ew")
+
+        # Вторая компактная полоса политики проверки и человеческого контроля
+        self.llm_policy_row = ctk.CTkFrame(ai_card, fg_color="transparent")
+        self.llm_policy_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.llm_policy_row.grid_columnconfigure(2, weight=1)
 
         ctk.CTkLabel(
-            llm_row,
-            text="Сверка:",
+            self.llm_policy_row,
+            text="Режим сверки:",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_muted"],
-        ).grid(row=0, column=5, padx=(0, 6), sticky="e")
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         self.passes_switch = ctk.CTkSegmentedButton(
-            llm_row,
+            self.llm_policy_row,
             values=self.passes_options,
             variable=self.passes_label_var,
+            height=28,
             selected_color=THEME["btn_neighbor"],
             selected_hover_color=THEME["btn_neighbor_hover"],
             command=self._on_passes_changed,
         )
-        self.passes_switch.grid(row=0, column=6, sticky="e")
+        self.passes_switch.grid(row=0, column=1, sticky="w")
+
+        ctk.CTkLabel(
+            self.llm_policy_row,
+            text="Консенсус 2+ проходов защищает цифры документа от тихих автоподмен",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=2, padx=(14, 10), sticky="w")
 
         self.ask_on_doubt_check = ctk.CTkCheckBox(
-            llm_row,
+            self.llm_policy_row,
             text="Спрашивать при сомнении",
             variable=self.ask_on_doubt_var,
             checkbox_width=18,
@@ -711,11 +753,11 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_main"],
         )
-        self.ask_on_doubt_check.grid(row=0, column=7, padx=(12, 0), sticky="e")
+        self.ask_on_doubt_check.grid(row=0, column=3, sticky="e")
 
         # Раскрываемая строка Прохода #2 (при 2 или 3 проходах)
         self.pass2_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        self.pass2_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        self.pass2_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
         self.pass2_row.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(
             self.pass2_row,
@@ -752,7 +794,7 @@ class SurveyApp(ctk.CTk):
 
         # Раскрываемая строка Прохода #3 (при 3 проходах)
         self.pass3_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        self.pass3_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.pass3_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 8))
         self.pass3_row.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(
             self.pass3_row,
@@ -795,14 +837,14 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=THEME["warn"],
         )
-        self.regex_mode_badge.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 8))
+        self.regex_mode_badge.grid(row=4, column=0, sticky="w", padx=14, pady=(0, 8))
         self.regex_mode_badge.grid_remove()
 
         # 3. Двухколоночная рабочая зона: Документ слева + Схема и ведомость справа
         workspace = ctk.CTkFrame(self, fg_color="transparent")
         workspace.grid(row=3, column=0, sticky="nsew", padx=16, pady=(10, 0))
-        workspace.grid_columnconfigure(0, weight=58)
-        workspace.grid_columnconfigure(1, weight=42)
+        workspace.grid_columnconfigure(0, weight=54)
+        workspace.grid_columnconfigure(1, weight=46)
         workspace.grid_rowconfigure(0, weight=1)
 
         # --- Левая колонка: 1. Исходное описание / PDF / Фото чертежа -------
@@ -904,7 +946,7 @@ class SurveyApp(ctk.CTk):
             command=self._clear_text,
         ).grid(row=0, column=5, padx=(6, 0), sticky="e")
 
-        # Панель подготовки архивных фото 80-х и повёрнутых сканов (раскрывается автоматически)
+        # Панель подготовки архивных фото 80-х и повёрнутых сканов (двухрядная без переполнения)
         self.visual_bar = ctk.CTkFrame(
             input_frame,
             fg_color=THEME["warn_bg"],
@@ -913,10 +955,14 @@ class SurveyApp(ctk.CTk):
             border_color=THEME["warn_border"],
         )
         self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
-        self.visual_bar.grid_columnconfigure(6, weight=1)
+        self.visual_bar.grid_columnconfigure(0, weight=1)
+
+        visual_top_row = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
+        visual_top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(5, 2))
+        visual_top_row.grid_columnconfigure(6, weight=1)
 
         self.prev_visual_button = ctk.CTkButton(
-            self.visual_bar,
+            visual_top_row,
             text="◀",
             width=28,
             height=26,
@@ -924,18 +970,18 @@ class SurveyApp(ctk.CTk):
             hover_color=THEME["btn_secondary_hover"],
             command=lambda: self.step_visual_frame(-1),
         )
-        self.prev_visual_button.grid(row=0, column=0, padx=(8, 3), pady=5)
+        self.prev_visual_button.grid(row=0, column=0, padx=(0, 3))
 
         self.visual_pos_label = ctk.CTkLabel(
-            self.visual_bar,
+            visual_top_row,
             text="Кадр 1/1 · 0°",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["warn"],
         )
-        self.visual_pos_label.grid(row=0, column=1, padx=3, pady=5)
+        self.visual_pos_label.grid(row=0, column=1, padx=3)
 
         self.next_visual_button = ctk.CTkButton(
-            self.visual_bar,
+            visual_top_row,
             text="▶",
             width=28,
             height=26,
@@ -943,10 +989,10 @@ class SurveyApp(ctk.CTk):
             hover_color=THEME["btn_secondary_hover"],
             command=lambda: self.step_visual_frame(1),
         )
-        self.next_visual_button.grid(row=0, column=2, padx=(3, 8), pady=5)
+        self.next_visual_button.grid(row=0, column=2, padx=(3, 8))
 
         self.rot_ccw_button = ctk.CTkButton(
-            self.visual_bar,
+            visual_top_row,
             text="⟲ -90°",
             width=58,
             height=26,
@@ -955,10 +1001,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(-90),
         )
-        self.rot_ccw_button.grid(row=0, column=3, padx=2, pady=5)
+        self.rot_ccw_button.grid(row=0, column=3, padx=2)
 
         self.rot_cw_button = ctk.CTkButton(
-            self.visual_bar,
+            visual_top_row,
             text="⟳ +90°",
             width=58,
             height=26,
@@ -967,10 +1013,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(90),
         )
-        self.rot_cw_button.grid(row=0, column=4, padx=2, pady=5)
+        self.rot_cw_button.grid(row=0, column=4, padx=2)
 
         self.rot_180_button = ctk.CTkButton(
-            self.visual_bar,
+            visual_top_row,
             text="⇅ 180°",
             width=56,
             height=26,
@@ -979,10 +1025,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(180),
         )
-        self.rot_180_button.grid(row=0, column=5, padx=(2, 8), pady=5)
+        self.rot_180_button.grid(row=0, column=5, padx=(2, 8))
 
-        self.pdf_pages_box = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
-        self.pdf_pages_box.grid(row=0, column=6, sticky="w", padx=(0, 6), pady=5)
+        self.pdf_pages_box = ctk.CTkFrame(visual_top_row, fg_color="transparent")
+        self.pdf_pages_box.grid(row=0, column=6, sticky="e", padx=(0, 2))
         ctk.CTkLabel(
             self.pdf_pages_box,
             text="Стр.:",
@@ -992,7 +1038,7 @@ class SurveyApp(ctk.CTk):
         self.pdf_pages_entry = ctk.CTkEntry(
             self.pdf_pages_box,
             textvariable=self.pdf_pages_var,
-            width=78,
+            width=84,
             height=26,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
@@ -1000,17 +1046,21 @@ class SurveyApp(ctk.CTk):
         )
         self.pdf_pages_entry.grid(row=0, column=1)
 
+        visual_opts_row = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
+        visual_opts_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(1, 5))
+        visual_opts_row.grid_columnconfigure(1, weight=1)
+
         self.enhance_scan_switch = ctk.CTkSwitch(
-            self.visual_bar,
-            text="Чёткость 80-х",
+            visual_opts_row,
+            text="Чёткость фото 80-х (CLAHE/контраст)",
             variable=self.enhance_scan_var,
             font=ctk.CTkFont(size=11),
             command=self._redraw_preview_canvas,
         )
-        self.enhance_scan_switch.grid(row=0, column=7, padx=(4, 8), pady=5, sticky="e")
+        self.enhance_scan_switch.grid(row=0, column=0, padx=(0, 12), sticky="w")
 
         self.auto_orient_switch = ctk.CTkCheckBox(
-            self.visual_bar,
+            visual_opts_row,
             text="🧭 ИИ-поворот (1 раз, $)",
             variable=self.auto_orient_var,
             checkbox_width=18,
@@ -1020,7 +1070,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._on_auto_orient_toggled,
         )
-        self.auto_orient_switch.grid(row=0, column=8, padx=(0, 10), pady=5, sticky="e")
+        self.auto_orient_switch.grid(row=0, column=2, sticky="e")
 
         self.auto_orient_warn_label = ctk.CTkLabel(
             self.visual_bar,
@@ -1033,15 +1083,15 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["warn"],
             anchor="w",
             justify="left",
-            wraplength=760,
+            wraplength=640,
         )
         self.auto_orient_warn_label.grid(
-            row=1, column=0, columnspan=9, sticky="ew", padx=10, pady=(0, 6)
+            row=2, column=0, sticky="ew", padx=10, pady=(0, 6)
         )
         self.auto_orient_warn_label.grid_remove()
         self.visual_bar.grid_remove()
 
-        # Плашка выбора роли участка на чертеже + пакет соседей
+        # Плашка выбора роли участка на чертеже + сверка и пакет соседей
         role_bar = ctk.CTkFrame(
             input_frame,
             fg_color=THEME["bg_inset"],
@@ -1055,40 +1105,40 @@ class SurveyApp(ctk.CTk):
         self.lot_role_var = ctk.StringVar(value="main")
         self.main_lot_radio = ctk.CTkRadioButton(
             role_bar,
-            text="Основной участок (PROPERTY_LINE + подписи)",
+            text="Основной (PROPERTY_LINE)",
             variable=self.lot_role_var,
             value="main",
             font=ctk.CTkFont(size=12),
             command=self._on_lot_role_changed,
         )
-        self.main_lot_radio.grid(row=0, column=0, sticky="w", padx=(10, 14), pady=7)
+        self.main_lot_radio.grid(row=0, column=0, sticky="w", padx=(10, 10), pady=7)
 
         self.neighbor_lot_radio = ctk.CTkRadioButton(
             role_bar,
-            text="Соседний (NEIGHBOR_LOT)",
+            text="Сосед (NEIGHBOR_LOT)",
             variable=self.lot_role_var,
             value="neighbor",
             font=ctk.CTkFont(size=12),
             command=self._on_lot_role_changed,
         )
-        self.neighbor_lot_radio.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=7)
+        self.neighbor_lot_radio.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=7)
 
         self.verify_neighbors_button = ctk.CTkButton(
             role_bar,
             text="🔍 Сверка с соседями",
-            width=162,
+            width=158,
             height=28,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._on_verify_neighbors_clicked,
         )
-        self.verify_neighbors_button.grid(row=0, column=3, sticky="e", padx=(4, 4), pady=6)
+        self.verify_neighbors_button.grid(row=0, column=3, sticky="e", padx=(2, 4), pady=6)
 
         self.batch_neighbors_button = ctk.CTkButton(
             role_bar,
             text="📂 Пакет соседей…",
-            width=142,
+            width=136,
             height=28,
             fg_color=THEME["btn_neighbor"],
             hover_color=THEME["btn_neighbor_hover"],
@@ -1119,8 +1169,8 @@ class SurveyApp(ctk.CTk):
         )
         preview_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         preview_card.grid_columnconfigure(0, weight=1)
-        preview_card.grid_rowconfigure(1, weight=54)
-        preview_card.grid_rowconfigure(2, weight=46)
+        preview_card.grid_rowconfigure(1, weight=56)
+        preview_card.grid_rowconfigure(2, weight=44)
 
         prev_header = ctk.CTkFrame(preview_card, fg_color="transparent")
         prev_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
@@ -1140,18 +1190,43 @@ class SurveyApp(ctk.CTk):
             selected_hover_color=THEME["btn_primary_hover"],
             command=self._on_preview_mode_changed,
         )
-        self.preview_mode_switch.grid(row=0, column=1, padx=(6, 6), sticky="e")
+        self.preview_mode_switch.grid(row=0, column=1, padx=(6, 4), sticky="e")
+
+        self.zoom_reset_button = ctk.CTkButton(
+            prev_header,
+            text="1:1",
+            width=42,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.reset_viewport_zoom,
+        )
+        self.zoom_reset_button.grid(row=0, column=2, padx=(0, 4), sticky="e")
+
+        self.copy_report_button = ctk.CTkButton(
+            prev_header,
+            text="📋 Копировать",
+            width=102,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self.copy_inspector_report,
+        )
+        self.copy_report_button.grid(row=0, column=3, padx=(0, 4), sticky="e")
+
         self.reset_scene_button = ctk.CTkButton(
             prev_header,
             text="Сбросить",
-            width=82,
+            width=74,
             height=26,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11),
             command=self._clear_preview_scene,
         )
-        self.reset_scene_button.grid(row=0, column=2, sticky="e")
+        self.reset_scene_button.grid(row=0, column=4, sticky="e")
 
         canvas_wrap = ctk.CTkFrame(
             preview_card,
@@ -1176,6 +1251,15 @@ class SurveyApp(ctk.CTk):
             bind_fn = getattr(self.preview_canvas, "bind", None)
             if callable(bind_fn):
                 bind_fn("<Configure>", lambda _ev: self._redraw_preview_canvas())
+                bind_fn("<MouseWheel>", self._on_canvas_mousewheel)
+                bind_fn("<Button-4>", lambda ev: self._on_canvas_mousewheel(ev, step_override=1))
+                bind_fn("<Button-5>", lambda ev: self._on_canvas_mousewheel(ev, step_override=-1))
+                bind_fn("<ButtonPress-1>", self._on_canvas_drag_start)
+                bind_fn("<B1-Motion>", self._on_canvas_drag_move)
+                bind_fn("<ButtonRelease-1>", self._on_canvas_drag_end)
+                bind_fn("<Double-Button-1>", lambda _ev: self.reset_viewport_zoom())
+                bind_fn("<Motion>", self._on_canvas_hover)
+                bind_fn("<Leave>", self._on_canvas_leave)
 
         self.inspector_box = ctk.CTkTextbox(
             preview_card,
@@ -1195,8 +1279,8 @@ class SurveyApp(ctk.CTk):
 
         self.parse_button = ctk.CTkButton(
             actions,
-            text="🔍 Проверить и показать схему",
-            width=235,
+            text="🔍 Проверить и показать схему  (Ctrl+Enter)",
+            width=285,
             height=42,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
@@ -1580,18 +1664,20 @@ class SurveyApp(ctk.CTk):
         self.passes_switch.configure(state=state)
 
         if not use_llm:
+            self.llm_policy_row.grid_remove()
             self.pass2_row.grid_remove()
             self.pass3_row.grid_remove()
-            self.regex_mode_badge.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 8))
+            self.regex_mode_badge.grid(row=4, column=0, sticky="w", padx=14, pady=(0, 8))
             return
 
+        self.llm_policy_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
         self.regex_mode_badge.grid_remove()
         if count >= 2:
-            self.pass2_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+            self.pass2_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
         else:
             self.pass2_row.grid_remove()
         if count >= 3:
-            self.pass3_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+            self.pass3_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 8))
         else:
             self.pass3_row.grid_remove()
 
@@ -1756,22 +1842,265 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    def copy_inspector_report(self) -> str:
+        """Копирует текущий текст ведомости участка в буфер обмена ОС."""
+        txt = str(self.inspector_box.get("1.0", "end") or "").strip()
+        if not txt:
+            self._set_status("Ведомость пуста — нечего копировать.")
+            return ""
+        clip_fn = getattr(self, "clipboard_clear", None)
+        append_fn = getattr(self, "clipboard_append", None)
+        if callable(clip_fn) and callable(append_fn):
+            clip_fn()
+            append_fn(txt)
+        self._set_status("📋 Ведомость участка скопирована в буфер обмена.")
+        return txt
+
+    def _bind_studio_shortcuts(self) -> None:
+        """Привязывает студийные горячие клавиши для быстрой повседневной работы."""
+        bind_fn = getattr(self, "bind_all", None) or getattr(self, "bind", None)
+        if not callable(bind_fn):
+            return
+
+        def _guard(action: Any) -> Any:
+            def _handler(_event: Any = None) -> str | None:
+                if getattr(self, "_busy", False):
+                    return None
+                action()
+                return "break"
+
+            return _handler
+
+        bind_fn("<Control-Return>", _guard(lambda: self._start(parse_only=True)))
+        bind_fn("<F5>", _guard(lambda: self._start(parse_only=False)))
+        bind_fn("<Control-o>", _guard(self._load_pdf))
+        bind_fn("<Control-O>", _guard(self._load_pdf))
+        bind_fn("<Control-i>", _guard(self._load_images))
+        bind_fn("<Control-I>", _guard(self._load_images))
+        bind_fn("<Control-s>", _guard(self._save_settings))
+        bind_fn("<Control-S>", _guard(self._save_settings))
+
+    def _open_shortcuts_window(self) -> None:
+        """Открывает компактную памятку по горячим клавишам и интерактивному холсту."""
+        existing = self.shortcuts_window
+        if existing is not None:
+            try:
+                existing.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        win = ctk.CTkToplevel(self)
+        self.shortcuts_window = win
+        win.title(f"Горячие клавиши и управление холстом — Title Survey AI v{VERSION}")
+        win.geometry("620x420")
+        win.configure(fg_color=THEME["bg_root"])
+        try:
+            win.attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            win,
+            text=f"⌨ Памятка управления Studio v{VERSION}",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+
+        guide = (
+            "КЛАВИАТУРА:\n"
+            "  Ctrl + Enter    — 🔍 Проверить описание и построить живую схему CAD\n"
+            "  F5              — 📐 Начертить участок напрямую в активном чертеже AutoCAD\n"
+            "  Ctrl + O        — 📄 Открыть PDF документ (текстовый или отсканированный)\n"
+            "  Ctrl + I        — 📷 Загрузить фото чертежа (JPG / PNG / WebP / TIFF)\n"
+            "  Ctrl + S        — 💾 Сохранить текущие настройки и выбранные модели\n\n"
+            "ИНТЕРАКТИВНЫЙ ХОЛСТ («📐 Схема CAD» и «🖼 Исходник»):\n"
+            "  Колесо мыши     — Плавный зум (0.6× .. 10×) к точке под курсором\n"
+            "                    (удобно для разглядывания мелких цифр 80-х на фото!)\n"
+            "  Зажатая ЛКМ     — Свободное панорамирование чертежа или скана\n"
+            "  Двойной клик    — Мгновенный сброс масштаба и панорамы в 1:1 (кнопка «1:1»)\n"
+            "  Наведение мыши  — Живые координаты (X, Y) ft от POB и подсветка стороны #N"
+        )
+        box = ctk.CTkTextbox(
+            win,
+            wrap="word",
+            fg_color=THEME["bg_inset"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        box.grid(row=1, column=0, sticky="nsew", padx=16, pady=6)
+        box.insert("1.0", guide)
+        try:
+            getattr(box, "_textbox", box).configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+
+        ctk.CTkButton(
+            win,
+            text="Закрыть",
+            width=120,
+            height=32,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            command=win.destroy,
+        ).grid(row=2, column=0, sticky="e", padx=16, pady=(4, 14))
+
+    def _reset_viewport_state(self) -> None:
+        self._canvas_zoom = 1.0
+        self._canvas_pan_x = 0.0
+        self._canvas_pan_y = 0.0
+        self._drag_origin = None
+        self._hovered_seg_idx = None
+        self._hover_world_pt = None
+        if hasattr(self, "zoom_reset_button"):
+            self.zoom_reset_button.configure(text="1:1")
+
+    def reset_viewport_zoom(self) -> None:
+        """Сбрасывает зум и панорамирование холста к 100% (1:1)."""
+        self._reset_viewport_state()
+        self._redraw_preview_canvas()
+
+    def zoom_viewport(
+        self,
+        factor: float,
+        *,
+        pivot_x: float | None = None,
+        pivot_y: float | None = None,
+    ) -> float:
+        """Масштабирует холст предпросмотра вокруг точки курсора (0.6× .. 10.0×)."""
+        old_zoom = float(self._canvas_zoom or 1.0)
+        new_zoom = max(0.6, min(10.0, old_zoom * float(factor)))
+        if abs(new_zoom - old_zoom) < 1e-4:
+            return old_zoom
+
+        canvas = self.preview_canvas
+        if canvas is not None and pivot_x is not None and pivot_y is not None:
+            w = max(int(getattr(canvas, "winfo_width", lambda: 0)() or 0), 260)
+            h = max(int(getattr(canvas, "winfo_height", lambda: 0)() or 0), 190)
+            dx = float(pivot_x) - (w / 2.0 + self._canvas_pan_x)
+            dy = float(pivot_y) - (h / 2.0 + self._canvas_pan_y)
+            ratio = new_zoom / old_zoom
+            self._canvas_pan_x -= dx * (ratio - 1.0)
+            self._canvas_pan_y -= dy * (ratio - 1.0)
+
+        self._canvas_zoom = new_zoom
+        if hasattr(self, "zoom_reset_button"):
+            lbl = "1:1" if abs(new_zoom - 1.0) < 0.03 else f"{new_zoom:.1f}×"
+            self.zoom_reset_button.configure(text=lbl)
+        self._redraw_preview_canvas()
+        return self._canvas_zoom
+
+    def _on_canvas_mousewheel(self, event: Any, step_override: int | None = None) -> None:
+        if step_override is not None:
+            direction = 1 if step_override > 0 else -1
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return
+            direction = 1 if delta > 0 else -1
+        factor = 1.22 if direction > 0 else (1.0 / 1.22)
+        px = getattr(event, "x", None)
+        py = getattr(event, "y", None)
+        self.zoom_viewport(
+            factor,
+            pivot_x=float(px) if px is not None else None,
+            pivot_y=float(py) if py is not None else None,
+        )
+
+    def _on_canvas_drag_start(self, event: Any) -> None:
+        self._drag_origin = (int(getattr(event, "x", 0)), int(getattr(event, "y", 0)))
+
+    def _on_canvas_drag_move(self, event: Any) -> None:
+        if self._drag_origin is None:
+            return
+        ex = int(getattr(event, "x", 0))
+        ey = int(getattr(event, "y", 0))
+        ox, oy = self._drag_origin
+        if ex == ox and ey == oy:
+            return
+        self._canvas_pan_x += float(ex - ox)
+        self._canvas_pan_y += float(ey - oy)
+        self._drag_origin = (ex, ey)
+        self._redraw_preview_canvas()
+
+    def _on_canvas_drag_end(self, _event: Any = None) -> None:
+        self._drag_origin = None
+
+    @staticmethod
+    def _point_to_segment_dist_px(
+        px: float, py: float, x1: float, y1: float, x2: float, y2: float
+    ) -> float:
+        vx, vy = x2 - x1, y2 - y1
+        len_sq = vx * vx + vy * vy
+        if len_sq <= 1e-9:
+            return math.hypot(px - x1, py - y1)
+        t = max(0.0, min(1.0, ((px - x1) * vx + (py - y1) * vy) / len_sq))
+        proj_x = x1 + t * vx
+        proj_y = y1 + t * vy
+        return math.hypot(px - proj_x, py - proj_y)
+
+    def _on_canvas_hover(self, event: Any) -> None:
+        if self.preview_mode_var.get() != "📐 Схема CAD":
+            return
+        tr = self._last_world_transform
+        if tr is None:
+            return
+        cx_w, cy_w, eff_scale, w, h = tr
+        if eff_scale <= 1e-9:
+            return
+        mx = float(getattr(event, "x", 0))
+        my = float(getattr(event, "y", 0))
+        wx = cx_w + (mx - (w / 2.0 + self._canvas_pan_x)) / eff_scale
+        wy = cy_w - (my - (h / 2.0 + self._canvas_pan_y)) / eff_scale
+        self._hover_world_pt = (wx, wy)
+
+        best_idx: int | None = None
+        best_dist = 9.5
+        active = self._last_active_plan or self._preview_main_plan
+        if active is not None:
+            for s_idx, bl in enumerate(active.boundary_lines, start=1):
+                p1, p2 = bl.start, bl.end
+                sx1 = w / 2.0 + self._canvas_pan_x + (p1[0] - cx_w) * eff_scale
+                sy1 = h / 2.0 + self._canvas_pan_y - (p1[1] - cy_w) * eff_scale
+                sx2 = w / 2.0 + self._canvas_pan_x + (p2[0] - cx_w) * eff_scale
+                sy2 = h / 2.0 + self._canvas_pan_y - (p2[1] - cy_w) * eff_scale
+                d_px = self._point_to_segment_dist_px(mx, my, sx1, sy1, sx2, sy2)
+                if d_px < best_dist:
+                    best_dist = d_px
+                    best_idx = s_idx
+
+        self._hovered_seg_idx = best_idx
+        self._redraw_preview_canvas()
+
+    def _on_canvas_leave(self, _event: Any = None) -> None:
+        if self._hover_world_pt is not None or self._hovered_seg_idx is not None:
+            self._hover_world_pt = None
+            self._hovered_seg_idx = None
+            self._redraw_preview_canvas()
+
     def _render_empty_inspector(self) -> None:
         hint = (
             "Ведомость участка пока пуста.\n\n"
-            "1. Загрузите PDF или выберите готовый пример слева.\n"
-            "2. Нажмите «🔍 Проверить и показать схему» для мгновенного построения\n"
-            "   чертежа и проверки невязки без запуска AutoCAD,\n"
-            "   либо сразу «Начертить участок в AutoCAD»."
+            "1. Загрузите PDF (Ctrl+O), фото 80-х (Ctrl+I) или выберите пример слева.\n"
+            "2. Нажмите «🔍 Проверить и показать схему» (Ctrl+Enter) для мгновенной\n"
+            "   проверки невязки и геометрии без запуска AutoCAD,\n"
+            "   либо «Начертить участок в AutoCAD» (F5).\n"
+            "3. На холсте выше работают зум колесом мыши и панорама перетаскиванием."
         )
         self._set_inspector_text(hint)
         self._redraw_preview_canvas()
 
     def _on_preview_mode_changed(self, _mode_label: str = "") -> None:
+        self._reset_viewport_state()
         self._redraw_preview_canvas()
 
     def _set_preview_mode(self, mode_label: str) -> None:
         if mode_label in self.preview_modes:
+            if self.preview_mode_var.get() != mode_label:
+                self._reset_viewport_state()
             self.preview_mode_var.set(mode_label)
             self.preview_mode_switch.set(mode_label)
             self._redraw_preview_canvas()
@@ -1841,7 +2170,7 @@ class SurveyApp(ctk.CTk):
             return
         if bool(self.auto_orient_var.get()) and self._has_visual_source():
             self.auto_orient_warn_label.grid(
-                row=1, column=0, columnspan=9, sticky="ew", padx=10, pady=(0, 6)
+                row=2, column=0, sticky="ew", padx=10, pady=(0, 6)
             )
         else:
             self.auto_orient_warn_label.grid_remove()
@@ -1895,7 +2224,7 @@ class SurveyApp(ctk.CTk):
         self.prev_visual_button.configure(state=nav_state)
         self.next_visual_button.configure(state=nav_state)
         if self.pdf_path and not self.image_paths and total > 1:
-            self.pdf_pages_box.grid(row=0, column=6, sticky="w", padx=(0, 6), pady=5)
+            self.pdf_pages_box.grid(row=0, column=6, sticky="e", padx=(0, 2))
         else:
             self.pdf_pages_box.grid_remove()
         self._refresh_auto_orient_warning()
@@ -2129,6 +2458,7 @@ class SurveyApp(ctk.CTk):
         self._last_active_plan = None
         self._neighbor_report = None
         self._last_suspicion_report = None
+        self._reset_viewport_state()
         self._refresh_neighbor_verify_button()
         self._refresh_suspicion_badge()
         self._render_empty_inspector()
@@ -2232,12 +2562,13 @@ class SurveyApp(ctk.CTk):
         return "\n".join(lines)
 
     def _draw_source_visual_on_canvas(self, canvas: Any, w: int, h: int) -> None:
-        """Рендерит загруженное фото/страницу PDF в режиме «🖼 Исходник» с учётом EXIF, поворота и фильтра 80-х."""
+        """Рендерит загруженное фото/страницу PDF в режиме «🖼 Исходник» с зумом, панорамой, EXIF и фильтром 80-х."""
+        self._last_world_transform = None
         if not self._has_visual_source():
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text="Исходное изображение не загружено.\nНажмите «📷 Фото (JPG)…» или «📄 PDF…»",
+                text="Исходное изображение не загружено.\nНажмите «📷 Фото (JPG)…» (Ctrl+I) или «📄 PDF…» (Ctrl+O)",
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",
@@ -2248,6 +2579,7 @@ class SurveyApp(ctk.CTk):
         idx = max(0, min(self._visual_cursor, total - 1))
         rot_cw = self._current_visual_rotation()
         do_enhance = bool(self.enhance_scan_var.get())
+        zoom = max(0.6, min(10.0, float(self._canvas_zoom or 1.0)))
 
         raw_source: Path | bytes | None = None
         frame_title = ""
@@ -2264,7 +2596,8 @@ class SurveyApp(ctk.CTk):
                 doc = fitz.open(self.pdf_path)
                 try:
                     page_i = min(idx, max(0, len(doc) - 1))
-                    pix = doc.load_page(page_i).get_pixmap(dpi=130, alpha=False)
+                    pdf_dpi = min(260, max(130, int(round(130 * min(zoom, 2.2)))))
+                    pix = doc.load_page(page_i).get_pixmap(dpi=pdf_dpi, alpha=False)
                     raw_source = pix.tobytes("png")
                     frame_title = f"PDF СТР. {page_i + 1}/{len(doc)}: {self.pdf_path.name}"
                 finally:
@@ -2273,7 +2606,8 @@ class SurveyApp(ctk.CTk):
             if raw_source is None:
                 return
 
-            preview_max = max(240, min(w - 16, h - 32))
+            base_side = max(240, min(w - 16, h - 36))
+            preview_max = min(2400, max(240, int(round(base_side * zoom))))
             img_bytes, _mime, meta = prepare_survey_image_bytes(
                 raw_source,
                 rotation_deg=rot_cw,
@@ -2291,16 +2625,22 @@ class SurveyApp(ctk.CTk):
                     pil_im = Image.open(_io.BytesIO(img_bytes))
                     tk_im = ImageTk.PhotoImage(pil_im)
                     self._tk_photo_ref = tk_im
-                    create_img_fn(w / 2, h / 2 + 8, image=tk_im, anchor="center")
+                    create_img_fn(
+                        w / 2 + self._canvas_pan_x,
+                        h / 2 + 8 + self._canvas_pan_y,
+                        image=tk_im,
+                        anchor="center",
+                    )
                     rendered_bitmap = True
                 except Exception:  # noqa: BLE001
                     rendered_bitmap = False
 
             exif_tag = " · EXIF✓" if meta.get("exif_transposed") else ""
             enh_tag = "80s+" if do_enhance else "RAW"
+            zoom_tag = f"  |  {int(round(zoom * 100))}%" if abs(zoom - 1.0) > 0.03 else ""
             hud = (
                 f"{frame_title}  |  {meta['width']}×{meta['height']}  |  "
-                f"+{rot_cw}°{exif_tag}  |  {enh_tag}"
+                f"+{rot_cw}°{exif_tag}  |  {enh_tag}{zoom_tag}"
             )
             canvas.create_text(
                 8,
@@ -2310,10 +2650,18 @@ class SurveyApp(ctk.CTk):
                 fill=THEME["warn"],
                 font=("Consolas", 8, "bold"),
             )
+            canvas.create_text(
+                w - 8,
+                h - 8,
+                text="Колесо: лупа · ЛКМ: панорама · 2×клик: 1:1",
+                anchor="se",
+                fill=THEME["text_dim"],
+                font=("Consolas", 8),
+            )
             if not rendered_bitmap:
                 canvas.create_text(
-                    w / 2,
-                    h / 2 + 6,
+                    w / 2 + self._canvas_pan_x,
+                    h / 2 + 6 + self._canvas_pan_y,
                     text=(
                         f"{frame_title}\n"
                         f"Размер превью: {meta['width']}×{meta['height']} px, поворот +{rot_cw}°"
@@ -2331,6 +2679,14 @@ class SurveyApp(ctk.CTk):
                 font=("Segoe UI", 10),
                 justify="center",
             )
+
+    @staticmethod
+    def _pick_nice_feet_step(raw_feet: float) -> float:
+        """Подбирает аккуратный геодезический шаг линейки/сетки в футах (5', 10', 25', 50', 100'…)."""
+        for step in (1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0):
+            if step >= raw_feet:
+                return step
+        return 2000.0
 
     def _redraw_preview_canvas(self) -> None:
         canvas = self.preview_canvas
@@ -2357,10 +2713,15 @@ class SurveyApp(ctk.CTk):
             plans.append(self._last_active_plan)
 
         if not plans:
+            self._last_world_transform = None
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text="Здесь появится векторная схема участка,\nулиц, точки POB и соседних лотов от (0, 0)",
+                text=(
+                    "Здесь появится интерактивная CAD-схема участка,\n"
+                    "красных линий улиц, точки POB и соседних лотов от (0, 0)\n"
+                    "(колесо мыши — масштаб, зажатая ЛКМ — панорама)"
+                ),
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",
@@ -2384,15 +2745,39 @@ class SurveyApp(ctk.CTk):
         min_y, max_y = min(ys), max(ys)
         span_x = max(max_x - min_x, 10.0)
         span_y = max(max_y - min_y, 10.0)
-        pad = 30.0
-        scale = min((w - 2 * pad) / span_x, (h - 2 * pad) / span_y)
+        pad = 34.0
+        base_scale = min(max((w - 2 * pad) / span_x, 0.05), max((h - 2 * pad) / span_y, 0.05))
+        zoom = max(0.6, min(10.0, float(self._canvas_zoom or 1.0)))
+        scale = base_scale * zoom
         cx_w = 0.5 * (min_x + max_x)
         cy_w = 0.5 * (min_y + max_y)
+        self._last_world_transform = (cx_w, cy_w, scale, w, h)
 
         def to_screen(pt: tuple[float, float]) -> tuple[float, float]:
-            sx = w * 0.5 + (pt[0] - cx_w) * scale
-            sy = h * 0.5 - (pt[1] - cy_w) * scale
+            sx = w * 0.5 + self._canvas_pan_x + (pt[0] - cx_w) * scale
+            sy = h * 0.5 + self._canvas_pan_y - (pt[1] - cy_w) * scale
             return sx, sy
+
+        # 0. Тонкая инженерная координатная сетка WCS (шаг подбирается автоматически)
+        grid_step = self._pick_nice_feet_step(68.0 / max(scale, 1e-6))
+        vis_min_x = cx_w + (0.0 - (w * 0.5 + self._canvas_pan_x)) / scale
+        vis_max_x = cx_w + (float(w) - (w * 0.5 + self._canvas_pan_x)) / scale
+        vis_min_y = cy_w - (float(h) - (h * 0.5 + self._canvas_pan_y)) / scale
+        vis_max_y = cy_w - (0.0 - (h * 0.5 + self._canvas_pan_y)) / scale
+        gx_val = math.floor(vis_min_x / grid_step) * grid_step
+        grid_guard = 0
+        while gx_val <= vis_max_x and grid_guard < 40:
+            sx_g, _ = to_screen((gx_val, 0.0))
+            canvas.create_line(sx_g, 0, sx_g, h, fill=THEME["cad_grid"], width=1)
+            gx_val += grid_step
+            grid_guard += 1
+        gy_val = math.floor(vis_min_y / grid_step) * grid_step
+        grid_guard = 0
+        while gy_val <= vis_max_y and grid_guard < 40:
+            _, sy_g = to_screen((0.0, gy_val))
+            canvas.create_line(0, sy_g, w, sy_g, fill=THEME["cad_grid"], width=1)
+            gy_val += grid_step
+            grid_guard += 1
 
         # 1. Пунктирные линии красных линий улиц (STREET_ROW_AI)
         for pl in plans:
@@ -2431,7 +2816,7 @@ class SurveyApp(ctk.CTk):
                 font=("Segoe UI", 8, "bold"),
             )
 
-        # 4. Основной участок (PROPERTY_LINE, красный контур + номера сторон + POB + GAP)
+        # 4. Основной участок (PROPERTY_LINE, контур + узлы + подсветка наведения + POB + GAP)
         focus_plan = self._preview_main_plan or self._last_active_plan
         if focus_plan is not None:
             if math.hypot(focus_plan.pob[0], focus_plan.pob[1]) > 1e-3:
@@ -2464,10 +2849,20 @@ class SurveyApp(ctk.CTk):
                         width=4.5,
                         dash=(5, 3),
                     )
-                canvas.create_line(x1, y1, x2, y2, fill=seg_color, width=2.4)
+                is_hovered = self._hovered_seg_idx == idx
+                line_col = THEME["cad_hover"] if is_hovered else seg_color
+                line_w = 3.6 if is_hovered else 2.4
+                canvas.create_line(x1, y1, x2, y2, fill=line_col, width=line_w)
+                canvas.create_oval(
+                    x2 - 2.3, y2 - 2.3, x2 + 2.3, y2 + 2.3, fill=line_col, outline=""
+                )
                 mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
                 lbl_txt = f"⚠ #{idx}" if idx in susp_map else f"#{idx}"
-                lbl_col = susp_map.get(idx, THEME["text_main"])
+                lbl_col = (
+                    THEME["cad_hover"]
+                    if is_hovered
+                    else susp_map.get(idx, THEME["text_main"])
+                )
                 canvas.create_text(
                     mx,
                     my - 7,
@@ -2559,9 +2954,64 @@ class SurveyApp(ctk.CTk):
                             font=("Consolas", 8, "bold"),
                         )
 
-        # Стрелка на Север в правом верхнем углу схемы
+        # 6. Динамическая масштабная линейка в футах (левый нижний угол)
+        ruler_ft = self._pick_nice_feet_step(58.0 / max(scale, 1e-6))
+        ruler_px = min(max(ruler_ft * scale, 28.0), max(w * 0.42, 60.0))
+        rx0, ry0 = 12.0, float(h) - 14.0
+        canvas.create_line(rx0, ry0, rx0 + ruler_px, ry0, fill=THEME["text_muted"], width=2)
+        canvas.create_line(rx0, ry0 - 4, rx0, ry0 + 4, fill=THEME["text_muted"], width=1.5)
+        canvas.create_line(
+            rx0 + ruler_px, ry0 - 4, rx0 + ruler_px, ry0 + 4, fill=THEME["text_muted"], width=1.5
+        )
+        canvas.create_text(
+            rx0 + 0.5 * ruler_px,
+            ry0 - 9,
+            text=f"{ruler_ft:g} ft",
+            fill=THEME["text_muted"],
+            font=("Consolas", 8, "bold"),
+        )
+
+        # 7. Живой HUD координат курсора и подсвеченной стороны (правый нижний угол)
+        if self._hover_world_pt is not None:
+            hx, hy = self._hover_world_pt
+            hud_parts = [f"XY ({hx:+.2f}', {hy:+.2f}')"]
+            if (
+                focus_plan is not None
+                and self._hovered_seg_idx is not None
+                and 1 <= self._hovered_seg_idx <= len(focus_plan.description.segments)
+            ):
+                h_seg = focus_plan.description.segments[self._hovered_seg_idx - 1]
+                h_dir = (
+                    h_seg.bearing_label
+                    if h_seg.has_bearing
+                    else (h_seg.course_note or "отн. курс")
+                )
+                hud_parts.append(
+                    f"#{self._hovered_seg_idx}: {format_distance(h_seg.distance_ft)} {h_dir}"
+                )
+            canvas.create_text(
+                w - 10,
+                h - 10,
+                text="  ·  ".join(hud_parts),
+                anchor="se",
+                fill=THEME["cad_hover"] if self._hovered_seg_idx else THEME["sky"],
+                font=("Consolas", 8, "bold"),
+            )
+        elif abs(zoom - 1.0) > 0.03:
+            canvas.create_text(
+                w - 10,
+                h - 10,
+                text=f"Масштаб вида: {int(round(zoom * 100))}%  (2×клик → 1:1)",
+                anchor="se",
+                fill=THEME["text_dim"],
+                font=("Consolas", 8),
+            )
+
+        # 8. Стрелка на Север в правом верхнем углу схемы
         nx_c, ny_c = w - 20, 26
         canvas.create_line(nx_c, ny_c + 10, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
+        canvas.create_line(nx_c - 3.5, ny_c - 3, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
+        canvas.create_line(nx_c + 3.5, ny_c - 3, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
         canvas.create_text(nx_c, ny_c - 15, text="N", fill=THEME["text_main"], font=("Consolas", 9, "bold"))
 
     # -------------------------------------------------------------- helpers --

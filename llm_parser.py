@@ -71,11 +71,14 @@ __all__ = [
     "ParseOutcome",
     "Segment",
     "TokenUsage",
+    "TypoSuspicion",
     "bearing_label",
     "build_discrepancy_focus_prompt",
     "build_pass_targets",
+    "build_typo_suspicion_focus_prompt",
     "clean_provider_key",
     "compare_legal_descriptions",
+    "detect_typo_suspicions",
     "detect_visual_orientations_llm",
     "dms_to_degrees",
     "enhance_archival_scan",
@@ -94,6 +97,7 @@ __all__ = [
     "protect_api_key",
     "read_pdf_text",
     "recheck_consensus_discrepancies",
+    "recheck_typo_suspicion",
     "render_image_files_base64",
     "render_pdf_pages_base64",
     "resolve_api_target",
@@ -206,6 +210,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vision_max_pages": 8,
         "vision_enhance_scans": True,
         "vision_auto_orient": False,
+        "ask_on_doubt": True,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
         "consensus": {
             "passes": 1,
@@ -1353,10 +1358,12 @@ class LegalDescription(BaseModel):
     anomaly_note: str | None = Field(
         default=None,
         description=(
-            "Если в тексте Legal Description или на скане обнаружена очевидная опечатка "
-            "(перепутаны N/S или E/W, либо цифра 3↔8, 8↔0, 1↔7, 5↔6 в угле или длине) "
-            "и она исправлена — обязательное пояснение на русском языке, что было указано "
-            "и на что исправлено; иначе null"
+            "ЗАПРЕЩЕНО самовольно подменять напечатанные в документе цифры и румбы в `segments` "
+            "ради замыкания контура! Если в документе есть открытая невязка, подозрение на "
+            "опечатку источника или плохо читаемый символ на скане — запиши в `segments` "
+            "буквально то, что прочитано в документе, а сюда на русском языке запиши своё "
+            "подозрение/наблюдение (какая сторона, какое значение напечатано и в чём сомнение); "
+            "если сомнений нет — null"
         ),
     )
     segments: list[Segment] = Field(
@@ -2057,13 +2064,11 @@ CRITICAL SURVEY RULES
 2. IGNORE BUILDING & FENCE OFFSETS:
    - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'", "GARAGE", "SHED") with lot boundary lines.
    - When both "(DEED)" / "(REC.)" and "(T.M.)" / "(TAX MAP)" / "(MEAS.)" values appear, prefer the measured survey boundary or "(DEED)" record dimension consistently around the closed loop.
-3. QUADRANT BEARINGS, RELATIVE NYC COURSES & TYPO EVALUATION:
+3. QUADRANT BEARINGS, RELATIVE NYC COURSES & STRICT VERBATIM RULE (NO SILENT AUTO-CORRECTION):
    - Every element of `segments` represents one lot boundary side in continuous loop order around the parcel. On survey plats, orient each bearing's N/S and E/W letters along your chosen CW/CCW loop direction.
-   - DO NOT alter small 0.01-ft rounding gaps (e.g. 0.003–0.015 ft on oblique trapezoids) — preserve exact record numbers; our CAD geometry engine handles analytical right-trapezoid closure and open rounding gaps automatically.
-   - HOWEVER, act as a thinking surveyor when a LARGE closure gap (> 0.1 ft) appears: check whether it is caused by an OBVIOUS TYPO or visual OCR digit confusion:
-     * Quadrant letter typo (`N` <-> `S` or `E` <-> `W`), OR
-     * Digit confusion (`6` <-> `9`, `3` <-> `8`, `8` <-> `0`, `1` <-> `7`, `5` <-> `6`, `0` <-> `6`, `0` <-> `9`) in `degrees`, `minutes`, `seconds`, or `distance_ft` (compare against opposite parallel/perpendicular sides, building dimensions, and lot frontage).
-     If an obvious typo is identified and fixing it cleanly closes the parcel, output the corrected value AND explain clearly in Russian in `anomaly_note` what was written in the source and what typo was corrected. If NO obvious typo can be determined with confidence, keep all printed lengths and angles strictly verbatim and set `anomaly_note` to `null` (or describe the unresolved discrepancy in `anomaly_note` without altering `segments`).
+   - STRICT VERBATIM NUMBERS & LETTERS: ALWAYS output the EXACT lengths, degrees, minutes, seconds, and quadrant letters printed in the source PDF/photo/deed in `segments` — EVEN IF the polygon does NOT close!
+   - NEVER substitute a printed number (for example, NEVER replace a printed `54` with `56` just to make opposite sides match or force `0.00` closure!). Our CAD survey engine has dedicated human-in-the-loop verification and open-gap rules; silent "corrections" corrupt legal survey data!
+   - If a closure gap (> 0.1 ft) appears OR a glyph on an old scan looks genuinely ambiguous/blurred (`6` vs `9`, `3` vs `8`, `5` vs `6`, `1` vs `7`, `0` vs `8`), put your best literal reading of the printed glyph in `segments` and describe the suspicion in Russian in `anomaly_note` (which side, what value is printed in the document, and why it looks doubtful — WITHOUT altering clear printed digits!). If everything is clearly legible, set `anomaly_note` to `null`.
    - When explicit quadrant bearings are given, split into `ns` ("N"/"S"), `degrees` (0..90), `minutes` (0..59), `seconds` (decimal), `ew` ("E"/"W"), `bearing_label` ("N 75°20'20\" E"), and set `has_bearing = true`.
    - When NO compass bearings are printed (common in NYC & 1980s surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
      * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) according to the North Arrow, and apply exact printed interior/right angles without inventing compass labels;
@@ -2099,7 +2104,7 @@ VISION_USER_PROMPT = """Examine the attached survey / title document image(s) ca
 1. ORIENTATION & NORTH ARROW FIRST: Check if any image is rotated (90°/180°/270° or tilted), locate the Title Block and the drawn NORTH ARROW ("N"), and establish true North before reading directions. Never assume the top of the photo is North!
 2. EXACT BOUNDARY CALLS & 1980s GLYPHS: Read lot boundary dimensions (including fractional inches like `25'-6 1/2"` -> `25.5417`) and bearings (or NYC relative notes like `PARALLEL WITH ...` / `AT RIGHT ANGLES TO ...`). Watch carefully for upside-down `6` vs `9` and faded/handwritten `3` vs `8`, `5` vs `6`, `1` vs `7`, `0` vs `8`.
 3. INTERIOR ANGLES & STREETS: Check inside every parcel corner for printed interior angles (such as `93°33'29.5"`) -> `interior_angle`. Read street names, subtitles in parentheses, corner tie distances (`distance_to_corner_ft`), and Block/Lot/Borough.
-4. CLOSED LOOP & MULTI-PHOTO CHECK: If multiple photos of the same lot are attached, cross-reference overview and close-ups. Walk the parcel boundary in continuous loop order, excluding COMMENCING / corner tie lines and building/fence offsets from `segments`. If you spot and fix an obvious typo or OCR digit confusion, explain it in Russian in `anomaly_note`."""
+4. CLOSED LOOP & MULTI-PHOTO CHECK (VERBATIM DIGITS ONLY): If multiple photos of the same lot are attached, cross-reference overview and close-ups. Walk the parcel boundary in continuous loop order, excluding COMMENCING / corner tie lines and building/fence offsets from `segments`. NEVER silently change a printed number (e.g. `54` -> `56`) just to force closure: keep exact printed numbers in `segments` and report any suspected typo or blurred glyph in Russian in `anomaly_note`."""
 
 
 def _messages(
@@ -3363,7 +3368,11 @@ def _extract_pob_tie_hint(
     return pob_dir, explicit_seg
 
 
-def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
+def parse_with_regex(
+    text: str,
+    *,
+    auto_repair_typos: bool = True,
+) -> tuple[LegalDescription, list[str]]:
     """
     Локальный разбор без LLM. Возвращает (модель, список предупреждений).
     Поддерживает:
@@ -3413,6 +3422,7 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
         front_segment_index=meta["front_segment_index"],
         cross_street_side_index=meta["cross_street_side_index"],
         from_vision=False,
+        auto_apply=auto_repair_typos,
     )
     warnings.extend(typo_notes)
     corner_tie = infer_corner_to_pob_bearing(
@@ -3548,6 +3558,53 @@ NYC_SAMPLES: dict[str, str] = {
 
 
 @dataclass
+class TypoSuspicion:
+    """Кандидат на опечатку или сомнительное место контура, требующее проверки ИИ с фокусом или решения человека."""
+
+    segment_index: int  # 1-based (#1..#N), либо 0 для замечания по всему участку
+    kind: str  # "quadrant_flip" | "angle_digit" | "length_digit" | "llm_anomaly"
+    original_value: str
+    suggested_value: str
+    digit_pair: str
+    is_lookalike: bool
+    closure_before_ft: float
+    closure_after_ft: float
+    reason_ru: str
+    repaired_segments: list[Segment] | None = None
+    repaired_data: LegalDescription | None = None
+    unanimous_llm_passes: int = 0
+
+    def can_auto_apply(self, *, ask_on_doubt: bool) -> bool:
+        """
+        Разрешена ли самостоятельная правка:
+          * НИКОГДА, если включено «Спрашивать при сомнении» (ask_on_doubt=True);
+          * НИКОГДА, если 2+ независимых прохода LLM единогласно прочитали original_value;
+          * НИКОГДА для визуально непохожих цифр (например 54 -> 56, пара 4->6: is_lookalike=False).
+        """
+        return (
+            (not ask_on_doubt)
+            and self.is_lookalike
+            and self.unanimous_llm_passes < 2
+            and (self.repaired_data is not None or self.repaired_segments is not None)
+        )
+
+    def short_summary(self) -> str:
+        seg_lbl = f"Сторона #{self.segment_index}" if self.segment_index > 0 else "Контур участка"
+        if self.suggested_value and self.suggested_value != self.original_value:
+            consensus_tag = (
+                f" [подтверждено {self.unanimous_llm_passes}/{self.unanimous_llm_passes} проходами ИИ]"
+                if self.unanimous_llm_passes >= 2
+                else ""
+            )
+            return (
+                f"{seg_lbl}: в документе прочитано «{self.original_value}»{consensus_tag}, "
+                f"а для замыкания контура требовалось бы «{self.suggested_value}» "
+                f"(невязка {self.closure_before_ft:.3f}' → {self.closure_after_ft:.3f}')"
+            )
+        return f"{seg_lbl}: {self.reason_ru}"
+
+
+@dataclass
 class ParseOutcome:
     """Результат разбора + метаданные для GUI/логов."""
 
@@ -3559,6 +3616,10 @@ class ParseOutcome:
     provider_label: str = ""
     model: str = ""
     llm_mode: str = ""
+    typo_suspicions: list[TypoSuspicion] = field(default_factory=list)
+    prepared_text: str = ""
+    prepared_images: list[str] = field(default_factory=list)
+    base_warnings: list[str] = field(default_factory=list)
 
 
 def _flip_segment_direction(seg: Segment) -> Segment:
@@ -3627,6 +3688,7 @@ _LOOKALIKE_DIGIT_PAIRS: set[frozenset[str]] = {
     frozenset(("8", "0")),
     frozenset(("1", "7")),
     frozenset(("5", "6")),
+    frozenset(("5", "8")),
     frozenset(("0", "6")),
     frozenset(("0", "9")),
     frozenset(("6", "9")),
@@ -3688,38 +3750,94 @@ def _mutate_segment_bearing(
     )
 
 
-def _detect_and_repair_obvious_typos(
+def _align_vision_loop_walk_order(
+    segments: Sequence[Segment],
+    *,
+    from_vision: bool = False,
+) -> tuple[list[Segment], dict[int, int] | None, list[str]]:
+    """
+    Чисто топологическая сборка замкнутого обхода на чертеже Survey (Vision):
+    НЕ меняет ни одной напечатанной цифры длины/угла и ни одного наклона линии —
+    только ориентирует стрелку обхода вдоль той же прямой (180°: N..E <-> S..W)
+    и выстраивает стороны голова-к-хвосту.
+    """
+    segs = list(segments)
+    n = len(segs)
+    if not from_vision or not (3 <= n <= 8):
+        return segs, None, []
+    err0, _ = _trace_closure_and_validity(segs)
+    if err0 <= 0.5:
+        return segs, None, []
+
+    best_err = err0
+    best_order: tuple[int, ...] | None = None
+    best_flips: tuple[bool, ...] | None = None
+    orders: list[tuple[int, ...]] = [tuple(range(n))]
+    if n <= 6:
+        orders.extend((0, *perm) for perm in itertools.permutations(range(1, n)))
+
+    for order in orders:
+        ordered_base = [segs[i] for i in order]
+        for flips in itertools.product((False, True), repeat=n):
+            if order == tuple(range(n)) and not any(flips):
+                continue
+            candidate = [
+                _flip_segment_direction(s) if fl else s
+                for s, fl in zip(ordered_base, flips)
+            ]
+            err, valid = _trace_closure_and_validity(candidate)
+            if valid and err <= 0.05 and err < best_err:
+                best_err = err
+                best_order = order
+                best_flips = flips
+        if best_order is not None and best_err <= 0.01:
+            break
+
+    if best_order is not None and best_flips is not None:
+        repaired_segs = [
+            _flip_segment_direction(segs[idx]) if fl else segs[idx]
+            for idx, fl in zip(best_order, best_flips)
+        ]
+        old_to_new = {old_i: new_i for new_i, old_i in enumerate(best_order)}
+        return (
+            repaired_segs,
+            old_to_new,
+            [
+                f"скорректирован порядок/направление обхода сторон по замыканию контура "
+                f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+            ],
+        )
+    return segs, None, []
+
+
+def _scan_single_typo_candidate(
     segments: Sequence[Segment],
     *,
     front_segment_index: int | None = None,
     cross_street_side_index: int | None = None,
-    from_vision: bool = False,
-) -> tuple[list[Segment], dict[int, int] | None, list[str]]:
+    unanimous_llm_passes: int = 0,
+) -> TypoSuspicion | None:
     """
-    Интеллектуальный геодезический поиск очевидных опечаток текста / OCR:
-      1) опечатка направления квадранта N↔S или E↔W (или разворот 180° на чертеже);
-      2) опечатка в цифрах угла (градусы/минуты/секунды: 3↔8, 8↔0, 1↔7, 5↔6 и др.,
-         включая сверку с параллельной/перпендикулярной противоположной стороной);
-      3) опечатка похожей цифры (3↔8, 8↔0, 1↔7, 5↔6 и др.) в длине стороны (с защитой
-         фасадных сторон вдоль улиц).
-    Всегда возвращает подробное русскоязычное пояснение найденной и исправленной опечатки.
-    Если опечатка неоднозначна — НЕ меняет данные молча.
+    Ищет ровно одного однозначного кандидата на опечатку в квадранте, DMS-угле или длине стороны.
+    НЕ мутирует входные сегменты — только возвращает структурированный ``TypoSuspicion``.
+    Важно: различает визуально похожие цифры OCR (``is_lookalike=True``: 6↔9, 3↔8, 5↔6, 5↔8…)
+    и визуально НЕ похожие замены (``is_lookalike=False``: например ``54 ↔ 56``, т.е. ``4↔6``),
+    которые НИКОГДА не должны применяться автоматически!
     """
     segs = list(segments)
     n = len(segs)
     if not (3 <= n <= 10):
-        return segs, None, []
+        return None
 
     err0, _ = _trace_closure_and_validity(segs)
     if err0 <= 0.08:
-        return segs, None, []
+        return None
 
     protected_street = {
         idx for idx in (front_segment_index, cross_street_side_index) if idx is not None
     }
 
     def _corner_geometry_score(cand_segs: Sequence[Segment]) -> tuple[int, float]:
-        """Число прямых углов (90° ± 0.05°) и минимальный sin угла между смежными сторонами."""
         ortho_cnt = 0
         min_sin = 1.0
         cnt = len(cand_segs)
@@ -3739,7 +3857,7 @@ def _detect_and_repair_obvious_typos(
                 min_sin = sin_ab
         return ortho_cnt, round(min_sin, 2)
 
-    # --- 1. Одиночная опечатка квадранта N↔S, E↔W или 180° (N↔S + E↔W) ---
+    # --- 1. Одиночная опечатка квадранта N↔S, E↔W или 180° ---
     quad_candidates: list[tuple[int, float, int, float, int, Segment, str]] = []
     for idx, seg in enumerate(segs):
         ns_flip: Literal["N", "S"] = "S" if seg.ns == "N" else "N"
@@ -3768,59 +3886,26 @@ def _detect_and_repair_obvious_typos(
         old_lbl = segs[best_idx].bearing_label
         repaired = list(segs)
         repaired[best_idx] = best_seg
-        return (
-            repaired,
-            None,
-            [
+        return TypoSuspicion(
+            segment_index=best_idx + 1,
+            kind="quadrant_flip",
+            original_value=old_lbl,
+            suggested_value=best_seg.bearing_label,
+            digit_pair=kind_tag,
+            is_lookalike=True,
+            closure_before_ft=err0,
+            closure_after_ft=best_err,
+            reason_ru=(
                 f"Обнаружена и исправлена очевидная опечатка направления в стороне №{best_idx + 1} "
                 f"({kind_tag}): «{old_lbl}» → «{best_seg.bearing_label}» "
                 f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
-            ],
+            ),
+            repaired_segments=repaired,
+            unanimous_llm_passes=unanimous_llm_passes,
         )
 
-    # --- 2. Многосегментный разворот 180° / перестановка на чертеже Survey ---
-    if n <= 8 and err0 > 0.5:
-        best_err = err0
-        best_order: tuple[int, ...] | None = None
-        best_flips: tuple[bool, ...] | None = None
-        orders: list[tuple[int, ...]] = [tuple(range(n))]
-        if from_vision and n <= 6:
-            orders.extend((0, *perm) for perm in itertools.permutations(range(1, n)))
-
-        for order in orders:
-            ordered_base = [segs[i] for i in order]
-            for flips in itertools.product((False, True), repeat=n):
-                if order == tuple(range(n)) and not any(flips):
-                    continue
-                candidate = [
-                    _flip_segment_direction(s) if fl else s
-                    for s, fl in zip(ordered_base, flips)
-                ]
-                err, valid = _trace_closure_and_validity(candidate)
-                if valid and err <= 0.05 and err < best_err:
-                    best_err = err
-                    best_order = order
-                    best_flips = flips
-            if best_order is not None and best_err <= 0.01:
-                break
-
-        if best_order is not None and best_flips is not None:
-            repaired_segs = [
-                _flip_segment_direction(segs[idx]) if fl else segs[idx]
-                for idx, fl in zip(best_order, best_flips)
-            ]
-            old_to_new = {old_i: new_i for new_i, old_i in enumerate(best_order)}
-            return (
-                repaired_segs,
-                old_to_new,
-                [
-                    f"скорректирован порядок/направление обхода сторон по замыканию контура "
-                    f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
-                ],
-            )
-
-    # --- 3. Опечатка в цифрах угла (градусы / минуты / секунды) одной стороны ---
-    dms_candidates: list[tuple[int, int, int, float, int, Segment, str]] = []
+    # --- 2. Одноцифровая разница в угле (градусы / минуты / секунды) одной стороны ---
+    dms_candidates: list[tuple[int, int, int, int, float, int, Segment, str, bool]] = []
     for idx, seg in enumerate(segs):
         if not seg.has_bearing:
             continue
@@ -3831,7 +3916,7 @@ def _detect_and_repair_obvious_typos(
         seen_dms: set[tuple[int, int, float]] = {(seg.degrees, seg.minutes, round(seg.seconds, 4))}
         trial_dms: list[tuple[int, int, float, bool, str]] = []
 
-        # 3a) Сверка с параллельными и перпендикулярными сторонами участка
+        # 2a) Сверка ТОЛЬКО по 1 цифре (никаких двухцифровых выдумок!) с параллельными/перпендикулярными сторонами
         for j, other in enumerate(segs):
             if j == idx or not other.has_bearing:
                 continue
@@ -3857,15 +3942,12 @@ def _detect_and_repair_obvious_typos(
                 if key in seen_dms:
                     continue
                 ref_code = f"{rd:02d}{rm:02d}{int(round(rs)):02d}"
-                digit_diffs = [
-                    (ca, cb) for ca, cb in zip(orig_code, ref_code) if ca != cb
-                ]
-                if 1 <= len(digit_diffs) <= 2:
+                d_one = _single_digit_diff(orig_code, ref_code)
+                if d_one is not None:
                     seen_dms.add(key)
-                    pair_desc = ", ".join(f"{a}→{b}" for a, b in digit_diffs)
-                    trial_dms.append((rd, rm, rs, True, pair_desc))
+                    trial_dms.append((rd, rm, rs, True, f"{d_one[0]}→{d_one[1]}"))
 
-        # 3b) Одиночные замены цифр в градусах, минутах и целых секундах
+        # 2b) Одиночные замены цифр в градусах, минутах и целых секундах
         deg_str = f"{seg.degrees:02d}"
         for pos in range(2):
             for d_ch in "0123456789":
@@ -3928,7 +4010,9 @@ def _detect_and_repair_obvious_typos(
                 f"{seg.degrees:02d}{seg.minutes:02d}{orig_sec_int:02d}",
                 f"{nd:02d}{nm:02d}{int(round(ns_val)):02d}",
             )
-            is_look = bool(d_diff and _is_lookalike_digit_pair(*d_diff))
+            if d_diff is None:
+                continue
+            is_look = _is_lookalike_digit_pair(*d_diff)
             if not (ref_match or is_look):
                 continue
             ortho_cnt, _ = _corner_geometry_score(trial)
@@ -3936,14 +4020,15 @@ def _detect_and_repair_obvious_typos(
             dms_candidates.append(
                 (
                     -ortho_cnt,
-                    0 if ref_match else 1,
                     0 if is_look else 1,
+                    0 if ref_match else 1,
                     street_pen,
                     err,
                     idx,
                     mutated,
                     pair_desc,
-                )  # type: ignore[arg-type]
+                    is_look,
+                )
             )
 
     if dms_candidates:
@@ -3957,25 +4042,33 @@ def _detect_and_repair_obvious_typos(
             and abs(c[4] - best[4]) < 0.01
         ]
         if not rivals:
-            _, _, _, _, best_err, best_idx, best_seg, pair_desc = best  # type: ignore[misc]
+            _, _, _, _, best_err, best_idx, best_seg, pair_desc, is_look = best
             old_lbl = segs[best_idx].bearing_label
             repaired = list(segs)
             repaired[best_idx] = best_seg
-            return (
-                repaired,
-                None,
-                [
+            return TypoSuspicion(
+                segment_index=best_idx + 1,
+                kind="angle_digit",
+                original_value=old_lbl,
+                suggested_value=best_seg.bearing_label,
+                digit_pair=pair_desc,
+                is_lookalike=is_look,
+                closure_before_ft=err0,
+                closure_after_ft=best_err,
+                reason_ru=(
                     f"Обнаружена и исправлена опечатка цифр в угле стороны №{best_idx + 1} "
                     f"(цифра {pair_desc}): «{old_lbl}» → «{best_seg.bearing_label}» "
                     f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
-                ],
+                ),
+                repaired_segments=repaired,
+                unanimous_llm_passes=unanimous_llm_passes,
             )
 
-    # --- 4. Опечатка похожей цифры (3↔8, 8↔0, 1↔7, 5↔6 и др.) в длине стороны ---
+    # --- 3. Одноцифровая разница в длине стороны (включая непохожие цифры типа 54.00' vs 56.00'!) ---
     if err0 >= 0.25:
         ex = sum(s.vector[0] for s in segs)
         ey = sum(s.vector[1] for s in segs)
-        dist_matches: list[tuple[int, Segment, str, str, tuple[str, str], float]] = []
+        dist_matches: list[tuple[int, Segment, str, str, tuple[str, str], float, bool]] = []
         for idx, seg in enumerate(segs):
             dx, dy = seg.vector
             length = math.hypot(dx, dy)
@@ -3992,16 +4085,17 @@ def _detect_and_repair_obvious_typos(
             s_old = f"{seg.distance_ft:.2f}"
             s_new = f"{cand_len:.2f}"
             diff_pair = _single_digit_diff(s_old, s_new)
-            if diff_pair is None or not _is_lookalike_digit_pair(*diff_pair):
+            if diff_pair is None:
                 continue
+            is_look = _is_lookalike_digit_pair(*diff_pair)
             mutated = seg.model_copy(update={"distance_ft": cand_len})
             trial = list(segs)
             trial[idx] = mutated
             err_after, valid = _trace_closure_and_validity(trial)
             if valid and err_after <= 0.03:
-                dist_matches.append((idx, mutated, s_old, s_new, diff_pair, err_after))
+                dist_matches.append((idx, mutated, s_old, s_new, diff_pair, err_after, is_look))
 
-        chosen_dist: tuple[int, Segment, str, str, tuple[str, str], float] | None = None
+        chosen_dist: tuple[int, Segment, str, str, tuple[str, str], float, bool] | None = None
         if len(dist_matches) == 1:
             chosen_dist = dist_matches[0]
         elif len(dist_matches) > 1:
@@ -4010,20 +4104,164 @@ def _detect_and_repair_obvious_typos(
                 chosen_dist = non_street[0]
 
         if chosen_dist is not None:
-            best_idx, best_seg, s_old, s_new, (d_old, d_new), best_err = chosen_dist
+            best_idx, best_seg, s_old, s_new, (d_old, d_new), best_err, is_look = chosen_dist
             repaired = list(segs)
             repaired[best_idx] = best_seg
-            return (
-                repaired,
-                None,
-                [
+            return TypoSuspicion(
+                segment_index=best_idx + 1,
+                kind="length_digit",
+                original_value=f"{s_old}'",
+                suggested_value=f"{s_new}'",
+                digit_pair=f"{d_old}→{d_new}",
+                is_lookalike=is_look,
+                closure_before_ft=err0,
+                closure_after_ft=best_err,
+                reason_ru=(
                     f"Обнаружена и исправлена очевидная опечатка цифры в длине стороны №{best_idx + 1} "
                     f"(цифра {d_old}→{d_new}): {s_old}' → {s_new}' "
                     f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
-                ],
+                ),
+                repaired_segments=repaired,
+                unanimous_llm_passes=unanimous_llm_passes,
             )
 
-    return segs, None, []
+    return None
+
+
+def _detect_and_repair_obvious_typos(
+    segments: Sequence[Segment],
+    *,
+    front_segment_index: int | None = None,
+    cross_street_side_index: int | None = None,
+    from_vision: bool = False,
+    auto_apply: bool = True,
+    unanimous_llm_passes: int = 0,
+) -> tuple[list[Segment], dict[int, int] | None, list[str]]:
+    """
+    Геодезический поиск очевидных опечаток текста / OCR с защитой от «безумной самостоятельности»:
+      * топологическая ориентация стрелок обхода (180° без смены цифр) на чертежах Vision выполняется безопасно;
+      * любые замены цифр/квадрантов применяются ТОЛЬКО если ``auto_apply=True``,
+        цифры действительно визуально похожи (``is_lookalike=True``, т.е. НЕ 54→56!)
+        и НЕТ единогласного консенсуса 2+ независимых проходов LLM (``unanimous_llm_passes < 2``).
+    """
+    segs, old_to_new, align_notes = _align_vision_loop_walk_order(
+        segments, from_vision=from_vision
+    )
+    eff_front = (
+        old_to_new.get(front_segment_index, front_segment_index)
+        if (old_to_new and front_segment_index is not None)
+        else front_segment_index
+    )
+    eff_cross = (
+        old_to_new.get(cross_street_side_index, cross_street_side_index)
+        if (old_to_new and cross_street_side_index is not None)
+        else cross_street_side_index
+    )
+    cand = _scan_single_typo_candidate(
+        segs,
+        front_segment_index=eff_front,
+        cross_street_side_index=eff_cross,
+        unanimous_llm_passes=unanimous_llm_passes,
+    )
+    if cand is not None and cand.can_auto_apply(ask_on_doubt=not auto_apply):
+        assert cand.repaired_segments is not None
+        return cand.repaired_segments, old_to_new, [*align_notes, cand.reason_ru]
+    return segs, old_to_new, align_notes
+
+
+def _finalize_repaired_model_tie(
+    base_model: LegalDescription,
+    new_segments: list[Segment],
+    *,
+    source_text: str = "",
+) -> LegalDescription:
+    """Строит копию ``LegalDescription`` с заменёнными сегментами и согласованным ``corner_to_pob_bearing``."""
+    upd: dict[str, Any] = {"segments": new_segments}
+    if base_model.distance_to_corner_ft > 1e-6:
+        pob_dir: str | None = None
+        explicit_tie: Segment | None = None
+        if source_text.strip():
+            preamble, lot_body = _split_preamble_and_body(source_text)
+            pob_dir, explicit_tie = _extract_pob_tie_hint(
+                preamble=preamble,
+                lot_body=lot_body,
+                distance_to_corner=base_model.distance_to_corner_ft,
+            )
+        expected_tie = infer_corner_to_pob_bearing(
+            new_segments,
+            distance_to_corner_ft=base_model.distance_to_corner_ft,
+            front_segment_index=base_model.front_segment_index,
+            front_side=base_model.front_side,
+            pob_direction=pob_dir,
+            explicit_tie_segment=explicit_tie,
+        )
+        if expected_tie is not None:
+            upd["corner_to_pob_bearing"] = expected_tie
+    return base_model.model_copy(update=upd)
+
+
+def detect_typo_suspicions(
+    model: LegalDescription,
+    *,
+    source_text: str = "",
+    unanimous_llm_passes: int = 0,
+) -> list[TypoSuspicion]:
+    """
+    Находит подозрения на опечатку или сомнительные места в ``model`` БЕЗ изменения ``model``.
+    Для каждого найденного числового/буквенного кандидата прикладывает ``repaired_data``,
+    чтобы пользователь в GUI мог по своей воле либо оставить документ как есть,
+    либо запустить прицельный раунд LLM с инъекцией промпта на зону внимания,
+    либо вручную подтвердить исправление.
+    """
+    suspicions: list[TypoSuspicion] = []
+    cand = _scan_single_typo_candidate(
+        model.segments,
+        front_segment_index=model.front_segment_index,
+        cross_street_side_index=model.cross_street_side_index,
+        unanimous_llm_passes=unanimous_llm_passes,
+    )
+    if cand is not None:
+        if cand.repaired_segments is not None:
+            cand.repaired_data = _finalize_repaired_model_tie(
+                model, cand.repaired_segments, source_text=source_text
+            )
+        # Человекочитаемое объяснение подозрения (без ложного утверждения «уже исправлено»!)
+        consensus_note = (
+            f" Все {unanimous_llm_passes} независимых прохода ИИ единогласно прочитали «{cand.original_value}» — "
+            "самовольная подмена запрещена!"
+            if unanimous_llm_passes >= 2
+            else (
+                f" Цифры ({cand.digit_pair}) визуально не похожи — автоматическая замена отключена."
+                if not cand.is_lookalike
+                else ""
+            )
+        )
+        cand.reason_ru = (
+            f"Подозрение на несовпадение в стороне №{cand.segment_index} ({cand.digit_pair}): "
+            f"в документе прочитано «{cand.original_value}» (невязка {cand.closure_before_ft:.3f} ft), "
+            f"тогда как при значении «{cand.suggested_value}» контур замкнулся бы в {cand.closure_after_ft:.3f} ft."
+            f"{consensus_note}"
+        )
+        suspicions.append(cand)
+
+    err0, _ = _trace_closure_and_validity(model.segments)
+    if not suspicions and model.anomaly_note and err0 > 0.05:
+        suspicions.append(
+            TypoSuspicion(
+                segment_index=0,
+                kind="llm_anomaly",
+                original_value="",
+                suggested_value="",
+                digit_pair="",
+                is_lookalike=False,
+                closure_before_ft=err0,
+                closure_after_ft=err0,
+                reason_ru=f"Замечание ИИ при невязке {err0:.3f} ft: {model.anomaly_note}",
+                repaired_data=None,
+                unanimous_llm_passes=unanimous_llm_passes,
+            )
+        )
+    return suspicions
 
 
 def _repair_llm_geometry(
@@ -4031,15 +4269,17 @@ def _repair_llm_geometry(
     *,
     from_vision: bool = False,
     source_text: str = "",
+    auto_apply_typos: bool = False,
+    unanimous_llm_passes: int = 0,
 ) -> tuple[LegalDescription, list[str]]:
     """
-    Упреждающая санитарная проверка и поиск очевидных опечаток ответа LLM / Vision:
+    Санитарная проверка ответа LLM / Vision:
       1) не допускает привязки main_street к тыльной/боковой границе PARALLEL WITH / AT RIGHT ANGLES;
       2) не допускает углового cross_street_side_index на рядовом участке (distance_to_corner_ft > 0.5);
-      3) ищет очевидные опечатки в буквах N/S/E/W, цифрах углов и похожих цифрах длин
-         (3↔8, 8↔0, 1↔7, 5↔6 и др.) либо перестановку/разворот сторон на чертеже Survey,
-         всегда формируя подробное пояснение; неоднозначные расхождения не маскирует;
-      4) сверяет вектор привязки corner_to_pob_bearing с направлением к POB вдоль main_street.
+      3) выстраивает непрерывный обход на чертеже Survey (180° без изменения цифр!);
+      4) НЕ меняет цифры и буквы румбов без разрешения (``auto_apply_typos=False`` по умолчанию,
+         и НИКОГДА не меняет при ``unanimous_llm_passes >= 2`` или для непохожих цифр вроде 54→56);
+      5) сверяет вектор привязки corner_to_pob_bearing с направлением к POB вдоль main_street.
     """
     notes: list[str] = []
     if model.anomaly_note:
@@ -4068,6 +4308,8 @@ def _repair_llm_geometry(
         front_segment_index=eff_front,
         cross_street_side_index=eff_cross,
         from_vision=from_vision,
+        auto_apply=auto_apply_typos,
+        unanimous_llm_passes=unanimous_llm_passes,
     )
     if typo_notes:
         updates["segments"] = repaired_segs
@@ -4474,6 +4716,7 @@ def parse_legal_description_full(
     rotation_deg: int | Sequence[int] = 0,
     enhance_scan: bool | None = None,
     auto_orient: bool = False,
+    ask_on_doubt: bool | None = None,
     use_llm: bool = True,
     provider: str | None = None,
     model: str | None = None,
@@ -4482,28 +4725,45 @@ def parse_legal_description_full(
     allow_regex_fallback: bool = False,
     progress: Callable[[str], None] | None = None,
     focus_instruction: str | None = None,
+    prepared_input: tuple[str, list[str], list[str]] | None = None,
+    prior_usage: TokenUsage | None = None,
 ) -> ParseOutcome:
     """
     Полный разбор: PDF / пачка фото чертежей (JPG/PNG/TIFF/WEBP) / текст ->
     LLM (или локальный парсер) -> LegalDescription.
     """
     cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
-    combined, image_data_urls, warnings, orient_usage = _prepare_parse_input(
-        text,
-        pdf_path,
-        cfg,
-        use_llm=use_llm,
-        image_paths=image_paths,
-        pdf_pages=pdf_pages,
-        rotation_deg=rotation_deg,
-        enhance_scan=enhance_scan,
-        auto_orient=auto_orient,
-        orient_provider=provider,
-        orient_model=model,
-        orient_api_key=api_key,
-        key_secret=key_secret,
-        progress=progress,
+    eff_ask_on_doubt = (
+        bool(cfg.get("api", {}).get("ask_on_doubt", True))
+        if ask_on_doubt is None
+        else bool(ask_on_doubt)
     )
+    orient_usage: TokenUsage | None = None
+    if prepared_input is not None:
+        combined, image_data_urls, base_warnings = (
+            prepared_input[0],
+            list(prepared_input[1]),
+            list(prepared_input[2]),
+        )
+        warnings = list(base_warnings)
+    else:
+        combined, image_data_urls, warnings, orient_usage = _prepare_parse_input(
+            text,
+            pdf_path,
+            cfg,
+            use_llm=use_llm,
+            image_paths=image_paths,
+            pdf_pages=pdf_pages,
+            rotation_deg=rotation_deg,
+            enhance_scan=enhance_scan,
+            auto_orient=auto_orient,
+            orient_provider=provider,
+            orient_model=model,
+            orient_api_key=api_key,
+            key_secret=key_secret,
+            progress=progress,
+        )
+        base_warnings = list(warnings)
 
     llm_error: Exception | None = None
     if use_llm:
@@ -4519,22 +4779,33 @@ def parse_legal_description_full(
                 image_data_urls=image_data_urls or None,
                 focus_instruction=focus_instruction,
             )
-            if orient_usage is not None and usage is not None:
-                usage = TokenUsage(
-                    prompt_tokens=orient_usage.prompt_tokens + usage.prompt_tokens,
-                    completion_tokens=orient_usage.completion_tokens + usage.completion_tokens,
-                    total_tokens=orient_usage.total_tokens + usage.total_tokens,
-                    provider=usage.provider,
-                    provider_label=usage.provider_label,
-                    model=usage.model,
-                    available=usage.available or orient_usage.available,
-                )
+            for extra_u in (orient_usage, prior_usage):
+                if extra_u is not None and usage is not None:
+                    usage = TokenUsage(
+                        prompt_tokens=extra_u.prompt_tokens + usage.prompt_tokens,
+                        completion_tokens=extra_u.completion_tokens + usage.completion_tokens,
+                        total_tokens=extra_u.total_tokens + usage.total_tokens,
+                        provider=usage.provider,
+                        provider_label=usage.provider_label,
+                        model=usage.model,
+                        available=usage.available or extra_u.available,
+                    )
             parsed_model, repair_notes = _repair_llm_geometry(
                 parsed_model,
                 from_vision=bool(image_data_urls),
                 source_text=combined,
+                auto_apply_typos=not eff_ask_on_doubt,
+                unanimous_llm_passes=1,
             )
             warnings.extend(repair_notes)
+            suspicions = detect_typo_suspicions(
+                parsed_model,
+                source_text=combined,
+                unanimous_llm_passes=1,
+            )
+            for susp in suspicions:
+                if susp.reason_ru not in warnings:
+                    warnings.append(f"⚠ {susp.reason_ru}")
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
             return ParseOutcome(
@@ -4546,6 +4817,10 @@ def parse_legal_description_full(
                 provider_label=usage.provider_label,
                 model=usage.model,
                 llm_mode=mode,
+                typo_suspicions=suspicions,
+                prepared_text=combined,
+                prepared_images=list(image_data_urls),
+                base_warnings=base_warnings,
             )
         except Exception as exc:  # noqa: BLE001
             llm_error = exc
@@ -4555,8 +4830,19 @@ def parse_legal_description_full(
 
     if progress:
         progress("Локальный разбор текста (regex)…")
-    parsed_model, regex_warnings = parse_with_regex(combined)
+    parsed_model, regex_warnings = parse_with_regex(
+        combined,
+        auto_repair_typos=not eff_ask_on_doubt,
+    )
     warnings.extend(regex_warnings)
+    suspicions_rx = detect_typo_suspicions(
+        parsed_model,
+        source_text=combined,
+        unanimous_llm_passes=0,
+    )
+    for susp in suspicions_rx:
+        if susp.reason_ru not in warnings:
+            warnings.append(f"⚠ {susp.reason_ru}")
 
     if llm_error is not None:
         warnings.insert(0, "геометрия получена локальным парсером — проверьте размеры вручную")
@@ -4564,6 +4850,10 @@ def parse_legal_description_full(
         data=parsed_model,
         source="llm" if not llm_error and use_llm else "regex",
         warnings=warnings,
+        typo_suspicions=suspicions_rx,
+        prepared_text=combined,
+        prepared_images=list(image_data_urls),
+        base_warnings=base_warnings,
     )
 
 
@@ -4691,6 +4981,9 @@ class ConsensusResult:
             else f"Конфликт проходов разрешён человеком: выбран {label}"
         )
         merged_warnings = [note, *chosen.warnings]
+        suspicions = detect_typo_suspicions(
+            chosen.data, source_text=self.prepared_text, unanimous_llm_passes=1
+        )
         return ParseOutcome(
             data=chosen.data,
             source=chosen.source,
@@ -4700,6 +4993,10 @@ class ConsensusResult:
             provider_label=chosen.provider_label,
             model=chosen.model,
             llm_mode=chosen.llm_mode,
+            typo_suspicions=suspicions,
+            prepared_text=self.prepared_text,
+            prepared_images=list(self.prepared_images),
+            base_warnings=list(self.base_warnings),
         )
 
 
@@ -4968,9 +5265,10 @@ def run_multipass_consensus(
     *,
     image_paths: Sequence[str | Path] | None = None,
     pdf_pages: str | Sequence[int] | None = None,
-    rotation_deg: int | Sequence[int] = 0,
+    rotation_deg: int | Sequence[int] | None | int = 0,
     enhance_scan: bool | None = None,
     auto_orient: bool = False,
+    ask_on_doubt: bool | None = None,
     targets: Sequence[PassTarget] | None = None,
     passes: int | None = None,
     primary_provider: str | None = None,
@@ -4986,8 +5284,15 @@ def run_multipass_consensus(
     """
     Выполняет 2 или 3 независимых параллельных вызова LLM (по одному на каждый PassTarget),
     сравнивает геометрию и метаданные и возвращает ``ConsensusResult``.
+    ВАЖНО: при согласованном ответе 2+ независимых проходов ИИ система НИКОГДА не подменяет
+    единогласно прочитанные цифры своими эвристиками (даже при выключенном «Спрашивать при сомнении»).
     """
     cfg_copy = copy.deepcopy(cfg) if cfg is not None else load_config()
+    eff_ask_on_doubt = (
+        bool(cfg_copy.get("api", {}).get("ask_on_doubt", True))
+        if ask_on_doubt is None
+        else bool(ask_on_doubt)
+    )
     pass_targets = (
         list(targets)
         if targets is not None
@@ -5036,7 +5341,7 @@ def run_multipass_consensus(
             use_llm=True,
             image_paths=image_paths,
             pdf_pages=pdf_pages,
-            rotation_deg=rotation_deg,
+            rotation_deg=rotation_deg or 0,
             enhance_scan=enhance_scan,
             auto_orient=auto_orient,
             orient_provider=p1.provider,
@@ -5069,10 +5374,13 @@ def run_multipass_consensus(
             image_data_urls=image_data_urls or None,
             focus_instruction=focus_instruction,
         )
+        # Внутри отдельных проходов НИКОГДА не меняем цифры/буквы эвристикой опечаток,
+        # чтобы compare_legal_descriptions сравнивал буквально то, что прочитала каждая модель!
         parsed_model, repair_notes = _repair_llm_geometry(
             parsed_model,
             from_vision=bool(image_data_urls),
             source_text=combined,
+            auto_apply_typos=False,
         )
         p_warnings = list(base_warnings) + list(repair_notes)
         if mode != "structured-outputs":
@@ -5088,6 +5396,9 @@ def run_multipass_consensus(
             provider_label=usage.provider_label,
             model=usage.model,
             llm_mode=mode,
+            prepared_text=combined,
+            prepared_images=list(image_data_urls),
+            base_warnings=list(base_warnings),
         )
 
     outcomes_by_index: dict[int, ParseOutcome] = {}
@@ -5131,12 +5442,22 @@ def run_multipass_consensus(
                 f"✓ Консенсус {n_passes}/{n_passes} независимых проходов LLM: "
                 "ответы полностью совпали"
             )
-        # Склеиваем уникальные пояснения со всех проходов без дублей
         merged_warns: list[str] = [consensus_banner]
         for out in ordered_outcomes:
             for w in out.warnings:
                 if w not in merged_warns:
                     merged_warns.append(w)
+        # ЖЁСТКИЙ ЗАПРЕТ: при согласованности 2+ мнений LLM мы НЕ трогаем согласованные цифры,
+        # а формируем только список подозрений (typo_suspicions) для прицельной проверки или решения юзера!
+        suspicions = detect_typo_suspicions(
+            first.data,
+            source_text=combined,
+            unanimous_llm_passes=n_passes,
+        )
+        for susp in suspicions:
+            warn_line = f"⚠ {susp.reason_ru}"
+            if warn_line not in merged_warns:
+                merged_warns.append(warn_line)
         selected = ParseOutcome(
             data=first.data,
             source=first.source,
@@ -5146,17 +5467,47 @@ def run_multipass_consensus(
             provider_label=f"Консенсус {n_passes}/{n_passes}",
             model=", ".join(o.model for o in ordered_outcomes if o.model),
             llm_mode=first.llm_mode,
+            typo_suspicions=suspicions,
+            prepared_text=combined,
+            prepared_images=list(image_data_urls),
+            base_warnings=list(base_warnings),
         )
     else:
+        sel_data = first.data
+        sel_warns = list(first.warnings)
+        if n_passes == 1 and not eff_ask_on_doubt:
+            sel_data, extra_notes = _repair_llm_geometry(
+                sel_data,
+                from_vision=bool(image_data_urls),
+                source_text=combined,
+                auto_apply_typos=True,
+                unanimous_llm_passes=1,
+            )
+            for en in extra_notes:
+                if en not in sel_warns:
+                    sel_warns.append(en)
+        suspicions_single = (
+            detect_typo_suspicions(sel_data, source_text=combined, unanimous_llm_passes=1)
+            if agreed
+            else []
+        )
+        for susp in suspicions_single:
+            warn_line = f"⚠ {susp.reason_ru}"
+            if warn_line not in sel_warns:
+                sel_warns.append(warn_line)
         selected = ParseOutcome(
-            data=first.data,
+            data=sel_data,
             source=first.source,
-            warnings=list(first.warnings),
+            warnings=sel_warns,
             usage=total_usage,
             provider=first.provider,
             provider_label=first.provider_label,
             model=first.model,
             llm_mode=first.llm_mode,
+            typo_suspicions=suspicions_single,
+            prepared_text=combined,
+            prepared_images=list(image_data_urls),
+            base_warnings=list(base_warnings),
         )
 
     return ConsensusResult(
@@ -5199,3 +5550,118 @@ def recheck_consensus_discrepancies(
             consensus.base_warnings,
         ),
     )
+
+
+def build_typo_suspicion_focus_prompt(
+    suspicions: Sequence[TypoSuspicion],
+    *,
+    extra_attention_notes: Sequence[str] | None = None,
+    round_number: int = 2,
+) -> str:
+    """
+    Формирует прицельную инъекцию промпта на зону внимания (подозрение на опечатку или
+    геометрическую аномалию) БЕЗ давления «подогнать ответ под замыкание».
+    """
+    lines: list[str] = [
+        f"TARGETED ATTENTION-ZONE VERIFICATION (ROUND #{round_number}):",
+        "Our survey geometry engine detected a closure/geometry suspicion in the extracted calls.",
+        "Zoom in with extreme care on the exact attention zone(s) below in the attached document:",
+    ]
+    for idx, susp in enumerate(suspicions, start=1):
+        if susp.segment_index > 0 and susp.suggested_value:
+            lines.append(
+                f"  {idx}. ATTENTION ON SIDE #{susp.segment_index}: previously read as "
+                f"'{susp.original_value}' (leaves closure gap {susp.closure_before_ft:.3f} ft; "
+                f"'{susp.suggested_value}' would close to {susp.closure_after_ft:.3f} ft, "
+                f"character difference {susp.digit_pair})."
+            )
+        else:
+            lines.append(f"  {idx}. ATTENTION ZONE: {susp.reason_ru}")
+    for note in extra_attention_notes or ():
+        lines.append(f"  - GEOMETRY CHECKPOINT: {note}")
+
+    lines.extend(
+        [
+            "",
+            "STRICT ANTI-HALLUCINATION & VERBATIM VERIFICATION RULES:",
+            "1. Re-read the exact digits, decimal points, fractional inches, degrees/minutes/seconds, "
+            "and N/S/E/W quadrant letters at the flagged side(s) AND check adjacent sides/angles "
+            "(also verify whether a small jog/chamfer segment was missed or a building/setback number was confused with a lot line).",
+            "2. DO NOT GUESS OR FORCE CLOSURE! If the source PDF/photo genuinely prints the original number "
+            "(for example, if it really says '54' and NOT '56'), YOU MUST OUTPUT '54' AGAIN! "
+            "Never substitute a clearly printed number just to make the polygon close!",
+            "3. Only change a value if magnified visual/text inspection proves the previous reading misread "
+            "a glyph in the source document.",
+            "4. In `anomaly_note` (in Russian), explicitly report what exact digits/letters are printed "
+            "in the source document in this attention zone and your conclusion.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def recheck_typo_suspicion(
+    previous_outcome: ParseOutcome,
+    cfg: dict[str, Any] | None = None,
+    *,
+    targets: Sequence[PassTarget] | None = None,
+    primary_provider: str | None = None,
+    primary_model: str | None = None,
+    primary_api_key: str | None = None,
+    key_secret: str = "",
+    extra_attention_notes: Sequence[str] | None = None,
+    round_number: int = 2,
+    progress: Callable[[str], None] | None = None,
+) -> ConsensusResult | ParseOutcome:
+    """
+    Запускает дополнительный раунд проходов LLM (1, 2 или 3 прохода в зависимости от конфигурации)
+    с прицельной инъекцией промпта на зону подозрительной стороны/опечатки, переиспользуя уже
+    подготовленные страницы PDF / фотографии без повторного рендеринга.
+    """
+    cfg_copy = copy.deepcopy(cfg) if cfg is not None else load_config()
+    focus_prompt = build_typo_suspicion_focus_prompt(
+        previous_outcome.typo_suspicions,
+        extra_attention_notes=extra_attention_notes,
+        round_number=round_number,
+    )
+    prep = (
+        previous_outcome.prepared_text,
+        list(previous_outcome.prepared_images),
+        list(previous_outcome.base_warnings),
+    )
+    eff_targets = (
+        list(targets)
+        if targets is not None
+        else build_pass_targets(
+            cfg_copy,
+            primary_provider=primary_provider,
+            primary_model=primary_model,
+            primary_api_key=primary_api_key,
+        )
+    )
+    if len(eff_targets) >= 2:
+        return run_multipass_consensus(
+            cfg=cfg_copy,
+            targets=eff_targets,
+            ask_on_doubt=True,
+            key_secret=key_secret,
+            progress=progress,
+            focus_instruction=focus_prompt,
+            prior_usage=previous_outcome.usage,
+            round_number=round_number,
+            prepared_input=prep,
+        )
+    t1 = eff_targets[0]
+    return parse_legal_description_full(
+        cfg=cfg_copy,
+        ask_on_doubt=True,
+        use_llm=True,
+        provider=t1.provider,
+        model=t1.model,
+        api_key=t1.api_key,
+        key_secret=key_secret,
+        progress=progress,
+        focus_instruction=focus_prompt,
+        prepared_input=prep,
+        prior_usage=previous_outcome.usage,
+    )
+

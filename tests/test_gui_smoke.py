@@ -1124,6 +1124,156 @@ def test_gui_lot_suspicion_signal_on_closed_skewed_rectangle(gui) -> None:
     app._on_close()
 
 
+def test_gui_ask_on_doubt_checkbox_prevents_silent_54_to_56_and_supports_focus_recheck(
+    gui, monkeypatch
+) -> None:
+    """
+    Сквозной GUI-тест защиты от самовольной подмены цифр (кейс «54 в PDF -> нельзя молча менять на 56»):
+      1) галочка «Спрашивать при сомнении» по умолчанию включена (True);
+      2) обе LLM в 2-проходном режиме читают 54.00' (при фасаде 56.00') ->
+         AutoCAD НЕ чертится без спроса, открывается панель/окно сомнения;
+      3) нажатие «🔬 Ещё раунд LLM с фокусом на зону внимания» отправляет инъекцию промпта на сторону #2;
+      4) нажатие «📄 Оставить как в документе» чертит именно паспортные 54.00', а «✏️ Применить» — 56.00';
+      5) при снятой галочке «Спрашивать при сомнении» 54.00' ВСЁ РАВНО не превращается в 56.00'!
+    """
+    import time
+    import llm_parser
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES, TokenUsage, parse_with_regex
+
+    app = gui.SurveyApp()
+    assert app.ask_on_doubt_var.get() is True
+
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    d_54 = dm.model_copy(deep=True)
+    d_54.segments[1] = d_54.segments[1].model_copy(update={"distance_ft": 54.0})
+    d_54.segments[3] = d_54.segments[3].model_copy(update={"distance_ft": 56.0})
+
+    focus_seen: list[str | None] = []
+
+    def fake_extract(
+        text,
+        cfg_arg,
+        *,
+        api_key=None,
+        progress=None,
+        provider=None,
+        model=None,
+        key_secret="",
+        image_data_urls=None,
+        focus_instruction=None,
+    ):
+        focus_seen.append(focus_instruction)
+        m = d_54.model_copy(deep=True)
+        if focus_instruction:
+            m.anomaly_note = "В PDF чётко напечатано 54.00', это не опечатка OCR."
+        return (
+            m,
+            "structured-outputs",
+            TokenUsage(
+                prompt_tokens=120,
+                completion_tokens=60,
+                total_tokens=180,
+                provider=str(provider),
+                model=str(model),
+                available=True,
+            ),
+        )
+
+    drawn_rear_lengths: list[float] = []
+
+    def fake_draw(self_builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        plan = self_builder.plan(description, scale=scale, is_neighbor=is_neighbor)
+        drawn_rear_lengths.append(description.segments[1].distance_ft)
+        return DrawResult(
+            plan=plan,
+            text_count=len(plan.items),
+            layers={"property_line": "PROPERTY_LINE", "boundary_text": "BOUNDARY_TEXT_AI"},
+        )
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+
+    app.use_llm_var.set(True)
+    app.passes_label_var.set("2 прохода")
+    app._on_passes_changed("2 прохода")
+    app.provider_key_vars["hydra"].set("sk-hydra-test")
+    app.provider_key_vars["openrouter"].set("sk-or-test")
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+
+    # Шаг 1: Запускаем отрисовку с включённым «Спрашивать при сомнении» -> стоп перед AutoCAD!
+    app._start(parse_only=False)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert drawn_rear_lengths == []
+    assert app.pending_doubt is not None
+    assert "54.00'" in app.doubt_title_var.get()
+    assert "56.00'" in app.doubt_title_var.get()
+
+    # Шаг 2: Юзер нажимает «🔬 Ещё раунд LLM с фокусом на зону внимания»
+    focus_seen.clear()
+    app.retry_doubt_with_focus()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert len(focus_seen) == 2
+    assert all(f and "TARGETED ATTENTION-ZONE VERIFICATION" in f and "SIDE #2" in f for f in focus_seen)
+    assert app.pending_doubt is not None
+    assert "В PDF чётко напечатано 54.00'" in app.status_var.get()
+    assert drawn_rear_lengths == []
+
+    # Шаг 3: Юзер выбирает «📄 Оставить как в документе (54.00')» -> в AutoCAD рисуется именно 54.00'!
+    app.confirm_doubt_keep_verbatim()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+
+    assert app.pending_doubt is None
+    assert drawn_rear_lengths == [pytest.approx(54.0)]
+
+    # Шаг 4: А если юзер явно нажал «✏️ Применить исправление» — применяется 56.00'
+    drawn_rear_lengths.clear()
+    app._start(parse_only=False)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert app.pending_doubt is not None
+    app.confirm_doubt_apply_fix()
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert drawn_rear_lengths == [pytest.approx(56.0)]
+
+    # Шаг 5: Снимаем галочку «Спрашивать при сомнении» -> без диалога, но 54.00' ВСЁ РАВНО НЕ подменяется на 56.00'!
+    drawn_rear_lengths.clear()
+    app.ask_on_doubt_var.set(False)
+    app._start(parse_only=False)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert app.pending_doubt is None
+    assert drawn_rear_lengths == [pytest.approx(54.0)]
+    app._on_close()
+
+
+
 
 
 

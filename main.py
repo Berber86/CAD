@@ -90,6 +90,7 @@ from llm_parser import (
     LegalDescriptionError,
     ParseOutcome,
     TokenUsage,
+    TypoSuspicion,
     clean_provider_key,
     inspect_pdf,
     is_image_file,
@@ -102,6 +103,7 @@ from llm_parser import (
     prepare_survey_image_bytes,
     protect_api_key,
     recheck_consensus_discrepancies,
+    recheck_typo_suspicion,
     run_multipass_consensus,
     save_config,
     save_protected_env,
@@ -109,7 +111,7 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1180x880"
-VERSION = "0.9.5"
+VERSION = "1.0.0"
 
 # Палитра Dark CAD Studio (высокий контраст, спокойные инженерные акценты)
 THEME: dict[str, str] = {
@@ -262,6 +264,11 @@ class SurveyApp(ctk.CTk):
         # ИИ-автоповорот через LLM ВСЕГДА выключен по умолчанию (доп. платный вызов API);
         # включается только разово на 1 конкретный запуск с явным предупреждением.
         self.auto_orient_var = ctk.BooleanVar(value=False)
+        self.ask_on_doubt_var = ctk.BooleanVar(
+            value=bool(self.config_data.get("api", {}).get("ask_on_doubt", True))
+        )
+        self.pending_doubt: dict[str, Any] | None = None
+        self.doubt_window: Any | None = None
         self.preview_modes = ["📐 Схема CAD", "🖼 Исходник"]
         self.preview_mode_var = ctk.StringVar(value=self.preview_modes[0])
         self.description: LegalDescription | None = None
@@ -694,6 +701,17 @@ class SurveyApp(ctk.CTk):
             command=self._on_passes_changed,
         )
         self.passes_switch.grid(row=0, column=6, sticky="e")
+
+        self.ask_on_doubt_check = ctk.CTkCheckBox(
+            llm_row,
+            text="Спрашивать при сомнении",
+            variable=self.ask_on_doubt_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.ask_on_doubt_check.grid(row=0, column=7, padx=(12, 0), sticky="e")
 
         # Раскрываемая строка Прохода #2 (при 2 или 3 проходах)
         self.pass2_row = ctk.CTkFrame(ai_card, fg_color="transparent")
@@ -1223,15 +1241,19 @@ class SurveyApp(ctk.CTk):
         self.progress.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 0))
         self.progress.set(0)
 
-        # 6. Панель разрешения конфликта проходов LLM ------------------------
+        # 6. Панель разрешения конфликта проходов LLM и сомнительных мест ----
+        self.alerts_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        self.alerts_wrap.grid(row=6, column=0, sticky="ew")
+        self.alerts_wrap.grid_columnconfigure(0, weight=1)
+
         self.conflict_bar = ctk.CTkFrame(
-            self,
+            self.alerts_wrap,
             fg_color=THEME["warn_bg"],
             corner_radius=10,
             border_width=1,
             border_color=THEME["warn_border"],
         )
-        self.conflict_bar.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 0))
         self.conflict_bar.grid_columnconfigure(0, weight=1)
 
         self.conflict_title_var = ctk.StringVar(
@@ -1306,6 +1328,79 @@ class SurveyApp(ctk.CTk):
         )
         self.open_conflict_details_button.grid(row=0, column=4, sticky="w")
         self.conflict_bar.grid_remove()
+
+        # Панель проверки подозрения на опечатку / рискованного действия
+        self.doubt_bar = ctk.CTkFrame(
+            self.alerts_wrap,
+            fg_color=THEME["warn_bg"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["warn_border"],
+        )
+        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.doubt_bar.grid_columnconfigure(0, weight=1)
+
+        self.doubt_title_var = ctk.StringVar(
+            value="🙋 Обнаружено сомнительное место / подозрение на опечатку!"
+        )
+        self.doubt_title_label = ctk.CTkLabel(
+            self.doubt_bar,
+            textvariable=self.doubt_title_var,
+            anchor="w",
+            justify="left",
+            wraplength=1100,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=THEME["warn"],
+        )
+        self.doubt_title_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
+
+        doubt_btns = ctk.CTkFrame(self.doubt_bar, fg_color="transparent")
+        doubt_btns.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+
+        self.retry_doubt_button = ctk.CTkButton(
+            doubt_btns,
+            text="🔬 Ещё раунд LLM с фокусом на зону внимания",
+            height=32,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.retry_doubt_with_focus,
+        )
+        self.retry_doubt_button.grid(row=0, column=0, padx=(0, 8), sticky="w")
+
+        self.keep_verbatim_button = ctk.CTkButton(
+            doubt_btns,
+            text="📄 Оставить как в документе",
+            height=32,
+            fg_color=THEME["btn_emerald"],
+            hover_color=THEME["btn_emerald_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.confirm_doubt_keep_verbatim,
+        )
+        self.keep_verbatim_button.grid(row=0, column=1, padx=(0, 8), sticky="w")
+
+        self.apply_typo_fix_button = ctk.CTkButton(
+            doubt_btns,
+            text="✏️ Применить исправление",
+            height=32,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.confirm_doubt_apply_fix,
+        )
+        self.apply_typo_fix_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+
+        self.open_doubt_details_button = ctk.CTkButton(
+            doubt_btns,
+            text="Подробности…",
+            height=32,
+            width=130,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            command=self._open_doubt_dialog,
+        )
+        self.open_doubt_details_button.grid(row=0, column=3, sticky="w")
+        self.doubt_bar.grid_remove()
 
         # 7. Нижняя приборная панель: KPI невязки и токенов + статус + лог ---
         status_frame = ctk.CTkFrame(
@@ -2735,6 +2830,7 @@ class SurveyApp(ctk.CTk):
         cfg["api"]["vision_enhance_scans"] = bool(self.enhance_scan_var.get())
         # Никогда не сохраняем платный ИИ-автоповорот как настройку по умолчанию
         cfg["api"]["vision_auto_orient"] = False
+        cfg["api"]["ask_on_doubt"] = bool(self.ask_on_doubt_var.get())
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
@@ -2938,6 +3034,9 @@ class SurveyApp(ctk.CTk):
             elif kind == "conflict":
                 self._finish_busy()
                 self._present_conflict(payload)
+            elif kind == "doubt":
+                self._finish_busy()
+                self._present_doubt(payload)
             elif kind == "batch_neighbors":
                 items_done, batch_errors = payload
                 self._finish_busy()
@@ -3645,6 +3744,38 @@ class SurveyApp(ctk.CTk):
                 f"POB ({plan.pob[0]:+.2f}, {plan.pob[1]:+.2f}) ft, "
                 f"Closure Error {plan.closure.distance:.3f} ft",
             )
+            ask_on_doubt = bool(cfg.get("api", {}).get("ask_on_doubt", True))
+            has_typo_suspicion = bool(outcome.typo_suspicions)
+            has_risky_draw_geometry = (
+                (not parse_only)
+                and (
+                    (plan.suspicion is not None and plan.suspicion.is_suspicious)
+                    or plan.closure.distance > 0.08
+                )
+            )
+            if ask_on_doubt and (has_typo_suspicion or has_risky_draw_geometry):
+                self._post(
+                    "doubt",
+                    {
+                        "outcome": outcome,
+                        "plan": plan,
+                        "cfg": cfg,
+                        "provider_id": provider_id,
+                        "model_name": model_name,
+                        "api_key": api_key,
+                        "key_secret": key_secret,
+                        "use_llm": use_llm,
+                        "scale": scale,
+                        "parse_only": parse_only,
+                        "is_neighbor": is_neighbor,
+                        "pre_counted": pre_counted,
+                        "round_usages": round_usages,
+                        "doubt_round": 1,
+                    },
+                )
+                self._post("done", None)
+                return
+
             if parse_only:
                 self._post("parsed", (outcome, None, pre_counted, round_usages))
                 self._post("done", None)
@@ -3708,7 +3839,22 @@ class SurveyApp(ctk.CTk):
                 f"всего {u.total_tokens:,}"
             )
 
+    def _dismiss_doubt_ui(self) -> None:
+        self.pending_doubt = None
+        try:
+            self.doubt_bar.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+        win = getattr(self, "doubt_window", None)
+        self.doubt_window = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _dismiss_conflict_ui(self) -> None:
+        self._dismiss_doubt_ui()
         self.pending_conflict = None
         try:
             self.conflict_bar.grid_remove()
@@ -3722,7 +3868,443 @@ class SurveyApp(ctk.CTk):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _build_doubt_report(self, doubt_ctx: dict[str, Any]) -> str:
+        outcome: ParseOutcome = doubt_ctx["outcome"]
+        plan: DrawPlan = doubt_ctx["plan"]
+        d_round = int(doubt_ctx.get("doubt_round") or 1)
+        parse_only = bool(doubt_ctx.get("parse_only", True))
+
+        lines: list[str] = []
+        if outcome.typo_suspicions:
+            lines.append(
+                f"🙋 Подозрение на опечатку / несовпадение контура (проверка #{d_round}):"
+            )
+            for idx, susp in enumerate(outcome.typo_suspicions, start=1):
+                lines.append(f"  {idx}. {susp.short_summary()}")
+                lines.append(f"     • {susp.reason_ru}")
+        else:
+            lines.append(
+                f"🙋 Подтверждение перед рискованным построением в AutoCAD (проверка #{d_round}):"
+            )
+            lines.append(
+                f"  • Невязка контура: {plan.closure.distance:.4f} ft"
+            )
+
+        if plan.suspicion is not None and plan.suspicion.is_suspicious:
+            lines.append("")
+            lines.append(plan.suspicion.format_report())
+
+        if outcome.data.anomaly_note:
+            lines.append("")
+            lines.append(f"💬 Ответ/наблюдение ИИ по документу: {outcome.data.anomaly_note}")
+
+        lines.append("")
+        lines.append("Автоматическая подмена цифр документа заблокирована. Выберите действие:")
+        lines.append(
+            "  • «🔬 Ещё раунд LLM с фокусом на зону внимания» — модели прицельно перечитают "
+            "именно спорную сторону в документе без давления «подогнать ответ»;"
+        )
+        lines.append(
+            "  • «📄 Оставить как в документе» — сохранить прочитанные из PDF/текста цифры "
+            + ("и показать схему;" if parse_only else "и начертить в AutoCAD как есть;")
+        )
+        first_fix = next(
+            (s for s in outcome.typo_suspicions if s.repaired_data is not None),
+            None,
+        )
+        if first_fix is not None:
+            lines.append(
+                f"  • «✏️ Применить исправление ({first_fix.original_value} → {first_fix.suggested_value})» — "
+                "заменить значение только если вы сами сверились с чертежом и уверены в опечатке."
+            )
+        return "\n".join(lines)
+
+    def _present_doubt(self, doubt_ctx: dict[str, Any]) -> None:
+        outcome: ParseOutcome = doubt_ctx["outcome"]
+        plan: DrawPlan = doubt_ctx["plan"]
+        pre_counted = bool(doubt_ctx.get("pre_counted", False))
+        round_usages = doubt_ctx.get("round_usages") or []
+        if round_usages:
+            self._record_round_usages(round_usages)
+            doubt_ctx["round_usages"] = []
+            doubt_ctx["pre_counted"] = True
+            pre_counted = True
+
+        self.pending_doubt = doubt_ctx
+        self._apply_parsed(outcome, already_counted=pre_counted)
+        doubt_ctx["pre_counted"] = True
+        self._record_plan_for_preview(plan, warnings=outcome.warnings)
+        self._update_closure_badge(plan.closure.short_report(), plan.closure.distance)
+
+        first_fix: TypoSuspicion | None = next(
+            (s for s in outcome.typo_suspicions if s.repaired_data is not None),
+            None,
+        )
+        if outcome.typo_suspicions:
+            head_txt = f"🙋 Сомнительное место: {outcome.typo_suspicions[0].short_summary()}"
+        elif plan.suspicion is not None and plan.suspicion.is_suspicious:
+            head_txt = f"🙋 Подтвердите перед отрисовкой в AutoCAD: {plan.suspicion.headline()}"
+        else:
+            head_txt = (
+                f"🙋 Подтвердите перед отрисовкой в AutoCAD: невязка {plan.closure.distance:.3f} ft"
+            )
+        self.doubt_title_var.set(head_txt)
+
+        if first_fix is not None:
+            self.keep_verbatim_button.configure(
+                text=f"📄 Оставить как в документе ({first_fix.original_value})"
+            )
+            self.apply_typo_fix_button.configure(
+                text=f"✏️ Заменить ({first_fix.original_value} → {first_fix.suggested_value})"
+            )
+            self.apply_typo_fix_button.grid(row=0, column=2, padx=(0, 8), sticky="w")
+        else:
+            parse_only = bool(doubt_ctx.get("parse_only", True))
+            self.keep_verbatim_button.configure(
+                text=(
+                    "📄 Оставить как есть"
+                    if parse_only
+                    else "📐 Всё равно начертить в AutoCAD как есть"
+                )
+            )
+            self.apply_typo_fix_button.grid_remove()
+
+        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        report_txt = self._build_doubt_report(doubt_ctx)
+        self._set_status(report_txt, warn=True)
+        self._log_line(report_txt)
+        self._open_doubt_dialog()
+
+    def _open_doubt_dialog(self) -> None:
+        if not self.pending_doubt:
+            return
+        ctx = self.pending_doubt
+        outcome: ParseOutcome = ctx["outcome"]
+        d_round = int(ctx.get("doubt_round") or 1)
+        parse_only = bool(ctx.get("parse_only", True))
+        first_fix: TypoSuspicion | None = next(
+            (s for s in outcome.typo_suspicions if s.repaired_data is not None),
+            None,
+        )
+
+        old_win = getattr(self, "doubt_window", None)
+        if old_win is not None:
+            try:
+                old_win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Проверка сомнительного места — раунд #{d_round}")
+        win.geometry("880x560")
+        win.configure(fg_color=THEME["bg_root"])
+        win.attributes("-topmost", True)
+        self.doubt_window = win
+
+        top_banner = ctk.CTkFrame(
+            win,
+            fg_color=THEME["warn_bg"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["warn_border"],
+        )
+        top_banner.pack(fill="x", padx=14, pady=(12, 8))
+
+        ctk.CTkLabel(
+            top_banner,
+            text=str(self.doubt_title_var.get()),
+            anchor="w",
+            justify="left",
+            wraplength=830,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=THEME["warn"],
+        ).pack(anchor="w", padx=14, pady=(10, 4))
+
+        ctk.CTkLabel(
+            top_banner,
+            text=(
+                "Система НЕ меняет спорные цифры самовольно. Вы можете отправить модели на прицельную "
+                "перепроверку именно этой стороны в документе, оставить прочитанные данные как есть "
+                "или вручную применить исправление."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=830,
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_main"],
+        ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        box = ctk.CTkTextbox(
+            win,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        box.insert("1.0", self._build_doubt_report(ctx))
+        target_tb = getattr(box, "_textbox", box)
+        target_tb.configure(state="disabled")
+
+        btn_bar = ctk.CTkFrame(win, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="🔬 Ещё раунд LLM с фокусом на зону внимания",
+            height=38,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.retry_doubt_with_focus,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        keep_lbl = (
+            f"📄 Оставить как в документе ({first_fix.original_value})"
+            if first_fix is not None
+            else (
+                "📄 Оставить схему как есть"
+                if parse_only
+                else "📐 Всё равно начертить в AutoCAD"
+            )
+        )
+        ctk.CTkButton(
+            btn_bar,
+            text=keep_lbl,
+            height=38,
+            fg_color=THEME["btn_emerald"],
+            hover_color=THEME["btn_emerald_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.confirm_doubt_keep_verbatim,
+        ).pack(side="left", padx=(0, 8))
+
+        if first_fix is not None:
+            ctk.CTkButton(
+                btn_bar,
+                text=f"✏️ Применить ({first_fix.original_value} → {first_fix.suggested_value})",
+                height=38,
+                fg_color=THEME["btn_primary"],
+                hover_color=THEME["btn_primary_hover"],
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=self.confirm_doubt_apply_fix,
+            ).pack(side="left", padx=(0, 8))
+
+        if not parse_only and first_fix is None:
+            ctk.CTkButton(
+                btn_bar,
+                text="Отмена (не чертить)",
+                height=38,
+                width=150,
+                fg_color=THEME["btn_secondary"],
+                hover_color=THEME["btn_secondary_hover"],
+                command=self.cancel_doubt_draw,
+            ).pack(side="left")
+
+    def retry_doubt_with_focus(self) -> None:
+        """Запускает ещё раунд проходов LLM с инъекцией промпта на подозрительную сторону/зону."""
+        if self._busy or not self.pending_doubt:
+            return
+        ctx = dict(self.pending_doubt)
+        next_round = int(ctx.get("doubt_round") or 1) + 1
+        # Если до этого шёл локальный regex, подтягиваем актуальные настройки провайдера из UI
+        cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
+        ctx["cfg"] = cfg
+        ctx["provider_id"] = provider_id
+        ctx["model_name"] = model_name
+        ctx["api_key"] = api_key
+        ctx["key_secret"] = key_secret
+
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(
+            f"Прицельная перепроверка зоны внимания (раунд #{next_round}): "
+            "отправлен фокус-запрос к LLM…"
+        )
+        self._log_line(
+            f"--- Прицельный раунд LLM по зоне сомнения (раунд #{next_round}) ---"
+        )
+        worker = threading.Thread(
+            target=self._retry_doubt_worker,
+            args=(ctx, next_round),
+            daemon=True,
+        )
+        worker.start()
+
+    def _retry_doubt_worker(self, ctx: dict[str, Any], next_round: int) -> None:
+        prev_outcome: ParseOutcome = ctx["outcome"]
+        prev_plan: DrawPlan = ctx["plan"]
+        cfg: dict[str, Any] = ctx["cfg"]
+        provider_id: str = ctx["provider_id"]
+        model_name: str = ctx["model_name"]
+        api_key: str | None = ctx["api_key"]
+        key_secret: str = ctx["key_secret"]
+        scale: float = ctx["scale"]
+        parse_only: bool = ctx["parse_only"]
+        is_neighbor: bool = ctx["is_neighbor"]
+
+        extra_notes: list[str] = []
+        if prev_plan.suspicion is not None and prev_plan.suspicion.is_suspicious:
+            for s_item in prev_plan.suspicion.items:
+                extra_notes.append(f"{s_item.title}: {s_item.detail}")
+        try:
+            res = recheck_typo_suspicion(
+                prev_outcome,
+                cfg,
+                primary_provider=provider_id,
+                primary_model=model_name,
+                primary_api_key=api_key,
+                key_secret=key_secret,
+                extra_attention_notes=extra_notes,
+                round_number=next_round,
+                progress=lambda msg: self._post("progress", msg),
+            )
+            self._last_valid_secret = key_secret
+            if isinstance(res, ConsensusResult):
+                if not res.agreed:
+                    self._post(
+                        "conflict",
+                        {
+                            "consensus": res,
+                            "cfg": cfg,
+                            "key_secret": key_secret,
+                            "scale": scale,
+                            "parse_only": parse_only,
+                            "is_neighbor": is_neighbor,
+                        },
+                    )
+                    self._post("done", None)
+                    return
+                new_outcome = res.selected_outcome
+                round_usages: list[TokenUsage | None] = [
+                    o.usage for o in res.pass_outcomes
+                ]
+                pre_counted = True
+            else:
+                new_outcome = res
+                round_usages = []
+                pre_counted = False
+
+            new_plan = AcadBuilder(cfg).plan(
+                new_outcome.data, scale=scale, is_neighbor=is_neighbor
+            )
+            still_doubtful = bool(new_outcome.typo_suspicions) or (
+                (not parse_only)
+                and (
+                    (new_plan.suspicion is not None and new_plan.suspicion.is_suspicious)
+                    or new_plan.closure.distance > 0.08
+                )
+            )
+            if still_doubtful:
+                updated_ctx = dict(ctx)
+                updated_ctx["outcome"] = new_outcome
+                updated_ctx["plan"] = new_plan
+                updated_ctx["pre_counted"] = pre_counted
+                updated_ctx["round_usages"] = round_usages
+                updated_ctx["doubt_round"] = next_round
+                self._post("doubt", updated_ctx)
+                self._post("done", None)
+                return
+
+            self._finalize_worker_outcome(
+                new_outcome,
+                cfg=cfg,
+                scale=scale,
+                parse_only=parse_only,
+                is_neighbor=is_neighbor,
+                pre_counted=pre_counted,
+                round_usages=round_usages,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._post("error", f"Ошибка прицельной перепроверки зоны сомнения: {exc}")
+            self._post("done", None)
+
+    def confirm_doubt_keep_verbatim(self) -> None:
+        """Оставляет данные строго как в документе (без автоисправления цифр) и завершает действие."""
+        if self._busy or not self.pending_doubt:
+            return
+        ctx = dict(self.pending_doubt)
+        outcome: ParseOutcome = ctx["outcome"]
+        first_fix: TypoSuspicion | None = next(
+            (s for s in outcome.typo_suspicions if s.repaired_data is not None),
+            None,
+        )
+        if first_fix is not None:
+            note = (
+                f"✓ Решение пользователя: оставлено исходное значение документа "
+                f"«{first_fix.original_value}» (сторона #{first_fix.segment_index}) без подмены"
+            )
+        else:
+            note = "✓ Решение пользователя: контур принят без изменений по документу"
+        confirmed_outcome = ParseOutcome(
+            data=outcome.data,
+            source=outcome.source,
+            warnings=[note, *outcome.warnings],
+            usage=outcome.usage,
+            provider=outcome.provider,
+            provider_label=outcome.provider_label,
+            model=outcome.model,
+            llm_mode=outcome.llm_mode,
+            typo_suspicions=[],
+            prepared_text=outcome.prepared_text,
+            prepared_images=outcome.prepared_images,
+            base_warnings=outcome.base_warnings,
+        )
+        self._dismiss_doubt_ui()
+        self._complete_resolved_outcome(confirmed_outcome, ctx, pre_counted=True)
+
+    def confirm_doubt_apply_fix(self) -> None:
+        """Применяет предложенное исправление опечатки ТОЛЬКО по явному нажатию пользователя."""
+        if self._busy or not self.pending_doubt:
+            return
+        ctx = dict(self.pending_doubt)
+        outcome: ParseOutcome = ctx["outcome"]
+        first_fix: TypoSuspicion | None = next(
+            (s for s in outcome.typo_suspicions if s.repaired_data is not None),
+            None,
+        )
+        if first_fix is None or first_fix.repaired_data is None:
+            self.confirm_doubt_keep_verbatim()
+            return
+        note = (
+            f"✏️ По явному решению пользователя исправлена сторона #{first_fix.segment_index}: "
+            f"«{first_fix.original_value}» → «{first_fix.suggested_value}» "
+            f"(невязка {first_fix.closure_before_ft:.3f}' → {first_fix.closure_after_ft:.3f}')"
+        )
+        cleaned_warns = [
+            w for w in outcome.warnings if first_fix.reason_ru not in w
+        ]
+        fixed_outcome = ParseOutcome(
+            data=first_fix.repaired_data,
+            source=outcome.source,
+            warnings=[note, *cleaned_warns],
+            usage=outcome.usage,
+            provider=outcome.provider,
+            provider_label=outcome.provider_label,
+            model=outcome.model,
+            llm_mode=outcome.llm_mode,
+            typo_suspicions=[],
+            prepared_text=outcome.prepared_text,
+            prepared_images=outcome.prepared_images,
+            base_warnings=outcome.base_warnings,
+        )
+        self._dismiss_doubt_ui()
+        self._complete_resolved_outcome(fixed_outcome, ctx, pre_counted=True)
+
+    def cancel_doubt_draw(self) -> None:
+        """Отменяет рискованную отрисовку в AutoCAD, оставляя схему предпросмотра."""
+        if self._busy or not self.pending_doubt:
+            return
+        self._dismiss_doubt_ui()
+        self._set_status(
+            "Отрисовка в AutoCAD отменена пользователем; схема оставлена в предпросмотре.",
+            warn=True,
+        )
+
     def _present_conflict(self, conflict_ctx: dict[str, Any]) -> None:
+        self._dismiss_doubt_ui()
         consensus: ConsensusResult = conflict_ctx["consensus"]
         self.pending_conflict = conflict_ctx
         self._record_round_usages([o.usage for o in consensus.pass_outcomes])
@@ -3756,7 +4338,7 @@ class SurveyApp(ctk.CTk):
         else:
             self.pick_pass3_button.grid_remove()
 
-        self.conflict_bar.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 0))
         self._update_closure_badge(
             "Closure Error по проходам:  "
             + "   |   ".join(
@@ -4011,6 +4593,7 @@ class SurveyApp(ctk.CTk):
                 "is_neighbor": ctx["is_neighbor"],
                 "pre_counted": pre_counted,
                 "round_usages": None,
+                "user_confirmed": True,
             },
             daemon=True,
         )
@@ -4026,10 +4609,37 @@ class SurveyApp(ctk.CTk):
         is_neighbor: bool,
         pre_counted: bool = True,
         round_usages: list[TokenUsage | None] | None = None,
+        user_confirmed: bool = False,
     ) -> None:
         try:
             builder = AcadBuilder(cfg)
-            builder.plan(outcome.data, scale=scale, is_neighbor=is_neighbor)
+            plan = builder.plan(outcome.data, scale=scale, is_neighbor=is_neighbor)
+            if (
+                not user_confirmed
+                and bool(cfg.get("api", {}).get("ask_on_doubt", True))
+                and bool(outcome.typo_suspicions)
+            ):
+                self._post(
+                    "doubt",
+                    {
+                        "outcome": outcome,
+                        "plan": plan,
+                        "cfg": cfg,
+                        "provider_id": str(cfg.get("api", {}).get("provider") or "hydra"),
+                        "model_name": str(cfg.get("api", {}).get("model") or "glm-5.2"),
+                        "api_key": None,
+                        "key_secret": self._last_valid_secret,
+                        "use_llm": True,
+                        "scale": scale,
+                        "parse_only": parse_only,
+                        "is_neighbor": is_neighbor,
+                        "pre_counted": pre_counted,
+                        "round_usages": round_usages or [],
+                        "doubt_round": 1,
+                    },
+                )
+                self._post("done", None)
+                return
             if parse_only:
                 self._post("parsed", (outcome, None, pre_counted, round_usages or []))
                 self._post("done", None)

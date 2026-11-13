@@ -2568,6 +2568,175 @@ def test_lot_suspicion_angle_sum_and_primitive_bugs() -> None:
     assert "POB_STREET_LINE_KINK" in {it.code for it in p_kink.suspicion.items}
 
 
+def test_unanimous_multipass_consensus_never_mutates_agreed_54_to_56(monkeypatch) -> None:
+    """
+    Защита от подмены согласованного мнения моделей:
+    если ОБЕ независимые LLM прочитали в документе «54.00'» (при противоположной 56.00' или 55.00'),
+    система НИКОГДА не подменяет 54 -> 56/55 ни при ask_on_doubt=True, ни при ask_on_doubt=False,
+    а формирует TypoSuspicion и позволяет запустить раунд с инъекцией промпта на зону внимания.
+    """
+    import llm_parser
+    from llm_parser import (
+        ASPENWALL_SAMPLES,
+        PassTarget,
+        TokenUsage,
+        load_config,
+        parse_with_regex,
+        recheck_typo_suspicion,
+        run_multipass_consensus,
+    )
+
+    cfg = load_config()
+    cfg["api"]["providers"]["hydra"]["api_key"] = "sk-hydra-test"
+    cfg["api"]["providers"]["openrouter"]["api_key"] = "sk-or-test"
+
+    dm, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    # В документе реально напечатано 54.00' на задней меже против 56.00' по фасаду (невязка 2.00')
+    d_54 = dm.model_copy(deep=True)
+    d_54.segments[1] = d_54.segments[1].model_copy(update={"distance_ft": 54.0})
+    d_54.segments[3] = d_54.segments[3].model_copy(update={"distance_ft": 56.0})
+
+    captured_focus: list[str | None] = []
+
+    def _fake_extract(
+        text,
+        cfg_arg,
+        *,
+        api_key=None,
+        progress=None,
+        provider=None,
+        model=None,
+        key_secret="",
+        image_data_urls=None,
+        focus_instruction=None,
+    ):
+        captured_focus.append(focus_instruction)
+        out_model = d_54.model_copy(deep=True)
+        if focus_instruction:
+            out_model.anomaly_note = "Проверено под увеличением: на чертеже в стороне #2 действительно напечатано 54.00'."
+        return (
+            out_model,
+            "structured-outputs",
+            TokenUsage(prompt_tokens=200, completion_tokens=80, total_tokens=280, provider=str(provider), model=str(model), available=True),
+        )
+
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", _fake_extract)
+
+    targets = [
+        PassTarget(pass_index=1, provider="hydra", model="glm-5.2", api_key="sk-hydra-test"),
+        PassTarget(pass_index=2, provider="openrouter", model="nvidia/nemotron-3.5-super-vl:free", api_key="sk-or-test"),
+    ]
+
+    # 1) Даже при ask_on_doubt=False согласованное мнение 2/2 LLM (54.00') неприкосновенно!
+    cons_free = run_multipass_consensus(
+        text=ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"],
+        cfg=cfg,
+        targets=targets,
+        ask_on_doubt=False,
+    )
+    assert cons_free.agreed is True
+    assert cons_free.selected_outcome.data.segments[1].distance_ft == pytest.approx(54.0)
+    assert len(cons_free.selected_outcome.typo_suspicions) == 1
+    susp = cons_free.selected_outcome.typo_suspicions[0]
+    assert susp.unanimous_llm_passes == 2
+    assert susp.original_value == "54.00'"
+    assert susp.suggested_value == "56.00'"
+    assert susp.can_auto_apply(ask_on_doubt=False) is False
+
+    # 2) Даже для визуально похожих цифр (56.00' vs 55.00', пара 6->5) единогласие 2/2 LLM НЕ перезаписывается!
+    d_56 = dm.model_copy(deep=True)
+    d_56.segments[1] = d_56.segments[1].model_copy(update={"distance_ft": 56.0})
+    monkeypatch.setattr(
+        llm_parser,
+        "_extract_with_llm",
+        lambda *a, **kw: (
+            d_56.model_copy(deep=True),
+            "structured-outputs",
+            TokenUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150, provider="hydra", model="glm-5.2", available=True),
+        ),
+    )
+    cons_lookalike = run_multipass_consensus(
+        text=ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"],
+        cfg=cfg,
+        targets=targets,
+        ask_on_doubt=False,
+    )
+    assert cons_lookalike.selected_outcome.data.segments[1].distance_ft == pytest.approx(56.0)
+    assert len(cons_lookalike.selected_outcome.typo_suspicions) == 1
+    assert cons_lookalike.selected_outcome.typo_suspicions[0].can_auto_apply(ask_on_doubt=False) is False
+
+    # 3) Повторный раунд с инъекцией промпта на зону внимания (recheck_typo_suspicion)
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", _fake_extract)
+    captured_focus.clear()
+    recheck_res = recheck_typo_suspicion(
+        cons_free.selected_outcome,
+        cfg,
+        targets=targets,
+        round_number=2,
+    )
+    assert len(captured_focus) == 2
+    assert all(
+        f is not None
+        and "TARGETED ATTENTION-ZONE VERIFICATION (ROUND #2)" in f
+        and "SIDE #2" in f
+        and "54.00'" in f
+        and "DO NOT GUESS OR FORCE CLOSURE" in f
+        for f in captured_focus
+    )
+    assert recheck_res.selected_outcome.data.segments[1].distance_ft == pytest.approx(54.0)
+    assert "действительно напечатано 54.00'" in (recheck_res.selected_outcome.data.anomaly_note or "")
+
+
+def test_ask_on_doubt_policy_sane_autonomy_vs_strict_human_confirmation() -> None:
+    """
+    Проверяет матрицу «Спрашивать при сомнении»:
+      * по умолчанию в config.json ask_on_doubt == True;
+      * непохожие цифры (54 -> 56, т.е. 4->6 в длине И в DMS-угле) НЕ меняются даже при ask_on_doubt=False;
+      * похожие цифры (56 -> 55, т.е. 6->5) в 1-проходном/regex режиме:
+        - при ask_on_doubt=True остаются как в документе (56.00') и выносятся в typo_suspicions;
+        - при ask_on_doubt=False аккуратно исправляются в 55.00' с русским пояснением.
+    """
+    from llm_parser import ASPENWALL_SAMPLES, DEFAULT_CONFIG, load_config, parse_legal_description_full
+
+    assert DEFAULT_CONFIG["api"]["ask_on_doubt"] is True
+    assert load_config()["api"]["ask_on_doubt"] is True
+
+    base_56 = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"].replace(
+        "55.00 feet", "56.00 feet"
+    )
+    # 54.00' против 56.00' (4->6 — НЕ похожие цифры!)
+    deed_len_54 = base_56.replace('N 75°20\'20" E, 56.00 feet', 'N 75°20\'20" E, 54.00 feet')
+    out_54_free = parse_legal_description_full(text=deed_len_54, use_llm=False, ask_on_doubt=False)
+    assert out_54_free.data.segments[1].distance_ft == pytest.approx(54.0)
+    assert len(out_54_free.typo_suspicions) == 1
+    assert out_54_free.typo_suspicions[0].is_lookalike is False
+
+    # 54" против 56" в секундах угла (4->6 — НЕ похожие цифры!)
+    base_sec56 = (
+        ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+        .replace("14°39'40\"", "14°39'56\"")
+        .replace("75°20'20\"", "75°20'04\"")
+    )
+    deed_ang_54 = base_sec56.replace('N 14°39\'56" W', 'N 14°39\'54" W')
+    out_ang54_free = parse_legal_description_full(text=deed_ang_54, use_llm=False, ask_on_doubt=False)
+    assert out_ang54_free.data.segments[2].seconds == pytest.approx(54.0)
+
+    # Похожая цифра 6->5 (56.00' вместо 55.00'):
+    deed_len_56 = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"].replace(
+        'N 75°20\'20" E, 55.00 feet', 'N 75°20\'20" E, 56.00 feet'
+    )
+    out_ask = parse_legal_description_full(text=deed_len_56, use_llm=False, ask_on_doubt=True)
+    assert out_ask.data.segments[1].distance_ft == pytest.approx(56.0)
+    assert len(out_ask.typo_suspicions) == 1
+    assert out_ask.typo_suspicions[0].repaired_data is not None
+    assert out_ask.typo_suspicions[0].repaired_data.segments[1].distance_ft == pytest.approx(55.0)
+
+    out_auto = parse_legal_description_full(text=deed_len_56, use_llm=False, ask_on_doubt=False)
+    assert out_auto.data.segments[1].distance_ft == pytest.approx(55.0)
+    assert out_auto.typo_suspicions == []
+
+
+
 
 
 

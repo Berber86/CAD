@@ -12,6 +12,7 @@
     "vision_max_pages": 8,
     "vision_enhance_scans": true,
     "vision_auto_orient": false,
+    "ask_on_doubt": true,
     "providers": {
       "hydra": {
         "label": "Hydra AI",

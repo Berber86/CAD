@@ -11,7 +11,7 @@
     "vision_dpi": 220,
     "vision_max_pages": 8,
     "vision_enhance_scans": true,
-    "vision_auto_orient": true,
+    "vision_auto_orient": false,
     "providers": {
       "hydra": {
         "label": "Hydra AI",

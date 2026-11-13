@@ -256,9 +256,9 @@ class SurveyApp(ctk.CTk):
         self.enhance_scan_var = ctk.BooleanVar(
             value=bool(self.config_data["api"].get("vision_enhance_scans", True))
         )
-        self.auto_orient_var = ctk.BooleanVar(
-            value=bool(self.config_data["api"].get("vision_auto_orient", True))
-        )
+        # ИИ-автоповорот через LLM ВСЕГДА выключен по умолчанию (доп. платный вызов API);
+        # включается только разово на 1 конкретный запуск с явным предупреждением.
+        self.auto_orient_var = ctk.BooleanVar(value=False)
         self.preview_modes = ["📐 Схема CAD", "🖼 Исходник"]
         self.preview_mode_var = ctk.StringVar(value=self.preview_modes[0])
         self.description: LegalDescription | None = None
@@ -986,13 +986,36 @@ class SurveyApp(ctk.CTk):
         )
         self.enhance_scan_switch.grid(row=0, column=7, padx=(4, 8), pady=5, sticky="e")
 
-        self.auto_orient_switch = ctk.CTkSwitch(
+        self.auto_orient_switch = ctk.CTkCheckBox(
             self.visual_bar,
-            text="🧭 Автоповорот ИИ",
+            text="🧭 ИИ-поворот (1 раз, $)",
             variable=self.auto_orient_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["warn"],
+            hover_color="#d97706",
             font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_auto_orient_toggled,
         )
         self.auto_orient_switch.grid(row=0, column=8, padx=(0, 10), pady=5, sticky="e")
+
+        self.auto_orient_warn_label = ctk.CTkLabel(
+            self.visual_bar,
+            text=(
+                "⚠ Включён разовый ИИ-автоповорот: выполнит ДОПОЛНИТЕЛЬНЫЙ платный запрос к LLM "
+                "(расход токенов API) только для одного ближайшего запуска, после чего сам выключится. "
+                "Бесплатная альтернатива: кнопки «⟲ -90° / ⟳ +90° / ⇅ 180°»."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["warn"],
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        )
+        self.auto_orient_warn_label.grid(
+            row=1, column=0, columnspan=9, sticky="ew", padx=10, pady=(0, 6)
+        )
+        self.auto_orient_warn_label.grid_remove()
         self.visual_bar.grid_remove()
 
         # Плашка выбора роли участка на чертеже + пакет соседей
@@ -1666,10 +1689,71 @@ class SurveyApp(ctk.CTk):
         self._refresh_visual_bar()
         self._set_preview_mode("🖼 Исходник")
 
+    def _confirm_auto_orient_dialog(self) -> bool:
+        """Диалог предупреждения о дополнительном платном вызове LLM при разовом ИИ-автоповороте."""
+        from tkinter import messagebox
+
+        return bool(
+            messagebox.askokcancel(
+                "Платный ИИ-автоповорот (только на 1 запуск)",
+                "Внимание: автоопределение поворота силами LLM выполняет ДОПОЛНИТЕЛЬНЫЙ "
+                "платный Vision-запрос к API перед чтением чертежа и расходует лишние токены.\n\n"
+                "Бесплатная альтернатива (0 токенов):\n"
+                "• смартфонный EXIF выравнивается автоматически и бесплатно;\n"
+                "• любой кадр можно повернуть вручную кнопками «⟲ -90° / ⟳ +90° / ⇅ 180°» "
+                "в режиме просмотра «🖼 Исходник».\n\n"
+                "Включить ИИ-автоповорот ТОЛЬКО ДЛЯ ОДНОГО ближайшего запуска?\n"
+                "(Сразу после запуска галочка автоматически снимется.)",
+                icon="warning",
+                parent=self,
+            )
+        )
+
+    def _refresh_auto_orient_warning(self) -> None:
+        """Показывает или скрывает янтарное предупреждение о разовом платном ИИ-повороте."""
+        if not hasattr(self, "auto_orient_warn_label"):
+            return
+        if bool(self.auto_orient_var.get()) and self._has_visual_source():
+            self.auto_orient_warn_label.grid(
+                row=1, column=0, columnspan=9, sticky="ew", padx=10, pady=(0, 6)
+            )
+        else:
+            self.auto_orient_warn_label.grid_remove()
+
+    def _on_auto_orient_toggled(self) -> None:
+        """Обработчик клика по галочке разового ИИ-автоповорота с обязательным предупреждением."""
+        if bool(self.auto_orient_var.get()):
+            if not self._confirm_auto_orient_dialog():
+                self.auto_orient_var.set(False)
+                self._refresh_auto_orient_warning()
+                self._set_status(
+                    "ИИ-автоповорот отменён — дополнительные токены не расходуются. "
+                    "Используйте бесплатные кнопки ⟲ / ⟳ / 180°."
+                )
+                return
+            self._refresh_auto_orient_warning()
+            self._set_status(
+                "⚠ Разовый ИИ-автоповорот включён ТОЛЬКО на 1 ближайший запуск "
+                "(будет выполнен доп. платный запрос к LLM, затем опция автоматически отключится).",
+                warn=True,
+            )
+        else:
+            self._refresh_auto_orient_warning()
+            self._set_status("Разовый ИИ-автоповорот выключен.")
+
+    def _consume_one_shot_auto_orient(self, has_visual: bool) -> bool:
+        """Забирает разовый флаг ИИ-автоповорота на текущий запуск и немедленно сбрасывает его в False."""
+        armed = bool(self.auto_orient_var.get()) and bool(has_visual)
+        if bool(self.auto_orient_var.get()):
+            self.auto_orient_var.set(False)
+        self._refresh_auto_orient_warning()
+        return armed
+
     def _refresh_visual_bar(self) -> None:
         if not hasattr(self, "visual_bar"):
             return
         if not self._has_visual_source():
+            self._refresh_auto_orient_warning()
             self.visual_bar.grid_remove()
             return
         total = self._visual_frame_count()
@@ -1688,6 +1772,7 @@ class SurveyApp(ctk.CTk):
             self.pdf_pages_box.grid(row=0, column=6, sticky="w", padx=(0, 6), pady=5)
         else:
             self.pdf_pages_box.grid_remove()
+        self._refresh_auto_orient_warning()
         self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
 
     def _clear_preview_scene(self) -> None:
@@ -2109,6 +2194,7 @@ class SurveyApp(ctk.CTk):
         self._visual_cursor = 0
         self._tk_photo_ref = None
         self.pdf_pages_var.set("")
+        self.auto_orient_var.set(False)
         self._refresh_visual_bar()
 
     def _on_sample_selected(self, label: str) -> None:
@@ -2181,8 +2267,9 @@ class SurveyApp(ctk.CTk):
         self._set_preview_mode("🖼 Исходник")
         self._set_status(
             f"Загружено фото чертежа ({len(paths)} шт.) — включён режим Vision LLM "
-            "(автоисправление EXIF, фильтр чёткости 80-х и 🧭 Автоповорот ИИ готовы). "
-            "При необходимости поверните кадры кнопками ⟲/⟳/180°."
+            "(бесплатное выравнивание EXIF и фильтр «Чёткость 80-х» активны; "
+            "платный ИИ-поворот по умолчанию выключен). "
+            "При необходимости поверните кадры бесплатно кнопками ⟲ / ⟳ / 180°."
         )
 
     def _load_images(self) -> None:
@@ -2309,7 +2396,8 @@ class SurveyApp(ctk.CTk):
         cfg["api"]["provider"] = active_pid
         cfg["api"]["model"] = active_model
         cfg["api"]["vision_enhance_scans"] = bool(self.enhance_scan_var.get())
-        cfg["api"]["vision_auto_orient"] = bool(self.auto_orient_var.get())
+        # Никогда не сохраняем платный ИИ-автоповорот как настройку по умолчанию
+        cfg["api"]["vision_auto_orient"] = False
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
@@ -2589,6 +2677,10 @@ class SurveyApp(ctk.CTk):
             self._refresh_consensus_rows()
         scale = self._current_scale()
         provider_title = self._pid_to_label.get(provider_id, provider_id)
+        has_visual_neighbors = any(
+            is_image_file(p) or p.suffix.lower() == ".pdf" for p in file_list
+        )
+        do_auto_orient = self._consume_one_shot_auto_orient(has_visual_neighbors)
 
         self._busy = True
         self._set_controls_busy(True)
@@ -2611,6 +2703,7 @@ class SurveyApp(ctk.CTk):
                 key_secret,
                 use_llm,
                 scale,
+                do_auto_orient,
             ),
             daemon=True,
         )
@@ -2626,13 +2719,13 @@ class SurveyApp(ctk.CTk):
         key_secret: str,
         use_llm: bool,
         scale: float,
+        do_auto_orient: bool = False,
     ) -> None:
         done_items: list[tuple[ParseOutcome, DrawResult | None]] = []
         errors: list[str] = []
         builder = AcadBuilder(cfg)
         total = len(file_list)
         do_enhance = bool(cfg.get("api", {}).get("vision_enhance_scans", True))
-        do_auto_orient = bool(cfg.get("api", {}).get("vision_auto_orient", True))
         for idx, fpath in enumerate(file_list, start=1):
             try:
                 self._post(
@@ -2728,8 +2821,8 @@ class SurveyApp(ctk.CTk):
             else None
         )
         do_enhance = bool(self.enhance_scan_var.get())
-        do_auto_orient = bool(self.auto_orient_var.get()) and bool(
-            vision_images or vision_pdf
+        do_auto_orient = self._consume_one_shot_auto_orient(
+            bool(vision_images or vision_pdf)
         )
 
         # Сопоставляем ручные углы поворота выбранным фото или страницам PDF

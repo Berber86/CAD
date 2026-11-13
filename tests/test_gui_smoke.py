@@ -207,7 +207,15 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     filedialog.askopenfilename = lambda **kwargs: ""
     filedialog.askopenfilenames = lambda **kwargs: ()
     tkinter.filedialog = filedialog
-    return {"customtkinter": ctk, "tkinter": tkinter, "tkinter.filedialog": filedialog}
+    messagebox = types.ModuleType("tkinter.messagebox")
+    messagebox.askokcancel = lambda *args, **kwargs: False
+    tkinter.messagebox = messagebox
+    return {
+        "customtkinter": ctk,
+        "tkinter": tkinter,
+        "tkinter.filedialog": filedialog,
+        "tkinter.messagebox": messagebox,
+    }
 
 
 @pytest.fixture()
@@ -866,6 +874,8 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
 
     assert len(app.image_paths) == 2
     assert app.visual_bar._gridded is True
+    assert app.auto_orient_var.get() is False
+    assert app.auto_orient_warn_label._gridded is False
     assert app.preview_mode_var.get() == "🖼 Исходник"
     assert "Фото Vision: 2 файл." in app.pdf_label.cget("text")
 
@@ -883,7 +893,7 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
     ]
     assert any("ФОТО 2/2" in t and "+180°" in t for t in hud_texts_2)
 
-    # Запускаем 2-проходный разбор связки фотографий
+    # По умолчанию ИИ-автоповорот ВЫКЛЮЧЕН (0 лишних платных запросов к LLM)
     app.select_passes(2)
     clean_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
     orient_called: list[int] = []
@@ -901,6 +911,7 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
     monkeypatch.setattr(llm_parser, "detect_visual_orientations_llm", fake_detect_orient)
     monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
 
+    # 1) Запуск по умолчанию — без платного предпрохода автоповорота
     app._start(parse_only=True)
     for _ in range(40):
         app._drain_events()
@@ -908,13 +919,49 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
             break
         time.sleep(0.02)
 
-    assert orient_called == [2]
+    assert orient_called == []
     assert seen_image_counts == [2, 2]
     # После успешного разбора предпросмотр автоматически переключается на CAD-схему!
     assert app.preview_mode_var.get() == "📐 Схема CAD"
     assert app.description is not None and len(app.description.segments) == 4
 
-    # Проверяем пакет соседей с .jpg фотографией соседа
+    # 2) Клик по «🧭 ИИ-поворот (1 раз, $)» с отменой в диалоге предупреждения -> остаётся False
+    from tkinter import messagebox
+
+    monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **kw: False)
+    app.auto_orient_var.set(True)
+    app._on_auto_orient_toggled()
+    assert app.auto_orient_var.get() is False
+    assert app.auto_orient_warn_label._gridded is False
+
+    # 3) Клик с подтверждением предупреждения -> включается РОВНО НА 1 ЗАПУСК и сам гаснет
+    monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **kw: True)
+    app.auto_orient_var.set(True)
+    app._on_auto_orient_toggled()
+    assert app.auto_orient_var.get() is True
+    assert app.auto_orient_warn_label._gridded is True
+
+    app._start(parse_only=True)
+    # Сразу при старте расчёта разовый флаг обязан сброситься обратно в False!
+    assert app.auto_orient_var.get() is False
+    assert app.auto_orient_warn_label._gridded is False
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert orient_called == [2]
+
+    # Повторный запуск снова идёт БЕЗ платного автоповорота (orient_called не растёт)
+    app._start(parse_only=True)
+    for _ in range(40):
+        app._drain_events()
+        if not app._busy:
+            break
+        time.sleep(0.02)
+    assert orient_called == [2]
+
+    # Проверяем пакет соседей с .jpg фотографией соседа (тоже без платного автоповорота по умолчанию)
     neighbor_jpg = tmp_path / "neighbor_1983_365.jpg"
     PIL_Image.new("RGB", (700, 900), (210, 210, 200)).save(neighbor_jpg, format="JPEG")
     neighbor_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
@@ -943,6 +990,7 @@ def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
 
     assert "обработано 1 уч. в слое NEIGHBOR_LOT" in app.status_var.get()
     assert len(app._preview_neighbor_plans) == 1
+    assert orient_called == [2]  # пакет соседей по умолчанию НЕ делает платный автоповорот
     app._on_close()
 
 

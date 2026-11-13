@@ -2199,6 +2199,22 @@ def test_photo_pdf_page_range_and_ai_auto_orient_prepass(tmp_path, monkeypatch):
     im2_after = PIL_Image.open(io.BytesIO(base64.b64decode(main_imgs[1].split(",", 1)[1])))
     assert im2_after.height > im2_after.width  # было 800×500 (на боку), стало портретным 500×800!
 
+    # По умолчанию (без явного auto_orient=True) платный предпроход автоповорота НЕ выполняется!
+    assert load_config()["api"]["vision_auto_orient"] is False
+    calls.clear()
+    outcome_default = parse_legal_description_full(
+        pdf_path=album_pdf,
+        pdf_pages="2, 4",
+        use_llm=True,
+        provider="routerai",
+        model="google/gemini-2.5-pro",
+        api_key="rk-test-orient",
+        cfg=load_config(),
+    )
+    assert len(calls) == 1  # ровно 1 основной запрос к LLM без лишнего вызова автоповорота
+    assert outcome_default.usage is not None and outcome_default.usage.total_tokens == 1500
+    assert not any("Автоповорот ИИ" in w for w in outcome_default.warnings)
+
 
 
 

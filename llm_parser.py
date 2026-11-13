@@ -205,7 +205,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vision_dpi": 220,
         "vision_max_pages": 8,
         "vision_enhance_scans": True,
-        "vision_auto_orient": True,
+        "vision_auto_orient": False,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
         "consensus": {
             "passes": 1,
@@ -4417,7 +4417,8 @@ def _prepare_parse_input(
                     "(например, hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)."
                 )
 
-    # Опциональный ИИ-автоповорот перевёрнутых (90°/180°/270°) архивных фото/страниц
+    # Разовый опциональный ИИ-автоповорот (только по явному запросу auto_orient=True;
+    # по умолчанию ВЫКЛЮЧЕН из-за дополнительного расхода токенов Vision LLM)
     if use_llm and auto_orient and image_data_urls:
         detected_rots, orient_usage = detect_visual_orientations_llm(
             image_data_urls,
@@ -4428,6 +4429,11 @@ def _prepare_parse_input(
             key_secret=key_secret,
             progress=progress,
         )
+        tok_note = (
+            f" (доп. вызов LLM: {orient_usage.total_tokens:,} ток.)"
+            if (orient_usage is not None and orient_usage.available)
+            else " (выполнен доп. вызов LLM)"
+        )
         rotated_labels: list[str] = []
         for idx, deg_cw in enumerate(detected_rots):
             if deg_cw in (90, 180, 270):
@@ -4437,8 +4443,12 @@ def _prepare_parse_input(
                 rotated_labels.append(f"#{idx + 1} → +{deg_cw}°")
         if rotated_labels:
             warnings.append(
-                "🧭 Автоповорот ИИ выровнял перевёрнутые изображения перед чтением размеров: "
+                f"🧭 Автоповорот ИИ (разовый запуск){tok_note} выровнял изображения перед чтением размеров: "
                 + ", ".join(rotated_labels)
+            )
+        else:
+            warnings.append(
+                f"🧭 Автоповорот ИИ (разовый запуск){tok_note}: все кадры уже в прямой ориентации (0°)"
             )
 
     combined = "\n\n".join(part for part in (pdf_text, text or "") if part and part.strip())

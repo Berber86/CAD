@@ -1339,8 +1339,21 @@ class SurveyApp(ctk.CTk):
                     f"→ POB ({pob_x:+.2f}, {pob_y:+.2f})"
                 )
         if outcome.warnings:
-            parts.append(f"предупреждений: {len(outcome.warnings)} (см. лог)")
-        return "  |  ".join(parts)
+            parts.append(f"пояснений/исправлений: {len(outcome.warnings)}")
+        header = "  |  ".join(parts)
+        extra_lines: list[str] = [f"• {w}" for w in outcome.warnings]
+        try:
+            plan = AcadBuilder(self.config_data).plan(data, scale=self._current_scale())
+            for info_note in plan.notes:
+                extra_lines.append(f"• {info_note}")
+                self._log_line(f"• {info_note}")
+            for plan_warn in plan.warnings:
+                extra_lines.append(f"! {plan_warn}")
+        except Exception:  # noqa: BLE001
+            pass
+        if extra_lines:
+            return header + "\n" + "\n".join(extra_lines)
+        return header
 
     def _closure_text(self, outcome: ParseOutcome) -> str:
         try:
@@ -1353,7 +1366,12 @@ class SurveyApp(ctk.CTk):
     def _handle_draw_result(self, outcome: ParseOutcome, result: DrawResult) -> None:
         self.draw_result = result
         self._apply_parsed(outcome)
-        self._set_status(result.summary())
+        for info_note in result.plan.notes:
+            self._log_line(f"• {info_note}")
+        summary_text = result.summary()
+        if outcome.warnings:
+            summary_text += "\n" + "\n".join(f"• {w}" for w in outcome.warnings)
+        self._set_status(summary_text)
         self.closure_var.set(result.closure.short_report())
 
 

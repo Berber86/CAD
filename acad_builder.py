@@ -46,6 +46,7 @@ __all__ = [
     "AcadBuilder",
     "bearing_azimuth_deg",
     "bearing_to_xy",
+    "build_boundary_lines",
     "build_polygon_points",
     "build_side_label",
     "build_side_lines",
@@ -58,7 +59,9 @@ __all__ = [
     "point_in_polygon",
     "polygon_centroid",
     "polygon_signed_area",
+    "resolve_analytical_right_trapezoid",
     "round_ft",
+    "select_gap_vertex_index",
     "text_rotation",
 ]
 
@@ -289,6 +292,276 @@ def polygon_centroid(points: Sequence[tuple[float, float]]) -> tuple[float, floa
             best_span = span
             best_pt = (mid_x, cy)
     return best_pt
+
+
+def resolve_analytical_right_trapezoid(
+    description: LegalDescription,
+    segments: Sequence[Segment],
+    front_index: int | None,
+) -> tuple[list[Segment], str | None]:
+    """
+    Исключение №1 (правило точной перпендикулярной глубины лота, напр. 63-01 Borden Ave):
+    если 4-угольный участок имеет:
+      * фронт вдоль ``main_street`` точной длины L_f (напр. 20.72'),
+      * одну боковую границу строго под 90° к ``main_street`` точной глубины L_d (напр. 90.00'),
+      * заднюю границу строго параллельно ``main_street`` (PARALLEL WITH ..., напр. 26.32'),
+      * вторую боковую границу под косым углом != 90° (напр. 93°33'29.5", 90.17'),
+    и исходный микрогэп (<= 0.03 ft) вызван исключительно округлением L_oblique и L_rear до 0.01',
+    принимает за основу L_f, L_d и все углы и вычисляет точные аналитические длины
+    L_oblique* и L_rear*, замыкая контур строго в 0.0000 ft.
+    """
+    segs = list(segments)
+    if len(segs) != 4 or front_index is None or not (0 <= front_index < 4):
+        return segs, None
+
+    raw_pts = build_polygon_points(segs)
+    raw_gap = math.hypot(raw_pts[-1][0] - raw_pts[0][0], raw_pts[-1][1] - raw_pts[0][1])
+    if not (1e-6 < raw_gap <= 0.03):
+        return segs, None
+
+    f_idx = front_index
+    r_idx = (f_idx + 2) % 4
+    adj_a = (f_idx - 1) % 4
+    adj_b = (f_idx + 1) % 4
+
+    unit_vecs: list[tuple[float, float]] = []
+    for s in segs:
+        dx, dy = segment_vector(s)
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return segs, None
+        unit_vecs.append((dx / length, dy / length))
+
+    ufx, ufy = unit_vecs[f_idx]
+    urx,ury = unit_vecs[r_idx]
+    # Задняя сторона должна быть параллельна (противоположна по обходу) фасаду
+    cross_fr = abs(ufx * ury - ufy * urx)
+    dot_fr = ufx * urx + ufy * ury
+    if cross_fr > math.sin(math.radians(0.03)) or dot_fr > -0.999:
+        return segs, None
+
+    dot_a = abs(ufx * unit_vecs[adj_a][0] + ufy * unit_vecs[adj_a][1])
+    dot_b = abs(ufx * unit_vecs[adj_b][0] + ufy * unit_vecs[adj_b][1])
+    tol_perp = math.sin(math.radians(0.03))
+    min_oblique = math.sin(math.radians(0.08))
+
+    if dot_a <= tol_perp and dot_b >= min_oblique:
+        d_idx, s_idx = adj_a, adj_b
+    elif dot_b <= tol_perp and dot_a >= min_oblique:
+        d_idx, s_idx = adj_b, adj_a
+    else:
+        return segs, None
+
+    usx, usy = unit_vecs[s_idx]
+    det = usx * ury - usy * urx
+    if abs(det) < 0.05:
+        return segs, None
+
+    lf = segs[f_idx].distance_ft
+    ld = segs[d_idx].distance_ft
+    rhs_x = -(lf * ufx + ld * unit_vecs[d_idx][0])
+    rhs_y = -(lf * ufy + ld * unit_vecs[d_idx][1])
+
+    ls_exact = (rhs_x * ury - rhs_y * urx) / det
+    lr_exact = (usx * rhs_y - usy * rhs_x) / det
+    if ls_exact <= 0.0 or lr_exact <= 0.0:
+        return segs, None
+
+    old_ls = segs[s_idx].distance_ft
+    old_lr = segs[r_idx].distance_ft
+    # Строгая проверка: обе аналитические длины при округлении до 0.01' совпадают с документом
+    if abs(ls_exact - old_ls) > 0.01 or abs(lr_exact - old_lr) > 0.01:
+        return segs, None
+
+    refined = list(segs)
+    refined[s_idx] = segs[s_idx].model_copy(update={"distance_ft": ls_exact})
+    refined[r_idx] = segs[r_idx].model_copy(update={"distance_ft": lr_exact})
+    street_title = description.main_street or "фасадной улицы"
+    note = (
+        f"Аналитическое замыкание прямоугольной трапеции: за основу приняты фронт "
+        f"{format_distance(lf)} ({street_title}), перпендикулярная глубина "
+        f"{format_distance(ld)} под 90° и точный косой угол; округлённые стороны уточнены "
+        f"№{s_idx + 1} ({old_ls:.2f}' → {ls_exact:.4f}') и №{r_idx + 1} "
+        f"({old_lr:.2f}' → {lr_exact:.4f}'), контур замкнут в 0.0000 ft"
+    )
+    return refined, note
+
+
+def select_gap_vertex_index(
+    description: LegalDescription,
+    vertices: Sequence[tuple[float, float]],
+    front_index: int | None,
+    ccw: bool,
+) -> tuple[int, str]:
+    """
+    Выбирает вершину для размещения открытого гэпа (без изменения длин и углов сторон):
+      * Угловой участок на пересечении 2 улиц: вершина, НЕ соприкасающаяся ни с одной
+        из двух улиц (внутренний задний угол — левый или правый).
+      * Рядовой участок: правый угол задней стороны:
+          - если дорога сверху (внешняя нормаль фасада смотрит на север / восток-запад) ->
+            правый нижний угол;
+          - если дорога снизу (внешняя нормаль фасада смотрит в южную полуплоскость) ->
+            правый верхний угол.
+    """
+    n = len(vertices)
+    if n == 0:
+        return 0, "начальная вершина"
+    f_idx = (front_index % n) if front_index is not None else 0
+
+    street_vertices: set[int] = {f_idx, (f_idx + 1) % n}
+    cross_idx = getattr(description, "cross_street_side_index", None)
+    dist_corner = float(getattr(description, "distance_to_corner_ft", 0.0) or 0.0)
+    is_corner_lot = bool(description.cross_street) and (
+        cross_idx is not None or dist_corner <= 1e-6
+    )
+    if is_corner_lot:
+        c_edge = (
+            int(cross_idx)
+            if cross_idx is not None and 0 <= int(cross_idx) < n
+            else (f_idx - 1) % n
+        )
+        street_vertices.add(c_edge % n)
+        street_vertices.add((c_edge + 1) % n)
+
+    if 0 <= f_idx < len(description.segments):
+        fdx, fdy = segment_vector(description.segments[f_idx])
+    else:
+        f_start = vertices[f_idx]
+        f_end = vertices[(f_idx + 1) % n]
+        fdx = f_end[0] - f_start[0]
+        fdy = f_end[1] - f_start[1]
+    flen = math.hypot(fdx, fdy)
+    if flen > 1e-9:
+        ux, uy = fdx / flen, fdy / flen
+        nx, ny = (uy, -ux) if ccw else (-uy, ux)
+    else:
+        nx, ny = 0.0, 1.0
+
+    # Вектор вглубь участка (от улицы к задней границе)
+    rear_x, rear_y = -nx, -ny
+    if ny >= -1e-6:
+        # Дорога сверху листа -> задняя сторона снизу -> правый нижний угол
+        up_x, up_y = nx, ny
+        sheet_pos = "правый нижний угол (дорога сверху)"
+    else:
+        # Дорога снизу листа -> задняя сторона сверху -> правый верхний угол
+        up_x, up_y = -nx, -ny
+        sheet_pos = "правый верхний угол (дорога снизу)"
+    right_x, right_y = up_y, -up_x
+
+    candidates = [v for v in range(n) if v not in street_vertices]
+    if not candidates:
+        candidates = [v for v in range(n) if v != f_idx] or [0]
+
+    if is_corner_lot and len(candidates) == 1:
+        only_v = candidates[0]
+        return only_v, "внутренний угол вне обеих улиц (угловой лот)"
+
+    all_rear = [pt[0] * rear_x + pt[1] * rear_y for pt in vertices]
+    min_r = min(all_rear)
+    max_r = max(all_rear)
+    rear_scores = {
+        v: vertices[v][0] * rear_x + vertices[v][1] * rear_y for v in candidates
+    }
+    rear_band = [
+        v for v in candidates if rear_scores[v] >= min_r + 0.45 * (max_r - min_r) - 1e-6
+    ] or candidates
+
+    chosen = max(
+        rear_band,
+        key=lambda v: (
+            round(vertices[v][0] * right_x + vertices[v][1] * right_y, 4),
+            round(rear_scores[v], 4),
+        ),
+    )
+    if is_corner_lot:
+        return chosen, f"внутренний задний угол вне обеих улиц ({sheet_pos})"
+    return chosen, sheet_pos
+
+
+def build_boundary_lines(
+    segments: Sequence[Segment],
+    pob: tuple[float, float] = (0.0, 0.0),
+    *,
+    gap_vertex_index: int = 0,
+    leave_gap_open: bool = True,
+) -> tuple[
+    list[LineItem],
+    list[tuple[float, float]],
+    tuple[tuple[float, float], tuple[float, float]] | None,
+]:
+    """
+    Строит N отдельных отрезков ``LineItem`` для всех сторон участка:
+      * каждый отрезок имеет строго паспортную длину и направление из ``segments``;
+      * вершина 0 жёстко стоит в ``pob`` (от перекрёстка ``(0, 0)``);
+      * при ненулевом гэпе и ``leave_gap_open=True`` разрыв выводится ровно в
+        вершину ``gap_vertex_index`` (все остальные N-1 углов состыкованы в ноль).
+    """
+    n = len(segments)
+    if n == 0:
+        return [], [], None
+    k = gap_vertex_index % n
+    vecs = [segment_vector(s) for s in segments]
+
+    q_pts: list[tuple[float, float]] = [(0.0, 0.0)]
+    qx, qy = 0.0, 0.0
+    for step in range(n):
+        dx, dy = vecs[(k + step) % n]
+        qx += dx
+        qy += dy
+        q_pts.append((qx, qy))
+
+    pob_step = (n - k) % n
+    shift_x = float(pob[0]) - q_pts[pob_step][0]
+    shift_y = float(pob[1]) - q_pts[pob_step][1]
+    r_pts = [(px + shift_x, py + shift_y) for px, py in q_pts]
+
+    gap_dist = math.hypot(r_pts[n][0] - r_pts[0][0], r_pts[n][1] - r_pts[0][1])
+    lines: list[LineItem] = []
+    vertices: list[tuple[float, float]] = []
+    for i in range(n):
+        j = (i - k) % n
+        start_pt = r_pts[j]
+        if not leave_gap_open and gap_dist > 1e-9 and j == n - 1:
+            end_pt = r_pts[0]
+        else:
+            end_pt = r_pts[j + 1]
+        lines.append(LineItem(start=start_pt, end=end_pt, kind=f"boundary-{i + 1}"))
+        vertices.append(start_pt)
+
+    gap_pts = (r_pts[0], r_pts[n]) if (leave_gap_open and gap_dist > 1e-7) else None
+    return lines, vertices, gap_pts
+
+
+def _diagnose_unresolved_gap(
+    segments: Sequence[Segment],
+    closure: ClosureError,
+) -> str | None:
+    """
+    Если после всех проверок осталась крупная невязка (> 0.02 ft), проверяет,
+    объясняется ли она изменением длины одной из сторон (проекция невязки вдоль курса),
+    и формирует подсказку геодезисту без автоматического изменения чертежа.
+    """
+    if closure.distance <= 0.02 or not segments:
+        return None
+    ex, ey = closure.dx, closure.dy
+    hints: list[str] = []
+    for idx, seg in enumerate(segments):
+        dx, dy = segment_vector(seg)
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        ux, uy = dx / length, dy / length
+        perp = abs(ex * uy - ey * ux)
+        if perp <= max(0.05, 0.02 * closure.distance):
+            alt_len = seg.distance_ft - (ex * ux + ey * uy)
+            if alt_len > 0.5:
+                hints.append(
+                    f"сторона №{idx + 1} ({seg.distance_ft:.2f}' → {alt_len:.2f}')"
+                )
+    if hints:
+        return "Возможный источник невязки: " + " или ".join(hints[:2])
+    return None
 
 
 def _polygon_self_intersects(points: Sequence[tuple[float, float]]) -> bool:
@@ -649,11 +922,16 @@ class DrawPlan:
     closure: ClosureError
     items: list[TextItem] = field(default_factory=list)
     lines: list[LineItem] = field(default_factory=list)
+    boundary_lines: list[LineItem] = field(default_factory=list)
     arcs: list[ArcItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     ccw: bool = True
     pob: tuple[float, float] = (0.0, 0.0)
     is_neighbor: bool = False
+    gap_vertex_index: int | None = None
+    gap_points: tuple[tuple[float, float], tuple[float, float]] | None = None
+    gap_corner_label: str = ""
 
     @property
     def area_sqft(self) -> float:
@@ -673,6 +951,7 @@ class DrawResult:
     layers: dict[str, str]
     handle: str | None = None
     warnings: list[str] = field(default_factory=list)
+    boundary_line_count: int = 0
 
     @property
     def closure(self) -> ClosureError:
@@ -681,6 +960,10 @@ class DrawResult:
     @property
     def vertices(self) -> list[tuple[float, float]]:
         return self.plan.vertices
+
+    @property
+    def boundary_lines(self) -> list[LineItem]:
+        return self.plan.boundary_lines
 
     @property
     def pob(self) -> tuple[float, float]:
@@ -713,14 +996,23 @@ class DrawResult:
             if self.is_neighbor
             else f"Слои: {self.layers.get('property_line')} / {self.layers.get('boundary_text')}"
         )
+        n_segs = self.boundary_line_count or self.segment_count
         lines = [
             f'Масштаб 1"={self.scale:g}\'{role_tag}, высота текста {self.text_height:.3f}',
             f"POB от перекрёстка (0, 0): ({self.pob[0]:+.2f}, {self.pob[1]:+.2f}) ft",
-            f"Сторон: {self.segment_count}, подписей создано: {self.text_count}, "
+            f"Отрезков границы (LINE): {n_segs}, подписей создано: {self.text_count}, "
             f"площадь ≈ {self.area_sqft:,.0f} sq ft",
             self.closure.report(),
             layer_summary,
         ]
+        if self.plan.gap_points is not None:
+            g0, g1 = self.plan.gap_points
+            lines.append(
+                f"Открытый гэп {self.closure.distance:.4f} ft отведён в {self.plan.gap_corner_label}: "
+                f"({g0[0]:+.3f}, {g0[1]:+.3f}) ↔ ({g1[0]:+.3f}, {g1[1]:+.3f})"
+            )
+        for info_note in self.plan.notes:
+            lines.append(f"• {info_note}")
         for warning in list(self.plan.warnings) + list(self.warnings):
             lines.append(f"! {warning}")
         return "\n".join(lines)
@@ -963,6 +1255,7 @@ class AcadBuilder:
         ccw: bool,
         warnings: list[str],
         front_index: int | None = None,
+        boundary_lines: Sequence[LineItem] | None = None,
     ) -> tuple[list[TextItem], list[ArcItem], dict[int, float]]:
         cfg = self.drawing_cfg
         offset = float(cfg.get("text_offset_factor", 1.8)) * text_height
@@ -975,8 +1268,12 @@ class AcadBuilder:
         count = len(points)
 
         for index, segment in enumerate(segments):
-            start = points[index % count]
-            end = points[(index + 1) % count]
+            if boundary_lines is not None and index < len(boundary_lines):
+                start = boundary_lines[index].start
+                end = boundary_lines[index].end
+            else:
+                start = points[index % count]
+                end = points[(index + 1) % count]
             nx, ny, length = self._outward_normal(start, end, ccw)
             if length < 1e-9:
                 warnings.append(f"сторона #{index + 1}: нулевая длина — пропущена")
@@ -1275,6 +1572,7 @@ class AcadBuilder:
         warnings: list[str],
         side_band_extra: dict[int, float] | None = None,
         front_index: int | None = None,
+        boundary_lines: Sequence[LineItem] | None = None,
     ) -> tuple[list[TextItem], list[LineItem]]:
         cfg = self.drawing_cfg
         items: list[TextItem] = []
@@ -1290,8 +1588,12 @@ class AcadBuilder:
             return items, row_lines
 
         count = len(points)
-        start = points[front_index]
-        end = points[(front_index + 1) % count]
+        if boundary_lines is not None and front_index < len(boundary_lines):
+            start = boundary_lines[front_index].start
+            end = boundary_lines[front_index].end
+        else:
+            start = points[front_index]
+            end = points[(front_index + 1) % count]
         nx, ny, length = self._outward_normal(start, end, ccw)
         if length < 1e-9:
             warnings.append("фасадная сторона имеет нулевую длину — подписи улиц пропущены")
@@ -1619,7 +1921,7 @@ class AcadBuilder:
         is_neighbor: bool = False,
         neighbor_label: str | None = None,
     ) -> DrawPlan:
-        """Считает геометрию от перекрёстка (0.0, 0.0) и раскладку подписей, ничего не рисуя."""
+        """Считает геометрию отрезков от перекрёстка (0.0, 0.0) и раскладку подписей."""
         cfg = self.drawing_cfg
         scale = float(scale if scale is not None else cfg.get("base_scale", 16.0))
         height = (
@@ -1629,21 +1931,73 @@ class AcadBuilder:
         )
 
         pob = compute_pob_point(description)
-        segments = description.segments
-        traverse = build_polygon_points(segments, start=pob)
-        if len(traverse) < 4:
+        orig_segments = list(description.segments)
+        raw_traverse = build_polygon_points(orig_segments, start=pob)
+        if len(raw_traverse) < 4:
             raise AcadDrawError(
-                f"для замкнутого участка нужно минимум 3 стороны, получено {len(segments)}"
+                f"для замкнутого участка нужно минимум 3 стороны, получено {len(orig_segments)}"
             )
-        vertices = traverse[:-1]
-        closure = closure_error(traverse)
+        raw_vertices = raw_traverse[:-1]
         warnings: list[str] = []
+        notes: list[str] = []
 
-        if closure.distance > CLOSURE_TOLERANCE_FT:
-            warnings.append(
-                f"описание не замыкается точно: невязка {closure.distance:.3f} ft — "
-                "контур замкнут по замыкающей линии"
+        signed_area = polygon_signed_area(raw_vertices)
+        ccw = signed_area > 0.0
+        self._front_warning = None
+        front_index = self._front_side_index(description, raw_vertices, ccw)
+
+        # Исключение №1: аналитическое закрытие прямоугольной трапеции с точной
+        # перпендикулярной глубиной к улице (напр. 63-01 Borden Ave: 20.72', 90.00' под 90°).
+        geom_segments, trapezoid_note = resolve_analytical_right_trapezoid(
+            description, orig_segments, front_index
+        )
+        if trapezoid_note:
+            notes.append(trapezoid_note)
+
+        traverse = build_polygon_points(geom_segments, start=pob)
+        closure = closure_error(traverse)
+
+        leave_gap_open = bool(cfg.get("leave_gap_open", True))
+        rounding_tol = float(cfg.get("rounding_gap_tolerance_ft", CLOSURE_TOLERANCE_FT))
+        gap_vertex_index: int | None = None
+        gap_corner_label = ""
+
+        if closure.distance > 1e-7 and leave_gap_open:
+            gap_vertex_index, gap_corner_label = select_gap_vertex_index(
+                description, traverse[:-1], front_index, ccw
             )
+            boundary_lines, vertices, gap_points = build_boundary_lines(
+                geom_segments,
+                pob=pob,
+                gap_vertex_index=gap_vertex_index,
+                leave_gap_open=True,
+            )
+            notes.append(
+                f"Контур построен отдельными отрезками LINE с сохранением точных длин и углов; "
+                f"открытый гэп {closure.distance:.4f} ft отведён в {gap_corner_label}"
+            )
+        else:
+            boundary_lines, vertices, gap_points = build_boundary_lines(
+                geom_segments,
+                pob=pob,
+                gap_vertex_index=0,
+                leave_gap_open=False,
+            )
+
+        if closure.distance > rounding_tol:
+            if leave_gap_open:
+                warnings.append(
+                    f"описание не замыкается точно: невязка {closure.distance:.3f} ft — "
+                    f"длины и углы сохранены строго, открытый гэп отведён в {gap_corner_label}"
+                )
+            else:
+                warnings.append(
+                    f"описание не замыкается точно: невязка {closure.distance:.3f} ft — "
+                    "контур замкнут по замыкающей линии"
+                )
+            diag_hint = _diagnose_unresolved_gap(geom_segments, closure)
+            if diag_hint:
+                warnings.append(diag_hint)
         if closure.distance > 5.0:
             warnings.append(
                 "невязка больше 5 ft — проверьте румбы и длины в исходном описании"
@@ -1660,9 +2014,6 @@ class AcadBuilder:
             )
 
         ccw = signed_area > 0.0
-        self._front_warning = None
-        front_index = self._front_side_index(description, vertices, ccw)
-
         if is_neighbor:
             items = [
                 self._neighbor_label_item(
@@ -1677,7 +2028,13 @@ class AcadBuilder:
             arcs: list[ArcItem] = []
         else:
             items, arcs, side_band_extra = self._side_items(
-                description, vertices, height, ccw, warnings, front_index=front_index
+                description,
+                vertices,
+                height,
+                ccw,
+                warnings,
+                front_index=front_index,
+                boundary_lines=boundary_lines,
             )
             street_texts, row_lines = self._street_items(
                 description,
@@ -1687,6 +2044,7 @@ class AcadBuilder:
                 warnings,
                 side_band_extra=side_band_extra,
                 front_index=front_index,
+                boundary_lines=boundary_lines,
             )
             items.extend(street_texts)
             if self._front_warning:
@@ -1700,11 +2058,16 @@ class AcadBuilder:
             closure=closure,
             items=items,
             lines=row_lines,
+            boundary_lines=boundary_lines,
             arcs=arcs,
             warnings=warnings,
+            notes=notes,
             ccw=ccw,
             pob=pob,
             is_neighbor=bool(is_neighbor),
+            gap_vertex_index=gap_vertex_index,
+            gap_points=gap_points,
+            gap_corner_label=gap_corner_label,
         )
 
     # -- подключение к AutoCAD ---------------------------------------------
@@ -1839,11 +2202,16 @@ class AcadBuilder:
 
     # -- создание объектов --------------------------------------------------
     def _add_polyline(
-        self, model_space: Any, points: Sequence[tuple[float, float]], layer: str
+        self,
+        model_space: Any,
+        points: Sequence[tuple[float, float]],
+        layer: str,
+        *,
+        closed: bool = True,
     ) -> Any:
         polyline = _com_retry(model_space.AddLightWeightPolyline, _variant_points(points))
         polyline.Layer = layer
-        polyline.Closed = True
+        polyline.Closed = bool(closed)
         return polyline
 
     def _add_line(
@@ -1984,7 +2352,30 @@ class AcadBuilder:
                     except Exception as exc:  # noqa: BLE001
                         warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
 
-            polyline = self._add_polyline(model_space, plan.vertices, poly_target_layer)
+            draw_as_lines = bool(drawing.get("property_as_lines", True))
+            primary_entity: Any = None
+            created_boundary_lines = 0
+            if draw_as_lines and plan.boundary_lines and hasattr(model_space, "AddLine"):
+                for b_line in plan.boundary_lines:
+                    line_ent = self._add_line(model_space, b_line, poly_target_layer)
+                    created_boundary_lines += 1
+                    if primary_entity is None:
+                        primary_entity = line_ent
+            else:
+                if plan.gap_points is not None and plan.boundary_lines:
+                    k_idx = plan.gap_vertex_index or 0
+                    n_b = len(plan.boundary_lines)
+                    ordered_chain = [
+                        plan.boundary_lines[(k_idx + step) % n_b] for step in range(n_b)
+                    ]
+                    poly_pts = [ordered_chain[0].start] + [seg_l.end for seg_l in ordered_chain]
+                    primary_entity = self._add_polyline(
+                        model_space, poly_pts, poly_target_layer, closed=False
+                    )
+                else:
+                    primary_entity = self._add_polyline(
+                        model_space, plan.vertices, poly_target_layer, closed=True
+                    )
 
             if plan.arcs and hasattr(model_space, "AddArc"):
                 for arc_item in plan.arcs:
@@ -2026,7 +2417,8 @@ class AcadBuilder:
 
             handle: str | None = None
             try:
-                handle = str(polyline.Handle)
+                if primary_entity is not None:
+                    handle = str(primary_entity.Handle)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2046,6 +2438,7 @@ class AcadBuilder:
                 layers=result_layers,
                 handle=handle,
                 warnings=warnings,
+                boundary_line_count=created_boundary_lines,
             )
         finally:
             if self._com_owned:

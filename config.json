@@ -87,6 +87,9 @@
     "degrees_as_control_code": true,
     "text_style": "AI_BOUNDARY",
     "draw_street_extensions": true,
+    "property_as_lines": true,
+    "leave_gap_open": true,
+    "rounding_gap_tolerance_ft": 0.015,
     "zoom_extents": true,
     "zoom_margin_scale": 0.84
   },

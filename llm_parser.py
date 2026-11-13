@@ -209,6 +209,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "degrees_as_control_code": True,
         "text_style": "AI_BOUNDARY",
         "draw_street_extensions": True,
+        "property_as_lines": True,
+        "leave_gap_open": True,
+        "rounding_gap_tolerance_ft": 0.015,
         "zoom_extents": True,
         "zoom_margin_scale": 0.84,
     },
@@ -1296,6 +1299,15 @@ class LegalDescription(BaseModel):
         default=None,
         description="Район/город/округ, например 'Staten Island, NY' или 'Queens, NY'",
     )
+    anomaly_note: str | None = Field(
+        default=None,
+        description=(
+            "Если в тексте Legal Description или на скане обнаружена очевидная опечатка "
+            "(перепутаны N/S или E/W, либо цифра 3↔8, 8↔0, 1↔7, 5↔6 в угле или длине) "
+            "и она исправлена — обязательное пояснение на русском языке, что было указано "
+            "и на что исправлено; иначе null"
+        ),
+    )
     segments: list[Segment] = Field(
         min_length=1,
         description="Стороны участка по порядку обхода (каждый call = один элемент)",
@@ -1336,6 +1348,7 @@ class LegalDescription(BaseModel):
         "block_number",
         "lot_number",
         "borough_or_city",
+        "anomaly_note",
         mode="before",
     )
     @classmethod
@@ -1573,11 +1586,16 @@ CRITICAL SURVEY RULES
 2. IGNORE BUILDING & FENCE OFFSETS:
    - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'") with lot boundary lines.
    - When both "(DEED)" and "(T.M.)" / "(TAX MAP)" values appear, prefer the "(DEED)" / record survey dimension.
-3. QUADRANT BEARINGS vs. RELATIVE NYC COURSES (Queens / Brooklyn / Bronx / Manhattan):
-   - Every element of `segments` must represent one lot boundary side in continuous loop order around the parcel, forming a CLOSED polygon (sum of dX ≈ 0, sum of dY ≈ 0). On survey plats, verify each bearing's N/S and E/W direction matches your chosen CW/CCW loop direction (flip N<->S AND E<->W if a plat labeled a wall in the opposite travel direction).
+3. QUADRANT BEARINGS, RELATIVE NYC COURSES & TYPO EVALUATION:
+   - Every element of `segments` represents one lot boundary side in continuous loop order around the parcel. On survey plats, orient each bearing's N/S and E/W letters along your chosen CW/CCW loop direction.
+   - DO NOT alter small 0.01-ft rounding gaps (e.g. 0.003–0.015 ft on oblique trapezoids) — preserve exact record numbers; our CAD geometry engine handles analytical right-trapezoid closure and open rounding gaps automatically.
+   - HOWEVER, act as a thinking surveyor when a LARGE closure gap (> 0.1 ft) appears: check whether it is caused by an OBVIOUS TYPO or visual OCR digit confusion:
+     * Quadrant letter typo (`N` <-> `S` or `E` <-> `W`), OR
+     * Digit confusion (`3` <-> `8`, `8` <-> `0`, `1` <-> `7`, `5` <-> `6`, `0` <-> `6`, `0` <-> `9`) in `degrees`, `minutes`, `seconds`, or `distance_ft` (compare against opposite parallel/perpendicular sides, building dimensions, and lot frontage).
+     If an obvious typo is identified and fixing it cleanly closes the parcel, output the corrected value AND explain clearly in Russian in `anomaly_note` what was written in the source and what typo was corrected. If NO obvious typo can be determined with confidence, keep all printed lengths and angles strictly verbatim and set `anomaly_note` to `null` (or describe the unresolved discrepancy in `anomaly_note` without altering `segments`).
    - When explicit quadrant bearings are given, split into `ns` ("N"/"S"), `degrees` (0..90), `minutes` (0..59), `seconds` (decimal), `ew` ("E"/"W"), `bearing_label` ("N 75°20'20\" E"), and set `has_bearing = true`.
    - When NO compass bearings are printed (common in NYC surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
-     * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) and apply exact interior/right angles so the polygon closes mathematically;
+     * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) and apply exact printed interior/right angles without inventing compass labels;
      * Set `has_bearing = false` on every course without an explicit compass bearing;
      * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
      * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
@@ -1601,10 +1619,10 @@ USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 Extract the lot geometry and survey metadata into JSON."""
 
 VISION_USER_PROMPT = """Examine the attached survey / title document page(s) carefully.
-1. Read the exact lot boundary dimensions and bearings (or NYC relative notes like PARALLEL WITH ... / AT RIGHT ANGLES TO ...).
+1. Read the exact lot boundary dimensions and bearings (or NYC relative notes like PARALLEL WITH ... / AT RIGHT ANGLES TO ...). Pay extra visual attention to lookalike digits (3 vs 8, 8 vs 0, 1 vs 7, 5 vs 6).
 2. Check inside the lot corners for any printed interior angle (such as 93°33'29.5") and put it in `interior_angle`!
 3. Read street names, street subtitles in parentheses, corner tie distances, and Block/Lot/Borough.
-4. Walk the parcel boundary in one continuous closed loop (sum of dX ≈ 0, sum of dY ≈ 0), excluding COMMENCING / corner tie lines and building/fence offsets from `segments`."""
+4. Walk the parcel boundary in continuous loop order, excluding COMMENCING / corner tie lines and building/fence offsets from `segments`. If you spot and fix an obvious typo or OCR digit confusion, explain it in Russian in `anomaly_note`."""
 
 
 def _messages(
@@ -2904,6 +2922,13 @@ def parse_with_regex(text: str) -> tuple[LegalDescription, list[str]]:
         distance_to_corner=distance_to_corner,
     )
     validated_segs = [Segment.model_validate(s) for s in raw_segments]
+    validated_segs, _, typo_notes = _detect_and_repair_obvious_typos(
+        validated_segs,
+        front_segment_index=meta["front_segment_index"],
+        cross_street_side_index=meta["cross_street_side_index"],
+        from_vision=False,
+    )
+    warnings.extend(typo_notes)
     corner_tie = infer_corner_to_pob_bearing(
         validated_segs,
         distance_to_corner_ft=distance_to_corner,
@@ -3111,49 +3136,164 @@ def _trace_closure_and_validity(segments: Sequence[Segment]) -> tuple[float, boo
     return err, True
 
 
-def _repair_llm_geometry(
-    model: LegalDescription,
+_LOOKALIKE_DIGIT_PAIRS: set[frozenset[str]] = {
+    frozenset(("3", "8")),
+    frozenset(("8", "0")),
+    frozenset(("1", "7")),
+    frozenset(("5", "6")),
+    frozenset(("0", "6")),
+    frozenset(("0", "9")),
+    frozenset(("1", "4")),
+    frozenset(("2", "7")),
+    frozenset(("3", "5")),
+    frozenset(("6", "8")),
+    frozenset(("8", "9")),
+}
+
+
+def _single_digit_diff(a_str: str, b_str: str) -> tuple[str, str] | None:
+    """Возвращает пару отличающихся цифр (old_d, new_d), если строки отличаются ровно в 1 цифре."""
+    if len(a_str) != len(b_str):
+        return None
+    diffs: list[tuple[str, str]] = []
+    for ca, cb in zip(a_str, b_str):
+        if ca != cb:
+            if not (ca.isdigit() and cb.isdigit()):
+                return None
+            diffs.append((ca, cb))
+            if len(diffs) > 1:
+                return None
+    return diffs[0] if len(diffs) == 1 else None
+
+
+def _is_lookalike_digit_pair(da: str, db: str) -> bool:
+    return frozenset((da, db)) in _LOOKALIKE_DIGIT_PAIRS
+
+
+def _mutate_segment_bearing(
+    seg: Segment,
     *,
+    ns: Literal["N", "S"] | None = None,
+    degrees: int | None = None,
+    minutes: int | None = None,
+    seconds: float | None = None,
+    ew: Literal["E", "W"] | None = None,
+) -> Segment | None:
+    d_val = seg.degrees if degrees is None else degrees
+    m_val = seg.minutes if minutes is None else minutes
+    s_val = seg.seconds if seconds is None else seconds
+    if d_val == 90 and (m_val > 0 or s_val > 1e-6):
+        return None
+    if not (0 <= d_val <= 90 and 0 <= m_val <= 59 and 0.0 <= s_val < 60.0):
+        return None
+    return Segment(
+        ns=seg.ns if ns is None else ns,
+        degrees=d_val,
+        minutes=m_val,
+        seconds=s_val,
+        ew=seg.ew if ew is None else ew,
+        distance_ft=seg.distance_ft,
+        has_bearing=seg.has_bearing,
+        course_note=seg.course_note,
+        interior_angle=seg.interior_angle,
+    )
+
+
+def _detect_and_repair_obvious_typos(
+    segments: Sequence[Segment],
+    *,
+    front_segment_index: int | None = None,
+    cross_street_side_index: int | None = None,
     from_vision: bool = False,
-    source_text: str = "",
-) -> tuple[LegalDescription, list[str]]:
+) -> tuple[list[Segment], dict[int, int] | None, list[str]]:
     """
-    Упреждающая санитарная проверка ответа LLM / Vision-разбора чертежа:
-      1) не допускает привязки main_street к тыльной/боковой границе PARALLEL WITH / AT RIGHT ANGLES;
-      2) не допускает углового cross_street_side_index на рядовом участке (distance_to_corner_ft > 0.5);
-      3) если на чертеже Survey подписи румбов были сняты без учёта направления обхода
-         (или в произвольном порядке сторон) и контур разомкнут (> 0.5 ft), проверяет,
-         существует ли перестановка/разворот румбов на 180°, дающий точное замыкание
-         (<= 0.05 ft) простого многоугольника без самопересечений. Реальные ошибки длин
-         в deed'е (например 130' вместо 120') не маскируются, т.к. не дают <= 0.05 ft;
-      4) сверяет вектор привязки corner_to_pob_bearing с направлением к POB вдоль main_street.
+    Интеллектуальный геодезический поиск очевидных опечаток текста / OCR:
+      1) опечатка направления квадранта N↔S или E↔W (или разворот 180° на чертеже);
+      2) опечатка в цифрах угла (градусы/минуты/секунды: 3↔8, 8↔0, 1↔7, 5↔6 и др.,
+         включая сверку с параллельной/перпендикулярной противоположной стороной);
+      3) опечатка похожей цифры (3↔8, 8↔0, 1↔7, 5↔6 и др.) в длине стороны (с защитой
+         фасадных сторон вдоль улиц).
+    Всегда возвращает подробное русскоязычное пояснение найденной и исправленной опечатки.
+    Если опечатка неоднозначна — НЕ меняет данные молча.
     """
-    notes: list[str] = []
-    updates: dict[str, Any] = {}
-
-    f_idx = model.front_segment_index
-    if f_idx is not None and 0 <= f_idx < len(model.segments):
-        c_note = (model.segments[f_idx].course_note or "").upper()
-        if "PARALLEL WITH" in c_note or "AT RIGHT ANGLES" in c_note:
-            updates["front_segment_index"] = None
-            notes.append(
-                "индекс фасада указывал на относительную тыльную/боковую границу — пересчитан по геометрии"
-            )
-
-    if (
-        model.cross_street_side_index is not None
-        and model.distance_to_corner_ft > 0.5
-    ):
-        updates["cross_street_side_index"] = None
-
-    segs = list(model.segments)
+    segs = list(segments)
     n = len(segs)
+    if not (3 <= n <= 10):
+        return segs, None, []
+
     err0, _ = _trace_closure_and_validity(segs)
-    if 3 <= n <= 8 and err0 > 0.5:
+    if err0 <= 0.08:
+        return segs, None, []
+
+    protected_street = {
+        idx for idx in (front_segment_index, cross_street_side_index) if idx is not None
+    }
+
+    def _corner_geometry_score(cand_segs: Sequence[Segment]) -> tuple[int, float]:
+        """Число прямых углов (90° ± 0.05°) и минимальный sin угла между смежными сторонами."""
+        ortho_cnt = 0
+        min_sin = 1.0
+        cnt = len(cand_segs)
+        uvecs: list[tuple[float, float]] = []
+        for cs in cand_segs:
+            vx, vy = cs.vector
+            vlen = math.hypot(vx, vy) or 1.0
+            uvecs.append((vx / vlen, vy / vlen))
+        for k_i in range(cnt):
+            ax, ay = uvecs[k_i]
+            bx, by = uvecs[(k_i + 1) % cnt]
+            dot_ab = abs(ax * bx + ay * by)
+            sin_ab = abs(ax * by - ay * bx)
+            if dot_ab <= math.sin(math.radians(0.05)):
+                ortho_cnt += 1
+            if sin_ab < min_sin:
+                min_sin = sin_ab
+        return ortho_cnt, round(min_sin, 2)
+
+    # --- 1. Одиночная опечатка квадранта N↔S, E↔W или 180° (N↔S + E↔W) ---
+    quad_candidates: list[tuple[int, float, int, float, int, Segment, str]] = []
+    for idx, seg in enumerate(segs):
+        ns_flip: Literal["N", "S"] = "S" if seg.ns == "N" else "N"
+        ew_flip: Literal["E", "W"] = "W" if seg.ew == "E" else "E"
+        variants = [
+            (_mutate_segment_bearing(seg, ns=ns_flip), f"{seg.ns}→{ns_flip}"),
+            (_mutate_segment_bearing(seg, ew=ew_flip), f"{seg.ew}→{ew_flip}"),
+            (_mutate_segment_bearing(seg, ns=ns_flip, ew=ew_flip), f"{seg.ns}→{ns_flip}, {seg.ew}→{ew_flip}"),
+        ]
+        for mutated, kind_tag in variants:
+            if mutated is None or mutated.bearing_label == seg.bearing_label:
+                continue
+            trial = list(segs)
+            trial[idx] = mutated
+            err, valid = _trace_closure_and_validity(trial)
+            if valid and err <= min(0.04, 0.03 * err0):
+                ortho_cnt, min_sin = _corner_geometry_score(trial)
+                street_pen = 1 if idx in protected_street else 0
+                quad_candidates.append(
+                    (-ortho_cnt, -min_sin, street_pen, err, idx, mutated, kind_tag)
+                )
+
+    if quad_candidates:
+        quad_candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        _, _, _, best_err, best_idx, best_seg, kind_tag = quad_candidates[0]
+        old_lbl = segs[best_idx].bearing_label
+        repaired = list(segs)
+        repaired[best_idx] = best_seg
+        return (
+            repaired,
+            None,
+            [
+                f"Обнаружена и исправлена очевидная опечатка направления в стороне №{best_idx + 1} "
+                f"({kind_tag}): «{old_lbl}» → «{best_seg.bearing_label}» "
+                f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+            ],
+        )
+
+    # --- 2. Многосегментный разворот 180° / перестановка на чертеже Survey ---
+    if n <= 8 and err0 > 0.5:
         best_err = err0
         best_order: tuple[int, ...] | None = None
         best_flips: tuple[bool, ...] | None = None
-
         orders: list[tuple[int, ...]] = [tuple(range(n))]
         if from_vision and n <= 6:
             orders.extend((0, *perm) for perm in itertools.permutations(range(1, n)))
@@ -3180,18 +3320,274 @@ def _repair_llm_geometry(
                 _flip_segment_direction(segs[idx]) if fl else segs[idx]
                 for idx, fl in zip(best_order, best_flips)
             ]
-            updates["segments"] = repaired_segs
             old_to_new = {old_i: new_i for new_i, old_i in enumerate(best_order)}
-            cur_f = updates.get("front_segment_index", model.front_segment_index)
-            if cur_f is not None and cur_f in old_to_new:
-                updates["front_segment_index"] = old_to_new[cur_f]
-            cur_c = updates.get("cross_street_side_index", model.cross_street_side_index)
-            if cur_c is not None and cur_c in old_to_new:
-                updates["cross_street_side_index"] = old_to_new[cur_c]
-            notes.append(
-                f"скорректирован порядок/направление обхода сторон по замыканию контура "
-                f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+            return (
+                repaired_segs,
+                old_to_new,
+                [
+                    f"скорректирован порядок/направление обхода сторон по замыканию контура "
+                    f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+                ],
             )
+
+    # --- 3. Опечатка в цифрах угла (градусы / минуты / секунды) одной стороны ---
+    dms_candidates: list[tuple[int, int, int, float, int, Segment, str]] = []
+    for idx, seg in enumerate(segs):
+        if not seg.has_bearing:
+            continue
+        sec_is_int = abs(seg.seconds - round(seg.seconds)) < 1e-4
+        orig_sec_int = int(round(seg.seconds))
+        orig_code = f"{seg.degrees:02d}{seg.minutes:02d}{orig_sec_int:02d}"
+
+        seen_dms: set[tuple[int, int, float]] = {(seg.degrees, seg.minutes, round(seg.seconds, 4))}
+        trial_dms: list[tuple[int, int, float, bool, str]] = []
+
+        # 3a) Сверка с параллельными и перпендикулярными сторонами участка
+        for j, other in enumerate(segs):
+            if j == idx or not other.has_bearing:
+                continue
+            ref_list = [(other.degrees, other.minutes, other.seconds)]
+            comp_total_sec = 90.0 * 3600.0 - (
+                other.degrees * 3600.0 + other.minutes * 60.0 + other.seconds
+            )
+            if 0.0 <= comp_total_sec <= 90.0 * 3600.0:
+                cd = int(comp_total_sec // 3600)
+                rem = comp_total_sec - cd * 3600
+                cm = int(rem // 60)
+                cs = round(rem - cm * 60, 4)
+                if cs >= 60.0:
+                    cs -= 60.0
+                    cm += 1
+                if cm >= 60:
+                    cm -= 60
+                    cd += 1
+                ref_list.append((cd, cm, cs))
+
+            for rd, rm, rs in ref_list:
+                key = (rd, rm, round(rs, 4))
+                if key in seen_dms:
+                    continue
+                ref_code = f"{rd:02d}{rm:02d}{int(round(rs)):02d}"
+                digit_diffs = [
+                    (ca, cb) for ca, cb in zip(orig_code, ref_code) if ca != cb
+                ]
+                if 1 <= len(digit_diffs) <= 2:
+                    seen_dms.add(key)
+                    pair_desc = ", ".join(f"{a}→{b}" for a, b in digit_diffs)
+                    trial_dms.append((rd, rm, rs, True, pair_desc))
+
+        # 3b) Одиночные замены цифр в градусах, минутах и целых секундах
+        deg_str = f"{seg.degrees:02d}"
+        for pos in range(2):
+            for d_ch in "0123456789":
+                if d_ch == deg_str[pos]:
+                    continue
+                nd = int(deg_str[:pos] + d_ch + deg_str[pos + 1 :])
+                if 0 <= nd <= 89:
+                    key = (nd, seg.minutes, round(seg.seconds, 4))
+                    if key not in seen_dms:
+                        seen_dms.add(key)
+                        trial_dms.append(
+                            (nd, seg.minutes, seg.seconds, False, f"{deg_str[pos]}→{d_ch}")
+                        )
+
+        min_str = f"{seg.minutes:02d}"
+        for pos in range(2):
+            for d_ch in "0123456789":
+                if d_ch == min_str[pos]:
+                    continue
+                nm = int(min_str[:pos] + d_ch + min_str[pos + 1 :])
+                if 0 <= nm <= 59:
+                    key = (seg.degrees, nm, round(seg.seconds, 4))
+                    if key not in seen_dms:
+                        seen_dms.add(key)
+                        trial_dms.append(
+                            (seg.degrees, nm, seg.seconds, False, f"{min_str[pos]}→{d_ch}")
+                        )
+
+        if sec_is_int:
+            sec_str = f"{orig_sec_int:02d}"
+            for pos in range(2):
+                for d_ch in "0123456789":
+                    if d_ch == sec_str[pos]:
+                        continue
+                    ns_int = int(sec_str[:pos] + d_ch + sec_str[pos + 1 :])
+                    if 0 <= ns_int <= 59:
+                        key = (seg.degrees, seg.minutes, float(ns_int))
+                        if key not in seen_dms:
+                            seen_dms.add(key)
+                            trial_dms.append(
+                                (
+                                    seg.degrees,
+                                    seg.minutes,
+                                    float(ns_int),
+                                    False,
+                                    f"{sec_str[pos]}→{d_ch}",
+                                )
+                            )
+
+        for nd, nm, ns_val, ref_match, pair_desc in trial_dms:
+            mutated = _mutate_segment_bearing(seg, degrees=nd, minutes=nm, seconds=ns_val)
+            if mutated is None:
+                continue
+            trial = list(segs)
+            trial[idx] = mutated
+            err, valid = _trace_closure_and_validity(trial)
+            if not valid or err > min(0.03, 0.03 * err0):
+                continue
+            d_diff = _single_digit_diff(
+                f"{seg.degrees:02d}{seg.minutes:02d}{orig_sec_int:02d}",
+                f"{nd:02d}{nm:02d}{int(round(ns_val)):02d}",
+            )
+            is_look = bool(d_diff and _is_lookalike_digit_pair(*d_diff))
+            if not (ref_match or is_look):
+                continue
+            ortho_cnt, _ = _corner_geometry_score(trial)
+            street_pen = 1 if idx in protected_street else 0
+            dms_candidates.append(
+                (
+                    -ortho_cnt,
+                    0 if ref_match else 1,
+                    0 if is_look else 1,
+                    street_pen,
+                    err,
+                    idx,
+                    mutated,
+                    pair_desc,
+                )  # type: ignore[arg-type]
+            )
+
+    if dms_candidates:
+        dms_candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+        best = dms_candidates[0]
+        rivals = [
+            c
+            for c in dms_candidates[1:]
+            if c[5] != best[5]
+            and c[:4] == best[:4]
+            and abs(c[4] - best[4]) < 0.01
+        ]
+        if not rivals:
+            _, _, _, _, best_err, best_idx, best_seg, pair_desc = best  # type: ignore[misc]
+            old_lbl = segs[best_idx].bearing_label
+            repaired = list(segs)
+            repaired[best_idx] = best_seg
+            return (
+                repaired,
+                None,
+                [
+                    f"Обнаружена и исправлена опечатка цифр в угле стороны №{best_idx + 1} "
+                    f"(цифра {pair_desc}): «{old_lbl}» → «{best_seg.bearing_label}» "
+                    f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+                ],
+            )
+
+    # --- 4. Опечатка похожей цифры (3↔8, 8↔0, 1↔7, 5↔6 и др.) в длине стороны ---
+    if err0 >= 0.25:
+        ex = sum(s.vector[0] for s in segs)
+        ey = sum(s.vector[1] for s in segs)
+        dist_matches: list[tuple[int, Segment, str, str, tuple[str, str], float]] = []
+        for idx, seg in enumerate(segs):
+            dx, dy = seg.vector
+            length = math.hypot(dx, dy)
+            if length < 1e-6:
+                continue
+            ux, uy = dx / length, dy / length
+            perp_err = abs(ex * uy - ey * ux)
+            if perp_err > 0.03:
+                continue
+            target_len = seg.distance_ft - (ex * ux + ey * uy)
+            cand_len = round(target_len, 2)
+            if cand_len <= 0.5 or abs(cand_len - target_len) > 0.03:
+                continue
+            s_old = f"{seg.distance_ft:.2f}"
+            s_new = f"{cand_len:.2f}"
+            diff_pair = _single_digit_diff(s_old, s_new)
+            if diff_pair is None or not _is_lookalike_digit_pair(*diff_pair):
+                continue
+            mutated = seg.model_copy(update={"distance_ft": cand_len})
+            trial = list(segs)
+            trial[idx] = mutated
+            err_after, valid = _trace_closure_and_validity(trial)
+            if valid and err_after <= 0.03:
+                dist_matches.append((idx, mutated, s_old, s_new, diff_pair, err_after))
+
+        chosen_dist: tuple[int, Segment, str, str, tuple[str, str], float] | None = None
+        if len(dist_matches) == 1:
+            chosen_dist = dist_matches[0]
+        elif len(dist_matches) > 1:
+            non_street = [m for m in dist_matches if m[0] not in protected_street]
+            if len(non_street) == 1:
+                chosen_dist = non_street[0]
+
+        if chosen_dist is not None:
+            best_idx, best_seg, s_old, s_new, (d_old, d_new), best_err = chosen_dist
+            repaired = list(segs)
+            repaired[best_idx] = best_seg
+            return (
+                repaired,
+                None,
+                [
+                    f"Обнаружена и исправлена очевидная опечатка цифры в длине стороны №{best_idx + 1} "
+                    f"(цифра {d_old}→{d_new}): {s_old}' → {s_new}' "
+                    f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+                ],
+            )
+
+    return segs, None, []
+
+
+def _repair_llm_geometry(
+    model: LegalDescription,
+    *,
+    from_vision: bool = False,
+    source_text: str = "",
+) -> tuple[LegalDescription, list[str]]:
+    """
+    Упреждающая санитарная проверка и поиск очевидных опечаток ответа LLM / Vision:
+      1) не допускает привязки main_street к тыльной/боковой границе PARALLEL WITH / AT RIGHT ANGLES;
+      2) не допускает углового cross_street_side_index на рядовом участке (distance_to_corner_ft > 0.5);
+      3) ищет очевидные опечатки в буквах N/S/E/W, цифрах углов и похожих цифрах длин
+         (3↔8, 8↔0, 1↔7, 5↔6 и др.) либо перестановку/разворот сторон на чертеже Survey,
+         всегда формируя подробное пояснение; неоднозначные расхождения не маскирует;
+      4) сверяет вектор привязки corner_to_pob_bearing с направлением к POB вдоль main_street.
+    """
+    notes: list[str] = []
+    if model.anomaly_note:
+        notes.append(f"[Пояснение LLM] {model.anomaly_note}")
+    updates: dict[str, Any] = {}
+
+    f_idx = model.front_segment_index
+    if f_idx is not None and 0 <= f_idx < len(model.segments):
+        c_note = (model.segments[f_idx].course_note or "").upper()
+        if "PARALLEL WITH" in c_note or "AT RIGHT ANGLES" in c_note:
+            updates["front_segment_index"] = None
+            notes.append(
+                "индекс фасада указывал на относительную тыльную/боковую границу — пересчитан по геометрии"
+            )
+
+    if (
+        model.cross_street_side_index is not None
+        and model.distance_to_corner_ft > 0.5
+    ):
+        updates["cross_street_side_index"] = None
+
+    eff_front = updates.get("front_segment_index", model.front_segment_index)
+    eff_cross = updates.get("cross_street_side_index", model.cross_street_side_index)
+    repaired_segs, old_to_new, typo_notes = _detect_and_repair_obvious_typos(
+        model.segments,
+        front_segment_index=eff_front,
+        cross_street_side_index=eff_cross,
+        from_vision=from_vision,
+    )
+    if typo_notes:
+        updates["segments"] = repaired_segs
+        if old_to_new is not None:
+            if eff_front is not None and eff_front in old_to_new:
+                updates["front_segment_index"] = old_to_new[eff_front]
+            if eff_cross is not None and eff_cross in old_to_new:
+                updates["cross_street_side_index"] = old_to_new[eff_cross]
+        notes.extend(typo_notes)
 
     if model.distance_to_corner_ft > 1e-6:
         eff_segs = updates.get("segments", model.segments)

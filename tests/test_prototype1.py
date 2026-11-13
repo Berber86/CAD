@@ -451,9 +451,11 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     result = builder.draw(make_description(), scale=10.0)
 
     space = app.doc.ModelSpace
-    assert len(space.polylines) == 1
-    coords = space.polylines[0]
-    assert len(coords) == 8  # 4 вершины * (x, y)
+    # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
+    assert len(space.polylines) == 0
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    assert len(prop_lines) == 4
+    assert result.boundary_line_count == 4
     # 4 стороны + фасадная улица + пересекаемая улица + расстояние до угла
     assert result.text_count == 7
     texts = {item.TextString for item in space.texts}
@@ -1222,10 +1224,12 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     result = builder.draw(vision_desc, scale=16.0)
 
     space = app.doc.ModelSpace
-    assert len(space.polylines) == 1
+    assert len(space.polylines) == 0
     assert len(space.arcs) == 1
-    assert len(space.lines) == 4
-    assert {ln.Layer for ln in space.lines} == {"STREET_ROW_AI"}
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    assert len(prop_lines) == 4
+    assert len(street_lines) == 4
     assert space.arcs[0].Layer == "BOUNDARY_TEXT_AI"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
@@ -1536,16 +1540,18 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     res_right = builder.draw(desc_right, scale=16.0, is_neighbor=True)
 
     space = app.doc.ModelSpace
-    assert len(space.polyline_entities) == 3
-    assert space.polyline_entities[0].Layer == "PROPERTY_LINE"
-    assert space.polyline_entities[1].Layer == "NEIGHBOR_LOT"
-    assert space.polyline_entities[2].Layer == "NEIGHBOR_LOT"
+    assert len(space.polyline_entities) == 0
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    assert len(prop_lines) == 4
+    assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
     assert res_main.is_neighbor is False
     assert res_left.is_neighbor is True and res_right.is_neighbor is True
 
     # Соседи не добавляют ни одной линии улицы и создают ровно по 1 тексту в центроиде
-    assert len(space.lines) == main_lines_before
+    assert len(street_lines) == main_lines_before - 4
     assert res_left.text_count == 1
     assert res_right.text_count == 1
     assert len(space.texts) == main_texts_before + 2
@@ -1622,6 +1628,206 @@ def test_corner_to_pob_bearing_inference_and_llm_repair_edge_cases():
     concave_l = [(0.0, 0.0), (100.0, 0.0), (100.0, 12.0), (12.0, 12.0), (12.0, 100.0), (0.0, 100.0)]
     c_pt = polygon_centroid(concave_l)
     assert point_in_polygon(c_pt, concave_l) is True
+
+
+# ---------------------------------------------------------------------------
+# Финальные геодезические правила Николая: отрезки LINE, аналитическое
+# закрытие прямоугольной трапеции, автопоиск опечаток и размещение гэпа
+# ---------------------------------------------------------------------------
+
+
+def test_borden_ave_analytical_right_trapezoid_closes_to_zero_with_explanation():
+    """
+    Исключение №1 (63-01 Borden Ave):
+    * Фронт по Borden Ave (20.72') и перпендикулярная глубина под 90° (90.00') неприкосновенны;
+    * Косая сторона по 63rd St (90.17') уточняется до 90 / cos(3°33'29.5") = 90.174010';
+    * Задняя параллельная сторона (26.32') уточняется до 20.72 + 90 * tan(3°33'29.5") = 26.316405';
+    * Контур замыкается строго в 0.000000 ft из 4 отдельных отрезков LINE без разрывов,
+      подписи на чертеже остаются 90.17' и 26.32', а в plan.notes пишется явное пояснение.
+    """
+    from llm_parser import NYC_SAMPLES
+
+    desc, warnings = parse_with_regex(NYC_SAMPLES["63-01 Borden Ave (Queens — без румбов)"])
+    assert warnings == []
+
+    plan = AcadBuilder(load_config()).plan(desc, scale=16.0)
+    assert plan.closure.distance == pytest.approx(0.0, abs=1e-9)
+    assert plan.gap_points is None
+    assert plan.warnings == []
+    assert len(plan.boundary_lines) == 4
+    assert any("Аналитическое замыкание прямоугольной трапеции" in n for n in plan.notes)
+    assert any("90.1738'" in n and "26.3164'" in n for n in plan.notes)
+
+    # Проверяем точные длины 4 отрезков LINE: [90.173824, 26.316405, 90.000000, 20.720000]
+    line_lengths = [
+        math.hypot(ln.end[0] - ln.start[0], ln.end[1] - ln.start[1])
+        for ln in plan.boundary_lines
+    ]
+    alpha = math.radians(3.0 + 33.0 / 60.0 + 29.5 / 3600.0)
+    assert line_lengths[0] == pytest.approx(90.0 / math.cos(alpha), abs=1e-6)
+    assert line_lengths[1] == pytest.approx(20.72 + 90.0 * math.tan(alpha), abs=1e-6)
+    assert line_lengths[2] == pytest.approx(90.00, abs=1e-9)
+    assert line_lengths[3] == pytest.approx(20.72, abs=1e-9)
+
+    # Все 4 угла состыкованы в ноль, а подписи на чертеже сохраняют паспортные 90.17' и 26.32'
+    for idx in range(4):
+        assert plan.boundary_lines[idx].end == pytest.approx(
+            plan.boundary_lines[(idx + 1) % 4].start, abs=1e-9
+        )
+    texts = {it.text for it in plan.items}
+    assert "90.17'" in texts
+    assert "26.32'" in texts
+
+
+def test_obvious_typos_repaired_with_mandatory_russian_explanations():
+    """
+    Исключения №2 и №3:
+      1) Опечатка направления N↔S (например N 75°20'20" W вместо S 75°20'20" W);
+      2) Опечатка направления E↔W (например S 14°39'40" W вместо S 14°39'40" E);
+      3) Опечатка цифры в угле (3↔8 / 8↔0 / 5↔8: N 78°20'20" E вместо N 75°20'20" E);
+      4) Опечатка похожей цифры в длине (5↔6: задняя сторона 56.00' вместо 55.00',
+         при этом фасадная сторона по улице 55.00' защищена и не трогается!).
+    Во всех 4 случаях контур исправляется и обязательно возвращается явное пояснение.
+    """
+    base_deed = (
+        "ALL that certain plot, piece or parcel of land, situate, lying and being in the "
+        "Borough of Queens, BEGINNING at a point on the southerly side of Aspenwall Street, "
+        "distant 420.00 feet easterly from the corner formed by the intersection of the "
+        "southerly side of Aspenwall Street with the easterly side of 149th Street; "
+        "RUNNING THENCE South 14 degrees 39 minutes 40 seconds East, 100.00 feet; "
+        "THENCE North 75 degrees 20 minutes 20 seconds East, 55.00 feet; "
+        "THENCE North 14 degrees 39 minutes 40 seconds West, 100.00 feet to the southerly side "
+        "of Aspenwall Street; "
+        "THENCE South 75 degrees 20 minutes 20 seconds West along the southerly side of "
+        "Aspenwall Street, 55.00 feet to the point or place of BEGINNING."
+    )
+
+    # 1) Опечатка N↔S в 4-й стороне
+    deed_ns = base_deed.replace(
+        "THENCE South 75 degrees 20 minutes 20 seconds West",
+        "THENCE North 75 degrees 20 minutes 20 seconds West",
+    )
+    d1, w1 = parse_with_regex(deed_ns)
+    assert d1.segments[3].bearing_label == 'S 75°20\'20" W'
+    assert any("опечатка направления" in w and "N→S" in w for w in w1)
+    assert AcadBuilder(load_config()).plan(d1).closure.distance < 1e-6
+
+    # 2) Опечатка E↔W в 1-й стороне
+    deed_ew = base_deed.replace(
+        "South 14 degrees 39 minutes 40 seconds East",
+        "South 14 degrees 39 minutes 40 seconds West",
+    )
+    d2, w2 = parse_with_regex(deed_ew)
+    assert d2.segments[0].bearing_label == 'S 14°39\'40" E'
+    assert any("опечатка направления" in w and "W→E" in w for w in w2)
+    assert AcadBuilder(load_config()).plan(d2).closure.distance < 1e-6
+
+    # 3) Опечатка цифры в градусах угла (78° вместо 75° на задней параллельной стороне)
+    deed_ang = base_deed.replace(
+        "THENCE North 75 degrees 20 minutes 20 seconds East, 55.00 feet",
+        "THENCE North 78 degrees 20 minutes 20 seconds East, 55.00 feet",
+    )
+    d3, w3 = parse_with_regex(deed_ang)
+    assert d3.segments[1].bearing_label == 'N 75°20\'20" E'
+    assert any("опечатка цифр в угле" in w and "8→5" in w for w in w3)
+    assert AcadBuilder(load_config()).plan(d3).closure.distance < 1e-6
+
+    # 4) Опечатка похожей цифры 6↔5 в длине задней стороны (56.00' вместо 55.00'):
+    # фасад по Aspenwall Street (индекс 3, 55.00') защищён, исправляется именно задняя сторона №2!
+    deed_len = base_deed.replace(
+        "THENCE North 75 degrees 20 minutes 20 seconds East, 55.00 feet",
+        "THENCE North 75 degrees 20 minutes 20 seconds East, 56.00 feet",
+    )
+    d4, w4 = parse_with_regex(deed_len)
+    assert d4.segments[3].distance_ft == pytest.approx(55.0)
+    assert d4.segments[1].distance_ft == pytest.approx(55.0)
+    assert any("стороны №2" in w and "6→5" in w for w in w4)
+    assert AcadBuilder(load_config()).plan(d4).closure.distance < 1e-6
+
+
+def test_open_gap_placement_regular_and_two_street_corner_lots():
+    """
+    Когда опечатки нет (косоугольная фигура с округлением или неопределяемое расхождение),
+    все N отрезков LINE строятся со СТРОГО паспортными длинами и углами, без принудительного
+    замыкания, а открытый гэп выводится:
+      * Рядовой участок, дорога сверху -> правый нижний угол (задняя сторона);
+      * Рядовой участок, дорога снизу -> правый верхний угол (задняя сторона);
+      * Угловой участок с фронтом на 2 улицы (боковая улица слева ИЛИ справа) -> строго во
+        внутренний задний угол, НЕ соприкасающийся ни с одной из двух улиц!
+    """
+    builder = AcadBuilder(load_config())
+
+    # --- А. Рядовой участок, дорога сверху (Main St на севере от лота, front_segment_index=3) ---
+    # Сторона 2 (правая стена) короче на 0.40' (99.60' вместо 100.00' — не одноцифровая опечатка)
+    reg_top = LegalDescription(
+        main_street="Aspenwall Street",
+        cross_street="149th Street",
+        distance_to_corner_ft=100.0,
+        front_side="south",
+        front_segment_index=3,
+        segments=[
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),   # v0->v1 левая (вниз)
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=50.0),   # v1->v2 задняя (вправо)
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=99.60),   # v2->v3 правая (вверх)
+            Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=50.0),   # v3->v0 фасад сверху (влево)
+        ],
+    )
+    plan_top = builder.plan(reg_top)
+    assert plan_top.gap_points is not None
+    assert plan_top.gap_vertex_index == 2  # правый нижний угол!
+    assert "правый нижний угол (дорога сверху)" in plan_top.gap_corner_label
+    # Все 4 отрезка LINE имеют 100% паспортные длины [100.0, 50.0, 99.60, 50.0]
+    lens_top = [math.hypot(l.end[0] - l.start[0], l.end[1] - l.start[1]) for l in plan_top.boundary_lines]
+    assert lens_top == pytest.approx([100.0, 50.0, 99.60, 50.0], abs=1e-9)
+    # Уличные вершины v3 и v0 состыкованы идеально, разрыв локализован ровно между line[1].end и line[2].start!
+    assert plan_top.boundary_lines[3].end == pytest.approx(plan_top.boundary_lines[0].start, abs=1e-9)
+    assert plan_top.boundary_lines[2].end == pytest.approx(plan_top.boundary_lines[3].start, abs=1e-9)
+    assert plan_top.gap_points == (plan_top.boundary_lines[2].start, plan_top.boundary_lines[1].end)
+
+    # --- Б. Рядовой участок, дорога снизу (Main St на юге от лота, front_segment_index=0) ---
+    reg_bot = LegalDescription(
+        main_street="Broadway",
+        cross_street="1st Ave",
+        distance_to_corner_ft=80.0,
+        front_side="north",
+        front_segment_index=0,
+        segments=[
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=50.0),   # v0->v1 фасад снизу (вправо)
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),   # v1->v2 правая (вверх)
+            Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=50.0),   # v2->v3 задняя сверху (влево)
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=99.60),   # v3->v0 левая (вниз)
+        ],
+    )
+    plan_bot = builder.plan(reg_bot)
+    assert plan_bot.gap_points is not None
+    assert plan_bot.gap_vertex_index == 2  # правый верхний угол (x=+130, y=+100)!
+    assert "правый верхний угол (дорога снизу)" in plan_bot.gap_corner_label
+
+    # --- В. Угловой участок с 2 улицами: улица №1 сверху (edge 3), улица №2 СПРАВА (edge 2) ---
+    # Здесь правый нижний угол (v2) касается боковой улицы Right Ave! Поэтому гэп ОБЯЗАН уйти
+    # в ЛЕВЫЙ нижний внутренний угол v1 (единственную вершину вне обеих улиц)!
+    corner_right_street = LegalDescription(
+        main_street="Top Avenue",
+        cross_street="Right Street",
+        distance_to_corner_ft=0.0,
+        front_segment_index=3,
+        cross_street_side_index=2,
+        segments=[
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=100.0),   # edge 0: v0->v1 внутренняя левая
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=50.0),   # edge 1: v1->v2 внутренняя задняя
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="W", distance_ft=99.60),   # edge 2: v2->v3 по Right Street!
+            Segment(ns="S", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=50.0),   # edge 3: v3->v0 по Top Avenue!
+        ],
+    )
+    plan_corner = builder.plan(corner_right_street)
+    assert plan_corner.gap_points is not None
+    assert plan_corner.gap_vertex_index == 1  # левый внутренний угол вне обеих улиц!
+    assert "вне обеих улиц" in plan_corner.gap_corner_label
+    # Оба уличных фронта (edge 2 по Right St и edge 3 по Top Ave) состыкованы без малейшего сдвига!
+    assert plan_corner.boundary_lines[1].end == pytest.approx(plan_corner.boundary_lines[2].start, abs=1e-9)
+    assert plan_corner.boundary_lines[2].end == pytest.approx(plan_corner.boundary_lines[3].start, abs=1e-9)
+    assert plan_corner.boundary_lines[3].end == pytest.approx(plan_corner.boundary_lines[0].start, abs=1e-9)
+
 
 
 

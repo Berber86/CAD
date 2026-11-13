@@ -24,6 +24,7 @@ Python: 3.11+, Windows, запущенный AutoCAD.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -35,9 +36,11 @@ __all__ = [
     "AcadBuilderError",
     "AcadConnectionError",
     "AcadDrawError",
+    "ArcItem",
     "ClosureError",
     "DrawPlan",
     "DrawResult",
+    "LineItem",
     "TextItem",
     "AcadBuilder",
     "bearing_azimuth_deg",
@@ -375,6 +378,83 @@ def build_side_label(
     return f"{bearing}{' ' * spaces}{distance}", True
 
 
+def format_dms_angle(angle_deg: float, use_control_code: bool = True) -> str:
+    """Форматирует внутренний угол в градусах-минутах-секундах (напр. 93%%d33'29.5\")."""
+    total_tenths = int(
+        Decimal(str(abs(angle_deg) * 36000.0)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    deg, rem = divmod(total_tenths, 36000)
+    minutes, tenths_sec = divmod(rem, 600)
+    if tenths_sec % 10 == 0:
+        sec_str = f"{tenths_sec // 10:02d}"
+    else:
+        sec_str = f"{tenths_sec / 10.0:04.1f}" if tenths_sec < 100 else f"{tenths_sec / 10.0:.1f}"
+    deg_symbol = "%%d" if use_control_code else "°"
+    return f"{deg}{deg_symbol}{minutes:02d}'{sec_str}\""
+
+
+_DMS_PARSE_RE = re.compile(
+    r"(\d+)\s*(?:°|%%[dD]|deg)\s*(\d+)?\s*(?:'|′)?\s*(\d+(?:\.\d+)?)?"
+)
+
+
+def _parse_dms_angle_deg(raw: str) -> float | None:
+    match = _DMS_PARSE_RE.search(str(raw))
+    if not match:
+        try:
+            return float(str(raw).strip().rstrip("°"))
+        except ValueError:
+            return None
+    deg = float(match.group(1))
+    minutes = float(match.group(2) or 0.0)
+    seconds = float(match.group(3) or 0.0)
+    return deg + minutes / 60.0 + seconds / 3600.0
+
+
+def _wrap_course_note(
+    note: str,
+    note_height: float,
+    side_length: float,
+    cfg: dict[str, Any],
+) -> list[str]:
+    """
+    Переносит длинную относительную ремарку (напр. ``PARALLEL WITH QUEENS MIDTOWN EXPY``
+    на короткой стороне 26.32') на 2 сбалансированные строки, как на эталонных NYC Survey.
+    На длинной стороне (90.00') строка остаётся в одну линию.
+    """
+    clean = " ".join(str(note).split())
+    if " " not in clean:
+        return [clean]
+    width = estimate_text_width(clean, note_height, cfg)
+    max_single_width = max(side_length * 0.55, 11.0 * note_height)
+    if width <= max_single_width:
+        return [clean]
+
+    for prefix in ("PARALLEL WITH ", "AT RIGHT ANGLES TO ", "ALONG "):
+        if clean.startswith(prefix) and len(clean) > len(prefix) + 3:
+            head = clean[: len(prefix)].strip()
+            tail = clean[len(prefix) :].strip()
+            if max(
+                estimate_text_width(head, note_height, cfg),
+                estimate_text_width(tail, note_height, cfg),
+            ) <= max(side_length * 0.85, width * 0.68):
+                return [head, tail]
+
+    words = clean.split(" ")
+    best_pair = [clean]
+    best_span = len(clean)
+    for split_idx in range(1, len(words)):
+        left = " ".join(words[:split_idx])
+        right = " ".join(words[split_idx:])
+        span = max(len(left), len(right))
+        if span < best_span:
+            best_span = span
+            best_pair = [left, right]
+    return best_pair
+
+
 def build_side_lines(
     segment: Segment,
     text_height: float,
@@ -382,25 +462,25 @@ def build_side_lines(
     cfg: dict[str, Any],
 ) -> tuple[list[str], bool]:
     """
-    Формирует 1 или 2 параллельные строки подписи стороны (от ближней к контуру к дальней):
+    Формирует логические строки подписи стороны:
       * для сторон без компасного румба (``has_bearing=False``, Queens/Brooklyn) —
-        ``[длина]`` или ``[длина, course_note]``;
+        ``[*wrapped_course_note, длина]`` (ремарка ближе к границе, длина — снаружи);
       * для узких сторон таунхаусов (``<= stack_short_side_ft``, где ``bearing + distance``
-        в одну строку шире 85% стороны, например 13.67' и 14.00') —
-        2 строки ``[длина, румб]``;
+        не помещается в 1 строку, например 13.67' и 14.00') — ``[румб, длина]``;
       * для обычных/длинных сторон — 1 строка из ``build_side_label`` (с растяжкой > 40 ft).
     """
     use_control = bool(cfg.get("degrees_as_control_code", True))
     distance = format_distance(segment.distance_ft)
     if not getattr(segment, "has_bearing", True):
-        lines = [distance]
         note = getattr(segment, "course_note", None)
         if note:
             clean_note = str(note).upper()
             if use_control:
                 clean_note = clean_note.replace("°", "%%d")
-            lines.append(clean_note)
-        return lines, False
+            note_h = text_height * 0.82
+            wrapped = _wrap_course_note(clean_note, note_h, side_length, cfg)
+            return [*wrapped, distance], False
+        return [distance], False
 
     single_line, stretched = build_side_label(segment, text_height, side_length, cfg)
     if stretched:
@@ -410,7 +490,7 @@ def build_side_lines(
     single_width = estimate_text_width(single_line, text_height, cfg)
     if side_length <= stack_limit or single_width > side_length * 0.75:
         bearing = format_bearing(segment, use_control_code=use_control)
-        return [distance, bearing], False
+        return [bearing, distance], False
 
     return [single_line], False
 
@@ -432,6 +512,26 @@ class TextItem:
 
 
 @dataclass
+class LineItem:
+    """Вспомогательный отрезок LINE (например продолжение красной линии улицы)."""
+
+    start: tuple[float, float]
+    end: tuple[float, float]
+    kind: str = "street-row"
+
+
+@dataclass
+class ArcItem:
+    """Дуга ARC в AutoCAD (угловая засечка внутреннего угла участка, обход CCW)."""
+
+    center: tuple[float, float]
+    radius: float
+    start_angle: float
+    end_angle: float
+    kind: str = "angle-arc"
+
+
+@dataclass
 class DrawPlan:
     """Полный план отрисовки — результат чистой математики, без COM."""
 
@@ -441,6 +541,8 @@ class DrawPlan:
     vertices: list[tuple[float, float]]
     closure: ClosureError
     items: list[TextItem] = field(default_factory=list)
+    lines: list[LineItem] = field(default_factory=list)
+    arcs: list[ArcItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     ccw: bool = True
 
@@ -636,6 +738,61 @@ class AcadBuilder:
             return uy, -ux, length
         return -uy, ux, length
 
+    def _vertex_interior_angle_info(
+        self,
+        vertex_index: int,
+        points: Sequence[tuple[float, float]],
+        segments: Sequence[Segment] | None = None,
+    ) -> tuple[float, float, float, float, float]:
+        """
+        Возвращает параметры внутреннего угла в вершине ``vertex_index``:
+        ``(interior_deg, bisector_angle_rad, start_arc_rad, end_arc_rad, min_adj_len)``.
+        Дуга ``start_arc_rad -> end_arc_rad`` гарантированно обходится против часовой
+        стрелки (CCW, конвенция AutoCAD ``AddArc``) строго внутри контура участка.
+        При малой невязке округления длин (напр. 0.004 ft на 20.72') использует точные
+        угловые направления сегментов, исключая паразитный сдвиг секунд замыкающей хорды.
+        """
+        two_pi = 2.0 * math.pi
+        count = len(points)
+        v_norm = vertex_index % count
+        curr = points[v_norm]
+        prev_pt = points[(v_norm - 1) % count]
+        next_pt = points[(v_norm + 1) % count]
+        dx1, dy1 = prev_pt[0] - curr[0], prev_pt[1] - curr[1]
+        dx2, dy2 = next_pt[0] - curr[0], next_pt[1] - curr[1]
+        len1 = math.hypot(dx1, dy1) or 1.0
+        len2 = math.hypot(dx2, dy2) or 1.0
+        min_len = min(len1, len2)
+
+        a1 = math.atan2(dy1, dx1) % two_pi
+        a2 = math.atan2(dy2, dx2) % two_pi
+        if segments is not None and len(segments) == count:
+            in_dx, in_dy = segments[(v_norm - 1) % count].vector
+            out_dx, out_dy = segments[v_norm].vector
+            if math.hypot(in_dx, in_dy) > 1e-9 and math.hypot(out_dx, out_dy) > 1e-9:
+                seg_a1 = math.atan2(-in_dy, -in_dx) % two_pi
+                seg_a2 = math.atan2(out_dy, out_dx) % two_pi
+                diff1 = abs(((seg_a1 - a1 + math.pi) % two_pi) - math.pi)
+                diff2 = abs(((seg_a2 - a2 + math.pi) % two_pi) - math.pi)
+                if diff1 < math.radians(0.5) and diff2 < math.radians(0.5):
+                    a1, a2 = seg_a1, seg_a2
+
+        sweep_12 = (a2 - a1) % two_pi
+        mid_12 = a1 + 0.5 * sweep_12
+        probe_step = min(0.35, 0.1 * min_len)
+        probe = (
+            curr[0] + math.cos(mid_12) * probe_step,
+            curr[1] + math.sin(mid_12) * probe_step,
+        )
+        if point_in_polygon(probe, points):
+            start_arc, end_arc, sweep = a1, a2, sweep_12
+            bis_angle = mid_12
+        else:
+            sweep_21 = (a1 - a2) % two_pi
+            start_arc, end_arc, sweep = a2, a1, sweep_21
+            bis_angle = a2 + 0.5 * sweep_21
+        return math.degrees(sweep), bis_angle, start_arc, end_arc, min_len
+
     def _interior_angle_point(
         self,
         vertex_index: int,
@@ -645,39 +802,31 @@ class AcadBuilder:
         """Точка внутри угла многоугольника по биссектрисе (для подписи 93°33'29.5")."""
         count = len(points)
         curr = points[vertex_index % count]
-        prev_pt = points[(vertex_index - 1) % count]
-        next_pt = points[(vertex_index + 1) % count]
-        dx1, dy1 = prev_pt[0] - curr[0], prev_pt[1] - curr[1]
-        dx2, dy2 = next_pt[0] - curr[0], next_pt[1] - curr[1]
-        len1 = math.hypot(dx1, dy1) or 1.0
-        len2 = math.hypot(dx2, dy2) or 1.0
-        bx = dx1 / len1 + dx2 / len2
-        by = dy1 / len1 + dy2 / len2
-        blen = math.hypot(bx, by)
-        if blen < 1e-6:
-            bx, by = -(dy2 / len2), dx2 / len2
-        else:
-            bx, by = bx / blen, by / blen
-        candidate = (curr[0] + bx * step, curr[1] + by * step)
-        if not point_in_polygon(candidate, points):
-            candidate = (curr[0] - bx * step, curr[1] - by * step)
-        return candidate
+        _, bis_angle, _, _, _ = self._vertex_interior_angle_info(vertex_index, points)
+        return (
+            curr[0] + math.cos(bis_angle) * step,
+            curr[1] + math.sin(bis_angle) * step,
+        )
 
     def _side_items(
         self,
-        segments: Sequence[Segment],
+        description: LegalDescription,
         points: Sequence[tuple[float, float]],
         text_height: float,
         ccw: bool,
         warnings: list[str],
-    ) -> tuple[list[TextItem], dict[int, int]]:
+        front_index: int | None = None,
+    ) -> tuple[list[TextItem], list[ArcItem], dict[int, float]]:
         cfg = self.drawing_cfg
-        offset = float(cfg.get("text_offset_factor", 1.5)) * text_height
-        line_gap = float(cfg.get("stacked_line_gap_factor", 1.45)) * text_height
+        offset = float(cfg.get("text_offset_factor", 1.8)) * text_height
+        line_gap = float(cfg.get("stacked_line_gap_factor", 1.9)) * text_height
         use_control = bool(cfg.get("degrees_as_control_code", True))
+        segments = description.segments
         items: list[TextItem] = []
-        line_counts: dict[int, int] = {}
+        arcs: list[ArcItem] = []
+        side_band_extra: dict[int, float] = {}
         count = len(points)
+
         for index, segment in enumerate(segments):
             start = points[index % count]
             end = points[(index + 1) % count]
@@ -685,45 +834,209 @@ class AcadBuilder:
             if length < 1e-9:
                 warnings.append(f"сторона #{index + 1}: нулевая длина — пропущена")
                 continue
+
             lines, _ = build_side_lines(segment, text_height, length, cfg)
-            line_counts[index] = len(lines)
-            max_line_width = max(
-                estimate_text_width(line_text, text_height, cfg) for line_text in lines
-            )
-            if max_line_width > length > 0:
-                warnings.append(
-                    f"подпись стороны #{index + 1} (≈{max_line_width:.1f} ед.) длиннее самой "
-                    f"стороны ({length:.1f} ft) — уменьшите масштаб/высоту текста"
-                )
             angle = math.atan2(end[1] - start[1], end[0] - start[0])
             rot = text_rotation(angle)
+            up_x, up_y = -math.sin(rot), math.cos(rot)
+            up_dot_n = up_x * nx + up_y * ny
             midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
-            for row, line_text in enumerate(lines):
-                row_offset = offset + row * line_gap
-                kind = f"side-{index + 1}" if row == 0 else f"side-{index + 1}-note"
+
+            has_bearing = bool(getattr(segment, "has_bearing", True))
+            if not has_bearing:
+                # Эталон NYC Survey без компасных румбов (Queens / Brooklyn):
+                # ремарка (PARALLEL WITH / AT RIGHT ANGLES) — мелким кеглем ближе к границе,
+                # длина (26.32', 90.00', 90.17', 20.72') — крупнее снаружи ремарки.
+                dist_h = round(text_height * 1.12, 4)
+                note_h = round(text_height * 0.82, 4)
+                note_gap = 1.48 * note_h
+                note_lines = lines[:-1]
+                dist_text = lines[-1]
+                max_line_width = max(
+                    [estimate_text_width(dist_text, dist_h, cfg)]
+                    + [estimate_text_width(nl, note_h, cfg) for nl in note_lines]
+                )
+                if max_line_width > length > 0:
+                    warnings.append(
+                        f"подпись стороны #{index + 1} (≈{max_line_width:.1f} ед.) длиннее самой "
+                        f"стороны ({length:.1f} ft) — уменьшите масштаб/высоту текста"
+                    )
+                if note_lines:
+                    ordered_notes = (
+                        list(reversed(note_lines)) if up_dot_n >= 0.0 else list(note_lines)
+                    )
+                    for r_idx, nl_text in enumerate(ordered_notes):
+                        r_off = offset + r_idx * note_gap
+                        suffix = "-note" if r_idx == 0 else f"-note-{r_idx + 1}"
+                        items.append(
+                            TextItem(
+                                text=nl_text,
+                                point=(midpoint[0] + nx * r_off, midpoint[1] + ny * r_off),
+                                rotation=rot,
+                                kind=f"side-{index + 1}{suffix}",
+                                height=note_h,
+                            )
+                        )
+                    dist_off = offset + (len(ordered_notes) - 1) * note_gap + line_gap
+                    side_band_extra[index] = dist_off - offset
+                else:
+                    dist_off = offset
+                    side_band_extra[index] = 0.0
+
                 items.append(
                     TextItem(
-                        text=line_text,
-                        point=(midpoint[0] + nx * row_offset, midpoint[1] + ny * row_offset),
+                        text=dist_text,
+                        point=(midpoint[0] + nx * dist_off, midpoint[1] + ny * dist_off),
                         rotation=rot,
-                        kind=kind,
+                        kind=f"side-{index + 1}",
+                        height=dist_h,
+                    )
+                )
+            else:
+                max_line_width = max(
+                    estimate_text_width(line_text, text_height, cfg) for line_text in lines
+                )
+                if max_line_width > length > 0:
+                    warnings.append(
+                        f"подпись стороны #{index + 1} (≈{max_line_width:.1f} ед.) длиннее самой "
+                        f"стороны ({length:.1f} ft) — уменьшите масштаб/высоту текста"
+                    )
+                if len(lines) == 1:
+                    side_band_extra[index] = 0.0
+                    items.append(
+                        TextItem(
+                            text=lines[0],
+                            point=(midpoint[0] + nx * offset, midpoint[1] + ny * offset),
+                            rotation=rot,
+                            kind=f"side-{index + 1}",
+                        )
+                    )
+                else:
+                    # Двухстрочная короткая сторона с румбом (13.67', 14.00'):
+                    # верхняя по чтению строка — румб, нижняя по чтению — длина.
+                    bearing_text, dist_text = lines[0], lines[1]
+                    if up_dot_n >= 0.0:
+                        dist_off = offset
+                        brg_off = offset + line_gap
+                    else:
+                        brg_off = offset
+                        dist_off = offset + line_gap
+                    side_band_extra[index] = line_gap
+                    items.append(
+                        TextItem(
+                            text=dist_text,
+                            point=(midpoint[0] + nx * dist_off, midpoint[1] + ny * dist_off),
+                            rotation=rot,
+                            kind=f"side-{index + 1}",
+                        )
+                    )
+                    items.append(
+                        TextItem(
+                            text=bearing_text,
+                            point=(midpoint[0] + nx * brg_off, midpoint[1] + ny * brg_off),
+                            rotation=rot,
+                            kind=f"side-{index + 1}-note",
+                        )
+                    )
+
+        # -- внутренние углы (явные из описания + автовывод на участках без румбов) --
+        used_vertices: set[int] = set()
+
+        def add_corner_angle(v_idx: int, raw_label: str, kind_idx: int) -> None:
+            v_norm = v_idx % count
+            if v_norm in used_vertices:
+                return
+            used_vertices.add(v_norm)
+            _, bis_angle, start_arc, end_arc, min_len = self._vertex_interior_angle_info(
+                v_norm, points, segments=segments
+            )
+            ia_text = str(raw_label).replace("°", "%%d") if use_control else str(raw_label)
+            arc_radius = min(2.5 * text_height, 0.20 * min_len)
+            text_step = min(7.8 * text_height, 0.44 * min_len)
+            curr = points[v_norm]
+            ia_point = (
+                curr[0] + math.cos(bis_angle) * text_step,
+                curr[1] + math.sin(bis_angle) * text_step,
+            )
+            items.append(
+                TextItem(
+                    text=ia_text,
+                    point=ia_point,
+                    rotation=text_rotation(bis_angle),
+                    kind=f"angle-{kind_idx}",
+                    height=round(text_height * 0.88, 4),
+                )
+            )
+            if arc_radius > 0.25 * text_height:
+                arcs.append(
+                    ArcItem(
+                        center=curr,
+                        radius=round(arc_radius, 4),
+                        start_angle=start_arc,
+                        end_angle=end_arc,
+                        kind=f"angle-arc-{kind_idx}",
                     )
                 )
 
+        for index, segment in enumerate(segments):
             ia_raw = getattr(segment, "interior_angle", None)
-            if ia_raw:
-                ia_text = str(ia_raw).replace("°", "%%d") if use_control else str(ia_raw)
-                ia_point = self._interior_angle_point(index, points, step=2.4 * text_height)
-                items.append(
-                    TextItem(
-                        text=ia_text,
-                        point=ia_point,
-                        rotation=0.0,
-                        kind=f"angle-{index + 1}",
-                        height=round(text_height * 0.85, 4),
-                    )
-                )
-        return items, line_counts
+            if not ia_raw:
+                continue
+            v_start = index % count
+            v_end = (index + 1) % count
+            parsed_deg = _parse_dms_angle_deg(str(ia_raw))
+            chosen_v = v_start
+            if parsed_deg is not None:
+                deg_start = self._vertex_interior_angle_info(
+                    v_start, points, segments=segments
+                )[0]
+                deg_end = self._vertex_interior_angle_info(
+                    v_end, points, segments=segments
+                )[0]
+                if abs(deg_end - parsed_deg) + 0.02 < abs(deg_start - parsed_deg):
+                    chosen_v = v_end
+            add_corner_angle(chosen_v, str(ia_raw), index + 1)
+
+        # Если участок задан без компасных румбов (как 63-01 Borden Ave при Vision-разборе),
+        # а Vision LLM пропустил строку interior_angle, автоматически проставляем базовый
+        # косой угол (напр. 93°33'29.5" на пересечении улиц), чтобы чертёж был математически полным.
+        if (
+            count >= 3
+            and not used_vertices
+            and all(not getattr(s, "has_bearing", True) for s in segments)
+        ):
+            cross_idx = getattr(description, "cross_street_side_index", None)
+            street_edges: set[int] = set()
+            if front_index is not None:
+                street_edges.add(front_index % count)
+            if cross_idx is not None and 0 <= int(cross_idx) < count:
+                street_edges.add(int(cross_idx))
+            elif (
+                front_index is not None
+                and description.cross_street
+                and description.distance_to_corner_ft is not None
+                and description.distance_to_corner_ft <= 1e-6
+            ):
+                street_edges.add((front_index - 1) % count)
+
+            oblique_candidates: list[tuple[int, int, int, float]] = []
+            for v_idx in range(count):
+                deg_v = self._vertex_interior_angle_info(
+                    v_idx, points, segments=segments
+                )[0]
+                if 0.08 <= abs(deg_v - 90.0) <= 88.0:
+                    inc_edges = {(v_idx - 1) % count, v_idx % count}
+                    street_hits = len(inc_edges & street_edges)
+                    pob_bonus = 1 if v_idx == 0 else 0
+                    oblique_candidates.append((street_hits, pob_bonus, -v_idx, deg_v))
+            if oblique_candidates:
+                oblique_candidates.sort(reverse=True)
+                best_hits, _, neg_v, best_deg = oblique_candidates[0]
+                best_v = -neg_v
+                label_str = format_dms_angle(best_deg, use_control_code=use_control)
+                add_corner_angle(best_v, label_str, best_v + 1)
+
+        return items, arcs, side_band_extra
 
     def _front_side_index(
         self,
@@ -736,9 +1049,9 @@ class AcadBuilder:
 
         1. Явный ``front_segment_index`` из документа/LLM (критично для узких
            таунхаусов NYC 13'–14' × 100'–125' при наклонной сетке кварталов).
-        2. Если задан ``front_side`` (N/S/E/W — куда смотрит фасад), выбираем
-           сторону с максимальной сонаправленностью внешней нормали (``score``);
-           длина используется только как тай-брейк при почти равном ``score``.
+        2. Если задан ``front_side`` (N/S/E/W/NE/NW/SE/SW — куда смотрит фасад),
+           выбираем сторону с максимальной сонаправленностью внешней нормали (``score``),
+           исключая тыльные/боковые границы ``PARALLEL WITH`` / ``AT RIGHT ANGLES``.
         3. Иначе — сторона из конфига (``front_side_index``), по умолчанию 0.
         """
         explicit_idx = getattr(description, "front_segment_index", None)
@@ -760,8 +1073,9 @@ class AcadBuilder:
         }
         if str(front_side) in direction_vectors:
             target = direction_vectors[str(front_side)]
-            candidates: list[tuple[float, float, int]] = []
-            for index in range(len(description.segments)):
+            primary_candidates: list[tuple[float, float, int]] = []
+            fallback_candidates: list[tuple[float, float, int]] = []
+            for index, seg in enumerate(description.segments):
                 nx, ny, length = self._outward_normal(
                     points[index % count], points[(index + 1) % count], ccw
                 )
@@ -769,7 +1083,15 @@ class AcadBuilder:
                     continue
                 score = nx * target[0] + ny * target[1]
                 if score > 0.35:
-                    candidates.append((score, length, index))
+                    note_up = str(getattr(seg, "course_note", "") or "").upper()
+                    is_relative_back = (
+                        "PARALLEL WITH" in note_up or "AT RIGHT ANGLES" in note_up
+                    )
+                    if is_relative_back:
+                        fallback_candidates.append((score, length, index))
+                    else:
+                        primary_candidates.append((score, length, index))
+            candidates = primary_candidates or fallback_candidates
             if candidates:
                 max_score = max(c[0] for c in candidates)
                 top = [c for c in candidates if c[0] >= max_score - 0.08]
@@ -796,16 +1118,21 @@ class AcadBuilder:
         text_height: float,
         ccw: bool,
         warnings: list[str],
-        line_counts: dict[int, int] | None = None,
-    ) -> list[TextItem]:
+        side_band_extra: dict[int, float] | None = None,
+        front_index: int | None = None,
+    ) -> tuple[list[TextItem], list[LineItem]]:
         cfg = self.drawing_cfg
         items: list[TextItem] = []
-        front_index = self._front_side_index(description, points, ccw)
+        row_lines: list[LineItem] = []
+        draw_ext = bool(cfg.get("draw_street_extensions", True))
+
+        if front_index is None:
+            front_index = self._front_side_index(description, points, ccw)
         if front_index is None:
             warnings.append(
                 "не удалось определить фасадную сторону — подписи улиц не нанесены"
             )
-            return items
+            return items, row_lines
 
         count = len(points)
         start = points[front_index]
@@ -813,47 +1140,84 @@ class AcadBuilder:
         nx, ny, length = self._outward_normal(start, end, ccw)
         if length < 1e-9:
             warnings.append("фасадная сторона имеет нулевую длину — подписи улиц пропущены")
-            return items
+            return items, row_lines
 
+        ux = (end[0] - start[0]) / length
+        uy = (end[1] - start[1]) / length
         angle = math.atan2(end[1] - start[1], end[0] - start[0])
+        rot = text_rotation(angle)
+        up_x, up_y = -math.sin(rot), math.cos(rot)
+        up_dot_n = up_x * nx + up_y * ny
         midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
-        base_street_offset = float(cfg.get("street_offset_factor", 3.2)) * text_height
-        line_gap = float(cfg.get("stacked_line_gap_factor", 1.45)) * text_height
-        front_extra = max(0, (line_counts or {}).get(front_index, 1) - 1) * line_gap
+
+        street_h = round(float(cfg.get("street_height_factor", 1.9)) * text_height, 4)
+        street_note_h = round(text_height * 1.05, 4)
+        base_street_offset = float(cfg.get("street_offset_factor", 6.5)) * text_height
+        front_extra = (side_band_extra or {}).get(front_index, 0.0)
         street_offset = base_street_offset + front_extra
 
         if description.main_street:
-            items.append(
-                TextItem(
-                    text=description.main_street.upper(),
-                    point=(
-                        midpoint[0] + nx * street_offset,
-                        midpoint[1] + ny * street_offset,
-                    ),
-                    rotation=text_rotation(angle),
-                    kind="main-street",
-                )
-            )
             street_note = getattr(description, "main_street_note", None)
             if street_note:
-                note_offset = street_offset + 1.5 * text_height
+                note_step = 2.05 * text_height
+                if up_dot_n < 0.0:
+                    main_off = street_offset
+                    sub_off = street_offset + note_step
+                else:
+                    sub_off = street_offset
+                    main_off = street_offset + note_step
+                items.append(
+                    TextItem(
+                        text=description.main_street.upper(),
+                        point=(midpoint[0] + nx * main_off, midpoint[1] + ny * main_off),
+                        rotation=rot,
+                        kind="main-street",
+                        height=street_h,
+                    )
+                )
                 items.append(
                     TextItem(
                         text=str(street_note).upper(),
-                        point=(
-                            midpoint[0] + nx * note_offset,
-                            midpoint[1] + ny * note_offset,
-                        ),
-                        rotation=text_rotation(angle),
+                        point=(midpoint[0] + nx * sub_off, midpoint[1] + ny * sub_off),
+                        rotation=rot,
                         kind="main-street-note",
-                        height=round(text_height * 0.82, 4),
+                        height=street_note_h,
+                    )
+                )
+            else:
+                items.append(
+                    TextItem(
+                        text=description.main_street.upper(),
+                        point=(
+                            midpoint[0] + nx * street_offset,
+                            midpoint[1] + ny * street_offset,
+                        ),
+                        rotation=rot,
+                        kind="main-street",
+                        height=street_h,
                     )
                 )
         else:
             warnings.append("main_street пуст — название фасадной улицы не нанесено")
 
         if not description.cross_street:
-            return items
+            if draw_ext and description.main_street:
+                ext = max(12.0 * text_height, min(22.0 * text_height, 0.45 * length))
+                row_lines.append(
+                    LineItem(
+                        start=(start[0] - ux * ext, start[1] - uy * ext),
+                        end=start,
+                        kind="main-street-row-1",
+                    )
+                )
+                row_lines.append(
+                    LineItem(
+                        start=end,
+                        end=(end[0] + ux * ext, end[1] + uy * ext),
+                        kind="main-street-row-2",
+                    )
+                )
+            return items, row_lines
 
         cross_idx = getattr(description, "cross_street_side_index", None)
         is_corner_lot = (
@@ -875,7 +1239,7 @@ class AcadBuilder:
             if c_len > 1e-9:
                 c_angle = math.atan2(c_end[1] - c_start[1], c_end[0] - c_start[0])
                 c_mid = ((c_start[0] + c_end[0]) / 2.0, (c_start[1] + c_end[1]) / 2.0)
-                c_extra = max(0, (line_counts or {}).get(side_idx, 1) - 1) * line_gap
+                c_extra = (side_band_extra or {}).get(side_idx, 0.0)
                 c_offset = base_street_offset + c_extra
                 items.append(
                     TextItem(
@@ -883,52 +1247,128 @@ class AcadBuilder:
                         point=(c_mid[0] + cnx * c_offset, c_mid[1] + cny * c_offset),
                         rotation=text_rotation(c_angle),
                         kind="cross-street",
+                        height=street_h,
                     )
                 )
-                return items
+                if draw_ext:
+                    f_ext = max(12.0 * text_height, min(20.0 * text_height, 0.35 * length))
+                    row_lines.append(
+                        LineItem(
+                            start=(start[0] - ux * f_ext, start[1] - uy * f_ext),
+                            end=start,
+                            kind="main-street-row-1",
+                        )
+                    )
+                    row_lines.append(
+                        LineItem(
+                            start=end,
+                            end=(end[0] + ux * f_ext, end[1] + uy * f_ext),
+                            kind="main-street-row-2",
+                        )
+                    )
+                    cux = (c_end[0] - c_start[0]) / c_len
+                    cuy = (c_end[1] - c_start[1]) / c_len
+                    c_ext = max(12.0 * text_height, min(20.0 * text_height, 0.22 * c_len))
+                    row_lines.append(
+                        LineItem(
+                            start=(c_start[0] - cux * c_ext, c_start[1] - cuy * c_ext),
+                            end=c_start,
+                            kind="cross-street-row-1",
+                        )
+                    )
+                    row_lines.append(
+                        LineItem(
+                            start=c_end,
+                            end=(c_end[0] + cux * c_ext, c_end[1] + cuy * c_ext),
+                            kind="cross-street-row-2",
+                        )
+                    )
+                return items, row_lines
 
-        # Рядовой участок: пересекаемая улица ориентирована перпендикулярно
-        # фасадной за углом, а расстояние привязки («150.00' TO CORNER» или tie_note)
-        # выносится вдоль фасадной улицы, чтобы Zoom Extents не сжимал чертёж.
-        ux = (end[0] - start[0]) / length
-        uy = (end[1] - start[1]) / length
-        gap = float(cfg.get("corner_label_gap_factor", 2.0)) * text_height
-        cross_width = estimate_text_width(
-            description.cross_street.upper(), text_height, cfg
-        )
-        anchor = (
-            start[0] - ux * (gap + text_height) + nx * street_offset,
-            start[1] - uy * (gap + text_height) + ny * street_offset,
-        )
-        items.append(
-            TextItem(
-                text=description.cross_street.upper(),
-                point=anchor,
-                rotation=text_rotation(angle + math.pi / 2.0),
-                kind="cross-street",
-            )
-        )
+        # Рядовой участок: вдоль продолжения красной линии фасадной улицы выносится
+        # размер привязки («150.00' TO CORNER» или «208.02' (DEED) / 208.22' (T.M.)»),
+        # а за концом этого выносного участка проводится перпендикулярная линия
+        # пересекаемой улицы и крупная подпись cross-street — без взаимного перехлёста.
         tie_note = getattr(description, "tie_note", None)
-        if tie_note or description.distance_to_corner_ft is not None:
-            distance_offset = float(cfg.get("corner_distance_offset_factor", 1.7)) * text_height
+        has_tie_label = bool(tie_note) or description.distance_to_corner_ft is not None
+        dist_label = ""
+        dist_width = 0.0
+        if has_tie_label:
             dist_label = (
                 str(tie_note).upper()
                 if tie_note
                 else f"{format_distance(float(description.distance_to_corner_ft))} TO CORNER"
             )
-            dist_shift = max(gap + cross_width * 0.35, 3.0 * text_height)
+            dist_width = estimate_text_width(dist_label, text_height, cfg)
+
+        gap = float(cfg.get("corner_label_gap_factor", 2.4)) * text_height
+        tie_span = (
+            max(dist_width + 9.0 * text_height, 18.0 * text_height)
+            if has_tie_label
+            else max(gap + 5.0 * text_height, 11.0 * text_height)
+        )
+        corner_pt = (start[0] - ux * tie_span, start[1] - uy * tie_span)
+
+        if has_tie_label:
+            tie_text_offset = float(cfg.get("corner_distance_offset_factor", 1.9)) * text_height
+            tie_mid = (
+                start[0] - ux * (0.5 * tie_span) + nx * tie_text_offset,
+                start[1] - uy * (0.5 * tie_span) + ny * tie_text_offset,
+            )
             items.append(
                 TextItem(
                     text=dist_label,
-                    point=(
-                        start[0] - ux * dist_shift + nx * (street_offset + distance_offset),
-                        start[1] - uy * dist_shift + ny * (street_offset + distance_offset),
-                    ),
-                    rotation=text_rotation(angle),
+                    point=tie_mid,
+                    rotation=rot,
                     kind="cross-street-distance",
                 )
             )
-        return items
+
+        cross_along_shift = tie_span + 2.8 * text_height
+        cross_normal_shift = 0.65 * street_offset
+        items.append(
+            TextItem(
+                text=description.cross_street.upper(),
+                point=(
+                    start[0] - ux * cross_along_shift + nx * cross_normal_shift,
+                    start[1] - uy * cross_along_shift + ny * cross_normal_shift,
+                ),
+                rotation=text_rotation(angle + math.pi / 2.0),
+                kind="cross-street",
+                height=street_h,
+            )
+        )
+
+        if draw_ext:
+            far_ext = max(10.0 * text_height, min(18.0 * text_height, 0.35 * length))
+            row_lines.append(
+                LineItem(
+                    start=corner_pt,
+                    end=start,
+                    kind="main-street-row-tie",
+                )
+            )
+            row_lines.append(
+                LineItem(
+                    start=end,
+                    end=(end[0] + ux * far_ext, end[1] + uy * far_ext),
+                    kind="main-street-row-2",
+                )
+            )
+            row_lines.append(
+                LineItem(
+                    start=(
+                        corner_pt[0] - nx * (4.5 * text_height),
+                        corner_pt[1] - ny * (4.5 * text_height),
+                    ),
+                    end=(
+                        corner_pt[0] + nx * (street_offset + 5.0 * text_height),
+                        corner_pt[1] + ny * (street_offset + 5.0 * text_height),
+                    ),
+                    kind="cross-street-row",
+                )
+            )
+        return items, row_lines
 
     def plan(
         self,
@@ -967,12 +1407,20 @@ class AcadBuilder:
 
         ccw = polygon_signed_area(vertices) > 0.0
         self._front_warning = None
-        items, line_counts = self._side_items(segments, vertices, height, ccw, warnings)
-        items.extend(
-            self._street_items(
-                description, vertices, height, ccw, warnings, line_counts=line_counts
-            )
+        front_index = self._front_side_index(description, vertices, ccw)
+        items, arcs, side_band_extra = self._side_items(
+            description, vertices, height, ccw, warnings, front_index=front_index
         )
+        street_texts, row_lines = self._street_items(
+            description,
+            vertices,
+            height,
+            ccw,
+            warnings,
+            side_band_extra=side_band_extra,
+            front_index=front_index,
+        )
+        items.extend(street_texts)
         if self._front_warning:
             warnings.append(self._front_warning)
 
@@ -983,6 +1431,8 @@ class AcadBuilder:
             vertices=vertices,
             closure=closure,
             items=items,
+            lines=row_lines,
+            arcs=arcs,
             warnings=warnings,
             ccw=ccw,
         )
@@ -1093,6 +1543,30 @@ class AcadBuilder:
         polyline.Closed = True
         return polyline
 
+    def _add_line(
+        self, model_space: Any, item: LineItem, layer: str
+    ) -> Any:
+        line_obj = _com_retry(
+            model_space.AddLine,
+            _variant_point(item.start),
+            _variant_point(item.end),
+        )
+        line_obj.Layer = layer
+        return line_obj
+
+    def _add_arc(
+        self, model_space: Any, item: ArcItem, layer: str
+    ) -> Any:
+        arc_obj = _com_retry(
+            model_space.AddArc,
+            _variant_point(item.center),
+            float(item.radius),
+            float(item.start_angle),
+            float(item.end_angle),
+        )
+        arc_obj.Layer = layer
+        return arc_obj
+
     def _add_text(
         self,
         model_space: Any,
@@ -1129,6 +1603,9 @@ class AcadBuilder:
 
         drawing = self.drawing_cfg
         line_layer_name, text_layer_name = self.layer_names()
+        street_row_layer_name = str(
+            self.cfg.get("layers", {}).get("street_row") or "STREET_ROW_AI"
+        )
         colors = self.cfg.get("layer_colors", {})
 
         app, doc = self.connect()
@@ -1146,13 +1623,32 @@ class AcadBuilder:
         text_layer = self._ensure_layer(
             doc, text_layer_name, int(colors.get("boundary_text", 3))
         )
+        street_row_layer = text_layer
+        if plan.lines:
+            street_row_layer = self._ensure_layer(
+                doc, street_row_layer_name, int(colors.get("street_row", 8))
+            )
         if line_layer == "0":
             warnings.append(f"слой {line_layer_name} недоступен — линия нарисована в слое 0")
         if text_layer == "0":
             warnings.append(f"слой {text_layer_name} недоступен — текст нарисован в слое 0")
         style = self._ensure_text_style(doc)
 
+        if plan.lines and hasattr(model_space, "AddLine"):
+            for row_line in plan.lines:
+                try:
+                    self._add_line(model_space, row_line, street_row_layer)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
+
         polyline = self._add_polyline(model_space, plan.vertices, line_layer)
+
+        if plan.arcs and hasattr(model_space, "AddArc"):
+            for arc_item in plan.arcs:
+                try:
+                    self._add_arc(model_space, arc_item, text_layer)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"не удалось создать дугу угла ({arc_item.kind}): {exc}")
 
         created = 0
         for item in plan.items:
@@ -1165,13 +1661,25 @@ class AcadBuilder:
                 warnings.append(f"не удалось создать текст «{item.text}»: {exc}")
 
         if drawing.get("zoom_extents", True):
+            zoomed = False
             try:
                 _com_retry(app.ZoomExtents)
+                zoomed = True
             except Exception:  # noqa: BLE001 - зум не критичен
                 try:
                     doc.SendCommand("_.ZOOM\n_E\n")
+                    zoomed = True
                 except Exception:  # noqa: BLE001
                     warnings.append("не удалось выполнить Zoom Extents")
+
+            # Отступ вокруг чертежа (acZoomScaledRelative = 1), чтобы нижняя
+            # плавающая командная строка и ViewCube в AutoCAD не перекрывали подписи.
+            margin_scale = float(drawing.get("zoom_margin_scale", 0.84) or 1.0)
+            if zoomed and 0.1 < margin_scale < 0.999 and hasattr(app, "ZoomScaled"):
+                try:
+                    _com_retry(app.ZoomScaled, margin_scale, 1)
+                except Exception:  # noqa: BLE001
+                    pass
 
         handle: str | None = None
         try:
@@ -1179,10 +1687,17 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001
             pass
 
+        result_layers = {
+            "property_line": line_layer,
+            "boundary_text": text_layer,
+        }
+        if plan.lines:
+            result_layers["street_row"] = street_row_layer
+
         return DrawResult(
             plan=plan,
             text_count=created,
-            layers={"property_line": line_layer, "boundary_text": text_layer},
+            layers=result_layers,
             handle=handle,
             warnings=warnings,
         )

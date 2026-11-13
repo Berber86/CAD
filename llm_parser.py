@@ -30,6 +30,7 @@ import copy
 import getpass
 import hashlib
 import hmac
+import itertools
 import json
 import math
 import os
@@ -188,29 +189,34 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_scale": 16.0,
         "base_text_height": 0.9,
         "available_scales": [10.0, 16.0, 20.0, 30.0],
-        "text_offset_factor": 1.5,
-        "street_offset_factor": 4.0,
-        "corner_label_gap_factor": 2.0,
-        "corner_distance_offset_factor": 1.7,
+        "text_offset_factor": 1.8,
+        "street_offset_factor": 6.5,
+        "street_height_factor": 1.9,
+        "corner_label_gap_factor": 2.4,
+        "corner_distance_offset_factor": 1.9,
         "long_side_threshold_ft": 40.0,
         "stack_short_side_ft": 30.0,
-        "stacked_line_gap_factor": 1.45,
-        "char_width_factor": 0.62,
-        "space_width_factor": 0.45,
-        "max_label_fill_ratio": 0.9,
-        "max_stretch_spaces": 240,
+        "stacked_line_gap_factor": 1.9,
+        "char_width_factor": 0.70,
+        "space_width_factor": 0.75,
+        "max_label_fill_ratio": 0.72,
+        "max_stretch_spaces": 65,
         "front_side_index": 0,
         "degrees_as_control_code": True,
         "text_style": "AI_BOUNDARY",
+        "draw_street_extensions": True,
         "zoom_extents": True,
+        "zoom_margin_scale": 0.84,
     },
     "layers": {
         "property_line": "PROPERTY_LINE",
         "boundary_text": "BOUNDARY_TEXT_AI",
+        "street_row": "STREET_ROW_AI",
     },
     "layer_colors": {
         "property_line": 1,
         "boundary_text": 3,
+        "street_row": 8,
     },
 }
 
@@ -1239,20 +1245,20 @@ CRITICAL SURVEY RULES
    - Never confuse building wall dimensions (e.g. 13.8', 24.3', 50.7' inside 2-sty frame/masonry house) or fence/setback offsets ("FE. 0.1'W", "1.5'E", "25.4'") with lot boundary lines.
    - When both "(DEED)" and "(T.M.)" / "(TAX MAP)" values appear, prefer the "(DEED)" / record survey dimension.
 3. QUADRANT BEARINGS vs. RELATIVE NYC COURSES (Queens / Brooklyn / Bronx / Manhattan):
-   - Every element of `segments` must represent one lot boundary side in continuous order around the parcel, forming a CLOSED polygon (sum of dX ≈ 0, sum of dY ≈ 0).
+   - Every element of `segments` must represent one lot boundary side in continuous loop order around the parcel, forming a CLOSED polygon (sum of dX ≈ 0, sum of dY ≈ 0). On survey plats, verify each bearing's N/S and E/W direction matches your chosen CW/CCW loop direction (flip N<->S AND E<->W if a plat labeled a wall in the opposite travel direction).
    - When explicit quadrant bearings are given, split into `ns` ("N"/"S"), `degrees` (0..90), `minutes` (0..59), `seconds` (decimal), `ew` ("E"/"W"), `bearing_label` ("N 75°20'20\" E"), and set `has_bearing = true`.
    - When NO compass bearings are printed (common in NYC surveys using "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", cardinal directions along streets, and/or an `interior_angle` like `93°33'29.5"`):
      * Align the primary East-West street to N 90°00' E / N 90°00' W (or North-South street to N 0°00' E / S 0°00' E) and apply exact interior/right angles so the polygon closes mathematically;
      * Set `has_bearing = false` on every course without an explicit compass bearing;
-     * Put exact directional notes printed on that side (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
-     * Put any printed vertex angle (e.g. `93°33'29.5"`) into `interior_angle` of that segment.
+     * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
+     * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
 4. DISTANCES:
    - `distance_ft` is in decimal feet. Convert feet-and-inches ("13 feet 8 inches" -> 13.6667, "25' 10\"" -> 25.8333, "55' 6\"" -> 55.5), varas (×2.77778), or chains (×66) to decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
    - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
    - `main_street_note`: parenthetical subtitle if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null.
-   - `front_segment_index`: 0-based index in `segments` of the lot boundary that fronts `main_street` (especially critical on narrow 13'–20' NYC townhouse lots!).
-   - `front_side`: compass direction ("N", "S", "E", "W") pointing OUTWARD from the lot toward `main_street`. If the lot is on the North/Northerly side of Main Street, the street is south of the lot -> "S".
+   - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
+   - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street`. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
@@ -1266,8 +1272,10 @@ USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 Extract the lot geometry and survey metadata into JSON."""
 
 VISION_USER_PROMPT = """Examine the attached survey / title document page(s) carefully.
-Read the exact lot boundary dimensions, bearings (or NYC relative notes like PARALLEL WITH / AT RIGHT ANGLES / interior corner angle), street names, street notes, corner tie distances, and Block/Lot numbers.
-Exclude COMMENCING / corner tie lines and building/fence offsets from `segments` — `segments` must contain ONLY the closed parcel boundary in continuous traverse order."""
+1. Read the exact lot boundary dimensions and bearings (or NYC relative notes like PARALLEL WITH ... / AT RIGHT ANGLES TO ...).
+2. Check inside the lot corners for any printed interior angle (such as 93°33'29.5") and put it in `interior_angle`!
+3. Read street names, street subtitles in parentheses, corner tie distances, and Block/Lot/Borough.
+4. Walk the parcel boundary in one continuous closed loop (sum of dX ≈ 0, sum of dY ≈ 0), excluding COMMENCING / corner tie lines and building/fence offsets from `segments`."""
 
 
 def _messages(
@@ -2527,6 +2535,153 @@ class ParseOutcome:
     llm_mode: str = ""
 
 
+def _flip_segment_direction(seg: Segment) -> Segment:
+    ns_flipped: Literal["N", "S"] = "S" if seg.ns == "N" else "N"
+    ew_flipped: Literal["E", "W"] = "W" if seg.ew == "E" else "E"
+    return Segment(
+        ns=ns_flipped,
+        degrees=seg.degrees,
+        minutes=seg.minutes,
+        seconds=seg.seconds,
+        ew=ew_flipped,
+        distance_ft=seg.distance_ft,
+        has_bearing=seg.has_bearing,
+        course_note=seg.course_note,
+        interior_angle=seg.interior_angle,
+    )
+
+
+def _proper_edge_intersect(
+    a1: tuple[float, float],
+    a2: tuple[float, float],
+    b1: tuple[float, float],
+    b2: tuple[float, float],
+) -> bool:
+    def ccw_turn(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> float:
+        return (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+
+    d1 = ccw_turn(a1, a2, b1)
+    d2 = ccw_turn(a1, a2, b2)
+    d3 = ccw_turn(b1, b2, a1)
+    d4 = ccw_turn(b1, b2, a2)
+    return (d1 * d2 < -1e-6) and (d3 * d4 < -1e-6)
+
+
+def _trace_closure_and_validity(segments: Sequence[Segment]) -> tuple[float, bool]:
+    x, y = 0.0, 0.0
+    pts: list[tuple[float, float]] = [(0.0, 0.0)]
+    for seg in segments:
+        dx, dy = seg.vector
+        x += dx
+        y += dy
+        pts.append((x, y))
+    err = math.hypot(x, y)
+    verts = pts[:-1]
+    n = len(verts)
+    area2 = 0.0
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        area2 += x1 * y2 - x2 * y1
+    if abs(area2) < 2.0:
+        return err, False
+    for i in range(n):
+        a1, a2 = verts[i], verts[(i + 1) % n]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            b1, b2 = verts[j], verts[(j + 1) % n]
+            if _proper_edge_intersect(a1, a2, b1, b2):
+                return err, False
+    return err, True
+
+
+def _repair_llm_geometry(
+    model: LegalDescription,
+    *,
+    from_vision: bool = False,
+) -> tuple[LegalDescription, list[str]]:
+    """
+    Упреждающая санитарная проверка ответа LLM / Vision-разбора чертежа:
+      1) не допускает привязки main_street к тыльной/боковой границе PARALLEL WITH / AT RIGHT ANGLES;
+      2) не допускает углового cross_street_side_index на рядовом участке (distance_to_corner_ft > 0.5);
+      3) если на чертеже Survey подписи румбов были сняты без учёта направления обхода
+         (или в произвольном порядке сторон) и контур разомкнут (> 0.5 ft), проверяет,
+         существует ли перестановка/разворот румбов на 180°, дающий точное замыкание
+         (<= 0.05 ft) простого многоугольника без самопересечений. Реальные ошибки длин
+         в deed'е (например 130' вместо 120') не маскируются, т.к. не дают <= 0.05 ft.
+    """
+    notes: list[str] = []
+    updates: dict[str, Any] = {}
+
+    f_idx = model.front_segment_index
+    if f_idx is not None and 0 <= f_idx < len(model.segments):
+        c_note = (model.segments[f_idx].course_note or "").upper()
+        if "PARALLEL WITH" in c_note or "AT RIGHT ANGLES" in c_note:
+            updates["front_segment_index"] = None
+            notes.append(
+                "индекс фасада указывал на относительную тыльную/боковую границу — пересчитан по геометрии"
+            )
+
+    if (
+        model.cross_street_side_index is not None
+        and model.distance_to_corner_ft is not None
+        and model.distance_to_corner_ft > 0.5
+    ):
+        updates["cross_street_side_index"] = None
+
+    segs = list(model.segments)
+    n = len(segs)
+    err0, _ = _trace_closure_and_validity(segs)
+    if 3 <= n <= 8 and err0 > 0.5:
+        best_err = err0
+        best_order: tuple[int, ...] | None = None
+        best_flips: tuple[bool, ...] | None = None
+
+        orders: list[tuple[int, ...]] = [tuple(range(n))]
+        if from_vision and n <= 6:
+            orders.extend((0, *perm) for perm in itertools.permutations(range(1, n)))
+
+        for order in orders:
+            ordered_base = [segs[i] for i in order]
+            for flips in itertools.product((False, True), repeat=n):
+                if order == tuple(range(n)) and not any(flips):
+                    continue
+                candidate = [
+                    _flip_segment_direction(s) if fl else s
+                    for s, fl in zip(ordered_base, flips)
+                ]
+                err, valid = _trace_closure_and_validity(candidate)
+                if valid and err <= 0.05 and err < best_err:
+                    best_err = err
+                    best_order = order
+                    best_flips = flips
+            if best_order is not None and best_err <= 0.01:
+                break
+
+        if best_order is not None and best_flips is not None:
+            repaired_segs = [
+                _flip_segment_direction(segs[idx]) if fl else segs[idx]
+                for idx, fl in zip(best_order, best_flips)
+            ]
+            updates["segments"] = repaired_segs
+            old_to_new = {old_i: new_i for new_i, old_i in enumerate(best_order)}
+            cur_f = updates.get("front_segment_index", model.front_segment_index)
+            if cur_f is not None and cur_f in old_to_new:
+                updates["front_segment_index"] = old_to_new[cur_f]
+            cur_c = updates.get("cross_street_side_index", model.cross_street_side_index)
+            if cur_c is not None and cur_c in old_to_new:
+                updates["cross_street_side_index"] = old_to_new[cur_c]
+            notes.append(
+                f"скорректирован порядок/направление обхода сторон по замыканию контура "
+                f"(невязка {err0:.2f} ft → {best_err:.3f} ft)"
+            )
+
+    if updates:
+        model = model.model_copy(update=updates)
+    return model, notes
+
+
 def parse_legal_description_full(
     text: str | None = None,
     pdf_path: str | Path | None = None,
@@ -2603,6 +2758,10 @@ def parse_legal_description_full(
                 key_secret=key_secret,
                 image_data_urls=image_data_urls or None,
             )
+            parsed_model, repair_notes = _repair_llm_geometry(
+                parsed_model, from_vision=bool(image_data_urls)
+            )
+            warnings.extend(repair_notes)
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
             return ParseOutcome(

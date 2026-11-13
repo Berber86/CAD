@@ -317,14 +317,38 @@ class FakePolyline:
     Handle = "1A2B"
 
 
+class FakeEntity:
+    def __init__(self, **kwargs):
+        self.Layer = "0"
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
 class FakeModelSpace:
     def __init__(self):
         self.polylines = []
         self.texts = []
+        self.lines = []
+        self.arcs = []
 
     def AddLightWeightPolyline(self, coordinates):
         self.polylines.append(list(coordinates))
         return FakePolyline()
+
+    def AddLine(self, start, end):
+        item = FakeEntity(StartPoint=start, EndPoint=end)
+        self.lines.append(item)
+        return item
+
+    def AddArc(self, center, radius, start_angle, end_angle):
+        item = FakeEntity(
+            Center=center,
+            Radius=radius,
+            StartAngle=start_angle,
+            EndAngle=end_angle,
+        )
+        self.arcs.append(item)
+        return item
 
     def AddText(self, text, point, height):
         item = FakeText(text, FakePoint(point), height)
@@ -397,6 +421,7 @@ class FakeApp:
     def __init__(self):
         self.doc = FakeDoc()
         self.zoomed = False
+        self.zoom_scaled = None
 
     @property
     def ActiveDocument(self):
@@ -404,6 +429,9 @@ class FakeApp:
 
     def ZoomExtents(self):
         self.zoomed = True
+
+    def ZoomScaled(self, scale, scale_type):
+        self.zoom_scaled = (scale, scale_type)
 
 
 def test_draw_writes_into_fake_autocad(monkeypatch):
@@ -460,8 +488,9 @@ def test_front_side_drives_street_label_placement():
     plan = AcadBuilder(load_config()).plan(model, scale=16.0)
     street = next(item for item in plan.items if item.kind == "main-street")
     side_one = next(item for item in plan.items if item.kind == "side-1")
-    # Фасад смотрит на север -> подпись улицы над первой (северной) стороной.
-    assert math.dist(street.point, side_one.point) < 3.0
+    # Фасад смотрит на север -> крупная подпись улицы над первой (северной) стороной.
+    assert math.dist(street.point, side_one.point) < 6.0
+    assert street.height is not None and street.height > plan.text_height * 1.5
     assert point_in_polygon(street.point, plan.vertices) is False
 
 
@@ -998,13 +1027,26 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # На сторонах без румбов нет искусственных DMS-румбов вроде «N 90%%d00' E»
     assert by_kind["side-1"].text == "90.17'"
     assert by_kind["side-2"].text == "26.32'"
-    assert by_kind["side-2-note"].text == "PARALLEL WITH QUEENS MIDTOWN EXPRESSWAY"
+    # Короткая верхняя ремарка перенесена в 2 строки под длиной 26.32' (как в эталоне PDF)
+    assert by_kind["side-2-note-2"].text == "PARALLEL WITH"
+    assert by_kind["side-2-note"].text == "QUEENS MIDTOWN EXPRESSWAY"
+    assert (
+        by_kind["side-2"].point[1]
+        > by_kind["side-2-note-2"].point[1]
+        > by_kind["side-2-note"].point[1]
+    )
+    # Справа ремарка ближе к границе, а размер 90.00' — правее ремарки
     assert by_kind["side-3"].text == "90.00'"
     assert by_kind["side-3-note"].text == "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY"
+    assert by_kind["side-3"].point[0] > by_kind["side-3-note"].point[0]
     assert by_kind["side-4"].text == "20.72'"
-    # Внутренний угол лежит внутри полигона у ЮЗ вершины
+    # Внутренний угол лежит внутри полигона у ЮЗ вершины вместе с угловой дугой
     assert by_kind["angle-1"].text == '93%%d33\'29.5"'
     assert point_in_polygon(by_kind["angle-1"].point, plan.vertices) is True
+    assert len(plan.arcs) == 1
+    assert len(plan.lines) == 4  # продолжения красных линий обеих улиц
+    # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
+    assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
     assert by_kind["cross-street"].text == "63RD STREET"
     assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
@@ -1105,4 +1147,153 @@ def test_vector_pdf_vision_pipeline_renders_and_calls_multimodal_llm(tmp_path, m
         and block["image_url"]["url"].startswith("data:image/png;base64,")
         for block in user_msg["content"]
     )
+
+
+def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatch):
+    """
+    Живой кейс из AutoCAD на 63-01 Borden Avenue: Vision LLM вычислил скошенный
+    курс N 3°33'29.5" W и has_bearing=False, но оставил interior_angle=None.
+    AcadBuilder обязан автоматически вывести точный внутренний угол 93°33'29.5",
+    отрисовать дугу AddArc, линии продолжения улиц AddLine и выполнить ZoomScaled(0.84, 1).
+    """
+    import acad_builder as module
+
+    monkeypatch.setattr(module, "_co_initialize", lambda: None)
+    monkeypatch.setattr(module, "_variant_points", lambda points: [c for p in points for c in p])
+    monkeypatch.setattr(module, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
+
+    vision_desc = LegalDescription(
+        main_street="Borden Avenue",
+        main_street_note="(QUEENS MIDTOWN EXPRESSWAY)",
+        cross_street="63rd Street",
+        distance_to_corner_ft=0.0,
+        front_side="S",
+        front_segment_index=3,
+        cross_street_side_index=0,
+        segments=[
+            Segment(
+                ns="N",
+                degrees=3,
+                minutes=33,
+                seconds=29.5,
+                ew="W",
+                distance_ft=90.17,
+                has_bearing=False,
+                interior_angle=None,
+            ),
+            Segment(
+                ns="N",
+                degrees=90,
+                minutes=0,
+                seconds=0.0,
+                ew="E",
+                distance_ft=26.32,
+                has_bearing=False,
+                course_note="PARALLEL WITH QUEENS MIDTOWN EXPY",
+            ),
+            Segment(
+                ns="S",
+                degrees=0,
+                minutes=0,
+                seconds=0.0,
+                ew="E",
+                distance_ft=90.00,
+                has_bearing=False,
+                course_note="AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY",
+            ),
+            Segment(
+                ns="N",
+                degrees=90,
+                minutes=0,
+                seconds=0.0,
+                ew="W",
+                distance_ft=20.72,
+                has_bearing=False,
+            ),
+        ],
+    )
+
+    builder = AcadBuilder(load_config())
+    app = FakeApp()
+    builder._app, builder._doc = app, app.doc
+    result = builder.draw(vision_desc, scale=16.0)
+
+    space = app.doc.ModelSpace
+    assert len(space.polylines) == 1
+    assert len(space.arcs) == 1
+    assert len(space.lines) == 4
+    assert {ln.Layer for ln in space.lines} == {"STREET_ROW_AI"}
+    assert space.arcs[0].Layer == "BOUNDARY_TEXT_AI"
+    assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
+    assert app.zoomed is True
+    assert app.zoom_scaled == (pytest.approx(0.84), 1)
+    assert result.warnings == []
+
+
+def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
+    """
+    Упреждающая защита от типичных ошибок Vision LLM при чтении чертежа:
+      1) разворот 180° для параллельной стены с одинаковой подписью румба + порядок сторон;
+      2) сброс ошибочного front_segment_index с тыльной границы PARALLEL WITH;
+      3) отсутствие маскировки реальной ошибки длин в deed'е (130' vs 120').
+    """
+    from llm_parser import _repair_llm_geometry
+
+    # На чертеже обе длинные стены подписаны N 56°01'16" W, а стороны перечислены вразнобой:
+    # [Front 14', Rear 14', Side 125', Side 125' (без разворота)] -> сырая невязка ~250 ft!
+    scrambled = LegalDescription(
+        main_street="Dartmouth Loop",
+        front_segment_index=0,
+        segments=[
+            Segment(ns="S", degrees=33, minutes=58, seconds=44.0, ew="W", distance_ft=14.0),
+            Segment(ns="N", degrees=33, minutes=58, seconds=44.0, ew="E", distance_ft=14.0),
+            Segment(ns="N", degrees=56, minutes=1, seconds=16.0, ew="W", distance_ft=125.0),
+            Segment(ns="N", degrees=56, minutes=1, seconds=16.0, ew="W", distance_ft=125.0),
+        ],
+    )
+    repaired, notes = _repair_llm_geometry(scrambled, from_vision=True)
+    assert notes
+    plan = AcadBuilder(load_config()).plan(repaired, scale=16.0)
+    assert plan.closure.distance < 0.01
+    assert plan.area_sqft == pytest.approx(14.0 * 125.0, rel=1e-3)
+
+    # Ошибочный front_segment_index на тыльной стороне PARALLEL WITH сбрасывается
+    bad_front = LegalDescription(
+        main_street="Borden Avenue",
+        front_side="S",
+        front_segment_index=1,
+        segments=[
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=90.0, has_bearing=False),
+            Segment(
+                ns="N",
+                degrees=90,
+                minutes=0,
+                seconds=0,
+                ew="E",
+                distance_ft=20.0,
+                has_bearing=False,
+                course_note="PARALLEL WITH BORDEN AVENUE",
+            ),
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=90.0, has_bearing=False),
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=20.0, has_bearing=False),
+        ],
+    )
+    fixed_front, front_notes = _repair_llm_geometry(bad_front, from_vision=True)
+    assert fixed_front.front_segment_index is None
+    assert front_notes
+
+    # Настоящая опечатка длины в deed'е (130' вместо 120') НЕ маскируется
+    bad_deed = LegalDescription(
+        main_street="Main St",
+        segments=[
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="E", distance_ft=130.0),
+            Segment(ns="S", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=80.0),
+            Segment(ns="N", degrees=90, minutes=0, seconds=0, ew="W", distance_ft=120.0),
+            Segment(ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=80.0),
+        ],
+    )
+    untouched, deed_notes = _repair_llm_geometry(bad_deed, from_vision=True)
+    assert deed_notes == []
+    assert untouched.segments[0].distance_ft == 130.0
+
 

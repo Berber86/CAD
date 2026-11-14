@@ -1,0 +1,82 @@
+ДАМП ЧЕРТЕЖА: for MLP 6910 15th Avenue, Brooklyn.dwg
+Файл: C:\Ser\mlp\1\for MLP 6910 15th Avenue, Brooklyn.dwg
+Область: весь ModelSpace · объектов в ModelSpace: 456 · записано: 456 · ошибок чтения: 0
+Единицы чертежа: INSUNITS = 2 (футы); DIMSCALE = 1; LTSCALE = 1; масштаб аннотаций: 1:1
+Габариты: X 4 912.59 … 5 094.52, Y 4 868.34 … 5 052.38 (181.93 × 184.04)
+
+=== 1. СЛОИ И ОБЪЕКТЫ НА НИХ ===
+Слой '0': BlockReference: 5, Line: 4, MText: 1 | высота текста: 1.2 ×1 | Примеры текста: ['SCALE: 1"=16\'']
+Слой 'M-NTH-ARROW': BlockReference: 1
+Слой 'M-PROPERTY': Line: 3
+Слой 'M-ROW-LINE': Line: 3
+Слой 'PNT-X' [заморожен]: Point: 48
+Слой 'S-CONC-MISC': BlockReference: 22
+Слой 'S-CURB-LINE': BlockReference: 57
+Слой 'S-FENCE': Line: 7, BlockReference: 7
+Слой 'S-ROAD-CL': BlockReference: 30
+Слой 'S-ROAD-SW-LINE': BlockReference: 33
+Слой 'S-ROAD-TCURB': BlockReference: 31
+Слой 'S-TREE': BlockReference: 8
+Слой 'ST-BLDG-LINE': BlockReference: 82, Line: 8
+Слой 'ST-MISC': BlockReference: 38, Line: 12, Hatch: 3
+Слой 'ST-OHED': BlockReference: 9, Line: 7
+Слой 'ST-STEP': BlockReference: 6
+Слой 'ST-WALL': BlockReference: 16, Line: 13
+Слой 'U-TRAF-IRON': BlockReference: 2
+Слои без записанных объектов (110): AQUESTION, BORDER, BRGTXT, Bldg, CURB LINE, D-BASELINE, D-BASELINE-TIES, D-BORDER, D-KEY-LAYOUT, D-LEGEND, D-MTCH-LINE, D-MTCH-LINE-SHEET1, D-MTCH-LINE-SHEET2, D-NOTES, D-ROAD-MISC, D-TOPO-TEXT, D-VIEW-PORT, Defpoints, ELEV, GRID, LETTER, M-BASE-LINE, M-BULKHEAD-LINE, M-EASEMENT, M-GRADIENT-BX-LINE, M-LEGAL-GRADE, M-PARKS-BNDY-LINE, M-PIERHEAD-BULK-LINE, M-PIERHEAD-LINE, M-REC-ROW-LINE, M-ROW-DIM, M-ROW-TEXT, M-TAX-DIM, M-TAX-LINE, M-TAX-TEXT, P-CENTERLINE, P-GRID, P-HWY-BLDG, P-HWY-BOC, P-HWY-BOC-MED, P-HWY-BOW, P-HWY-ROW, P-HWY-TOC, P-HWY-TOC-MED, P-LEGAL-GRADE, P-SEWR, P-SEWR-COMB, P-SEWR-SAN, P-SEWR-STM, PL, PNTDESC, PNTELEV, PNTNO, PNTS, PT_N, PT_S, S-CD, S-CONT-BASELINE, S-CONT-MON, S-CONT-PNTS, S-CONT-SET, S-CURB-DROP, S-DWY, S-GUIDE-RAIL, S-MHWL, S-MISC-IRON, S-MLWL, S-ROAD-DWY, S-ROAD-EOP, S-ROAD-JERSEY-BAR, S-RR, S-SLOPE-BOT, S-SLOPE-TOP, S-TOPO-MISC, S-TOPO-XSEC, S-TREE-HEDG, S-TREE-PINE, S-TREE-TEXT, S-WETLAND, S-WETLAND-ADJ, ST-BLDG-ELEV, ST-BLDG-HATCH, ST-BLDG-TEXT, ST-SUBW-LIMT-LINE, TXT, U-CABLE-IRON, U-CABLE-LINE, U-ELEC-IRON, U-ELEC-LINE, U-FIRE-IRON, U-FIRE-LINE, U-GAS-IRON, U-GAS-LINE, U-MISC-IRON, U-MISC-OHED, U-SEWR-ELEV, U-SEWR-FLOW, U-SEWR-IRON, U-SEWR-LINE, U-SEWR-LINE-COMB, U-SEWR-LINE-SAN, U-SEWR-LINE-STM, U-STEAM-IRON, U-STEAM-LINE, U-SUBW-IRON, U-SUBW-LINE, U-TELE-IRON, U-TELE-LINE, U-WATR-IRON, U-WATR-LINE
+
+=== 2. ТЕКСТОВЫЕ СТИЛИ ===
+  - 'Standard': шрифт romans.shx, высота 0.9, сжатие 1 · текстов: 0
+  - 'ROMANS': шрифт romans.shx, высота 0, сжатие 1 · текстов: 0
+  - 'ROMAND': шрифт romand, высота 0, сжатие 1 · текстов: 0
+  - 'STANDARD2': шрифт Arial, высота 0, сжатие 1 · текстов: 0
+  - 'ROMANT': шрифт romant.shx, высота 0, сжатие 1 · текстов: 0
+  - 'SITELINEDIM': шрифт romant.shx, высота 3.2, сжатие 1 · текстов: 0
+  - 'GOTHICE': шрифт gothice.shx, высота 0, сжатие 1 · текстов: 0
+  - 'RDTEXT': шрифт romans.shx, высота 0, сжатие 1 · текстов: 0
+  - 'ROMAND-I': шрифт romand.shx, высота 0, сжатие 1 · текстов: 0
+  - '': шрифт ltypeshp.shx, высота 0, сжатие 1 · текстов: 0
+  - 'STREETLINEDIM': шрифт romand.shx, высота 2.8, сжатие 1 · текстов: 0
+  - 'ARIAL': шрифт Arial, высота 50, сжатие 0.85 · текстов: 0
+  - 'PTXT': шрифт TXT, высота 0, сжатие 1 · текстов: 0
+  - 'Legend': шрифт Calibri, высота 0, сжатие 1 · текстов: 0
+  - 'TEXT': шрифт Times New Roman, высота 14, сжатие 1 · текстов: 0
+  - 'RDS': шрифт ROMAND.shx, высота 0, сжатие 0.8 · текстов: 0
+  - 'style2': шрифт Times New Roman, высота 1.2, сжатие 1 · текстов: 1
+  - 'RS': шрифт ROMANS.shx, высота 0, сжатие 0.8 · текстов: 0
+  - 'BASE': шрифт Romans.shx, высота 0.1, сжатие 0.85 · текстов: 0
+  - 'BASE-PN': шрифт Romans.shx, высота 0.5, сжатие 0.85 · текстов: 0
+
+=== 3. БЛОКИ (СТРЕЛКА СЕВЕРА, РАМКА) ===
+  - Блок 'BLANK' ×22 | Слой: 'S-CONC-MISC' | Поворот: 0°
+  - Блок 'BLANK' ×53 | Слой: 'S-CURB-LINE' | Поворот: 0°
+  - Блок 'BLANK' ×30 | Слой: 'S-ROAD-CL' | Поворот: 0°
+  - Блок 'BLANK' ×33 | Слой: 'S-ROAD-SW-LINE' | Поворот: 0°
+  - Блок 'BLANK' ×31 | Слой: 'S-ROAD-TCURB' | Поворот: 0°
+  - Блок 'BLANK' ×8 | Слой: 'S-TREE' | Поворот: 0°
+  - Блок 'BLANK' ×70 | Слой: 'ST-BLDG-LINE' | Поворот: 0°
+  - Блок 'BLANK' ×29 | Слой: 'ST-MISC' | Поворот: 0°
+  - Блок 'BLANK' ×5 | Слой: 'ST-OHED' | Поворот: 0°
+  - Блок 'BLANK' ×6 | Слой: 'ST-STEP' | Поворот: 0°
+  - Блок 'BLANK' ×10 | Слой: 'ST-WALL' | Поворот: 0°
+  - Блок 'NA' ×1 | Слой: 'M-NTH-ARROW' | Поворот: 308.237°
+  - Блок 'SRVPNO1' ×5 | Слой: '0' | Поворот: 3.518°
+  - Блок 'WUP' ×1 | Слой: 'U-TRAF-IRON' | Поворот: 0°
+  - Блок 'srvpno3' ×4 | Слой: 'S-CURB-LINE' | Поворот: 327.677°
+  - Блок 'srvpno3' ×4 | Слой: 'S-FENCE' | Поворот: 3.518°
+  - Блок 'srvpno3' ×3 | Слой: 'S-FENCE' | Поворот: 327.677°
+  - Блок 'srvpno3' ×7 | Слой: 'ST-BLDG-LINE' | Поворот: 3.518°
+  - Блок 'srvpno3' ×5 | Слой: 'ST-BLDG-LINE' | Поворот: 327.677°
+  - Блок 'srvpno3' ×4 | Слой: 'ST-MISC' | Поворот: 3.518°
+  - Блок 'srvpno3' ×5 | Слой: 'ST-MISC' | Поворот: 327.677°
+  - Блок 'srvpno3' ×3 | Слой: 'ST-OHED' | Поворот: 3.518°
+  - Блок 'srvpno3' ×1 | Слой: 'ST-OHED' | Поворот: 327.677°
+  - Блок 'srvpno3' ×6 | Слой: 'ST-WALL' | Поворот: 3.518°
+  - Блок 'srvpno3' ×1 | Слой: 'U-TRAF-IRON' | Поворот: 3.518°
+
+=== 4. ОТДЕЛЬНЫЕ ГРУППЫ ОБЪЕКТОВ (несколько чертежей в одном файле; оценка) ===
+  Группа 1: объектов 135 · X 4 965.18 … 5 044.94, Y 4 923.88 … 5 035.52 · слои: PNT-X (37), ST-MISC (24), ST-WALL (19), ST-BLDG-LINE (14)
+  Мелких групп (меньше 5 объектов): 11, объектов в них: 24
+
+=== 5. ЛИСТЫ ===
+  - 'layout': Viewport: 2 | масштабы видовых экранов: [0.03333333, 1]

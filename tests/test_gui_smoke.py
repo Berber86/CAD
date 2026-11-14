@@ -2990,3 +2990,202 @@ def test_unreadable_reselected_neighbor_pdf_keeps_old_plan_blocked(gui, tmp_path
     assert app._neighbor_plan_sources[path] is not old
     assert path not in app._pending_neighbor_files
     app._on_close()
+
+
+# ------------------------------------- Шаг 2: вторая глобальная вкладка окна --
+
+def _step2_result(skip_existing=True):
+    """Готовый FeatureLabelResult на синтетическом чертеже (без AutoCAD)."""
+    import acad_builder as ab
+    import feature_labeler as fl
+    from test_feature_labeling import HOUSE, build_scene
+
+    snap = build_scene(with_existing=True)
+    boundary = fl.find_property_polygon(snap, {})
+    recognition = fl.recognize_features(snap, boundary, {}, HOUSE)
+    plan = ab.plan_feature_labels(recognition, snap, {}, text_height=0.9, skip_existing=skip_existing)
+    return ab.FeatureLabelResult(
+        plan=plan, layer=plan.output_layer, created_labels=len(plan.items),
+        created_texts=plan.count_placement("along"),
+        created_mtexts=len(plan.items) - plan.count_placement("along"),
+        created_leaders=plan.count_placement("leader"),
+    )
+
+
+def _wait_idle(app):
+    import time
+
+    for _ in range(100):
+        app._drain_events()
+        if not app._busy:
+            return
+        time.sleep(0.02)
+    raise AssertionError("фоновое задание не завершилось")
+
+
+def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
+    app = gui.SurveyApp()
+
+    assert gui.STEP_TABS == (
+        "Шаг 1. Граница участка (Legal Description)",
+        "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
+    )
+    assert list(app.step_tab_buttons) == list(gui.STEP_TABS)
+    # По умолчанию открыт Шаг 1: рабочая зона границы и её кнопки на месте.
+    assert app.step_tab_var.get() == gui.STEP_TAB_BOUNDARY
+    assert app.main_wrap._gridded is True
+    assert app.step2_page._gridded is False
+    assert app.draw_button._gridded is True
+
+    # Элементы вкладки Шага 2 из постановки задачи.
+    assert app.house_text_entry.cget("placeholder_text") == "например: 2 STY. BRK. & FR."
+    assert app.skip_existing_labels_check.cget("text") == (
+        "Не дублировать уже существующие на чертеже надписи"
+    )
+    assert app.skip_existing_labels_var.get() is True
+    assert "Автопоиск участка и подписание объектов" in app.feature_auto_button.cget("text")
+    assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
+    assert "0.900 ft" in app.step2_height_label.cget("text")
+
+    app._select_step_tab(gui.STEP_TAB_LABELS)
+    assert app.main_wrap._gridded is False
+    assert app.step2_page._gridded is True
+    assert app.draw_button._gridded is False
+    assert app.add_neighbor_button._gridded is False
+    assert app.step_tab_buttons[gui.STEP_TAB_LABELS].cget("fg_color") == gui.THEME["btn_primary"]
+    assert app.step_tab_buttons[gui.STEP_TAB_BOUNDARY].cget("fg_color") == gui.THEME["bg_field"]
+
+    # Клавиши Шага 1 на вкладке Шага 2 не запускают разбор и отрисовку границы.
+    started = []
+    app._start = lambda **kwargs: started.append(kwargs)
+    assert app._global_bindings["<F5>"]() is None
+    assert app._global_bindings["<Control-Return>"]() is None
+    assert started == []
+
+    # Возврат на Шаг 1 восстанавливает рабочую зону и клавиши.
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.main_wrap._gridded is True
+    assert app.step2_page._gridded is False
+    assert app.draw_button._gridded is True
+    assert app.add_neighbor_button._gridded is True
+    assert app._global_bindings["<F5>"]() == "break"
+    assert started == [{"parse_only": False}]
+
+    # Высота текста подписей следует за масштабом из шапки.
+    app.scale_var.set('1"=20\'')
+    app._refresh_height_label()
+    assert "1.125 ft" in app.step2_height_label.cget("text")
+
+
+def test_step2_house_text_normalization(gui):
+    assert gui.normalize_house_text("  2 STY.   BRK. & FR. ") == "2 STY. BRK. & FR."
+    assert gui.normalize_house_text("2 STY. FRAME / No. 87") == "2 STY. FRAME\nNo. 87"
+    assert gui.normalize_house_text("2 STY. FRAME | DWELLING") == "2 STY. FRAME\nDWELLING"
+    assert gui.normalize_house_text("1 1/2 STY. FRAME") == "1 1/2 STY. FRAME"  # дробь не разрывается
+    assert gui.normalize_house_text("   ") == ""
+    assert gui.normalize_house_text(None) == ""
+
+
+@pytest.mark.parametrize("mode", ["auto", "pick"])
+def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    calls = []
+    prepared = _step2_result()
+
+    def fake_label_features(builder, **kwargs):
+        calls.append(kwargs)
+        kwargs["progress"]("Читаю объекты активного чертежа AutoCAD…")
+        assert kwargs["should_continue"]() is True
+        return prepared
+
+    monkeypatch.setattr(gui.AcadBuilder, "label_features", fake_label_features)
+
+    app = gui.SurveyApp()
+    app._select_step_tab(gui.STEP_TAB_LABELS)
+    app.house_text_var.set("2 STY. BRK. & FR. / No. 87")
+    app.scale_var.set('1"=20\'')
+    button = app.feature_auto_button if mode == "auto" else app.feature_pick_button
+    button.cget("command")()
+    assert app._busy is True
+    assert app.feature_auto_button.cget("state") == "disabled"
+    assert app.feature_pick_button.cget("state") == "disabled"
+    _wait_idle(app)
+
+    assert len(calls) == 1
+    assert calls[0]["mode"] == mode
+    assert calls[0]["house_text"] == "2 STY. BRK. & FR.\nNo. 87"
+    assert calls[0]["skip_existing"] is True
+    assert calls[0]["scale"] == pytest.approx(20.0)
+    assert app.feature_auto_button.cget("state") == "normal"
+    assert app.feature_pick_button.cget("state") == "normal"
+    assert app.feature_label_result is prepared
+
+    # Счётчики и подробный отчёт на вкладке Шага 2.
+    assert app.step2_stat_vars["codes"].get() == "4"
+    assert app.step2_stat_vars["layers"].get() == "13"
+    assert app.step2_stat_vars["labeled"].get() == "15"
+    assert app.step2_stat_vars["skipped"].get() == "3"
+    report = app.step2_report_box.get("1.0", "end")
+    assert "по кодам точек (POINT_LABELS): 4" in report
+    assert "по именам слоёв: 13" in report
+    assert "ПОДПИСАНО: 15" in report
+    # Тот же отчёт — в журнале операций (лог-панель).
+    log = "\n".join(app._log)
+    assert "Шаг 2 · • по кодам точек (POINT_LABELS): 4" in log
+    assert "Шаг 2 · • по именам слоёв: 13" in log
+    assert "Шаг 2 · ПОДПИСАНО: 15" in log
+    assert "Подписано объектов: 15 в слое D-TOPO-TEXT" in app.status_var.get()
+
+    # Отчёт копируется и очищается.
+    app._copy_step2_report()
+    assert "ПОДПИСАНО: 15" in app._clipboard
+    app._clear_step2_report()
+    assert app.feature_label_result is None
+    assert app.step2_stat_vars["labeled"].get() == "—"
+    assert app.step2_report_box.get("1.0", "end") == gui.STEP2_EMPTY_REPORT
+
+
+def test_step2_passes_dedup_checkbox_state(gui, monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    calls = []
+    monkeypatch.setattr(
+        gui.AcadBuilder, "label_features",
+        lambda builder, **kwargs: calls.append(kwargs) or _step2_result(skip_existing=False),
+    )
+    app = gui.SurveyApp()
+    app.skip_existing_labels_var.set(False)
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert calls[0]["skip_existing"] is False
+    assert calls[0]["house_text"] == ""
+    assert app.step2_stat_vars["skipped"].get() == "0"
+    assert app.step2_stat_vars["labeled"].get() == "18"
+
+
+def test_step2_error_is_shown_in_report_and_status(gui, monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+
+    def fail(builder, **kwargs):
+        raise gui.AcadBuilderError("в слоях границы не найден замкнутый контур участка")
+
+    monkeypatch.setattr(gui.AcadBuilder, "label_features", fail)
+    app = gui.SurveyApp()
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    report = app.step2_report_box.get("1.0", "end")
+    assert report.startswith("ШАГ 2 НЕ ВЫПОЛНЕН")
+    assert "не найден замкнутый контур участка" in report
+    assert "Указать границу участка в AutoCAD" in report  # подсказка для автопоиска
+    assert "Шаг 2 не выполнен" in app.status_var.get()
+    assert app.feature_label_result is None
+    assert app._busy is False
+    assert app.feature_auto_button.cget("state") == "normal"
+
+
+def test_step2_requires_windows_autocad(gui, monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "linux")
+    app = gui.SurveyApp()
+    app._start_feature_labeling("pick")
+    _wait_idle(app)
+    assert "только в Windows" in app.step2_report_box.get("1.0", "end")
+    assert "Шаг 2 не выполнен" in app.status_var.get()

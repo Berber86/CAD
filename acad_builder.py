@@ -33,6 +33,29 @@ from typing import Any, Callable, Iterable, Sequence
 
 from llm_parser import LegalDescription, Segment, load_config
 
+# feature_labeler импортируется первым: при отсутствии shapely он выдаёт
+# понятное сообщение об установке зависимостей.
+from feature_labeler import (
+    DrawingLine,
+    DrawingSnapshot,
+    DrawingText,
+    Feature,
+    FeatureLabelError,
+    LayerClassifier,
+    RecognitionResult,
+    feature_settings,
+    find_property_polygon,
+    labels_similar,
+    line_to_shapely,
+    plain_text,
+    property_polygon_from_selection,
+    recognize_features,
+)
+from shapely import affinity as shapely_affinity
+from shapely.geometry import LineString, Point
+from shapely.geometry import box as shapely_box
+from shapely.strtree import STRtree
+
 __all__ = [
     "AcadBuilderError",
     "AcadConnectionError",
@@ -41,6 +64,11 @@ __all__ = [
     "ClosureError",
     "DrawPlan",
     "DrawResult",
+    "FeatureDuplicate",
+    "FeatureLabelError",
+    "FeatureLabelItem",
+    "FeatureLabelPlan",
+    "FeatureLabelResult",
     "LineItem",
     "LotSuspicionReport",
     "NeighborPairReport",
@@ -62,6 +90,7 @@ __all__ = [
     "estimate_text_width",
     "format_bearing",
     "format_distance",
+    "plan_feature_labels",
     "point_in_polygon",
     "polygon_centroid",
     "polygon_intersection_area",
@@ -76,6 +105,24 @@ __all__ = [
 # --- Константы AutoCAD ActiveX (значения одинаковы во всех версиях) ---------
 ACAD_PROGID = "AutoCAD.Application"
 AC_ALIGNMENT_MIDDLE_CENTER = 10
+# AcAttachmentPoint (MText) и AcLeaderType — для подписей объектов (Шаг 2)
+AC_ATTACHMENT_MIDDLE_LEFT = 4
+AC_ATTACHMENT_MIDDLE_CENTER = 5
+AC_ATTACHMENT_MIDDLE_RIGHT = 6
+AC_LEADER_LINE_WITH_ARROW = 2
+
+#: линейные объекты DWG, из которых собираются участок, заборы и строения
+_FEATURE_LINE_KINDS = frozenset(
+    {
+        "AcDbLine",
+        "AcDbPolyline",
+        "AcDb2dPolyline",
+        "AcDb3dPolyline",
+        "AcDbArc",
+        "AcDbCircle",
+        "AcDbSpline",
+    }
+)
 
 _INSUNITS_NAMES = {
     0: "unitless",
@@ -1076,6 +1123,80 @@ def _variant_points(points: Iterable[tuple[float, ...]]) -> Any:
 def _variant_point(point: tuple[float, float], z: float = 0.0) -> Any:
     """Точка [x, y, z] как VARIANT(VT_ARRAY | VT_R8)."""
     return _variant_array((point[0], point[1], z))
+
+
+def _null_dispatch() -> Any:
+    """Пустая ссылка на объект (Nothing) — выноска без привязанной аннотации."""
+    try:
+        import pythoncom
+        import win32com.client
+
+        return win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+    except ImportError:  # не Windows: используется только в тестах с заглушками
+        return None
+
+
+def _arc_points(
+    center: tuple[float, float],
+    radius: float,
+    start_angle: float,
+    end_angle: float,
+    step_deg: float = 10.0,
+) -> list[tuple[float, float]]:
+    """Дуга (против часовой стрелки от start до end, радианы) в виде ломаной."""
+    sweep = (end_angle - start_angle) % (2.0 * math.pi)
+    if sweep <= 1e-12:
+        sweep = 2.0 * math.pi
+    count = max(2, int(math.ceil(math.degrees(sweep) / step_deg)))
+    return [
+        (
+            center[0] + radius * math.cos(start_angle + sweep * index / count),
+            center[1] + radius * math.sin(start_angle + sweep * index / count),
+        )
+        for index in range(count + 1)
+    ]
+
+
+def _expand_polyline_bulges(
+    points: Sequence[tuple[float, float]], bulges: Sequence[float], closed: bool
+) -> list[tuple[float, float]]:
+    """
+    Заменяет дуговые сегменты LWPOLYLINE (bulge = tan(θ/4)) короткими хордами.
+
+    Для замкнутой полилинии учитывается и замыкающий сегмент (последняя
+    вершина -> первая); сама первая вершина в конце не повторяется.
+    """
+    count = len(points)
+    result: list[tuple[float, float]] = []
+    segments = count if closed else count - 1
+    for index in range(count):
+        start = points[index]
+        result.append(start)
+        if index >= segments:
+            continue
+        end = points[(index + 1) % count]
+        bulge = float(bulges[index]) if index < len(bulges) else 0.0
+        chord = math.hypot(end[0] - start[0], end[1] - start[1])
+        if abs(bulge) <= 1e-9 or chord <= 1e-9:
+            continue
+        theta = 4.0 * math.atan(bulge)
+        half_tan = math.tan(theta / 2.0)
+        if abs(half_tan) <= 1e-12:
+            continue
+        # Центр дуги лежит на серединном перпендикуляре хорды.
+        offset = (chord / 2.0) / half_tan
+        mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+        normal = (-(end[1] - start[1]) / chord, (end[0] - start[0]) / chord)
+        center = (mid[0] + normal[0] * offset, mid[1] + normal[1] * offset)
+        radius = math.hypot(start[0] - center[0], start[1] - center[1])
+        angle = math.atan2(start[1] - center[1], start[0] - center[0])
+        steps = max(2, int(math.ceil(abs(math.degrees(theta)) / 10.0)))
+        for step in range(1, steps):
+            current = angle + theta * step / steps
+            result.append(
+                (center[0] + radius * math.cos(current), center[1] + radius * math.sin(current))
+            )
+    return result
 
 
 def _com_retry(
@@ -2456,6 +2577,619 @@ class AcadBuilder:
                 warnings=warnings,
                 boundary_line_count=created_boundary_lines,
             )
+        finally:
+            if self._com_owned:
+                self._app = None
+                self._doc = None
+                self._com_owned = False
+                self._com_thread_id = None
+                _co_uninitialize()
+
+
+    # ======================================================================
+    # Шаг 2. Автоподписание объектов (Feature Labeling) в слое D-TOPO-TEXT
+    # ======================================================================
+
+    def feature_text_height(
+        self, scale: float | None = None, text_height: float | None = None
+    ) -> float:
+        """Высота текста подписей объектов: явная, из конфига либо по масштабу."""
+        if text_height is not None and float(text_height) > 0:
+            return float(text_height)
+        fcfg = feature_settings(self.cfg)
+        fixed = fcfg.get("text_height_ft")
+        if fixed is not None and float(fixed) > 0:
+            return float(fixed)
+        base_scale = float(self.drawing_cfg.get("base_scale", 16.0)) or 16.0
+        height = self.text_height_for_scale(float(scale or base_scale), self.cfg)
+        return height * (float(fcfg.get("text_height_factor") or 1.0) or 1.0)
+
+    # -- чтение чертежа -----------------------------------------------------
+    @staticmethod
+    def _iter_com(collection: Any) -> Iterable[Any]:
+        """Перебор COM-коллекции: по ``Count``/``Item`` с повтором при занятости AutoCAD."""
+        try:
+            count = int(collection.Count)
+        except Exception:  # noqa: BLE001 - коллекция без Count (или тестовая)
+            yield from collection
+            return
+        for index in range(count):
+            try:
+                yield _com_retry(collection.Item, index)
+            except Exception:  # noqa: BLE001 - объект удалён или недоступен
+                continue
+
+    @staticmethod
+    def _hidden_layer_names(doc: Any) -> set[str]:
+        """Имена замороженных и выключенных слоёв (в верхнем регистре)."""
+        hidden: set[str] = set()
+        try:
+            layers = doc.Layers
+        except Exception:  # noqa: BLE001
+            return hidden
+        for layer in AcadBuilder._iter_com(layers):
+            try:
+                frozen = bool(getattr(layer, "Freeze", False))
+                visible = bool(getattr(layer, "LayerOn", True))
+                if frozen or not visible:
+                    hidden.add(str(layer.Name).upper())
+            except Exception:  # noqa: BLE001
+                continue
+        return hidden
+
+    @staticmethod
+    def _entity_bbox(entity: Any) -> tuple[float, float, float, float] | None:
+        """Габарит объекта из AutoCAD (``GetBoundingBox``) либо ``None``."""
+        try:
+            result = entity.GetBoundingBox()
+            low, high = result[0], result[1]
+            bbox = (float(low[0]), float(low[1]), float(high[0]), float(high[1]))
+        except Exception:  # noqa: BLE001 - при позднем связывании нужны выходные VARIANT
+            try:
+                import pythoncom
+                import win32com.client
+
+                kind = pythoncom.VT_BYREF | pythoncom.VT_ARRAY | pythoncom.VT_R8
+                low_ref = win32com.client.VARIANT(kind, (0.0, 0.0, 0.0))
+                high_ref = win32com.client.VARIANT(kind, (0.0, 0.0, 0.0))
+                entity.GetBoundingBox(low_ref, high_ref)
+                low, high = low_ref.value, high_ref.value
+                bbox = (float(low[0]), float(low[1]), float(high[0]), float(high[1]))
+            except Exception:  # noqa: BLE001 - габарит будет оценён по тексту и высоте
+                return None
+        if not all(math.isfinite(value) for value in bbox):
+            return None
+        return bbox
+
+    @staticmethod
+    def _entity_polyline(
+        entity: Any, kind: str
+    ) -> tuple[list[tuple[float, float]], bool] | None:
+        """Геометрия линейного объекта в виде ломаной ``(точки, замкнута)``."""
+        if kind == "AcDbLine":
+            start, end = entity.StartPoint, entity.EndPoint
+            return [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))], False
+        if kind == "AcDbPolyline":
+            flat = [float(value) for value in entity.Coordinates]
+            points = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
+            closed = bool(getattr(entity, "Closed", False))
+            bulges = [0.0] * len(points)
+            if 2 <= len(points) <= 256 and hasattr(entity, "GetBulge"):
+                try:
+                    bulges = [float(entity.GetBulge(index)) for index in range(len(points))]
+                except Exception:  # noqa: BLE001
+                    bulges = [0.0] * len(points)
+            if any(abs(bulge) > 1e-9 for bulge in bulges):
+                points = _expand_polyline_bulges(points, bulges, closed)
+            return points, closed
+        if kind in {"AcDb2dPolyline", "AcDb3dPolyline"}:
+            flat = [float(value) for value in entity.Coordinates]
+            points = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 2, 3)]
+            return points, bool(getattr(entity, "Closed", False))
+        if kind == "AcDbArc":
+            center = entity.Center
+            return (
+                _arc_points(
+                    (float(center[0]), float(center[1])), float(entity.Radius),
+                    float(entity.StartAngle), float(entity.EndAngle),
+                ),
+                False,
+            )
+        if kind == "AcDbCircle":
+            center = entity.Center
+            ring = _arc_points(
+                (float(center[0]), float(center[1])), float(entity.Radius), 0.0, 2.0 * math.pi
+            )
+            return ring[:-1], True
+        if kind == "AcDbSpline":
+            flat: list[float] = []
+            for attr in ("FitPoints", "ControlPoints"):
+                try:
+                    flat = [float(value) for value in getattr(entity, attr)]
+                except Exception:  # noqa: BLE001
+                    flat = []
+                if len(flat) >= 6:
+                    break
+            points = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 2, 3)]
+            return (points, bool(getattr(entity, "Closed", False))) if len(points) >= 2 else None
+        return None
+
+    def read_drawing_snapshot(
+        self,
+        doc: Any,
+        *,
+        progress: Callable[[str], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> DrawingSnapshot:
+        """
+        Читает из ModelSpace линии и тексты, нужные для Шага 2.
+
+        Объекты скрытых (замороженных/выключенных) слоёв не считаются ни
+        объектами, ни препятствиями; коды точек и существующие подписи читаются
+        всегда — это исходные данные распознавания и дедупликации.
+        """
+        fcfg = feature_settings(self.cfg)
+        classifier = LayerClassifier(fcfg)
+        hidden = self._hidden_layer_names(doc) if fcfg.get("ignore_hidden_layers", True) else set()
+        snapshot = DrawingSnapshot()
+        try:
+            model_space = doc.ModelSpace
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
+        try:
+            total = int(model_space.Count)
+        except Exception:  # noqa: BLE001
+            total = 0
+        for index, entity in enumerate(self._iter_com(model_space), 1):
+            snapshot.entity_count = index
+            if index % 250 == 0:
+                if should_continue is not None and not should_continue():
+                    raise AcadBuilderError("операция отменена: чертёж не изменён")
+                if progress is not None:
+                    of_total = f" из {total}" if total else ""
+                    progress(f"Чтение чертежа AutoCAD: {index}{of_total} объектов…")
+            try:
+                self._read_entity(entity, snapshot, classifier, hidden)
+            except Exception:  # noqa: BLE001 - прокси-объекты, повреждённые примитивы
+                snapshot.read_errors += 1
+        if snapshot.read_errors:
+            snapshot.notes.append(
+                f"не удалось прочитать объектов чертежа: {snapshot.read_errors} (пропущены)"
+            )
+        return snapshot
+
+    def _read_entity(
+        self,
+        entity: Any,
+        snapshot: DrawingSnapshot,
+        classifier: LayerClassifier,
+        hidden: set[str],
+    ) -> None:
+        layer = str(entity.Layer)
+        kind = str(entity.ObjectName)
+        is_hidden = layer.upper() in hidden
+        if kind in {"AcDbText", "AcDbMText", "AcDbMLeader"}:
+            is_point = classifier.is_point_label(layer)
+            is_label = classifier.is_existing_label(layer)
+            if is_hidden and not (is_point or is_label):
+                snapshot.skipped_hidden += 1
+                return
+            text = plain_text(entity.TextString)
+            if not text:
+                return
+            bbox = None if (is_point and not is_label) else self._entity_bbox(entity)
+            if kind == "AcDbMLeader":
+                if bbox is None:
+                    return
+                point = (bbox[0], bbox[3])
+                height, rotation = 0.0, 0.0
+                try:
+                    flat = [float(value) for value in entity.GetLeaderLineVertices(0)]
+                    path = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 2, 3)]
+                    if len(path) >= 2 and is_label:
+                        snapshot.leaders.append(
+                            DrawingLine(layer=layer, points=tuple(path), kind=kind)
+                        )
+                except Exception:  # noqa: BLE001 - у мультивыноски может не быть линий
+                    pass
+            else:
+                insertion = entity.InsertionPoint
+                point = (float(insertion[0]), float(insertion[1]))
+                height = float(getattr(entity, "Height", 0.0) or 0.0)
+                rotation = float(getattr(entity, "Rotation", 0.0) or 0.0)
+            snapshot.texts.append(
+                DrawingText(
+                    layer=layer, text=text, point=point, height=height, rotation=rotation,
+                    bbox=bbox, kind="AcDbMText" if kind == "AcDbMLeader" else kind,
+                    hidden=is_hidden,
+                )
+            )
+            return
+        if kind == "AcDbLeader":
+            if not classifier.is_existing_label(layer):
+                return
+            flat = [float(value) for value in entity.Coordinates]
+            path = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 2, 3)]
+            if len(path) >= 2:
+                snapshot.leaders.append(DrawingLine(layer=layer, points=tuple(path), kind=kind))
+            return
+        if kind not in _FEATURE_LINE_KINDS:
+            return
+        wanted = (
+            classifier.is_feature_linework(layer)
+            or classifier.is_obstacle(layer)
+            or classifier.is_existing_label(layer)
+        )
+        if not wanted:
+            return
+        if is_hidden:
+            snapshot.skipped_hidden += 1
+            return
+        geometry = self._entity_polyline(entity, kind)
+        if geometry is None:
+            return
+        points, closed = geometry
+        if len(points) >= 2:
+            snapshot.lines.append(
+                DrawingLine(layer=layer, points=tuple(points), closed=closed, kind=kind)
+            )
+
+    # -- указание границы участка в AutoCAD ----------------------------------
+    def pick_boundary_lines(
+        self, app: Any, doc: Any, progress: Callable[[str], None] | None = None
+    ) -> list[DrawingLine]:
+        """
+        Просит геодезиста выбрать в AutoCAD объекты границы участка.
+
+        Используется именованный набор выбора ``SelectOnScreen``: можно указать
+        замкнутую полилинию либо все (или несколько) сторон границы и нажать Enter.
+        """
+        if progress is not None:
+            progress(
+                "Перейдите в AutoCAD: выберите линии границы участка "
+                "(замкнутую полилинию или все стороны) и нажмите Enter…"
+            )
+        try:
+            app.Visible = True
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # вывести окно AutoCAD на передний план (только Windows)
+            import win32gui
+
+            win32gui.SetForegroundWindow(int(app.HWND))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            doc.Utility.Prompt(
+                "\nTitle Survey AI: выберите линии границы участка и нажмите Enter: "
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        set_name = "TSAI_BOUNDARY_PICK"
+        try:
+            selection_sets = doc.SelectionSets
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"наборы выбора AutoCAD недоступны: {exc}") from exc
+        try:
+            selection_sets.Item(set_name).Delete()
+        except Exception:  # noqa: BLE001 - набора с таким именем ещё нет
+            pass
+        try:
+            selection = _com_retry(selection_sets.Add, set_name)
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"не удалось создать набор выбора: {exc}") from exc
+        try:
+            try:
+                # Без повторов: отмена (Esc) не должна запускать выбор заново.
+                selection.SelectOnScreen()
+            except Exception as exc:  # noqa: BLE001
+                raise AcadBuilderError(
+                    "Выбор границы в AutoCAD отменён или AutoCAD занят другой командой. "
+                    f"Чертёж не изменён. Детали: {exc}"
+                ) from exc
+            picked: list[DrawingLine] = []
+            for entity in self._iter_com(selection):
+                try:
+                    kind = str(entity.ObjectName)
+                    if kind not in _FEATURE_LINE_KINDS:
+                        continue
+                    geometry = self._entity_polyline(entity, kind)
+                    if geometry is None or len(geometry[0]) < 2:
+                        continue
+                    picked.append(
+                        DrawingLine(
+                            layer=str(entity.Layer), points=tuple(geometry[0]),
+                            closed=geometry[1], kind=kind,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+        finally:
+            try:
+                selection.Delete()
+            except Exception:  # noqa: BLE001
+                pass
+        if not picked:
+            raise AcadBuilderError(
+                "В AutoCAD не выбрано ни одной линии или полилинии границы участка. "
+                "Чертёж не изменён."
+            )
+        return picked
+
+    # -- создание подписей --------------------------------------------------
+    def _ensure_feature_layer(self, doc: Any, name: str, color: int) -> str:
+        """
+        Целевой слой подписей. Существующий слой геодезиста включается и
+        размораживается, но его цвет не меняется; цвет задаётся только новому слою.
+        """
+        existed = True
+        try:
+            layer = doc.Layers.Item(name)
+        except Exception:  # noqa: BLE001
+            existed = False
+            try:
+                layer = _com_retry(doc.Layers.Add, name)
+            except Exception:  # noqa: BLE001
+                try:
+                    layer = doc.Layers.Item(name)
+                except Exception:  # noqa: BLE001
+                    return "0"
+        if layer is None:
+            return "0"
+        try:
+            layer.LayerOn = True
+            layer.Freeze = False
+            layer.Lock = False
+            if not existed:
+                layer.color = color
+        except Exception:  # noqa: BLE001 - часть свойств может быть недоступна
+            pass
+        return name
+
+    def _add_mtext(
+        self,
+        model_space: Any,
+        item: FeatureLabelItem,
+        layer: str,
+        style: str,
+    ) -> Any:
+        """MText без переноса по ширине с заданной точкой привязки и поворотом."""
+        point = _variant_point(item.point)
+        mtext = _com_retry(model_space.AddMText, point, 0.0, item.mtext_string)
+        try:
+            mtext.StyleName = style
+        except Exception:  # noqa: BLE001
+            pass
+        mtext.Height = float(item.height)
+        # Сначала точка привязки, затем точка вставки: смена привязки сдвигает вставку.
+        mtext.AttachmentPoint = int(item.attachment)
+        mtext.InsertionPoint = _variant_point(item.point)
+        mtext.Rotation = float(item.rotation)
+        mtext.Layer = layer
+        return mtext
+
+    def _add_leader(
+        self,
+        model_space: Any,
+        item: FeatureLabelItem,
+        annotation: Any,
+        layer: str,
+    ) -> tuple[Any, str]:
+        """
+        Выноска со стрелкой. Возвращает ``(объект, предупреждение)``.
+
+        Порядок попыток: ``AddLeader`` с привязанным MText -> ``AddLeader`` без
+        аннотации -> полилиния с клиновидной стрелкой (если AddLeader недоступен).
+        """
+        fcfg = feature_settings(self.cfg)
+        points3d = [(x, y, 0.0) for x, y in item.leader_points]
+        coordinates = _variant_points(points3d)
+        leader: Any = None
+        warning = ""
+        attach = (
+            bool(fcfg.get("leader_attach_annotation", True))
+            and item.attach_annotation
+            and annotation is not None
+        )
+        if hasattr(model_space, "AddLeader"):
+            attempts: list[Any] = []
+            if attach:
+                attempts.append(annotation)
+            attempts.append(_null_dispatch())
+            for candidate in attempts:
+                try:
+                    leader = _com_retry(
+                        model_space.AddLeader, coordinates, candidate, AC_LEADER_LINE_WITH_ARROW,
+                        attempts=2,
+                    )
+                    break
+                except Exception:  # noqa: BLE001 - пробуем следующий вариант
+                    leader = None
+        if leader is not None:
+            arrow_factor = float(fcfg.get("leader_arrow_size_factor") or 0.0)
+            if arrow_factor > 0.0:
+                try:
+                    leader.ScaleFactor = 1.0
+                    leader.ArrowheadSize = float(item.height) * arrow_factor
+                except Exception:  # noqa: BLE001 - остаётся размер из текущего размерного стиля
+                    pass
+            leader.Layer = layer
+            try:
+                leader.Update()
+            except Exception:  # noqa: BLE001
+                pass
+            return leader, warning
+
+        # Запасной вариант: полилиния, первый короткий сегмент которой — стрелка.
+        tip, second = item.leader_points[0], item.leader_points[1]
+        length = math.hypot(second[0] - tip[0], second[1] - tip[1])
+        arrow = min(float(item.height) * 0.9, length * 0.4)
+        path = list(item.leader_points)
+        if length > 1e-9 and arrow > 1e-9:
+            neck = (
+                tip[0] + (second[0] - tip[0]) * arrow / length,
+                tip[1] + (second[1] - tip[1]) * arrow / length,
+            )
+            path.insert(1, neck)
+        polyline = _com_retry(model_space.AddLightWeightPolyline, _variant_points(path))
+        try:
+            polyline.SetWidth(0, 0.0, arrow / 3.0)
+        except Exception:  # noqa: BLE001
+            pass
+        polyline.Layer = layer
+        warning = "AddLeader недоступен — выноска начерчена полилинией со стрелкой"
+        return polyline, warning
+
+    def draw_feature_labels(
+        self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto"
+    ) -> FeatureLabelResult:
+        """Создаёт запланированные подписи в целевом слое (одна отмена Undo на всё)."""
+        fcfg = feature_settings(self.cfg)
+        result = FeatureLabelResult(plan=plan, layer=plan.output_layer, mode=mode)
+        try:
+            model_space = doc.ModelSpace
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
+        if not plan.items:
+            return result
+
+        style = self._ensure_text_style(doc)
+        layer = self._ensure_feature_layer(
+            doc, plan.output_layer, int(fcfg.get("label_output_layer_color") or 7)
+        )
+        if layer == "0":
+            result.warnings.append(
+                f"слой {plan.output_layer} недоступен — подписи созданы в слое 0"
+            )
+        result.layer = layer
+
+        undo_open = False
+        try:
+            doc.StartUndoMark()
+            undo_open = True
+        except Exception:  # noqa: BLE001 - группировка отмены не критична
+            pass
+        leader_warned = False
+        try:
+            for item in plan.items:
+                title = item.single_line
+                try:
+                    if item.kind == "text":
+                        self._add_text(
+                            model_space,
+                            TextItem(
+                                text=item.text, point=item.point, rotation=item.rotation,
+                                kind="feature", height=item.height,
+                            ),
+                            item.height, layer, style,
+                        )
+                        result.created_texts += 1
+                    else:
+                        mtext = self._add_mtext(model_space, item, layer, style)
+                        result.created_mtexts += 1
+                        if item.kind == "leader" and len(item.leader_points) >= 2:
+                            try:
+                                _leader, note = self._add_leader(model_space, item, mtext, layer)
+                                result.created_leaders += 1
+                                if note and not leader_warned:
+                                    result.warnings.append(note)
+                                    leader_warned = True
+                            except Exception as exc:  # noqa: BLE001
+                                result.failed.append(
+                                    f"текст «{title}» создан, но выноска к нему не построена: {exc}"
+                                )
+                    result.created_labels += 1
+                except Exception as exc:  # noqa: BLE001
+                    result.failed.append(f"не удалось создать подпись «{title}»: {exc}")
+        finally:
+            if undo_open:
+                try:
+                    doc.EndUndoMark()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            app.Update()
+        except Exception:  # noqa: BLE001 - обновление экрана не критично
+            pass
+        return result
+
+    def label_features(
+        self,
+        *,
+        mode: str = "auto",
+        house_text: str = "",
+        skip_existing: bool | None = None,
+        scale: float | None = None,
+        text_height: float | None = None,
+        progress: Callable[[str], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        dry_run: bool = False,
+    ) -> FeatureLabelResult:
+        """
+        Шаг 2 целиком: чтение активного чертежа, поиск участка, распознавание
+        объектов и создание подписей в слое ``label_output_layer`` (D-TOPO-TEXT).
+
+        ``mode="auto"`` — автопоиск участка по слоям границы;
+        ``mode="pick"`` — геодезист указывает границу в AutoCAD.
+        ``dry_run=True`` — только расчёт и отчёт, чертёж не меняется.
+        """
+        fcfg = feature_settings(self.cfg)
+        if skip_existing is None:
+            skip_existing = bool(fcfg.get("skip_existing_labels", True))
+        height = self.feature_text_height(scale, text_height)
+
+        def notify(message: str) -> None:
+            if progress is not None:
+                progress(message)
+
+        def check_continue() -> None:
+            if should_continue is not None and not should_continue():
+                raise AcadBuilderError("операция отменена: чертёж не изменён")
+
+        app, doc = self.connect()
+        try:
+            unit_warning = self._unit_warning
+            try:
+                if getattr(doc, "ActiveSpace", 1) == 0 and not getattr(doc, "MSpace", False):
+                    doc.ActiveSpace = 1
+            except Exception:  # noqa: BLE001
+                pass
+
+            selected: list[DrawingLine] | None = None
+            if mode == "pick":
+                selected = self.pick_boundary_lines(app, doc, notify)
+                check_continue()
+
+            notify("Читаю объекты активного чертежа AutoCAD…")
+            snapshot = self.read_drawing_snapshot(
+                doc, progress=progress, should_continue=should_continue
+            )
+            notify(
+                f"Прочитано: линий {len(snapshot.lines)}, текстов {len(snapshot.texts)}. "
+                "Ищу участок и объекты…"
+            )
+            if selected is not None:
+                boundary = property_polygon_from_selection(selected, snapshot, self.cfg)
+            else:
+                boundary = find_property_polygon(snapshot, self.cfg)
+            recognition = recognize_features(snapshot, boundary, self.cfg, house_text)
+            recognition.notes.extend(snapshot.notes)
+            plan = plan_feature_labels(
+                recognition, snapshot, self.cfg,
+                text_height=height, skip_existing=bool(skip_existing),
+            )
+            check_continue()
+            if dry_run:
+                result = FeatureLabelResult(
+                    plan=plan, layer=plan.output_layer, mode=mode, dry_run=True
+                )
+            else:
+                notify(f"Создаю подписи в слое {plan.output_layer}: {len(plan.items)} шт.…")
+                result = self.draw_feature_labels(app, doc, plan, mode=mode)
+            if unit_warning:
+                result.warnings.append(unit_warning)
+            return result
         finally:
             if self._com_owned:
                 self._app = None
@@ -4499,3 +5233,852 @@ def audit_lot_suspicion(plan: DrawPlan) -> LotSuspicionReport:
     )
 
 
+# ---------------------------------------------------------------------------
+# Шаг 2. Автоподписание объектов: размещение подписей в слое D-TOPO-TEXT
+# ---------------------------------------------------------------------------
+#
+# Распознавание объектов (что и как подписать) выполняет feature_labeler.py.
+# Здесь — правила размещения: дедупликация с уже существующими надписями,
+# текст вдоль забора, текст внутри контура, выноски и проверка пересечений
+# габаритов текста (shapely.geometry.box) между собой и с линиями чертежа.
+
+
+@dataclass
+class FeatureLabelItem:
+    """Одна подпись объекта, готовая к созданию в AutoCAD."""
+
+    feature: Feature
+    text: str  # строки разделены "\n"
+    kind: str  # "text" (AddText) | "mtext" (AddMText) | "leader" (AddLeader + AddMText)
+    placement: str  # "along" | "inside" | "leader"
+    point: tuple[float, float]  # центр текста либо точка вставки MText выноски
+    height: float
+    rotation: float = 0.0
+    attachment: int = AC_ATTACHMENT_MIDDLE_CENTER
+    leader_points: list[tuple[float, float]] = field(default_factory=list)
+    box: Any = None  # shapely Polygon: габарит текста
+    note: str = ""
+    attach_annotation: bool = True  # False — выноска без привязки к MText (без «полки»)
+
+    @property
+    def single_line(self) -> str:
+        return " ".join(part for part in self.text.split("\n") if part)
+
+    @property
+    def mtext_string(self) -> str:
+        """Содержимое MText: спецсимволы экранированы, строки соединены ``\\P``."""
+        lines = [
+            line.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+            for line in self.text.split("\n")
+        ]
+        return "\\P".join(lines)
+
+    @property
+    def placement_title(self) -> str:
+        return {
+            "along": "вдоль линии",
+            "inside": "внутри контура",
+            "leader": "выноска",
+        }.get(self.placement, self.placement)
+
+
+@dataclass
+class FeatureDuplicate:
+    """Объект, который не подписан повторно: рядом уже есть аналогичная надпись."""
+
+    feature: Feature
+    existing_text: str
+    existing_layer: str
+    own: bool = False  # True — надпись создана в этом же запуске
+
+
+@dataclass
+class FeatureLabelPlan:
+    """План подписей Шага 2 — результат чистой геометрии, без COM."""
+
+    recognition: RecognitionResult
+    text_height: float
+    output_layer: str
+    skip_existing: bool = True
+    items: list[FeatureLabelItem] = field(default_factory=list)
+    duplicates: list[FeatureDuplicate] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    line_count: int = 0
+    text_count: int = 0
+
+    def count_placement(self, placement: str) -> int:
+        return sum(1 for item in self.items if item.placement == placement)
+
+
+@dataclass
+class FeatureLabelResult:
+    """Итог Шага 2 для статуса и подробного отчёта в окне программы."""
+
+    plan: FeatureLabelPlan
+    layer: str
+    created_labels: int = 0
+    created_texts: int = 0
+    created_mtexts: int = 0
+    created_leaders: int = 0
+    failed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    mode: str = "auto"
+    dry_run: bool = False
+
+    @property
+    def recognition(self) -> RecognitionResult:
+        return self.plan.recognition
+
+    @property
+    def found_by_point_codes(self) -> int:
+        return self.recognition.by_point_codes
+
+    @property
+    def found_by_layers(self) -> int:
+        return self.recognition.by_layers
+
+    @property
+    def skipped_duplicates(self) -> int:
+        return len(self.plan.duplicates)
+
+    @property
+    def has_issues(self) -> bool:
+        return bool(self.failed or self.warnings or self.plan.warnings)
+
+    def summary(self) -> str:
+        rec = self.recognition
+        verb = "Запланировано подписей" if self.dry_run else "Подписано объектов"
+        parts = [
+            f"Шаг 2: найдено объектов с подписью — {len(rec.labeled)} "
+            f"(по кодам точек: {rec.by_point_codes}, по слоям: {rec.by_layers}"
+            + (f", дом: {rec.by_user}" if rec.by_user else "")
+            + ")",
+            f"{verb}: {self.created_labels if not self.dry_run else len(self.plan.items)} "
+            f"в слое {self.layer}",
+        ]
+        if self.plan.duplicates:
+            parts.append(f"пропущено уже подписанных: {len(self.plan.duplicates)}")
+        if self.failed:
+            parts.append(f"ошибок AutoCAD: {len(self.failed)}")
+        return ". ".join(parts) + "."
+
+    def report(self) -> str:
+        """Подробный русскоязычный отчёт для лог-панели вкладки «Шаг 2»."""
+        rec = self.recognition
+        plan = self.plan
+        boundary = rec.boundary
+        how = "указана в AutoCAD" if boundary.method == "pick" else "автопоиск"
+        lines = [
+            f"ШАГ 2 · АВТОПОДПИСАНИЕ ОБЪЕКТОВ → слой {self.layer}"
+            + ("  [ПРОБНЫЙ РАСЧЁТ, чертёж не изменён]" if self.dry_run else ""),
+            f"Граница участка: слой {boundary.layer} · вершин {boundary.vertex_count} · "
+            f"площадь {boundary.area_sqft:,.0f} sq ft ({how})".replace(",", " "),
+            f"Зона поиска: участок + буфер; высота текста {plan.text_height:.3f} ft",
+            f"Прочитано из чертежа: линий {plan.line_count}, текстов {plan.text_count}, "
+            f"кодов точек {len(rec.point_codes)} (из них по словарю: {rec.known_point_codes})",
+            "",
+            f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
+            f"  • по кодам точек (POINT_LABELS): {rec.by_point_codes}",
+            f"  • по именам слоёв: {rec.by_layers}",
+        ]
+        if rec.by_user:
+            lines.append(f"  • основной дом (текст из окна программы): {rec.by_user}")
+        done = len(plan.items) if self.dry_run else self.created_labels
+        lines.append(
+            f"{'К ПОДПИСАНИЮ' if self.dry_run else 'ПОДПИСАНО'}: {done} "
+            f"(вдоль линии: {plan.count_placement('along')}, "
+            f"внутри контура: {plan.count_placement('inside')}, "
+            f"выноска: {plan.count_placement('leader')})"
+        )
+        if not self.dry_run:
+            lines.append(
+                f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
+                f"{self.created_mtexts}, AddLeader — {self.created_leaders}"
+            )
+        lines.append(
+            f"ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: {len(plan.duplicates)}"
+            + ("" if plan.skip_existing else "  (проверка надписей чертежа выключена)")
+        )
+        unlabeled = rec.unlabeled
+        if unlabeled:
+            by_layer: dict[str, int] = {}
+            for feature in unlabeled:
+                by_layer[feature.layer] = by_layer.get(feature.layer, 0) + 1
+            listing = ", ".join(f"{name} ({count})" for name, count in sorted(by_layer.items()))
+            lines.append(f"БЕЗ ПОДПИСИ (для слоя нет правила): {len(unlabeled)} — {listing}")
+        if rec.unknown_codes:
+            listing = ", ".join(
+                f"{code} ×{count}" for code, count in sorted(rec.unknown_codes.items())
+            )
+            lines.append(f"Коды точек не из словаря: {listing}")
+
+        if plan.items:
+            lines += ["", "Подписи:"]
+            for item in plan.items:
+                note = f" · {item.note}" if item.note else ""
+                lines.append(
+                    f"  + {item.single_line} — {item.feature.title} · "
+                    f"{item.feature.source_text} · {item.placement_title}{note}"
+                )
+        if plan.duplicates:
+            lines += ["", "Уже подписаны (дубликат не создан):"]
+            for dup in plan.duplicates:
+                origin = "поставлена в этом запуске" if dup.own else f"слой {dup.existing_layer}"
+                lines.append(
+                    f"  = {dup.feature.label} — {dup.feature.title} · рядом «{dup.existing_text}» "
+                    f"({origin})"
+                )
+        notes = list(boundary.notes) + list(rec.notes)
+        if notes:
+            lines += ["", "Примечания:"]
+            lines += [f"  • {note}" for note in notes]
+        problems = list(plan.warnings) + list(self.warnings) + list(self.failed)
+        if problems:
+            lines += ["", "Предупреждения:"]
+            lines += [f"  ! {problem}" for problem in problems]
+        return "\n".join(lines)
+
+
+@dataclass
+class _KnownLabel:
+    """Надпись чертежа (или только что размещённая) для проверки дубликатов."""
+
+    text: str
+    layer: str
+    box: Any
+    anchors: list[Any] = field(default_factory=list)  # концы выносок (стрелки)
+    owner: Feature | None = None
+
+
+def _rotated_box(
+    center: tuple[float, float], width: float, height: float, rotation: float
+) -> Any:
+    """Габарит текста: ``shapely.geometry.box``, повёрнутый вокруг центра."""
+    cx, cy = center
+    rect = shapely_box(cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
+    if abs(rotation) > 1e-9:
+        rect = shapely_affinity.rotate(rect, rotation, origin=(cx, cy), use_radians=True)
+    return rect
+
+
+def _existing_text_box(text: DrawingText, fallback_height: float, drawing_cfg: dict[str, Any]) -> Any:
+    """Габарит существующего текста: из AutoCAD (GetBoundingBox) или оценка."""
+    bbox = text.bbox
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        if all(math.isfinite(value) for value in bbox) and maxx > minx and maxy > miny:
+            return shapely_box(minx, miny, maxx, maxy)
+    height = float(text.height) if text.height and text.height > 0 else float(fallback_height)
+    width = max(estimate_text_width(text.text, height, drawing_cfg), height * 0.5)
+    x, y = text.point
+    if text.kind == "AcDbText":
+        rect = shapely_box(x, y, x + width, y + height)  # вставка: слева по базовой линии
+    else:
+        rect = shapely_box(x, y - height, x + width, y)  # MText: вставка в левом верхнем углу
+    if abs(text.rotation) > 1e-9:
+        rect = shapely_affinity.rotate(rect, text.rotation, origin=(x, y), use_radians=True)
+    return rect
+
+
+def _two_line_variant(text: str) -> str | None:
+    """«WOOD DECK» -> «WOOD\\nDECK»: перенос по пробелу, ближайшему к середине."""
+    if "\n" in text or " " not in text.strip():
+        return None
+    middle = len(text) / 2.0
+    best = min(
+        (index for index, char in enumerate(text) if char == " "),
+        key=lambda index: abs(index - middle),
+    )
+    left, right = text[:best].strip(), text[best + 1:].strip()
+    if not left or not right:
+        return None
+    return f"{left}\n{right}"
+
+
+class _LabelPlacer:
+    """Последовательно размещает подписи, не допуская наложений."""
+
+    #: варианты выноски: (угол в градусах, текст по центру над/под концом выноски)
+    _LEADER_VARIANTS = (
+        (45, False), (135, False), (-45, False), (-135, False),
+        (25, False), (155, False), (-25, False), (-155, False),
+        (65, False), (115, False), (-65, False), (-115, False),
+        (90, True), (-90, True), (70, True), (110, True), (-70, True), (-110, True),
+    )
+
+    def __init__(
+        self,
+        recognition: RecognitionResult,
+        snapshot: DrawingSnapshot,
+        cfg: dict[str, Any] | None,
+        text_height: float,
+        skip_existing: bool,
+    ) -> None:
+        self.recognition = recognition
+        self.fcfg = feature_settings(cfg)
+        self.drawing_cfg = (cfg or {}).get("drawing", cfg or {}) if isinstance(cfg, dict) else {}
+        self.h = float(text_height)
+        self.skip_existing = bool(skip_existing)
+        self.zone = recognition.zone
+        self.lot = recognition.boundary.polygon
+        self.synonyms = self.fcfg.get("label_synonyms")
+        self.radius = float(self.fcfg.get("duplicate_radius_ft") or 0.0)
+        self.text_clear = float(self.fcfg.get("text_clearance_factor") or 0.0) * self.h
+        self.line_clear = float(self.fcfg.get("line_clearance_factor") or 0.0) * self.h
+        self.inside_clear = float(self.fcfg.get("inside_clearance_factor") or 0.0) * self.h
+        self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
+        classifier = LayerClassifier(self.fcfg)
+        self.classifier = classifier
+
+        margin = 20.0 * self.h + 10.0
+        minx, miny, maxx, maxy = self.zone.bounds
+        self._bounds = (minx - margin, miny - margin, maxx + margin, maxy + margin)
+
+        # --- линии чертежа, которые нельзя закрывать текстом -----------------
+        self.lines: list[Any] = []
+        for line in snapshot.lines:
+            if not (classifier.is_obstacle(line.layer) or classifier.is_feature_linework(line.layer)):
+                continue
+            geom = line_to_shapely(line)
+            if geom is not None and self._in_bounds(geom):
+                self.lines.append(geom)
+        self.lines.append(LineString(list(self.lot.exterior.coords)))
+        self.tree = STRtree(self.lines)
+        self.new_lines: list[Any] = []
+
+        # --- существующие тексты: препятствия и источник дубликатов ----------
+        self.text_boxes: list[Any] = []
+        self.known: list[_KnownLabel] = []
+        avoid_points = bool(self.fcfg.get("point_labels_as_obstacles", False))
+        for text in snapshot.texts:
+            if not str(text.text or "").strip():
+                continue
+            rect = _existing_text_box(text, self.h, self.drawing_cfg)
+            if not self._in_bounds(rect):
+                continue
+            is_point = classifier.is_point_label(text.layer)
+            is_label = classifier.is_existing_label(text.layer)
+            if not text.hidden and (avoid_points or not is_point or is_label):
+                self.text_boxes.append(rect)
+            if is_label:
+                self.known.append(_KnownLabel(text=text.text, layer=text.layer, box=rect))
+        self._link_existing_leaders(snapshot)
+        self.area_features = [f for f in recognition.features if f.kind == "area"]
+
+        self.items: list[FeatureLabelItem] = []
+        self.duplicates: list[FeatureDuplicate] = []
+        self.warnings: list[str] = []
+
+    # -- вспомогательная геометрия -------------------------------------------
+    def _in_bounds(self, geom: Any) -> bool:
+        minx, miny, maxx, maxy = geom.bounds
+        b = self._bounds
+        return not (maxx < b[0] or maxy < b[1] or minx > b[2] or miny > b[3])
+
+    def _link_existing_leaders(self, snapshot: DrawingSnapshot) -> None:
+        """
+        Связывает существующие выноски с их текстом: стрелка выноски указывает
+        на подписанный объект, даже когда сам текст стоит в стороне от него.
+        """
+        if not self.known:
+            return
+        candidates: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        for leader in snapshot.leaders:
+            if len(leader.points) >= 2:
+                candidates.append((leader.points[0], leader.points[-1]))
+        for line in snapshot.lines:
+            if self.classifier.is_existing_label(line.layer) and len(line.points) >= 2 and not line.closed:
+                candidates.append((line.points[0], line.points[-1]))
+        link = max(2.0, 2.5 * self.h)
+        for first, last in candidates:
+            p_first, p_last = Point(first), Point(last)
+            best: tuple[float, _KnownLabel, Any] | None = None
+            for known in self.known:
+                d_first, d_last = known.box.distance(p_first), known.box.distance(p_last)
+                # Ближний к тексту конец — «полка», дальний — стрелка у объекта.
+                near, tip = (d_first, p_last) if d_first <= d_last else (d_last, p_first)
+                if near <= link and (best is None or near < best[0]):
+                    best = (near, known, tip)
+            if best is not None:
+                best[1].anchors.append(best[2])
+
+    def _text_size(self, text: str) -> tuple[float, float]:
+        lines = text.split("\n") or [text]
+        width = max(estimate_text_width(line, self.h, self.drawing_cfg) for line in lines)
+        spacing = float(self.fcfg.get("mtext_line_spacing_factor") or 1.67)
+        height = self.h * (1.0 + (len(lines) - 1) * spacing)
+        return max(width, self.h * 0.5), height
+
+    def _hits_text(self, rect: Any) -> bool:
+        padded = rect.buffer(self.text_clear) if self.text_clear > 0 else rect
+        minx, miny, maxx, maxy = padded.bounds
+        for other in self.text_boxes:
+            ob = other.bounds
+            if ob[2] < minx or ob[3] < miny or ob[0] > maxx or ob[1] > maxy:
+                continue
+            if padded.intersects(other):
+                return True
+        return False
+
+    def _line_hits(self, rect: Any) -> int:
+        padded = rect.buffer(self.line_clear) if self.line_clear > 0 else rect
+        hits = len(self.tree.query(padded, predicate="intersects"))
+        hits += sum(1 for line in self.new_lines if padded.intersects(line))
+        return int(hits)
+
+    def _path_crossings(self, path: Any) -> int:
+        return int(len(self.tree.query(path, predicate="intersects"))) + sum(
+            1 for line in self.new_lines if path.intersects(line)
+        )
+
+    def _path_hits_text(self, path: Any) -> bool:
+        return any(path.intersects(other) for other in self.text_boxes)
+
+    def _placement_region(self, feature: Feature) -> Any | None:
+        """Часть контура объекта внутри зоны поиска (подпись ставится рядом с участком)."""
+        geom = feature.geometry
+        if geom.geom_type != "Polygon":
+            return None
+        if self.zone.contains(geom):
+            return geom
+        try:
+            clipped = geom.intersection(self.zone)
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            return geom
+        parts = [g for g in getattr(clipped, "geoms", [clipped]) if g.geom_type == "Polygon"]
+        if not parts:
+            return None
+        return max(parts, key=lambda part: part.area)
+
+    def _region_axes(self, region: Any) -> list[float]:
+        """Направления текста: вдоль сторон контура (ближе к горизонтали — первым), затем 0°."""
+        angles: list[float] = []
+        rect = region.minimum_rotated_rectangle
+        if rect.geom_type == "Polygon":
+            coords = list(rect.exterior.coords)
+            for a, b in ((coords[0], coords[1]), (coords[1], coords[2])):
+                if math.hypot(b[0] - a[0], b[1] - a[1]) <= 1e-9:
+                    continue
+                angle = text_rotation(math.atan2(b[1] - a[1], b[0] - a[0]))
+                if abs(angle) < math.radians(0.5):
+                    angle = 0.0
+                angles.append(angle)
+            angles.sort(key=abs)
+        if all(abs(angle) > math.radians(3.0) for angle in angles):
+            angles.append(0.0)
+        unique: list[float] = []
+        for angle in angles:
+            if all(abs(angle - seen) > math.radians(1.0) for seen in unique):
+                unique.append(angle)
+        return unique or [0.0]
+
+    def _region_centers(self, region: Any, angle: float, step: float) -> list[tuple[float, float]]:
+        """Кандидаты центра: центр масс, «полюс недоступности», затем сдвиги вдоль оси."""
+        points: list[tuple[float, float]] = []
+
+        def add(x: float, y: float) -> None:
+            if all(math.hypot(x - px, y - py) > 0.05 for px, py in points):
+                points.append((x, y))
+
+        centroid = region.centroid
+        if region.contains(centroid):
+            add(centroid.x, centroid.y)
+        pole = _polygon_pole(region, max(0.05, self.h / 4.0))
+        add(pole[0], pole[1])
+        base = points[0]
+        ux, uy = math.cos(angle), math.sin(angle)
+        for factor in (1, -1, 2, -2, 3, -3):
+            x, y = base[0] + ux * step * factor, base[1] + uy * step * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
+        return points
+
+    # -- дедупликация ---------------------------------------------------------
+    def _text_belongs_to_other_area(self, known: _KnownLabel, feature: Feature) -> bool:
+        center = known.box.centroid
+        if feature.geometry.contains(center):
+            return False
+        for other in self.area_features:
+            if other is feature:
+                continue
+            if other.geometry.contains(center):
+                return True
+        return False
+
+    def find_duplicate(self, feature: Feature) -> _KnownLabel | None:
+        """
+        Аналогичная надпись в радиусе ``duplicate_radius_ft`` от объекта.
+
+        Надписи чертежа учитываются при включённой галочке; подписи, созданные
+        в этом же запуске, — всегда (две кромки одной дорожки, повторные
+        пикеты одного колодца), но только для объектов того же слоя.
+        """
+        label = str(feature.label or "").replace("\n", " ")
+        if not label:
+            return None
+        geom = feature.geometry
+        for known in self.known:
+            if known.owner is None and not self.skip_existing:
+                continue
+            if known.owner is not None:
+                if known.owner is feature:
+                    return known
+                if known.owner.layer != feature.layer:
+                    continue
+                if feature.kind == "area" and feature.closed:
+                    continue
+            if not labels_similar(known.text, label, self.synonyms):
+                continue
+            distance = geom.distance(known.box)
+            for anchor in known.anchors:
+                distance = min(distance, geom.distance(anchor))
+            if distance > self.radius:
+                continue
+            if (
+                known.owner is None
+                and feature.kind == "area"
+                and self._text_belongs_to_other_area(known, feature)
+            ):
+                continue
+            return known
+        return None
+
+    # -- фиксация результата --------------------------------------------------
+    def _commit(self, item: FeatureLabelItem) -> None:
+        self.items.append(item)
+        self.text_boxes.append(item.box)
+        anchors = [Point(item.leader_points[0])] if item.leader_points else []
+        self.known.append(
+            _KnownLabel(
+                text=item.single_line, layer=self.output_layer, box=item.box,
+                anchors=anchors, owner=item.feature,
+            )
+        )
+        if len(item.leader_points) >= 2:
+            self.new_lines.append(LineString(item.leader_points))
+
+    # -- текст внутри контура -------------------------------------------------
+    def place_inside(self, feature: Feature, *, force: bool = False) -> FeatureLabelItem | None:
+        """AddMText по центру контура, если габарит текста помещается внутри."""
+        text = str(feature.label or "")
+        region = self._placement_region(feature)
+        if region is None or region.is_empty:
+            return None
+        variants = [text]
+        wrapped = _two_line_variant(text)
+        if wrapped:
+            variants.append(wrapped)
+        axes = self._region_axes(region)
+        fallback: tuple[float, FeatureLabelItem] | None = None
+        for variant in variants:
+            width, height = self._text_size(variant)
+            for angle in axes:
+                for center in self._region_centers(region, angle, max(width * 0.75, self.h)):
+                    rect = _rotated_box(center, width, height, angle)
+                    padded = rect.buffer(self.inside_clear) if self.inside_clear > 0 else rect
+                    fits = region.contains(padded)
+                    blocked = self._hits_text(rect) or self._line_hits(rect) > 0
+                    item = FeatureLabelItem(
+                        feature=feature, text=variant, kind="mtext", placement="inside",
+                        point=center, height=self.h, rotation=angle,
+                        attachment=AC_ATTACHMENT_MIDDLE_CENTER, box=rect,
+                    )
+                    if fits and not blocked:
+                        return item
+                    if force:
+                        overflow = max(0.0, rect.area - rect.intersection(region).area)
+                        penalty = overflow + (rect.area if blocked else 0.0)
+                        if fallback is None or penalty < fallback[0] - 1e-9:
+                            fallback = (penalty, item)
+        if force and fallback is not None:
+            item = fallback[1]
+            item.note = "не помещается в контур или перекрывает объекты — проверьте положение"
+            self.warnings.append(
+                f"подпись «{item.single_line}» ({feature.title}) размещена с наложением: "
+                "проверьте её положение"
+            )
+            return item
+        return None
+
+    # -- текст вдоль забора ---------------------------------------------------
+    def _straight_runs(self, line: Any) -> list[tuple[tuple[float, float], tuple[float, float], float]]:
+        """Прямые участки ломаной (соседние сегменты с отклонением в пределах допуска)."""
+        coords = [(float(x), float(y)) for x, y, *_rest in line.coords]
+        tolerance = math.radians(float(self.fcfg.get("straight_angle_tolerance_deg") or 0.0))
+        runs: list[tuple[tuple[float, float], tuple[float, float], float]] = []
+        start = coords[0]
+        previous = coords[0]
+        base_angle: float | None = None
+        for point in coords[1:]:
+            if math.hypot(point[0] - previous[0], point[1] - previous[1]) <= 1e-9:
+                continue
+            angle = math.atan2(point[1] - previous[1], point[0] - previous[0])
+            if base_angle is None:
+                base_angle = angle
+            else:
+                turn = abs((angle - base_angle + math.pi) % (2.0 * math.pi) - math.pi)
+                if turn > tolerance:
+                    runs.append((start, previous, math.hypot(previous[0] - start[0], previous[1] - start[1])))
+                    start = previous
+                    base_angle = angle
+            previous = point
+        runs.append((start, previous, math.hypot(previous[0] - start[0], previous[1] - start[1])))
+        return [run for run in runs if run[2] > 1e-9]
+
+    def place_along(self, feature: Feature) -> FeatureLabelItem | None:
+        """
+        AddText параллельно линии забора посередине прямого участка.
+
+        Условие: прямой участок длиннее ``ширина текста + 4 ft`` и место вдоль
+        него свободно. Отступ от линии — ``0.8 * высота текста``; угол
+        ``90°..270°`` разворачивается на 180°, чтобы текст не был перевёрнут.
+        """
+        text = str(feature.label or "").replace("\n", " ")
+        width, height = self._text_size(text)
+        need = width + float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
+        offset = float(self.fcfg.get("fence_text_offset_factor") or 0.8) * self.h
+        margin = float(self.fcfg.get("fence_end_margin_ft") or 0.0)
+        centroid = self.lot.centroid
+        runs = sorted(self._straight_runs(feature.geometry), key=lambda run: -run[2])
+        for start, end, length in runs:
+            if length <= need:
+                break
+            ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
+            nx, ny = -uy, ux
+            rotation = text_rotation(math.atan2(uy, ux))
+            mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+            # Первой проверяется сторона, обращённая внутрь участка.
+            toward = (centroid.x - mid[0]) * nx + (centroid.y - mid[1]) * ny
+            first_side = 1.0 if toward >= 0.0 else -1.0
+            max_shift = max(0.0, (length - width) / 2.0 - margin)
+            for fraction in (0.0, -0.3, 0.3, -0.6, 0.6, -0.9, 0.9):
+                shift = fraction * max_shift
+                if fraction and max_shift <= 1e-6:
+                    break
+                base = (mid[0] + ux * shift, mid[1] + uy * shift)
+                for side in (first_side, -first_side):
+                    center = (base[0] + nx * offset * side, base[1] + ny * offset * side)
+                    rect = _rotated_box(center, width, height, rotation)
+                    if self._hits_text(rect) or self._line_hits(rect) > 0:
+                        continue
+                    return FeatureLabelItem(
+                        feature=feature, text=text, kind="text", placement="along",
+                        point=center, height=self.h, rotation=rotation, box=rect,
+                    )
+        return None
+
+    # -- выноска --------------------------------------------------------------
+    def _leader_tips(self, feature: Feature) -> list[tuple[float, float]]:
+        geom = feature.geometry
+        if geom.geom_type == "Point":
+            return [(geom.x, geom.y)]
+        if geom.geom_type == "Polygon":
+            region = self._placement_region(feature) or geom
+            pole = _polygon_pole(region, max(0.05, self.h / 4.0))
+            return [pole]
+        tips: list[tuple[float, float]] = []
+        runs = sorted(self._straight_runs(geom), key=lambda run: -run[2])
+        if runs:
+            start, end, _length = runs[0]
+            tips.append(((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0))
+        middle = geom.interpolate(0.5, normalized=True)
+        if all(math.hypot(middle.x - x, middle.y - y) > 0.5 for x, y in tips):
+            tips.append((middle.x, middle.y))
+        return tips
+
+    def _leader_lengths(self) -> list[float]:
+        low = max(2.5, float(self.fcfg.get("leader_min_length_factor") or 3.0))
+        high = max(low, float(self.fcfg.get("leader_max_length_factor") or 16.0))
+        lengths = [low]
+        while lengths[-1] * 1.45 < high:
+            lengths.append(lengths[-1] * 1.45)
+        if high - lengths[-1] > 0.5:
+            lengths.append(high)
+        return [value * self.h for value in lengths]
+
+    def _structure_blocks(self, rect: Any, feature: Feature) -> bool:
+        """Текст выноски не должен ложиться на контур строения (в т. ч. чужого)."""
+        for other in self.area_features:
+            if not other.closed and other.category == "surface":
+                continue  # дорожки/заезды — плоские покрытия, текст над ними допустим
+            if other.geometry.intersects(rect):
+                return True
+        return False
+
+    def place_leader(self, feature: Feature) -> FeatureLabelItem:
+        """Выноска со стрелкой (AddLeader) и горизонтальный MText на свободном месте."""
+        text = str(feature.label or "").replace("\n", " ")
+        width, height = self._text_size(text)
+        landing = float(self.fcfg.get("leader_landing_factor") or 0.0) * self.h
+        gap = float(self.fcfg.get("leader_text_gap_factor") or 0.0) * self.h
+        best: tuple[float, FeatureLabelItem] | None = None
+        best_clean: tuple[float, FeatureLabelItem] | None = None
+        forced: FeatureLabelItem | None = None
+        # Объект участка подписывается на участке: вынос текста за границу
+        # (на соседний участок или улицу) допустим, но хуже любого места внутри.
+        try:
+            prefer_lot = bool(self.lot.buffer(self.line_clear).contains(feature.geometry))
+        except Exception:  # noqa: BLE001 - вырожденная геометрия
+            prefer_lot = False
+        for tip in self._leader_tips(feature):
+            for length in self._leader_lengths():
+                if best_clean is not None and length / self.h >= best_clean[0]:
+                    break  # более длинная выноска уже не станет лучше найденной
+                for angle_deg, stacked in self._LEADER_VARIANTS:
+                    angle = math.radians(angle_deg)
+                    elbow = (tip[0] + length * math.cos(angle), tip[1] + length * math.sin(angle))
+                    if stacked:
+                        # Текст по центру над (под) концом выноски — для узких мест,
+                        # где надпись не помещается сбоку от полки.
+                        up = 1.0 if math.sin(angle) >= 0.0 else -1.0
+                        center = (elbow[0], elbow[1] + up * (gap + height / 2.0))
+                        rect = _rotated_box(center, width, height, 0.0)
+                        item = FeatureLabelItem(
+                            feature=feature, text=text, kind="leader", placement="leader",
+                            point=center, height=self.h, rotation=0.0,
+                            attachment=AC_ATTACHMENT_MIDDLE_CENTER,
+                            leader_points=[tip, elbow], box=rect, attach_annotation=False,
+                        )
+                    else:
+                        side = 1.0 if math.cos(angle) >= 0.0 else -1.0
+                        shelf = (elbow[0] + side * landing, elbow[1])
+                        anchor = (shelf[0] + side * gap, shelf[1])
+                        center = (anchor[0] + side * width / 2.0, anchor[1])
+                        rect = _rotated_box(center, width, height, 0.0)
+                        item = FeatureLabelItem(
+                            feature=feature, text=text, kind="leader", placement="leader",
+                            point=anchor, height=self.h, rotation=0.0,
+                            attachment=(
+                                AC_ATTACHMENT_MIDDLE_LEFT if side > 0 else AC_ATTACHMENT_MIDDLE_RIGHT
+                            ),
+                            leader_points=[tip, elbow] + ([shelf] if landing > 1e-9 else []),
+                            box=rect,
+                        )
+                    points = item.leader_points
+                    if forced is None:
+                        forced = item
+                    path = LineString(points)
+                    if self._hits_text(rect) or self._path_hits_text(path):
+                        continue
+                    line_hits = self._line_hits(rect)
+                    on_structure = self._structure_blocks(rect, feature)
+                    outside = not self.zone.contains(rect)
+                    off_lot = prefer_lot and not self.lot.contains(rect)
+                    crossings = self._path_crossings(path)
+                    score = (
+                        line_hits * 1000.0
+                        + (200.0 if on_structure else 0.0)
+                        + (50.0 if outside else 0.0)
+                        + (12.0 if off_lot else 0.0)
+                        + crossings * 8.0
+                        + length / self.h
+                    )
+                    clean = line_hits == 0 and not on_structure and not outside
+                    if best is None or score < best[0]:
+                        best = (score, item)
+                    if clean and (best_clean is None or score < best_clean[0]):
+                        best_clean = (score, item)
+        if best_clean is not None:
+            return best_clean[1]
+        if best is not None:
+            item = best[1]
+            item.note = "свободного места рядом нет — проверьте положение текста"
+        else:
+            item = forced  # type: ignore[assignment]
+            item.note = "текст наложен на другие надписи — переместите вручную"
+        self.warnings.append(
+            f"выноска «{item.single_line}» ({feature.title}): {item.note}"
+        )
+        return item
+
+    # -- главный проход -------------------------------------------------------
+    def run(self) -> None:
+        labeled = self.recognition.labeled
+
+        def order_key(feature: Feature) -> tuple[int, float]:
+            if feature.is_main_house:
+                return (0, 0.0)
+            if feature.kind == "area":
+                return (1, -feature.geometry.area)
+            if feature.kind == "fence":
+                return (2, -feature.geometry.length)
+            if feature.kind == "edge":
+                return (3, -feature.geometry.length)
+            return (4, 0.0)
+
+        leader_queue: list[Feature] = []
+        for feature in sorted(labeled, key=order_key):
+            if self._skip_duplicate(feature):
+                continue
+            item: FeatureLabelItem | None = None
+            if feature.is_main_house:
+                item = self.place_inside(feature, force=True)
+            elif feature.kind == "area":
+                item = self.place_inside(feature)
+            elif feature.kind == "fence":
+                item = self.place_along(feature)
+            if item is None:
+                leader_queue.append(feature)
+            else:
+                self._commit(item)
+        for feature in leader_queue:
+            if self._skip_duplicate(feature):
+                continue
+            self._commit(self.place_leader(feature))
+
+    def _skip_duplicate(self, feature: Feature) -> bool:
+        known = self.find_duplicate(feature)
+        if known is None:
+            return False
+        self.duplicates.append(
+            FeatureDuplicate(
+                feature=feature, existing_text=plain_text(known.text),
+                existing_layer=known.layer, own=known.owner is not None,
+            )
+        )
+        return True
+
+
+def _polygon_pole(region: Any, tolerance: float) -> tuple[float, float]:
+    """Точка внутри полигона, максимально удалённая от его границ."""
+    try:
+        from shapely.ops import polylabel
+
+        pole = polylabel(region, tolerance=tolerance)
+    except Exception:  # noqa: BLE001 - вырожденный контур
+        pole = region.representative_point()
+    return float(pole.x), float(pole.y)
+
+
+def plan_feature_labels(
+    recognition: RecognitionResult,
+    snapshot: DrawingSnapshot,
+    cfg: dict[str, Any] | None = None,
+    *,
+    text_height: float,
+    skip_existing: bool = True,
+) -> FeatureLabelPlan:
+    """
+    Раскладывает подписи распознанных объектов (чистая геометрия, без AutoCAD).
+
+    1. Дедупликация: объект пропускается, если в радиусе ``duplicate_radius_ft``
+       (6 ft) уже стоит аналогичная надпись из слоёв ``existing_label_layers``.
+    2. Заборы: текст вдоль прямого участка (``AddText``), иначе выноска.
+    3. Строения и покрытия: ``AddMText`` внутри контура, если помещается;
+       узкие контуры (ступени, клумбы) — выноска (``AddLeader`` + ``AddMText``).
+    4. Габариты текстов (``shapely.geometry.box``) не пересекают друг друга,
+       существующие надписи и линии чертежа.
+    """
+    placer = _LabelPlacer(recognition, snapshot, cfg, text_height, skip_existing)
+    placer.run()
+    return FeatureLabelPlan(
+        recognition=recognition,
+        text_height=float(text_height),
+        output_layer=placer.output_layer,
+        skip_existing=bool(skip_existing),
+        items=placer.items,
+        duplicates=placer.duplicates,
+        warnings=placer.warnings,
+        line_count=len(snapshot.lines),
+        text_count=len(snapshot.texts),
+    )

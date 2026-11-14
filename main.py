@@ -60,17 +60,34 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
 from acad_builder import (
+    AcadAnnotationWriter,
     AcadBuilder,
     AcadBuilderError,
     AcadConnectionError,
     DrawPlan,
     DrawResult,
+    FeatureLabelOverrides,
     LotSuspicionReport,
     NeighborVerificationReport,
     SuspicionItem,
     compute_pob_point,
+    dedupe_text_layers,
+    feature_layer_name,
     format_distance,
     verify_with_neighbors,
+)
+from feature_labeler import (
+    SHAPELY_AVAILABLE as FEATURE_SHAPELY_AVAILABLE,
+    AcadDrawing,
+    FeatureLabeler,
+    FeatureLabelerError,
+    LabelingOptions,
+    LabelingResult,
+    ShapelyMissingError,
+    configure_feature_cfg,
+    feature_text_height,
+    load_feature_cfg,
+    normalize_layer_name,
 )
 from llm_parser import (
     ASPENWALL_SAMPLES,
@@ -109,7 +126,10 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1440x940"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+# Глобальные вкладки окна: шаг 1 (границы участка) и шаг 2 (подписи D-TOPO-TEXT).
+STEP_TAB_BOUNDARY = "Шаг 1. Границы участка"
+STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
 RESULT_PANEL_DEFAULT_WIDTH = 384
 RESULT_PANEL_MIN_WIDTH = 340
 CENTER_PANEL_MIN_WIDTH = 260
@@ -431,6 +451,22 @@ class SurveyApp(ctk.CTk):
         self.pass3_provider_label_var = ctk.StringVar(value=self._pid_to_label[p3_pid])
         self.pass3_model_var = ctk.StringVar(value=p3_model or self._provider_models[p3_pid][0])
 
+        # --- Шаг 2: автоподписание объектов (D-TOPO-TEXT) -------------------
+        self.step_tab_var = ctk.StringVar(value=STEP_TAB_BOUNDARY)
+        self.house_label_var = ctk.StringVar(
+            value=str(
+                (self.config_data.get("features") or {}).get("house_label_placeholder")
+                or "2 STY. FRK. & BRK."
+            )
+        )
+        self.skip_existing_labels_var = ctk.BooleanVar(value=True)
+        self.dry_run_labels_var = ctk.BooleanVar(value=False)
+        self.label_text_height_var = ctk.StringVar(
+            value=f"{feature_text_height(configure_feature_cfg(self.config_data)):.2f}"
+        )
+        self.label_result: LabelingResult | None = None
+        self._label_report_window: Any | None = None
+
         self.pending_conflict: dict[str, Any] | None = None
         self.conflict_window: Any | None = None
         self._last_consensus_label: str | None = None
@@ -473,12 +509,15 @@ class SurveyApp(ctk.CTk):
         self._refresh_engine_card()
         self._refresh_stepper()
         self._render_empty_inspector()
+        self._refresh_step_tabs()
+        self._refresh_step2_controls()
         self.after(120, self._drain_events)
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(2, weight=0)
+        self.grid_rowconfigure(3, weight=1)
 
         # 0. Верхняя шапка: бренд + степпер сценария + масштаб + клавиши/настройки
         self.header = ctk.CTkFrame(
@@ -659,10 +698,17 @@ class SurveyApp(ctk.CTk):
             command=self._apply_topmost,
         ).grid(row=0, column=3, sticky="e")
 
+        # Две глобальные вкладки проекта: шаг 1 (границы) и шаг 2 (подписи D-TOPO-TEXT)
+        self._build_step_tabs(self)
+
         # Трёхколоночная рабочая зона Spectrum: Источник | Холст+Проверки | Результат
         main_wrap = ctk.CTkFrame(self, fg_color=THEME["bg_root"])
-        main_wrap.grid(row=2, column=0, sticky="nsew")
+        main_wrap.grid(row=3, column=0, sticky="nsew")
         self.main_wrap = main_wrap
+        self.step_tab_frames = {
+            STEP_TAB_BOUNDARY: main_wrap,
+            STEP_TAB_LABELS: self._build_feature_tab(self),
+        }
         main_wrap.grid_columnconfigure(0, weight=0)
         main_wrap.grid_columnconfigure(1, weight=1)
         main_wrap.grid_columnconfigure(2, weight=0)
@@ -2341,7 +2387,8 @@ class SurveyApp(ctk.CTk):
             border_width=0,
             height=64,
         )
-        footer.grid(row=3, column=0, sticky="ew")
+        footer.grid(row=4, column=0, sticky="ew")
+        self.footer = footer
         footer.grid_propagate(False)
         footer.grid_columnconfigure(1, weight=1)
 
@@ -2390,6 +2437,855 @@ class SurveyApp(ctk.CTk):
         )
         self.draw_button.grid(row=0, column=3, padx=(6, 16), pady=11, sticky="e")
 
+    # ============================================================ ШАГ 1 / ШАГ 2 ==
+    def _build_step_tabs(self, parent: Any) -> None:
+        """
+        Верхние глобальные вкладки проекта.
+
+        Первая вкладка — весь прежний сценарий определения границ участка
+        (источники, разбор, проверки, отрисовка). Вторая — новый шаг 2:
+        автоматическое распознавание и подписание объектов в слое D-TOPO-TEXT.
+        """
+        self.step_tabs_frame = ctk.CTkFrame(parent, fg_color=THEME["bg_field"], corner_radius=0)
+        self.step_tabs_frame.grid(row=2, column=0, sticky="ew")
+        self.step_tabs_frame.grid_columnconfigure(0, weight=0)
+        self.step_tabs_frame.grid_columnconfigure(1, weight=0)
+        self.step_tabs_frame.grid_columnconfigure(2, weight=1)
+
+        self.step_tab_buttons: dict[str, Any] = {}
+        specs = (
+            (STEP_TAB_BOUNDARY, "1", "определение границ участка"),
+            (STEP_TAB_LABELS, "2", "распознавание и подписи объектов"),
+        )
+        for column, (label, digit, hint) in enumerate(specs):
+            button = ctk.CTkButton(
+                self.step_tabs_frame,
+                text=f"  {digit}  ·  {label}",
+                height=38,
+                width=0,
+                corner_radius=0,
+                border_width=0,
+                anchor="w",
+                fg_color="transparent",
+                hover_color=THEME["btn_secondary"],
+                text_color=THEME["text_muted"],
+                font=ctk.CTkFont(size=13, weight="bold"),
+                command=lambda chosen=label: self.select_step_tab(chosen),
+            )
+            button.grid(row=0, column=column, sticky="w", padx=(10 if column == 0 else 2, 0))
+            self.step_tab_buttons[label] = button
+
+        self.step_tab_hint_label = ctk.CTkLabel(
+            self.step_tabs_frame,
+            text="",
+            anchor="e",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        )
+        self.step_tab_hint_label.grid(row=0, column=2, sticky="e", padx=(8, 16))
+
+        # Тонкая подсветка выбранной вкладки (акцентная линия снизу)
+        self.step_tab_indicator = ctk.CTkFrame(
+            self.step_tabs_frame, height=2, fg_color=THEME["btn_primary"], corner_radius=0
+        )
+        self.step_tab_indicator.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._refresh_step_tabs()
+
+    def select_step_tab(self, label: str) -> None:
+        """Переключает глобальную вкладку, сохраняя всё состояние шага 1."""
+        if label not in self.step_tab_frames:
+            return
+        self.step_tab_var.set(label)
+        self._refresh_step_tabs()
+
+    def _refresh_step_tabs(self) -> None:
+        """Показывает выбранную вкладку и подсвечивает её кнопку."""
+        frames = getattr(self, "step_tab_frames", None)
+        if not frames:
+            return
+        current = str(self.step_tab_var.get() or STEP_TAB_BOUNDARY)
+        if current not in frames:
+            current = STEP_TAB_BOUNDARY
+        for label, frame in frames.items():
+            if label == current:
+                frame.grid(row=3, column=0, sticky="nsew")
+            else:
+                frame.grid_remove()
+        for label, button in getattr(self, "step_tab_buttons", {}).items():
+            if label == current:
+                button.configure(
+                    fg_color=THEME["bg_card"],
+                    text_color="#ffffff",
+                )
+            else:
+                button.configure(
+                    fg_color="transparent",
+                    text_color=THEME["text_muted"],
+                )
+        hint = getattr(self, "step_tab_hint_label", None)
+        if hint is not None:
+            if current == STEP_TAB_LABELS:
+                layer = feature_layer_name(self.config_data)
+                hint.configure(
+                    text=f"Шаг 2 → слой {layer} · {len(self._scene_plans())} уч. в сцене",
+                    text_color=THEME["sky"],
+                )
+            else:
+                hint.configure(
+                    text="Шаг 1 → границы участка, невязка, проверки и отрисовка",
+                    text_color=THEME["text_dim"],
+                )
+        self._refresh_step2_controls()
+
+    # ------------------------------------------------------------- ШАГ 2 ------
+    def _build_feature_tab(self, parent: Any) -> Any:
+        """
+        Рабочая зона шага 2: слева параметры подписания, справа отчёт.
+
+        Функциональность шага 1 не меняется — эта вкладка самостоятельная.
+        """
+        card = THEME["bg_card"]
+        field = THEME["bg_field"]
+        outer = ctk.CTkFrame(parent, fg_color=THEME["bg_root"])
+        outer.grid_columnconfigure(0, weight=0)
+        outer.grid_columnconfigure(1, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        # Колонки задаются сразу: окно строится один раз, а не по событию Configure.
+        self._step2_layout(outer)
+
+        left = ctk.CTkFrame(outer, fg_color=card, corner_radius=0, width=430)
+        left.grid(row=0, column=0, sticky="nsew")
+        left.grid_propagate(False)
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        scroll.grid_columnconfigure(0, weight=1)
+        self.step2_scroll = scroll
+
+        head = ctk.CTkFrame(
+            scroll,
+            fg_color=field,
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        head.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            head,
+            text="2",
+            width=24,
+            height=24,
+            corner_radius=6,
+            fg_color=THEME["blue_soft_bg"],
+            text_color=THEME["blue_soft_fg"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(10, 8), pady=(10, 0))
+        ctk.CTkLabel(
+            head,
+            text="Автоподписание объектов",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff",
+        ).grid(row=0, column=1, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(
+            head,
+            text=(
+                "Шаг 2 выполняется ПОСЛЕ усадки границы участка и ПЕРЕД расстановкой "
+                "офсетов. Объекты распознаются по кодам точек POINT_LABELS и по именам "
+                "слоёв, подписи ставятся в слой D-TOPO-TEXT."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
+
+        # --- Описание дома ----------------------------------------------------
+        house_box = ctk.CTkFrame(
+            scroll, fg_color=field, corner_radius=10,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        house_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        house_box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            house_box,
+            text="ОПИСАНИЕ ОСНОВНОГО ДОМА (MTEXT В ЦЕНТРЕ КОНТУРА)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(9, 3))
+        self.house_label_entry = ctk.CTkEntry(
+            house_box,
+            textvariable=self.house_label_var,
+            height=30,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            placeholder_text="2 STY. BRK. & FR.",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.house_label_entry.grid(row=1, column=0, sticky="ew", padx=10)
+        ctk.CTkLabel(
+            house_box,
+            text=(
+                "Например: «2 STY. FRAME», «2 STY. BRK. & FR.», «1 STY. FRK. & BRK.». "
+                "Пустое поле — дом не подписывается."
+            ),
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        ).grid(row=2, column=0, sticky="ew", padx=10, pady=(3, 9))
+
+        # --- Переключатели ----------------------------------------------------
+        opts = ctk.CTkFrame(
+            scroll, fg_color=field, corner_radius=10,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        opts.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        opts.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            opts,
+            text="ПРАВИЛА ПОДПИСАНИЯ",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(9, 4))
+        self.skip_existing_check = ctk.CTkCheckBox(
+            opts,
+            text="Не дублировать уже существующие на чертеже надписи",
+            variable=self.skip_existing_labels_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+            command=self._on_skip_existing_toggled,
+        )
+        self.skip_existing_check.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
+        ctk.CTkLabel(
+            opts,
+            text=(
+                "Читает D-TOPO-TEXT, FENCE_NOTE, ENTRANCE_TEXT, SURFACE_TEXT, CONTEXT_TEXT "
+                "и не ставит повторно аналогичную надпись в радиусе 6.0 ft."
+            ),
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self.dry_run_check = ctk.CTkCheckBox(
+            opts,
+            text="Только анализ (показать план подписей, ничего не создавать)",
+            variable=self.dry_run_labels_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_main"],
+        )
+        self.dry_run_check.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 9))
+
+        height_row = ctk.CTkFrame(opts, fg_color="transparent")
+        height_row.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        height_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            height_row,
+            text="Высота подписи, ft",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=0, sticky="w")
+        self.label_height_entry = ctk.CTkEntry(
+            height_row,
+            textvariable=self.label_text_height_var,
+            width=76,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            justify="right",
+        )
+        self.label_height_entry.grid(row=0, column=1, sticky="e")
+        self.label_height_reset_button = ctk.CTkButton(
+            height_row,
+            text="по масштабу",
+            width=96,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=10),
+            command=self._reset_label_text_height,
+        )
+        self.label_height_reset_button.grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+        # --- Кнопки -----------------------------------------------------------
+        actions = ctk.CTkFrame(scroll, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        actions.grid_columnconfigure(0, weight=1)
+        self.auto_label_button = ctk.CTkButton(
+            actions,
+            text="🪄  Автопоиск участка и подписание объектов",
+            height=46,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_feature_labeling,
+        )
+        self.auto_label_button.grid(row=0, column=0, sticky="ew")
+        self.pick_boundary_label_button = ctk.CTkButton(
+            actions,
+            text="🎯  Указать границу участка в AutoCAD и подписать объекты",
+            height=40,
+            fg_color=THEME["btn_neighbor"],
+            hover_color=THEME["btn_neighbor_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._start_feature_labeling_with_pick,
+        )
+        self.pick_boundary_label_button.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.analyze_labels_button = ctk.CTkButton(
+            actions,
+            text="🔎  Показать план подписей без записи в DWG",
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._start_feature_labeling(dry_run=True),
+        )
+        self.analyze_labels_button.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.export_labels_button = ctk.CTkButton(
+            actions,
+            text="📋  Скопировать отчёт в буфер",
+            height=28,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11),
+            command=self._copy_label_report,
+        )
+        self.export_labels_button.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+
+        # --- Справка по слоям входящего DWG -----------------------------------
+        legend = ctk.CTkFrame(
+            scroll, fg_color=field, corner_radius=10,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        legend.grid(row=4, column=0, sticky="ew")
+        legend.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            legend,
+            text="СЛОИ ВХОДЯЩЕГО DWG (ИЗ CONFIG.JSON)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(9, 4))
+        self.label_layers_label = ctk.CTkLabel(
+            legend,
+            text=self._feature_layers_text(),
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_muted"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        )
+        self.label_layers_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        # ------------------------------------------------------------- правая --
+        right = ctk.CTkFrame(outer, fg_color=THEME["bg_root"], corner_radius=0)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        self.step2_right = right
+        self._step2_layout(outer, left_widget=left, right_widget=right)
+
+        rhead = ctk.CTkFrame(right, fg_color=card, corner_radius=0, height=46)
+        rhead.grid(row=0, column=0, sticky="ew")
+        rhead.grid_propagate(False)
+        rhead.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            rhead,
+            text="📝 Отчёт автоподписания",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#ffffff",
+        ).grid(row=0, column=0, sticky="w", padx=(14, 8), pady=10)
+        self.label_stats_label = ctk.CTkLabel(
+            rhead,
+            text="",
+            anchor="e",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["sky"],
+        )
+        self.label_stats_label.grid(row=0, column=1, sticky="e", padx=(0, 10))
+        self.save_labels_button = ctk.CTkButton(
+            rhead,
+            text="💾 Сохранить отчёт…",
+            width=140,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self._save_label_report,
+        )
+        self.save_labels_button.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
+        self.label_report_box = ctk.CTkTextbox(
+            right,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=8,
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self.label_report_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        self.label_report_box.insert("1.0", self._feature_report_placeholder())
+        try:
+            getattr(self.label_report_box, "_textbox", self.label_report_box).configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+        return outer
+
+    def _step2_layout(
+        self,
+        outer: Any,
+        *,
+        left_widget: Any | None = None,
+        right_widget: Any | None = None,
+    ) -> None:
+        """
+        Раскладка рабочей зоны шага 2: узкая левая колонка параметров + отчёт.
+
+        Левая колонка (430 px) остаётся фиксированной, отчёт занимает всё
+        остальное место и перерисовывается вместе с окном.
+        """
+        try:
+            outer.grid_columnconfigure(0, weight=0)
+            outer.grid_columnconfigure(1, weight=1)
+            outer.grid_rowconfigure(0, weight=1)
+        except Exception:  # noqa: BLE001
+            return
+        left = left_widget if left_widget is not None else getattr(self, "step2_left", None)
+        if left is not None:
+            self.step2_left = left
+        right = right_widget if right_widget is not None else getattr(self, "step2_right", None)
+        if right is not None:
+            self.step2_right = right
+            try:
+                right.grid_columnconfigure(0, weight=1)
+                right.grid_rowconfigure(1, weight=1)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -------------------------------------------------------- шаг 2: справка --
+    def _feature_layers_text(self) -> str:
+        """Легенда слоёв: что реально прочитано из config.json."""
+        cfg = self.config_data.get("features") or {}
+        fences = ", ".join(str(x) for x in (cfg.get("fence_layers") or []))
+        prefixes = ", ".join(str(x) for x in (cfg.get("fence_prefixes") or []))
+        points = ", ".join(str(x) for x in (cfg.get("point_label_layers") or []))
+        structures = cfg.get("structure_layers") or {}
+        house = ", ".join(str(x) for x in (structures.get("house") or []))
+        steps = ", ".join(str(x) for x in (structures.get("steps") or []))
+        return (
+            f"• Граница участка: {', '.join(str(x) for x in (cfg.get('property_line_layers') or []))}\n"
+            f"• Коды точек: {points}\n"
+            f"• Заборы: {fences}; префиксы: {prefixes}\n"
+            f"• Дом: {house}\n"
+            f"• Ступеньки: {steps} (+ проточки {cfg.get('step_tread_pattern') or '*_STEP_TREADS'})\n"
+            f"• Целевой слой подписей: {cfg.get('label_output_layer') or 'D-TOPO-TEXT'}"
+        )
+
+    def _feature_report_placeholder(self) -> str:
+        buffer_ft = (self.config_data.get("features") or {}).get("search_buffer_ft", 50.0)
+        return (
+            "Шаг 2. Автоматическое распознавание и подписание объектов (Feature Labeling)\n"
+            "──────────────────────────────────────────────────────────────\n"
+            "Порядок сценария: границы участка (вкладка «Шаг 1») → усадка границы →\n"
+            "  ⬅ ВЫ ЗДЕСЬ: подписи объектов в D-TOPO-TEXT → расстановка офсетов.\n\n"
+            f"1. Откройте DWG полевого съёмщика в AutoCAD.\n"
+            f"2. Убедитесь, что граница участка есть в слое PROPERTY_LINE / PL /\n"
+            f"   M-TAX-LINE / PROPERTY_LINES_APPROX (или рассчитана на шаге 1).\n"
+            f"3. Введите описание дома, например «2 STY. BRK. & FR.».\n"
+            "4. Нажмите «🪄 Автопоиск участка и подписание объектов».\n"
+            "   Если граница в чертеже не замкнута — «🎯 Указать границу участка…».\n\n"
+            f"Вокруг участка будет просмотрен буфер {float(buffer_ft):g} ft.\n"
+            "Коды точек ('2 FEC', '3 FEV64', …) привязываются к ближайшей линии\n"
+            "забора в радиусе 3.5 ft; иначе подпись берётся из имени слоя.\n\n"
+            "Отчёт покажет: сколько объектов найдено, сколько подписано по кодам\n"
+            "POINT_LABELS, сколько по слоям, сколько пропущено как дубли."
+        )
+
+    def _set_label_report(self, text: str) -> None:
+        box = getattr(self, "label_report_box", None)
+        if box is None:
+            return
+        target = getattr(box, "_textbox", box)
+        try:
+            target.configure(state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        box.delete("1.0", "end")
+        box.insert("1.0", text)
+        try:
+            target.configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _label_report_text(self) -> str:
+        box = getattr(self, "label_report_box", None)
+        if box is None:
+            return ""
+        try:
+            return str(box.get("1.0", "end") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _copy_label_report(self) -> None:
+        text = self._label_report_text()
+        if not text:
+            self._set_status("Отчёт шага 2 пуст — нечего копировать.", warn=True)
+            return
+        clip_fn = getattr(self, "clipboard_clear", None)
+        append_fn = getattr(self, "clipboard_append", None)
+        if callable(clip_fn) and callable(append_fn):
+            clip_fn()
+            append_fn(text)
+            self._set_status("📋 Отчёт автоподписания скопирован в буфер обмена.")
+        else:  # pragma: no cover - среда без Tk-буфера
+            self._set_status("Буфер обмена недоступен.", warn=True)
+
+    def _save_label_report(self) -> None:
+        text = self._label_report_text()
+        if not text:
+            self._set_status("Отчёт шага 2 пуст — нечего сохранять.", warn=True)
+            return
+        from tkinter import filedialog
+
+        path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт автоподписания",
+            defaultextension=".txt",
+            filetypes=[("Текстовый отчёт", "*.txt"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text + "\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Не удалось сохранить отчёт: {exc}", error=True)
+            return
+        self._set_status(f"Отчёт автоподписания сохранён: {path}")
+
+    def _on_skip_existing_toggled(self) -> None:
+        state = "включена" if self.skip_existing_labels_var.get() else "выключена"
+        self._set_status(f"Проверка существующих подписей {state} (шаг 2).")
+
+    def _reset_label_text_height(self) -> None:
+        self.label_text_height_var.set(
+            f"{feature_text_height(configure_feature_cfg(self.config_data)):.2f}"
+        )
+        self._set_status("Высота подписи шага 2 сброшена к значению по масштабу.")
+
+    def _refresh_step2_controls(self) -> None:
+        """Доступность кнопок шага 2 и подсказка о найденной границе участка."""
+        if not hasattr(self, "auto_label_button"):
+            return
+        busy = bool(getattr(self, "_busy", False))
+        state = "disabled" if busy else "normal"
+        for name in (
+            "auto_label_button",
+            "pick_boundary_label_button",
+            "analyze_labels_button",
+            "skip_existing_check",
+            "dry_run_check",
+        ):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except Exception:  # noqa: BLE001
+                pass
+        stats = getattr(self, "label_stats_label", None)
+        if stats is not None and getattr(self, "label_result", None) is None:
+            plan = self._preview_main_plan or self._last_active_plan
+            if plan is not None:
+                stats.configure(
+                    text=f"Граница шага 1: {len(plan.vertices)} верш. · {plan.area_sqft:,.0f} sq ft".replace(",", " "),
+                    text_color=THEME["ok"],
+                )
+            elif not FEATURE_SHAPELY_AVAILABLE:
+                stats.configure(text="shapely не установлен", text_color=THEME["err"])
+            else:
+                stats.configure(text="граница участка не задана", text_color=THEME["text_dim"])
+
+    def _feature_house_label(self) -> str:
+        try:
+            return str(self.house_label_var.get() or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _feature_text_height(self) -> float | None:
+        raw = str(self.label_text_height_var.get() or "").strip().replace(",", ".")
+        if not raw:
+            return feature_text_height(configure_feature_cfg(self.config_data), self._current_scale())
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    def _labeling_options(self, *, dry_run: bool = False) -> LabelingOptions:
+        height = self._feature_text_height()
+        return LabelingOptions(
+            house_label=self._feature_house_label(),
+            skip_existing=bool(self.skip_existing_labels_var.get()),
+            dry_run=bool(dry_run or self.dry_run_labels_var.get()),
+            text_height=height,
+        )
+
+    # -------------------------------------------------------- шаг 2: запуск ---
+    def _start_feature_labeling(self, *, dry_run: bool = False) -> None:
+        """«Автопоиск участка и подписание объектов» — контур из шага 1 или слоёв."""
+        if self._busy:
+            self._set_status("Дождитесь завершения текущего задания.", warn=True)
+            return
+        plan_vertices = None
+        plan = self._preview_main_plan or self._last_active_plan
+        if plan is not None and not plan.is_neighbor:
+            plan_vertices = list(plan.vertices)
+        self._launch_feature_labeling(plan_vertices=plan_vertices, dry_run=dry_run, picked=False)
+
+    def _start_feature_labeling_with_pick(self) -> None:
+        """«Указать границу участка в AutoCAD и подписать объекты»."""
+        if self._busy:
+            self._set_status("Дождитесь завершения текущего задания.", warn=True)
+            return
+        if sys.platform != "win32":
+            self._set_status(
+                "Указание границы в AutoCAD возможно только в Windows с запущенным AutoCAD.",
+                error=True,
+            )
+            return
+        try:
+            picked_vertices = self._pick_boundary_polyline()
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Не удалось получить полилинию границы: {exc}", error=True)
+            return
+        if not picked_vertices:
+            self._set_status(
+                "Указание границы отменено. Подписание не выполнено.", warn=True
+            )
+            return
+        self._launch_feature_labeling(
+            plan_vertices=None, dry_run=self.dry_run_labels_var.get(), picked=True,
+            picked_vertices=picked_vertices,
+        )
+
+    def _pick_boundary_polyline(self) -> list[tuple[float, float]]:
+        """
+        Просит выбрать в AutoCAD полилинию границы участка и читает её вершины.
+
+        Вызывается только из главного потока Tkinter: AutoCAD забирает фокус
+        в свой чертёж, а после выбора возвращаем его окну программы.
+        """
+        drawing = AcadDrawing()
+        try:
+            drawing.connect()
+            entity = drawing.prompt_polyline(
+                "Укажите замкнутую полилинию границы участка (LWPOLYLINE): "
+            )
+            if entity is None:
+                return []
+            entity_type = str(AcadDrawing._safe_attr(entity, "EntityName", "") or "").upper()
+            if "POLYLINE" not in entity_type:
+                self._set_status(
+                    f"Выбран объект {entity_type or 'неизвестного типа'} — нужна полилиния "
+                    "границы участка (LWPOLYLINE/POLYLINE).",
+                    error=True,
+                )
+                return []
+            vertices = AcadDrawing._coords_to_pairs(
+                AcadDrawing._safe_attr(entity, "Coordinates")
+            )
+            if not vertices:
+                vertices = drawing._vertices_from_objects(entity)
+            if len(vertices) < 3:
+                self._set_status(
+                    "В выбранной полилинии меньше 3 вершин — границу участка не построить.",
+                    error=True,
+                )
+                return []
+            self._set_status(
+                f"Граница участка указана: {len(vertices)} вершин в слое "
+                f"{AcadDrawing._safe_attr(entity, 'Layer', '—')}."
+            )
+            return vertices
+        finally:
+            drawing.release()
+            try:
+                self.lift()
+                self.focus_force()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _launch_feature_labeling(
+        self,
+        *,
+        plan_vertices: list[tuple[float, float]] | None,
+        dry_run: bool,
+        picked: bool,
+        picked_vertices: list[tuple[float, float]] | None = None,
+    ) -> None:
+        """Готовит конфиг шага 2 и запускает фоновый поток распознавания/записи."""
+        if not FEATURE_SHAPELY_AVAILABLE:
+            self._set_status(
+                "Шаг 2 требует библиотеку shapely. Выполните: python -m pip install -r "
+                "requirements.txt",
+                error=True,
+            )
+            self._set_label_report(
+                "Шаг 2 недоступен: не установлена библиотека shapely.\n"
+                "Установка: python -m pip install -r requirements.txt"
+            )
+            return
+        if sys.platform != "win32":
+            self._set_status(
+                "Шаг 2 работает с открытым DWG через AutoCAD и доступен только в Windows "
+                f"(текущая ОС: {sys.platform}).",
+                error=True,
+            )
+            return
+        options = self._labeling_options(dry_run=dry_run)
+        if options.text_height is None:
+            self._set_status(
+                "Высота подписи должна быть положительным числом (например 0.18).", error=True
+            )
+            return
+        cfg = dict(self.config_data)
+        features_cfg = dict(cfg.get("features") or {})
+        features_cfg["text_height"] = float(options.text_height)
+        cfg["features"] = features_cfg
+        source_note = (
+            "по указанной полилинии"
+            if picked
+            else (
+                "по границе шага 1"
+                if plan_vertices
+                else "по слоям PROPERTY_LINE/PL/M-TAX-LINE/PROPERTY_LINES_APPROX"
+            )
+        )
+        mode_note = "пробный прогон (без записи)" if options.dry_run else "с записью в DWG"
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(
+            f"Шаг 2: ищу объекты вокруг участка ({source_note}), {mode_note}…"
+        )
+        self._set_label_report(
+            "Идёт распознавание объектов…\n\n"
+            f"• контур участка: {source_note}\n"
+            f"• режим: {mode_note}\n"
+            f"• высота подписи: {float(options.text_height):.3f} ft\n"
+            f"• описание дома: {options.house_label or '— (дом не подписывается)'}\n"
+            f"• дубли: {'пропускаются' if options.skip_existing else 'разрешены'}"
+        )
+        self._start_background(
+            self._feature_labeling_worker,
+            args=(cfg, options, plan_vertices, picked_vertices),
+        )
+
+    def _feature_labeling_worker(
+        self,
+        cfg: dict[str, Any],
+        options: LabelingOptions,
+        plan_vertices: list[tuple[float, float]] | None,
+        picked_vertices: list[tuple[float, float]] | None,
+    ) -> None:
+        """Фоновый поток: чтение DWG, распознавание объектов и запись подписей."""
+        post = self._worker_poster()
+        result: LabelingResult | None = None
+        error = ""
+        try:
+            labeler = FeatureLabeler(cfg)
+            if options.text_height is not None:
+                labeler.cfg["text_height"] = float(options.text_height)
+            drawing = AcadDrawing()
+            try:
+                post("progress", "Шаг 2: читаю объекты активного DWG в AutoCAD…")
+                result = labeler.run(
+                    drawing,
+                    plan_vertices=plan_vertices,
+                    picked_vertices=picked_vertices,
+                    house_label=options.house_label,
+                    skip_existing=options.skip_existing,
+                    dry_run=options.dry_run,
+                )
+            finally:
+                drawing.release()
+        except ShapelyMissingError as exc:
+            error = str(exc)
+        except (FeatureLabelerError, AcadConnectionError) as exc:
+            error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            error = f"непредвиденная ошибка шага 2: {exc}"
+        post("feature_labeled", (result, error))
+        post("done", None)
+
+    def _handle_feature_label_result(
+        self, result: LabelingResult | None, error: str
+    ) -> None:
+        """Показывает подробный отчёт шага 2 в правой панели и в журнале."""
+        self._finish_busy()
+        if result is None:
+            self.label_result = None
+            self._set_label_report(
+                "Шаг 2 не выполнен.\n\n"
+                + (error or "Причина не указана.")
+                + "\n\nПроверьте: AutoCAD открыт и активен нужный DWG; в чертеже есть\n"
+                "замкнутая граница участка; установлены pywin32 и shapely."
+            )
+            self.label_stats_label.configure(text="ошибка", text_color=THEME["err"])
+            self._set_status(f"Шаг 2: {error}", error=True)
+            return
+
+        self.label_result = result
+        report = result.summary()
+        if result.written and not result.stats.dry_run:
+            report += f"\n\nСоздано подписей в слое {feature_layer_name(self.config_data)}: {result.written}"
+        if result.warnings:
+            report += "\n\nПредупреждения AutoCAD:\n" + "\n".join(f"! {w}" for w in result.warnings)
+        self._set_label_report(report)
+        stats = result.stats
+        badge = (
+            f"объектов {stats.features_in_buffer} · подписано {stats.created}"
+            f" · по кодам {stats.point_codes_used}"
+        )
+        self.label_stats_label.configure(
+            text=badge,
+            text_color=THEME["ok"] if stats.created else THEME["warn"],
+        )
+        for line in report.splitlines():
+            if line.strip():
+                self._log_line("[шаг 2] " + line)
+        dry_note = " (пробный прогон — в DWG ничего не записано)" if stats.dry_run else ""
+        warn = bool(stats.warnings) or bool(result.warnings)
+        self._set_status(
+            f"Шаг 2: найдено объектов {stats.features_in_buffer}, подписано {stats.created} "
+            f"(по кодам POINT_LABELS {stats.point_codes_used}, по слоям "
+            f"{max(0, stats.features_in_buffer - stats.point_codes_used)}; точечных кодов без "
+            f"линии-цели {stats.point_codes_non_fence}), дублей пропущено "
+            f"{stats.skipped_existing}{dry_note}.",
+            error=False,
+            warn=warn,
+        )
+        self._refresh_step2_controls()
+
     # --------------------------------------------------- ящик ключей и ИИ ---
     def _configured_keys_count(self) -> int:
         count = 0
@@ -2425,7 +3321,7 @@ class SurveyApp(ctk.CTk):
         if shell is None:
             return
         if self._keys_drawer_open:
-            shell.grid(row=0, column=0, rowspan=10, sticky="nsew")
+            shell.grid(row=0, column=0, rowspan=20, sticky="nsew")
             try:
                 shell.lift()
             except Exception:  # noqa: BLE001
@@ -2668,6 +3564,18 @@ class SurveyApp(ctk.CTk):
             # Маркер заменяет значок вкладки, чтобы подпись не обрезалась на узкой панели.
             text = f"{marker} {label.split(' ', 1)[1]}" if marker else label
             button.configure(text=text, fg_color=color, hover_color=hover, text_color=text_color)
+        # Глобальная вкладка шага 2 показывает, что план подписей уже рассчитан.
+        step2_button = getattr(self, "step_tab_buttons", {}).get(STEP_TAB_LABELS)
+        step2_active = str(getattr(self, "step_tab_var", None).get() if getattr(self, "step_tab_var", None) else "") == STEP_TAB_LABELS
+        if step2_button is not None and not step2_active:
+            created = getattr(getattr(self, "label_result", None), "stats", None)
+            if created is not None and created.created:
+                step2_button.configure(
+                    text=f"  2  ·  {STEP_TAB_LABELS}  ✓ {created.created}",
+                    text_color=THEME["ok"],
+                )
+            else:
+                step2_button.configure(text=f"  2  ·  {STEP_TAB_LABELS}", text_color=THEME["text_muted"])
 
     def _select_result_tab(self, label: str) -> None:
         self.result_tab_var.set(label)
@@ -3279,6 +4187,10 @@ class SurveyApp(ctk.CTk):
         bind_fn("<Control-I>", _guard(self._load_images))
         bind_fn("<Control-s>", _guard(self._save_settings))
         bind_fn("<Control-S>", _guard(self._save_settings))
+        bind_fn("<Control-Key-1>", _guard(lambda: self.select_step_tab(STEP_TAB_BOUNDARY)))
+        bind_fn("<Control-Key-2>", _guard(lambda: self.select_step_tab(STEP_TAB_LABELS)))
+        bind_fn("<Control-l>", _guard(lambda: self._start_feature_labeling()))
+        bind_fn("<Control-L>", _guard(lambda: self._start_feature_labeling()))
 
     def _open_shortcuts_window(self) -> None:
         """Открывает компактную памятку по горячим клавишам и интерактивному холсту."""
@@ -3314,7 +4226,10 @@ class SurveyApp(ctk.CTk):
             "  F5              — 📐 Начертить готовую схему в активном чертеже AutoCAD\n"
             "  Ctrl + O        — 📄 Открыть PDF документ (текстовый или отсканированный)\n"
             "  Ctrl + I        — 📷 Загрузить фото чертежа (JPG / PNG / WebP / TIFF)\n"
-            "  Ctrl + S        — 💾 Сохранить текущие настройки и выбранные модели\n\n"
+            "  Ctrl + S        — 💾 Сохранить текущие настройки и выбранные модели\n"
+            "  Ctrl + 1        — 🗺 Вкладка «Шаг 1. Границы участка»\n"
+            "  Ctrl + 2        — 🏷 Вкладка «Шаг 2. Автоподписание объектов»\n"
+            "  Ctrl + L        — 🪄 Шаг 2: автопоиск участка и подписание объектов\n\n"
             "ИНТЕРАКТИВНЫЙ ХОЛСТ («📐 Схема CAD» и «🖼 Исходник»):\n"
             "  Колесо мыши     — Плавный зум (0.6× .. 10×) к точке под курсором\n"
             "                    (удобно для разглядывания мелких цифр 80-х на фото!)\n"
@@ -4800,6 +5715,9 @@ class SurveyApp(ctk.CTk):
         self.pdf_label.configure(text="PDF не загружен", text_color=THEME["text_dim"])
         self.tokens_var.set("Токены за вызов: —")
         self._clear_preview_scene()
+        self.label_result = None
+        if hasattr(self, "label_report_box"):
+            self._set_label_report(self._feature_report_placeholder())
         self._update_closure_badge("Closure Error: —", None)
         self._refresh_text_counter()
         self._refresh_parse_actions()
@@ -5586,6 +6504,9 @@ class SurveyApp(ctk.CTk):
                         f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
                         error=True,
                     )
+            elif kind == "feature_labeled":
+                result_payload, error_text = payload
+                self._handle_feature_label_result(result_payload, str(error_text or ""))
             elif kind == "done":
                 self._finish_busy()
         self.after(120, self._drain_events)
@@ -5607,6 +6528,20 @@ class SurveyApp(ctk.CTk):
         self.regex_link_button.configure(state=state)
         self.save_button.configure(state=state)
         self.save_env_button.configure(state=state)
+        for name in (
+            "auto_label_button",
+            "pick_boundary_label_button",
+            "analyze_labels_button",
+            "skip_existing_check",
+            "dry_run_check",
+        ):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _finish_busy(self) -> None:
         self._busy = False

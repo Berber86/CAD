@@ -4499,3 +4499,415 @@ def audit_lot_suspicion(plan: DrawPlan) -> LotSuspicionReport:
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# Шаг 2: подписи объектов в целевом слое D-TOPO-TEXT (MText, Leader, дедупликация)
+# ---------------------------------------------------------------------------
+
+
+#: Выравнивание MTEXT по центру (attachmentPoint = 5, acAttachmentPointMiddleCenter)
+AC_ATTACHMENT_MIDDLE_CENTER = 5
+#: Выравнивание выноски к тексту (leader annotation attachment)
+AC_LEADER_MTEXT_LEFT = 8
+
+
+@dataclass
+class FeatureLabelOverrides:
+    """
+    Переопределения раскладки подписей, которые геодезист задаёт в GUI.
+
+    Значения ``None`` означают «взять из config.json / секции features».
+    """
+
+    output_layer: str | None = None
+    text_height: float | None = None
+    dedupe_radius_ft: float | None = None
+    point_code_radius_ft: float | None = None
+    search_buffer_ft: float | None = None
+    skip_existing: bool | None = None
+
+    def apply_to(self, feature_cfg: dict[str, Any]) -> dict[str, Any]:
+        cfg = dict(feature_cfg)
+        if self.output_layer:
+            cfg["label_output_layer"] = str(self.output_layer)
+        if self.text_height is not None:
+            cfg["text_height"] = float(self.text_height)
+        if self.dedupe_radius_ft is not None:
+            cfg["dedupe_radius_ft"] = float(self.dedupe_radius_ft)
+        if self.point_code_radius_ft is not None:
+            cfg["point_code_radius_ft"] = float(self.point_code_radius_ft)
+        if self.search_buffer_ft is not None:
+            cfg["search_buffer_ft"] = float(self.search_buffer_ft)
+        if self.skip_existing is not None:
+            cfg["skip_existing_labels"] = bool(self.skip_existing)
+        return cfg
+
+
+def feature_layer_name(cfg: dict[str, Any] | None = None) -> str:
+    """Целевой слой чистовых подписей (`D-TOPO-TEXT` по умолчанию)."""
+    cfg = cfg or {}
+    features = cfg.get("features") if isinstance(cfg.get("features"), dict) else cfg
+    return str((features or {}).get("label_output_layer") or "D-TOPO-TEXT")
+
+
+def dedupe_text_layers(cfg: dict[str, Any] | None = None) -> list[str]:
+    """Слои, из которых читаются уже стоящие надписи для дедупликации."""
+    cfg = cfg or {}
+    features = cfg.get("features") if isinstance(cfg.get("features"), dict) else cfg
+    layers = (features or {}).get("dedupe_text_layers")
+    if not layers:
+        layers = ["D-TOPO-TEXT", "FENCE_NOTE", "ENTRANCE_TEXT", "SURFACE_TEXT", "CONTEXT_TEXT"]
+    return [str(name) for name in layers if str(name).strip()]
+
+
+def _plain_text(raw: str) -> str:
+    """MTEXT/DBTEXT → простой текст для сравнения (`{A1;}%%d2` → `°2`)."""
+    text = str(raw or "")
+    text = re.sub(r"\\[A-Za-z][^;{}]*;", "", text)
+    text = re.sub(r"\\P", " ", text)
+    text = text.replace("%%d", "°").replace("%%D", "°").replace("%%p", "±")
+    text = text.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", " ", text).strip().upper()
+
+
+def normalize_label_text(raw: str) -> str:
+    """Нормализованный ключ надписи: только буквы/цифры/пробелы, верхний регистр."""
+    return re.sub(r"[^A-Z0-9 ]+", " ", _plain_text(raw)).strip()
+
+
+class AcadAnnotationWriter:
+    """
+    Запись готовых подписей в AutoCAD: `AddMText` внутри контура и
+    `AddLeader` + `AddMText` выноской, строго в целевой слой `D-TOPO-TEXT`.
+
+    Класс отвечает ТОЛЬКО за COM-часть: раскладку (где именно ставить текст,
+    что не перекрывать) выполняет ``feature_labeler.FeatureLabeler``. Все
+    методы рассчитаны на вызов из фонового потока после `AcadBuilder.connect()`.
+    """
+
+    def __init__(
+        self,
+        builder: "AcadBuilder",
+        *,
+        overrides: FeatureLabelOverrides | None = None,
+    ) -> None:
+        self.builder = builder
+        self.cfg = builder.cfg
+        merged = dict(self.cfg)
+        merged["features"] = dict(self.cfg.get("features") or {})
+        if overrides is not None:
+            merged["features"] = overrides.apply_to(merged["features"])
+        self.feature_cfg = merged["features"]
+        self.warnings: list[str] = []
+        self.created_texts: list[Any] = []
+        self.created_leaders: list[Any] = []
+
+    # -- свойства ----------------------------------------------------------
+    @property
+    def output_layer(self) -> str:
+        return str(self.feature_cfg.get("label_output_layer") or "D-TOPO-TEXT")
+
+    @property
+    def dedupe_layers(self) -> list[str]:
+        layers = self.feature_cfg.get("dedupe_text_layers") or []
+        return [str(name) for name in layers if str(name).strip()]
+
+    # -- чтение существующих надписей --------------------------------------
+    def collect_existing_texts(self, snapshots: Iterable[Any]) -> list[Any]:
+        """
+        Прочитать все существующие тексты из слоёв дедупликации.
+
+        Возвращает список ``feature_labeler.CadText`` — он же используется
+        раскладкой для проверки радиуса 6.0 ft от объекта.
+        """
+        from feature_labeler import CadText, normalize_layer_name
+
+        wanted = {normalize_layer_name(name) for name in self.dedupe_layers}
+        found: list[CadText] = []
+        for snap in snapshots:
+            if getattr(snap, "kind", "") != "text":
+                continue
+            if normalize_layer_name(getattr(snap, "layer", "")) not in wanted:
+                continue
+            raw = str(getattr(snap, "text", "") or "").strip()
+            if not raw:
+                continue
+            found.append(
+                CadText(
+                    text=raw,
+                    point=tuple(getattr(snap, "point", (0.0, 0.0))),  # type: ignore[arg-type]
+                    layer=str(getattr(snap, "layer", "")),
+                    height=float(getattr(snap, "height", 0.0) or 0.0),
+                    rotation=float(getattr(snap, "rotation", 0.0) or 0.0),
+                )
+            )
+        return found
+
+    # -- низкоуровневая запись --------------------------------------------
+    def _ensure_output_layer(self, doc: Any) -> str:
+        """
+        Целевой слой `D-TOPO-TEXT`: существующий слой НЕ пересоздаётся и не
+        перекрашивается (это рабочий слой геодезиста), отсутствующий — создаётся.
+        """
+        name = self.output_layer
+        try:
+            doc.Layers.Item(name)
+            return name
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            layer = _com_retry(doc.Layers.Add, name)
+            try:
+                layer.color = 3  # зелёный, как принято у подписей D-TOPO
+            except Exception:  # noqa: BLE001
+                pass
+            self.warnings.append(f"создан новый слой подписей {name}")
+            return name
+        except Exception as exc:  # noqa: BLE001
+            self.warnings.append(
+                f"слой {name} недоступен ({exc}); подписи будут созданы в слое 0"
+            )
+            return "0"
+
+    def _mtext_width(self, text: str, height: float) -> float:
+        drawing = dict(self.cfg.get("drawing") or {})
+        width = estimate_text_width(text, height, drawing or self.cfg)
+        return max(width * 1.15, height * 2.0)
+
+    def add_mtext(
+        self,
+        model_space: Any,
+        text: str,
+        point: tuple[float, float],
+        *,
+        layer: str,
+        height: float,
+        rotation: float = 0.0,
+        style: str | None = None,
+        width: float | None = None,
+        attachment: int = AC_ATTACHMENT_MIDDLE_CENTER,
+    ) -> Any:
+        """`AddMText` с привязкой MiddleCenter; текст всегда читается влево-вправо."""
+        width_value = float(width if width is not None else self._mtext_width(text, height))
+        mtext = _com_retry(
+            model_space.AddMText, _variant_point(point), width_value, str(text)
+        )
+        try:
+            mtext.Height = float(height)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if style:
+                mtext.StyleName = style
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mtext.Layer = layer
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mtext.Rotation = float(rotation)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mtext.AttachmentPoint = int(attachment)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # После смены AttachmentPoint точку вставки задаём ещё раз.
+            mtext.InsertionPoint = _variant_point(point)
+        except Exception:  # noqa: BLE001
+            pass
+        self.created_texts.append(mtext)
+        return mtext
+
+    def add_leader(
+        self,
+        model_space: Any,
+        points: Sequence[tuple[float, float]],
+        *,
+        layer: str,
+        annotation: Any | None = None,
+        arrow_head_size: float = 0.0,
+        dim_scale: float = 1.0,
+    ) -> Any | None:
+        """`AddLeader` (стрелка у объекта) + привязка готового `MText` как аннотации."""
+        try:
+            leader = _com_retry(model_space.AddLeader, _variant_points(points))
+        except Exception as exc:  # noqa: BLE001
+            self.warnings.append(f"AddLeader недоступен: {exc}")
+            return None
+        try:
+            leader.Layer = layer
+        except Exception:  # noqa: BLE001
+            pass
+        if arrow_head_size > 0:
+            try:
+                leader.ArrowHeadSize = float(arrow_head_size)
+            except Exception:  # noqa: BLE001
+                pass
+        if dim_scale and dim_scale != 1.0:
+            try:
+                leader.DimensionScaleFactor = float(dim_scale)
+            except Exception:  # noqa: BLE001
+                pass
+        if annotation is not None:
+            try:
+                leader.Annotation = annotation
+            except Exception as exc:  # noqa: BLE001
+                self.warnings.append(f"не удалось привязать MText к выноске: {exc}")
+            try:
+                leader.AnnotationType = 1  # acMTextAnnotation
+            except Exception:  # noqa: BLE001
+                pass
+        self.created_leaders.append(leader)
+        return leader
+
+    # -- главный вход ------------------------------------------------------
+    def write_plans(
+        self,
+        plans: Sequence[Any],
+        *,
+        doc: Any | None = None,
+        model_space: Any | None = None,
+        style: str | None = None,
+        dedupe_check: Callable[[str, tuple[float, float]], bool] | None = None,
+    ) -> tuple[int, list[str]]:
+        """
+        Создаёт объекты по готовому списку `feature_labeler.LabelPlan`.
+
+        Возвращает (сколько подписей создано, предупреждения COM).
+
+        ``dedupe_check(label, point)`` — последняя защита от дубля перед
+        записью: если пользователь уже успел подписать объект вручную, пока
+        шла раскладка, текст не создаётся повторно.
+        """
+        made = 0
+        warnings: list[str] = []
+        if not plans:
+            return 0, warnings
+        app_doc = doc if doc is not None else self.builder.connect()[1]
+        space = model_space if model_space is not None else app_doc.ModelSpace
+        layer = self._ensure_output_layer(app_doc)
+        if style is None:
+            try:
+                style = self.builder._ensure_text_style(app_doc)
+            except Exception:  # noqa: BLE001
+                style = None
+        arrow = max(0.04, float(self.feature_cfg.get("text_height", 0.16) or 0.16) * 0.9)
+        for plan in plans:
+            text = str(getattr(plan, "text", "") or "").strip()
+            if not text:
+                continue
+            point = tuple(getattr(plan, "point", (0.0, 0.0)))
+            height = float(getattr(plan, "height", 0.0) or 0.16)
+            if dedupe_check is not None:
+                try:
+                    if dedupe_check(text, point):
+                        warnings.append(f"пропущен дубль надписи «{text}» (появилась в чертеже)")
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                mtext = self.add_mtext(
+                    space,
+                    text,
+                    point,
+                    layer=layer,
+                    height=height,
+                    rotation=float(getattr(plan, "rotation", 0.0) or 0.0),
+                    style=style,
+                )
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"не удалось создать подпись «{text}»: {exc}")
+                continue
+            made += 1
+            leader_points = list(getattr(plan, "leader_points", []) or [])
+            if str(getattr(plan, "mode", "")) == "leader" and len(leader_points) >= 2:
+                try:
+                    self.add_leader(
+                        space,
+                        leader_points,
+                        layer=layer,
+                        annotation=mtext,
+                        arrow_head_size=arrow,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"не удалось создать выноску «{text}»: {exc}")
+        return made, warnings
+
+
+def label_drawing_features(
+    cfg: dict[str, Any] | None = None,
+    *,
+    description: LegalDescription | None = None,
+    plan_vertices: Sequence[tuple[float, float]] | None = None,
+    picked_vertices: Sequence[tuple[float, float]] | None = None,
+    house_label: str = "",
+    skip_existing: bool = True,
+    dry_run: bool = False,
+    text_height: float | None = None,
+    scale: float | None = None,
+    builder: "AcadBuilder" | None = None,
+) -> Any:
+    """
+    Шаг 2 для активного чертежа AutoCAD: распознать объекты и подписать их.
+
+    Полный сценарий «из GUI»: подключение к открытому DWG → чтение ModelSpace →
+    контур участка (из шага 1 либо по слоям PROPERTY_LINE) → раскладка подписей
+    в `D-TOPO-TEXT` → подробный отчёт. Требует Windows и запущенный AutoCAD,
+    `dry_run=True` выполняет только анализ без записи объектов.
+    """
+    from feature_labeler import (
+        AcadDrawing,
+        FeatureLabeler,
+        FeatureLabelerError,
+        LabelingOptions,
+        ensure_shapely,
+    )
+
+    ensure_shapely()
+    cfg_local = cfg if cfg is not None else load_config()
+    merged = dict(cfg_local)
+    features_cfg = dict(merged.get("features") or {})
+    if text_height is not None:
+        features_cfg["text_height"] = float(text_height)
+    merged["features"] = features_cfg
+    acad_builder = builder or AcadBuilder(merged)
+    drawing = AcadDrawing(acad_builder)
+    options = LabelingOptions(
+        house_label=house_label,
+        skip_existing=skip_existing,
+        dry_run=dry_run,
+        text_height=text_height,
+        scale=scale,
+    )
+    labeler = FeatureLabeler(merged)
+    if options.text_height is not None:
+        labeler.cfg["text_height"] = float(options.text_height)
+    try:
+        return labeler.run(
+            drawing,
+            plan_vertices=plan_vertices,
+            picked_vertices=picked_vertices,
+            house_label=house_label,
+            skip_existing=skip_existing,
+            dry_run=dry_run,
+        )
+    except FeatureLabelerError:
+        raise
+    finally:
+        drawing.release()
+
+
+__all__ += [
+    "AC_ATTACHMENT_MIDDLE_CENTER",
+    "AC_LEADER_MTEXT_LEFT",
+    "AcadAnnotationWriter",
+    "FeatureLabelOverrides",
+    "dedupe_text_layers",
+    "feature_layer_name",
+    "label_drawing_features",
+    "normalize_label_text",
+]

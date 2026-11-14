@@ -7,5 +7,6 @@ customtkinter>=5.2       # GUI
 pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (только Windows)
 pymupdf>=1.24            # извлечение текста и рендер страниц PDF
 Pillow>=10.0             # EXIF-поворот, улучшение фото старых чертежей (JPG/TIFF/PNG) и превью в GUI
+shapely>=2.0             # шаг 2: буферы, пересечения, linemerge, проверка наложений подписей
 # dev
 pytest>=8.0

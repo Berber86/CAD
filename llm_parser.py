@@ -258,6 +258,125 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "street_row": 8,
         "neighbor_lot": 4,
     },
+    "features": {
+        "property_line_layers": [
+            "PROPERTY_LINE",
+            "PL",
+            "M-TAX-LINE",
+            "PROPERTY_LINES_APPROX"
+        ],
+        "point_label_layers": [
+            "POINT_LABELS",
+            "PNT-X",
+            "PNTS"
+        ],
+        "fence_layers": [
+            "S-FENCE",
+            "ST-WALL",
+            "CODE_CREW"
+        ],
+        "fence_prefixes": [
+            "FENCE_",
+            "GATE_",
+            "LOW_EDGE_"
+        ],
+        "fence_exclude_patterns": [
+            "*_NOTE",
+            "*_TEXT"
+        ],
+        "structure_layers": {
+            "house": [
+                "BUILDING_OUTLINE",
+                "ST-BLDG-LINE",
+                "REF_VEC_BUILDING"
+            ],
+            "shed": [
+                "SUBJECT_SHED_OUTLINE",
+                "NEIGHBOUR_SHED_OUTLINE"
+            ],
+            "porch": [
+                "SIDE_PORCH",
+                "NEIGHBOUR_SIDE_PORCH",
+                "FRONT_LANDING",
+                "REAR_DECK_EDGE"
+            ],
+            "steps": [
+                "FRONT_STEPS",
+                "REAR_STEPS",
+                "ST-STEP",
+                "NEIGHBOUR_SIDE_STAIR"
+            ],
+            "walk": [
+                "DRIVEWAY_EDGE",
+                "SIDEWALK_EDGE",
+                "WALK_EDGE",
+                "WALK_43_SKETCH",
+                "PLANTER_EDGE",
+                "SIDE_PLANTER_5",
+                "GRASS_STRIP_EDGE"
+            ]
+        },
+        "step_tread_pattern": "*_STEP_TREADS",
+        "label_output_layer": "D-TOPO-TEXT",
+        "dedupe_text_layers": [
+            "D-TOPO-TEXT",
+            "FENCE_NOTE",
+            "ENTRANCE_TEXT",
+            "SURFACE_TEXT",
+            "CONTEXT_TEXT"
+        ],
+        "search_buffer_ft": 50.0,
+        "point_code_radius_ft": 3.5,
+        "dedupe_radius_ft": 6.0,
+        "text_height": 0.16,
+        "text_height_by_scale": {
+            "factor": 0.18
+        },
+        "parallel_text_offset_factor": 0.8,
+        "min_parallel_extra_ft": 4.0,
+        "leader_gap_factor": 2.2,
+        "leader_min_length_ft": 2.5,
+        "leader_max_length_ft": 60.0,
+        "max_leader_attempts": 16,
+        "text_clearance_ft": 0.35,
+        "text_angle_tolerance_deg": 10.0,
+        "curved_segment_min_ft": 6.0,
+        "curved_segment_step_deg": 26.0,
+        "mtext_width_factor": 6.5,
+        "house_label_placeholder": "2 STY. FRK. & BRK.",
+        "skip_existing_labels": True,
+        "zoom_to_labels": True,
+        "point_code_dictionary": {
+            "FEC*": "CHAIN LINK FENCE",
+            "FEV*": "VINYL FENCE",
+            "FEW*": "WOOD FENCE",
+            "FEI*": "IRON FENCE",
+            "TTP*": "UTILITY POLE",
+            "LP*": "UTILITY POLE",
+            "UP*": "UTILITY POLE",
+            "CB*": "CATCH BASIN",
+            "MH*": "MANHOLE",
+            "HYD*": "HYDRANT"
+        },
+        "layer_label_mapping": {
+            "FENCE_CHAIN*": "CHAIN LINK FENCE",
+            "FENCE_VINYL*": "VINYL FENCE",
+            "FENCE_WOOD*": "WOOD FENCE",
+            "LOW_EDGE*": "LOW TIMBER EDGE",
+            "SUBJECT_SHED_OUTLINE": "SHED",
+            "SIDE_PORCH": "PORCH",
+            "FRONT_LANDING": "PORCH",
+            "REAR_DECK_EDGE": "WOOD DECK",
+            "FRONT_STEPS": "STEPS",
+            "REAR_STEPS": "STEPS",
+            "ST-STEP": "STEPS",
+            "DRIVEWAY_EDGE": "DRIVEWAY",
+            "SIDEWALK_EDGE": "CONCRETE WALK",
+            "WALK_EDGE": "CONCRETE WALK",
+            "PLANTER_EDGE": "PLANTER",
+            "SIDE_PLANTER*": "PLANTER"
+        }
+    },
 }
 
 

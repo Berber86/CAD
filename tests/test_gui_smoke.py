@@ -1435,7 +1435,7 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
     )
 
     app = gui.SurveyApp()
-    assert gui.VERSION == "1.0.0"
+    assert gui.VERSION == "1.1.0"
     assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings

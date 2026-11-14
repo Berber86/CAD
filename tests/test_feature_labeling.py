@@ -659,6 +659,37 @@ def test_existing_labels_are_not_duplicated():
     assert item_for(plan, "WALK_EDGE").text == "CONC. WALK"
 
 
+def test_field_drawing_tax_texts_and_overlay_path_do_not_push_labels():
+    """Tax-тексты полевого чертежа и надпись-путь подложки в итог не идут — подписям не мешают."""
+    baseline = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE)
+    deck = item_for(baseline, "REAR_DECK_EDGE")
+    shed = item_for(baseline, "SUBJECT_SHED_OUTLINE")
+
+    snap = build_stafford_scene()
+    snap.texts.append(DrawingText("TAX_LOT_TEXT", "#87   LOT 70", deck.point, height=1.4))
+    snap.texts.append(DrawingText("TAX_LOT_TEXT", "S 33°23'48\" W  40.00 FT", (8.0, 99.0), height=0.5))
+    overlay = r"f\field-011-87stafford-clean-20261104-214406\ortho2024.png"
+    snap.texts.append(DrawingText("0", overlay, (-40.0, 45.0), height=4.0))
+    snap.texts.append(DrawingText("CONTEXT_TEXT", overlay, (-40.0, 60.0), height=4.0))
+    plan = make_plan(snap, house=STAFFORD_HOUSE)
+    assert plan.warnings == baseline.warnings == []
+    assert [(i.feature.layer, i.text, i.placement) for i in plan.items] == [
+        (i.feature.layer, i.text, i.placement) for i in baseline.items
+    ]
+    for new, old in zip(plan.items, baseline.items):
+        assert new.point == pytest.approx(old.point)
+    assert not [note for note in plan.recognition.field_notes if "ortho2024" in note.text]
+
+    # Подписи границы Шага 1 и готовые подписи D-TOPO-TEXT остаются в чертеже — их обходим.
+    snap = build_stafford_scene()
+    snap.texts.append(DrawingText("BOUNDARY_TEXT_AI", "N 56°36'12\" W", shed.point, height=1.0))
+    plan = make_plan(snap, house=STAFFORD_HOUSE)
+    moved = item_for(plan, "SUBJECT_SHED_OUTLINE")
+    assert moved.point != pytest.approx(shed.point)
+    blocker = ab._existing_text_box(snap.texts[-1], 1.0, {})
+    assert not moved.box.intersects(blocker)
+
+
 def test_field_notes_are_a_source_not_a_duplicate_or_obstacle():
     """Заметка полевика рядом с объектом не отменяет подпись и не мешает ей."""
     snap = build_scene()

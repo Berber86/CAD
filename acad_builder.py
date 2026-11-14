@@ -45,6 +45,7 @@ from feature_labeler import (
     RecognitionResult,
     feature_settings,
     find_property_polygon,
+    is_file_reference,
     labels_similar,
     line_to_shapely,
     lookup_pattern_label,
@@ -5738,14 +5739,16 @@ class _LabelPlacer:
         for text in snapshot.texts:
             if not str(text.text or "").strip():
                 continue
-            if classifier.is_field_note(text.layer):
+            if classifier.is_field_note(text.layer) or is_file_reference(text.text):
                 continue
             rect = _existing_text_box(text, self.h, self.drawing_cfg)
             if not self._in_bounds(rect):
                 continue
             is_point = classifier.is_point_label(text.layer)
             is_label = classifier.is_existing_label(text.layer)
-            if not text.hidden and (avoid_points or not is_point or is_label):
+            # Препятствие — только текст, который останется в итоговом чертеже.
+            keeps = classifier.is_text_obstacle(text.layer) or (avoid_points and is_point)
+            if not text.hidden and keeps:
                 self.text_boxes.append(rect)
             if is_label:
                 self.known.append(_KnownLabel(text=text.text, layer=text.layer, box=rect))

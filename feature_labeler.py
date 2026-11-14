@@ -242,6 +242,10 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "ignore_hidden_layers": True,
     "obstacle_layers": ["*"],
     "obstacle_layer_exclude": [],
+    # Тексты-препятствия — только те, что остаются в итоговом чертеже: готовые
+    # подписи (existing_label_layers) и подписи границы Шага 1. Tax-тексты
+    # полевого чертежа («#87 LOT 70», румбы красных линий) подписям не мешают.
+    "text_obstacle_layers": ["BOUNDARY_TEXT*"],
     "point_labels_as_obstacles": False,
     # --- дедупликация --------------------------------------------------------
     "skip_existing_labels": True,
@@ -417,6 +421,7 @@ class LayerClassifier:
             self._existing.append(output)
         self._obstacle = _as_patterns(fcfg.get("obstacle_layers"))
         self._obstacle_exclude = _as_patterns(fcfg.get("obstacle_layer_exclude"))
+        self._text_obstacle = _as_patterns(fcfg.get("text_obstacle_layers"))
         self._cache: dict[tuple[str, str], Any] = {}
 
     def _cached(self, kind: str, layer: str, compute: Any) -> Any:
@@ -493,6 +498,12 @@ class LayerClassifier:
             return layer_matches(layer, self._obstacle)
 
         return self._cached("obst", layer, compute)
+
+    def is_text_obstacle(self, layer: str) -> bool:
+        """Текст слоя остаётся в итоговом чертеже — новые подписи его обходят."""
+        return self.is_existing_label(layer) or self._cached(
+            "tobst", layer, lambda: layer_matches(layer, self._text_obstacle)
+        )
 
     def is_feature_linework(self, layer: str) -> bool:
         """Слой с линиями, из которых строятся участок или объекты."""
@@ -1422,6 +1433,16 @@ def translate_field_note(text: str, rules: Any) -> tuple[str, dict[str, str]] | 
     return None
 
 
+_FILE_REFERENCE_RE = re.compile(
+    r"\.(png|jpe?g|tiff?|bmp|gif|pdf|dwg|dxf|ecw|sid|jp2|csv|txt)\b", re.IGNORECASE
+)
+
+
+def is_file_reference(text: str) -> bool:
+    """Текст-путь к файлу (подпись подложки ``…\\ortho2024.png``): не заметка и не препятствие."""
+    return bool(_FILE_REFERENCE_RE.search(str(text or "")))
+
+
 def _collect_field_notes(
     snapshot: DrawingSnapshot,
     classifier: LayerClassifier,
@@ -1435,7 +1456,7 @@ def _collect_field_notes(
         if not classifier.is_field_note(text.layer):
             continue
         value = re.sub(r"\s+", " ", plain_text(text.text)).strip()
-        if not value:
+        if not value or is_file_reference(text.text):
             continue
         rect = approx_text_box(text)
         if not rect.intersects(zone):

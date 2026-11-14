@@ -482,6 +482,9 @@
       "*"
     ],
     "obstacle_layer_exclude": [],
+    "text_obstacle_layers": [
+      "BOUNDARY_TEXT*"
+    ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,
     "duplicate_radius_ft": 6.0,

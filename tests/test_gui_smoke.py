@@ -3055,6 +3055,8 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     assert "Автопоиск участка и подписание объектов" in app.feature_auto_button.cget("text")
     assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
     assert "0.900 ft" in app.step2_height_label.cget("text")
+    assert app.step2_height_entry.cget("placeholder_text") == "авто"
+    assert app.feature_text_height_var.get() == ""
 
     app._select_step_tab(gui.STEP_TAB_LABELS)
     assert app.main_wrap._gridded is False
@@ -3175,6 +3177,37 @@ def test_step2_passes_dedup_checkbox_state(gui, monkeypatch):
     assert calls[0]["house_text"] == ""
     assert app.step2_stat_vars["skipped"].get() == "0"
     assert app.step2_stat_vars["labeled"].get() == "18"
+
+
+def test_step2_text_height_field_overrides_scale(gui, monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    calls = []
+    monkeypatch.setattr(
+        gui.AcadBuilder, "label_features",
+        lambda builder, **kwargs: calls.append(kwargs) or _step2_result(),
+    )
+    app = gui.SurveyApp()
+    # Пустое поле — высота по масштабу.
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert calls[-1]["text_height"] is None
+
+    # Запятая как десятичный разделитель и знак фута допустимы.
+    app.feature_text_height_var.set("0,45'")
+    app._refresh_step2_height_label()
+    assert "0.450 ft (задано вручную" in app.step2_height_label.cget("text")
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert calls[-1]["text_height"] == pytest.approx(0.45)
+
+    # Не число — запуск не начинается, AutoCAD не трогается.
+    app.feature_text_height_var.set("мелко")
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert len(calls) == 2
+    assert app._busy is False
+    assert "Высота текста подписей указана неверно" in app.step2_report_box.get("1.0", "end")
+    assert "неверная высота текста" in app.status_var.get()
 
 
 def test_step2_error_is_shown_in_report_and_status(gui, monkeypatch):

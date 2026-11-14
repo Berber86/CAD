@@ -362,6 +362,7 @@ class SurveyApp(ctk.CTk):
         # Шаг 2: автоподписание объектов (вторая глобальная вкладка)
         self.step_tab_var = ctk.StringVar(value=STEP_TAB_BOUNDARY)
         self.house_text_var = ctk.StringVar(value="")
+        self.feature_text_height_var = ctk.StringVar(value="")
         self.skip_existing_labels_var = ctk.BooleanVar(
             value=bool(feature_settings(self.config_data).get("skip_existing_labels", True))
         )
@@ -2602,8 +2603,32 @@ class SurveyApp(ctk.CTk):
         )
         self.step2_notes_hint.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 8))
 
+        height_row = ctk.CTkFrame(panel, fg_color="transparent")
+        height_row.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 10))
+        height_row.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(
+            height_row,
+            text="Высота текста подписей, ft:",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.step2_height_entry = ctk.CTkEntry(
+            height_row,
+            textvariable=self.feature_text_height_var,
+            width=90,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            placeholder_text="авто",
+        )
+        self.step2_height_entry.grid(row=0, column=1, sticky="w")
+        for event_name in ("<KeyRelease>", "<FocusOut>"):
+            self.step2_height_entry.bind(
+                event_name, lambda _event: self._refresh_step2_height_label()
+            )
         self.step2_height_label = ctk.CTkLabel(
-            panel,
+            height_row,
             text="",
             font=ctk.CTkFont(size=11),
             text_color=THEME["sky"],
@@ -2611,7 +2636,9 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=420,
         )
-        self.step2_height_label.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step2_height_label.grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0)
+        )
 
         self.feature_auto_button = ctk.CTkButton(
             panel,
@@ -2765,19 +2792,47 @@ class SurveyApp(ctk.CTk):
             "объекты не удаляются."
         )
 
+    def _feature_text_height_override(self) -> float | None:
+        """Высота текста Шага 2 из поля вкладки: ``None`` — авто, ``ValueError`` — не число."""
+        raw = str(self.feature_text_height_var.get() or "").strip().replace(",", ".")
+        raw = raw.replace("'", "").strip()
+        if not raw or raw.lower() in {"авто", "auto"}:
+            return None
+        value = float(raw)
+        if not (0.05 <= value <= 20.0):
+            raise ValueError(raw)
+        return value
+
     def _refresh_step2_height_label(self) -> None:
         label = getattr(self, "step2_height_label", None)
         if label is None:
             return
         scale = self._current_scale()
         try:
-            height = AcadBuilder(self.config_data).feature_text_height(scale)
+            manual = self._feature_text_height_override()
+        except ValueError:
+            label.configure(
+                text="Высота текста: введите число в футах от 0.05 до 20 (например 0.5) "
+                     "или оставьте поле пустым.",
+                text_color=THEME["warn"],
+            )
+            return
+        try:
+            auto = AcadBuilder(self.config_data).feature_text_height(scale)
         except Exception:  # noqa: BLE001 - некорректное значение в настройках
             return
-        label.configure(
-            text=f"Высота текста подписей: {height:.3f} ft — по масштабу 1\" = {scale:g}' "
-                 "из шапки окна (как у подписей границы)."
-        )
+        if manual is not None:
+            text = (
+                f"Подписи будут высотой {manual:.3f} ft (задано вручную; авто по масштабу "
+                f"1\" = {scale:g}' — {auto:.3f} ft)."
+            )
+        else:
+            text = (
+                f"Поле пустое — высота {auto:.3f} ft по масштабу 1\" = {scale:g}' из шапки "
+                "окна (как у подписей границы). Нужен текст мельче или крупнее — впишите "
+                "высоту в футах."
+            )
+        label.configure(text=text, text_color=THEME["sky"])
 
     def _select_step_tab(self, label: str) -> None:
         self.step_tab_var.set(label)
@@ -2858,6 +2913,17 @@ class SurveyApp(ctk.CTk):
         skip_existing = bool(self.skip_existing_labels_var.get())
         hide_notes = bool(self.hide_field_notes_var.get())
         scale = self._current_scale()
+        try:
+            text_height = self._feature_text_height_override()
+        except ValueError:
+            self._refresh_step2_height_label()
+            self._set_step2_report(
+                "ШАГ 2 НЕ ВЫПОЛНЕН\n\nВысота текста подписей указана неверно: "
+                f"«{self.feature_text_height_var.get()}». Введите число в футах от 0.05 до 20 "
+                "(например 0.5) или оставьте поле пустым — тогда высота берётся по масштабу."
+            )
+            self._set_status("Шаг 2 не выполнен: неверная высота текста подписей", error=True)
+            return
         cfg, _provider, _model, _key, _secret = self._build_runtime_config()
         self._busy = True
         self._set_controls_busy(True)
@@ -2878,7 +2944,7 @@ class SurveyApp(ctk.CTk):
         )
         self._start_background(
             self._feature_label_worker,
-            args=(cfg, mode, house_text, skip_existing, scale, hide_notes),
+            args=(cfg, mode, house_text, skip_existing, scale, hide_notes, text_height),
         )
 
     def _feature_label_worker(
@@ -2889,6 +2955,7 @@ class SurveyApp(ctk.CTk):
         skip_existing: bool,
         scale: float,
         hide_field_notes: bool = False,
+        text_height: float | None = None,
     ) -> None:
         post = self._worker_poster()
         result: FeatureLabelResult | None = None
@@ -2910,6 +2977,7 @@ class SurveyApp(ctk.CTk):
                     skip_existing=skip_existing,
                     hide_field_notes=hide_field_notes,
                     scale=scale,
+                    text_height=text_height,
                     progress=lambda message: post("progress", message),
                     should_continue=self._worker_is_current,
                 )
@@ -6179,6 +6247,7 @@ class SurveyApp(ctk.CTk):
         self.feature_auto_button.configure(state=state)
         self.feature_pick_button.configure(state=state)
         self.house_text_entry.configure(state=state)
+        self.step2_height_entry.configure(state=state)
         self.skip_existing_labels_check.configure(state=state)
         self.hide_field_notes_check.configure(state=state)
 

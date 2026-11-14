@@ -265,7 +265,7 @@ def test_shipped_config_mirrors_feature_defaults():
     assert section == fl.DEFAULT_FEATURE_CONFIG
     # Ключи из постановки задачи.
     assert section["property_line_layers"] == [
-        "PROPERTY_LINE", "PL", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
     ]
     assert section["point_label_layers"] == ["POINT_LABELS", "PNT-X", "PNTS"]
     assert section["label_output_layer"] == "D-TOPO-TEXT"
@@ -277,6 +277,7 @@ def test_shipped_config_mirrors_feature_defaults():
     assert section["layer_label_mapping"]["*PORCH*"] == "O.P."
     assert set(section["structure_layers"]) == {
         "house", "shed", "porch", "steps", "planter", "surface",
+        "pool", "wall", "overhang", "misc",  # слои шаблона геодезиста
     }
     assert section["existing_label_layers"] == ["D-TOPO-TEXT"]
     assert section["field_note_layers"] == [
@@ -304,8 +305,11 @@ def test_feature_settings_override_replaces_key_and_null_keeps_default():
 
 def test_layer_classifier_fence_patterns_and_note_exclusion():
     classifier = fl.LayerClassifier(fl.feature_settings({}))
-    for name in ("S-FENCE", "ST-WALL", "CODE_CREW", "FENCE_CHAIN_LEFT", "GATE_REAR", "gate_left_insert"):
+    for name in ("S-FENCE", "CODE_CREW", "FENCE_CHAIN_LEFT", "GATE_REAR", "gate_left_insert"):
         assert classifier.is_fence(name), name
+    # Стена — не забор: это объект со своим контуром (двойная линия со штриховкой).
+    assert not classifier.is_fence("ST-WALL")
+    assert classifier.structure_category("ST-WALL") == "wall"
     for name in ("FENCE_NOTE", "GATE_NOTE", "BUILDING_OUTLINE", "POINT_LABELS", "LOW_EDGE_TIMBER"):
         assert not classifier.is_fence(name), name
     assert classifier.is_gate("GATE_LEFT_SECOND") and not classifier.is_gate("FENCE_CHAIN_LEFT")
@@ -439,7 +443,8 @@ def test_step_count_and_point_objects_are_optional():
     assert labels_of(result, "FRONT_STEPS") == ["3 STEPS"]
     steps = next(f for f in result.features if f.layer == "FRONT_STEPS")
     assert steps.tread_count == 3
-    assert {f.label for f in result.features if f.kind == "point"} == {"UTILITY POLE", "MANHOLE"}
+    # TTP — точка хода (S-CONT-SET), а не столб: подписи не получает.
+    assert {f.label for f in result.features if f.kind == "point"} == {"MANHOLE"}
 
 
 def test_structural_point_codes_are_not_reported_as_unknown():
@@ -899,7 +904,7 @@ def test_report_lists_counters_for_gui_log():
     )
     report = result.report()
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 0" in report
-    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по кодам и описаниям точек съёмки: 2" in report
     assert "по именам слоёв: 15" in report
     assert "ПОДПИСАНО: 15 (вдоль линии: 4, внутри контура: 7, у объекта: 4, выноска: 0)" in report
     assert "ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: 3" in report
@@ -1153,7 +1158,24 @@ def fake_autocad(snapshot, *, with_leader=True, font_scale=None):
                        InsertionPoint=(text.point[0], text.point[1], 0.0),
                        Height=text.height, Rotation=text.rotation)
         )
+    for survey in snapshot.survey_points:
+        doc.Layers.items.setdefault(survey.layer, FakeLayer(survey.layer))
+        space.entities.append(fake_point_block(survey))
     return FakeApp(doc), doc
+
+
+def fake_point_block(survey, tags=("PT#", "ELEV2", "DESC2")):
+    """Блок точки съёмки ``srvpno3``: атрибуты номер / отметка / описание."""
+    values = (survey.number, survey.elevation, survey.description)
+    attributes = tuple(
+        FakeEntity("AcDbAttribute", "PNTDESC", TagString=tag, TextString=value)
+        for tag, value in zip(tags, values)
+    )
+    return FakeEntity(
+        "AcDbBlockReference", survey.layer, HasAttributes=True,
+        InsertionPoint=(survey.point[0], survey.point[1], 0.0),
+        EffectiveName=survey.block or "srvpno3", GetAttributes=lambda: attributes,
+    )
 
 
 @pytest.fixture()
@@ -1245,7 +1267,7 @@ def test_label_features_draws_into_d_topo_text(com):
     assert not created & {"UTILITY POLE", "MANHOLE", "LOW TIMBER EDGE"}
 
     report = result.report()
-    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по кодам и описаниям точек съёмки: 2" in report
     assert "по именам слоёв: 15" in report
     assert "ПОДПИСАНО: 18" in report
 
@@ -1490,3 +1512,223 @@ def test_feature_text_height_follows_scale_and_config():
     fixed = dict(cfg)
     fixed["feature_labeling"] = {"text_height_ft": 1.2}
     assert AcadBuilder(fixed).feature_text_height(30.0) == pytest.approx(1.2)
+
+
+# ---------------------------------------------------------------------------
+# Типовой чертёж геодезиста: описания объектов в атрибутах блоков точек
+# ---------------------------------------------------------------------------
+
+ILION_HOUSE = "2 STY\nFRAME\nNo. 12"
+
+
+def load_ilion():
+    """Полевой чертёж «12 Ilion Place» из дампа inspect_dwg.py (tests/data/ilion_field.txt)."""
+    snap = DrawingSnapshot()
+    for raw in (ROOT / "tests" / "data" / "ilion_field.txt").read_text(encoding="utf-8").splitlines():
+        row = raw.strip()
+        if not row or row.startswith("#"):
+            continue
+        parts = row.split()
+        if parts[0] == "L":
+            x0, y0, x1, y1 = (float(value) for value in parts[2:6])
+            snap.lines.append(DrawingLine(layer=parts[1], points=((x0, y0), (x1, y1))))
+        elif parts[0] == "P":
+            head, description = row.split("|", 1)
+            _kind, layer, number, x, y = head.split()
+            snap.survey_points.append(
+                fl.SurveyPoint(layer=layer, number=number, description=description.strip(),
+                               point=(float(x), float(y)), elevation="100.00", block="srvpno3")
+            )
+        elif parts[0] == "T":
+            head, text = row.split("|", 1)
+            _kind, layer, x, y, height, rotation = head.split()
+            snap.texts.append(
+                DrawingText(layer=layer, text=text.strip(), point=(float(x), float(y)),
+                            height=float(height), rotation=math.radians(float(rotation)),
+                            kind="AcDbMText")
+            )
+    return snap
+
+
+def ilion_features(result, label, kind=None):
+    return [
+        f for f in result.features
+        if f.flat_label == label and (kind is None or f.kind == kind)
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("VINYL FENCE", ("VINYL FENCE", "fence")),
+        ("F E C", ("CHAIN LINK FENCE", "fence")),
+        ("o porch", ("O.P.", "porch")),
+        ("CONC-SW", ("CONC. WALK", "surface")),
+        ("EDG  DWY", ("DRIVEWAY", "surface")),
+        ("BOT WALL", ("WALL", "wall")),
+        ("BLC DW", ("", "")),           # угол дома: точка известна, подпись не нужна
+        ("BLC5", ("", "")),
+        ("SPOT GRADE PAV.", ("", "")),
+        ("TTP", ("", "")),
+    ],
+)
+def test_point_descriptions_are_translated_to_customer_wording(raw, expected):
+    rules = fl.DEFAULT_FEATURE_CONFIG["point_descriptions"]
+    label, category, _pattern = fl.translate_description(raw, rules)
+    assert (label, category) == expected
+
+
+def test_unknown_description_has_no_rule_and_normalization_ignores_punctuation():
+    rules = fl.DEFAULT_FEATURE_CONFIG["point_descriptions"]
+    assert fl.translate_description("GAZEBO", rules) is None
+    assert fl.translate_description("", rules) is None
+    assert fl.normalize_description(" conc-sw ") == "CONC SW"
+    assert fl.normalize_description("SPOT GRADE PAV.") == "SPOT GRADE PAV"
+
+
+def test_ilion_lot_is_closed_by_the_street_line():
+    """В M-PROPERTY четыре стороны из пяти: фасад начерчен только в M-ROW-LINE."""
+    snap = load_ilion()
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.layer == "M-PROPERTY"
+    assert boundary.vertex_count == 5
+    assert boundary.area_sqft == pytest.approx(4339.0, abs=2.0)
+    assert any("M-ROW-LINE" in note for note in boundary.notes)
+    # Без замыкающего слоя — понятная ошибка, а не чужой контур.
+    with pytest.raises(fl.FeatureLabelError):
+        fl.find_property_polygon(snap, {"feature_labeling": {"property_closing_layers": []}})
+
+
+def test_ilion_descriptions_become_labels():
+    """Чертёж без единой подписи: всё берётся из атрибута DESC2 блоков точек."""
+    snap = load_ilion()
+    result = recognize(snap, house=ILION_HOUSE)
+    assert len(snap.survey_points) == 93
+    assert result.unknown_codes == {}
+    assert result.by_notes == 0 and result.by_layers == 0
+
+    # Бассейн и ступени к нему начерчены общими линиями, но это два объекта.
+    (pool,) = ilion_features(result, "POOL")
+    assert pool.kind == "area" and pool.category == "pool" and pool.layer == "ST-MISC"
+    assert pool.geometry.area == pytest.approx(349.0, abs=3.0)
+    assert sorted(code.number for code in pool.codes) == ["51", "52", "53"]
+    pool_steps = [f for f in ilion_features(result, "STEPS") if f.geometry.distance(pool.geometry) < 0.1]
+    assert len(pool_steps) == 1 and pool_steps[0].geometry.area == pytest.approx(20.0, abs=1.0)
+
+    # Крыльцо с проступями: линии слоя ST-MISC упираются в стену дома (другой
+    # слой), контур не замкнут — объект один, площадь по оболочке его линий.
+    (porch,) = ilion_features(result, "O.P.")
+    assert porch.category == "porch" and not porch.closed
+    assert porch.geometry.area == pytest.approx(31.7, abs=1.0)
+    assert sorted(code.number for code in porch.codes) == ["10", "11"]
+
+    assert len(ilion_features(result, "SHED", "area")) == 2
+    assert len(ilion_features(result, "STEPS")) == 5
+    (planter,) = ilion_features(result, "PLANTER")
+    assert planter.kind == "edge" and planter.geometry.length == pytest.approx(17.9, abs=0.1)
+    (driveway,) = ilion_features(result, "DRIVEWAY")
+    assert driveway.kind == "area" and driveway.layer == "S-ROAD-DWY"
+    (walk,) = ilion_features(result, "CONC. WALK")
+    assert walk.kind == "edge" and walk.geometry.length == pytest.approx(50.3, abs=0.1)
+    (overhang,) = ilion_features(result, "CANTILEVER")
+    assert overhang.kind == "edge" and overhang.layer == "ST-OHED"
+    walls = ilion_features(result, "WALL")
+    assert len(walls) == 3 and {wall.layer for wall in walls} == {"ST-WALL"}
+    # Длинная стена вдоль задней межи — лента шириной в фут: подпись вдоль неё.
+    assert max(walls, key=lambda wall: wall.geometry.length).kind == "edge"
+
+    house = next(f for f in result.features if f.is_main_house)
+    assert house.layer == "ST-BLDG-LINE" and house.label == ILION_HOUSE
+
+    # Объекты без описания остаются без подписи и попадают в отчёт.
+    assert sorted((f.layer, f.kind) for f in result.unlabeled) == [
+        ("S-FENCE", "fence"), ("ST-MISC", "area"), ("ST-MISC", "edge"), ("ST-MISC", "edge"),
+    ]
+    # Точки, рядом с которыми в их слое нет линий.
+    assert sorted(code.title for code in result.unbound_descriptions) == [
+        "76 PLANTER", "91 BOT WALL",
+    ]
+
+
+def test_ilion_fences_follow_the_point_descriptions():
+    result = recognize(load_ilion(), house=ILION_HOUSE)
+    vinyl = ilion_features(result, "VINYL FENCE")
+    chain = ilion_features(result, "CHAIN LINK FENCE")
+    assert sorted(round(f.geometry.length, 1) for f in chain) == [8.1, 21.3, 33.1, 33.2, 35.3]
+    # Виниловый забор вокруг двора — одна линия; точка 37 «F E C» лежит на ней в
+    # футе от угла, но относится к соседней сетке и забор не делит.
+    main = max(vinyl, key=lambda f: f.geometry.length)
+    assert main.geometry.length == pytest.approx(222.8, abs=0.5)
+    assert {code.label for code in main.codes} == {"VINYL FENCE"}
+    east_chain = next(f for f in chain if round(f.geometry.length, 1) == 33.1)
+    assert sorted(code.number for code in east_chain.codes) == ["37", "39"]
+    assert not result.unbound_fence_codes
+
+
+def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
+    snap = load_ilion()
+    plan = make_plan(snap, house=ILION_HOUSE, height=0.9)
+    texts = sorted(item.single_line for item in plan.items)
+    for expected in ("POOL", "SHED", "O.P.", "PLANTER", "DRIVEWAY", "CONC. WALK",
+                     "VINYL FENCE", "CHAIN LINK FENCE", "2 STY FRAME No. 12"):
+        assert expected in texts, expected
+    assert plan.count_placement("leader") <= 2
+    assert plan.survey_point_count == 93
+    boxes = [item.box for item in plan.items]
+    for i, first in enumerate(boxes):
+        for second in boxes[i + 1:]:
+            assert not first.intersects(second)
+    report = ab.FeatureLabelResult(plan=plan, layer=plan.output_layer, dry_run=True).report()
+    assert "Точек съёмки с описанием в атрибутах блоков: 93" in report
+    assert "76 PLANTER" in report
+
+
+def test_point_blocks_are_read_from_autocad_even_with_frozen_attribute_layers(com):
+    source = load_ilion()
+    builder, _app, doc = com(source)
+    for name in ("PNTDESC", "PNTNO", "PNTELEV", "PNTS"):
+        doc.Layers.items[name] = FakeLayer(name)
+        doc.Layers.items[name].Freeze = True
+    space = doc.ModelSpace
+    # Блоки, которые точками съёмки не являются: без атрибутов и с пустым описанием.
+    space.entities.append(FakeEntity("AcDbBlockReference", "M-NTH-ARROW", HasAttributes=False))
+    space.entities.append(
+        fake_point_block(fl.SurveyPoint(layer="0", number="1", description="", point=(4999.83, 4999.22)))
+    )
+    snapshot = builder.read_drawing_snapshot(doc)
+    assert snapshot.read_errors == 0
+    assert len(snapshot.survey_points) == 93
+    first = snapshot.survey_points[0]
+    assert (first.layer, first.number, first.description, first.block) == (
+        "ST-BLDG-LINE", "7", "BLC", "srvpno3",
+    )
+    assert first.point == pytest.approx((5006.22, 5015.13))
+    restored = recognize(snapshot, house=ILION_HOUSE)
+    expected = recognize(source, house=ILION_HOUSE)
+    assert sorted(f.flat_label for f in restored.labeled) == sorted(f.flat_label for f in expected.labeled)
+
+
+def test_label_features_on_point_block_drawing_creates_labels(com):
+    builder, _app, doc = com(load_ilion())
+    result = builder.label_features(house_text=ILION_HOUSE)
+    created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
+    assert result.created_labels == len(result.plan.items) > 20
+    assert created and {e.Layer for e in created} == {"D-TOPO-TEXT"}
+    # Повторный запуск ничего не добавляет.
+    again = builder.label_features(house_text=ILION_HOUSE)
+    assert again.created_labels == 0
+
+
+def test_short_codes_in_block_attributes_use_the_code_dictionary():
+    """Атрибут с коротким кодом («FEV64») работает как текст слоя POINT_LABELS."""
+    snap = DrawingSnapshot()
+    for a, b in (((0, 0), (40, 0)), ((40, 0), (40, 60)), ((40, 60), (0, 60)), ((0, 60), (0, 0))):
+        snap.lines.append(DrawingLine(layer="PROPERTY_LINE", points=(a, b)))
+    snap.lines.append(DrawingLine(layer="S-FENCE", points=((0.5, 5), (0.5, 55))))
+    for number, code, point in (("1", "FEV64", (0.5, 5)), ("2", "FEV64", (0.5, 55)),
+                                ("3", "BLC", (10, 10)), ("4", "GAZEBO", (20, 20))):
+        snap.survey_points.append(fl.SurveyPoint(layer="S-FENCE", number=number, description=code, point=point))
+    result = recognize(snap, house="")
+    (fence,) = [f for f in result.features if f.kind == "fence"]
+    assert fence.label == "VINYL FENCE" and fence.source == "point_code"
+    assert result.unknown_codes == {"GAZEBO": 1}

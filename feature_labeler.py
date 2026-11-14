@@ -86,9 +86,14 @@ __all__ = [
 #: полный и окончательный список правил). ``null`` в config.json = «по умолчанию».
 DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- слои входящего чертежа (шаблоны * и ?, регистр не важен) ----------
-    "property_line_layers": ["PROPERTY_LINE", "PL", "M-TAX-LINE", "PROPERTY_LINES_APPROX"],
+    "property_line_layers": [
+        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+    ],
+    #: линии, которыми замыкается граница, если в слое участка её не хватает:
+    #: фасадная сторона участка обычно начерчена только как красная линия улицы
+    "property_closing_layers": ["M-ROW-LINE"],
     "point_label_layers": ["POINT_LABELS", "PNT-X", "PNTS"],
-    "fence_layers": ["S-FENCE", "ST-WALL", "CODE_CREW", "FENCE_*"],
+    "fence_layers": ["S-FENCE", "FENCE", "CODE_CREW", "FENCE_*"],
     "fence_layer_exclude": ["*_NOTE"],
     #: линии, соединяющие снятые точки (CODE_CREW): забором они считаются
     #: только там, где рядом стоит код забора; без кода — молча пропускаются
@@ -101,14 +106,27 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         "porch": ["*PORCH*", "*LANDING*", "*DECK*"],
         "steps": ["*_STEPS", "*STAIR*", "ST-STEP"],
         "planter": ["*PLANTER*"],
+        "pool": ["POOL"],
+        "wall": ["ST-WALL", "WALL"],
+        "overhang": ["ST-OHED"],
         "surface": [
             "DRIVEWAY_EDGE",
             "SIDEWALK_EDGE",
             "WALK_EDGE",
             "WALK_*_SKETCH",
             "GRASS_STRIP_EDGE",
+            "S-ROAD-DWY",
+            "S-ROAD-SW-LINE",
         ],
+        #: «разное» шаблона геодезиста: что это за объект, говорит описание точки
+        "misc": ["ST-MISC"],
     },
+    #: категории линейных объектов: подпись вдоль линии, площадь не строится
+    "linear_structure_categories": ["overhang"],
+    #: узкие длинные контуры этих категорий (стена — две линии в футе друг от
+    #: друга) подписываются как линия: текст вдоль длинной стороны
+    "ribbon_categories": ["wall"],
+    "ribbon_max_width_ft": 1.6,
     "step_tread_layers": ["*TREADS*"],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
@@ -191,7 +209,6 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         "FEV*": "VINYL FENCE",
         "FEW*": "WOOD FENCE",
         "FEI*": "IRON FENCE",
-        "TTP*": "UTILITY POLE",
         "LP*": "UTILITY POLE",
         "UP*": "UTILITY POLE",
         "CB*": "CATCH BASIN",
@@ -203,9 +220,42 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: коды углов объектов (дом, крыльцо, ступени…): подпись не нужна, в отчёте
     #: «коды не из словаря» они не показываются
     "point_codes_without_label": [
-        "BLC*", "DW*", "OP*", "PLAN*", "SHED*", "STEP*", "SW*", "LST*", "FD*", "XP*",
+        "BLC*", "DW*", "OP*", "PLAN*", "SHED*", "STEP*", "SW*", "LST*", "FD*", "XP*", "TTP*",
     ],
     "point_to_fence_max_ft": 3.5,
+    # --- источник 2б: описания точек съёмки (атрибуты блоков) ---------------
+    #: Типовой чертёж геодезиста: подписей на экране нет, описание объекта
+    #: записано в атрибуте блока точки (``DESC2`` блока ``srvpno3``), а сам блок
+    #: лежит в слое объекта. Теги атрибутов блока точки (шаблоны * и ?):
+    "point_block_attribute_tags": {
+        "number": ["PT#", "PT*", "PNT*", "NUM*"],
+        "description": ["DESC*"],
+        "elevation": ["ELEV*"],
+    },
+    #: Перевод рабочих описаний геодезиста в подписи заказчика. Срабатывает
+    #: ПЕРВОЕ подходящее правило; регистр, пробелы и знаки («CONC-SW» =
+    #: «conc sw») не важны. ``category`` — тип объекта: fence, shed, porch,
+    #: steps, planter, pool, wall, overhang, surface. Пустая подпись — точка
+    #: известна, но объект не подписывается (углы домов, точки хода, отметки).
+    "point_descriptions": [
+        {"match": ["VINYL FENCE", "V FENCE", "PVC FENCE"], "label": "VINYL FENCE", "category": "fence"},
+        {"match": ["F E C", "CHAIN LINK FENCE", "C L F"], "label": "CHAIN LINK FENCE", "category": "fence"},
+        {"match": ["WOOD FENCE", "W FENCE", "STOCKADE FENCE"], "label": "WOOD FENCE", "category": "fence"},
+        {"match": ["IRON FENCE", "I FENCE"], "label": "IRON FENCE", "category": "fence"},
+        {"match": ["O PORCH", "OPEN PORCH", "PORCH"], "label": "O.P.", "category": "porch"},
+        {"match": ["DECK", "WOOD DECK", "FRAME DECK"], "label": "FRAME\nDECK", "category": "porch"},
+        {"match": ["STEPS", "STEP", "STAIRS"], "label": "STEPS", "category": "steps"},
+        {"match": ["SHED"], "label": "SHED", "category": "shed"},
+        {"match": ["POOL"], "label": "POOL", "category": "pool"},
+        {"match": ["PLANTER"], "label": "PLANTER", "category": "planter"},
+        {"match": ["BOT WALL", "TOP WALL", "WALL"], "label": "WALL", "category": "wall"},
+        {"match": ["CANTILEVER", "OVERHANG"], "label": "CANTILEVER", "category": "overhang"},
+        {"match": ["EDG DWY", "EDGE DWY", "DWY", "DRIVEWAY"], "label": "DRIVEWAY", "category": "surface"},
+        {"match": ["CONC SW", "CONC WALK", "SW"], "label": "CONC. WALK", "category": "surface"},
+        {"match": ["BLC*", "TTP*", "SPOT GRADE*"], "label": ""},
+    ],
+    #: точка описания относится к ближайшей линии своего слоя не дальше этого
+    "point_to_feature_max_ft": 2.0,
     #: столбы, колодцы, гидранты: заказчик их не подписывает (true — подписывать)
     "label_point_features": False,
     # --- источник 3: имена слоёв --------------------------------------------
@@ -589,11 +639,29 @@ class DrawingText:
 
 
 @dataclass
+class SurveyPoint:
+    """
+    Точка съёмки: вставка блока с атрибутами «номер / отметка / описание».
+
+    ``layer`` — слой вставки блока: геодезист кладёт точку в слой своего объекта
+    (``S-FENCE``, ``ST-MISC``…), сами атрибуты обычно лежат в замороженных слоях.
+    """
+
+    layer: str
+    number: str
+    description: str
+    point: tuple[float, float]
+    elevation: str = ""
+    block: str = ""
+
+
+@dataclass
 class DrawingSnapshot:
     """Всё, что прочитано из ModelSpace за один проход."""
 
     lines: list[DrawingLine] = field(default_factory=list)
     texts: list[DrawingText] = field(default_factory=list)
+    survey_points: list[SurveyPoint] = field(default_factory=list)
     leaders: list[DrawingLine] = field(default_factory=list)
     entity_count: int = 0
     skipped_hidden: int = 0
@@ -642,6 +710,40 @@ def parse_point_code(text: str) -> tuple[str, str] | None:
     if match is None:
         return None
     return (match.group(1) or ""), match.group(2).upper()
+
+
+_DESCRIPTION_SPLIT_RE = re.compile(r"[^A-Z0-9*?]+")
+
+
+def normalize_description(text: str) -> str:
+    """
+    Описание точки съёмки в виде для сравнения: верхний регистр, знаки и
+    лишние пробелы убраны (``'conc-sw'`` -> ``'CONC SW'``,
+    ``'SPOT GRADE PAV.'`` -> ``'SPOT GRADE PAV'``).
+    """
+    upper = plain_text(text).upper()
+    return " ".join(part for part in _DESCRIPTION_SPLIT_RE.split(upper) if part)
+
+
+def translate_description(text: str, rules: Any) -> tuple[str, str, str] | None:
+    """
+    Перевод описания точки по ``point_descriptions``.
+
+    Возвращает ``(подпись, категория, сработавший шаблон)`` первого подходящего
+    правила; пустая подпись — «точка известна, подпись не нужна». ``None`` —
+    правила для описания нет.
+    """
+    key = normalize_description(text)
+    if not key or not isinstance(rules, (list, tuple)):
+        return None
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        for pattern in _as_patterns(rule.get("match")):
+            if _wild_regex(normalize_description(pattern)).match(key):
+                label = str(rule.get("label") or "").strip()
+                return label, str(rule.get("category") or "").strip().lower(), pattern
+    return None
 
 
 def label_tokens(text: str) -> list[str]:
@@ -709,6 +811,10 @@ class PointCode:
     layer: str
     raw: str
     is_fence: bool = False
+    #: тип объекта из правила ``point_descriptions`` (shed, steps, pool…)
+    category: str = ""
+    #: точка — блок с атрибутами (а не текст «64 FEV» слоя POINT_LABELS)
+    from_block: bool = False
 
     @property
     def title(self) -> str:
@@ -1049,9 +1155,15 @@ def find_property_polygon(
     fcfg = feature_settings(cfg)
     classifier = LayerClassifier(fcfg)
     by_rank: dict[int, dict[str, list[LineString]]] = {}
+    closing_layers = _as_patterns(fcfg.get("property_closing_layers"))
+    closers: dict[str, list[LineString]] = {}
     for line in snapshot.lines:
         rank = classifier.property_rank(line.layer)
         if rank is None:
+            if closing_layers and layer_matches(line.layer, closing_layers):
+                geom = line_to_shapely(line)
+                if geom is not None:
+                    closers.setdefault(line.layer, []).append(geom)
             continue
         geom = line_to_shapely(line)
         if geom is not None:
@@ -1078,6 +1190,23 @@ def find_property_polygon(
             lines, snap_tolerance=snap_tol, gap_tolerance=gap_tol,
             min_area=min_area, allow_chain_closure=True,
         )
+        closed_by = ""
+        if not polygons and closers:
+            # Фасадной стороны в слое участка нет — она начерчена красной линией улицы.
+            extra = [geom for group in closers.values() for geom in group]
+            candidates, gaps = polygons_from_lines(
+                lines + extra, snap_tolerance=snap_tol, gap_tolerance=gap_tol,
+                min_area=min_area, allow_chain_closure=False,
+            )
+            own = unary_union(lines).buffer(max(snap_tol, 0.01))
+            kept = [
+                (index, poly) for index, poly in enumerate(candidates)
+                if poly.exterior.intersection(own).length >= 0.5 * poly.exterior.length
+            ]
+            polygons = [poly for _index, poly in kept]
+            gaps = {new: gaps[old] for new, (old, _poly) in enumerate(kept) if old in gaps}
+            if polygons:
+                closed_by = ", ".join(sorted(closers))
         if not polygons:
             continue
         if survey_lines is None:
@@ -1087,6 +1216,11 @@ def find_property_polygon(
         if polygon is None:
             continue
         notes: list[str] = []
+        if closed_by:
+            notes.append(
+                f"в слое {layer_name} граница не замкнута: недостающая сторона взята "
+                f"из слоя {closed_by} (красная линия улицы)"
+            )
         gap = float(gaps.get(index, 0.0))
         if gap > 0.0:
             notes.append(
@@ -1209,6 +1343,10 @@ _CATEGORY_TITLES = {
     "porch": "крыльцо/терраса",
     "steps": "ступени",
     "surface": "покрытие",
+    "pool": "бассейн",
+    "wall": "стена",
+    "overhang": "навес/консоль",
+    "misc": "объект",
     "point": "точка",
 }
 
@@ -1287,6 +1425,8 @@ class RecognitionResult:
     point_codes: list[PointCode] = field(default_factory=list)
     unknown_codes: dict[str, int] = field(default_factory=dict)
     unbound_fence_codes: list[PointCode] = field(default_factory=list)
+    #: точки с описанием объекта (не забора), рядом с которыми нет линий слоя
+    unbound_descriptions: list[PointCode] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     field_notes: list["FieldNote"] = field(default_factory=list)
 
@@ -1380,6 +1520,45 @@ def _collect_point_codes(
                 layer=text.layer,
                 raw=text.text,
                 is_fence=layer_matches(code, fence_codes),
+            )
+        )
+
+    # Точки-блоки: описание в атрибуте, слой блока — слой объекта.
+    rules = fcfg.get("point_descriptions")
+    for survey in snapshot.survey_points:
+        description = normalize_description(survey.description)
+        if not description or not search.contains(Point(survey.point)):
+            continue
+        label: str | None = None
+        pattern: str | None = None
+        category = ""
+        is_fence = False
+        translated = translate_description(description, rules)
+        if translated is not None:
+            label, category, pattern = translated[0] or None, translated[1], translated[2]
+            is_fence = category == "fence"
+        else:
+            # Короткий код в атрибуте («FEV64») — как текст слоя POINT_LABELS.
+            single = description if " " not in description else ""
+            found = lookup_pattern_label(single, dictionary) if single else None
+            if found is not None:
+                label, pattern = found
+                is_fence = layer_matches(single, fence_codes)
+                category = "fence" if is_fence else "point"
+            elif not (single and layer_matches(single, silent)):
+                unknown[description] = unknown.get(description, 0) + 1
+        codes.append(
+            PointCode(
+                number=str(survey.number or "").strip(),
+                code=description,
+                label=label,
+                pattern=pattern,
+                point=(float(survey.point[0]), float(survey.point[1])),
+                layer=survey.layer,
+                raw=plain_text(survey.description),
+                is_fence=is_fence,
+                category=category,
+                from_block=True,
             )
         )
     return codes, unknown
@@ -1854,6 +2033,69 @@ class _LayerShape:
     geometry: BaseGeometry
     closed: bool
     is_area: bool
+    #: точки съёмки с описанием, лежащие на контуре (самое частое описание — первым)
+    codes: tuple[PointCode, ...] = ()
+
+
+def _majority_first(codes: Sequence[PointCode]) -> tuple[PointCode, ...]:
+    """Точки объекта: сначала точки самого частого описания."""
+    counts: dict[str, int] = {}
+    for code in codes:
+        counts[str(code.label)] = counts.get(str(code.label), 0) + 1
+    order = {label: index for index, label in enumerate(counts)}
+    return tuple(
+        sorted(codes, key=lambda code: (-counts[str(code.label)], order[str(code.label)]))
+    )
+
+
+def _assign_points_to_shapes(
+    faces: Sequence[Polygon],
+    groups: Sequence[BaseGeometry],
+    points: Sequence[PointCode],
+    reach: float,
+) -> tuple[dict[int, list[PointCode]], dict[int, list[PointCode]], list[PointCode]]:
+    """
+    Относит точки с описанием к контурам (``faces``) и незамкнутым линиям
+    (``groups``) одного слоя: к ближайшему объекту не дальше ``reach``.
+
+    Точка в общем углу двух объектов (крыльцо и первая проступь) достаётся:
+    замкнутому контуру, а не примыкающему хвосту; контуру, у которого есть
+    «своя» точка с тем же описанием; при прочих равных — меньшему контуру
+    (бассейн, а не двор вокруг него).
+    """
+    targets: list[tuple[int, int, BaseGeometry, float]] = []  # (тип, индекс, геометрия, размер)
+    for index, face in enumerate(faces):
+        targets.append((0, index, face.exterior, face.area))
+    for index, group in enumerate(groups):
+        targets.append((1, index, group, group.length))
+    options: list[list[int]] = []
+    for code in points:
+        point = Point(code.point)
+        distances = [target[2].distance(point) for target in targets]
+        nearest = min(distances, default=math.inf)
+        if nearest > reach:
+            options.append([])
+            continue
+        options.append([i for i, dist in enumerate(distances) if dist <= nearest + 0.1])
+    own: dict[tuple[int, str], int] = {}
+    for code, found in zip(points, options):
+        if len(found) == 1:
+            key = (found[0], str(code.label))
+            own[key] = own.get(key, 0) + 1
+    by_face: dict[int, list[PointCode]] = {}
+    by_group: dict[int, list[PointCode]] = {}
+    loose: list[PointCode] = []
+    for code, found in zip(points, options):
+        if not found:
+            loose.append(code)
+            continue
+        best = min(
+            found,
+            key=lambda i: (targets[i][0], -own.get((i, str(code.label)), 0), targets[i][3]),
+        )
+        kind, index = targets[best][0], targets[best][1]
+        (by_face if kind == 0 else by_group).setdefault(index, []).append(code)
+    return by_face, by_group, loose
 
 
 def _extract_layer_shapes(
@@ -1862,70 +2104,154 @@ def _extract_layer_shapes(
     tolerance: float,
     min_width: float,
     pair_gap: float,
+    points: Sequence[PointCode] = (),
+    point_reach: float = 0.0,
+    loose: list[PointCode] | None = None,
+    linear: bool = False,
 ) -> list[_LayerShape]:
     """
     Делит линии одного слоя на отдельные объекты: замкнутые контуры, открытые
     контуры (приближённая площадь) и одиночные кромки.
+
+    ``points`` — точки съёмки этого слоя с описанием. Контур, на котором лежат
+    такие точки, становится отдельным объектом с этим описанием (бассейн и
+    ступени к нему — два объекта, хотя линии общие); примыкающие к нему
+    контуры без точек (проступи у крыльца) — детали, отдельно не выдаются.
+    Точки, рядом с которыми нет линий слоя, складываются в ``loose``.
+
+    ``linear`` — слой линейных объектов (пунктир консоли вокруг дома): площадь
+    по незамкнутым линиям не строится, объект — самая длинная ломаная.
     """
     noded = _noded(snap_endpoints(lines, tolerance))
     if not noded:
+        if loose is not None:
+            loose.extend(points)
         return []
     polys, dangles, cuts, invalid = polygonize_full(noded)
-    faces = [poly for poly in _polygon_parts(polys) if poly.is_valid and poly.area > 0.0]
-    solids: list[Polygon] = []
-    if faces:
-        for solid in _polygon_parts(unary_union(faces)):
-            solids.append(Polygon(solid.exterior.coords))
-    shapes = [_LayerShape(geometry=solid, closed=True, is_area=True) for solid in solids]
-
-    leftover = _line_parts(dangles) + _line_parts(cuts) + _line_parts(invalid)
-    if not leftover:
-        return shapes
+    faces = [
+        Polygon(poly.exterior.coords)
+        for poly in _polygon_parts(polys) if poly.is_valid and poly.area > 0.0
+    ]
     reach = max(tolerance, 1e-6)
-    groups = _connected_groups(leftover, reach)
-    # Хвосты, примыкающие к замкнутому контуру, — детали того же объекта.
-    free_groups: list[list[LineString]] = []
-    for group in groups:
-        geom = unary_union(group)
-        if any(geom.distance(solid) <= reach for solid in solids):
-            continue
-        free_groups.append(group)
-    if not free_groups:
+    leftover = _line_parts(dangles) + _line_parts(cuts) + _line_parts(invalid)
+    groups = _connected_groups(leftover, reach) if leftover else []
+    group_geoms = [unary_union(group) for group in groups]
+
+    face_codes: dict[int, list[PointCode]] = {}
+    group_codes: dict[int, list[PointCode]] = {}
+    if points:
+        face_codes, group_codes, missed = _assign_points_to_shapes(
+            faces, group_geoms, points, max(point_reach, reach)
+        )
+        if loose is not None:
+            loose.extend(missed)
+
+    shapes: list[_LayerShape] = []
+    # --- замкнутые контуры --------------------------------------------------
+    plain_faces = list(range(len(faces)))
+    if face_codes:
+        for index in sorted(face_codes):
+            shapes.append(
+                _LayerShape(
+                    geometry=faces[index], closed=True, is_area=True,
+                    codes=_majority_first(face_codes[index]),
+                )
+            )
+        # Контуры без точек, примыкающие (и по цепочке) к описанному, — его детали.
+        detail = set(face_codes)
+        frontier = list(face_codes)
+        while frontier:
+            current = faces[frontier.pop()]
+            for index, face in enumerate(faces):
+                if index not in detail and face.distance(current) <= reach:
+                    detail.add(index)
+                    frontier.append(index)
+        plain_faces = [index for index in plain_faces if index not in detail]
+    solids: list[Polygon] = []
+    if plain_faces:
+        for solid in _polygon_parts(unary_union([faces[index] for index in plain_faces])):
+            solids.append(Polygon(solid.exterior.coords))
+    shapes.extend(_LayerShape(geometry=solid, closed=True, is_area=True) for solid in solids)
+
+    # --- незамкнутые линии --------------------------------------------------
+    # Хвосты без описания, примыкающие к замкнутому контуру, — детали того же объекта.
+    free: list[int] = []
+    for index, geom in enumerate(group_geoms):
+        if index in group_codes or not any(geom.distance(face) <= reach for face in faces):
+            free.append(index)
+    if not free:
         return shapes
 
     # Кромки одного покрытия (две стороны дорожки) объединяются в один объект.
-    clusters: list[list[LineString]] = []
-    if pair_gap > 0.0 and len(free_groups) > 1:
-        group_geoms = [unary_union(group) for group in free_groups]
-        parent = list(range(len(free_groups)))
+    parent = {index: index for index in free}
 
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
 
-        for i in range(len(free_groups)):
-            for j in range(i + 1, len(free_groups)):
+    if pair_gap > 0.0 and len(free) > 1:
+        for position, i in enumerate(free):
+            for j in free[position + 1:]:
                 if group_geoms[i].distance(group_geoms[j]) <= pair_gap:
                     root_a, root_b = find(i), find(j)
                     if root_a != root_b:
                         parent[root_b] = root_a
-        merged_clusters: dict[int, list[LineString]] = {}
-        for index, group in enumerate(free_groups):
-            merged_clusters.setdefault(find(index), []).extend(group)
-        clusters = list(merged_clusters.values())
-    else:
-        clusters = free_groups
+    clusters: dict[int, list[int]] = {}
+    for index in free:
+        clusters.setdefault(find(index), []).append(index)
 
-    for cluster in clusters:
+    for members in clusters.values():
+        cluster = [line for index in members for line in groups[index]]
+        codes = _majority_first(
+            [code for index in members for code in group_codes.get(index, [])]
+        )
+        chains = merge_lines(cluster, 0.0) or cluster
+        # Кромки покрытия с описанием («CONC-SW» по трём линиям тротуара): выпуклая
+        # оболочка накрыла бы чужие объекты, подпись ставится вдоль длинной кромки.
+        edges_only = linear or (
+            bool(codes) and codes[0].category == "surface" and len(chains) > 2
+        )
+        if edges_only:
+            longest = max(chains, key=lambda chain: chain.length)
+            shapes.append(_LayerShape(geometry=longest, closed=False, is_area=False, codes=codes))
+            continue
         polygon = _shape_from_open_lines(cluster, min_width)
         if polygon is not None:
-            shapes.append(_LayerShape(geometry=polygon, closed=False, is_area=True))
+            shapes.append(_LayerShape(geometry=polygon, closed=False, is_area=True, codes=codes))
             continue
-        for chain in merge_lines(cluster, 0.0) or cluster:
-            shapes.append(_LayerShape(geometry=chain, closed=False, is_area=False))
+        for chain in chains:
+            near = tuple(
+                code for code in codes
+                if chain.distance(Point(code.point)) <= max(point_reach, reach)
+            )
+            shapes.append(
+                _LayerShape(geometry=chain, closed=False, is_area=False, codes=near or codes)
+            )
     return shapes
+
+
+def _ribbon_side(polygon: Polygon, max_width: float) -> LineString | None:
+    """
+    Длинная сторона узкого контура-ленты (стена из двух параллельных линий).
+
+    ``None`` — контур не лента: средняя ширина (2·площадь / периметр) больше
+    ``max_width`` либо он короче четырёх своих ширин.
+    """
+    perimeter = polygon.exterior.length
+    if perimeter <= 0.0 or max_width <= 0.0:
+        return None
+    width = 2.0 * polygon.area / perimeter
+    if width > max_width or perimeter / 2.0 < 4.0 * width:
+        return None
+    coords = _clean_coords(polygon.exterior.coords)
+    best: LineString | None = None
+    for start, end in zip(coords, coords[1:]):
+        side = LineString([start, end])
+        if best is None or side.length > best.length:
+            best = side
+    return best
 
 
 def _count_treads(polygon: Polygon, treads: Sequence[LineString], tolerance: float) -> int:
@@ -2036,6 +2362,35 @@ def recognize_features(
         result.unbound_fence_codes.extend(
             code for code in codes if code.is_fence and code.label
         )
+
+    # Два забора рядом (свой виниловый и соседская сетка в полуфуте): точка,
+    # попавшая на линию с другим материалом, переносится на соседнюю линию,
+    # у которой все точки — того же материала.
+    if len(bound) > 1:
+        moves: list[tuple[PointCode, int, int]] = []
+        for index, part_codes in bound.items():
+            counts: dict[str, int] = {}
+            for code in part_codes:
+                counts[str(code.label)] = counts.get(str(code.label), 0) + 1
+            if len(counts) < 2:
+                continue
+            major = max(counts, key=lambda label: counts[label])
+            for code in part_codes:
+                if code.label == major:
+                    continue
+                point = Point(code.point)
+                options = [
+                    (fence_parts[other][1].distance(point), other)
+                    for other, other_codes in bound.items()
+                    if other != index
+                    and all(item.label == code.label for item in other_codes)
+                    and fence_parts[other][1].distance(point) <= max_code_dist
+                ]
+                if options:
+                    moves.append((code, index, min(options)[1]))
+        for code, source, target in moves:
+            bound[source].remove(code)
+            bound[target].append(code)
 
     abbreviations = fcfg.get("fence_abbreviations")
     gate_plain = _normalize_house_text(str(fcfg.get("gate_label_plain") or "GATE"))
@@ -2152,13 +2507,36 @@ def recognize_features(
     # --- строения, крыльца, ступени, покрытия -------------------------------
     count_treads = bool(fcfg.get("step_count_labels", False))
     house_candidates: list[Feature] = []
+    # Описания точек съёмки (блоки с атрибутами): точка лежит в слое объекта.
+    described: dict[str, list[PointCode]] = {}
+    for code in codes:
+        if code.from_block and code.label and not code.is_fence:
+            described.setdefault(code.layer.strip().upper(), []).append(code)
+    feature_reach = max(0.0, float(fcfg.get("point_to_feature_max_ft") or 0.0))
+    linear_categories = {
+        str(name).strip().lower()
+        for name in _as_patterns(fcfg.get("linear_structure_categories"))
+    }
+    ribbon_categories = {
+        str(name).strip().lower() for name in _as_patterns(fcfg.get("ribbon_categories"))
+    }
+    ribbon_width = max(0.0, float(fcfg.get("ribbon_max_width_ft") or 0.0))
+    loose_points: list[PointCode] = []
     for layer in sorted(structure_lines):
         category = classifier.structure_category(layer) or "structure"
         shapes = _extract_layer_shapes(
             structure_lines[layer],
             tolerance=tolerance,
             min_width=min_width,
-            pair_gap=pair_gap if category == "surface" else 0.0,
+            pair_gap=(
+                pair_gap if category == "surface"
+                else max(1.0, feature_reach) if category in linear_categories
+                else 0.0
+            ),
+            points=described.pop(layer.strip().upper(), []),
+            point_reach=feature_reach,
+            loose=loose_points,
+            linear=category in linear_categories,
         )
         mapped = classifier.layer_label(layer)
         for shape in shapes:
@@ -2181,6 +2559,19 @@ def recognize_features(
                 rule=mapped[1] if mapped else "",
                 closed=shape.closed,
             )
+            if shape.codes:
+                # Описание точки важнее имени слоя: слой — класс, описание — объект.
+                first = shape.codes[0]
+                feature.label = first.label
+                feature.source = "point_code"
+                feature.rule = f"{first.raw} → {first.pattern}"
+                feature.codes = shape.codes
+                feature.category = first.category or category
+            if feature.kind == "area" and feature.category in ribbon_categories:
+                side = _ribbon_side(geometry, ribbon_width)  # type: ignore[arg-type]
+                if side is not None:
+                    feature.kind = "edge"
+                    feature.geometry = side
             if count_treads and category == "steps" and feature.label and feature.kind == "area":
                 treads = _count_treads(geometry, tread_lines, tolerance)  # type: ignore[arg-type]
                 if treads > 0:
@@ -2233,6 +2624,15 @@ def recognize_features(
                 )
             )
 
+    loose_points.extend(code for layer_codes in described.values() for code in layer_codes)
+    result.unbound_descriptions = loose_points
+    if loose_points:
+        titles = ", ".join(f"{code.title} ({code.layer})" for code in loose_points[:6])
+        more = "…" if len(loose_points) > 6 else ""
+        result.notes.append(
+            f"описания точек без линии объекта в своём слое ближе {feature_reach:g} ft: "
+            f"{titles}{more}"
+        )
     if result.unbound_fence_codes:
         titles = ", ".join(code.title for code in result.unbound_fence_codes[:6])
         more = "…" if len(result.unbound_fence_codes) > 6 else ""

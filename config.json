@@ -119,8 +119,12 @@
     "property_line_layers": [
       "PROPERTY_LINE",
       "PL",
+      "M-PROPERTY",
       "M-TAX-LINE",
       "PROPERTY_LINES_APPROX"
+    ],
+    "property_closing_layers": [
+      "M-ROW-LINE"
     ],
     "point_label_layers": [
       "POINT_LABELS",
@@ -129,7 +133,7 @@
     ],
     "fence_layers": [
       "S-FENCE",
-      "ST-WALL",
+      "FENCE",
       "CODE_CREW",
       "FENCE_*"
     ],
@@ -165,14 +169,36 @@
       "planter": [
         "*PLANTER*"
       ],
+      "pool": [
+        "POOL"
+      ],
+      "wall": [
+        "ST-WALL",
+        "WALL"
+      ],
+      "overhang": [
+        "ST-OHED"
+      ],
       "surface": [
         "DRIVEWAY_EDGE",
         "SIDEWALK_EDGE",
         "WALK_EDGE",
         "WALK_*_SKETCH",
-        "GRASS_STRIP_EDGE"
+        "GRASS_STRIP_EDGE",
+        "S-ROAD-DWY",
+        "S-ROAD-SW-LINE"
+      ],
+      "misc": [
+        "ST-MISC"
       ]
     },
+    "linear_structure_categories": [
+      "overhang"
+    ],
+    "ribbon_categories": [
+      "wall"
+    ],
+    "ribbon_max_width_ft": 1.6,
     "step_tread_layers": [
       "*TREADS*"
     ],
@@ -421,7 +447,6 @@
       "FEV*": "VINYL FENCE",
       "FEW*": "WOOD FENCE",
       "FEI*": "IRON FENCE",
-      "TTP*": "UTILITY POLE",
       "LP*": "UTILITY POLE",
       "UP*": "UTILITY POLE",
       "CB*": "CATCH BASIN",
@@ -441,9 +466,154 @@
       "SW*",
       "LST*",
       "FD*",
-      "XP*"
+      "XP*",
+      "TTP*"
     ],
     "point_to_fence_max_ft": 3.5,
+    "point_block_attribute_tags": {
+      "number": [
+        "PT#",
+        "PT*",
+        "PNT*",
+        "NUM*"
+      ],
+      "description": [
+        "DESC*"
+      ],
+      "elevation": [
+        "ELEV*"
+      ]
+    },
+    "point_descriptions": [
+      {
+        "match": [
+          "VINYL FENCE",
+          "V FENCE",
+          "PVC FENCE"
+        ],
+        "label": "VINYL FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "F E C",
+          "CHAIN LINK FENCE",
+          "C L F"
+        ],
+        "label": "CHAIN LINK FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "WOOD FENCE",
+          "W FENCE",
+          "STOCKADE FENCE"
+        ],
+        "label": "WOOD FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "IRON FENCE",
+          "I FENCE"
+        ],
+        "label": "IRON FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "O PORCH",
+          "OPEN PORCH",
+          "PORCH"
+        ],
+        "label": "O.P.",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "DECK",
+          "WOOD DECK",
+          "FRAME DECK"
+        ],
+        "label": "FRAME\nDECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "STEPS",
+          "STEP",
+          "STAIRS"
+        ],
+        "label": "STEPS",
+        "category": "steps"
+      },
+      {
+        "match": [
+          "SHED"
+        ],
+        "label": "SHED",
+        "category": "shed"
+      },
+      {
+        "match": [
+          "POOL"
+        ],
+        "label": "POOL",
+        "category": "pool"
+      },
+      {
+        "match": [
+          "PLANTER"
+        ],
+        "label": "PLANTER",
+        "category": "planter"
+      },
+      {
+        "match": [
+          "BOT WALL",
+          "TOP WALL",
+          "WALL"
+        ],
+        "label": "WALL",
+        "category": "wall"
+      },
+      {
+        "match": [
+          "CANTILEVER",
+          "OVERHANG"
+        ],
+        "label": "CANTILEVER",
+        "category": "overhang"
+      },
+      {
+        "match": [
+          "EDG DWY",
+          "EDGE DWY",
+          "DWY",
+          "DRIVEWAY"
+        ],
+        "label": "DRIVEWAY",
+        "category": "surface"
+      },
+      {
+        "match": [
+          "CONC SW",
+          "CONC WALK",
+          "SW"
+        ],
+        "label": "CONC. WALK",
+        "category": "surface"
+      },
+      {
+        "match": [
+          "BLC*",
+          "TTP*",
+          "SPOT GRADE*"
+        ],
+        "label": ""
+      }
+    ],
+    "point_to_feature_max_ft": 2.0,
     "label_point_features": false,
     "layer_label_mapping": {
       "FENCE_CHAIN*": "CHAIN LINK FENCE",

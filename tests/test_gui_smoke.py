@@ -3140,13 +3140,13 @@ def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
     assert app.step2_stat_vars["skipped"].get() == "3"
     report = app.step2_report_box.get("1.0", "end")
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 1" in report
-    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по кодам и описаниям точек съёмки: 2" in report
     assert "по именам слоёв: 14" in report
     assert "ПОДПИСАНО: 15" in report
     assert "полевая заметка «WOOD PORCH»" in report
     # Тот же отчёт — в журнале операций (лог-панель).
     log = "\n".join(app._log)
-    assert "Шаг 2 · • по кодам точек (POINT_LABELS): 2" in log
+    assert "Шаг 2 · • по кодам и описаниям точек съёмки: 2" in log
     assert "Шаг 2 · • по именам слоёв: 14" in log
     assert "Шаг 2 · ПОДПИСАНО: 15" in log
     assert "Подписано объектов: 15 в слое D-TOPO-TEXT" in app.status_var.get()

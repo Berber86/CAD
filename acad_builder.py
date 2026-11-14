@@ -43,10 +43,12 @@ from feature_labeler import (
     FeatureLabelError,
     LayerClassifier,
     RecognitionResult,
+    SurveyPoint,
     feature_settings,
     find_property_polygon,
     is_file_reference,
     labels_similar,
+    layer_matches,
     line_to_shapely,
     lookup_pattern_label,
     plain_text,
@@ -2809,6 +2811,9 @@ class AcadBuilder:
                 )
             )
             return
+        if kind == "AcDbBlockReference":
+            self._read_survey_point(entity, layer, snapshot, classifier.fcfg)
+            return
         if kind == "AcDbLeader":
             if not (classifier.is_existing_label(layer) or classifier.is_field_note(layer)):
                 return
@@ -2839,6 +2844,46 @@ class AcadBuilder:
             snapshot.lines.append(
                 DrawingLine(layer=layer, points=tuple(points), closed=closed, kind=kind)
             )
+
+    @staticmethod
+    def _read_survey_point(
+        entity: Any, layer: str, snapshot: DrawingSnapshot, fcfg: dict[str, Any]
+    ) -> None:
+        """
+        Точка съёмки — блок с атрибутами «номер / отметка / описание»
+        (``srvpno3``: ``PT#``, ``ELEV2``, ``DESC2``).
+
+        Атрибуты читаются и тогда, когда их слои заморожены (на экране их не
+        видно): описание точки — исходные данные распознавания. Блоки без
+        атрибута-описания (стрелка севера, знаки) пропускаются.
+        """
+        if not bool(getattr(entity, "HasAttributes", False)):
+            return
+        tags = fcfg.get("point_block_attribute_tags") or {}
+        values = {"number": "", "description": "", "elevation": ""}
+        for attribute in entity.GetAttributes() or ():
+            tag = str(attribute.TagString or "").strip()
+            for role in values:
+                if not values[role] and layer_matches(tag, tags.get(role)):
+                    values[role] = plain_text(attribute.TextString)
+                    break
+        if not values["description"]:
+            return
+        insertion = entity.InsertionPoint
+        try:
+            block = str(entity.EffectiveName)
+        except Exception:  # noqa: BLE001 - старые версии AutoCAD
+            block = str(getattr(entity, "Name", "") or "")
+        snapshot.survey_points.append(
+            SurveyPoint(
+                layer=layer,
+                number=values["number"],
+                description=values["description"],
+                point=(float(insertion[0]), float(insertion[1])),
+                elevation=values["elevation"],
+                block=block,
+            )
+        )
 
     # -- указание границы участка в AutoCAD ----------------------------------
     def pick_boundary_lines(
@@ -5424,6 +5469,8 @@ class FeatureLabelPlan:
     text_count: int = 0
     #: поправка ширины текста, измеренная в AutoCAD (1.0 — расчётный шрифт)
     width_scale: float = 1.0
+    #: точек съёмки с описанием (блоки с атрибутами)
+    survey_point_count: int = 0
 
     def count_placement(self, placement: str) -> int:
         return sum(1 for item in self.items if item.placement == placement)
@@ -5506,10 +5553,11 @@ class FeatureLabelResult:
             f"Прочитано из чертежа: линий {plan.line_count}, текстов {plan.text_count}, "
             f"кодов точек {len(rec.point_codes)} (из них по словарю: {rec.known_point_codes}), "
             f"полевых заметок {len(rec.field_notes)}",
+            f"Точек съёмки с описанием в атрибутах блоков: {plan.survey_point_count}",
             "",
             f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
             f"  • по заметкам полевого чертёжника (перевод в формулировки заказчика): {rec.by_notes}",
-            f"  • по кодам точек (POINT_LABELS): {rec.by_point_codes}",
+            f"  • по кодам и описаниям точек съёмки: {rec.by_point_codes}",
             f"  • по именам слоёв: {rec.by_layers}",
         ]
         if rec.by_user:
@@ -5543,7 +5591,9 @@ class FeatureLabelResult:
             listing = ", ".join(
                 f"{code} ×{count}" for code, count in sorted(rec.unknown_codes.items())
             )
-            lines.append(f"Коды точек не из словаря: {listing}")
+            lines.append(
+                f"Коды и описания точек не из словаря (point_descriptions): {listing}"
+            )
         unknown_notes = rec.unknown_notes
         if unknown_notes:
             listing = "; ".join(sorted({f"«{note.text}»" for note in unknown_notes}))
@@ -6780,4 +6830,5 @@ def plan_feature_labels(
         line_count=len(snapshot.lines),
         text_count=len(snapshot.texts),
         width_scale=placer.width_scale,
+        survey_point_count=len(snapshot.survey_points),
     )

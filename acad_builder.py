@@ -2290,7 +2290,12 @@ class AcadBuilder:
             is_neighbor=is_neighbor,
             neighbor_label=neighbor_label,
         )
+        return self.draw_plan(plan)
+
+    def draw_plan(self, plan: DrawPlan) -> DrawResult:
+        """Рисует готовый план без повторного расчёта его геометрии."""
         warnings: list[str] = []
+        is_neighbor = plan.is_neighbor
 
         drawing = self.drawing_cfg
         layers_cfg = self.cfg.get("layers", {})

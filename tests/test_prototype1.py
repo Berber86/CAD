@@ -2774,3 +2774,35 @@ def test_text_pdf_selected_pages_use_only_local_text_layer(tmp_path, monkeypatch
         parse_legal_description_full(pdf_path=pdf, pdf_pages="3", use_llm=False)
     with pytest.raises(PDFError, match="вне диапазона"):
         parse_legal_description_full(pdf_path=pdf, pdf_pages="5", use_llm=False)
+
+
+def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
+    """COM получает готовые координаты и метки, а не заново рассчитанный контур."""
+    import acad_builder as module
+    from llm_parser import ASPENWALL_SAMPLES
+
+    monkeypatch.setattr(module, "_co_initialize", lambda: False)
+    monkeypatch.setattr(module, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
+    monkeypatch.setattr(module, "_variant_points", lambda points: [c for p in points for c in p])
+    builder = AcadBuilder(load_config())
+    app = FakeApp()
+    builder._app, builder._doc = app, app.doc
+    main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    neighbor_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    main_plan = builder.plan(main_desc, scale=10, is_neighbor=False)
+    neighbor_plan = builder.plan(neighbor_desc, scale=20, is_neighbor=True)
+    main_edges = [(edge.start, edge.end) for edge in main_plan.boundary_lines]
+    neighbor_edges = [(edge.start, edge.end) for edge in neighbor_plan.boundary_lines]
+    monkeypatch.setattr(builder, "plan", lambda *a, **kw: pytest.fail("план не должен пересчитываться"))
+
+    first = builder.draw_plan(main_plan)
+    second = builder.draw_plan(neighbor_plan)
+    assert first.plan is main_plan and second.plan is neighbor_plan
+    assert first.text_height == main_plan.text_height
+    space = app.doc.ModelSpace
+    for layer, edges in (("PROPERTY_LINE", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+        lines = [line for line in space.lines if line.Layer == layer]
+        assert len(lines) == len(edges)
+        for line, (start, end) in zip(lines, edges):
+            assert line.StartPoint == pytest.approx([*start, 0])
+            assert line.EndPoint == pytest.approx([*end, 0])

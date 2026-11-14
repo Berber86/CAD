@@ -103,6 +103,7 @@ def test_real_window_starts_and_handles_basic_actions(stored_key, tmp_path, monk
         image = tmp_path / "survey.jpg"
         Image.new("RGB", (30, 40), "white").save(image)
         monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(image),))
+        monkeypatch.setattr(app, "_ask_source_role", lambda _kind: "main")
         app.photo_load_button.invoke()
         app.update()
         assert app.image_paths == [image]
@@ -206,6 +207,7 @@ def test_real_resizable_panel_topmost_neighbor_tab_and_full_reset(tmp_path, monk
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
     app = main.SurveyApp()
+    monkeypatch.setattr(app, "_ask_source_role", lambda _kind: "neighbor")
     callback_errors = []
     app.report_callback_exception = lambda typ, value, tb: callback_errors.append(
         "".join(traceback.format_exception(typ, value, tb))
@@ -250,6 +252,8 @@ def test_real_resizable_panel_topmost_neighbor_tab_and_full_reset(tmp_path, monk
         app.update()
         assert app._result_panel_width == main.RESULT_PANEL_MIN_WIDTH
         assert app._result_fonts["mono"].cget("size") == mono_size
+        widths = [button.winfo_width() for button in app.result_tab_buttons.values()]
+        assert max(widths) - min(widths) <= 1 and min(widths) >= 70
 
         # Кнопка именно внутри вкладки и доступна при минимальной ширине панели.
         app.result_tab_var.set("🏘 Соседи")
@@ -300,5 +304,129 @@ def test_real_resizable_panel_topmost_neighbor_tab_and_full_reset(tmp_path, monk
         assert app.provider_key_vars["hydra"].get() == "not-cleared"
         assert all(path.exists() for path in files)
         assert not callback_errors, "\n".join(callback_errors)
+    finally:
+        app.destroy()
+
+
+def test_real_file_role_dialog_and_persistent_severity_tabs(tmp_path, monkeypatch):
+    """Настоящие модальный выбор роли и независимые цвета вкладок при переключении."""
+    _tk, ctk = _require_gui()
+    import main
+    import llm_parser
+    from tkinter import filedialog
+    from acad_builder import AcadBuilder, LotSuspicionReport, SuspicionItem, NeighborPairReport, NeighborVerificationReport
+    from llm_parser import ASPENWALL_SAMPLES, parse_with_regex
+
+    monkeypatch.setattr(main, "load_config", lambda: llm_parser.load_config(tmp_path / "config.json"))
+    monkeypatch.setattr(main, "_stored_provider_keys", lambda: {})
+    app = main.SurveyApp()
+    errors = []
+    app.report_callback_exception = lambda typ, value, tb: errors.append(
+        "".join(traceback.format_exception(typ, value, tb))
+    )
+    try:
+        app.update()
+        if app._keys_drawer_open:
+            app.toggle_keys_drawer()
+        app.update()
+        assert app.source_mode_switch.cget("values") == ["📄 PDF", "📷 Фото", "📝 Текст"]
+        assert app.role_bar.winfo_ismapped()
+        app.source_mode_var.set("📷 Фото")
+        app._on_source_mode_changed()
+        app.update()
+        assert not app.role_bar.winfo_ismapped()
+
+        events = []
+        monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append("files") or ())
+        def cancel_role():
+            win = app._source_role_dialog
+            events.append(("role", win._role_buttons["neighbor"].cget("text"), bool(win.grab_current())))
+            win._role_buttons["cancel"].invoke()
+        app.after(100, cancel_role)
+        app._load_images()
+        assert events == [("role", "Соседний участок / участки", True)]
+        assert app._source_role_dialog is None
+        app.after(100, cancel_role)
+        app._pick_and_verify_neighbor_files()
+        assert events[-1][0] == "role" and "files" not in events
+        app.after(100, cancel_role)
+        app._load_neighbor_files()
+        assert events[-1][0] == "role" and "files" not in events
+
+        # При выборе соседей файловый диалог открывается строго после выбора роли.
+        def choose_neighbor():
+            events.append("choose-neighbor")
+            app._source_role_dialog._role_buttons["neighbor"].invoke()
+        app.after(100, choose_neighbor)
+        app._load_pdf()
+        assert events[-2:] == ["choose-neighbor", "files"]
+        assert app._source_role_dialog is None
+
+        main_text = tmp_path / "main.txt"
+        main_text.write_text(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"], encoding="utf-8")
+        monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append("files-main") or (str(main_text),))
+        def choose_main():
+            events.append("choose-main")
+            app._source_role_dialog._role_buttons["main"].invoke()
+        app.after(100, choose_main)
+        app._pick_and_verify_neighbor_files()
+        assert events[-2:] == ["choose-main", "files-main"]
+        assert app._current_source_mode() == "📝 Текст" and not app.is_neighbor_mode()
+        assert main_text.name in app._text_source_label and not app._busy
+        app.source_mode_var.set("📝 Текст")
+        app._on_source_mode_changed()
+        app.update()
+        assert app.role_bar.winfo_ismapped()
+
+        desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+        builder = AcadBuilder(app.config_data)
+        main_plan = builder.plan(desc)
+        main_plan.suspicion = LotSuspicionReport(
+            shape_kind="основной", status="error",
+            items=[SuspicionItem("main-error", "error", "Ошибка основного", "Проверить документ")],
+        )
+        neighbor = builder.plan(desc, is_neighbor=True)
+        neighbor.suspicion = LotSuspicionReport(shape_kind="сосед", status="ok", items=[])
+        pair_status = ["warn"]
+        monkeypatch.setattr(main, "verify_with_neighbors", lambda *_: NeighborVerificationReport(
+            overall_status=pair_status[0], warning_count=int(pair_status[0] == "warn"),
+            pair_reports=[NeighborPairReport(1, "сосед", status=pair_status[0])],
+        ))
+        app._record_plan_for_preview(neighbor, source=tmp_path / "clean.pdf")
+        app.update()
+        assert app.result_tab_buttons["🏘 Соседи"].cget("fg_color") == main.THEME["bg_field"]
+        assert app.neighbors_scroll_frame.winfo_children()[0].cget("fg_color") == main.THEME["bg_inset"]
+        app._record_plan_for_preview(main_plan)
+        app._record_plan_for_preview(neighbor, source=tmp_path / "clean.pdf")
+        app._select_result_tab("🛡 Проверки")
+        app.update()
+        checks = app.result_tab_buttons["🛡 Проверки"]
+        neighbors = app.result_tab_buttons["🏘 Соседи"]
+        assert checks.cget("fg_color") == "#dc2626"
+        assert neighbors.cget("fg_color") == "#92400e"
+        assert checks.cget("text") == "⛔ Проверки" and neighbors.cget("text") == "⚠ Соседи"
+
+        def labels(widget):
+            own = [str(widget.cget("text"))] if isinstance(widget, ctk.CTkLabel) else []
+            return own + [text for child in widget.winfo_children() for text in labels(child)]
+        visible = "\n".join(labels(app.checks_scroll_frame))
+        assert "Ошибка основного" in visible and "clean.pdf" in visible
+        assert "Замечаний к форме не найдено" in visible
+        app._select_result_tab("🏘 Соседи")
+        app.update()
+        assert checks.cget("fg_color") == "#991b1b" and neighbors.cget("fg_color") == "#d97706"
+        app._clear_neighbors_scene()
+        app.update()
+        assert neighbors.cget("fg_color") == main.THEME["seg_sel"]
+        assert checks.cget("fg_color") == "#991b1b"
+        pair_status[0] = "ok"
+        main_plan.suspicion = LotSuspicionReport(shape_kind="основной", status="ok", items=[])
+        app._record_plan_for_preview(main_plan)
+        app._record_plan_for_preview(neighbor, source=tmp_path / "clean.pdf")
+        app._select_result_tab("🛡 Проверки")
+        app.update()
+        assert checks.cget("fg_color") == "#059669" and checks.cget("text") == "✓ Проверки"
+        assert neighbors.cget("fg_color") == "#065f46" and neighbors.cget("text") == "✓ Соседи"
+        assert not errors, "\n".join(errors)
     finally:
         app.destroy()

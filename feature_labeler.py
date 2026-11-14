@@ -90,6 +90,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "point_label_layers": ["POINT_LABELS", "PNT-X", "PNTS"],
     "fence_layers": ["S-FENCE", "ST-WALL", "CODE_CREW", "FENCE_*"],
     "fence_layer_exclude": ["*_NOTE"],
+    #: линии, соединяющие снятые точки (CODE_CREW): забором они считаются
+    #: только там, где рядом стоит код забора; без кода — молча пропускаются
+    "code_linework_layers": ["CODE_CREW"],
     #: калитки и ворота: подпись «<сокращение материала> / GATE» поперёк линии
     "gate_layers": ["GATE_*", "*_GATE"],
     "structure_layers": {
@@ -106,7 +109,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
             "GRASS_STRIP_EDGE",
         ],
     },
-    "step_tread_layers": ["*_STEP_TREADS"],
+    "step_tread_layers": ["*TREADS*"],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
     #: слои готовых подписей (итоговый чертёж): по ним проверяются дубликаты
@@ -114,7 +117,16 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- источник 1: заметки полевого чертёжника -----------------------------
     #: слои полевых заметок: текст заметки переводится в формулировку заказчика
     #: и ставится в D-TOPO-TEXT у объекта, на который указывает заметка
-    "field_note_layers": ["FENCE_NOTE", "ENTRANCE_TEXT", "SURFACE_TEXT", "CONTEXT_TEXT"],
+    "field_note_layers": [
+        "FENCE_NOTE",
+        "ENTRANCE_TEXT",
+        "SURFACE_TEXT",
+        "CONTEXT_TEXT",
+        "CONTEXT_SURFACE_TEXT",
+        "LOW_EDGE_NOTE",
+        "*_NOTE",
+        "*_TEXT",
+    ],
     #: Правила перевода. Срабатывает ПЕРВОЕ подходящее правило. ``target`` —
     #: категория объекта, к которому привязывается подпись: fence, gate, shed,
     #: porch, steps, planter, surface либо ground (покрытие/грунт: подпись
@@ -274,7 +286,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: после подписания выключить слои полевых заметок (их заменили подписи)
     "hide_field_notes_after_labeling": True,
     "fence_min_extra_length_ft": 4.0,
-    "fence_text_offset_factor": 0.8,
+    #: расстояние от линии забора до середины текста, в высотах текста
+    "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
     #: подпись ставится на каждом прямом участке забора не короче этой длины
     "fence_label_every_run_min_ft": 25.0,
@@ -284,9 +297,23 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "fence_min_label_length_ft": 3.0,
     "straight_angle_tolerance_deg": 2.0,
     "text_clearance_factor": 0.3,
-    "line_clearance_factor": 0.15,
+    "line_clearance_factor": 0.3,
     "inside_clearance_factor": 0.3,
     "mtext_line_spacing_factor": 1.67,
+    #: Ширина символов шрифта подписей в высотах текста (чертёжный SHX-шрифт
+    #: заказчика): буква/цифра, пробел, узкий знак. В AutoCAD эти значения
+    #: уточняются измерением пробного текста (measure_text_in_autocad).
+    "char_width_factor": 0.92,
+    "space_width_factor": 1.0,
+    "narrow_char_width_factor": 0.5,
+    "narrow_chars": ".,'`:;!|",
+    "measure_text_in_autocad": True,
+    #: короткие заборы целиком за пределами участка (возвраты и продолжения
+    #: соседских заборов) сокращением «C.L.F.» не подписываются
+    "label_short_fences_outside_lot": False,
+    "fence_near_lot_ft": 2.0,
+    #: заметка о покрытии снимает подпись по слою у такого же покрытия в этом радиусе
+    "field_note_surface_radius_ft": 15.0,
     #: "arc" — короткая дуговая выноска полилинией со стрелкой (как у заказчика);
     #: "leader" — объект AddLeader с полкой
     "leader_style": "arc",
@@ -422,6 +449,7 @@ class LayerClassifier:
         self._obstacle = _as_patterns(fcfg.get("obstacle_layers"))
         self._obstacle_exclude = _as_patterns(fcfg.get("obstacle_layer_exclude"))
         self._text_obstacle = _as_patterns(fcfg.get("text_obstacle_layers"))
+        self._code_linework = _as_patterns(fcfg.get("code_linework_layers"))
         self._cache: dict[tuple[str, str], Any] = {}
 
     def _cached(self, kind: str, layer: str, compute: Any) -> Any:
@@ -445,12 +473,18 @@ class LayerClassifier:
 
     def structure_category(self, layer: str) -> str | None:
         def compute() -> str | None:
+            if self.is_tread(layer):
+                return None  # линии проступей — не контур ступеней
             for category, patterns in self._structures:
                 if layer_matches(layer, patterns):
                     return category
             return None
 
         return self._cached("struct", layer, compute)
+
+    def is_code_linework(self, layer: str) -> bool:
+        """Линии между снятыми точками: без кода забора подписи не требуют."""
+        return self._cached("crew", layer, lambda: layer_matches(layer, self._code_linework))
 
     def structure_rank(self, layer: str) -> int:
         """Позиция слоя внутри своей категории (для выбора основного дома)."""
@@ -483,6 +517,8 @@ class LayerClassifier:
         """Слой заметок полевого чертёжника (источник подписей, не препятствие)."""
         def compute() -> bool:
             if self.is_existing_label(layer) or self.is_point_label(layer):
+                return False
+            if self.is_property(layer) or layer_matches(layer, self._text_obstacle):
                 return False
             return layer_matches(layer, self._notes)
 
@@ -1195,6 +1231,9 @@ class Feature:
     tread_count: int = 0
     note_text: str = ""  # исходный текст полевой заметки (source == "field_note")
     skip_reason: str = ""  # почему объект намеренно оставлен без подписи
+    #: контур, внутри которого лежит объект (крыльцо для ступеней без своего
+    #: контура): подпись ставится за пределами этого контура
+    host: BaseGeometry | None = None
 
     @property
     def flat_label(self) -> str:
@@ -1433,6 +1472,9 @@ def translate_field_note(text: str, rules: Any) -> tuple[str, dict[str, str]] | 
     return None
 
 
+#: причина пропуска линии слоя ``code_linework_layers`` без кода забора
+CODE_LINEWORK_REASON = "линия между точками съёмки без кода забора"
+
 _FILE_REFERENCE_RE = re.compile(
     r"\.(png|jpe?g|tiff?|bmp|gif|pdf|dwg|dxf|ecw|sid|jp2|csv|txt)\b", re.IGNORECASE
 )
@@ -1506,23 +1548,88 @@ def _collect_field_notes(
     return notes
 
 
+def _tread_clusters(
+    treads: Sequence[tuple[str, LineString]], gap: float = 1.6
+) -> list[tuple[str, BaseGeometry]]:
+    """Группы линий проступей (одна лестница): ``(слой, выпуклая оболочка)``."""
+    if not treads:
+        return []
+    groups = _connected_groups([line for _layer, line in treads], gap)
+    by_id = {id(line): layer for layer, line in treads}
+    clusters: list[tuple[str, BaseGeometry]] = []
+    for group in groups:
+        hull = unary_union(list(group)).convex_hull
+        if hull.geom_type != "Polygon" or hull.area < 0.05:
+            hull = hull.buffer(0.3, cap_style=2)
+        clusters.append((by_id.get(id(group[0]), ""), hull))
+    return clusters
+
+
 def _apply_field_notes(
     result: "RecognitionResult",
     notes: Sequence[FieldNote],
     fcfg: dict[str, Any],
     new_id: Any,
+    treads: Sequence[tuple[str, LineString]] = (),
 ) -> None:
     """
     Привязывает переведённые заметки к объектам: подпись заметки заменяет
     подпись по коду точки и по слою. Заметка о покрытии/грунте (и заметка,
     объект которой не найден) ставится отдельной подписью в своей точке.
+
+    Ступени без собственного контура (в чертеже есть только линии проступей
+    внутри контура крыльца) получают объект по этим линиям: подпись
+    ``CONC. STEPS`` ставится рядом с лестницей, за контуром крыльца.
     """
     radius = max(0.0, float(fcfg.get("field_note_bind_radius_ft") or 0.0))
+    wide = max(radius, float(fcfg.get("field_note_surface_radius_ft") or 0.0))
+    synonyms = fcfg.get("label_synonyms")
     claims: dict[int, tuple[float, FieldNote, str]] = {}
     spots: list[tuple[FieldNote, str, str, str]] = []  # заметка, подпись, категория, пояснение
+    # Лестницы без контура: группы проступей, не лежащие в контуре ступеней.
+    step_areas = [
+        f.geometry for f in result.features if f.category == "steps" and f.kind == "area"
+    ]
+    clusters = [
+        (layer, hull) for layer, hull in _tread_clusters(treads)
+        if not any(area.buffer(0.3).intersects(hull.centroid) for area in step_areas)
+    ]
+    used_clusters: set[int] = set()
     for note in notes:
         for target, label in note.labels.items():
             anchors: list[BaseGeometry] = [Point(tip) for tip in note.tips] or [note.box]
+            if target == "steps" and clusters:
+                # Ближайшая лестница без контура — раньше, чем чужой контур ступеней.
+                near = [
+                    (min(hull.distance(anchor) for anchor in anchors), index)
+                    for index, (_layer, hull) in enumerate(clusters)
+                    if index not in used_clusters
+                ]
+                near = [pair for pair in near if pair[0] <= 2.0 * radius]
+                outlined = [
+                    min(f.geometry.distance(anchor) for anchor in anchors)
+                    for f in result.features
+                    if f.category == "steps" and f.kind in {"area", "edge"}
+                ]
+                if near and (not outlined or min(near)[0] < min(outlined)):
+                    distance, index = min(near)
+                    layer, hull = clusters[index]
+                    used_clusters.add(index)
+                    hosts = [
+                        f.geometry for f in result.features
+                        if f.kind == "area" and f.category in {"porch", "steps"}
+                        and f.geometry.buffer(0.3).intersects(hull.centroid)
+                    ]
+                    result.features.append(
+                        Feature(
+                            feature_id=new_id(), kind="area", category="steps", layer=layer,
+                            geometry=hull, label=label, source="field_note",
+                            rule=note.pattern, note_text=note.text, closed=False,
+                            host=min(hosts, key=lambda g: g.area) if hosts else None,
+                        )
+                    )
+                    note.status = "bound"
+                    continue
             best: tuple[tuple[float, float, int], int] | None = None
             for index, feature in enumerate(result.features):
                 if feature.is_main_house or feature.kind in {"point", "spot"}:
@@ -1549,6 +1656,17 @@ def _apply_field_notes(
                         feature.label = None
                         feature.source = None
                         feature.skip_reason = f"покрытие подписано по заметке «{note.text}»"
+                    # То же покрытие чуть дальше (тротуар в 8 ft от заметки
+                    # «CONCRETE SIDEWALK»): двух одинаковых подписей не нужно.
+                    for other in result.features:
+                        if other.category != "surface" or other.source != "layer":
+                            continue
+                        if not other.label or not labels_similar(other.label, label, synonyms):
+                            continue
+                        if min(other.geometry.distance(anchor) for anchor in anchors) <= wide:
+                            other.label = None
+                            other.source = None
+                            other.skip_reason = f"покрытие подписано по заметке «{note.text}»"
                     spots.append((note, label, GROUND_TARGET, ""))
                     continue
             if best is None:
@@ -1861,6 +1979,7 @@ def recognize_features(
     fence_lines: dict[str, list[LineString]] = {}
     structure_lines: dict[str, list[LineString]] = {}
     tread_lines: list[LineString] = []
+    tread_layers: list[tuple[str, LineString]] = []
     for line in snapshot.lines:
         is_fence = classifier.is_fence(line.layer)
         category = classifier.structure_category(line.layer)
@@ -1872,6 +1991,8 @@ def recognize_features(
             continue
         if is_tread:
             tread_lines.append(geom)
+            if geom.intersects(zone):
+                tread_layers.append((line.layer, geom))
         elif category:
             structure_lines.setdefault(line.layer, []).append(geom)
         else:
@@ -1999,6 +2120,11 @@ def recognize_features(
                 label=mapped[0] if mapped else None,
                 source="layer" if mapped else None,
                 rule=mapped[1] if mapped else "",
+                # Линия между снятыми точками без кода забора — не забор.
+                skip_reason=(
+                    CODE_LINEWORK_REASON
+                    if not mapped and classifier.is_code_linework(layer) else ""
+                ),
             )
         )
 
@@ -2089,7 +2215,7 @@ def recognize_features(
 
     # --- заметки полевого чертёжника: формулировки заказчика ----------------
     result.field_notes = _collect_field_notes(snapshot, classifier, fcfg, zone)
-    _apply_field_notes(result, result.field_notes, fcfg, new_id)
+    _apply_field_notes(result, result.field_notes, fcfg, new_id, tread_layers)
 
     # --- точечные объекты (столбы, колодцы, гидранты) -----------------------
     if bool(fcfg.get("label_point_features", False)):

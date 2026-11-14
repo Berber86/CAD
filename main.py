@@ -6453,8 +6453,27 @@ class SurveyApp(ctk.CTk):
 
 
 def main() -> None:
-    app = SurveyApp()
-    app.mainloop()
+    """Точка входа: любой сбой сборки/запуска интерфейса пишется в лог, а окно не схлопывается молча."""
+    try:
+        app = SurveyApp()
+        app.mainloop()
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        report = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+        log_path: Path | None = None
+        try:
+            log_path = Path.home() / "tsai_crash.log"
+            log_path.write_text(report, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            log_path = None
+        print(report)
+        if log_path is not None:
+            print(f"\nОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}")
+        try:
+            input("Нажмите Enter, чтобы закрыть окно...")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

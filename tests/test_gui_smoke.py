@@ -935,6 +935,46 @@ def test_gui_studio_ux_drawer_preview_canvas_and_inspector(gui, monkeypatch, tmp
     app._on_close()
 
 
+def test_empty_photo_tab_offers_first_file_and_tracks_source(gui, monkeypatch, tmp_path):
+    from tkinter import filedialog
+    from PIL import Image
+    import llm_parser
+
+    monkeypatch.setattr(gui, "load_config", lambda: llm_parser.load_config(tmp_path / "config.json"))
+    monkeypatch.setattr(gui, "_stored_provider_keys", lambda: {})
+    app = gui.SurveyApp()
+    app.source_mode_var.set("📷 Фото")
+    app._on_source_mode_changed()
+    assert app.photo_empty_card._gridded is True
+    assert app.photo_load_button._gridded is True
+    assert app.visual_bar._gridded is False
+    assert app.pdf_mode_card._gridded is False
+
+    # Отмена диалога не убирает кнопку; выбор файла показывает инструменты.
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: ())
+    app.photo_load_button.cget("command")()
+    assert app.photo_empty_card._gridded is True
+    image = tmp_path / "survey.jpg"
+    Image.new("RGB", (30, 40), "white").save(image)
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(image),))
+    app.photo_load_button.cget("command")()
+    assert app.image_paths == [image]
+    assert app.photo_empty_card._gridded is False
+    assert app.visual_bar._gridded is True
+
+    app.source_mode_var.set("📝 Текст")
+    app._on_source_mode_changed()
+    assert app.photo_empty_card._gridded is False
+    assert app.visual_bar._gridded is False
+    app.source_mode_var.set("📷 Фото")
+    app._on_source_mode_changed()
+    assert app.visual_bar._gridded is True
+    app._reset_visual_sources()
+    assert app.visual_bar._gridded is False
+    assert app.photo_empty_card._gridded is True
+    app._on_close()
+
+
 def test_gui_archival_jpg_bundle_rotation_preview_and_neighbor_photos(
     gui, monkeypatch, tmp_path
 ):

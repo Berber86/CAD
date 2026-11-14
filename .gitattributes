@@ -1,0 +1,3 @@
+# Windows cmd.exe может неверно находить метки goto в файлах с LF.
+# CRLF применяется при checkout и в GitHub ZIP-архивах.
+*.bat text eol=crlf

@@ -1263,6 +1263,26 @@ class SurveyApp(ctk.CTk):
         )
         self.load_images_button.grid(row=3, column=0, sticky="ew", pady=(10, 0))
 
+        # Пустой режим «📷 Фото» тоже должен позволять выбрать первый файл.
+        self.photo_empty_card = ctk.CTkFrame(input_frame, fg_color="transparent")
+        self.photo_empty_card.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
+        self.photo_empty_card.grid_columnconfigure(0, weight=1)
+        self.photo_load_button = ctk.CTkButton(
+            self.photo_empty_card,
+            text="📷  Выберите фото чертежа\nJPG · PNG · TIFF · несколько кадров · Ctrl+I",
+            height=132,
+            fg_color=THEME["bg_field"],
+            hover_color=THEME["blue_soft_bg"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=10,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_muted"],
+            command=self._load_images,
+        )
+        self.photo_load_button.grid(row=0, column=0, sticky="ew")
+        self.photo_empty_card.grid_remove()
+
         # Панель режима «📷 Фото»: кадр, навигация/поворот и фильтры сканов 80-х
         self.visual_bar = ctk.CTkFrame(
             input_frame,
@@ -3272,7 +3292,11 @@ class SurveyApp(ctk.CTk):
             self._refresh_auto_orient_warning()
             if self._current_source_mode() == "📷 Фото":
                 self.visual_bar.grid_remove()
+                self.photo_empty_card.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
+            else:
+                self.photo_empty_card.grid_remove()
             return
+        self.photo_empty_card.grid_remove()
         total = self._visual_frame_count()
         while len(self._visual_rotations) < total:
             self._visual_rotations.append(0)

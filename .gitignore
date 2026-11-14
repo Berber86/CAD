@@ -11,3 +11,7 @@ logs/
 *.log
 .env
 config.local.json
+
+# дампы чертежей (inspect_dwg.py)
+*.dump.json
+*.dump.txt

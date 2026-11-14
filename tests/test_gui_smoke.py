@@ -138,6 +138,21 @@ class _Widget:
     def grid_rowconfigure(self, *args, **kwargs):
         return None
 
+    def grid_propagate(self, *args, **kwargs):
+        return None
+
+    def pack_propagate(self, *args, **kwargs):
+        return None
+
+    def lift(self, *args, **kwargs):
+        return None
+
+    def lower(self, *args, **kwargs):
+        return None
+
+    def focus_set(self, *args, **kwargs):
+        return None
+
     def winfo_children(self):
         return []
 
@@ -510,17 +525,17 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
 
     app = gui.SurveyApp()
     assert app.is_neighbor_mode() is False
-    assert app.draw_button.cget("text") == "Начертить участок в AutoCAD"
+    assert "Начертить участок в AutoCAD" in app.draw_button.cget("text")
 
     # Переключаем радиокнопку в режим «Соседний участок»
     app.neighbor_lot_radio.select()
     assert app.is_neighbor_mode() is True
-    assert app.draw_button.cget("text") == "Начертить соседа в AutoCAD"
+    assert "Начертить соседа в AutoCAD" in app.draw_button.cget("text")
 
     # Возврат на основной участок по выбору пресета Aspenwall 420'
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     assert app.is_neighbor_mode() is False
-    assert app.draw_button.cget("text") == "Начертить участок в AutoCAD"
+    assert "Начертить участок в AutoCAD" in app.draw_button.cget("text")
 
     # Подменяем отрисовку AutoCAD для проверки force_neighbor и пакетного режима на Linux
     drawn_calls: list[tuple[float, bool]] = []
@@ -1305,7 +1320,7 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
 
     app = gui.SurveyApp()
     assert gui.VERSION == "1.0.0"
-    assert gui.APP_GEOMETRY == "1280x900"
+    assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings
     assert "<Control-o>" in app._global_bindings

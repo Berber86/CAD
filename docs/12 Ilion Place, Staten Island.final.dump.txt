@@ -1,0 +1,57 @@
+ДАМП ЧЕРТЕЖА: 12 Ilion Place, Staten Island.dwg
+Файл: C:\Ser\mlp\2\12 Ilion Place, Staten Island.dwg
+Область: только выбранные объекты · объектов в ModelSpace: 3729 · записано: 250 · ошибок чтения: 0
+Единицы чертежа: INSUNITS = 2 (футы); DIMSCALE = 1; LTSCALE = 1; масштаб аннотаций: 1:1
+Габариты: X 4 944.00 … 5 075.19, Y 4 900.59 … 5 119.13 (131.18 × 218.54)
+
+=== 1. СЛОИ И ОБЪЕКТЫ НА НИХ ===
+Слой '0': MText: 2 | высота текста: 1.5 ×1, 1.2 ×1 | Примеры текста: ['xqc;2 STY FRAME (PARTIALLY BRICK FACE) W', 'SCALE: 1"=16\'']
+Слой 'BORDER': Polyline: 1
+Слой 'Bldg': MText: 2 | высота текста: 1.5 ×1, 1.6362 ×1 | Примеры текста: ['Surveyed: November 4, 2026 ANDRZEJ M. GA', 'TITLE No: SAI9260 CERTIFIED TO: SERGEANT']
+Слой 'CURB LINE': MText: 1 | высота текста: 0.9 ×1 | Примеры текста: ['Certification indicated hereon signify t']
+Слой 'D-TOPO-TEXT': Text: 43, MText: 36, Leader: 20, Solid: 8, Line: 6 | высота текста: 0.9 ×74, 1.1 ×5 | Примеры текста: ['V.FE.', 'TREES', "BLDG 6.2'E"]
+Слой 'LETTER': Text: 2 | высота текста: 4 ×2 | Примеры текста: ['EBONY STREET', 'ILION PLACE']
+Слой 'M-NTH-ARROW': BlockReference: 1
+Слой 'M-ROW-LINE': Line: 6
+Слой 'M-TAX-DIM': Text: 7 | высота текста: 2 ×5, 1.6 ×2 | Примеры текста: ["81.98'", "(50' WIDE)", 'S 79°54\'29" W 40.00\'']
+Слой 'S-FENCE': Line: 24
+Слой 'S-ROAD-DWY': Line: 2
+Слой 'S-ROAD-SW-LINE': Line: 5
+Слой 'ST-BLDG-LINE': Line: 10
+Слой 'ST-MISC': Line: 45, Hatch: 3, Polyline: 1, MText: 1 | высота текста: 1.2188 ×1 | Примеры текста: ['NOTES: xi-2,l2;1. THE OFFSETS OR DIMENSI']
+Слой 'ST-OHED': Line: 3
+Слой 'ST-WALL': Line: 21
+Слои без записанных объектов (129): AQUESTION, BRGTXT, BUILD, CONC, CONTROL, D-BASELINE, D-BASELINE-TIES, D-BORDER, D-KEY-LAYOUT, D-LEGEND, D-MTCH-LINE, D-MTCH-LINE-SHEET1, D-MTCH-LINE-SHEET2, D-NOTES, D-ROAD-MISC, D-VIEW-PORT, Defpoints, ELEV, EXIST, FENCE, GRID, HEDGE, HEDGEDESC, HEDGEELEV, HEDGEMARK, HEDGENO, LCON, M-BASE-LINE, M-BULKHEAD-LINE, M-EASEMENT, M-GRADIENT-BX-LINE, M-LEGAL-GRADE, M-PARKS-BNDY-LINE, M-PIERHEAD-BULK-LINE, M-PIERHEAD-LINE, M-REC-ROW-LINE, M-ROW-DIM, M-ROW-TEXT, M-TAX-LINE, M-TAX-TEXT, P-CENTERLINE, P-GRID, P-HWY-BLDG, P-HWY-BOC, P-HWY-BOC-MED, P-HWY-BOW, P-HWY-ROW, P-HWY-TOC, P-HWY-TOC-MED, P-LEGAL-GRADE, P-SEWR, P-SEWR-COMB, P-SEWR-SAN, P-SEWR-STM, PL, PNT-X, PNTDESC, PNTELEV, PNTNO, PNTS, PNTSYMB, POOL, PROP, PT_N, PT_S, S-CD, S-CONC-MISC, S-CONT-BASELINE, S-CONT-MON, S-CONT-PNTS, S-CONT-SET, S-CURB-DROP, S-CURB-LINE, S-DWY, S-GUIDE-RAIL, S-MHWL, S-MISC-IRON, S-MLWL, S-PROP-LINE, S-ROAD-CL, S-ROAD-EOP, S-ROAD-JERSEY-BAR, S-ROAD-TCURB, S-RR, S-SLOPE-BOT, S-SLOPE-TOP, S-TOPO-MISC, S-TOPO-XSEC, S-TREE, S-TREE-HEDG, S-TREE-PINE, S-TREE-TEXT, S-WETLAND, S-WETLAND-ADJ, ST-BLDG-ELEV, ST-BLDG-HATCH, ST-BLDG-TEXT, ST-STEP, ST-SUBW-LIMT-LINE, STEP, TEXT, TXT, U-CABLE-IRON, U-CABLE-LINE, U-ELEC-IRON, U-ELEC-LINE, U-FIRE-IRON, U-FIRE-LINE, U-GAS-IRON, U-GAS-LINE, U-MISC-IRON, U-MISC-OHED, U-SEWR-ELEV, U-SEWR-FLOW, U-SEWR-IRON, U-SEWR-LINE, U-SEWR-LINE-COMB, U-SEWR-LINE-SAN, U-SEWR-LINE-STM, U-STEAM-IRON, U-STEAM-LINE, U-SUBW-IRON, U-SUBW-LINE, U-TELE-IRON, U-TELE-LINE, U-TRAF-IRON, U-WATR-IRON, U-WATR-LINE, WALL
+
+=== 2. ТЕКСТОВЫЕ СТИЛИ ===
+  - 'Standard': шрифт romans.shx, высота 0.9, сжатие 1 · текстов: 1
+  - 'ROMANS': шрифт romans.shx, высота 0, сжатие 1 · текстов: 86
+  - 'ROMAND': шрифт romand, высота 0, сжатие 1 · текстов: 0
+  - 'STANDARD2': шрифт Arial, высота 0, сжатие 1 · текстов: 0
+  - 'ROMANT': шрифт romant.shx, высота 0, сжатие 1 · текстов: 2
+  - 'SITELINEDIM': шрифт romant.shx, высота 3.2, сжатие 1 · текстов: 0
+  - 'GOTHICE': шрифт gothice.shx, высота 0, сжатие 1 · текстов: 0
+  - 'RDTEXT': шрифт romans.shx, высота 0, сжатие 1 · текстов: 0
+  - 'ROMAND-I': шрифт romand.shx, высота 0, сжатие 1 · текстов: 0
+  - '': шрифт ltypeshp.shx, высота 0, сжатие 1 · текстов: 0
+  - 'STREETLINEDIM': шрифт romand.shx, высота 2.8, сжатие 1 · текстов: 0
+  - 'ARIAL': шрифт Arial, высота 50, сжатие 0.85 · текстов: 0
+  - 'PTXT': шрифт TXT, высота 0, сжатие 1 · текстов: 0
+  - 'Legend': шрифт Calibri, высота 0, сжатие 1 · текстов: 0
+  - 'TEXT': шрифт Times New Roman, высота 14, сжатие 1 · текстов: 0
+  - 'RDS': шрифт ROMAND.shx, высота 0, сжатие 0.8 · текстов: 1
+  - 'style2': шрифт Times New Roman, высота 1.2, сжатие 1 · текстов: 1
+  - 'RS': шрифт ROMANS.shx, высота 0, сжатие 0.8 · текстов: 1
+  - 'BASE': шрифт Romans.shx, высота 0.1, сжатие 0.85 · текстов: 0
+  - 'BASE-PN': шрифт Romans.shx, высота 0.5, сжатие 0.85 · текстов: 0
+  - 'MtXpl_Times_New_Roma': шрифт Times New Roman, высота 0, сжатие 1 · текстов: 2
+  - 'STREET': шрифт Times New Roman, высота 14, сжатие 0.77 · текстов: 0
+
+=== 3. БЛОКИ (СТРЕЛКА СЕВЕРА, РАМКА) ===
+  - Блок 'NA' ×1 | Слой: 'M-NTH-ARROW' | Поворот: 350.326°
+
+=== 4. ОТДЕЛЬНЫЕ ГРУППЫ ОБЪЕКТОВ (несколько чертежей в одном файле; оценка) ===
+  Все объекты лежат одной группой.
+
+=== 5. ЛИСТЫ ===
+  - 'layout': Viewport: 2 | масштабы видовых экранов: [0.03333333, 1]

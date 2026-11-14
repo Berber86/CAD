@@ -2744,3 +2744,65 @@ def test_ask_on_doubt_policy_sane_autonomy_vs_strict_human_confirmation() -> Non
 
 
 
+
+
+def test_text_pdf_selected_pages_use_only_local_text_layer(tmp_path, monkeypatch):
+    pymupdf = pytest.importorskip("pymupdf")
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, PDFError, parse_legal_description_full
+
+    pdf = tmp_path / "two-lots.pdf"
+    doc = pymupdf.open()
+    for sample in (
+        ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"],
+        ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"],
+        None,
+    ):
+        page = doc.new_page()
+        if sample:
+            assert page.insert_textbox(pymupdf.Rect(25, 25, 575, 800), sample, fontsize=9) >= 0
+    doc.save(pdf)
+    doc.close()
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("API не нужен"))
+    monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
+
+    for spec, distance in (("1", 365.0), ("2", 475.0)):
+        outcome = parse_legal_description_full(pdf_path=pdf, pdf_pages=spec, use_llm=False)
+        assert outcome.source == "regex"
+        assert outcome.data.distance_to_corner_ft == pytest.approx(distance)
+    with pytest.raises(PDFError, match="выбранных страницах.*текстового слоя"):
+        parse_legal_description_full(pdf_path=pdf, pdf_pages="3", use_llm=False)
+    with pytest.raises(PDFError, match="вне диапазона"):
+        parse_legal_description_full(pdf_path=pdf, pdf_pages="5", use_llm=False)
+
+
+def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
+    """COM получает готовые координаты и метки, а не заново рассчитанный контур."""
+    import acad_builder as module
+    from llm_parser import ASPENWALL_SAMPLES
+
+    monkeypatch.setattr(module, "_co_initialize", lambda: False)
+    monkeypatch.setattr(module, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
+    monkeypatch.setattr(module, "_variant_points", lambda points: [c for p in points for c in p])
+    builder = AcadBuilder(load_config())
+    app = FakeApp()
+    builder._app, builder._doc = app, app.doc
+    main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    neighbor_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    main_plan = builder.plan(main_desc, scale=10, is_neighbor=False)
+    neighbor_plan = builder.plan(neighbor_desc, scale=20, is_neighbor=True)
+    main_edges = [(edge.start, edge.end) for edge in main_plan.boundary_lines]
+    neighbor_edges = [(edge.start, edge.end) for edge in neighbor_plan.boundary_lines]
+    monkeypatch.setattr(builder, "plan", lambda *a, **kw: pytest.fail("план не должен пересчитываться"))
+
+    first = builder.draw_plan(main_plan)
+    second = builder.draw_plan(neighbor_plan)
+    assert first.plan is main_plan and second.plan is neighbor_plan
+    assert first.text_height == main_plan.text_height
+    space = app.doc.ModelSpace
+    for layer, edges in (("PROPERTY_LINE", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+        lines = [line for line in space.lines if line.Layer == layer]
+        assert len(lines) == len(edges)
+        for line, (start, end) in zip(lines, edges):
+            assert line.StartPoint == pytest.approx([*start, 0])
+            assert line.EndPoint == pytest.approx([*end, 0])

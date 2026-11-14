@@ -127,8 +127,10 @@ STEP2_EMPTY_REPORT = (
     "1. Откройте в AutoCAD чертёж, в котором уже посажена граница участка (Шаг 1).\n"
     "2. При необходимости введите текст для основного дома.\n"
     "3. Нажмите «Автопоиск участка и подписание объектов» либо укажите границу в AutoCAD.\n\n"
-    "В отчёте будет показано, сколько объектов найдено по кодам точек (POINT_LABELS), "
-    "сколько — по именам слоёв и сколько подписано."
+    "Заметки полевого чертёжника переводятся в формулировки заказчика (WOOD PORCH → FRAME DECK, "
+    "PAVERS → DECO. PAVERS, CHAIN LINK GATE → C.L.F. / GATE) и ставятся в слой D-TOPO-TEXT.\n"
+    "В отчёте будет показано, сколько объектов найдено по заметкам, по кодам точек "
+    "(POINT_LABELS), по именам слоёв и сколько подписано."
 )
 
 
@@ -362,6 +364,11 @@ class SurveyApp(ctk.CTk):
         self.house_text_var = ctk.StringVar(value="")
         self.skip_existing_labels_var = ctk.BooleanVar(
             value=bool(feature_settings(self.config_data).get("skip_existing_labels", True))
+        )
+        self.hide_field_notes_var = ctk.BooleanVar(
+            value=bool(
+                feature_settings(self.config_data).get("hide_field_notes_after_labeling", True)
+            )
         )
         self.feature_label_result: FeatureLabelResult | None = None
         self._step2_report_text = ""
@@ -2485,7 +2492,7 @@ class SurveyApp(ctk.CTk):
         panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
         panel.grid_propagate(False)
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(9, weight=1)
+        panel.grid_rowconfigure(11, weight=1)
 
         ctk.CTkLabel(
             panel,
@@ -2571,7 +2578,29 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=420,
         )
-        self.step2_dedup_hint.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.step2_dedup_hint.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 4))
+        self.hide_field_notes_check = ctk.CTkCheckBox(
+            panel,
+            text="Выключить слои полевых заметок после подписания",
+            variable=self.hide_field_notes_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.hide_field_notes_check.grid(row=5, column=0, sticky="w", padx=16, pady=(2, 2))
+        self.step2_notes_hint = ctk.CTkLabel(
+            panel,
+            text=self._feature_notes_hint(),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.step2_notes_hint.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         self.step2_height_label = ctk.CTkLabel(
             panel,
@@ -2582,7 +2611,7 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=420,
         )
-        self.step2_height_label.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step2_height_label.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 10))
 
         self.feature_auto_button = ctk.CTkButton(
             panel,
@@ -2593,7 +2622,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=lambda: self._start_feature_labeling("auto"),
         )
-        self.feature_auto_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.feature_auto_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.feature_pick_button = ctk.CTkButton(
             panel,
             text="🖱  Указать границу участка в AutoCAD и подписать объекты",
@@ -2603,7 +2632,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=lambda: self._start_feature_labeling("pick"),
         )
-        self.feature_pick_button.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.feature_pick_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
         ctk.CTkLabel(
             panel,
             text=(
@@ -2617,7 +2646,7 @@ class SurveyApp(ctk.CTk):
             anchor="w",
             justify="left",
             wraplength=420,
-        ).grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 8))
+        ).grid(row=10, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         # --- Правая карточка: счётчики и подробный отчёт ----------------------
         report_card = ctk.CTkFrame(
@@ -2635,6 +2664,7 @@ class SurveyApp(ctk.CTk):
         stats.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         self.step2_stat_vars: dict[str, Any] = {}
         stat_defs = (
+            ("notes", "По заметкам", THEME["sky"]),
             ("codes", "По кодам точек", THEME["sky"]),
             ("layers", "По слоям", THEME["sky"]),
             ("labeled", "Подписано", THEME["ok"]),
@@ -2721,8 +2751,18 @@ class SurveyApp(ctk.CTk):
         layers = ", ".join(str(name) for name in fcfg.get("existing_label_layers") or [])
         radius = float(fcfg.get("duplicate_radius_ft") or 0.0)
         return (
-            f"Перед подписанием читаются тексты слоёв {layers}: если рядом с объектом "
-            f"(в радиусе {radius:g} ft) уже стоит аналогичная надпись, дубликат не создаётся."
+            f"Перед подписанием читаются готовые подписи слоёв {layers}: если рядом с объектом "
+            f"(в радиусе {radius:g} ft) уже стоит аналогичная надпись, дубликат не создаётся "
+            "(повторный запуск ничего не удваивает)."
+        )
+
+    def _feature_notes_hint(self) -> str:
+        fcfg = feature_settings(self.config_data)
+        layers = ", ".join(str(name) for name in fcfg.get("field_note_layers") or [])
+        return (
+            f"Заметки слоёв {layers} — источник подписей: они переводятся в формулировки "
+            "заказчика и в итоговый чертёж не идут. Слои только выключаются (LayerOn), "
+            "объекты не удаляются."
         )
 
     def _refresh_step2_height_label(self) -> None:
@@ -2816,6 +2856,7 @@ class SurveyApp(ctk.CTk):
         mode = "pick" if mode == "pick" else "auto"
         house_text = normalize_house_text(self.house_text_var.get())
         skip_existing = bool(self.skip_existing_labels_var.get())
+        hide_notes = bool(self.hide_field_notes_var.get())
         scale = self._current_scale()
         cfg, _provider, _model, _key, _secret = self._build_runtime_config()
         self._busy = True
@@ -2836,7 +2877,8 @@ class SurveyApp(ctk.CTk):
             else "Шаг 2: автопоиск участка и объектов в активном чертеже AutoCAD…"
         )
         self._start_background(
-            self._feature_label_worker, args=(cfg, mode, house_text, skip_existing, scale)
+            self._feature_label_worker,
+            args=(cfg, mode, house_text, skip_existing, scale, hide_notes),
         )
 
     def _feature_label_worker(
@@ -2846,6 +2888,7 @@ class SurveyApp(ctk.CTk):
         house_text: str,
         skip_existing: bool,
         scale: float,
+        hide_field_notes: bool = False,
     ) -> None:
         post = self._worker_poster()
         result: FeatureLabelResult | None = None
@@ -2865,6 +2908,7 @@ class SurveyApp(ctk.CTk):
                     mode=mode,
                     house_text=house_text,
                     skip_existing=skip_existing,
+                    hide_field_notes=hide_field_notes,
                     scale=scale,
                     progress=lambda message: post("progress", message),
                     should_continue=self._worker_is_current,
@@ -2891,6 +2935,7 @@ class SurveyApp(ctk.CTk):
             self._set_status(f"Шаг 2 не выполнен: {message}", error=True)
             return
         self.feature_label_result = result
+        self.step2_stat_vars["notes"].set(str(result.found_by_notes))
         self.step2_stat_vars["codes"].set(str(result.found_by_point_codes))
         self.step2_stat_vars["layers"].set(str(result.found_by_layers))
         self.step2_stat_vars["labeled"].set(str(result.created_labels))
@@ -6135,6 +6180,7 @@ class SurveyApp(ctk.CTk):
         self.feature_pick_button.configure(state=state)
         self.house_text_entry.configure(state=state)
         self.skip_existing_labels_check.configure(state=state)
+        self.hide_field_notes_check.configure(state=state)
 
     def _finish_busy(self) -> None:
         self._busy = False

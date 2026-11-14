@@ -2998,9 +2998,13 @@ def _step2_result(skip_existing=True):
     """Готовый FeatureLabelResult на синтетическом чертеже (без AutoCAD)."""
     import acad_builder as ab
     import feature_labeler as fl
+    from feature_labeler import DrawingLine, DrawingText
     from test_feature_labeling import HOUSE, build_scene
 
     snap = build_scene(with_existing=True)
+    # Заметка полевика с выноской к террасе: WOOD PORCH -> FRAME DECK.
+    snap.texts.append(DrawingText("ENTRANCE_TEXT", "WOOD PORCH", (-14.0, 66.0), height=1.3))
+    snap.lines.append(DrawingLine("ENTRANCE_TEXT", ((-4.0, 66.6), (15.0, 67.0))))
     boundary = fl.find_property_polygon(snap, {})
     recognition = fl.recognize_features(snap, boundary, {}, HOUSE)
     plan = ab.plan_feature_labels(recognition, snap, {}, text_height=0.9, skip_existing=skip_existing)
@@ -3043,6 +3047,11 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
         "Не дублировать уже существующие на чертеже надписи"
     )
     assert app.skip_existing_labels_var.get() is True
+    assert app.hide_field_notes_check.cget("text") == (
+        "Выключить слои полевых заметок после подписания"
+    )
+    assert app.hide_field_notes_var.get() is True
+    assert "FENCE_NOTE" in app.step2_notes_hint.cget("text")
     assert "Автопоиск участка и подписание объектов" in app.feature_auto_button.cget("text")
     assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
     assert "0.900 ft" in app.step2_height_label.cget("text")
@@ -3115,24 +3124,28 @@ def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
     assert calls[0]["mode"] == mode
     assert calls[0]["house_text"] == "2 STY. BRK. & FR.\nNo. 87"
     assert calls[0]["skip_existing"] is True
+    assert calls[0]["hide_field_notes"] is True
     assert calls[0]["scale"] == pytest.approx(20.0)
     assert app.feature_auto_button.cget("state") == "normal"
     assert app.feature_pick_button.cget("state") == "normal"
     assert app.feature_label_result is prepared
 
     # Счётчики и подробный отчёт на вкладке Шага 2.
-    assert app.step2_stat_vars["codes"].get() == "4"
-    assert app.step2_stat_vars["layers"].get() == "13"
+    assert app.step2_stat_vars["notes"].get() == "1"
+    assert app.step2_stat_vars["codes"].get() == "2"
+    assert app.step2_stat_vars["layers"].get() == "14"
     assert app.step2_stat_vars["labeled"].get() == "15"
     assert app.step2_stat_vars["skipped"].get() == "3"
     report = app.step2_report_box.get("1.0", "end")
-    assert "по кодам точек (POINT_LABELS): 4" in report
-    assert "по именам слоёв: 13" in report
+    assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 1" in report
+    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по именам слоёв: 14" in report
     assert "ПОДПИСАНО: 15" in report
+    assert "полевая заметка «WOOD PORCH»" in report
     # Тот же отчёт — в журнале операций (лог-панель).
     log = "\n".join(app._log)
-    assert "Шаг 2 · • по кодам точек (POINT_LABELS): 4" in log
-    assert "Шаг 2 · • по именам слоёв: 13" in log
+    assert "Шаг 2 · • по кодам точек (POINT_LABELS): 2" in log
+    assert "Шаг 2 · • по именам слоёв: 14" in log
     assert "Шаг 2 · ПОДПИСАНО: 15" in log
     assert "Подписано объектов: 15 в слое D-TOPO-TEXT" in app.status_var.get()
 
@@ -3154,9 +3167,11 @@ def test_step2_passes_dedup_checkbox_state(gui, monkeypatch):
     )
     app = gui.SurveyApp()
     app.skip_existing_labels_var.set(False)
+    app.hide_field_notes_var.set(False)
     app._start_feature_labeling("auto")
     _wait_idle(app)
     assert calls[0]["skip_existing"] is False
+    assert calls[0]["hide_field_notes"] is False
     assert calls[0]["house_text"] == ""
     assert app.step2_stat_vars["skipped"].get() == "0"
     assert app.step2_stat_vars["labeled"].get() == "18"

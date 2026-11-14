@@ -36,7 +36,7 @@ def build_scene(angle_deg: float = 0.0, gap: float = 0.0, with_existing: bool = 
     проступями, дорожки, заборы (CODE_CREW с кодами точек и FENCE_* по слоям).
 
     ``angle_deg`` поворачивает весь чертёж, ``gap`` оставляет разрыв в углу
-    границы, ``with_existing`` добавляет уже стоящие на чертеже надписи.
+    границы, ``with_existing`` добавляет уже стоящие в слое D-TOPO-TEXT подписи.
     """
     a = math.radians(angle_deg)
 
@@ -119,9 +119,109 @@ def build_scene(angle_deg: float = 0.0, gap: float = 0.0, with_existing: bool = 
     # Подпись стороны из Шага 1 — препятствие для новых текстов.
     text("BOUNDARY_TEXT_AI", "N 00%%d00' E   100.00'", (-2.05, 35), rotation=math.pi / 2)
     if with_existing:
-        text("FENCE_NOTE", "CHAIN LINK FENCE", (2, 60), rotation=math.pi / 2)
+        # Готовые подписи заказчика (итоговый слой): повторно не ставятся.
+        text("D-TOPO-TEXT", "CHAIN LINK FENCE", (2, 60), rotation=math.pi / 2)
         text("D-TOPO-TEXT", "SHED", (31, 90.5))
-        text("SURFACE_TEXT", "CONC. WALK", (40, -7))
+        text("D-TOPO-TEXT", "CONC. WALK", (40, -7))
+    return snap
+
+
+STAFFORD_HOUSE = "1 STY\nFRAME\n(BRICK FACE)\nW/BSMNT\nNo. 87"
+
+
+def build_stafford_scene(angle_deg: float = 0.0, note_height: float = 1.3):
+    a = math.radians(angle_deg)
+
+    def rot(p):
+        x, y = p
+        return (x * math.cos(a) - y * math.sin(a), x * math.sin(a) + y * math.cos(a))
+
+    snap = DrawingSnapshot()
+
+    def line(layer, *pts, closed=False):
+        snap.lines.append(
+            DrawingLine(layer, tuple(rot(p) for p in pts), closed=closed, kind="AcDbPolyline")
+        )
+
+    def rect(layer, x0, y0, x1, y1):
+        line(layer, (x0, y0), (x1, y0), (x1, y1), (x0, y1), closed=True)
+
+    def text(layer, value, p, h=0.5):
+        snap.texts.append(DrawingText(layer, value, rot(p), height=h, rotation=a))
+
+    def note(layer, value, p, tip=None, h=note_height):
+        """Заметка полевика: текст (левый нижний угол в ``p``) и выноска к ``tip``."""
+        snap.texts.append(DrawingText(layer, value, rot(p), height=h, rotation=a))
+        if tip is not None:
+            width = 0.75 * h * len(value)
+            start = (p[0] - 0.5, p[1] + h / 2) if tip[0] < p[0] else (p[0] + width + 0.5, p[1] + h / 2)
+            line(layer, start, tip)
+
+    # Участки: свой 40 x 100 и соседи (все — замкнутые контуры одного слоя).
+    for x0 in (-40, 0, 40, 80):
+        rect("PROPERTY_LINES_APPROX", x0, 0, x0 + 40, 100)
+
+    # Строения.
+    rect("BUILDING_OUTLINE", 4.9, 21.6, 31.9, 69.0)
+    rect("BUILDING_OUTLINE", 45.4, 20.0, 70.0, 68.75)  # соседний дом
+    rect("SUBJECT_SHED_OUTLINE", 30.2, 89.3, 38.5, 99.3)
+    line("REAR_DECK_EDGE", (5, 69), (5, 80), (8.5, 83.4), (24.4, 83.4), (24.4, 76.1),
+         (21.4, 76.1), (21.4, 69))
+    rect("REAR_STEPS", 21.4, 73.0, 25.0, 76.1)
+    for x in (22.3, 23.2, 24.1):
+        line("REAR_STEP_TREADS", (x, 73.0), (x, 76.1))
+    rect("SIDE_PLANTER_5", 2.25, 54.0, 4.9, 69.0)
+    rect("SIDE_PORCH", 1.25, 30.25, 4.9, 34.0)
+    rect("FRONT_STEPS", 1.25, 26.5, 4.9, 30.25)
+    for y in (27.4, 28.3, 29.2):
+        line("FRONT_STEP_TREADS", (1.25, y), (4.9, y))
+    rect("NEIGHBOUR_SIDE_PORCH", 42.25, 30.0, 45.4, 35.0)
+    rect("NEIGHBOUR_SIDE_STAIR", 42.25, 26.5, 45.4, 30.0)
+    line("LOW_EDGE_TIMBER", (24.4, 83.4), (30.2, 83.4), (30.2, 89.3))
+
+    # Заборы (на 0.3 ft от границы) и калитки.
+    line("FENCE_CHAIN_LEFT", (0.3, 54.0), (0.3, 99.7))
+    line("FENCE_CHAIN_REAR", (0.3, 99.7), (30.0, 99.7))
+    line("FENCE_VINYL_REAR", (30.0, 99.7), (52.0, 99.7))
+    line("FENCE_CHAIN_RIGHT", (39.7, 47.6), (39.7, 99.7))
+    line("GATE_LEFT_INSERT", (0.3, 54.0), (4.9, 54.0))
+    line("GATE_LEFT_SECOND", (-5.5, 54.0), (0.3, 54.0))
+    line("GATE_RIGHT_INSERT", (31.9, 47.6), (39.7, 47.6))
+    line("GATE_RIGHT_CHAIN", (39.7, 68.75), (45.4, 68.75))
+
+    # Коды точек.
+    codes = [
+        ("1 FEC", (0.3, 99.7)), ("2 FEC", (0.3, 75)), ("3 FEV64", (0.3, 54.0)),
+        ("4 FEC", (15, 99.7)), ("5 FEV", (30.0, 99.7)), ("6 FEV", (45, 99.7)),
+        ("7 FEC296", (39.7, 68.75)), ("8 FEC", (39.7, 90)), ("9 TTP", (3, 96)),
+        ("10 BLC", (4.9, 69)), ("11 BLC1", (31.9, 69)), ("12 OP", (5, 80)),
+        ("13 OP", (24.4, 83.4)), ("14 STEP", (21.4, 73)), ("15 SHED", (30.2, 89.3)),
+        ("16 PLAN", (2.25, 54)), ("17 SW3", (2, 2)), ("18 LST", (30.2, 83.4)),
+        ("19 TTP", (34.3, 80.2)),
+    ]
+    for value, p in codes:
+        text("POINT_LABELS", value, (p[0] + 0.2, p[1] + 0.2))
+
+    # Заметки полевого чертёжника.
+    note("CONTEXT_TEXT", "GROUND", (21.0, 92.0), h=1.8)
+    note("CONTEXT_TEXT", "SHED", (31.5, 93.5), h=1.8)
+    note("SURFACE_TEXT", "GRASS", (42.5, 85.0), h=1.8)
+    note("CONTEXT_TEXT", "LOW TIMBER EDGE", (19.0, 85.5), tip=(27.0, 83.4), h=0.8)
+    note("ENTRANCE_TEXT", "WOOD PORCH", (10.0, 76.5))
+    note("ENTRANCE_TEXT", "4 WOOD STEPS", (9.0, 72.5), tip=(22.0, 74.5))
+    note("SURFACE_TEXT", "PAVERS", (41.5, 79.5), tip=(34.3, 80.2))
+    note("FENCE_NOTE", "CHAIN LINK FENCE", (42.5, 74.6), tip=(39.7, 75.2))
+    note("FENCE_NOTE", "CHAIN LINK GATE", (46.0, 66.5), tip=(41.0, 68.75))
+    note("FENCE_NOTE", "CHAIN LINK FENCE", (-17.0, 71.0), tip=(0.3, 70.4))
+    note("SURFACE_TEXT", "PAVERS", (-7.5, 62.3), tip=(1.2, 62.9))
+    note("SURFACE_TEXT", "PLANTER", (7.0, 62.0), tip=(4.0, 62.3))
+    note("FENCE_NOTE", "VINYL GATE 7 FEET HIGH", (-26.0, 52.5), tip=(-2.5, 54.0))
+    note("FENCE_NOTE", "VINYL GATE 7 FEET HIGH", (-20.0, 50.5), tip=(2.5, 54.0))
+    note("FENCE_NOTE", "VINYL GATE", (41.0, 48.5), tip=(36.0, 47.6))
+    note("CONTEXT_TEXT", "HOUSE", (14.0, 45.0), h=1.8)
+    note("CONTEXT_TEXT", "NEIGHBOUR HOUSE", (49.0, 45.5), h=1.6)
+    note("ENTRANCE_TEXT", "SIDE BRICK PORCH & 3 TREADS", (-24.0, 31.5), tip=(1.25, 32.3))
+    note("ENTRANCE_TEXT", "BRICK PORCH & 3 TREADS", (47.0, 34.0), tip=(45.4, 34.5))
     return snap
 
 
@@ -150,8 +250,17 @@ def test_shipped_config_mirrors_feature_defaults():
     assert section["point_to_fence_max_ft"] == 3.5
     assert section["duplicate_radius_ft"] == 6.0
     assert section["point_code_dictionary"]["FEV*"] == "VINYL FENCE"
-    assert section["layer_label_mapping"]["REAR_DECK_EDGE"] == "WOOD DECK"
-    assert set(section["structure_layers"]) == {"house", "shed", "porch", "steps", "surface"}
+    # Формулировки заказчика: терраса — FRAME DECK в две строки, крыльцо — O.P.
+    assert section["layer_label_mapping"]["*DECK*"] == "FRAME\nDECK"
+    assert section["layer_label_mapping"]["*PORCH*"] == "O.P."
+    assert set(section["structure_layers"]) == {
+        "house", "shed", "porch", "steps", "planter", "surface",
+    }
+    assert section["existing_label_layers"] == ["D-TOPO-TEXT"]
+    assert section["field_note_layers"] == [
+        "FENCE_NOTE", "ENTRANCE_TEXT", "SURFACE_TEXT", "CONTEXT_TEXT",
+    ]
+    assert section["label_point_features"] is False
     # load_config() доносит раздел до AcadBuilder без изменений.
     assert fl.feature_settings(load_config()) == fl.DEFAULT_FEATURE_CONFIG
 
@@ -163,18 +272,24 @@ def test_feature_settings_override_replaces_key_and_null_keeps_default():
     assert settings["point_to_fence_max_ft"] == 5.0
     assert settings["search_buffer_ft"] == 50.0
     assert settings["layer_label_mapping"] == {"MY_SHED": "SHED"}
-    assert fl.DEFAULT_FEATURE_CONFIG["layer_label_mapping"]["SIDE_PORCH"] == "PORCH"
+    assert fl.DEFAULT_FEATURE_CONFIG["layer_label_mapping"]["*PORCH*"] == "O.P."
 
 
 def test_layer_classifier_fence_patterns_and_note_exclusion():
     classifier = fl.LayerClassifier(fl.feature_settings({}))
-    for name in ("S-FENCE", "ST-WALL", "CODE_CREW", "FENCE_CHAIN_LEFT", "GATE_REAR", "low_edge_timber"):
+    for name in ("S-FENCE", "ST-WALL", "CODE_CREW", "FENCE_CHAIN_LEFT", "GATE_REAR", "gate_left_insert"):
         assert classifier.is_fence(name), name
-    for name in ("FENCE_NOTE", "GATE_NOTE", "BUILDING_OUTLINE", "POINT_LABELS"):
+    for name in ("FENCE_NOTE", "GATE_NOTE", "BUILDING_OUTLINE", "POINT_LABELS", "LOW_EDGE_TIMBER"):
         assert not classifier.is_fence(name), name
+    assert classifier.is_gate("GATE_LEFT_SECOND") and not classifier.is_gate("FENCE_CHAIN_LEFT")
     assert classifier.is_point_label("pnt-x")
-    assert classifier.is_existing_label("FENCE_NOTE")
-    assert classifier.is_existing_label("D-TOPO-TEXT")
+    # Заметки полевика — источник подписей, а не готовые подписи.
+    assert classifier.is_field_note("FENCE_NOTE") and classifier.is_field_note("context_text")
+    assert not classifier.is_existing_label("FENCE_NOTE")
+    assert classifier.is_existing_label("D-TOPO-TEXT") and not classifier.is_field_note("D-TOPO-TEXT")
+    assert classifier.structure_category("NEIGHBOUR_SIDE_STAIR") == "steps"
+    assert classifier.structure_category("NEIGHBOUR_SHED_OUTLINE") == "shed"
+    assert classifier.structure_category("SIDE_PLANTER_5") == "planter"
 
 
 @pytest.mark.parametrize(
@@ -198,10 +313,15 @@ def test_labels_similar_handles_abbreviations_and_synonyms():
     synonyms = fl.DEFAULT_FEATURE_CONFIG["label_synonyms"]
     assert fl.labels_similar("CHAIN LINK FENCE", "CHAIN LINK FENCE", synonyms)
     assert fl.labels_similar("6' CHAIN LINK FENCE", "CHAIN LINK FENCE", synonyms)
-    assert fl.labels_similar("CONC. WALK", "CONCRETE WALK", synonyms)
+    assert fl.labels_similar("C.L.F.", "CHAIN LINK FENCE", synonyms)
+    assert fl.labels_similar("CONCRETE WALK", "CONC. WALK", synonyms)
     assert fl.labels_similar("3 STEPS", "STEPS", synonyms)
+    assert fl.labels_similar("FRAME DECK", "FRAME\nDECK", synonyms)
     assert not fl.labels_similar("WOOD FENCE", "CHAIN LINK FENCE", synonyms)
-    assert not fl.labels_similar("SHED", "WOOD DECK", synonyms)
+    assert not fl.labels_similar("SHED", "FRAME DECK", synonyms)
+    # Подпись калитки — не подпись забора из того же материала.
+    assert not fl.labels_similar("C.L.F. GATE", "CHAIN LINK FENCE", synonyms)
+    assert fl.labels_similar("V.FE. GATE", "V.FE.\nGATE", synonyms)
 
 
 # -------------------------------------------------------------- распознавание
@@ -241,7 +361,7 @@ def test_property_polygon_from_selected_lines():
 def test_recognition_sources_and_counters(angle, gap):
     result = recognize(build_scene(angle, gap))
 
-    # Источник 1: коды точек делят общий слой CODE_CREW по материалу забора.
+    # Коды точек делят общий слой CODE_CREW по материалу забора.
     crew = {f.label: f for f in result.features if f.layer == "CODE_CREW"}
     assert set(crew) == {"CHAIN LINK FENCE", "VINYL FENCE"}
     assert crew["CHAIN LINK FENCE"].source == "point_code"
@@ -249,41 +369,59 @@ def test_recognition_sources_and_counters(angle, gap):
     assert crew["VINYL FENCE"].geometry.length == pytest.approx(39.2, abs=0.2)
     assert {code.code for code in crew["VINYL FENCE"].codes} == {"FEV64"}
 
-    # Источник 2: имена слоёв.
+    # Имена слоёв — в формулировках заказчика.
     assert labels_of(result, "FENCE_WOOD_RIGHT") == ["WOOD FENCE"]
     assert labels_of(result, "FENCE_CHAIN_FRONT") == ["CHAIN LINK FENCE"]
-    assert labels_of(result, "LOW_EDGE_TIMBER") == ["LOW TIMBER EDGE"]
     assert labels_of(result, "SUBJECT_SHED_OUTLINE") == ["SHED"]
-    assert labels_of(result, "SIDE_PORCH") == ["PORCH"]
-    assert labels_of(result, "FRONT_LANDING") == ["PORCH"]
-    assert labels_of(result, "REAR_DECK_EDGE") == ["WOOD DECK"]
+    assert labels_of(result, "NEIGHBOUR_SHED_OUTLINE") == ["SHED"]
+    assert labels_of(result, "SIDE_PORCH") == ["O.P."]
+    assert labels_of(result, "FRONT_LANDING") == ["O.P."]
+    assert labels_of(result, "REAR_DECK_EDGE") == ["FRAME\nDECK"]
     assert labels_of(result, "DRIVEWAY_EDGE") == ["DRIVEWAY"]
-    assert labels_of(result, "SIDEWALK_EDGE") == ["CONCRETE WALK"]
-    assert labels_of(result, "WALK_EDGE") == ["CONCRETE WALK"]
+    assert labels_of(result, "SIDEWALK_EDGE") == ["CONC. WALK"]
+    assert labels_of(result, "WALK_EDGE") == ["CONC. WALK"]
     assert labels_of(result, "PLANTER_EDGE") == ["PLANTER"]
-    # Проступи *_STEP_TREADS внутри контура ступеней дают «3 STEPS».
-    assert labels_of(result, "FRONT_STEPS") == ["3 STEPS"]
+    assert labels_of(result, "GRASS_STRIP_EDGE") == ["GRASS"]
+    # Заказчик не пишет число ступеней: проступи считаются только по настройке.
+    assert labels_of(result, "FRONT_STEPS") == ["STEPS"]
     assert labels_of(result, "REAR_STEPS") == ["STEPS"]
-    steps = next(f for f in result.features if f.layer == "FRONT_STEPS")
-    assert steps.tread_count == 3
+    # Калитка без своего кода: сокращение материала соседнего забора + GATE.
+    gate = next(f for f in result.features if f.layer == "GATE_FRONT")
+    assert (gate.category, gate.label, gate.source) == ("gate", "C.L.F.\nGATE", "adjacent")
+    # LOW_EDGE_* заказчик не подписывает: это только линия-препятствие.
+    assert not [f for f in result.features if f.layer == "LOW_EDGE_TIMBER"]
 
     # Дом подписывается текстом из окна программы.
     house = next(f for f in result.features if f.layer == "BUILDING_OUTLINE")
     assert house.is_main_house and house.label == HOUSE and house.source == "user"
 
-    # Точечные объекты по кодам; точка за буфером 50 ft не учитывается.
-    points = {f.label for f in result.features if f.kind == "point"}
-    assert points == {"UTILITY POLE", "MANHOLE"}
+    # Столбы и колодцы заказчик не подписывает; точка за буфером 50 ft не читается.
+    assert not [f for f in result.features if f.kind == "point"]
     assert result.unknown_codes == {"XYZ": 1}
     assert len(result.point_codes) == 8
 
     # Слои без правила найдены, но остаются без подписи.
-    unlabeled = {f.layer for f in result.unlabeled}
-    assert unlabeled == {
-        "GATE_FRONT", "ST-WALL", "GRASS_STRIP_EDGE", "NEIGHBOUR_SHED_OUTLINE", "REF_VEC_BUILDING",
-    }
-    assert (result.by_point_codes, result.by_layers, result.by_user) == (4, 13, 1)
+    assert {f.layer for f in result.unlabeled} == {"ST-WALL", "REF_VEC_BUILDING"}
+    assert (result.by_notes, result.by_point_codes, result.by_layers, result.by_user) == (0, 2, 15, 1)
     assert len(result.labeled) == 18
+
+
+def test_step_count_and_point_objects_are_optional():
+    cfg = {"feature_labeling": {"step_count_labels": True, "label_point_features": True}}
+    result = recognize(build_scene(), cfg=cfg)
+    assert labels_of(result, "FRONT_STEPS") == ["3 STEPS"]
+    steps = next(f for f in result.features if f.layer == "FRONT_STEPS")
+    assert steps.tread_count == 3
+    assert {f.label for f in result.features if f.kind == "point"} == {"UTILITY POLE", "MANHOLE"}
+
+
+def test_structural_point_codes_are_not_reported_as_unknown():
+    snap = build_scene()
+    for index, value in enumerate(("BLC", "BLC2", "OP77", "SW3", "STEP6", "PLAN69", "ABC12", "ABC")):
+        snap.texts.append(DrawingText("POINT_LABELS", f"{50 + index} {value}", (5 + index, 6), height=0.5))
+    result = recognize(snap)
+    # Коды углов объектов молчат; у остальных числовой хвост отбрасывается.
+    assert result.unknown_codes == {"XYZ": 1, "ABC": 2}
 
 
 def test_house_without_user_text_is_not_labeled():
@@ -349,13 +487,14 @@ def test_plan_places_every_label_without_overlaps(angle):
     assert plan.duplicates == []
     assert plan.warnings == []
     assert plan.output_layer == "D-TOPO-TEXT"
+    assert plan.count_placement("leader") == 0  # выноски — только когда рядом нет места
 
     boxes = [item.box for item in plan.items]
     for i, first in enumerate(boxes):
         for second in boxes[i + 1:]:
             assert not first.intersects(second)
 
-    # Новые тексты не ложатся на линии чертежа (кроме дома — он ставится принудительно).
+    # Новые тексты не ложатся на линии чертежа (кроме дома и калитки поперёк линии).
     lines = [fl.line_to_shapely(line) for line in snap.lines]
     for item in plan.items:
         if item.feature.is_main_house:
@@ -363,17 +502,22 @@ def test_plan_places_every_label_without_overlaps(angle):
         for geom in lines:
             assert not item.box.intersects(geom), (item.text, item.placement)
 
-    # Текст не перевёрнут: поворот вне интервала 90°..270°.
+    # Текст не перевёрнут: горизонтальный читается слева направо, вертикальный —
+    # сверху вниз (поворот в окне −120°..60°), и стоит по осям участка.
     for item in plan.items:
-        degrees = math.degrees(item.rotation) % 360.0
-        assert not (90.0 + 1e-6 < degrees < 270.0 - 1e-6), (item.text, degrees)
+        degrees = math.degrees(item.rotation)
+        assert -120.0 - 1e-6 <= degrees < 60.0, (item.text, degrees)
+        assert (degrees - angle) % 90.0 == pytest.approx(0.0, abs=1e-4) or (
+            degrees - angle
+        ) % 90.0 == pytest.approx(90.0, abs=1e-4), (item.text, degrees)
 
 
 def test_long_fence_gets_text_parallel_to_line_with_offset():
     plan = make_plan(build_scene())
     item = item_for(plan, "FENCE_WOOD_RIGHT")
     assert (item.kind, item.placement) == ("text", "along")
-    assert math.degrees(item.rotation) % 180.0 == pytest.approx(90.0, abs=1e-6)
+    # Вертикальный текст читается сверху вниз, как на чертеже заказчика.
+    assert math.degrees(item.rotation) == pytest.approx(-90.0, abs=1e-6)
     # Отступ от линии забора = 0.8 * высоты текста, текст со стороны участка.
     assert abs(item.point[0] - 39.8) == pytest.approx(0.8, abs=1e-6)
     assert item.point[0] < 39.8
@@ -381,35 +525,98 @@ def test_long_fence_gets_text_parallel_to_line_with_offset():
 
     rear = item_for(plan, "CODE_CREW", "VINYL FENCE")
     assert (rear.kind, rear.placement) == ("text", "along")
-    assert math.degrees(rear.rotation) % 180.0 == pytest.approx(0.0, abs=1e-6)
+    assert math.degrees(rear.rotation) == pytest.approx(0.0, abs=1e-6)
     assert rear.point[1] == pytest.approx(99.6 - 0.8, abs=1e-6)
+
+
+def test_vertical_text_direction_is_configurable():
+    assert math.degrees(ab.label_rotation(math.pi / 2)) == pytest.approx(-90.0)
+    assert math.degrees(ab.label_rotation(math.radians(88.0))) == pytest.approx(-92.0)
+    assert math.degrees(ab.label_rotation(math.radians(92.0))) == pytest.approx(-88.0)
+    assert math.degrees(ab.label_rotation(math.radians(200.0))) == pytest.approx(20.0)
+    assert math.degrees(ab.label_rotation(math.pi / 2, "up")) == pytest.approx(90.0)
+    assert math.degrees(ab.label_rotation(math.radians(272.0), "up")) == pytest.approx(92.0)
+    plan = make_plan(build_scene(), cfg={"feature_labeling": {"vertical_text_reads": "up"}})
+    assert math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation) == pytest.approx(90.0)
+
+
+def test_fence_text_moves_away_from_parallel_property_line():
+    """Забор в 0.3 ft от границы: подпись не ложится ни на забор, ни на границу."""
+    plan = make_plan(build_scene())
+    item = item_for(plan, "CODE_CREW", "CHAIN LINK FENCE")
+    assert item.placement == "along" and item.note == ""
+    minx, _miny, _maxx, _maxy = item.box.bounds
+    assert minx > 0.3 + 0.15  # правее забора (x = 0.3) и границы (x = 0) с зазором
+    lot_line = plan.recognition.boundary.polygon.exterior
+    assert not item.box.intersects(lot_line)
+
+
+def test_long_fence_is_labeled_on_every_long_run_once():
+    snap = build_scene()
+    plan = make_plan(snap)
+    # CODE_CREW/CHAIN LINK: вертикальный участок 97 ft — одна подпись.
+    chain = [i for i in plan.items if i.feature.layer == "CODE_CREW" and i.text == "CHAIN LINK FENCE"]
+    assert len(chain) == 1
+    # Забор «Г»-образный, оба участка длиннее 25 ft: подпись на каждом.
+    snap.lines.append(DrawingLine("FENCE_IRON_FAR", ((-30, 110), (30, 110), (30, 140)), kind="AcDbPolyline"))
+    plan = make_plan(snap)
+    iron = [i for i in plan.items if i.feature.layer == "FENCE_IRON_FAR"]
+    assert sorted(round(math.degrees(i.rotation)) for i in iron) == [-90, 0]
+    assert {i.text for i in iron} == {"IRON FENCE"}
 
 
 def test_rotated_fence_text_follows_fence_angle():
     plan = make_plan(build_scene(17.0))
     item = item_for(plan, "FENCE_WOOD_RIGHT")
     assert item.placement == "along"
-    assert math.degrees(item.rotation) % 180.0 == pytest.approx(107.0, abs=1e-6)
-    degrees = math.degrees(item.rotation) % 360.0
-    assert not (90.0 < degrees < 270.0)  # 287°, а не перевёрнутые 107°
+    # Линия под 107°: текст вдоль неё, сверху вниз (−73°), а не перевёрнутые 107°.
+    assert math.degrees(item.rotation) == pytest.approx(-73.0, abs=1e-6)
 
 
-def test_short_fence_and_narrow_steps_get_leaders():
+def test_short_fence_gets_abbreviation_and_steps_label_sits_beside():
     plan = make_plan(build_scene())
-    for layer in ("FENCE_CHAIN_FRONT", "LOW_EDGE_TIMBER", "FRONT_STEPS"):
-        item = item_for(plan, layer)
-        assert (item.kind, item.placement) == ("leader", "leader"), layer
-        assert len(item.leader_points) >= 2
-        assert item.rotation == 0.0
-    # Стрелка выноски стоит на самом объекте.
+    # Короткий участок забора (6 ft): сокращение материала вдоль линии, без выноски.
+    short = item_for(plan, "FENCE_CHAIN_FRONT")
+    assert (short.text, short.kind, short.placement) == ("C.L.F.", "text", "along")
+    assert short.leader_points == []
+    # Ступени с проступями: подпись вплотную к контуру, со стороны от дома.
     steps = item_for(plan, "FRONT_STEPS")
-    assert steps.text == "3 STEPS"
-    tip = steps.leader_points[0]
-    assert 19.5 <= tip[0] <= 24.5 and 22.0 <= tip[1] <= 26.0
+    assert (steps.text, steps.kind, steps.placement) == ("STEPS", "mtext", "beside")
+    assert steps.leader_points == []
+    minx, miny, maxx, maxy = steps.box.bounds
+    assert 19.5 <= minx and maxx <= 24.5 and maxy < 22.0 and miny > 22.0 - 2.5
     # Объекты участка подписываются на участке, а не за его границей.
-    lot = recognize(build_scene()).boundary.polygon
-    for layer in ("FENCE_CHAIN_FRONT", "LOW_EDGE_TIMBER", "FRONT_STEPS"):
+    lot = plan.recognition.boundary.polygon
+    for layer in ("FENCE_CHAIN_FRONT", "FRONT_STEPS", "GATE_FRONT"):
         assert lot.contains(item_for(plan, layer).box), layer
+
+
+def test_gate_label_is_stacked_across_the_gate_line():
+    snap = build_stafford_scene()
+    plan = make_plan(snap, house=STAFFORD_HOUSE)
+    gate = item_for(plan, "GATE_RIGHT_CHAIN")
+    assert (gate.text, gate.kind, gate.placement) == ("C.L.F.\nGATE", "mtext", "gate")
+    # Середина подписи — на линии калитки: одна строка над линией, вторая под ней.
+    assert gate.point == pytest.approx(((39.7 + 45.4) / 2, 68.75), abs=1e-6)
+    assert gate.rotation == pytest.approx(0.0)
+    assert gate.mtext_string == "C.L.F.\\PGATE"
+    # Тесное место (клумба, забор): обе строки с одной стороны линии.
+    left = item_for(plan, "GATE_LEFT_INSERT")
+    assert left.text == "V.FE.\nGATE" and left.placement == "gate"
+    assert left.box.bounds[3] < 54.0
+
+
+def test_leader_is_short_arc_when_no_room_beside():
+    plan = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE)
+    assert plan.count_placement("leader") == 1
+    item = item_for(plan, "NEIGHBOUR_SIDE_STAIR")
+    assert (item.text, item.kind, item.placement) == ("CONC.\nSTEPS", "leader", "leader")
+    assert len(item.leader_points) == 2 and item.leader_bulge != 0.0
+    tip, end = item.leader_points
+    assert 42.25 <= tip[0] <= 45.4 and 26.5 <= tip[1] <= 30.0  # стрелка на ступенях
+    assert math.hypot(end[0] - tip[0], end[1] - tip[1]) <= 12.0 * plan.text_height
+    arc = ab._bulge_arc_points(tip, end, item.leader_bulge)
+    assert arc[0] == tip and arc[-1] == end and len(arc) > 2
 
 
 def test_structures_get_mtext_centered_inside():
@@ -442,14 +649,31 @@ def test_existing_labels_are_not_duplicated():
     plan = make_plan(snap)
     skipped = {(dup.feature.layer, dup.existing_layer) for dup in plan.duplicates}
     assert skipped == {
-        ("CODE_CREW", "FENCE_NOTE"),
+        ("CODE_CREW", "D-TOPO-TEXT"),
         ("SUBJECT_SHED_OUTLINE", "D-TOPO-TEXT"),
-        ("SIDEWALK_EDGE", "SURFACE_TEXT"),
+        ("SIDEWALK_EDGE", "D-TOPO-TEXT"),
     }
     assert len(plan.items) == 15
     # Одноимённый забор другого слоя далеко от надписи всё равно подписывается.
-    assert item_for(plan, "FENCE_CHAIN_FRONT").text == "CHAIN LINK FENCE"
-    assert item_for(plan, "WALK_EDGE").text == "CONCRETE WALK"
+    assert item_for(plan, "FENCE_CHAIN_FRONT").text == "C.L.F."
+    assert item_for(plan, "WALK_EDGE").text == "CONC. WALK"
+
+
+def test_field_notes_are_a_source_not_a_duplicate_or_obstacle():
+    """Заметка полевика рядом с объектом не отменяет подпись и не мешает ей."""
+    snap = build_scene()
+    snap.texts.append(DrawingText("CONTEXT_TEXT", "SHED", (30.5, 90.0), height=1.8))
+    snap.texts.append(DrawingText("FENCE_NOTE", "WOOD FENCE", (37.5, 50.0), height=1.3, rotation=math.pi / 2))
+    baseline = make_plan(build_scene())
+    plan = make_plan(snap)
+    assert plan.duplicates == []
+    assert len(plan.items) == len(baseline.items) == 18
+    shed = item_for(plan, "SUBJECT_SHED_OUTLINE")
+    assert shed.feature.source == "field_note" and shed.feature.note_text == "SHED"
+    assert shed.point == pytest.approx((33.0, 91.0), abs=1e-6)  # по центру, поверх заметки
+    # Подписи стоят там же, где стояли бы без заметок.
+    for layer in ("SUBJECT_SHED_OUTLINE", "FENCE_WOOD_RIGHT"):
+        assert item_for(plan, layer).point == pytest.approx(item_for(baseline, layer).point)
 
 
 def test_dedup_checkbox_off_labels_everything_again():
@@ -473,36 +697,41 @@ def test_existing_label_far_from_object_is_not_a_duplicate():
 
 
 def test_existing_leader_arrow_marks_object_as_labeled():
-    """Текст стоит в стороне, но его выноска указывает на объект — дубликат не нужен."""
+    """Готовая подпись стоит в стороне, но её выноска указывает на объект — дубликат не нужен."""
     snap = build_scene()
-    snap.texts.append(DrawingText("ENTRANCE_TEXT", "3 STEPS", (-12, 12), height=0.9))
+    snap.texts.append(DrawingText("D-TOPO-TEXT", "STEPS", (-10, 12), height=0.9))
     snap.leaders.append(
-        DrawingLine("ENTRANCE_TEXT", ((22.0, 24.0), (-5.0, 12.4), (-6.5, 12.4)), kind="AcDbLeader")
+        DrawingLine("D-TOPO-TEXT", ((22.0, 24.0), (-5.0, 12.4), (-6.5, 12.4)), kind="AcDbLeader")
     )
     plan = make_plan(snap)
     assert [(dup.feature.layer, dup.existing_text) for dup in plan.duplicates] == [
-        ("FRONT_STEPS", "3 STEPS")
+        ("FRONT_STEPS", "STEPS")
     ]
 
 
 def test_report_lists_counters_for_gui_log():
     plan = make_plan(build_scene(with_existing=True))
     result = ab.FeatureLabelResult(
-        plan=plan, layer=plan.output_layer, created_labels=15, created_texts=2,
-        created_mtexts=13, created_leaders=5,
+        plan=plan, layer=plan.output_layer, created_labels=15, created_texts=4,
+        created_mtexts=11, created_leaders=0,
     )
     report = result.report()
-    assert "по кодам точек (POINT_LABELS): 4" in report
-    assert "по именам слоёв: 13" in report
-    assert "ПОДПИСАНО: 15" in report
+    assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 0" in report
+    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по именам слоёв: 15" in report
+    assert "ПОДПИСАНО: 15 (вдоль линии: 4, внутри контура: 9, у объекта: 2, выноска: 0)" in report
     assert "ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: 3" in report
-    assert "AddText — 2, AddMText — 13, AddLeader — 5" in report
+    assert "AddText — 4, AddMText — 11, выносок — 0" in report
     assert "XYZ ×1" in report
     assert "D-TOPO-TEXT" in report
     summary = result.summary()
-    assert "по кодам точек: 4" in summary and "по слоям: 13" in summary
+    assert "по полевым заметкам: 0" in summary
+    assert "по кодам точек: 2" in summary and "по слоям: 15" in summary
     assert "Подписано объектов: 15" in summary
-    assert (result.found_by_point_codes, result.found_by_layers, result.skipped_duplicates) == (4, 13, 3)
+    assert (
+        result.found_by_notes, result.found_by_point_codes,
+        result.found_by_layers, result.skipped_duplicates,
+    ) == (0, 2, 15, 3)
 
 
 # ------------------------------------------------ геометрия чтения из AutoCAD
@@ -583,6 +812,8 @@ class FakeModelSpace:
     def AddLightWeightPolyline(self, coordinates):
         entity = FakeEntity("AcDbPolyline", "0", Coordinates=list(coordinates), Closed=False)
         entity.SetWidth = lambda *args: setattr(entity, "width", args)
+        entity.bulges = {}
+        entity.SetBulge = lambda index, value: entity.bulges.__setitem__(index, value)
         return self._created(entity)
 
 
@@ -736,8 +967,11 @@ def com(monkeypatch):
     monkeypatch.setattr(ab, "_variant_point", lambda point, z=0.0: [point[0], point[1], z])
     monkeypatch.setattr(ab, "_null_dispatch", lambda: None)
 
-    def connect(snapshot, **kwargs):
-        builder = AcadBuilder(load_config())
+    def connect(snapshot, feature_cfg=None, **kwargs):
+        cfg = load_config()
+        if feature_cfg:
+            cfg["feature_labeling"] = {**cfg["feature_labeling"], **feature_cfg}
+        builder = AcadBuilder(cfg)
         app, doc = fake_autocad(snapshot, **kwargs)
         builder._app, builder._doc = app, doc
         return builder, app, doc
@@ -757,7 +991,7 @@ def test_read_drawing_snapshot_from_fake_autocad(com):
     assert len(snapshot.texts) == len(source.texts)
     assert snapshot.read_errors == 0
     restored = recognize(snapshot)
-    assert (restored.by_point_codes, restored.by_layers, restored.by_user) == (4, 13, 1)
+    assert (restored.by_point_codes, restored.by_layers, restored.by_user) == (2, 15, 1)
 
 
 def test_hidden_layers_are_ignored_but_point_codes_still_read(com):
@@ -772,7 +1006,7 @@ def test_hidden_layers_are_ignored_but_point_codes_still_read(com):
     codes = [text for text in snapshot.texts if text.layer == "POINT_LABELS"]
     assert len(codes) == 7 and all(text.hidden for text in codes)
     result = recognize(snapshot)
-    assert result.by_point_codes == 4  # привязка заборов по кодам сохраняется
+    assert result.by_point_codes == 2  # привязка заборов по кодам сохраняется
 
 
 def test_label_features_draws_into_d_topo_text(com):
@@ -784,39 +1018,101 @@ def test_label_features_draws_into_d_topo_text(com):
     assert result.layer == "D-TOPO-TEXT"
     assert result.failed == [] and result.warnings == []
     assert result.created_labels == 18
-    assert (result.created_texts, result.created_mtexts, result.created_leaders) == (3, 15, 5)
+    assert (result.created_texts, result.created_mtexts, result.created_leaders) == (5, 13, 0)
     assert result.plan.text_height == pytest.approx(0.9)
     assert {entity.Layer for entity in space.created} == {"D-TOPO-TEXT"}
     assert "D-TOPO-TEXT" in doc.Layers.items
     assert doc.undo_marks == ["start", "end"]
     assert app.updated == 1
     assert any("Читаю" in message for message in messages)
+    assert result.hidden_layers == []  # заметок полевика на чертеже нет — слои не трогаются
 
     texts = [e for e in space.created if e.ObjectName == "AcDbText"]
     mtexts = [e for e in space.created if e.ObjectName == "AcDbMText"]
-    leaders = [e for e in space.created if e.ObjectName == "AcDbLeader"]
-    assert sorted(e.TextString for e in texts) == ["CHAIN LINK FENCE", "VINYL FENCE", "WOOD FENCE"]
+    assert sorted(e.TextString for e in texts) == [
+        "C.L.F.", "CHAIN LINK FENCE", "GRASS", "VINYL FENCE", "WOOD FENCE",
+    ]
     assert all(e.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for e in texts)
     assert all(e.Height == pytest.approx(0.9) for e in texts + mtexts)
-    assert len(leaders) == 5
-    assert all(e.Type == ab.AC_LEADER_LINE_WITH_ARROW for e in leaders)
-    assert all(len(e.Coordinates) % 3 == 0 and len(e.Coordinates) >= 6 for e in leaders)
+    wood = next(e for e in texts if e.TextString == "WOOD FENCE")
+    assert math.degrees(wood.Rotation) == pytest.approx(-90.0)  # вертикальный текст — сверху вниз
 
     house = next(e for e in mtexts if e.TextString == HOUSE)
     assert house.AttachmentPoint == ab.AC_ATTACHMENT_MIDDLE_CENTER
     assert house.InsertionPoint[:2] == pytest.approx([23.0, 46.0])
     assert house.Width == 0.0
     assert {e.TextString for e in mtexts} >= {
-        "SHED", "WOOD DECK", "PORCH", "3 STEPS", "DRIVEWAY", "CONCRETE WALK", "UTILITY POLE", "MANHOLE",
+        "SHED", "FRAME\\PDECK", "O.P.", "STEPS", "DRIVEWAY", "CONC. WALK", "PLANTER", "C.L.F.\\PGATE",
     }
-    # Выноска с полкой привязана к своему MText.
-    steps = next(e for e in mtexts if e.TextString == "3 STEPS")
-    assert any(e.Annotation is steps for e in leaders)
+    # Столбы, колодцы и LOW TIMBER EDGE заказчик не подписывает.
+    created = {e.TextString for e in texts + mtexts}
+    assert not created & {"UTILITY POLE", "MANHOLE", "LOW TIMBER EDGE"}
 
     report = result.report()
-    assert "по кодам точек (POINT_LABELS): 4" in report
-    assert "по именам слоёв: 13" in report
+    assert "по кодам точек (POINT_LABELS): 2" in report
+    assert "по именам слоёв: 15" in report
     assert "ПОДПИСАНО: 18" in report
+
+
+def test_stafford_field_drawing_is_labeled_like_the_customer(com):
+    """Полевой чертёж «87 Stafford»: заметки полевика -> подписи заказчика в D-TOPO-TEXT."""
+    builder, _app, doc = com(build_stafford_scene())
+    result = builder.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
+    assert result.failed == [] and result.warnings == []
+    rec = result.recognition
+    assert (rec.by_notes, rec.by_point_codes, rec.by_layers, rec.by_user) == (18, 2, 0, 1)
+    assert result.skipped_duplicates == 0
+    assert result.created_labels == 21
+    assert result.created_leaders == 1
+
+    space = doc.ModelSpace
+    texts = sorted(e.TextString for e in space.created if e.ObjectName == "AcDbText")
+    mtexts = sorted(e.TextString for e in space.created if e.ObjectName == "AcDbMText")
+    assert texts == ["CHAIN LINK FENCE"] * 3 + ["VINYL FENCE"]
+    assert mtexts == sorted([
+        "1 STY\\PFRAME\\P(BRICK FACE)\\PW/BSMNT\\PNo. 87",
+        "FRAME\\PDECK", "FRAME\\PSTEPS", "SHED", "PLANTER", "EARTH", "GRASS",
+        "DECO. PAVERS", "DECO. PAVERS", "O.P.", "O.P.", "CONC.\\PSTEPS", "CONC.\\PSTEPS",
+        "C.L.F.\\PGATE", "V.FE.\\PGATE", "V.FE.\\PGATE", "V.FE.\\PGATE",
+    ])
+    assert {e.Layer for e in space.created} == {"D-TOPO-TEXT"}
+
+    # Выноска — дуговая полилиния с клиновидной стрелкой (AddLeader не используется).
+    assert not [e for e in space.created if e.ObjectName == "AcDbLeader"]
+    arrows = [e for e in space.created if e.ObjectName == "AcDbPolyline"]
+    assert len(arrows) == 1
+    assert len(arrows[0].Coordinates) == 6  # остриё, шейка стрелки, конец у текста
+    assert arrows[0].width[1] == 0.0 and arrows[0].width[2] > 0.0
+    assert set(arrows[0].bulges) == {0, 1} and all(arrows[0].bulges.values())
+
+    # Слои заметок выключены (объекты не удалены), остальные слои не тронуты.
+    assert sorted(result.hidden_layers) == ["CONTEXT_TEXT", "ENTRANCE_TEXT", "FENCE_NOTE", "SURFACE_TEXT"]
+    assert all(doc.Layers.items[name].LayerOn is False for name in result.hidden_layers)
+    assert doc.Layers.items["BUILDING_OUTLINE"].LayerOn is True
+    assert doc.Layers.items["POINT_LABELS"].LayerOn is True
+
+    report = result.report()
+    assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 18" in report
+    assert "Слои полевых заметок выключены" in report
+    assert "Заметки, которые не переносятся по правилам: «HOUSE»; «LOW TIMBER EDGE»; «NEIGHBOUR HOUSE»" in report
+    assert "Коды точек не из словаря" not in report  # BLC, OP, STEP, SW… — коды углов объектов
+    assert "FRAME DECK — крыльцо/терраса REAR_DECK_EDGE" in report
+    assert "полевая заметка «WOOD PORCH»" in report
+
+    # Повторный запуск читает заметки из выключенных слоёв и ничего не удваивает.
+    created = len(space.created)
+    second = builder.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
+    assert second.created_labels == 0 and second.skipped_duplicates == 21
+    assert second.recognition.by_notes == 18
+    assert len(space.created) == created
+
+
+def test_field_note_layers_stay_visible_when_checkbox_is_off(com):
+    builder, _app, doc = com(build_stafford_scene())
+    result = builder.label_features(house_text=STAFFORD_HOUSE, hide_field_notes=False)
+    assert result.hidden_layers == []
+    assert doc.Layers.items["FENCE_NOTE"].LayerOn is True
+    assert "Слои полевых заметок выключены" not in result.report()
 
 
 def test_second_run_creates_no_duplicates(com):
@@ -894,17 +1190,31 @@ def test_cancelled_job_does_not_draw(com):
     assert doc.ModelSpace.created == []
 
 
-def test_leader_falls_back_to_polyline_when_addleader_fails(com):
-    builder, _app, doc = com(build_scene(), with_leader=False)
-    result = builder.label_features(house_text=HOUSE)
-    assert result.created_labels == 18
-    assert result.created_leaders == 5
+def test_leader_style_leader_uses_addleader_and_falls_back_to_polyline(com):
+    # leader_style = "leader": объект AddLeader вместо дуговой полилинии.
+    builder, _app, doc = com(build_stafford_scene(), feature_cfg={"leader_style": "leader"})
+    result = builder.label_features(house_text=STAFFORD_HOUSE)
+    assert result.created_leaders == 1 and result.warnings == []
+    leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
+    assert len(leaders) == 1
+    assert leaders[0].Type == ab.AC_LEADER_LINE_WITH_ARROW
+    assert len(leaders[0].Coordinates) in (6, 9)  # стрелка, излом (и полка, если текст сбоку)
+    assert not [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbPolyline"]
+
+    # AddLeader недоступен: прямая полилиния со стрелкой и одно предупреждение.
+    builder, _app, doc = com(
+        build_stafford_scene(), feature_cfg={"leader_style": "leader"}, with_leader=False
+    )
+    result = builder.label_features(house_text=STAFFORD_HOUSE)
+    assert result.created_labels == 21
+    assert result.created_leaders == 1
     assert result.failed == []
     assert len(result.warnings) == 1 and "полилинией" in result.warnings[0]
     arrows = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbPolyline"]
-    assert len(arrows) == 5
+    assert len(arrows) == 1
     assert {e.Layer for e in arrows} == {"D-TOPO-TEXT"}
     assert all(e.width[1] == 0.0 and e.width[2] > 0.0 for e in arrows)  # клин-стрелка у объекта
+    assert arrows[0].bulges == {}
 
 
 def test_existing_output_layer_keeps_color_and_is_thawed(com):

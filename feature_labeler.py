@@ -32,7 +32,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
@@ -686,6 +686,11 @@ class SurveyPoint:
     block: str = ""
 
 
+#: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
+#: программы работала (описания точек из атрибутов блоков читаются с 2.2).
+STEP2_VERSION = "2.4 (2026-11-14)"
+
+
 @dataclass
 class DrawingSnapshot:
     """Всё, что прочитано из ModelSpace за один проход."""
@@ -698,6 +703,9 @@ class DrawingSnapshot:
     skipped_hidden: int = 0
     read_errors: int = 0
     notes: list[str] = field(default_factory=list)
+    #: блоки с атрибутами, в которых не нашлось описания точки, и их теги
+    blocks_without_description: int = 0
+    block_tags: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1245,7 @@ def find_property_polygon(
     min_area = float(fcfg.get("min_property_area_sqft") or 0.0)
     survey_lines: list[LineString] | None = None
     seen: list[str] = []
+    empty: PropertyBoundary | None = None  # контур, внутри которого ничего не снято
     for rank in sorted(by_rank):
         layers = by_rank[rank]
         layer_name = ", ".join(sorted(layers))
@@ -1288,10 +1297,23 @@ def find_property_polygon(
                 + ("самый крупный — проверьте результат или укажите границу в AutoCAD"
                    if ambiguous else "контур с наибольшим числом снятых объектов")
             )
-        return PropertyBoundary(
+        found = PropertyBoundary(
             polygon=polygon, layer=layer_name, method="auto",
             candidates=len(polygons), closed_gap_ft=gap, notes=notes,
         )
+        if not survey_lines or _activity_score(polygon, survey_lines) > 0.0:
+            if empty is not None:
+                found.notes.append(
+                    f"контур слоя {empty.layer} пропущен: внутри него нет снятых заборов и "
+                    f"строений (он начерчен в стороне от съёмки); взят слой {layer_name}"
+                )
+            return found
+        # Контур есть, но съёмки внутри нет (например, граница Шага 1 начерчена
+        # в стороне): смотрим следующие слои, этот оставляем запасным.
+        if empty is None:
+            empty = found
+    if empty is not None:
+        return empty
     raise FeatureLabelError(
         "Линии границы найдены, но не образуют замкнутый контур: "
         + "; ".join(seen)
@@ -1324,6 +1346,38 @@ def property_polygon_from_selection(
     min_area = float(fcfg.get("min_property_area_sqft") or 0.0)
     layer_name = ", ".join(sorted({line.layer for line in selected if line.layer})) or "?"
     survey_lines = _survey_lines(snapshot, classifier)
+
+    # Выбрано всё подряд (рамкой): вместе с границей попали заборы и строения.
+    # Контур из такой смеси — случайный, поэтому граница строится только по
+    # выбранным линиям слоёв участка, как при автопоиске.
+    closing_layers = _as_patterns(fcfg.get("property_closing_layers"))
+
+    def is_boundary_layer(layer: str) -> bool:
+        return classifier.is_property(layer) or bool(
+            closing_layers and layer_matches(layer, closing_layers)
+        )
+
+    own = [line for line in selected if classifier.is_property(line.layer)]
+    foreign = [line for line in selected if not is_boundary_layer(line.layer)]
+    if own and foreign:
+        narrowed = replace(
+            snapshot,
+            lines=[line for line in selected if is_boundary_layer(line.layer)]
+            + [line for line in snapshot.lines if not is_boundary_layer(line.layer)],
+        )
+        try:
+            boundary = find_property_polygon(narrowed, cfg)
+        except FeatureLabelError:
+            boundary = None
+        if boundary is not None:
+            boundary.method = "pick"
+            boundary.notes.insert(
+                0,
+                f"выбраны объекты {len({line.layer for line in selected})} слоёв: граница "
+                f"построена только по линиям слоя участка ({boundary.layer}), остальные "
+                "выбранные линии — заборы и строения — в контур не вошли",
+            )
+            return boundary
 
     polygons, gaps = polygons_from_lines(
         picked, snap_tolerance=snap_tol, gap_tolerance=gap_tol,

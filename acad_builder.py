@@ -36,6 +36,7 @@ from llm_parser import LegalDescription, Segment, load_config
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
 # понятное сообщение об установке зависимостей.
 from feature_labeler import (
+    STEP2_VERSION,
     DrawingLine,
     DrawingSnapshot,
     DrawingText,
@@ -2861,13 +2862,20 @@ class AcadBuilder:
             return
         tags = fcfg.get("point_block_attribute_tags") or {}
         values = {"number": "", "description": "", "elevation": ""}
+        seen_tags: list[str] = []
         for attribute in entity.GetAttributes() or ():
             tag = str(attribute.TagString or "").strip()
+            seen_tags.append(tag)
             for role in values:
                 if not values[role] and layer_matches(tag, tags.get(role)):
                     values[role] = plain_text(attribute.TextString)
                     break
         if not values["description"]:
+            # Для отчёта: блоки с атрибутами есть, а описания точки в них нет
+            # (другие теги атрибутов либо пустое описание).
+            snapshot.blocks_without_description += 1
+            for tag in seen_tags:
+                snapshot.block_tags[tag] = snapshot.block_tags.get(tag, 0) + 1
             return
         insertion = entity.InsertionPoint
         try:
@@ -3324,6 +3332,16 @@ class AcadBuilder:
                 boundary = find_property_polygon(snapshot, self.cfg)
             recognition = recognize_features(snapshot, boundary, self.cfg, house_text)
             recognition.notes.extend(snapshot.notes)
+            if not snapshot.survey_points and snapshot.blocks_without_description:
+                wanted = ", ".join(
+                    (fcfg.get("point_block_attribute_tags") or {}).get("description") or []
+                )
+                found_tags = ", ".join(sorted(snapshot.block_tags)) or "атрибутов нет"
+                recognition.notes.append(
+                    f"блоков с атрибутами: {snapshot.blocks_without_description}, но описания "
+                    f"точки нет ни в одном (теги в блоках: {found_tags}; описание ищется в "
+                    f"тегах: {wanted}) — добавьте тег в point_block_attribute_tags"
+                )
             width_scale = 1.0
             if not dry_run and bool(fcfg.get("measure_text_in_autocad", True)):
                 width_scale = self._measure_text_width_scale(doc, height)
@@ -5554,6 +5572,7 @@ class FeatureLabelResult:
             f"кодов точек {len(rec.point_codes)} (из них по словарю: {rec.known_point_codes}), "
             f"полевых заметок {len(rec.field_notes)}",
             f"Точек съёмки с описанием в атрибутах блоков: {plan.survey_point_count}",
+            f"Версия Шага 2: {STEP2_VERSION}",
             "",
             f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
             f"  • по заметкам полевого чертёжника (перевод в формулировки заказчика): {rec.by_notes}",

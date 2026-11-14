@@ -1813,6 +1813,71 @@ def test_label_features_on_point_block_drawing_creates_labels(com):
     assert again.created_labels == 0
 
 
+def test_selecting_everything_builds_the_lot_from_property_layers_only():
+    """
+    Реальный запуск: границу «указали в AutoCAD» рамкой вокруг всего чертежа.
+    Из смеси заборов, стен и строений получался случайный контур в 2 121 sq ft.
+    """
+    snap = load_ilion()
+    boundary = fl.property_polygon_from_selection(list(snap.lines), snap, {})
+    assert boundary.method == "pick" and boundary.layer == "M-PROPERTY"
+    assert boundary.vertex_count == 5
+    assert boundary.area_sqft == pytest.approx(4339.0, abs=2.0)
+    assert "граница построена только по линиям слоя участка (M-PROPERTY)" in boundary.notes[0]
+    result = fl.recognize_features(snap, boundary, {}, ILION_HOUSE)
+    assert len(result.labeled) == len(recognize(load_ilion(), house=ILION_HOUSE).labeled) > 20
+
+    # Выбраны только линии границы — они и берутся, без пояснений о лишних слоях.
+    only = [line for line in snap.lines if line.layer in {"M-PROPERTY", "M-ROW-LINE"}]
+    boundary = fl.property_polygon_from_selection(only, snap, {})
+    assert boundary.area_sqft == pytest.approx(4339.0, abs=2.0)
+    assert not [note for note in boundary.notes if "остальные выбранные линии" in note]
+
+
+@pytest.mark.parametrize("shift, layer", [(0.0, "PROPERTY_LINE"), (300.0, "M-PROPERTY")])
+def test_step1_boundary_away_from_the_survey_does_not_hide_the_surveyed_lot(shift, layer):
+    """Граница Шага 1 (PROPERTY_LINE) приоритетна, только если съёмка лежит внутри неё."""
+    snap = load_ilion()
+    lot = fl.find_property_polygon(snap, {}).polygon
+    snap.lines.append(
+        DrawingLine("PROPERTY_LINE", tuple((x + shift, y) for x, y in lot.exterior.coords),
+                    kind="AcDbPolyline", closed=True)
+    )
+    for boundary in (
+        fl.find_property_polygon(snap, {}),
+        fl.property_polygon_from_selection(list(snap.lines), snap, {}),
+    ):
+        assert boundary.layer == layer
+        assert boundary.area_sqft == pytest.approx(4339.0, abs=2.0)
+        # В обоих случаях участок — тот, где лежит съёмка.
+        assert boundary.polygon.centroid.distance(lot.centroid) < 0.5
+        skipped = [note for note in boundary.notes if "контур слоя PROPERTY_LINE пропущен" in note]
+        assert bool(skipped) == bool(shift)
+
+
+def test_report_names_the_version_and_blocks_without_description(com):
+    builder, _app, doc = com(load_ilion())
+    result = builder.label_features(house_text=ILION_HOUSE, dry_run=True)
+    report = result.report()
+    assert f"Версия Шага 2: {fl.STEP2_VERSION}" in report
+    assert "Точек съёмки с описанием в атрибутах блоков: 93" in report
+    assert "блоков с атрибутами" not in report
+
+    # Блоки точек с другими тегами атрибутов: описаний нет — отчёт говорит почему.
+    source = load_ilion()
+    builder, _app, doc = com(source)
+    space = doc.ModelSpace
+    space.entities[:] = [e for e in space.entities if e.ObjectName != "AcDbBlockReference"]
+    for survey in source.survey_points:
+        space.entities.append(fake_point_block(survey, tags=("NUM", "Z", "NOTE")))
+    result = builder.label_features(house_text=ILION_HOUSE, dry_run=True)
+    report = result.report()
+    assert "Точек съёмки с описанием в атрибутах блоков: 0" in report
+    assert "блоков с атрибутами: 93, но описания точки нет ни в одном" in report
+    assert "теги в блоках: NOTE, NUM, Z" in report
+    assert "point_block_attribute_tags" in report
+
+
 def test_short_codes_in_block_attributes_use_the_code_dictionary():
     """Атрибут с коротким кодом («FEV64») работает как текст слоя POINT_LABELS."""
     snap = DrawingSnapshot()

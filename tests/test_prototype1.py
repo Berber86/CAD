@@ -2744,3 +2744,33 @@ def test_ask_on_doubt_policy_sane_autonomy_vs_strict_human_confirmation() -> Non
 
 
 
+
+
+def test_text_pdf_selected_pages_use_only_local_text_layer(tmp_path, monkeypatch):
+    pymupdf = pytest.importorskip("pymupdf")
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, PDFError, parse_legal_description_full
+
+    pdf = tmp_path / "two-lots.pdf"
+    doc = pymupdf.open()
+    for sample in (
+        ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"],
+        ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"],
+        None,
+    ):
+        page = doc.new_page()
+        if sample:
+            assert page.insert_textbox(pymupdf.Rect(25, 25, 575, 800), sample, fontsize=9) >= 0
+    doc.save(pdf)
+    doc.close()
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("API не нужен"))
+    monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
+
+    for spec, distance in (("1", 365.0), ("2", 475.0)):
+        outcome = parse_legal_description_full(pdf_path=pdf, pdf_pages=spec, use_llm=False)
+        assert outcome.source == "regex"
+        assert outcome.data.distance_to_corner_ft == pytest.approx(distance)
+    with pytest.raises(PDFError, match="выбранных страницах.*текстового слоя"):
+        parse_legal_description_full(pdf_path=pdf, pdf_pages="3", use_llm=False)
+    with pytest.raises(PDFError, match="вне диапазона"):
+        parse_legal_description_full(pdf_path=pdf, pdf_pages="5", use_llm=False)

@@ -48,6 +48,17 @@ _TRANSPARENT_COLORS = {
 }
 
 
+class _Font:
+    def __init__(self, **kwargs):
+        self._options = dict(kwargs)
+
+    def cget(self, name):
+        return self._options.get(name)
+
+    def configure(self, **kwargs):
+        self._options.update(kwargs)
+
+
 class _Widget:
     def _validate_colors(self, kwargs):
         allowed = _TRANSPARENT_COLORS.get(type(self).__name__)
@@ -59,8 +70,10 @@ class _Widget:
 
     def __init__(self, *args, **kwargs):
         self._validate_colors(kwargs)
+        self.master = args[0] if args else kwargs.get("master")
         self._kwargs = dict(kwargs)
         self._show = kwargs.get("show", "")
+        self._attributes = {}
         self._text = kwargs.get("text", "")
         self._values = list(kwargs.get("values") or [])
         var = kwargs.get("variable") or kwargs.get("textvariable")
@@ -147,6 +160,10 @@ class _Widget:
         return None
 
     def attributes(self, *args, **kwargs):
+        if len(args) >= 2:
+            self._attributes[args[0]] = args[1]
+        elif args:
+            return self._attributes.get(args[0])
         return None
 
     def protocol(self, *args, **kwargs):
@@ -184,6 +201,14 @@ class _Widget:
 
     def winfo_children(self):
         return []
+
+    def winfo_width(self):
+        return self._kwargs.get("width", 1440)
+
+    def bind(self, event_name, callback, *args, **kwargs):
+        if not hasattr(self, "_bindings"):
+            self._bindings = {}
+        self._bindings[event_name] = callback
 
     def bind_all(self, event_name, callback):
         if not hasattr(self, "_global_bindings"):
@@ -236,6 +261,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     for name in (
         "CTk",
         "CTkFrame",
+        "CTkScrollableFrame",
         "CTkLabel",
         "CTkButton",
         "CTkEntry",
@@ -250,7 +276,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
         "CTkToplevel",
     ):
         setattr(ctk, name, type(name, (_Widget,), {}))
-    ctk.CTkFont = lambda **kwargs: None
+    ctk.CTkFont = _Font
     ctk.set_appearance_mode = lambda *args: None
     ctk.set_default_color_theme = lambda *args: None
     ctk.StringVar = _Var
@@ -264,6 +290,8 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     tkinter.filedialog = filedialog
     messagebox = types.ModuleType("tkinter.messagebox")
     messagebox.askokcancel = lambda *args, **kwargs: False
+    messagebox.askyesno = lambda *args, **kwargs: False
+    messagebox.askyesnocancel = lambda *args, **kwargs: None
     tkinter.messagebox = messagebox
     return {
         "customtkinter": ctk,
@@ -1518,4 +1546,576 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
             break
         time.sleep(0.01)
     assert app._preview_main_plan is not None
+    app._on_close()
+
+
+def _write_test_pdf(path, pages):
+    """Небольшие настоящие PDF: текстовый слой без внешних фикстур."""
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    try:
+        for content in pages:
+            page = doc.new_page()
+            if content:
+                remaining = page.insert_textbox(pymupdf.Rect(25, 25, 575, 800), content, fontsize=9)
+                assert remaining >= 0
+        doc.save(path)
+    finally:
+        doc.close()
+
+
+def _wait_for_gui_worker(app, timeout=8):
+    import time
+
+    end = time.monotonic() + timeout
+    while app._busy and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+    assert not app._busy, "фоновое задание не завершилось"
+
+
+def test_text_pdf_defaults_to_local_and_ai_is_an_explicit_choice(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    text_pdf = tmp_path / "text.pdf"
+    scan_pdf = tmp_path / "scan.pdf"
+    _write_test_pdf(text_pdf, [sample])
+    _write_test_pdf(scan_pdf, [None])
+    app = gui.SurveyApp()
+    app.select_passes(1)
+    assert app.topmost_var.get() is False
+    assert app.attributes("-topmost") is False
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(text_pdf))
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("вызов API не ожидался"))
+
+    app._load_pdf()
+    assert app.pdf_path == text_pdf
+    assert app.use_llm_var.get() is False
+    assert "бесплатно" in app.parse_button.cget("text").lower()
+    assert "с ИИ" in app.regex_link_button.cget("text")
+    assert app.parse_button.cget("fg_color") == gui.THEME["btn_primary"]
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.description is not None
+    assert app.description.distance_to_corner_ft == pytest.approx(420.0)
+    assert "0 (локальный" in app.tokens_var.get()
+
+    seen = []
+    desc = app.description
+    def fake_ai(**kwargs):
+        seen.append(kwargs)
+        return ParseOutcome(data=desc, source="llm")
+    monkeypatch.setattr(gui, "parse_legal_description_full", fake_ai)
+    app.regex_link_button.cget("command")()
+    _wait_for_gui_worker(app)
+    assert app.use_llm_var.get() is True
+    assert len(seen) == 1 and seen[0]["use_llm"] is True
+    assert "локальный" in app.regex_link_button.cget("text").lower()
+
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(scan_pdf))
+    app._load_pdf()
+    assert app._pdf_needs_vision is True
+    assert app.use_llm_var.get() is True
+    assert "Vision" in app.pdf_label.cget("text")
+    app._on_close()
+
+
+def test_neighbor_pdf_batch_attaches_without_api_then_builds_distinct_plans(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    first, second = tmp_path / "left.pdf", tmp_path / "copy.pdf"
+    bad = tmp_path / "broken.pdf"
+    _write_test_pdf(first, [sample])
+    _write_test_pdf(second, [sample])  # одинаковый POB не должен схлопывать два файла
+    bad.write_bytes(b"invalid pdf")
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app.neighbor_lot_radio.select()
+    assert app.verify_neighbors_button.master.master is app.neighbors_tab_frame
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(first), str(second), str(bad)))
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("API не должен вызываться"))
+    monkeypatch.setattr(gui.AcadBuilder, "draw", lambda *a, **k: pytest.fail("AutoCAD не должен вызываться"))
+
+    app.load_pdf_button.cget("command")()
+    assert app.neighbor_pdf_paths == [first, second]
+    assert app.pdf_path is None
+    assert app.use_llm_var.get() is False
+    assert "все PDF" in app.regex_link_button.cget("text")
+    assert not app._busy and not app._preview_neighbor_plans
+    assert "broken.pdf" in app.log_text()
+    assert "left.pdf" in app.neighbor_pdf_summary.cget("text")
+    app.main_lot_radio.select()
+    app._start(parse_only=True)
+    assert not app._busy
+    assert "Прикреплён пакет соседей" in app.status_var.get()
+    app.neighbor_lot_radio.select()
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert len(app._preview_neighbor_plans) == 2
+    assert len(app._neighbor_report.pair_reports) == 2
+    assert set(app._neighbor_plan_sources) == {first, second}
+    assert app._preview_neighbor_plans[0].pob == app._preview_neighbor_plans[1].pob
+
+    # Повторный разбор того же набора обновляет файлы, а не добавляет дубликаты.
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert len(app._preview_neighbor_plans) == 2
+    app._clear_neighbors_scene()
+    assert not app._preview_neighbor_plans
+    assert app._last_active_plan is app._preview_main_plan
+    app._on_close()
+
+
+def test_mixed_neighbor_pdf_batch_reports_scan_without_silent_ai(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome, parse_with_regex
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    text_pdf, scan_pdf = tmp_path / "text.pdf", tmp_path / "scan.pdf"
+    _write_test_pdf(text_pdf, [sample])
+    _write_test_pdf(scan_pdf, [None])
+    app = gui.SurveyApp()
+    app.select_passes(1)
+    app.neighbor_lot_radio.select()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(text_pdf), str(scan_pdf)))
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("платный запрос без выбора ИИ"))
+    app._load_pdf()
+    assert app.use_llm_var.get() is False
+    assert "потребуют ИИ" in app.status_var.get()
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert list(app._neighbor_plan_sources) == [text_pdf]
+    assert "scan.pdf" in app.log_text() and "Vision" in app.log_text()
+    assert "Ошибок: 1" in app.status_var.get()
+
+    # Вторая кнопка — явный платный выбор; каждый PDF обрабатывается отдельно.
+    desc, _ = parse_with_regex(sample)
+    calls = []
+    def fake_ai(**kwargs):
+        calls.append(kwargs)
+        return ParseOutcome(data=desc, source="llm")
+    monkeypatch.setattr(gui, "parse_legal_description_full", fake_ai)
+    app.regex_link_button.cget("command")()
+    _wait_for_gui_worker(app)
+    assert [kw["pdf_path"] for kw in calls] == [text_pdf, scan_pdf]
+    assert all(kw["use_llm"] for kw in calls)
+    assert len(app._preview_neighbor_plans) == 2
+    app._on_close()
+
+
+def test_neighbor_batch_honors_multipass_and_skips_disagreements(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome, TokenUsage, parse_with_regex
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    paths = [tmp_path / "agree.pdf", tmp_path / "conflict.pdf"]
+    for path in paths:
+        _write_test_pdf(path, [sample])
+    app = gui.SurveyApp()
+    app.neighbor_lot_radio.select()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, paths)))
+    app._load_pdf()
+    app.use_llm_var.set(True)
+    app.select_passes(2)
+    desc, _ = parse_with_regex(sample)
+    usage = TokenUsage(prompt_tokens=5, completion_tokens=2, total_tokens=7, model="fake")
+    out = ParseOutcome(data=desc, source="llm", usage=usage)
+    seen = []
+    def fake_consensus(**kwargs):
+        seen.append(kwargs)
+        return types.SimpleNamespace(
+            agreed=kwargs["pdf_path"] == paths[0], pass_outcomes=[out, out],
+            selected_outcome=out, discrepancy_report=lambda: "различие румба",
+        )
+    monkeypatch.setattr(gui, "run_multipass_consensus", fake_consensus)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert len(seen) == 2 and all(call["passes"] == 2 for call in seen)
+    assert list(app._neighbor_plan_sources) == [paths[0]]
+    assert "conflict.pdf" in app.log_text() and "различие румба" in app.log_text()
+    assert app._session_llm_calls == 4
+    assert app._session_prompt_tokens == 20
+    assert "Сессия (4 выз.)" in app.tokens_var.get()
+    app._on_close()
+
+
+def test_neighbor_pdf_draw_is_separate_and_uses_all_selected_files(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    paths = [tmp_path / "one.pdf", tmp_path / "two.pdf"]
+    for path in paths:
+        _write_test_pdf(path, [sample])
+    app = gui.SurveyApp()
+    app.neighbor_lot_radio.select()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, paths)))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    draws = []
+    def fake_draw(builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        plan = builder.plan(description, scale=scale, is_neighbor=is_neighbor)
+        draws.append(plan)
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"neighbor_lot": "NEIGHBOR_LOT"})
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    app._load_pdf()
+    assert draws == []
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(draws) == 2 and all(plan.is_neighbor for plan in draws)
+    assert len(app._preview_neighbor_plans) == 2
+    assert "обработано 2 уч." in app.status_var.get()
+    app._on_close()
+
+
+def test_pdf_page_selection_applies_to_every_neighbor_without_vision(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES
+
+    left = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    right = ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"]
+    files = [tmp_path / "a.pdf", tmp_path / "b.pdf"]
+    for path in files:
+        _write_test_pdf(path, [left, right])
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app.neighbor_lot_radio.select()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
+    monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
+    app._load_pdf()
+    app.pdf_pages_var.set("2")
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert len(app._preview_neighbor_plans) == 2
+    assert all(p.description.distance_to_corner_ft == pytest.approx(475) for p in app._preview_neighbor_plans)
+
+    app.pdf_pages_var.set("1")
+    app._on_verify_neighbors_clicked()  # смена диапазона не должна показывать старую сверку
+    _wait_for_gui_worker(app)
+    assert len(app._preview_neighbor_plans) == 2
+    assert all(p.description.distance_to_corner_ft == pytest.approx(365) for p in app._preview_neighbor_plans)
+    for path in files:
+        _write_test_pdf(path, [right])  # заново прикреплённый путь может содержать новые данные
+    app._load_pdf()
+    app._on_verify_neighbors_clicked()
+    _wait_for_gui_worker(app)
+    assert len(app._preview_neighbor_plans) == 2
+    assert all(p.description.distance_to_corner_ft == pytest.approx(475) for p in app._preview_neighbor_plans)
+    app._on_close()
+
+
+def test_reset_preserves_settings_and_rejects_all_stale_worker_events(gui, tmp_path, monkeypatch):
+    import threading
+    import time
+    from tkinter import messagebox
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome, parse_with_regex
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    desc, _ = parse_with_regex(sample)
+    old_started, new_started = threading.Event(), threading.Event()
+    release_old, release_new = threading.Event(), threading.Event()
+    old_returned = threading.Event()
+    draws = []
+
+    def fake_parse(**kwargs):
+        text = kwargs.get("text") or ""
+        if "OLD-REQUEST" in text:
+            old_started.set()
+            assert release_old.wait(5)
+            # Консенсус может сообщать прогресс из дочернего потока.
+            child = threading.Thread(target=lambda: kwargs["progress"]("УСТАРЕВШИЙ ПРОГРЕСС"))
+            child.start()
+            child.join()
+            old_returned.set()
+        else:
+            new_started.set()
+            assert release_new.wait(5)
+        return ParseOutcome(data=desc, source="regex")
+
+    monkeypatch.setattr(gui, "parse_legal_description_full", fake_parse)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(gui.AcadBuilder, "draw", lambda *a, **k: draws.append(True))
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("key-stays-in-memory")
+    app.key_secret_var.set("pin-stays")
+    app._last_valid_secret = "old-valid-pin"
+    app.select_provider("openrouter")
+    app.select_passes(1)
+    app.scale_var.set('1"=20\'')
+    app.use_llm_var.set(False)
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample + "\nOLD-REQUEST")
+    app._start(parse_only=False)
+    assert old_started.wait(3)
+    original_generation = app._generation
+    assert app._busy
+
+    # Отказ не должен ничего очищать, даже во время задания.
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: False)
+    app._reset_session_clicked()
+    assert app._generation == original_generation and app._busy
+    assert "OLD-REQUEST" in app.text_box.get("1.0", "end")
+
+    file_on_disk = tmp_path / "untouched.pdf"
+    file_on_disk.write_bytes(b"not modified")
+    app.neighbor_pdf_paths = [file_on_disk]
+    app._session_llm_calls = 7
+    app._session_prompt_tokens = 800
+    app._last_consensus_label = "2/2"
+    app._log_line("старый журнал")
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or True)
+    app.reset_session_button.cget("command")()
+    assert prompts and "AutoCAD" in prompts[0] and "нельзя прервать" in prompts[0]
+    assert app._generation == original_generation + 1 and not app._busy
+    assert app.description is None and app.draw_result is None and app.last_usage is None
+    assert app.pdf_path is None and app.neighbor_pdf_paths == [] and app.image_paths == []
+    assert app._preview_main_plan is None and app._preview_neighbor_plans == []
+    assert app._neighbor_report is None and app.pending_conflict is None and app.pending_doubt is None
+    assert app._session_llm_calls == 0 and app._session_prompt_tokens == 0
+    assert app._last_consensus_label is None and app.log_text() == ""
+    assert app.text_box.get("1.0", "end") == ""
+    assert file_on_disk.read_bytes() == b"not modified"
+    assert app.provider_key_vars["hydra"].get() == "key-stays-in-memory"
+    assert app.key_secret_var.get() == "pin-stays" and app._last_valid_secret == "old-valid-pin"
+    assert app.current_provider_id() == "openrouter" and app.scale_var.get() == '1"=20\''
+
+    app.text_box.insert("1.0", sample + "\nNEW-REQUEST")
+    app._start(parse_only=True)
+    assert new_started.wait(3) and app._busy
+    # Сообщения, уже оказавшиеся в очереди до сброса/между проверкой и put.
+    for kind, payload in (("progress", "УСТАРЕВШИЙ СТАТУС"), ("error", "старая ошибка"),
+                          ("done", None), ("conflict", {}), ("parsed", ())):
+        app._events.put((original_generation, kind, payload))
+    release_old.set()
+    assert old_returned.wait(3)
+    time.sleep(0.05)
+    app._drain_events()
+    assert app._busy, "старый done не должен завершать новое задание"
+    assert "УСТАРЕВШ" not in app.status_var.get() and "УСТАРЕВШ" not in app.log_text()
+    assert app.description is None and draws == []
+    release_new.set()
+    _wait_for_gui_worker(app)
+    assert app.description is not None and app._preview_main_plan is not None
+    assert draws == []  # сброшенное построение так и не запустило AutoCAD
+    app._on_close()
+
+
+def test_single_text_pdf_respects_selected_page_in_gui(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES
+
+    pdf = tmp_path / "pages.pdf"
+    _write_test_pdf(pdf, [
+        ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"],
+        ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"],
+    ])
+    app = gui.SurveyApp()
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(pdf))
+    monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
+    app._load_pdf()
+    assert app.use_llm_var.get() is False
+    app.pdf_pages_var.set("2")
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.description.distance_to_corner_ft == pytest.approx(475.0)
+    assert app._preview_main_plan.description.distance_to_corner_ft == pytest.approx(475.0)
+    app._on_close()
+
+
+def test_reset_during_com_draw_serializes_new_draw_and_ignores_old_result(gui, monkeypatch):
+    import threading
+    import time
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES
+
+    first_started, second_started = threading.Event(), threading.Event()
+    release_first = threading.Event()
+    order = []
+    def fake_draw(builder, description, scale=None, text_height=None, *, is_neighbor=False, neighbor_label=None):
+        distance = description.distance_to_corner_ft
+        order.append(("start", distance))
+        if distance == pytest.approx(420.0):
+            first_started.set()
+            assert release_first.wait(5)
+        else:
+            second_started.set()
+        plan = builder.plan(description, scale=scale, is_neighbor=is_neighbor)
+        order.append(("end", distance))
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(gui.AcadBuilder, "draw", fake_draw)
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app._start(parse_only=False)
+    assert first_started.wait(3)
+    app._reset_session()
+    app.text_box.insert("1.0", ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    app._start(parse_only=False)
+    time.sleep(0.1)
+    assert not second_started.is_set(), "два COM-вызова не должны выполняться одновременно"
+    assert app._busy
+    release_first.set()
+    assert second_started.wait(3)
+    _wait_for_gui_worker(app)
+    assert order == [("start", 420.0), ("end", 420.0), ("start", 365.0), ("end", 365.0)]
+    assert app.description.distance_to_corner_ft == pytest.approx(365.0)
+    assert app.draw_result.plan.description.distance_to_corner_ft == pytest.approx(365.0)
+    app._on_close()
+
+
+def test_reset_cancels_remaining_neighbor_batch_files(gui, tmp_path, monkeypatch):
+    import threading
+    import time
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome, parse_with_regex
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    files = [tmp_path / "first.pdf", tmp_path / "second.pdf"]
+    for path in files:
+        _write_test_pdf(path, [sample])
+    desc, _ = parse_with_regex(sample)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    seen = []
+    def fake_parse(**kwargs):
+        seen.append(kwargs["pdf_path"])
+        started.set()
+        assert release.wait(5)
+        finished.set()
+        return ParseOutcome(data=desc, source="regex")
+    monkeypatch.setattr(gui, "parse_legal_description_full", fake_parse)
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
+    app = gui.SurveyApp()
+    app.neighbor_lot_radio.select()
+    app._load_pdf()
+    app._start(parse_only=True)
+    assert started.wait(3)
+    app._reset_session()
+    release.set()
+    assert finished.wait(3)
+    time.sleep(0.05)
+    app._drain_events()
+    assert seen == [files[0]]
+    assert not app._busy and not app._preview_neighbor_plans
+    assert app.description is None and app.log_text() == ""
+    app._on_close()
+
+
+def test_suspicious_neighbor_is_not_silently_drawn_in_batch(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES, ParseOutcome, parse_with_regex
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    path = tmp_path / "needs-review.pdf"
+    _write_test_pdf(path, [sample])
+    desc, _ = parse_with_regex(sample)
+    outcome = ParseOutcome(data=desc, source="regex", typo_suspicions=[object()])
+    draws = []
+    monkeypatch.setattr(gui, "parse_legal_description_full", lambda **kw: outcome)
+    monkeypatch.setattr(gui.AcadBuilder, "draw", lambda *a, **kw: draws.append(True))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(path),))
+    app = gui.SurveyApp()
+    app.ask_on_doubt_var.set(True)
+    app.neighbor_lot_radio.select()
+    app._load_pdf()
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert draws == [] and not app._preview_neighbor_plans
+    assert "геометрия требует подтверждения" in app.log_text()
+    assert "ошибок: 1" in app.status_var.get()
+    app._on_close()
+
+
+def test_direct_neighbor_verification_offers_free_pdf_before_any_api(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog, messagebox
+    import llm_parser
+    from llm_parser import ASPENWALL_SAMPLES
+
+    pdf, scan = tmp_path / "text.pdf", tmp_path / "scan.pdf"
+    _write_test_pdf(pdf, [ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]])
+    _write_test_pdf(scan, [None])
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    assert app.use_llm_var.get() is True  # исходный режим ИИ не должен приводить к скрытому запросу
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(pdf), str(scan)))
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **kw: pytest.fail("API без согласия"))
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesnocancel", lambda *a, **kw: prompts.append((a, kw)) or True)
+    app._on_verify_neighbors_clicked()
+    _wait_for_gui_worker(app)
+    assert prompts and prompts[0][1]["default"] == "yes"
+    assert "сканы/фото" in prompts[0][0][1]
+    assert not app.use_llm_var.get()
+    assert list(app._neighbor_plan_sources) == [pdf]
+    assert "scan.pdf" in app.log_text() and "Vision" in app.log_text()
+    app._on_close()
+
+
+def test_direct_neighbor_visual_batch_requires_confirmation(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog, messagebox
+
+    scan = tmp_path / "scan.pdf"
+    _write_test_pdf(scan, [None])
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(scan),))
+    prompts = []
+    monkeypatch.setattr(messagebox, "askokcancel", lambda *a, **kw: prompts.append((a, kw)) or False)
+    app._on_verify_neighbors_clicked()
+    assert prompts and prompts[0][1]["default"] == "cancel"
+    assert not app._busy and not app._preview_neighbor_plans
+    app._on_close()
+
+
+def test_topmost_starts_off_and_auxiliary_windows_follow_toggle(gui):
+    app = gui.SurveyApp()
+    assert app.topmost_var.get() is False and app.attributes("-topmost") is False
+    app._show_log()
+    assert app._session_windows[-1].attributes("-topmost") is False
+    app.topmost_var.set(True)
+    app._apply_topmost()
+    app._show_log()
+    assert app.attributes("-topmost") is True
+    assert app._session_windows[-1].attributes("-topmost") is True
+    app.topmost_var.set(False)
+    app._apply_topmost()
+    assert app.attributes("-topmost") is False
+    app._on_close()
+
+
+def test_switching_to_text_does_not_reparse_attached_neighbor_pdfs(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES
+
+    paths = [tmp_path / "first.pdf", tmp_path / "second.pdf"]
+    for path in paths:
+        _write_test_pdf(path, [ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]])
+    app = gui.SurveyApp()
+    app.neighbor_lot_radio.select()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: tuple(map(str, paths)))
+    app._load_pdf()
+    assert "все PDF" in app.regex_link_button.cget("text")
+    app.source_mode_var.set("📝 Текст")
+    app._on_source_mode_changed()
+    assert "все PDF" not in app.regex_link_button.cget("text")
+    app.text_box.insert("1.0", ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"])
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.description.distance_to_corner_ft == pytest.approx(475.0)
+    assert not app._neighbor_plan_sources
+    assert app.neighbor_pdf_paths == paths
     app._on_close()

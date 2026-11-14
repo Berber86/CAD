@@ -179,3 +179,126 @@ def test_real_startup_failure_exits_nonzero_and_writes_log(tmp_path):
     assert result.returncode == 1
     assert "ConfigError" in result.stderr
     assert "ConfigError" in (work / "tsai_crash.log").read_text(encoding="utf-8")
+
+
+def test_real_resizable_panel_topmost_neighbor_tab_and_full_reset(tmp_path, monkeypatch):
+    tk, _ctk = _require_gui()
+    import time
+    import llm_parser
+    import main
+    from tkinter import filedialog, messagebox
+    from llm_parser import ASPENWALL_SAMPLES
+
+    pymupdf = pytest.importorskip("pymupdf")
+    monkeypatch.setattr(main, "load_config", lambda: llm_parser.load_config(tmp_path / "config.json"))
+    monkeypatch.setattr(main, "_stored_provider_keys", lambda: {})
+    files = [tmp_path / "left.pdf", tmp_path / "right.pdf"]
+    for path, sample in zip(files, (
+        ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"],
+        ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"],
+    )):
+        doc = pymupdf.open()
+        page = doc.new_page()
+        assert page.insert_textbox(pymupdf.Rect(25, 25, 575, 800), sample, fontsize=9) >= 0
+        doc.save(path)
+        doc.close()
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    app = main.SurveyApp()
+    callback_errors = []
+    app.report_callback_exception = lambda typ, value, tb: callback_errors.append(
+        "".join(traceback.format_exception(typ, value, tb))
+    )
+    try:
+        app.update()
+        if app._keys_drawer_open:
+            app.toggle_keys_drawer()
+        app.update()
+        assert not app.topmost_var.get()
+        assert not bool(app.attributes("-topmost"))
+        app.after(550, app.quit)
+        app.mainloop()
+        assert not app.topmost_var.get() and not bool(app.attributes("-topmost"))
+
+        before_right = app.right_panel.winfo_width()
+        before_center = app.center_col.winfo_width()
+        mono_size = app._result_fonts["mono"].cget("size")
+        text_font = str(app.inspector_box._textbox.cget("font"))
+        log_font = str(app.log_box._textbox.cget("font"))
+        grip = app.result_splitter_grip
+        root_x, root_y = grip.winfo_rootx() + 5, grip.winfo_rooty() + 5
+        # Настоящие события на внутреннем tk.Label, не прямой вызов обработчика.
+        grip._label.event_generate("<ButtonPress-1>", x=5, y=5, rootx=root_x, rooty=root_y)
+        grip._label.event_generate("<B1-Motion>", x=5, y=5, rootx=root_x - 200,
+                                   rooty=root_y, state=0x100)
+        app.update()
+        assert app.right_panel.winfo_width() > before_right + 150
+        assert app.center_col.winfo_width() < before_center - 150
+        assert app._result_fonts["mono"].cget("size") > mono_size
+        assert str(app.inspector_box._textbox.cget("font")) != text_font
+        assert str(app.log_box._textbox.cget("font")) != log_font
+        expanded = app._result_panel_width
+        app.geometry("1100x760")
+        app.update()
+        assert app._result_logical_pixels(app.center_col.winfo_width()) >= main.CENTER_PANEL_MIN_WIDTH - 2
+        assert app._result_panel_width < expanded
+        app.geometry("1440x940")
+        app.update()
+        assert app._result_panel_width == expanded
+        app._set_result_panel_width(100)
+        app.update()
+        assert app._result_panel_width == main.RESULT_PANEL_MIN_WIDTH
+        assert app._result_fonts["mono"].cget("size") == mono_size
+
+        # Кнопка именно внутри вкладки и доступна при минимальной ширине панели.
+        app.result_tab_var.set("🏘 Соседи")
+        app._switch_result_tab()
+        app.update()
+        assert app.verify_neighbors_button.winfo_ismapped()
+        assert app.verify_neighbors_button.master.master is app.neighbors_tab_frame
+        assert app.verify_neighbors_button.winfo_rootx() >= app.right_panel.winfo_rootx()
+        assert (app.verify_neighbors_button.winfo_rootx() + app.verify_neighbors_button.winfo_width()
+                <= app.right_panel.winfo_rootx() + app.right_panel.winfo_width())
+
+        app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+        app.lot_role_var.set("neighbor")
+        app._on_lot_role_changed()
+        app.source_mode_var.set("📄 PDF")
+        app._on_source_mode_changed()
+        app.load_pdf_button.invoke()
+        app.geometry("1100x760")
+        app.update()
+        assert app.neighbor_pdf_paths == files and not app.use_llm_var.get()
+        assert app.neighbor_pdf_summary.winfo_ismapped()
+        assert app.reset_session_button.winfo_ismapped()
+        assert app.regex_mode_badge.master is app.engine_model_label.master
+        assert (app.regex_mode_badge.winfo_rooty() + app.regex_mode_badge.winfo_height()
+                <= app.reset_session_button.winfo_rooty())
+        app.parse_button.invoke()
+        deadline = time.monotonic() + 8
+        while app._busy and time.monotonic() < deadline:
+            app.update()
+            time.sleep(0.01)
+        app.update()
+        assert not app._busy
+        assert len(app._preview_neighbor_plans) == 2
+        assert len(app._neighbor_report.pair_reports) == 2
+        assert len(app.neighbors_scroll_frame.winfo_children()) == 2
+        app.geometry("1440x940")
+        app.update()
+        app._set_result_panel_width(700)
+        app.update()
+        assert app._result_fonts["body"].cget("size") > 11
+        assert len(app.neighbors_scroll_frame.winfo_children()) == 2
+
+        app.provider_key_vars["hydra"].set("not-cleared")
+        app.reset_session_button.invoke()
+        app.update()
+        assert app.neighbor_pdf_paths == [] and app._preview_main_plan is None
+        assert app._preview_neighbor_plans == [] and app.description is None
+        assert app.provider_key_vars["hydra"].get() == "not-cleared"
+        assert all(path.exists() for path in files)
+        assert not callback_errors, "\n".join(callback_errors)
+    finally:
+        app.destroy()

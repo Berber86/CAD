@@ -4615,7 +4615,21 @@ def _prepare_parse_input(
                 and any(int(r) % 360 != 0 for r in rotation_deg)
             )
         )
-        if pdf_info["has_text"] and not explicit_pages:
+        if explicit_pages and not use_llm:
+            # Локальный выбор страниц должен читать именно их текстовый слой,
+            # а не игнорировать диапазон и не отправлять страницы в Vision.
+            doc, _ = _open_fitz_doc(eff_pdf_path)
+            try:
+                indices = parse_page_range(pdf_pages, len(doc), max_pages=0)
+                pdf_text = "\n".join(doc.load_page(i).get_text("text") or "" for i in indices)
+            finally:
+                doc.close()
+            if len(pdf_text.strip()) < 20:
+                raise PDFError(
+                    f"на выбранных страницах PDF «{p_name}» нет читаемого текстового слоя. "
+                    "Для скана выберите ИИ-разбор с Vision-моделью."
+                )
+        elif pdf_info["has_text"] and not explicit_pages:
             pdf_text = str(pdf_info["text"])
         if (
             not pdf_info.get("has_legal_text", pdf_info["has_text"])

@@ -221,6 +221,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: «коды не из словаря» они не показываются
     "point_codes_without_label": [
         "BLC*", "DW*", "OP*", "PLAN*", "SHED*", "STEP*", "SW*", "LST*", "FD*", "XP*", "TTP*",
+        "BL", "BL?",
     ],
     "point_to_fence_max_ft": 3.5,
     # --- источник 2б: описания точек съёмки (атрибуты блоков) ---------------
@@ -237,6 +238,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: «conc sw») не важны. ``category`` — тип объекта: fence, shed, porch,
     #: steps, planter, pool, wall, overhang, surface. Пустая подпись — точка
     #: известна, но объект не подписывается (углы домов, точки хода, отметки).
+    #: Номер линии Carlson в конце кода (``BLC2``, ``SHED1``) отбрасывается.
+    #: ``{area}`` в подписи — площадь контура в кв. футах; ``label_narrow`` —
+    #: подпись для объекта уже ``narrow_object_max_width_ft`` (одна ступень).
     "point_descriptions": [
         {"match": ["VINYL FENCE", "V FENCE", "PVC FENCE"], "label": "VINYL FENCE", "category": "fence"},
         {"match": ["F E C", "CHAIN LINK FENCE", "C L F"], "label": "CHAIN LINK FENCE", "category": "fence"},
@@ -244,16 +248,29 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         {"match": ["IRON FENCE", "I FENCE"], "label": "IRON FENCE", "category": "fence"},
         {"match": ["O PORCH", "OPEN PORCH", "PORCH"], "label": "O.P.", "category": "porch"},
         {"match": ["DECK", "WOOD DECK", "FRAME DECK"], "label": "FRAME\nDECK", "category": "porch"},
-        {"match": ["STEPS", "STEP", "STAIRS"], "label": "STEPS", "category": "steps"},
+        {
+            "match": ["STEPS", "STEP", "STAIRS"], "label": "STEPS", "label_narrow": "STEP",
+            "category": "steps",
+        },
         {"match": ["SHED"], "label": "SHED", "category": "shed"},
-        {"match": ["POOL"], "label": "POOL", "category": "pool"},
+        {"match": ["POOL"], "label": "POOL\nAREA {area} Sq.Ft.", "category": "pool"},
         {"match": ["PLANTER"], "label": "PLANTER", "category": "planter"},
         {"match": ["BOT WALL", "TOP WALL", "WALL"], "label": "WALL", "category": "wall"},
-        {"match": ["CANTILEVER", "OVERHANG"], "label": "CANTILEVER", "category": "overhang"},
+        {"match": ["CANTILEVER", "OVERHANG"], "label": "CANTIL.", "category": "overhang"},
         {"match": ["EDG DWY", "EDGE DWY", "DWY", "DRIVEWAY"], "label": "DRIVEWAY", "category": "surface"},
-        {"match": ["CONC SW", "CONC WALK", "SW"], "label": "CONC. WALK", "category": "surface"},
-        {"match": ["BLC*", "TTP*", "SPOT GRADE*"], "label": ""},
+        # BLC — building corner, BL — building line; TTP — точка хода; CONC-SW —
+        # кромка тротуара/дорожки: материал покрытия заказчик берёт с фотографий.
+        {"match": ["BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW"], "label": ""},
     ],
+    "narrow_object_max_width_ft": 1.5,
+    #: забор, идущий по стене (в пределах ``fence_atop_wall_reach_ft`` от её
+    #: контура), подписывается вместе с ней; у стены своей подписи нет
+    "fence_atop_wall_format": "{fence} ATOP {wall}",
+    "fence_atop_wall_reach_ft": 0.5,
+    "fence_atop_wall_min_ft": 4.0,
+    #: общая подпись ставится, если забор идёт по стене не короче этой длины;
+    #: на более коротком участке стена просто остаётся без подписи
+    "fence_atop_wall_label_min_ft": 10.0,
     #: точка описания относится к ближайшей линии своего слоя не дальше этого
     "point_to_feature_max_ft": 2.0,
     #: столбы, колодцы, гидранты: заказчик их не подписывает (true — подписывать)
@@ -330,9 +347,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- размещение подписей (acad_builder.py) -------------------------------
     "text_height_ft": None,
     "text_height_factor": 1.0,
-    #: вертикальный текст читается сверху вниз ("down", как у заказчика) или
-    #: снизу вверх ("up")
-    "vertical_text_reads": "down",
+    #: вертикальный текст читается снизу вверх ("up", как в итоговом чертеже
+    #: заказчика: поворот +90°) или сверху вниз ("down", −90°)
+    "vertical_text_reads": "up",
     #: после подписания выключить слои полевых заметок (их заменили подписи)
     "hide_field_notes_after_labeling": True,
     "fence_min_extra_length_ft": 4.0,
@@ -359,8 +376,22 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "narrow_chars": ".,'`:;!|",
     "measure_text_in_autocad": True,
     #: короткие заборы целиком за пределами участка (возвраты и продолжения
-    #: соседских заборов) сокращением «C.L.F.» не подписываются
-    "label_short_fences_outside_lot": False,
+    #: соседских заборов) подписываются сокращением «C.L.F.», как в итоговом
+    #: чертеже заказчика (false — не подписывать)
+    "label_short_fences_outside_lot": True,
+    #: полное название («CHAIN LINK FENCE») пишется на прямом участке, который
+    #: длиннее подписи не меньше чем в столько раз; на более коротком —
+    #: сокращение («C.L.F.»)
+    "fence_full_label_ratio": 2.0,
+    #: Соседский забор — тот, что больше чем наполовину идёт за линией участка
+    #: (дальше fence_on_line_tolerance_ft). Сокращение ставится на каждом его
+    #: прямом участке, включая отводы (у своего забора — только на самом
+    #: длинном). Одинаковые сокращения — не ближе fence_abbreviation_spacing_ft.
+    "fence_on_line_tolerance_ft": 0.15,
+    "fence_abbreviation_spacing_ft": 4.0,
+    #: категории, у которых подпись вдоль кромки ставится с внешней стороны
+    #: (клумба — полоса между своей кромкой и забором у границы участка)
+    "outward_label_categories": ["planter"],
     "fence_near_lot_ft": 2.0,
     #: заметка о покрытии снимает подпись по слою у такого же покрытия в этом радиусе
     "field_note_surface_radius_ft": 15.0,
@@ -733,16 +764,39 @@ def translate_description(text: str, rules: Any) -> tuple[str, str, str] | None:
     правила; пустая подпись — «точка известна, подпись не нужна». ``None`` —
     правила для описания нет.
     """
+    found = find_description_rule(text, rules)
+    if found is None:
+        return None
+    rule, pattern = found
+    label = str(rule.get("label") or "").strip()
+    return label, str(rule.get("category") or "").strip().lower(), pattern
+
+
+_LINE_NUMBER_RE = re.compile(r"\s*\d+$")
+
+
+def find_description_rule(text: str, rules: Any) -> tuple[dict[str, Any], str] | None:
+    """
+    Правило ``point_descriptions`` для описания точки: ``(правило, шаблон)``.
+
+    Если целиком описание не подошло, отбрасывается номер линии Carlson в
+    конце (``SHED1``, ``F E C 2``): он говорит, какие точки соединять, а не
+    что это за объект.
+    """
     key = normalize_description(text)
     if not key or not isinstance(rules, (list, tuple)):
         return None
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        for pattern in _as_patterns(rule.get("match")):
-            if _wild_regex(normalize_description(pattern)).match(key):
-                label = str(rule.get("label") or "").strip()
-                return label, str(rule.get("category") or "").strip().lower(), pattern
+    keys = [key]
+    stripped = _LINE_NUMBER_RE.sub("", key)
+    if stripped and stripped != key:
+        keys.append(stripped)
+    for candidate in keys:
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            for pattern in _as_patterns(rule.get("match")):
+                if _wild_regex(normalize_description(pattern)).match(candidate):
+                    return rule, pattern
     return None
 
 
@@ -815,6 +869,8 @@ class PointCode:
     category: str = ""
     #: точка — блок с атрибутами (а не текст «64 FEV» слоя POINT_LABELS)
     from_block: bool = False
+    #: подпись для узкого объекта (``label_narrow`` правила): STEPS -> STEP
+    narrow_label: str = ""
 
     @property
     def title(self) -> str:
@@ -1533,9 +1589,13 @@ def _collect_point_codes(
         pattern: str | None = None
         category = ""
         is_fence = False
-        translated = translate_description(description, rules)
+        narrow_label = ""
+        translated = find_description_rule(description, rules)
         if translated is not None:
-            label, category, pattern = translated[0] or None, translated[1], translated[2]
+            rule, pattern = translated
+            label = str(rule.get("label") or "").strip() or None
+            category = str(rule.get("category") or "").strip().lower()
+            narrow_label = str(rule.get("label_narrow") or "").strip()
             is_fence = category == "fence"
         else:
             # Короткий код в атрибуте («FEV64») — как текст слоя POINT_LABELS.
@@ -1559,6 +1619,7 @@ def _collect_point_codes(
                 is_fence=is_fence,
                 category=category,
                 from_block=True,
+                narrow_label=narrow_label,
             )
         )
     return codes, unknown
@@ -1567,6 +1628,10 @@ def _collect_point_codes(
 # ---------------------------------------------------------------------------
 # Заметки полевого чертёжника -> формулировки заказчика
 # ---------------------------------------------------------------------------
+
+#: почему объект намеренно оставлен без подписи
+SURFACE_EDGE_REASON = "кромка покрытия: материал по линиям не определить"
+WALL_UNDER_FENCE_REASON = "стена подписана вместе с забором на ней"
 
 #: категория «покрытие/грунт»: подпись ставится в точке заметки, без объекта
 GROUND_TARGET = "ground"
@@ -1713,15 +1778,18 @@ def _collect_field_notes(
             paths.append((coords[0], coords[-1]))
     for first, last in paths:
         p_first, p_last = Point(first), Point(last)
-        best: tuple[float, FieldNote, tuple[float, float]] | None = None
+        # Выноска принадлежит переведённой заметке; посторонний текст на слое
+        # заметок (tax-подпись у конца стрелки) её не перехватывает.
+        best: tuple[tuple[int, float], FieldNote, tuple[float, float]] | None = None
         for note in notes:
             link = max(2.0, 2.5 * (note.height or 1.0))
             d_first, d_last = note.box.distance(p_first), note.box.distance(p_last)
             near, far, tip = (d_first, d_last, last) if d_first <= d_last else (d_last, d_first, first)
             if near > link or far < 0.5:
                 continue
-            if best is None or near < best[0]:
-                best = (near, note, (float(tip[0]), float(tip[1])))
+            key = (0 if note.labels else 1, near)
+            if best is None or key < best[0]:
+                best = (key, note, (float(tip[0]), float(tip[1])))
         if best is not None and best[2] not in best[1].tips:
             best[1].tips.append(best[2])
     return notes
@@ -2120,7 +2188,7 @@ def _extract_layer_shapes(
     Точки, рядом с которыми нет линий слоя, складываются в ``loose``.
 
     ``linear`` — слой линейных объектов (пунктир консоли вокруг дома): площадь
-    по незамкнутым линиям не строится, объект — самая длинная ломаная.
+    по незамкнутым линиям не строится, объект — каждая ломаная длиннее 5 ft.
     """
     noded = _noded(snap_endpoints(lines, tolerance))
     if not noded:
@@ -2215,7 +2283,13 @@ def _extract_layer_shapes(
         )
         if edges_only:
             longest = max(chains, key=lambda chain: chain.length)
-            shapes.append(_LayerShape(geometry=longest, closed=False, is_area=False, codes=codes))
+            # Пунктир консоли идёт вдоль нескольких стен дома — подпись у каждой;
+            # у кромок покрытия подписывается одна, самая длинная.
+            kept = [chain for chain in chains if chain.length >= 5.0] if linear else []
+            for chain in kept or [longest]:
+                shapes.append(
+                    _LayerShape(geometry=chain, closed=False, is_area=False, codes=codes)
+                )
             continue
         polygon = _shape_from_open_lines(cluster, min_width)
         if polygon is not None:
@@ -2252,6 +2326,89 @@ def _ribbon_side(polygon: Polygon, max_width: float) -> LineString | None:
         if best is None or side.length > best.length:
             best = side
     return best
+
+
+def _mean_width(geometry: BaseGeometry) -> float:
+    """Средняя ширина контура: 2·площадь / периметр (у ленты 1 × 45 ft — 1 ft)."""
+    perimeter = geometry.length
+    return 2.0 * geometry.area / perimeter if perimeter > 0.0 else 0.0
+
+
+def _fill_area(label: str, polygon: BaseGeometry | None) -> str:
+    """``{area}`` -> площадь контура; у линии строка с ``{area}`` убирается."""
+    lines = []
+    for line in label.split("\n"):
+        if "{area}" in line:
+            if polygon is None:
+                continue
+            line = line.replace("{area}", f"{polygon.area:.0f}")
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _fences_atop_walls(
+    result: "RecognitionResult",
+    wall_shapes: dict[int, Polygon],
+    fcfg: dict[str, Any],
+    new_id: Any,
+) -> None:
+    """
+    Забор на стене: часть линии забора, идущая по контуру стены, становится
+    отдельным объектом с подписью «VINYL FENCE ATOP WALL»; стена своей подписи
+    не получает (заказчик подписывает их вместе).
+    """
+    reach = max(0.0, float(fcfg.get("fence_atop_wall_reach_ft") or 0.0))
+    min_atop = max(0.0, float(fcfg.get("fence_atop_wall_min_ft") or 0.0))
+    min_label = max(min_atop, float(fcfg.get("fence_atop_wall_label_min_ft") or 0.0))
+    template = str(fcfg.get("fence_atop_wall_format") or "").strip()
+    min_length = float(fcfg.get("min_feature_length_ft") or 0.0)
+    if not template or not wall_shapes:
+        return
+    walls = {f.feature_id: f for f in result.features if f.feature_id in wall_shapes}
+    wall_names = {wall_id: wall.label for wall_id, wall in walls.items()}
+    for wall_id, polygon in wall_shapes.items():
+        wall = walls.get(wall_id)
+        if wall is None:
+            continue
+        zone = polygon.buffer(reach)
+        for fence in list(result.features):
+            if fence.kind != "fence" or fence.category != "fence" or not fence.label:
+                continue
+            if " ATOP " in fence.label:
+                continue
+            atop = merge_lines(_line_parts(fence.geometry.intersection(zone)), 1e-6)
+            atop = [part for part in atop if part.length >= min_atop]
+            if not atop:
+                continue
+            wall.label = None
+            wall.skip_reason = WALL_UNDER_FENCE_REASON
+            atop = [part for part in atop if part.length >= min_label]
+            if not atop:
+                continue  # короткий участок стены под забором: только забор
+            wall_name = " ".join(str(wall_names.get(wall_id) or "WALL").split())
+            try:
+                label = template.format(fence=fence.flat_label, wall=wall_name)
+            except (KeyError, IndexError, ValueError):
+                label = f"{fence.flat_label} ATOP {wall_name}"
+            rest = merge_lines(_line_parts(fence.geometry.difference(zone)), 1e-6)
+            rest = [part for part in rest if part.length >= max(min_length, 1e-6)]
+            result.features.remove(fence)
+            for part in atop:
+                result.features.append(
+                    Feature(
+                        feature_id=new_id(), kind="fence", category="fence", layer=fence.layer,
+                        geometry=part, label=label, source=fence.source,
+                        rule=f"{fence.rule}; на стене {wall.layer}", codes=fence.codes,
+                    )
+                )
+            for part in rest:
+                result.features.append(
+                    Feature(
+                        feature_id=new_id(), kind="fence", category="fence", layer=fence.layer,
+                        geometry=part, label=fence.label, source=fence.source,
+                        rule=fence.rule, codes=fence.codes,
+                    )
+                )
 
 
 def _count_treads(polygon: Polygon, treads: Sequence[LineString], tolerance: float) -> int:
@@ -2521,6 +2678,8 @@ def recognize_features(
         str(name).strip().lower() for name in _as_patterns(fcfg.get("ribbon_categories"))
     }
     ribbon_width = max(0.0, float(fcfg.get("ribbon_max_width_ft") or 0.0))
+    narrow_width = max(0.0, float(fcfg.get("narrow_object_max_width_ft") or 0.0))
+    wall_shapes: dict[int, Polygon] = {}
     loose_points: list[PointCode] = []
     for layer in sorted(structure_lines):
         category = classifier.structure_category(layer) or "structure"
@@ -2567,11 +2726,21 @@ def recognize_features(
                 feature.rule = f"{first.raw} → {first.pattern}"
                 feature.codes = shape.codes
                 feature.category = first.category or category
+                if first.narrow_label and shape.is_area and _mean_width(geometry) <= narrow_width:
+                    feature.label = first.narrow_label  # одна ступень: STEP, а не STEPS
+            if feature.label and "{area}" in feature.label:
+                feature.label = _fill_area(feature.label, geometry if shape.is_area else None)
+            if feature.category == "wall" and feature.kind == "area":
+                wall_shapes[feature.feature_id] = geometry  # type: ignore[assignment]
             if feature.kind == "area" and feature.category in ribbon_categories:
                 side = _ribbon_side(geometry, ribbon_width)  # type: ignore[arg-type]
                 if side is not None:
                     feature.kind = "edge"
                     feature.geometry = side
+            if not feature.label and category == "surface":
+                # Кромка тротуара или заезда без описания материала: что это за
+                # покрытие, по линиям не понять — в «без подписи» не выносится.
+                feature.skip_reason = SURFACE_EDGE_REASON
             if count_treads and category == "steps" and feature.label and feature.kind == "area":
                 treads = _count_treads(geometry, tread_lines, tolerance)  # type: ignore[arg-type]
                 if treads > 0:
@@ -2585,6 +2754,8 @@ def recognize_features(
             if category == "house" and feature.kind == "area":
                 house_candidates.append(feature)
             result.features.append(feature)
+
+    _fences_atop_walls(result, wall_shapes, fcfg, new_id)
 
     # --- основной дом: текст из окна программы ------------------------------
     house_label = _normalize_house_text(house_text)

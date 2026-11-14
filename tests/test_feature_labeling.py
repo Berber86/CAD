@@ -287,7 +287,7 @@ def test_shipped_config_mirrors_feature_defaults():
     assert section["step_tread_layers"] == ["*TREADS*"]
     assert section["code_linework_layers"] == ["CODE_CREW"]
     assert section["fence_text_offset_factor"] == 1.1
-    assert section["label_short_fences_outside_lot"] is False
+    assert section["label_short_fences_outside_lot"] is True
     assert section["label_point_features"] is False
     # load_config() доносит раздел до AcadBuilder без изменений.
     assert fl.feature_settings(load_config()) == fl.DEFAULT_FEATURE_CONFIG
@@ -535,10 +535,10 @@ def test_plan_places_every_label_without_overlaps(angle):
             assert not item.box.intersects(geom), (item.text, item.placement)
 
     # Текст не перевёрнут: горизонтальный читается слева направо, вертикальный —
-    # сверху вниз (поворот в окне −120°..60°), и стоит по осям участка.
+    # снизу вверх (поворот в окне −60°..120°), и стоит по осям участка.
     for item in plan.items:
         degrees = math.degrees(item.rotation)
-        assert -120.0 - 1e-6 <= degrees < 60.0, (item.text, degrees)
+        assert -60.0 < degrees <= 120.0 + 1e-6, (item.text, degrees)
         assert (degrees - angle) % 90.0 == pytest.approx(0.0, abs=1e-4) or (
             degrees - angle
         ) % 90.0 == pytest.approx(90.0, abs=1e-4), (item.text, degrees)
@@ -548,8 +548,8 @@ def test_long_fence_gets_text_parallel_to_line_with_offset():
     plan = make_plan(build_scene())
     item = item_for(plan, "FENCE_WOOD_RIGHT")
     assert (item.kind, item.placement) == ("text", "along")
-    # Вертикальный текст читается сверху вниз, как на чертеже заказчика.
-    assert math.degrees(item.rotation) == pytest.approx(-90.0, abs=1e-6)
+    # Вертикальный текст читается снизу вверх, как в итоговом чертеже заказчика.
+    assert math.degrees(item.rotation) == pytest.approx(90.0, abs=1e-6)
     # Отступ от линии забора = 1.1 * высоты текста, текст со стороны участка:
     # между линией и буквами остаётся зазор в 0.6 высоты текста.
     assert abs(item.point[0] - 39.8) == pytest.approx(1.1, abs=1e-6)
@@ -564,14 +564,21 @@ def test_long_fence_gets_text_parallel_to_line_with_offset():
 
 
 def test_vertical_text_direction_is_configurable():
-    assert math.degrees(ab.label_rotation(math.pi / 2)) == pytest.approx(-90.0)
-    assert math.degrees(ab.label_rotation(math.radians(88.0))) == pytest.approx(-92.0)
-    assert math.degrees(ab.label_rotation(math.radians(92.0))) == pytest.approx(-88.0)
-    assert math.degrees(ab.label_rotation(math.radians(200.0))) == pytest.approx(20.0)
+    assert math.degrees(ab.label_rotation(math.pi / 2, "down")) == pytest.approx(-90.0)
+    assert math.degrees(ab.label_rotation(math.radians(88.0), "down")) == pytest.approx(-92.0)
+    assert math.degrees(ab.label_rotation(math.radians(92.0), "down")) == pytest.approx(-88.0)
+    assert math.degrees(ab.label_rotation(math.radians(200.0), "down")) == pytest.approx(20.0)
     assert math.degrees(ab.label_rotation(math.pi / 2, "up")) == pytest.approx(90.0)
     assert math.degrees(ab.label_rotation(math.radians(272.0), "up")) == pytest.approx(92.0)
-    plan = make_plan(build_scene(), cfg={"feature_labeling": {"vertical_text_reads": "up"}})
-    assert math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation) == pytest.approx(90.0)
+    # Итоговый чертёж Ilion Place: 90.4° вдоль боковых границ, 70.8° вдоль скошенной.
+    assert math.degrees(ab.label_rotation(math.radians(270.418), "up")) == pytest.approx(90.418)
+    assert math.degrees(ab.label_rotation(math.radians(250.836), "up")) == pytest.approx(70.836)
+    assert math.degrees(ab.label_rotation(math.radians(180.418), "up")) == pytest.approx(0.418)
+    # По умолчанию — снизу вверх; настройка возвращает чтение сверху вниз.
+    assert fl.DEFAULT_FEATURE_CONFIG["vertical_text_reads"] == "up"
+    assert math.degrees(item_for(make_plan(build_scene()), "FENCE_WOOD_RIGHT").rotation) == pytest.approx(90.0)
+    plan = make_plan(build_scene(), cfg={"feature_labeling": {"vertical_text_reads": "down"}})
+    assert math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation) == pytest.approx(-90.0)
 
 
 def test_fence_text_moves_away_from_parallel_property_line():
@@ -595,7 +602,7 @@ def test_long_fence_is_labeled_on_every_long_run_once():
     snap.lines.append(DrawingLine("FENCE_IRON_FAR", ((-30, 110), (30, 110), (30, 140)), kind="AcDbPolyline"))
     plan = make_plan(snap)
     iron = [i for i in plan.items if i.feature.layer == "FENCE_IRON_FAR"]
-    assert sorted(round(math.degrees(i.rotation)) for i in iron) == [-90, 0]
+    assert sorted(round(math.degrees(i.rotation)) for i in iron) == [0, 90]
     assert {i.text for i in iron} == {"IRON FENCE"}
 
 
@@ -603,8 +610,8 @@ def test_rotated_fence_text_follows_fence_angle():
     plan = make_plan(build_scene(17.0))
     item = item_for(plan, "FENCE_WOOD_RIGHT")
     assert item.placement == "along"
-    # Линия под 107°: текст вдоль неё, сверху вниз (−73°), а не перевёрнутые 107°.
-    assert math.degrees(item.rotation) == pytest.approx(-73.0, abs=1e-6)
+    # Линия под 107°: текст вдоль неё, снизу вверх, как вдоль остальных боковых линий.
+    assert math.degrees(item.rotation) == pytest.approx(107.0, abs=1e-6)
 
 
 def test_short_fence_gets_abbreviation_and_steps_label_sits_beside():
@@ -710,20 +717,28 @@ def test_gate_crossing_the_lot_line_is_labeled_inside_the_lot():
     assert 31.9 < minx and maxx < 39.7  # между стеной дома и забором, границу не задевает
 
 
-def test_short_neighbour_fences_outside_the_lot_are_not_labeled():
-    plan = stafford_plan()
-    labeled = {item.feature.layer for item in plan.items}
+def test_short_neighbour_fences_outside_the_lot_get_abbreviations():
+    """Возвраты и продолжения соседских заборов — сокращением, как в итоговом чертеже."""
     outside = {"FENCE_CHAIN_9_NORTH", "FENCE_VINYL_REAR_RETURN", "FENCE_VINYL_16_EXTENSION"}
-    assert not labeled & outside
+    plan = stafford_plan()
+    assert plan.skipped == []
+    assert {item.feature.layer: item.text for item in plan.items if item.feature.layer in outside} == {
+        "FENCE_CHAIN_9_NORTH": "C.L.F.",
+        "FENCE_VINYL_REAR_RETURN": "V.FE.",
+        "FENCE_VINYL_16_EXTENSION": "V.FE.",
+    }
+    assert not [item for item in plan.items if item.feature.layer in outside and item.placement != "along"]
+    # Забор соседа вдоль задней границы (в 0.5–0.9 ft от неё) подписывается полностью:
+    # прямой участок 23.6 ft больше чем вдвое длиннее подписи.
+    assert item_for(plan, "FENCE_VINYL_REAR_MEASURED").text == "VINYL FENCE"
+
+    # Настройка убирает сокращения с коротких заборов за участком.
+    plan = stafford_plan(cfg={"feature_labeling": {"label_short_fences_outside_lot": False}})
+    assert not {item.feature.layer for item in plan.items} & outside
     assert {feature.layer for feature, _reason in plan.skipped} == outside
     assert {reason for _feature, reason in plan.skipped} == {"короткий забор за пределами участка"}
     assert not [item for item in plan.items if item.text in {"C.L.F.", "V.FE."}]
-    # Забор соседа вдоль задней границы (в 0.5–0.9 ft от неё) подписывается полностью.
     assert item_for(plan, "FENCE_VINYL_REAR_MEASURED").text == "VINYL FENCE"
-
-    # Настройка возвращает сокращения на коротких заборах за участком.
-    plan = stafford_plan(cfg={"feature_labeling": {"label_short_fences_outside_lot": True}})
-    assert {"FENCE_VINYL_16_EXTENSION"} <= {item.feature.layer for item in plan.items}
 
 
 def test_fence_text_keeps_clear_of_fence_and_lot_lines():
@@ -766,7 +781,7 @@ def test_stafford_plan_has_no_overlaps_at_any_rotation():
         plan = make_plan(
             build_stafford_scene(angle_deg=angle), house=STAFFORD_HOUSE, height=0.9
         )
-        assert len(plan.items) == 23 and plan.warnings == [], angle
+        assert len(plan.items) == 26 and plan.warnings == [], angle
         assert plan.count_placement("leader") == 0, angle
         assert not [item for item in plan.items if item.note], angle
         boxes = [item.box for item in plan.items]
@@ -1253,7 +1268,7 @@ def test_label_features_draws_into_d_topo_text(com):
     assert all(e.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for e in texts)
     assert all(e.Height == pytest.approx(0.9) for e in texts + mtexts)
     wood = next(e for e in texts if e.TextString == "WOOD FENCE")
-    assert math.degrees(wood.Rotation) == pytest.approx(-90.0)  # вертикальный текст — сверху вниз
+    assert math.degrees(wood.Rotation) == pytest.approx(90.0)  # вертикальный текст — снизу вверх
 
     house = next(e for e in mtexts if e.TextString == HOUSE)
     assert house.AttachmentPoint == ab.AC_ATTACHMENT_MIDDLE_CENTER
@@ -1280,13 +1295,13 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
     rec = result.recognition
     assert (rec.by_notes, rec.by_point_codes, rec.by_layers, rec.by_user) == (23, 1, 1, 1)
     assert result.skipped_duplicates == 0
-    assert result.created_labels == 23
+    assert result.created_labels == 26
     assert result.created_leaders == 0  # при тексте 0.9 ft всё встаёт без выносок
 
     space = doc.ModelSpace
     texts = sorted(e.TextString for e in space.created if e.ObjectName == "AcDbText")
     mtexts = sorted(e.TextString for e in space.created if e.ObjectName == "AcDbMText")
-    assert texts == ["CHAIN LINK FENCE"] * 3 + ["VINYL FENCE"]
+    assert texts == ["C.L.F."] + ["CHAIN LINK FENCE"] * 3 + ["V.FE."] * 2 + ["VINYL FENCE"]
     assert mtexts == sorted([
         "1 STY\\PFRAME\\P(BRICK FACE)\\PW/BSMNT\\PNo. 87",
         "FRAME\\PDECK", "FRAME\\PSTEPS", "SHED", "PLANTER", "EARTH", "GRASS",
@@ -1313,7 +1328,7 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
     report = result.report()
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 23" in report
     assert "БЕЗ ПОДПИСИ (для слоя нет правила): 1 — BUILDING_OUTLINE (1)" in report  # без CODE_CREW
-    assert "короткий забор за пределами участка" in report
+    assert "короткий забор за пределами участка" not in report  # они подписаны сокращениями
     assert "Слои полевых заметок выключены" in report
     assert "Заметки, которые не переносятся по правилам: «HOUSE»; «LOW TIMBER EDGE»; «NEIGHBOUR HOUSE»" in report
     assert "Коды точек не из словаря" not in report  # BLC, OP, STEP, SW… — коды углов объектов
@@ -1323,7 +1338,7 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
     # Повторный запуск читает заметки из выключенных слоёв и ничего не удваивает.
     created = len(space.created)
     second = builder.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
-    assert second.created_labels == 0 and second.skipped_duplicates == 23
+    assert second.created_labels == 0 and second.skipped_duplicates == 26
     assert second.recognition.by_notes == 23
     assert len(space.created) == created
 
@@ -1333,7 +1348,7 @@ def test_arc_leader_is_a_polyline_with_wedge_arrow(com):
     builder, _app, doc = com(build_stafford_scene())
     result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.0)
     assert result.failed == [] and result.warnings == []
-    assert result.created_labels == 23 and result.created_leaders == 2
+    assert result.created_labels == 26 and result.created_leaders == 2
     space = doc.ModelSpace
     assert not [e for e in space.created if e.ObjectName == "AcDbLeader"]
     arrows = [e for e in space.created if e.ObjectName == "AcDbPolyline"]
@@ -1355,7 +1370,7 @@ def test_text_width_is_measured_in_autocad_when_font_differs(com):
     fence = next(i for i in result.plan.items if i.text == "CHAIN LINK FENCE")
     length = max(fence.box.bounds[2] - fence.box.bounds[0], fence.box.bounds[3] - fence.box.bounds[1])
     assert length == pytest.approx(1.25 * ab.feature_text_width("CHAIN LINK FENCE", 0.9))
-    assert result.created_labels == 23 and result.failed == []
+    assert result.created_labels == 26 and result.failed == []
 
     # Отличие в пределах 4 % — шрифт расчётный, поправка не вводится.
     builder, _app, doc = com(build_stafford_scene(), font_scale=1.02)
@@ -1481,7 +1496,7 @@ def test_leader_style_leader_uses_addleader_and_falls_back_to_polyline(com):
         build_stafford_scene(), feature_cfg={"leader_style": "leader"}, with_leader=False
     )
     result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.0)
-    assert result.created_labels == 23
+    assert result.created_labels == 26
     assert result.created_leaders == 2
     assert result.failed == []
     assert len(result.warnings) == 1 and "полилинией" in result.warnings[0]
@@ -1563,7 +1578,12 @@ def ilion_features(result, label, kind=None):
         ("VINYL FENCE", ("VINYL FENCE", "fence")),
         ("F E C", ("CHAIN LINK FENCE", "fence")),
         ("o porch", ("O.P.", "porch")),
-        ("CONC-SW", ("CONC. WALK", "surface")),
+        ("CONC-SW", ("", "")),          # кромка тротуара: материал заказчик берёт с фото
+        ("CANTILEVER", ("CANTIL.", "overhang")),
+        ("POOL", ("POOL\nAREA {area} Sq.Ft.", "pool")),
+        ("SHED1", ("SHED", "shed")),    # номер линии Carlson в конце описания
+        ("F E C 2", ("CHAIN LINK FENCE", "fence")),
+        ("BL", ("", "")),               # building line: точка на стене, угол не снят
         ("EDG  DWY", ("DRIVEWAY", "surface")),
         ("BOT WALL", ("WALL", "wall")),
         ("BLC DW", ("", "")),           # угол дома: точка известна, подпись не нужна
@@ -1608,8 +1628,10 @@ def test_ilion_descriptions_become_labels():
     assert result.by_notes == 0 and result.by_layers == 0
 
     # Бассейн и ступени к нему начерчены общими линиями, но это два объекта.
-    (pool,) = ilion_features(result, "POOL")
-    assert pool.kind == "area" and pool.category == "pool" and pool.layer == "ST-MISC"
+    # У бассейна заказчик пишет площадь: она считается по контуру.
+    (pool,) = [f for f in result.features if f.category == "pool"]
+    assert pool.label == "POOL\nAREA 349 Sq.Ft."
+    assert pool.kind == "area" and pool.layer == "ST-MISC"
     assert pool.geometry.area == pytest.approx(349.0, abs=3.0)
     assert sorted(code.number for code in pool.codes) == ["51", "52", "53"]
     pool_steps = [f for f in ilion_features(result, "STEPS") if f.geometry.distance(pool.geometry) < 0.1]
@@ -1623,19 +1645,29 @@ def test_ilion_descriptions_become_labels():
     assert sorted(code.number for code in porch.codes) == ["10", "11"]
 
     assert len(ilion_features(result, "SHED", "area")) == 2
-    assert len(ilion_features(result, "STEPS")) == 5
+    # Узкая ступень (шириной до 1.5 ft) — «STEP», лестница — «STEPS».
+    narrow = ilion_features(result, "STEP")
+    assert len(narrow) == 2 and len(ilion_features(result, "STEPS")) == 3
+    width = fl.DEFAULT_FEATURE_CONFIG["narrow_object_max_width_ft"]
+    assert all(2.0 * f.geometry.area / f.geometry.length <= width for f in narrow)
     (planter,) = ilion_features(result, "PLANTER")
     assert planter.kind == "edge" and planter.geometry.length == pytest.approx(17.9, abs=0.1)
     (driveway,) = ilion_features(result, "DRIVEWAY")
     assert driveway.kind == "area" and driveway.layer == "S-ROAD-DWY"
-    (walk,) = ilion_features(result, "CONC. WALK")
-    assert walk.kind == "edge" and walk.geometry.length == pytest.approx(50.3, abs=0.1)
-    (overhang,) = ilion_features(result, "CANTILEVER")
-    assert overhang.kind == "edge" and overhang.layer == "ST-OHED"
-    walls = ilion_features(result, "WALL")
+    # Кромка тротуара подписи не получает: в итоговом чертеже её нет.
+    walks = [f for f in result.features if f.layer == "S-ROAD-SW-LINE"]
+    assert walks and not [f for f in walks if f.label]
+    assert {f.skip_reason for f in walks} == {fl.SURFACE_EDGE_REASON}
+    # Свес («CANTIL.») — на каждой стороне дома, где он начерчен.
+    overhangs = ilion_features(result, "CANTIL.")
+    assert len(overhangs) == 2 and {f.layer for f in overhangs} == {"ST-OHED"}
+    assert not ilion_features(result, "CANTILEVER")
+
+    # Стены под заборами отдельной подписи не получают.
+    walls = [f for f in result.features if f.category == "wall"]
     assert len(walls) == 3 and {wall.layer for wall in walls} == {"ST-WALL"}
-    # Длинная стена вдоль задней межи — лента шириной в фут: подпись вдоль неё.
-    assert max(walls, key=lambda wall: wall.geometry.length).kind == "edge"
+    assert not [wall for wall in walls if wall.label]
+    assert {wall.skip_reason for wall in walls} == {fl.WALL_UNDER_FENCE_REASON}
 
     house = next(f for f in result.features if f.is_main_house)
     assert house.layer == "ST-BLDG-LINE" and house.label == ILION_HOUSE
@@ -1654,25 +1686,87 @@ def test_ilion_fences_follow_the_point_descriptions():
     result = recognize(load_ilion(), house=ILION_HOUSE)
     vinyl = ilion_features(result, "VINYL FENCE")
     chain = ilion_features(result, "CHAIN LINK FENCE")
-    assert sorted(round(f.geometry.length, 1) for f in chain) == [8.1, 21.3, 33.1, 33.2, 35.3]
-    # Виниловый забор вокруг двора — одна линия; точка 37 «F E C» лежит на ней в
-    # футе от угла, но относится к соседней сетке и забор не делит.
-    main = max(vinyl, key=lambda f: f.geometry.length)
-    assert main.geometry.length == pytest.approx(222.8, abs=0.5)
-    assert {code.label for code in main.codes} == {"VINYL FENCE"}
+    assert sorted(round(f.geometry.length, 1) for f in chain) == [0.6, 8.1, 18.6, 33.1, 35.3]
+    assert sorted(round(f.geometry.length, 1) for f in vinyl) == [5.2, 6.9, 8.5, 9.4, 69.7, 83.7]
+    # Точка 37 «F E C» лежит на виниловом заборе в футе от угла, но относится к
+    # соседней сетке и забор не делит.
+    for fence in vinyl:
+        assert {code.label for code in fence.codes} == {"VINYL FENCE"}
     east_chain = next(f for f in chain if round(f.geometry.length, 1) == 33.1)
     assert sorted(code.number for code in east_chain.codes) == ["37", "39"]
     assert not result.unbound_fence_codes
+
+
+def test_ilion_fence_on_a_wall_is_one_label():
+    """Заказчик пишет «VINYL FENCE ATOP MASONRY WALL», а не забор и стену отдельно."""
+    result = recognize(load_ilion(), house=ILION_HOUSE)
+    (vinyl,) = ilion_features(result, "VINYL FENCE ATOP WALL")
+    assert vinyl.kind == "fence" and vinyl.geometry.length == pytest.approx(69.4, abs=0.2)
+    assert "на стене ST-WALL" in vinyl.rule
+    chain = ilion_features(result, "CHAIN LINK FENCE ATOP WALL")
+    assert sorted(round(f.geometry.length, 1) for f in chain) == [14.6, 20.7]
+    # 8 ft сетки над короткой стеной у сарая: общей подписи нет, стена молчит,
+    # забор остаётся целым (33.1 ft).
+    assert fl.DEFAULT_FEATURE_CONFIG["fence_atop_wall_label_min_ft"] == 10.0
+    assert [f for f in ilion_features(result, "CHAIN LINK FENCE") if round(f.geometry.length, 1) == 33.1]
+
+    # Настройка отключает правило: забор и стена подписываются отдельно.
+    plain = recognize(load_ilion(), house=ILION_HOUSE, cfg={"feature_labeling": {"fence_atop_wall_format": ""}})
+    assert not [f for f in plain.features if " ATOP " in f.flat_label]
+    assert len(ilion_features(plain, "WALL")) == 3
+
+
+#: Подписи итогового чертежа заказчика (docs/12 Ilion Place…final.dump.json),
+#: которые Шаг 2 ставит тем же текстом: текст, центр рамки, поворот, допуск в ft.
+ILION_FINAL_LABELS = [
+    ("VINYL FENCE", (4993.2, 5001.5), 70.8, 2.5),
+    ("VINYL FENCE", (5038.4, 5025.8), 90.4, 2.5),
+    ("C.L.F.", (5045.1, 5027.9), 0.4, 2.5),
+    ("C.L.F.", (5044.5, 5052.2), 0.4, 2.5),
+    ("C.L.F.", (5041.3, 4993.7), 90.4, 2.5),
+    ("C.L.F.", (5042.6, 5063.6), 89.2, 5.0),
+    ("V.FE.", (4982.7, 4982.9), 67.9, 2.5),
+    ("V.FE.", (4983.0, 4988.7), -14.4, 2.5),
+    ("CANTIL.", (5034.6, 5033.7), 90.4, 2.5),
+    ("CANTIL.", (5003.8, 5033.4), 90.4, 2.5),
+    ("CANTIL.", (5015.0, 5062.8), 0.4, 8.0),
+    ("O.P.", (5004.4, 5044.0), 90.4, 2.5),
+    ("STEP", (5012.8, 5014.1), 0.4, 2.5),
+    ("PLANTER", (5038.2, 4993.0), 89.4, 4.0),
+]
+
+
+def test_ilion_plan_matches_the_customer_final_drawing():
+    """Те же сокращения, там же и с тем же поворотом, что в итоговом чертеже."""
+    plan = make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)
+    for text, point, rotation, tolerance in ILION_FINAL_LABELS:
+        found = [
+            item for item in plan.items
+            if item.single_line == text and math.dist(item.point, point) <= tolerance
+        ]
+        assert len(found) == 1, (text, point, [i.point for i in plan.items if i.single_line == text])
+        # Полевой чертёж повёрнут относительно итогового на 0.4°.
+        assert math.degrees(found[0].rotation) == pytest.approx(rotation, abs=1.5), text
+    texts = [item.single_line for item in plan.items]
+    assert "VINYL FENCE ATOP WALL" in texts and texts.count("C.L.F. ATOP WALL") == 2
+    assert "POOL AREA 349 Sq.Ft." in texts
+    # Того, чего в итоговом чертеже нет: отдельной стены, тротуара, полного «CANTILEVER».
+    for absent in ("WALL", "CONC. WALK", "CANTILEVER", "CHAIN LINK FENCE"):
+        assert absent not in texts, absent
+    # Короткая сетка у стены: сокращение на выноске в две строки, как у заказчика.
+    (atop,) = [item for item in plan.items if item.text == "C.L.F. ATOP\nWALL"]
+    assert atop.placement == "leader"
 
 
 def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
     snap = load_ilion()
     plan = make_plan(snap, house=ILION_HOUSE, height=0.9)
     texts = sorted(item.single_line for item in plan.items)
-    for expected in ("POOL", "SHED", "O.P.", "PLANTER", "DRIVEWAY", "CONC. WALK",
-                     "VINYL FENCE", "CHAIN LINK FENCE", "2 STY FRAME No. 12"):
+    for expected in ("POOL AREA 349 Sq.Ft.", "SHED", "O.P.", "PLANTER", "DRIVEWAY", "STEP", "STEPS",
+                     "VINYL FENCE", "C.L.F.", "V.FE.", "CANTIL.", "2 STY FRAME No. 12"):
         assert expected in texts, expected
-    assert plan.count_placement("leader") <= 2
+    assert len(plan.items) == 30
+    assert plan.count_placement("leader") <= 3
     assert plan.survey_point_count == 93
     boxes = [item.box for item in plan.items]
     for i, first in enumerate(boxes):

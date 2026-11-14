@@ -5752,13 +5752,13 @@ def _two_line_variant(text: str) -> str | None:
     return f"{left}\n{right}"
 
 
-def label_rotation(line_angle_rad: float, reads: str = "down") -> float:
+def label_rotation(line_angle_rad: float, reads: str = "up") -> float:
     """
     Угол поворота подписи Шага 2 вдоль линии с углом ``line_angle_rad``.
 
     Горизонтальный текст читается слева направо. Вертикальный (и близкий к
-    нему, в пределах 30°) — как у заказчика: ``reads="down"`` — сверху вниз
-    (поворот −90°), ``reads="up"`` — снизу вверх (поворот +90°).
+    нему, в пределах 30°): ``reads="up"`` — снизу вверх (поворот +90°, как в
+    итоговых чертежах заказчика), ``reads="down"`` — сверху вниз (−90°).
     """
     skew = math.radians(30.0)
     center = skew if str(reads).strip().lower() == "up" else -skew
@@ -5866,7 +5866,7 @@ class _LabelPlacer:
         self.line_clear = float(self.fcfg.get("line_clearance_factor") or 0.0) * self.h
         self.inside_clear = float(self.fcfg.get("inside_clearance_factor") or 0.0) * self.h
         self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
-        self.reads = str(self.fcfg.get("vertical_text_reads") or "down")
+        self.reads = str(self.fcfg.get("vertical_text_reads") or "up")
         self.leader_style = str(self.fcfg.get("leader_style") or "arc").strip().lower()
         classifier = LayerClassifier(self.fcfg)
         self.classifier = classifier
@@ -6095,6 +6095,12 @@ class _LabelPlacer:
         label = feature.flat_label
         if not label:
             return None
+        variants = [label]
+        if feature.kind == "fence" and feature.category == "fence":
+            # На выноске забор пишется сокращением («C.L.F. ATOP WALL»).
+            short = self._fence_short_label(label)
+            if short:
+                variants.append(short)
         geom = feature.geometry
         radius = self.radius
         if feature.kind == "spot":
@@ -6110,7 +6116,7 @@ class _LabelPlacer:
                     continue
                 if feature.kind == "area" and feature.closed:
                     continue
-            if not labels_similar(known.text, label, self.synonyms):
+            if not any(labels_similar(known.text, variant, self.synonyms) for variant in variants):
                 continue
             distance = geom.distance(known.box)
             for anchor in known.anchors:
@@ -6342,6 +6348,12 @@ class _LabelPlacer:
         # Первой проверяется сторона, обращённая внутрь участка.
         toward = (centroid.x - mid[0]) * nx + (centroid.y - mid[1]) * ny
         first_side = 1.0 if toward >= 0.0 else -1.0
+        if feature.kind == "edge" and layer_matches(
+            feature.category, self.fcfg.get("outward_label_categories")
+        ):
+            # Кромка клумбы: сама клумба — полоса между этой линией и забором у
+            # границы, подпись ставится в неё, а не во двор.
+            first_side = -first_side
         max_shift = max(0.0, (length - width) / 2.0 - margin)
         best: tuple[int, FeatureLabelItem] | None = None
         # Рядом с забором часто идёт граница участка (FE. 0.3'): если вплотную
@@ -6398,8 +6410,18 @@ class _LabelPlacer:
         duplicate: _KnownLabel | None = None
         # Полоса вдоль линии, в которой может стоять подпись этого участка.
         reach = (float(self.fcfg.get("fence_text_offset_factor") or 0.8) + 2.0) * self.h
+        short_text = self._fence_short_label(text) if feature.kind == "fence" else None
+        if short_text is not None and self._neighbour_fence(feature.geometry):
+            # Забор за линией участка (соседский): заказчик пишет его сокращением
+            # на каждом прямом участке, включая отводы; полностью — только на
+            # длинном участке.
+            return self._place_neighbour(feature, text, short_text, runs, reach)
+        full_from = width + extra
+        if short_text is not None:
+            # Забор: полное название — только на длинном участке, иначе сокращение.
+            full_from = max(full_from, float(self.fcfg.get("fence_full_label_ratio") or 0.0) * width)
         for index, run in enumerate(runs):
-            if run[2] <= width + extra:
+            if run[2] <= full_from:
                 break
             if index > 0 and (every <= 0.0 or run[2] < every):
                 break
@@ -6430,19 +6452,18 @@ class _LabelPlacer:
             )
             return []
         # Короткий участок: сокращение материала вдоль линии.
-        short = lookup_pattern_label(text, self.fcfg.get("fence_abbreviations"))
         if (
             feature.kind == "fence"
-            and not bool(self.fcfg.get("label_short_fences_outside_lot", False))
+            and not bool(self.fcfg.get("label_short_fences_outside_lot", True))
             and self._outside_lot(feature.geometry)
         ):
-            # Возврат или продолжение соседского забора: заказчик их не подписывает.
+            # Возврат или продолжение соседского забора в стороне от участка.
             self.skipped.append((feature, "короткий забор за пределами участка"))
             return []
-        if short is not None and feature.kind == "fence":
-            short_width, _h = self._text_size(short[0])
+        if short_text is not None:
+            short_width, _h = self._text_size(short_text)
             if runs[0][2] >= short_width + 1.0:
-                already = self._run_label(short[0], runs[0][0], runs[0][1], reach)
+                already = self._run_label(short_text, runs[0][0], runs[0][1], reach)
                 if already is not None:
                     self.duplicates.append(
                         FeatureDuplicate(
@@ -6451,12 +6472,92 @@ class _LabelPlacer:
                         )
                     )
                     return []
-                found = self._along_run(feature, short[0], runs[0])
+                found = self._along_run(feature, short_text, runs[0])
                 if found is not None and found[0] == 0:
-                    if self._same_label_near(short[0], found[1].point, spacing) is not None:
+                    if self._same_label_near(short_text, found[1].point, spacing) is not None:
                         return []
                     self._commit(found[1])
                     return [found[1]]
+        return None
+
+    def _fence_short_label(self, text: str) -> str | None:
+        """``CHAIN LINK FENCE`` -> ``C.L.F.``; ``… ATOP WALL`` сокращается так же."""
+        base, separator, tail = text.partition(" ATOP ")
+        short = lookup_pattern_label(base, self.fcfg.get("fence_abbreviations"))
+        if short is None:
+            return None
+        return f"{short[0]} ATOP {tail}" if separator else short[0]
+
+    def _neighbour_fence(self, geometry: Any) -> bool:
+        """Больше половины длины забора идёт за линией участка (забор соседа)."""
+        on_line = float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0)
+        try:
+            inside = geometry.intersection(self.lot.buffer(on_line)).length
+        except Exception:  # noqa: BLE001
+            return False
+        return inside < 0.5 * geometry.length
+
+    def _place_neighbour(
+        self,
+        feature: Feature,
+        text: str,
+        short_text: str,
+        runs: list[tuple[tuple[float, float], tuple[float, float], float]],
+        reach: float,
+    ) -> list[FeatureLabelItem] | None:
+        """Подписи соседского забора: сокращение на каждом прямом участке."""
+        spacing = float(self.fcfg.get("fence_abbreviation_spacing_ft") or 0.0)
+        full_spacing = float(self.fcfg.get("fence_label_spacing_ft") or 0.0)
+        width, _h = self._text_size(text)
+        short_width, _h = self._text_size(short_text)
+        extra = float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
+        ratio = float(self.fcfg.get("fence_full_label_ratio") or 0.0)
+        full_from = max(width + extra, ratio * width)
+        if (
+            runs[0][2] <= full_from
+            and not bool(self.fcfg.get("label_short_fences_outside_lot", True))
+            and self._outside_lot(feature.geometry)
+        ):
+            # Возврат или продолжение соседского забора в стороне от участка.
+            self.skipped.append((feature, "короткий забор за пределами участка"))
+            return []
+        items: list[FeatureLabelItem] = []
+        duplicate: _KnownLabel | None = None
+        fitted = False
+        for run in runs:
+            if run[2] < short_width + 1.0:
+                break
+            fitted = True
+            full = run[2] > full_from
+            label = text if full else short_text
+            already = self._run_label(label, run[0], run[1], reach)
+            if already is not None:
+                duplicate = duplicate or already
+                continue
+            found = self._along_run(feature, label, run)
+            if found is None or found[0] > 0:
+                continue
+            near = self._same_label_near(label, found[1].point, full_spacing if full else spacing)
+            if near is not None:
+                duplicate = duplicate or near
+                continue
+            self._commit(found[1])
+            items.append(found[1])
+        if items:
+            return items
+        if duplicate is not None:
+            self.duplicates.append(
+                FeatureDuplicate(
+                    feature=feature, existing_text=plain_text(duplicate.text),
+                    existing_layer=duplicate.layer, own=duplicate.owner is not None,
+                )
+            )
+            return []
+        if fitted:
+            # Сокращение помещается по длине, но рядом нет свободного места:
+            # выноска к соседскому забору чертёж только загромождает.
+            self.skipped.append((feature, "рядом с забором нет места для сокращения"))
+            return []
         return None
 
     def _outside_lot(self, geometry: Any) -> bool:
@@ -6617,12 +6718,24 @@ class _LabelPlacer:
                 return True
         return False
 
+    def _leader_text(self, feature: Feature) -> str:
+        """
+        Текст подписи на выноске. Забор, вдоль которого подпись не поместилась,
+        пишется сокращением: ``C.L.F.``, ``C.L.F. ATOP`` / ``WALL``.
+        """
+        text = str(feature.label or "")
+        if feature.kind == "fence" and feature.category == "fence":
+            short = self._fence_short_label(feature.flat_label)
+            if short:
+                return short.replace(" ATOP ", " ATOP\n", 1)
+        return text
+
     def place_leader(self, feature: Feature) -> FeatureLabelItem:
         """
         Короткая выноска со стрелкой и текст на свободном месте рядом с объектом.
         Текст повёрнут по горизонтальной оси участка, двухсловные подписи — в две строки.
         """
-        text = str(feature.label or "")
+        text = self._leader_text(feature)
         width, height = self._text_size(text)
         arc = self.leader_style != "leader"
         landing = 0.0 if arc else float(self.fcfg.get("leader_landing_factor") or 0.0) * self.h

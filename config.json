@@ -467,7 +467,9 @@
       "LST*",
       "FD*",
       "XP*",
-      "TTP*"
+      "TTP*",
+      "BL",
+      "BL?"
     ],
     "point_to_fence_max_ft": 3.5,
     "point_block_attribute_tags": {
@@ -545,6 +547,7 @@
           "STAIRS"
         ],
         "label": "STEPS",
+        "label_narrow": "STEP",
         "category": "steps"
       },
       {
@@ -558,7 +561,7 @@
         "match": [
           "POOL"
         ],
-        "label": "POOL",
+        "label": "POOL\nAREA {area} Sq.Ft.",
         "category": "pool"
       },
       {
@@ -582,7 +585,7 @@
           "CANTILEVER",
           "OVERHANG"
         ],
-        "label": "CANTILEVER",
+        "label": "CANTIL.",
         "category": "overhang"
       },
       {
@@ -597,22 +600,21 @@
       },
       {
         "match": [
-          "CONC SW",
-          "CONC WALK",
-          "SW"
-        ],
-        "label": "CONC. WALK",
-        "category": "surface"
-      },
-      {
-        "match": [
           "BLC*",
+          "BL",
           "TTP*",
-          "SPOT GRADE*"
+          "SPOT GRADE*",
+          "CONC SW",
+          "SW"
         ],
         "label": ""
       }
     ],
+    "narrow_object_max_width_ft": 1.5,
+    "fence_atop_wall_format": "{fence} ATOP {wall}",
+    "fence_atop_wall_reach_ft": 0.5,
+    "fence_atop_wall_min_ft": 4.0,
+    "fence_atop_wall_label_min_ft": 10.0,
     "point_to_feature_max_ft": 2.0,
     "label_point_features": false,
     "layer_label_mapping": {
@@ -723,7 +725,7 @@
     },
     "text_height_ft": null,
     "text_height_factor": 1.0,
-    "vertical_text_reads": "down",
+    "vertical_text_reads": "up",
     "hide_field_notes_after_labeling": true,
     "fence_min_extra_length_ft": 4.0,
     "fence_text_offset_factor": 1.1,
@@ -741,7 +743,13 @@
     "narrow_char_width_factor": 0.5,
     "narrow_chars": ".,'`:;!|",
     "measure_text_in_autocad": true,
-    "label_short_fences_outside_lot": false,
+    "label_short_fences_outside_lot": true,
+    "fence_full_label_ratio": 2.0,
+    "fence_on_line_tolerance_ft": 0.15,
+    "fence_abbreviation_spacing_ft": 4.0,
+    "outward_label_categories": [
+      "planter"
+    ],
     "fence_near_lot_ft": 2.0,
     "field_note_surface_radius_ft": 15.0,
     "leader_style": "arc",

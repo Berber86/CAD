@@ -26,7 +26,16 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo [3/3] Запускаю приложение ...
 ".venv\Scripts\python.exe" main.py
+if errorlevel 1 goto :launch_error
 goto :eof
+
+:launch_error
+echo.
+echo Ошибка запуска. Скопируйте текст ошибки выше.
+echo Если создан журнал, он находится здесь: %USERPROFILE%\tsai_crash.log
+echo Перед отправкой отчёта удалите из него API-ключи, если они там есть.
+pause
+exit /b 1
 
 :error
 echo.

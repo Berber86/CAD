@@ -29,8 +29,36 @@ class _Var:
         self._value = value
 
 
+# CustomTkinter разрешает прозрачность только для отдельных цветовых параметров.
+# Заглушка должна соблюдать этот контракт, иначе тест сборки окна пропускает
+# ValueError из настоящих конструкторов виджетов.
+_TRANSPARENT_COLORS = {
+    "CTkFrame": {"bg_color", "fg_color"},
+    "CTkLabel": {"bg_color", "fg_color"},
+    "CTkButton": {"bg_color", "fg_color"},
+    "CTkEntry": {"bg_color", "fg_color"},
+    "CTkTextbox": {"bg_color", "fg_color"},
+    "CTkOptionMenu": {"bg_color"},
+    "CTkComboBox": {"bg_color"},
+    "CTkSegmentedButton": {"bg_color"},
+    "CTkRadioButton": {"bg_color"},
+    "CTkCheckBox": {"bg_color"},
+    "CTkProgressBar": {"bg_color"},
+    "CTkSwitch": {"bg_color", "border_color", "progress_color"},
+}
+
+
 class _Widget:
+    def _validate_colors(self, kwargs):
+        allowed = _TRANSPARENT_COLORS.get(type(self).__name__)
+        if allowed is None:
+            return
+        for name, value in kwargs.items():
+            if "color" in name and value == "transparent" and name not in allowed:
+                raise ValueError(f"transparency is not allowed for {type(self).__name__}.{name}")
+
     def __init__(self, *args, **kwargs):
+        self._validate_colors(kwargs)
         self._kwargs = dict(kwargs)
         self._show = kwargs.get("show", "")
         self._text = kwargs.get("text", "")
@@ -53,6 +81,7 @@ class _Widget:
         return None
 
     def configure(self, **kwargs):
+        self._validate_colors(kwargs)
         self._kwargs.update(kwargs)
         if "show" in kwargs:
             self._show = kwargs["show"]
@@ -254,6 +283,56 @@ def gui(monkeypatch):
 
     yield gui_module
     sys.modules.pop("main", None)
+
+
+def test_widget_stub_rejects_unsupported_transparency():
+    ctk = _fake_modules()["customtkinter"]
+    with pytest.raises(ValueError, match=r"CTkButton\.hover_color"):
+        ctk.CTkButton(hover_color="transparent")
+    for color in ("fg_color", "button_color"):
+        with pytest.raises(ValueError, match=rf"CTkOptionMenu\.{color}"):
+            ctk.CTkOptionMenu(**{color: "transparent"})
+    button = ctk.CTkButton(fg_color="transparent", hover=False)
+    with pytest.raises(ValueError, match=r"CTkButton\.hover_color"):
+        button.configure(hover_color="transparent")
+
+
+def test_main_returns_failure_and_saves_traceback(gui, tmp_path, monkeypatch, capsys):
+    def fail_startup():
+        raise ValueError("startup test error")
+
+    monkeypatch.setattr(gui, "SurveyApp", fail_startup)
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert gui.main() == 1
+    log = tmp_path / "tsai_crash.log"
+    assert "ValueError: startup test error" in log.read_text(encoding="utf-8")
+    assert "startup test error" in capsys.readouterr().err
+
+
+def test_main_still_reports_when_crash_log_cannot_be_written(gui, tmp_path, monkeypatch, capsys):
+    def fail_startup():
+        raise RuntimeError("startup without writable log")
+
+    monkeypatch.setattr(gui, "SurveyApp", fail_startup)
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path / "missing-directory"))
+
+    assert gui.main() == 1
+    stderr = capsys.readouterr().err
+    assert "RuntimeError: startup without writable log" in stderr
+    assert "Не удалось сохранить журнал" in stderr
+
+
+def test_main_returns_success_after_mainloop(gui, monkeypatch):
+    ran = []
+
+    class FakeApp:
+        def mainloop(self):
+            ran.append(True)
+
+    monkeypatch.setattr(gui, "SurveyApp", FakeApp)
+    assert gui.main() == 0
+    assert ran == [True]
 
 
 def test_gui_builds_and_reports(gui):

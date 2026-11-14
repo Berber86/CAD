@@ -658,7 +658,7 @@ class SurveyApp(ctk.CTk):
             self.settings_drawer_shell,
             text="",
             fg_color="transparent",
-            hover_color="transparent",
+            hover=False,
             corner_radius=0,
             command=self.toggle_keys_drawer,
         )
@@ -1151,8 +1151,8 @@ class SurveyApp(ctk.CTk):
             variable=self.sample_var,
             width=170,
             height=24,
-            fg_color="transparent",
-            button_color="transparent",
+            fg_color=THEME["bg_card"],
+            button_color=THEME["bg_card"],
             button_hover_color=THEME["btn_secondary"],
             text_color=THEME["text_muted"],
             font=ctk.CTkFont(size=11),
@@ -6452,29 +6452,27 @@ class SurveyApp(ctk.CTk):
         self._refresh_stepper()
 
 
-def main() -> None:
-    """Точка входа: любой сбой сборки/запуска интерфейса пишется в лог, а окно не схлопывается молча."""
+def main() -> int:
+    """Запускает окно; при сбое возвращает ненулевой код и сохраняет диагностику."""
     try:
         app = SurveyApp()
         app.mainloop()
-    except SystemExit:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        report = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+    except Exception:  # noqa: BLE001
+        report = traceback.format_exc()
         log_path: Path | None = None
         try:
             log_path = Path.home() / "tsai_crash.log"
-            log_path.write_text(report, encoding="utf-8")
-        except Exception:  # noqa: BLE001
+            log_path.write_text(report, encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 - не скрывать исходную ошибку, если лог недоступен
             log_path = None
-        print(report)
+        print(report, file=sys.stderr)
         if log_path is not None:
-            print(f"\nОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}")
-        try:
-            input("Нажмите Enter, чтобы закрыть окно...")
-        except Exception:  # noqa: BLE001
-            pass
+            print(f"ОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}", file=sys.stderr)
+        else:
+            print("Не удалось сохранить журнал ошибки.", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

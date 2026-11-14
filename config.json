@@ -114,5 +114,189 @@
     "boundary_text": 3,
     "street_row": 8,
     "neighbor_lot": 4
+  },
+  "feature_labeling": {
+    "property_line_layers": [
+      "PROPERTY_LINE",
+      "PL",
+      "M-TAX-LINE",
+      "PROPERTY_LINES_APPROX"
+    ],
+    "point_label_layers": [
+      "POINT_LABELS",
+      "PNT-X",
+      "PNTS"
+    ],
+    "fence_layers": [
+      "S-FENCE",
+      "ST-WALL",
+      "CODE_CREW",
+      "FENCE_*",
+      "GATE_*",
+      "LOW_EDGE_*"
+    ],
+    "fence_layer_exclude": [
+      "*_NOTE"
+    ],
+    "structure_layers": {
+      "house": [
+        "BUILDING_OUTLINE",
+        "ST-BLDG-LINE",
+        "REF_VEC_BUILDING"
+      ],
+      "shed": [
+        "SUBJECT_SHED_OUTLINE",
+        "NEIGHBOUR_SHED_OUTLINE"
+      ],
+      "porch": [
+        "SIDE_PORCH",
+        "NEIGHBOUR_SIDE_PORCH",
+        "FRONT_LANDING",
+        "REAR_DECK_EDGE"
+      ],
+      "steps": [
+        "FRONT_STEPS",
+        "REAR_STEPS",
+        "ST-STEP",
+        "NEIGHBOUR_SIDE_STAIR"
+      ],
+      "surface": [
+        "DRIVEWAY_EDGE",
+        "SIDEWALK_EDGE",
+        "WALK_EDGE",
+        "WALK_43_SKETCH",
+        "PLANTER_EDGE",
+        "SIDE_PLANTER_5",
+        "GRASS_STRIP_EDGE"
+      ]
+    },
+    "step_tread_layers": [
+      "*_STEP_TREADS"
+    ],
+    "label_output_layer": "D-TOPO-TEXT",
+    "label_output_layer_color": 7,
+    "existing_label_layers": [
+      "D-TOPO-TEXT",
+      "FENCE_NOTE",
+      "ENTRANCE_TEXT",
+      "SURFACE_TEXT",
+      "CONTEXT_TEXT"
+    ],
+    "point_code_dictionary": {
+      "FEC*": "CHAIN LINK FENCE",
+      "FEV*": "VINYL FENCE",
+      "FEW*": "WOOD FENCE",
+      "FEI*": "IRON FENCE",
+      "TTP*": "UTILITY POLE",
+      "LP*": "UTILITY POLE",
+      "UP*": "UTILITY POLE",
+      "CB*": "CATCH BASIN",
+      "MH*": "MANHOLE",
+      "HYD*": "HYDRANT"
+    },
+    "fence_point_codes": [
+      "FE*"
+    ],
+    "point_to_fence_max_ft": 3.5,
+    "label_point_features": true,
+    "layer_label_mapping": {
+      "FENCE_CHAIN*": "CHAIN LINK FENCE",
+      "FENCE_VINYL*": "VINYL FENCE",
+      "FENCE_WOOD*": "WOOD FENCE",
+      "LOW_EDGE*": "LOW TIMBER EDGE",
+      "SUBJECT_SHED_OUTLINE": "SHED",
+      "SIDE_PORCH": "PORCH",
+      "FRONT_LANDING": "PORCH",
+      "REAR_DECK_EDGE": "WOOD DECK",
+      "FRONT_STEPS": "STEPS",
+      "REAR_STEPS": "STEPS",
+      "ST-STEP": "STEPS",
+      "DRIVEWAY_EDGE": "DRIVEWAY",
+      "SIDEWALK_EDGE": "CONCRETE WALK",
+      "WALK_EDGE": "CONCRETE WALK",
+      "PLANTER_EDGE": "PLANTER",
+      "SIDE_PLANTER*": "PLANTER"
+    },
+    "step_count_label_format": "{n} STEPS",
+    "step_count_label_format_single": "{n} STEP",
+    "search_buffer_ft": 50.0,
+    "min_property_area_sqft": 200.0,
+    "boundary_snap_tolerance_ft": 0.05,
+    "boundary_gap_tolerance_ft": 2.0,
+    "merge_tolerance_ft": 0.05,
+    "min_feature_length_ft": 0.5,
+    "min_area_width_ft": 0.75,
+    "edge_pair_max_gap_ft": 12.0,
+    "ignore_hidden_layers": true,
+    "obstacle_layers": [
+      "*"
+    ],
+    "obstacle_layer_exclude": [],
+    "point_labels_as_obstacles": false,
+    "skip_existing_labels": true,
+    "duplicate_radius_ft": 6.0,
+    "label_synonyms": {
+      "CHAIN LINK FENCE": [
+        "C.L.F.",
+        "C.L. FENCE",
+        "CHAIN LINK FNC."
+      ],
+      "VINYL FENCE": [
+        "PVC FENCE"
+      ],
+      "WOOD FENCE": [
+        "WD. FENCE",
+        "STOCKADE FENCE"
+      ],
+      "IRON FENCE": [
+        "W.I. FENCE"
+      ],
+      "UTILITY POLE": [
+        "U.P.",
+        "UTIL. POLE",
+        "U. POLE"
+      ],
+      "CATCH BASIN": [
+        "C.B."
+      ],
+      "MANHOLE": [
+        "M.H."
+      ],
+      "HYDRANT": [
+        "HYD."
+      ],
+      "CONCRETE WALK": [
+        "CONC. WALK",
+        "CONCRETE SIDEWALK",
+        "CONC. SIDEWALK"
+      ],
+      "DRIVEWAY": [
+        "DRWY.",
+        "D/W"
+      ],
+      "WOOD DECK": [
+        "WD. DECK"
+      ],
+      "STEPS": [
+        "STEP",
+        "STAIRS"
+      ]
+    },
+    "text_height_ft": null,
+    "text_height_factor": 1.0,
+    "fence_min_extra_length_ft": 4.0,
+    "fence_text_offset_factor": 0.8,
+    "fence_end_margin_ft": 2.0,
+    "straight_angle_tolerance_deg": 2.0,
+    "text_clearance_factor": 0.3,
+    "line_clearance_factor": 0.15,
+    "inside_clearance_factor": 0.3,
+    "mtext_line_spacing_factor": 1.67,
+    "leader_min_length_factor": 3.0,
+    "leader_max_length_factor": 16.0,
+    "leader_landing_factor": 1.0,
+    "leader_text_gap_factor": 0.5,
+    "leader_arrow_size_factor": 0.8,
+    "leader_attach_annotation": true
   }
 }

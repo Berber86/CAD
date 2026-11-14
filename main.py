@@ -110,48 +110,61 @@ from llm_parser import (
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
-APP_GEOMETRY = "1280x900"
+APP_GEOMETRY = "1440x940"
 VERSION = "1.0.0"
 
-# Палитра Dark CAD Studio v1.0 (высокий контраст, инженерная сетка, чистые акценты)
+# Палитра Dark CAD Studio v1.0 (Spectrum-редизайн, slate-плоскости, инженерная сетка)
 THEME: dict[str, str] = {
     "bg_root": "#0a111a",
     "bg_header": "#0f1926",
-    "bg_card": "#131f2f",
+    "bg_card": "#0d1622",
     "bg_inset": "#0d1622",
     "bg_editor": "#080e16",
+    "bg_field": "#020617",
     "border_card": "#23354d",
-    "border_subtle": "#1a2a3e",
+    "border_subtle": "#1e293b",
     "border_active": "#3b82f6",
     "text_main": "#eaf1fb",
-    "text_muted": "#93a8c1",
-    "text_dim": "#637994",
+    "text_muted": "#94a3b8",
+    "text_dim": "#475569",
+    "blue_soft_bg": "#0c1c33",
+    "blue_soft_fg": "#bfdbfe",
+    "seg_sel": "#334155",
+    "side_label": "#a7b6c9",
+    "grid_axis": "#4d6381",
     "btn_primary": "#2563eb",
     "btn_primary_hover": "#1d4ed8",
     "btn_neighbor": "#0d9488",
     "btn_neighbor_hover": "#0f766e",
     "btn_secondary": "#1c2c40",
     "btn_secondary_hover": "#283d58",
-    "btn_amber": "#c26a16",
+    "btn_amber": "#b45309",
     "btn_amber_hover": "#d97706",
-    "btn_emerald": "#1f6f50",
-    "btn_emerald_hover": "#278762",
-    "badge_v1_bg": "#0f2d24",
-    "badge_v1_border": "#1f6f50",
-    "badge_v1_fg": "#34d399",
+    "btn_emerald": "#059669",
+    "btn_emerald_hover": "#10b981",
+    "badge_v1_bg": "#05251b",
+    "badge_v1_border": "#14543c",
+    "badge_v1_fg": "#6ee7b7",
     "ok": "#34d399",
-    "ok_bg": "#102a22",
+    "ok_bg": "#05251b",
     "warn": "#fbbf24",
-    "warn_bg": "#2c2012",
-    "warn_border": "#854d0e",
+    "warn_bg": "#231708",
+    "warn_border": "#92400e",
     "err": "#f87171",
+    "err_border": "#b91c1c",
     "sky": "#7dd3fc",
     "cad_grid": "#132235",
+    "cad_grid_minor": "#101c2c",
     "cad_prop": "#f87171",
     "cad_neighbor": "#22d3ee",
     "cad_street": "#475569",
+    "cad_street_text": "#7dd3fc",
     "cad_tie": "#fbbf24",
     "cad_hover": "#fde047",
+    "cad_origin": "#94a3b8",
+    "icon_purple": "#a78bfa",
+    "teal_soft_bg": "#042f2e",
+    "teal_soft_fg": "#5eead4",
 }
 
 
@@ -382,6 +395,7 @@ class SurveyApp(ctk.CTk):
 
         self.pending_conflict: dict[str, Any] | None = None
         self.conflict_window: Any | None = None
+        self._last_consensus_label: str | None = None
         self.shortcuts_window: Any | None = None
         self.preview_canvas: Any | None = None
         self._canvas_zoom: float = 1.0
@@ -398,94 +412,178 @@ class SurveyApp(ctk.CTk):
         self._refresh_provider_highlights()
         self._refresh_keys_drawer()
         self._refresh_consensus_rows()
+        self._on_source_mode_changed()
+        self._refresh_result_stats(None)
+        self._refresh_engine_card()
+        self._refresh_stepper()
         self._render_empty_inspector()
         self.after(120, self._drain_events)
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
-        # 0. Верхняя шапка: бренд + масштаб чертежа + ящик ключей + поверх окон
-        header = ctk.CTkFrame(
+        # 0. Верхняя шапка: бренд + степпер сценария + масштаб + клавиши/настройки
+        self.header = ctk.CTkFrame(
             self,
             corner_radius=0,
             fg_color=THEME["bg_header"],
+            border_width=0,
+        )
+        self.header.grid(row=0, column=0, sticky="ew")
+        self.header.grid_columnconfigure(0, weight=0)
+        self.header.grid_columnconfigure(1, weight=1)
+        self.header.grid_columnconfigure(2, weight=0)
+
+        brand_box = ctk.CTkFrame(self.header, fg_color="transparent")
+        brand_box.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=9)
+        ctk.CTkLabel(
+            brand_box,
+            text="📐",
+            width=30,
+            height=30,
+            corner_radius=8,
+            fg_color=THEME["btn_primary"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 10))
+        brand_titles = ctk.CTkFrame(brand_box, fg_color="transparent")
+        brand_titles.grid(row=0, column=1, sticky="w")
+        title_row = ctk.CTkFrame(brand_titles, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            title_row,
+            text="Title Survey AI",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff",
+        ).grid(row=0, column=0, sticky="w")
+        self.version_badge = ctk.CTkLabel(
+            title_row,
+            text=f"v{VERSION} · STUDIO",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=THEME["badge_v1_bg"],
+            corner_radius=5,
+            padx=7,
+            pady=1,
+            text_color=THEME["badge_v1_fg"],
+        )
+        self.version_badge.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ctk.CTkLabel(
+            brand_titles,
+            text="Legal Description → AutoCAD",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        ).grid(row=1, column=0, sticky="w", pady=(1, 0))
+
+        # Степпер из 4 шагов рабочего сценария геодезиста
+        self.stepper_frame = ctk.CTkFrame(self.header, fg_color="transparent")
+        self.stepper_frame.grid(row=0, column=1, sticky="", pady=9)
+        self._step_meta: list[tuple[str, str]] = [
+            ("Источник", "todo"),
+            ("Разбор", "todo"),
+            ("Проверка", "todo"),
+            ("AutoCAD", "todo"),
+        ]
+        self._step_chips: list[Any] = []
+        self._step_dots: list[Any] = []
+        self._step_links: list[Any] = []
+        for idx, (label, _state) in enumerate(self._step_meta):
+            chip = ctk.CTkFrame(
+                self.stepper_frame,
+                fg_color="transparent",
+                corner_radius=999,
+            )
+            chip.grid(row=0, column=idx * 2, padx=(0 if idx == 0 else 4, 0))
+            dot = ctk.CTkLabel(
+                chip,
+                text=str(idx + 1),
+                width=18,
+                height=18,
+                corner_radius=9,
+                fg_color=THEME["border_subtle"],
+                text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=10, weight="bold"),
+            )
+            dot.grid(row=0, column=0, padx=(8, 6), pady=4)
+            lbl = ctk.CTkLabel(
+                chip,
+                text=label,
+                text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+            )
+            lbl.grid(row=0, column=1, padx=(0, 9), pady=4)
+            self._step_chips.append((chip, lbl))
+            self._step_dots.append(dot)
+            if idx < len(self._step_meta) - 1:
+                link = ctk.CTkFrame(
+                    self.stepper_frame,
+                    width=20,
+                    height=1,
+                    fg_color=THEME["border_subtle"],
+                )
+                link.grid(row=0, column=idx * 2 + 1, pady=0)
+                self._step_links.append(link)
+
+        header_tools = ctk.CTkFrame(self.header, fg_color="transparent")
+        header_tools.grid(row=0, column=2, sticky="e", padx=(8, 16), pady=9)
+
+        # Компактная капсула выбора масштаба чертежа
+        scale_group = ctk.CTkFrame(header_tools, fg_color="transparent")
+        scale_group.grid(row=0, column=0, padx=(0, 10), sticky="e")
+        ctk.CTkLabel(
+            scale_group,
+            text="Масштаб",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        ).grid(row=0, column=0, padx=(0, 6), sticky="w")
+        scale_pill = ctk.CTkFrame(
+            scale_group,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(1, weight=1)
-
-        brand_box = ctk.CTkFrame(header, fg_color="transparent")
-        brand_box.grid(row=0, column=0, sticky="w", padx=18, pady=10)
-        ctk.CTkLabel(
-            brand_box,
-            text="Title Survey AI",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=THEME["text_main"],
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            brand_box,
-            text=f"v{VERSION} · STUDIO",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color=THEME["badge_v1_bg"],
-            corner_radius=6,
-            padx=8,
-            pady=2,
-            text_color=THEME["badge_v1_fg"],
-        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ctk.CTkLabel(
-            brand_box,
-            text="Legal Description & Survey PDF  →  AutoCAD (LINE / NEIGHBOR_LOT)",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
-
-        header_tools = ctk.CTkFrame(header, fg_color="transparent")
-        header_tools.grid(row=0, column=2, sticky="e", padx=18, pady=10)
-
-        # Компактная капсула выбора масштаба чертежа
-        scale_pill = ctk.CTkFrame(
-            header_tools,
-            fg_color=THEME["bg_inset"],
-            corner_radius=8,
-            border_width=1,
-            border_color=THEME["border_card"],
-        )
-        scale_pill.grid(row=0, column=0, padx=(0, 8), sticky="e")
-        ctk.CTkLabel(
-            scale_pill,
-            text="Масштаб:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=0, padx=(10, 6), pady=5)
+        scale_pill.grid(row=0, column=1, sticky="e")
         self.scale_menu = ctk.CTkOptionMenu(
             scale_pill,
             values=self.scale_options,
             variable=self.scale_var,
-            width=102,
-            height=28,
-            fg_color=THEME["btn_secondary"],
-            button_color=THEME["btn_primary"],
-            button_hover_color=THEME["btn_primary_hover"],
+            width=98,
+            height=26,
+            fg_color=THEME["bg_field"],
+            button_color=THEME["seg_sel"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
             command=lambda _value: self._refresh_height_label(),
         )
-        self.scale_menu.grid(row=0, column=1, padx=(0, 8), pady=5)
+        self.scale_menu.grid(row=0, column=0, padx=(3, 3), pady=3)
         self.height_label = ctk.CTkLabel(
             scale_pill,
             text="",
             anchor="w",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11),
             text_color=THEME["sky"],
         )
-        self.height_label.grid(row=0, column=2, padx=(0, 10), pady=5)
+        self.height_label.grid(row=0, column=1, padx=(0, 9), pady=3)
+
+        self.shortcuts_button = ctk.CTkButton(
+            header_tools,
+            text="⌨",
+            width=32,
+            height=32,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            font=ctk.CTkFont(size=15),
+            command=self._open_shortcuts_window,
+        )
+        self.shortcuts_button.grid(row=0, column=1, padx=(0, 6))
 
         self.keys_toggle_button = ctk.CTkButton(
             header_tools,
-            text="🔑 API-ключи и защита ▾",
-            height=34,
-            width=192,
+            text="⚙ Настройки  🔑 0",
+            height=32,
+            width=168,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             border_width=1,
@@ -493,58 +591,151 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.toggle_keys_drawer,
         )
-        self.keys_toggle_button.grid(row=0, column=1, padx=(0, 8))
-
-        self.shortcuts_button = ctk.CTkButton(
-            header_tools,
-            text="⌨ Клавиши",
-            height=34,
-            width=102,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            border_width=1,
-            border_color=THEME["border_card"],
-            font=ctk.CTkFont(size=12),
-            command=self._open_shortcuts_window,
-        )
-        self.shortcuts_button.grid(row=0, column=2, padx=(0, 10))
+        self.keys_toggle_button.grid(row=0, column=2, padx=(0, 8))
 
         self.topmost_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(
             header_tools,
             text="Поверх окон",
             variable=self.topmost_var,
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11),
+            width=36,
             command=self._apply_topmost,
         ).grid(row=0, column=3, sticky="e")
 
-        # 1. Сворачиваемый ящик API-ключей, PIN и сохранения настроек --------
-        self.keys_drawer = ctk.CTkFrame(
-            self,
+        # Трёхколоночная рабочая зона Spectrum: Источник | Холст+Проверки | Результат
+        main_wrap = ctk.CTkFrame(self, fg_color=THEME["bg_root"])
+        main_wrap.grid(row=2, column=0, sticky="nsew")
+        main_wrap.grid_columnconfigure(0, weight=0)
+        main_wrap.grid_columnconfigure(1, weight=1)
+        main_wrap.grid_columnconfigure(2, weight=0)
+        main_wrap.grid_rowconfigure(0, weight=1)
+
+        # Левая колонка — «1 Источник» (фиксированная ширина 360, скролл-контент)
+        self.left_panel = ctk.CTkFrame(
+            main_wrap,
             fg_color=THEME["bg_card"],
-            corner_radius=10,
+            corner_radius=0,
+            border_width=0,
+            width=360,
+        )
+        self.left_panel.grid(row=0, column=0, sticky="nsew")
+        self.left_panel.grid_propagate(False)
+        self.left_panel.grid_columnconfigure(0, weight=1)
+        self.left_panel.grid_rowconfigure(0, weight=1)
+
+        # Центральная колонка — холст предпросмотра + алерты конфликтов
+        self.center_col = ctk.CTkFrame(
+            main_wrap,
+            fg_color=THEME["bg_root"],
+            corner_radius=0,
+            border_width=0,
+        )
+        self.center_col.grid(row=0, column=1, sticky="nsew")
+        self.center_col.grid_columnconfigure(0, weight=1)
+        self.center_col.grid_rowconfigure(2, weight=1)
+
+        # Правая колонка — «2 Результат» (фиксированная ширина 380, вкладки)
+        self.right_panel = ctk.CTkFrame(
+            main_wrap,
+            fg_color=THEME["bg_card"],
+            corner_radius=0,
+            border_width=0,
+            width=384,
+        )
+        self.right_panel.grid(row=0, column=2, sticky="nsew")
+        self.right_panel.grid_propagate(False)
+        self.right_panel.grid_columnconfigure(0, weight=1)
+        self.right_panel.grid_rowconfigure(2, weight=1)
+
+        # Выезжающая шторка «Настройки»: тёмная подложка на весь экран + панель 470px справа
+        self.settings_drawer_shell = ctk.CTkFrame(self, fg_color="#05080d", corner_radius=0)
+        self.settings_drawer_shell.grid_columnconfigure(1, weight=0)
+        self.settings_drawer_shell.grid_rowconfigure(0, weight=1)
+
+        dimmer_cls = getattr(ctk, "CTkButton", None)
+        self.settings_dimmer = dimmer_cls(
+            self.settings_drawer_shell,
+            text="",
+            fg_color="transparent",
+            hover_color="transparent",
+            corner_radius=0,
+            command=self.toggle_keys_drawer,
+        )
+        self.settings_dimmer.grid(row=0, column=0, sticky="nsew")
+        self.settings_drawer_shell.grid_columnconfigure(0, weight=1)
+
+        # 1. Ящик настроек: ИИ-движок, режим сверки, API-ключи, PIN и сохранение
+        self.keys_drawer = ctk.CTkFrame(
+            self.settings_drawer_shell,
+            fg_color=THEME["bg_card"],
+            corner_radius=0,
             border_width=1,
             border_color=THEME["border_card"],
+            width=470,
         )
-        self.keys_drawer.grid(row=1, column=0, sticky="ew", padx=16, pady=(10, 0))
+        self.keys_drawer.grid(row=0, column=1, sticky="nsew")
+        self.keys_drawer.grid_propagate(False)
         self.keys_drawer.grid_columnconfigure(0, weight=1)
+        self.keys_drawer.grid_rowconfigure(1, weight=1)
 
-        keys_frame = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
-        keys_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        drawer_head = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
+        drawer_head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+        drawer_head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            drawer_head,
+            text="Настройки",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color="#ffffff",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            drawer_head,
+            text="ИИ-движок, режим сверки и API-ключи",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(1, 0))
+        ctk.CTkButton(
+            drawer_head,
+            text="✕",
+            width=30,
+            height=30,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            font=ctk.CTkFont(size=13),
+            text_color=THEME["text_muted"],
+            command=self.toggle_keys_drawer,
+        ).grid(row=0, column=1, rowspan=2, sticky="ne")
+
+        drawer_body = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
+        drawer_body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        drawer_body.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            drawer_body,
+            text="API-КЛЮЧИ (НА ДИСК ПОПАДАЮТ ТОЛЬКО ШИФРОВАННЫЕ ТОКЕНЫ TSAI1:…)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 4))
+
+        keys_frame = ctk.CTkFrame(drawer_body, fg_color="transparent")
+        keys_frame.grid(row=2, column=0, sticky="ew", pady=(2, 6))
+        keys_frame.grid_columnconfigure(0, weight=1)
         for col, pid in enumerate(self.provider_ids):
-            keys_frame.grid_columnconfigure(col, weight=1)
             card = ctk.CTkFrame(
                 keys_frame,
-                fg_color=THEME["bg_inset"],
+                fg_color=THEME["bg_field"],
                 corner_radius=8,
                 border_width=1,
                 border_color=THEME["border_subtle"],
             )
             card.grid(
-                row=0,
-                column=col,
+                row=col,
+                column=0,
                 sticky="ew",
-                padx=(0 if col == 0 else 6, 0 if col == len(self.provider_ids) - 1 else 6),
+                pady=(0 if col == 0 else 6, 0),
             )
             card.grid_columnconfigure(0, weight=1)
 
@@ -590,27 +781,26 @@ class SurveyApp(ctk.CTk):
             self.provider_key_entries[pid] = entry
             self.provider_key_buttons[pid] = btn
 
-        vault_row = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
-        vault_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 10))
-        vault_row.grid_columnconfigure(3, weight=1)
+        vault_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
+        vault_row.grid(row=3, column=0, sticky="ew", pady=(10, 4))
+        vault_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             vault_row,
-            text="🔒 PIN пересчёта (в RAM, опц.):",
+            text="🔒 PIN пересчёта ключей (только в RAM)",
             font=ctk.CTkFont(size=12),
             text_color=THEME["text_muted"],
-        ).grid(row=0, column=0, padx=(2, 8), sticky="w")
+        ).grid(row=0, column=0, columnspan=2, padx=(2, 8), sticky="w")
         self.key_secret_entry = ctk.CTkEntry(
             vault_row,
             textvariable=self.key_secret_var,
             show="•",
-            width=175,
             height=30,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
             placeholder_text="не пишется на диск",
         )
-        self.key_secret_entry.grid(row=0, column=1, sticky="w")
+        self.key_secret_entry.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         self.secret_eye_button = ctk.CTkButton(
             vault_row,
             text="👁",
@@ -620,288 +810,334 @@ class SurveyApp(ctk.CTk):
             hover_color=THEME["btn_secondary_hover"],
             command=self._toggle_secret_visibility,
         )
-        self.secret_eye_button.grid(row=0, column=2, padx=(5, 12), sticky="w")
+        self.secret_eye_button.grid(row=1, column=1, padx=(5, 2), pady=(3, 0), sticky="w")
         ctk.CTkLabel(
             vault_row,
             text="На диске хранится только зашифрованный токен tsai1:… (MachineGuid + DPAPI + PIN)",
             anchor="w",
+            justify="left",
+            wraplength=410,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
-        ).grid(row=0, column=3, sticky="w")
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        drawer_foot = ctk.CTkFrame(self.keys_drawer, fg_color=THEME["bg_header"])
+        drawer_foot.grid(row=2, column=0, sticky="ew")
+        drawer_foot.grid_columnconfigure(0, weight=1)
         self.save_env_button = ctk.CTkButton(
-            vault_row,
+            drawer_foot,
             text="Защитить в .env",
-            width=136,
-            height=30,
+            width=132,
+            height=32,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             border_width=1,
             border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=12),
             command=self._save_protected_env_clicked,
         )
-        self.save_env_button.grid(row=0, column=4, padx=(8, 6), sticky="e")
+        self.save_env_button.grid(row=0, column=0, padx=(12, 6), pady=10, sticky="w")
         self.save_button = ctk.CTkButton(
-            vault_row,
-            text="💾 Сохранить настройки",
-            width=172,
-            height=30,
+            drawer_foot,
+            text="💾 Сохранить  (Ctrl+S)",
+            width=190,
+            height=32,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._save_settings,
         )
-        self.save_button.grid(row=0, column=5, sticky="e")
+        self.save_button.grid(row=0, column=1, padx=(0, 12), pady=10, sticky="e")
 
-        # 2. Карточка ИИ-движка, консенсуса 1–3 проходов и политики сомнений --
-        ai_card = ctk.CTkFrame(
-            self,
-            fg_color=THEME["bg_card"],
-            corner_radius=10,
-            border_width=1,
-            border_color=THEME["border_card"],
-        )
-        ai_card.grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 0))
+        # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
+        ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
+        ai_card.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         ai_card.grid_columnconfigure(0, weight=1)
 
-        llm_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        llm_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(9, 4))
-        llm_row.grid_columnconfigure(4, weight=1)
+        ctk.CTkLabel(
+            ai_card,
+            text="РЕЖИМ СВЕРКИ LLM",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        self.llm_policy_row = ctk.CTkFrame(ai_card, fg_color="transparent")
+        self.llm_policy_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.llm_policy_row.grid_columnconfigure(0, weight=1)
 
         self.use_llm_switch = ctk.CTkSwitch(
-            llm_row,
+            self.llm_policy_row,
             text="ИИ-разбор (LLM)",
             variable=self.use_llm_var,
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._on_use_llm_toggled,
         )
-        self.use_llm_switch.grid(row=0, column=0, padx=(0, 14), sticky="w")
-
-        self.pass1_title_label = ctk.CTkLabel(
-            llm_row,
-            text="Проход #1:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=THEME["text_muted"],
-        )
-        self.pass1_title_label.grid(row=0, column=1, padx=(0, 6), sticky="w")
-
-        self.provider_switch = ctk.CTkSegmentedButton(
-            llm_row,
-            values=self.provider_labels,
-            variable=self.provider_label_var,
-            selected_color=THEME["btn_primary"],
-            selected_hover_color=THEME["btn_primary_hover"],
-            command=self._on_provider_changed,
-        )
-        self.provider_switch.grid(row=0, column=2, padx=(0, 12), sticky="w")
-
-        ctk.CTkLabel(
-            llm_row,
-            text="Модель:",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=3, padx=(0, 6), sticky="w")
-
-        self.model_combo = ctk.CTkComboBox(
-            llm_row,
-            values=self._provider_models[self._active_provider_id],
-            variable=self.model_var,
-            fg_color=THEME["bg_editor"],
-            border_color=THEME["border_card"],
-            button_color=THEME["btn_secondary"],
-            button_hover_color=THEME["btn_secondary_hover"],
-            command=self._on_model_selected,
-        )
-        self.model_combo.grid(row=0, column=4, sticky="ew")
-
-        # Вторая компактная полоса политики проверки и человеческого контроля
-        self.llm_policy_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        self.llm_policy_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
-        self.llm_policy_row.grid_columnconfigure(2, weight=1)
-
-        ctk.CTkLabel(
-            self.llm_policy_row,
-            text="Режим сверки:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.use_llm_switch.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         self.passes_switch = ctk.CTkSegmentedButton(
             self.llm_policy_row,
             values=self.passes_options,
             variable=self.passes_label_var,
-            height=28,
-            selected_color=THEME["btn_neighbor"],
-            selected_hover_color=THEME["btn_neighbor_hover"],
+            height=30,
+            fg_color=THEME["bg_field"],
+            unselected_color=THEME["bg_field"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
             command=self._on_passes_changed,
         )
-        self.passes_switch.grid(row=0, column=1, sticky="w")
+        self.passes_switch.grid(row=1, column=0, sticky="ew", pady=(0, 4))
 
         ctk.CTkLabel(
             self.llm_policy_row,
-            text="Консенсус 2+ проходов защищает цифры документа от тихих автоподмен",
+            text=(
+                "Независимые запросы идут параллельно. Расхождение откроет панель выбора, "
+                "совпадение — построит участок сразу. Консенсус 2+ проходов защищает цифры "
+                "документа от тихих автоподмен."
+            ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
-        ).grid(row=0, column=2, padx=(14, 10), sticky="w")
+            justify="left",
+            wraplength=430,
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
 
-        self.ask_on_doubt_check = ctk.CTkCheckBox(
+        toggles_card = ctk.CTkFrame(
             self.llm_policy_row,
-            text="Спрашивать при сомнении",
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        toggles_card.grid(row=3, column=0, sticky="ew", pady=(0, 2))
+        toggles_card.grid_columnconfigure(0, weight=1)
+        self.ask_on_doubt_check = ctk.CTkCheckBox(
+            toggles_card,
+            text="Спрашивать при сомнении — стоп и выбор человека при подозрении на опечатку",
             variable=self.ask_on_doubt_var,
             checkbox_width=18,
             checkbox_height=18,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["text_main"],
         )
-        self.ask_on_doubt_check.grid(row=0, column=3, sticky="e")
+        self.ask_on_doubt_check.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 8))
 
-        # Раскрываемая строка Прохода #2 (при 2 или 3 проходах)
-        self.pass2_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        self.pass2_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
-        self.pass2_row.grid_columnconfigure(3, weight=1)
+        def _slot_card(row_i: int, title: str, hint: str, hint_color: str) -> Any:
+            card = ctk.CTkFrame(
+                ai_card,
+                fg_color=THEME["bg_field"],
+                corner_radius=8,
+                border_width=1,
+                border_color=THEME["border_subtle"],
+            )
+            card.grid(row=row_i, column=0, sticky="ew", pady=(0, 6))
+            card.grid_columnconfigure(0, weight=1)
+            head = ctk.CTkFrame(card, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=10, pady=(7, 5))
+            head.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                head,
+                text=title,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=THEME["text_main"],
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(
+                head,
+                text=hint,
+                font=ctk.CTkFont(size=10),
+                text_color=hint_color,
+                anchor="e",
+            ).grid(row=0, column=1, sticky="e")
+            return card
+
+        # Слот Прохода #1 (основной)
+        pass1_card = _slot_card(2, "Проход #1", "основной", THEME["sky"])
+        self.pass1_title_label = ctk.CTkLabel(
+            pass1_card,
+            text="Провайдер:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.pass1_title_label.grid(row=1, column=0, sticky="w", padx=10)
+        self.provider_switch = ctk.CTkSegmentedButton(
+            pass1_card,
+            values=self.provider_labels,
+            variable=self.provider_label_var,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["btn_primary"],
+            selected_hover_color=THEME["btn_primary_hover"],
+            command=self._on_provider_changed,
+        )
+        self.provider_switch.grid(row=2, column=0, sticky="ew", padx=10, pady=(2, 6))
         ctk.CTkLabel(
-            self.pass2_row,
-            text="↳ Проход #2 (независимая сверка):",
-            text_color=THEME["sky"],
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, padx=(0, 10), sticky="w")
+            pass1_card,
+            text="Модель:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=3, column=0, sticky="w", padx=10)
+        self.model_combo = ctk.CTkComboBox(
+            pass1_card,
+            values=self._provider_models[self._active_provider_id],
+            variable=self.model_var,
+            height=30,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            button_color=THEME["btn_secondary"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(family="Consolas", size=11),
+            command=self._on_model_selected,
+        )
+        self.model_combo.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
+
+        # Слот Прохода #2 (независимая сверка)
+        self.pass2_row = _slot_card(3, "Проход #2", "независимая сверка", THEME["sky"])
         self.pass2_provider_switch = ctk.CTkSegmentedButton(
             self.pass2_row,
             values=self.provider_labels,
             variable=self.pass2_provider_label_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
             selected_color=THEME["btn_primary"],
             selected_hover_color=THEME["btn_primary_hover"],
             command=self._on_pass2_provider_changed,
         )
-        self.pass2_provider_switch.grid(row=0, column=1, padx=(0, 12), sticky="w")
-        ctk.CTkLabel(
-            self.pass2_row,
-            text="Модель #2:",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=2, padx=(0, 6), sticky="w")
+        self.pass2_provider_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
         self.pass2_model_combo = ctk.CTkComboBox(
             self.pass2_row,
             values=self._provider_models[self._pass2_pid],
             variable=self.pass2_model_var,
+            height=28,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
             button_color=THEME["btn_secondary"],
             button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(family="Consolas", size=11),
             command=lambda val: self.pass2_model_var.set(str(val or "").strip()),
         )
-        self.pass2_model_combo.grid(row=0, column=3, sticky="ew")
+        self.pass2_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
-        # Раскрываемая строка Прохода #3 (при 3 проходах)
-        self.pass3_row = ctk.CTkFrame(ai_card, fg_color="transparent")
-        self.pass3_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 8))
-        self.pass3_row.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(
-            self.pass3_row,
-            text="↳ Проход #3 (арбитражный слот):",
-            text_color=THEME["ok"],
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, padx=(0, 10), sticky="w")
+        # Слот Прохода #3 (арбитражный)
+        self.pass3_row = _slot_card(4, "Проход #3", "арбитражный слот", THEME["ok"])
         self.pass3_provider_switch = ctk.CTkSegmentedButton(
             self.pass3_row,
             values=self.provider_labels,
             variable=self.pass3_provider_label_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
             selected_color=THEME["btn_primary"],
             selected_hover_color=THEME["btn_primary_hover"],
             command=self._on_pass3_provider_changed,
         )
-        self.pass3_provider_switch.grid(row=0, column=1, padx=(0, 12), sticky="w")
-        ctk.CTkLabel(
-            self.pass3_row,
-            text="Модель #3:",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=2, padx=(0, 6), sticky="w")
+        self.pass3_provider_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
         self.pass3_model_combo = ctk.CTkComboBox(
             self.pass3_row,
             values=self._provider_models[self._pass3_pid],
             variable=self.pass3_model_var,
+            height=28,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
             button_color=THEME["btn_secondary"],
             button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(family="Consolas", size=11),
             command=lambda val: self.pass3_model_var.set(str(val or "").strip()),
         )
-        self.pass3_model_combo.grid(row=0, column=3, sticky="ew")
+        self.pass3_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
-        # Бейдж офлайн-режима (показывается, когда ИИ-разбор выключен)
+        # Бейдж офлайн-режима (показывается в левой колонке, когда ИИ-разбор выключен)
         self.regex_mode_badge = ctk.CTkLabel(
-            ai_card,
-            text="⚡ Включён локальный офлайн-парсер (Regex) — запросы к API не отправляются, расход токенов = 0",
+            self.left_panel,
+            text="⚡ Локальный офлайн-парсер (Regex): без API, расход токенов = 0",
             anchor="w",
-            font=ctk.CTkFont(size=12),
+            justify="left",
+            wraplength=320,
+            font=ctk.CTkFont(size=11),
             text_color=THEME["warn"],
         )
-        self.regex_mode_badge.grid(row=4, column=0, sticky="w", padx=14, pady=(0, 8))
         self.regex_mode_badge.grid_remove()
 
-        # 3. Двухколоночная рабочая зона: Документ слева + Схема и ведомость справа
-        workspace = ctk.CTkFrame(self, fg_color="transparent")
-        workspace.grid(row=3, column=0, sticky="nsew", padx=16, pady=(10, 0))
-        workspace.grid_columnconfigure(0, weight=54)
-        workspace.grid_columnconfigure(1, weight=46)
-        workspace.grid_rowconfigure(0, weight=1)
+        # 3. Левая колонка «1 Источник»: шапка панели + вкладки Текст / PDF / Фото
+        workspace = self.left_panel
+        workspace.grid_rowconfigure(4, weight=1)
 
-        # --- Левая колонка: 1. Исходное описание / PDF / Фото чертежа -------
+        # --- Левая колонка «1 Источник»: шапка, вкладки Текст/PDF/Фото -------
         input_frame = ctk.CTkFrame(
             workspace,
             fg_color=THEME["bg_card"],
-            corner_radius=10,
-            border_width=1,
-            border_color=THEME["border_card"],
+            corner_radius=0,
+            border_width=0,
         )
-        input_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        input_frame.grid(row=0, column=0, rowspan=9, sticky="nsew")
         input_frame.grid_columnconfigure(0, weight=1)
-        input_frame.grid_rowconfigure(4, weight=1)
+        input_frame.grid_rowconfigure(3, weight=1)
+        self.panel_input_frame = input_frame
 
         doc_header = ctk.CTkFrame(input_frame, fg_color="transparent")
-        doc_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        doc_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
         doc_header.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             doc_header,
-            text="1. Исходный документ (PDF / Фото чертежа JPG / Текст)",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=THEME["text_main"],
+            text="1",
+            width=24,
+            height=24,
+            corner_radius=6,
+            fg_color=THEME["blue_soft_bg"],
+            text_color=THEME["blue_soft_fg"],
+            font=ctk.CTkFont(size=12, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            doc_header,
+            text="Исходные данные",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         self.pdf_label = ctk.CTkLabel(
             doc_header,
             text="PDF не загружен",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
         )
-        self.pdf_label.grid(row=0, column=1, sticky="e")
+        self.pdf_label.grid(row=0, column=2, sticky="e")
 
-        toolbar = ctk.CTkFrame(input_frame, fg_color="transparent")
-        toolbar.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 6))
-        toolbar.grid_columnconfigure(2, weight=1)
-
-        ctk.CTkButton(
-            toolbar,
-            text="📄 PDF…",
-            width=96,
+        # Сегментированный переключатель источника данных
+        self.source_mode_var = ctk.StringVar(value="📝 Текст")
+        self.source_mode_switch = ctk.CTkSegmentedButton(
+            input_frame,
+            values=["📝 Текст", "📄 PDF", "📷 Фото"],
+            variable=self.source_mode_var,
             height=32,
-            fg_color=THEME["btn_primary"],
-            hover_color=THEME["btn_primary_hover"],
+            fg_color=THEME["bg_field"],
+            unselected_color=THEME["bg_field"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=12, weight="bold"),
-            command=self._load_pdf,
+            command=self._on_source_mode_changed,
+        )
+        self.source_mode_switch.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        # Карточка текстового редактора (режим «📝 Текст»)
+        self.text_editor_card = ctk.CTkFrame(input_frame, fg_color="transparent")
+        self.text_editor_card.grid(row=2, column=0, rowspan=2, sticky="nsew", padx=16)
+        self.text_editor_card.grid_columnconfigure(0, weight=1)
+        self.text_editor_card.grid_rowconfigure(1, weight=1)
+
+        toolbar = ctk.CTkFrame(self.text_editor_card, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        toolbar.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            toolbar,
+            text="LEGAL DESCRIPTION",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
         ).grid(row=0, column=0, sticky="w")
-
-        self.load_images_button = ctk.CTkButton(
-            toolbar,
-            text="📷 Фото (JPG)…",
-            width=126,
-            height=32,
-            fg_color=THEME["btn_amber"],
-            hover_color=THEME["btn_amber_hover"],
-            font=ctk.CTkFont(size=12, weight="bold"),
-            command=self._load_images,
-        )
-        self.load_images_button.grid(row=0, column=1, padx=(6, 0), sticky="w")
 
         self._sample_presets: dict[str, str] = {
             "Базовый пример (TX)": EXAMPLE_TEXT,
@@ -913,155 +1149,258 @@ class SurveyApp(ctk.CTk):
             toolbar,
             values=list(self._sample_presets.keys()),
             variable=self.sample_var,
-            width=215,
-            height=32,
-            fg_color=THEME["btn_secondary"],
-            button_color=THEME["btn_secondary_hover"],
-            button_hover_color=THEME["btn_primary"],
+            width=170,
+            height=24,
+            fg_color="transparent",
+            button_color="transparent",
+            button_hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11),
             command=self._on_sample_selected,
         )
-        self.sample_menu.grid(row=0, column=3, padx=(8, 0), sticky="e")
+        self.sample_menu.grid(row=0, column=1, padx=(4, 0), sticky="e")
 
         ctk.CTkButton(
             toolbar,
-            text="Пример",
-            width=68,
-            height=32,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            border_width=1,
-            border_color=THEME["border_card"],
-            command=self._insert_example,
-        ).grid(row=0, column=4, padx=(6, 0), sticky="e")
-
-        ctk.CTkButton(
-            toolbar,
-            text="Очистить",
-            width=76,
-            height=32,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            border_width=1,
-            border_color=THEME["border_card"],
+            text="🧹 Очистить",
+            width=84,
+            height=24,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11),
             command=self._clear_text,
-        ).grid(row=0, column=5, padx=(6, 0), sticky="e")
+        ).grid(row=0, column=2, padx=(2, 0), sticky="e")
 
-        # Панель подготовки архивных фото 80-х и повёрнутых сканов (двухрядная без переполнения)
-        self.visual_bar = ctk.CTkFrame(
-            input_frame,
-            fg_color=THEME["warn_bg"],
+        self.text_box = ctk.CTkTextbox(
+            self.text_editor_card,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            text_color=THEME["text_main"],
+            corner_radius=8,
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self.text_box.grid(row=1, column=0, sticky="nsew")
+        self.text_box.insert("1.0", "")
+        inner_editor = getattr(self.text_box, "_textbox", None)
+        bind_editor = getattr(inner_editor, "bind", None) if inner_editor is not None else None
+        if callable(bind_editor):
+            bind_editor("<KeyRelease>", lambda _ev: self._refresh_text_counter())
+
+        # Карточка PDF (режим «📄 PDF»): зона загрузки + выбор страниц
+        self.pdf_mode_card = ctk.CTkFrame(input_frame, fg_color="transparent")
+        self.pdf_mode_card.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
+        self.pdf_mode_card.grid_columnconfigure(0, weight=1)
+
+        self.load_pdf_button = ctk.CTkButton(
+            self.pdf_mode_card,
+            text="⭱\n\nВыберите PDF\nТекстовый, векторный или скан · Ctrl+O",
+            height=132,
+            fg_color=THEME["bg_field"],
+            hover_color=THEME["blue_soft_bg"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=10,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_muted"],
+            command=self._load_pdf,
+        )
+        self.load_pdf_button.grid(row=0, column=0, sticky="ew")
+
+        pdfpages_row = ctk.CTkFrame(
+            self.pdf_mode_card,
+            fg_color=THEME["bg_field"],
             corner_radius=8,
             border_width=1,
-            border_color=THEME["warn_border"],
+            border_color=THEME["border_subtle"],
         )
-        self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        pdfpages_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        pdfpages_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            pdfpages_row,
+            text="Страницы",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=7)
+        self.pdf_pages_entry = ctk.CTkEntry(
+            pdfpages_row,
+            textvariable=self.pdf_pages_var,
+            width=96,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            justify="right",
+            placeholder_text="1-8 / все",
+        )
+        self.pdf_pages_entry.grid(row=0, column=1, sticky="e", padx=10, pady=7)
+        ctk.CTkLabel(
+            self.pdf_mode_card,
+            text=(
+                "Если в PDF есть текст обхода — он читается напрямую. "
+                "Скан или чертёж без текста автоматически уходит в Vision-модель."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+        ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        self.load_images_button = ctk.CTkButton(
+            self.pdf_mode_card,
+            text="📷  Загрузить фото чертежа\nJPG · PNG · TIFF · несколько кадров · Ctrl+I",
+            height=64,
+            fg_color=THEME["bg_field"],
+            hover_color=THEME["blue_soft_bg"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=10,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_muted"],
+            command=self._load_images,
+        )
+        self.load_images_button.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+        # Панель режима «📷 Фото»: кадр, навигация/поворот и фильтры сканов 80-х
+        self.visual_bar = ctk.CTkFrame(
+            input_frame,
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0,
+        )
+        self.visual_bar.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
         self.visual_bar.grid_columnconfigure(0, weight=1)
 
-        visual_top_row = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
-        visual_top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(5, 2))
-        visual_top_row.grid_columnconfigure(6, weight=1)
-
-        self.prev_visual_button = ctk.CTkButton(
-            visual_top_row,
-            text="◀",
-            width=28,
-            height=26,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            command=lambda: self.step_visual_frame(-1),
+        # Миниатюра текущего кадра (превью из центрального холста дублируется здесь ярлыком)
+        self.visual_thumb_card = ctk.CTkFrame(
+            self.visual_bar,
+            fg_color=THEME["bg_editor"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            height=150,
         )
-        self.prev_visual_button.grid(row=0, column=0, padx=(0, 3))
-
-        self.visual_pos_label = ctk.CTkLabel(
-            visual_top_row,
+        self.visual_thumb_card.grid(row=0, column=0, sticky="ew")
+        self.visual_thumb_card.grid_columnconfigure(0, weight=1)
+        self.visual_thumb_card.grid_rowconfigure(0, weight=1)
+        self.visual_thumb_label = ctk.CTkLabel(
+            self.visual_thumb_card,
             text="Кадр 1/1 · 0°",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["warn"],
         )
-        self.visual_pos_label.grid(row=0, column=1, padx=3)
+        self.visual_thumb_label.grid(row=0, column=0, padx=10, pady=10)
+        self.visual_pos_label = self.visual_thumb_label
+
+        visual_top_row = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
+        visual_top_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        visual_top_row.grid_columnconfigure(3, weight=1)
+
+        self.prev_visual_button = ctk.CTkButton(
+            visual_top_row,
+            text="◀",
+            width=30,
+            height=28,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            command=lambda: self.step_visual_frame(-1),
+        )
+        self.prev_visual_button.grid(row=0, column=0, padx=(0, 4))
 
         self.next_visual_button = ctk.CTkButton(
             visual_top_row,
             text="▶",
-            width=28,
-            height=26,
+            width=30,
+            height=28,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
             command=lambda: self.step_visual_frame(1),
         )
-        self.next_visual_button.grid(row=0, column=2, padx=(3, 8))
+        self.next_visual_button.grid(row=0, column=1, padx=(0, 8))
 
         self.rot_ccw_button = ctk.CTkButton(
             visual_top_row,
             text="⟲ -90°",
             width=58,
-            height=26,
+            height=28,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(-90),
         )
-        self.rot_ccw_button.grid(row=0, column=3, padx=2)
+        self.rot_ccw_button.grid(row=0, column=2, padx=(0, 4))
 
         self.rot_cw_button = ctk.CTkButton(
             visual_top_row,
             text="⟳ +90°",
             width=58,
-            height=26,
+            height=28,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(90),
         )
-        self.rot_cw_button.grid(row=0, column=4, padx=2)
+        self.rot_cw_button.grid(row=0, column=3, padx=(0, 4))
 
         self.rot_180_button = ctk.CTkButton(
             visual_top_row,
             text="⇅ 180°",
             width=56,
-            height=26,
+            height=28,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.rotate_visual(180),
         )
-        self.rot_180_button.grid(row=0, column=5, padx=(2, 8))
+        self.rot_180_button.grid(row=0, column=4, padx=(0, 4))
 
-        self.pdf_pages_box = ctk.CTkFrame(visual_top_row, fg_color="transparent")
-        self.pdf_pages_box.grid(row=0, column=6, sticky="e", padx=(0, 2))
-        ctk.CTkLabel(
-            self.pdf_pages_box,
-            text="Стр.:",
+        self.add_more_photos_button = ctk.CTkButton(
+            visual_top_row,
+            text="Ещё…",
+            width=60,
+            height=28,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
             font=ctk.CTkFont(size=11),
-            text_color=THEME["text_main"],
-        ).grid(row=0, column=0, padx=(0, 4))
-        self.pdf_pages_entry = ctk.CTkEntry(
-            self.pdf_pages_box,
-            textvariable=self.pdf_pages_var,
-            width=84,
-            height=26,
-            fg_color=THEME["bg_editor"],
-            border_color=THEME["border_card"],
-            placeholder_text="1-8 / все",
+            command=self._load_images,
         )
-        self.pdf_pages_entry.grid(row=0, column=1)
+        self.add_more_photos_button.grid(row=0, column=5, sticky="e")
 
-        visual_opts_row = ctk.CTkFrame(self.visual_bar, fg_color="transparent")
-        visual_opts_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(1, 5))
-        visual_opts_row.grid_columnconfigure(1, weight=1)
+        visual_opts_card = ctk.CTkFrame(
+            self.visual_bar,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        visual_opts_card.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        visual_opts_card.grid_columnconfigure(0, weight=1)
 
         self.enhance_scan_switch = ctk.CTkSwitch(
-            visual_opts_row,
-            text="Чёткость фото 80-х (CLAHE/контраст)",
+            visual_opts_card,
+            text="Чёткость фото 80-х  (контраст и резкость без искажения цветов)",
             variable=self.enhance_scan_var,
             font=ctk.CTkFont(size=11),
             command=self._redraw_preview_canvas,
         )
-        self.enhance_scan_switch.grid(row=0, column=0, padx=(0, 12), sticky="w")
+        self.enhance_scan_switch.grid(row=0, column=0, padx=10, pady=(9, 5), sticky="w")
 
         self.auto_orient_switch = ctk.CTkCheckBox(
-            visual_opts_row,
-            text="🧭 ИИ-поворот (1 раз, $)",
+            visual_opts_card,
+            text="🧭 ИИ-поворот  (платно · 1 раз; ручной поворот бесплатен)",
             variable=self.auto_orient_var,
             checkbox_width=18,
             checkbox_height=18,
@@ -1070,7 +1409,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._on_auto_orient_toggled,
         )
-        self.auto_orient_switch.grid(row=0, column=2, sticky="e")
+        self.auto_orient_switch.grid(row=1, column=0, padx=10, pady=(4, 9), sticky="w")
 
         self.auto_orient_warn_label = ctk.CTkLabel(
             self.visual_bar,
@@ -1083,10 +1422,10 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["warn"],
             anchor="w",
             justify="left",
-            wraplength=640,
+            wraplength=320,
         )
         self.auto_orient_warn_label.grid(
-            row=2, column=0, sticky="ew", padx=10, pady=(0, 6)
+            row=3, column=0, sticky="ew", pady=(6, 0)
         )
         self.auto_orient_warn_label.grid_remove()
         self.visual_bar.grid_remove()
@@ -1099,7 +1438,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        role_bar.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
+        role_bar.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 0))
         role_bar.grid_columnconfigure(2, weight=1)
 
         self.lot_role_var = ctk.StringVar(value="main")
@@ -1147,95 +1486,229 @@ class SurveyApp(ctk.CTk):
         )
         self.batch_neighbors_button.grid(row=0, column=4, sticky="e", padx=(2, 8), pady=6)
 
-        self.text_box = ctk.CTkTextbox(
+        # Счётчик символов описания (внизу карточки редактора)
+        self.text_counter_label = ctk.CTkLabel(
+            self.text_editor_card,
+            text="0 симв.",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="e",
+        )
+        self.text_counter_label.grid(row=2, column=0, sticky="e", pady=(3, 0))
+
+        # Тонкий индикатор прогресса параллельных проходов ИИ (внизу источника)
+        self.progress = ctk.CTkProgressBar(
             input_frame,
-            wrap="word",
-            fg_color=THEME["bg_editor"],
-            border_width=1,
-            border_color=THEME["border_subtle"],
-            text_color=THEME["text_main"],
-            font=ctk.CTkFont(size=13),
+            mode="indeterminate",
+            height=5,
+            corner_radius=3,
+            fg_color=THEME["bg_field"],
+            progress_color=THEME["btn_primary"],
         )
-        self.text_box.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self.text_box.insert("1.0", "")
+        self.progress.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.progress.set(0)
 
-        # --- Правая колонка: 2. Живой CAD-предпросмотр / Исходник + ведомость ---
-        preview_card = ctk.CTkFrame(
-            workspace,
-            fg_color=THEME["bg_card"],
-            corner_radius=10,
-            border_width=1,
-            border_color=THEME["border_card"],
-        )
-        preview_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        preview_card.grid_columnconfigure(0, weight=1)
-        preview_card.grid_rowconfigure(1, weight=56)
-        preview_card.grid_rowconfigure(2, weight=44)
-
-        prev_header = ctk.CTkFrame(preview_card, fg_color="transparent")
-        prev_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        prev_header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            prev_header,
-            text="2. Предпросмотр и ведомость",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=THEME["text_main"],
-        ).grid(row=0, column=0, sticky="w")
-        self.preview_mode_switch = ctk.CTkSegmentedButton(
-            prev_header,
-            values=self.preview_modes,
-            variable=self.preview_mode_var,
-            height=26,
-            selected_color=THEME["btn_primary"],
-            selected_hover_color=THEME["btn_primary_hover"],
-            command=self._on_preview_mode_changed,
-        )
-        self.preview_mode_switch.grid(row=0, column=1, padx=(6, 4), sticky="e")
-
-        self.zoom_reset_button = ctk.CTkButton(
-            prev_header,
-            text="1:1",
-            width=42,
-            height=26,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            font=ctk.CTkFont(size=11, weight="bold"),
-            command=self.reset_viewport_zoom,
-        )
-        self.zoom_reset_button.grid(row=0, column=2, padx=(0, 4), sticky="e")
-
-        self.copy_report_button = ctk.CTkButton(
-            prev_header,
-            text="📋 Копировать",
-            width=102,
-            height=26,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            font=ctk.CTkFont(size=11),
-            command=self.copy_inspector_report,
-        )
-        self.copy_report_button.grid(row=0, column=3, padx=(0, 4), sticky="e")
-
-        self.reset_scene_button = ctk.CTkButton(
-            prev_header,
-            text="Сбросить",
-            width=74,
-            height=26,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            font=ctk.CTkFont(size=11),
-            command=self._clear_preview_scene,
-        )
-        self.reset_scene_button.grid(row=0, column=4, sticky="e")
-
-        canvas_wrap = ctk.CTkFrame(
-            preview_card,
-            fg_color=THEME["bg_editor"],
+        # Мини-карточка ИИ-движка (Spectrum SourcePanel): активная модель + режим сверки
+        engine_card = ctk.CTkFrame(
+            input_frame,
+            fg_color=THEME["bg_field"],
             corner_radius=8,
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        canvas_wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(2, 6))
+        engine_card.grid(row=6, column=0, sticky="ew", padx=16, pady=(10, 0))
+        engine_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            engine_card,
+            text="ИИ-ДВИЖОК",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(8, 5))
+
+        ctk.CTkLabel(
+            engine_card,
+            text="✨",
+            width=24,
+            height=24,
+            corner_radius=6,
+            fg_color="#1e1b3a",
+            text_color=THEME["icon_purple"],
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, padx=(10, 8), pady=(0, 6))
+
+        self.engine_model_var = ctk.StringVar(value="")
+        self.engine_model_label = ctk.CTkLabel(
+            engine_card,
+            textvariable=self.engine_model_var,
+            anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.engine_model_label.grid(row=1, column=1, sticky="w")
+
+        self.ask_on_doubt_badge = ctk.CTkLabel(
+            engine_card,
+            text="спрашивать",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            fg_color=THEME["blue_soft_bg"],
+            text_color=THEME["blue_soft_fg"],
+            corner_radius=4,
+            padx=5,
+            pady=1,
+        )
+        self.ask_on_doubt_badge.grid(row=1, column=2, padx=(6, 0), pady=(0, 6))
+
+        ctk.CTkButton(
+            engine_card,
+            text="⚙ Настроить",
+            height=24,
+            fg_color="transparent",
+            hover_color=THEME["blue_soft_bg"],
+            text_color=THEME["sky"],
+            font=ctk.CTkFont(size=11),
+            command=self.toggle_keys_drawer,
+        ).grid(row=1, column=3, sticky="e", padx=(4, 8), pady=(0, 6))
+
+        ctk.CTkLabel(
+            engine_card,
+            text="Сверка",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.passes_switch_mini = ctk.CTkSegmentedButton(
+            engine_card,
+            values=self.passes_options,
+            variable=self.passes_label_var,
+            height=24,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self._on_passes_changed,
+        )
+        self.passes_switch_mini.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
+
+        # Блок главного действия в источнике (Spectrum: «Разобрать и проверить» + regex)
+        run_box = ctk.CTkFrame(input_frame, fg_color=THEME["bg_header"], corner_radius=0)
+        run_box.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        run_box.grid_columnconfigure(0, weight=1)
+
+        self.parse_button = ctk.CTkButton(
+            run_box,
+            text="🔍  Разобрать и проверить   (Ctrl+Enter)",
+            height=44,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self._start(parse_only=True),
+        )
+        self.parse_button.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
+
+        self.regex_link_button = ctk.CTkButton(
+            run_box,
+            text="⚡ Быстрый разбор без ИИ (regex, бесплатно)",
+            height=26,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_dim"],
+            font=ctk.CTkFont(size=11),
+            command=self._run_regex_only,
+        )
+        self.regex_link_button.grid(row=1, column=0, pady=(0, 10))
+
+        # --- Центральная колонка: шапка холста + живой CAD-предпросмотр ------
+        center_head = ctk.CTkFrame(
+            self.center_col,
+            fg_color=THEME["bg_card"],
+            corner_radius=0,
+            border_width=0,
+            height=48,
+        )
+        center_head.grid(row=0, column=0, sticky="ew")
+        center_head.grid_propagate(False)
+        center_head.grid_columnconfigure(1, weight=1)
+
+        self.preview_mode_switch = ctk.CTkSegmentedButton(
+            center_head,
+            values=self.preview_modes,
+            variable=self.preview_mode_var,
+            height=30,
+            fg_color=THEME["bg_field"],
+            unselected_color=THEME["bg_field"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._on_preview_mode_changed,
+        )
+        self.preview_mode_switch.grid(row=0, column=0, sticky="w", padx=(12, 8))
+
+        center_badges = ctk.CTkFrame(center_head, fg_color="transparent")
+        center_badges.grid(row=0, column=1, sticky="e", padx=(0, 12))
+        self.consensus_badge = ctk.CTkLabel(
+            center_badges,
+            text="",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=THEME["badge_v1_bg"],
+            text_color=THEME["badge_v1_fg"],
+            corner_radius=5,
+            padx=7,
+            pady=1,
+        )
+        self.center_closure_badge = ctk.CTkLabel(
+            center_badges,
+            text="",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=THEME["badge_v1_bg"],
+            text_color=THEME["badge_v1_fg"],
+            corner_radius=5,
+            padx=7,
+            pady=1,
+        )
+
+        self.copy_report_button = ctk.CTkButton(
+            center_badges,
+            text="📋 Копировать",
+            width=104,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=11),
+            command=self.copy_inspector_report,
+        )
+        self.copy_report_button.grid(row=0, column=0, padx=(0, 6), sticky="e")
+
+        self.reset_scene_button = ctk.CTkButton(
+            center_badges,
+            text="Сбросить",
+            width=76,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=11),
+            command=self._clear_preview_scene,
+        )
+        self.reset_scene_button.grid(row=0, column=1, padx=(0, 8), sticky="e")
+
+        # Панели конфликта проходов и сомнительных мест (между шапкой и холстом)
+        self.alerts_wrap = ctk.CTkFrame(self.center_col, fg_color="transparent")
+        self.alerts_wrap.grid(row=1, column=0, sticky="ew")
+        self.alerts_wrap.grid_columnconfigure(0, weight=1)
+
+        # Холст предпросмотра с оверлеями (зум-контролы, HUD)
+        canvas_wrap = ctk.CTkFrame(
+            self.center_col,
+            fg_color=THEME["bg_editor"],
+            corner_radius=0,
+            border_width=0,
+        )
+        canvas_wrap.grid(row=2, column=0, sticky="nsew")
         canvas_wrap.grid_columnconfigure(0, weight=1)
         canvas_wrap.grid_rowconfigure(0, weight=1)
 
@@ -1247,7 +1720,7 @@ class SurveyApp(ctk.CTk):
                 highlightthickness=0,
                 bd=0,
             )
-            self.preview_canvas.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
+            self.preview_canvas.grid(row=0, column=0, sticky="nsew")
             bind_fn = getattr(self.preview_canvas, "bind", None)
             if callable(bind_fn):
                 bind_fn("<Configure>", lambda _ev: self._redraw_preview_canvas())
@@ -1261,75 +1734,107 @@ class SurveyApp(ctk.CTk):
                 bind_fn("<Motion>", self._on_canvas_hover)
                 bind_fn("<Leave>", self._on_canvas_leave)
 
-        self.inspector_box = ctk.CTkTextbox(
-            preview_card,
-            wrap="word",
-            fg_color=THEME["bg_inset"],
-            border_width=1,
-            border_color=THEME["border_subtle"],
-            text_color=THEME["text_main"],
-            font=ctk.CTkFont(family="Consolas", size=12),
-        )
-        self.inspector_box.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-
-        # 4. Панель главных действий -----------------------------------------
-        actions = ctk.CTkFrame(self, fg_color="transparent")
-        actions.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 0))
-        actions.grid_columnconfigure(1, weight=1)
-
-        self.parse_button = ctk.CTkButton(
-            actions,
-            text="🔍 Проверить и показать схему  (Ctrl+Enter)",
-            width=285,
-            height=42,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
+        # Оверлеи холста: зум-контролы справа + чип масштаба/подсказка снизу
+        zoom_box = ctk.CTkFrame(
+            canvas_wrap,
+            fg_color=THEME["bg_header"],
+            corner_radius=8,
             border_width=1,
             border_color=THEME["border_card"],
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._start(parse_only=True),
         )
-        self.parse_button.grid(row=0, column=0, sticky="w")
-
-        self.draw_button = ctk.CTkButton(
-            actions,
-            text="Начертить участок в AutoCAD",
-            height=44,
-            fg_color=THEME["btn_primary"],
-            hover_color=THEME["btn_primary_hover"],
+        zoom_box.grid(row=0, column=0, sticky="ne", padx=12, pady=84)
+        self.zoom_in_button = ctk.CTkButton(
+            zoom_box,
+            text="+",
+            width=150,
+            height=30,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
             font=ctk.CTkFont(size=15, weight="bold"),
-            command=lambda: self._start(parse_only=False),
+            command=lambda: self.zoom_viewport(1.3),
         )
-        self.draw_button.grid(row=0, column=1, padx=10, sticky="ew")
-
-        self.add_neighbor_button = ctk.CTkButton(
-            actions,
-            text="Добавить соседа на чертёж",
-            height=42,
-            width=225,
-            fg_color=THEME["btn_neighbor"],
-            hover_color=THEME["btn_neighbor_hover"],
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=lambda: self._start(parse_only=False, force_neighbor=True),
+        self.zoom_in_button.grid(row=0, column=0)
+        ctk.CTkFrame(zoom_box, height=1, fg_color=THEME["border_subtle"]).grid(
+            row=1, column=0, sticky="ew"
         )
-        self.add_neighbor_button.grid(row=0, column=2, sticky="e")
-
-        # 5. Тонкий индикатор прогресса --------------------------------------
-        self.progress = ctk.CTkProgressBar(
-            self,
-            mode="indeterminate",
-            height=6,
-            fg_color=THEME["bg_inset"],
-            progress_color=THEME["btn_primary"],
+        self.zoom_reset_button = ctk.CTkButton(
+            zoom_box,
+            text="1:1",
+            width=150,
+            height=34,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+            command=self.reset_viewport_zoom,
         )
-        self.progress.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 0))
-        self.progress.set(0)
+        self.zoom_reset_button.grid(row=2, column=0)
+        ctk.CTkFrame(zoom_box, height=1, fg_color=THEME["border_subtle"]).grid(
+            row=3, column=0, sticky="ew"
+        )
+        self.zoom_out_button = ctk.CTkButton(
+            zoom_box,
+            text="−",
+            width=150,
+            height=30,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            font=ctk.CTkFont(size=15, weight="bold"),
+            command=lambda: self.zoom_viewport(1.0 / 1.3),
+        )
+        self.zoom_out_button.grid(row=4, column=0)
 
-        # 6. Панель разрешения конфликта проходов LLM и сомнительных мест ----
-        self.alerts_wrap = ctk.CTkFrame(self, fg_color="transparent")
-        self.alerts_wrap.grid(row=6, column=0, sticky="ew")
-        self.alerts_wrap.grid_columnconfigure(0, weight=1)
+        self.canvas_hint_label = ctk.CTkLabel(
+            canvas_wrap,
+            text="Колесо — зум · ЛКМ — панорама · 2× клик — вписать",
+            font=ctk.CTkFont(size=10),
+            fg_color=THEME["bg_header"],
+            text_color=THEME["text_dim"],
+            corner_radius=999,
+            padx=12,
+            pady=3,
+        )
+        self.canvas_hint_label.grid(row=0, column=0, sticky="s", pady=(0, 12))
+        for overlay in (zoom_box, self.canvas_hint_label):
+            try:
+                overlay.lift()
+            except Exception:  # noqa: BLE001
+                pass
 
+        # --- Правая колонка «2 Результат»: вкладки Ведомость/Проверки/Соседи/Журнал
+        result_head = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        result_head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+        result_head.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            result_head,
+            text="2",
+            width=24,
+            height=24,
+            corner_radius=6,
+            fg_color=THEME["blue_soft_bg"],
+            text_color=THEME["blue_soft_fg"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            result_head,
+            text="Результат",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.result_copy_button = ctk.CTkButton(
+            result_head,
+            text="📋 Копировать",
+            width=104,
+            height=26,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11),
+            command=self.copy_inspector_report,
+        )
+        self.result_copy_button.grid(row=0, column=2, sticky="e")
+
+        # Панель разрешения конфликта проходов LLM и сомнительных мест --------
         self.conflict_bar = ctk.CTkFrame(
             self.alerts_wrap,
             fg_color=THEME["warn_bg"],
@@ -1337,7 +1842,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["warn_border"],
         )
-        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(6, 0))
         self.conflict_bar.grid_columnconfigure(0, weight=1)
 
         self.conflict_title_var = ctk.StringVar(
@@ -1348,7 +1853,7 @@ class SurveyApp(ctk.CTk):
             textvariable=self.conflict_title_var,
             anchor="w",
             justify="left",
-            wraplength=1100,
+            wraplength=860,
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=THEME["warn"],
         )
@@ -1421,7 +1926,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["warn_border"],
         )
-        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
         self.doubt_bar.grid_columnconfigure(0, weight=1)
 
         self.doubt_title_var = ctk.StringVar(
@@ -1432,7 +1937,7 @@ class SurveyApp(ctk.CTk):
             textvariable=self.doubt_title_var,
             anchor="w",
             justify="left",
-            wraplength=1100,
+            wraplength=860,
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=THEME["warn"],
         )
@@ -1486,36 +1991,139 @@ class SurveyApp(ctk.CTk):
         self.open_doubt_details_button.grid(row=0, column=3, sticky="w")
         self.doubt_bar.grid_remove()
 
-        # 7. Нижняя приборная панель: KPI невязки и токенов + статус + лог ---
-        status_frame = ctk.CTkFrame(
-            self,
-            fg_color=THEME["bg_card"],
-            corner_radius=10,
-            border_width=1,
-            border_color=THEME["border_card"],
+        # --- Тело правой колонки: 4 вкладки результатов ---------------------
+        self.result_tab_var = ctk.StringVar(value="📋 Ведомость")
+        self.result_tabs = ctk.CTkSegmentedButton(
+            self.right_panel,
+            values=["📋 Ведомость", "🛡 Проверки", "🏘 Соседи", "🧾 Журнал"],
+            variable=self.result_tab_var,
+            height=30,
+            fg_color=THEME["bg_field"],
+            unselected_color=THEME["bg_field"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda _v: self._switch_result_tab(),
         )
-        status_frame.grid(row=7, column=0, sticky="ew", padx=16, pady=(8, 12))
-        status_frame.grid_columnconfigure(0, weight=1)
+        self.result_tabs.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
-        kpi_bar = ctk.CTkFrame(status_frame, fg_color="transparent")
-        kpi_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
-        kpi_bar.grid_columnconfigure(2, weight=1)
+        result_body = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        result_body.grid(row=2, column=0, sticky="nsew")
+        result_body.grid_columnconfigure(0, weight=1)
+        result_body.grid_rowconfigure(0, weight=1)
+
+        # — Вкладка «📋 Ведомость»: KPI-карточки + привязка + расписание сторон
+        self.sheet_tab_frame = ctk.CTkFrame(result_body, fg_color="transparent")
+        self.sheet_tab_frame.grid_columnconfigure(0, weight=1)
+        self.sheet_tab_frame.grid_rowconfigure(3, weight=1)
+
+        stats_grid = ctk.CTkFrame(self.sheet_tab_frame, fg_color="transparent")
+        stats_grid.grid(row=0, column=0, sticky="ew", padx=12, pady=(2, 8))
+        stats_grid.grid_columnconfigure(0, weight=1)
+        stats_grid.grid_columnconfigure(1, weight=1)
+
+        def _stat_card(row: int, col: int, title: str, var: Any, accent: str) -> Any:
+            card = ctk.CTkFrame(
+                stats_grid,
+                fg_color=THEME["bg_field"],
+                corner_radius=8,
+                border_width=1,
+                border_color=THEME["border_subtle"],
+            )
+            card.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 5, 5 if col == 0 else 0), pady=3)
+            ctk.CTkLabel(
+                card,
+                text=title,
+                font=ctk.CTkFont(size=10),
+                text_color=THEME["text_dim"],
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=10, pady=(7, 0))
+            value_label = ctk.CTkLabel(
+                card,
+                textvariable=var,
+                font=ctk.CTkFont(family="Consolas", size=15, weight="bold"),
+                text_color=accent,
+                anchor="w",
+            )
+            value_label.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 7))
+            return value_label
 
         self.closure_var = ctk.StringVar(value="Closure Error: —")
-        self.closure_label = ctk.CTkLabel(
-            kpi_bar,
-            textvariable=self.closure_var,
-            anchor="w",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=THEME["text_main"],
-        )
-        self.closure_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.stat_closure_var = ctk.StringVar(value="—")
+        self.tokens_var = ctk.StringVar(value="Токены за вызов: —")
+        self.closure_label = _stat_card(0, 0, "Невязка (Closure)", self.stat_closure_var, THEME["ok"])
+        self.stat_area_var = ctk.StringVar(value="—")
+        _stat_card(0, 1, "Площадь", self.stat_area_var, THEME["text_main"])
+        self.stat_perimeter_var = ctk.StringVar(value="—")
+        _stat_card(1, 0, "Периметр", self.stat_perimeter_var, THEME["text_main"])
+        self.stat_text_height_var = ctk.StringVar(value="—")
+        _stat_card(1, 1, "Высота текста", self.stat_text_height_var, THEME["sky"])
 
+        self.tie_info_var = ctk.StringVar(value="")
+        tie_box = ctk.CTkFrame(
+            self.sheet_tab_frame,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        tie_box.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+        tie_box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            tie_box,
+            text="ПРИВЯЗКА К ПЕРЕКРЁСТКУ (0.0, 0.0)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(7, 2))
+        self.tie_info_label = ctk.CTkLabel(
+            tie_box,
+            textvariable=self.tie_info_var,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color=THEME["text_muted"],
+            anchor="w",
+            justify="left",
+            wraplength=340,
+        )
+        self.tie_info_label.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.tie_info_var.set("Фасад: — · Угол: —\nPOB: (0.00, 0.00) ft")
+
+        ctk.CTkLabel(
+            self.sheet_tab_frame,
+            text="СТОРОНЫ КОНТУРА (наведите мышью на схеме — подсветка синхронна)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 2))
+        self.inspector_box = ctk.CTkTextbox(
+            self.sheet_tab_frame,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=8,
+            text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=11),
+        )
+        self.inspector_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+        # — Вкладка «🛡 Проверки»: бейдж подозрительности + карточки находок
+        self.checks_tab_frame = ctk.CTkFrame(result_body, fg_color="transparent")
+        self.checks_tab_frame.grid_columnconfigure(0, weight=1)
+
+        susp_head = ctk.CTkFrame(
+            self.checks_tab_frame,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        susp_head.grid(row=0, column=0, sticky="ew", padx=12, pady=(2, 8))
+        susp_head.grid_columnconfigure(0, weight=1)
         self.suspicion_badge_button = ctk.CTkButton(
-            kpi_bar,
+            susp_head,
             text="🔎 Форма: —",
-            width=190,
-            height=26,
+            height=30,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
             border_width=1,
@@ -1523,43 +2131,142 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._open_lot_suspicion_window,
         )
-        self.suspicion_badge_button.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        self.suspicion_badge_button.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
 
-        self.tokens_var = ctk.StringVar(value="Токены за вызов: —")
-        self.tokens_label = ctk.CTkLabel(
-            kpi_bar,
-            textvariable=self.tokens_var,
-            anchor="w",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["sky"],
-        )
-        self.tokens_label.grid(row=0, column=2, sticky="w")
+        self.checks_scroll_frame = ctk.CTkFrame(self.checks_tab_frame, fg_color="transparent")
+        self.checks_scroll_frame.grid(row=1, column=0, sticky="nsew", padx=12)
 
-        ctk.CTkButton(
-            kpi_bar,
-            text="📋 Показать лог",
-            width=126,
-            height=28,
+        # — Вкладка «🏘 Соседи»: карточки соседних участков + акт сверки
+        self.neighbors_tab_frame = ctk.CTkFrame(result_body, fg_color="transparent")
+        self.neighbors_tab_frame.grid_columnconfigure(0, weight=1)
+
+        nb_actions = ctk.CTkFrame(self.neighbors_tab_frame, fg_color="transparent")
+        nb_actions.grid(row=0, column=0, sticky="ew", padx=12, pady=(2, 6))
+        nb_actions.grid_columnconfigure(0, weight=1)
+        self.clear_neighbors_button = ctk.CTkButton(
+            nb_actions,
+            text="🧹 Убрать всех",
+            height=26,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self._clear_neighbors_scene,
+        )
+        self.clear_neighbors_button.grid(row=0, column=0, sticky="w")
+
+        self.neighbors_scroll_frame = ctk.CTkFrame(self.neighbors_tab_frame, fg_color="transparent")
+        self.neighbors_scroll_frame.grid(row=1, column=0, sticky="nsew", padx=12)
+
+        self.copy_act_button = ctk.CTkButton(
+            self.neighbors_tab_frame,
+            text="📄 Скопировать акт сверки",
+            height=30,
+            fg_color=THEME["btn_neighbor"],
+            hover_color=THEME["btn_neighbor_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._copy_neighbor_act,
+        )
+        self.copy_act_button.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 12))
+
+        # — Вкладка «🧾 Журнал»: токены сессии + лента операций
+        self.log_tab_frame = ctk.CTkFrame(result_body, fg_color="transparent")
+        self.log_tab_frame.grid_columnconfigure(0, weight=1)
+        self.log_tab_frame.grid_rowconfigure(1, weight=1)
+
+        log_head = ctk.CTkFrame(self.log_tab_frame, fg_color="transparent")
+        log_head.grid(row=0, column=0, sticky="ew", padx=12, pady=(2, 6))
+        log_head.grid_columnconfigure(0, weight=1)
+        self.tokens_label = ctk.CTkLabel(
+            log_head,
+            text="",
+            anchor="w",
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color=THEME["sky"],
+            textvariable=self.tokens_var,
+        )
+        self.tokens_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            log_head,
+            text="Очистить",
+            height=24,
+            width=80,
+            fg_color="transparent",
+            hover_color=THEME["btn_secondary"],
+            text_color=THEME["text_dim"],
+            font=ctk.CTkFont(size=11),
+            command=self._clear_log,
+        ).grid(row=0, column=1, sticky="e")
+
+        self.log_box = ctk.CTkTextbox(
+            self.log_tab_frame,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
             border_width=1,
-            border_color=THEME["border_card"],
-            command=self._show_log,
-        ).grid(row=0, column=3, sticky="e")
+            border_color=THEME["border_subtle"],
+            corner_radius=8,
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(family="Consolas", size=10),
+        )
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+        self._switch_result_tab()
+
+        # 4. Нижняя панель действий: статус + сверка + большая кнопка AutoCAD -
+        footer = ctk.CTkFrame(
+            self,
+            fg_color=THEME["bg_header"],
+            corner_radius=0,
+            border_width=0,
+            height=64,
+        )
+        footer.grid(row=3, column=0, sticky="ew")
+        footer.grid_propagate(False)
+        footer.grid_columnconfigure(1, weight=1)
+
+        self.status_dot = ctk.CTkLabel(
+            footer,
+            text="●",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["ok"],
+        )
+        self.status_dot.grid(row=0, column=0, padx=(16, 8))
 
         self.status_var = ctk.StringVar(
             value="Готово. Загрузите PDF, выберите пример или вставьте текст Legal Description."
         )
         self.status_label = ctk.CTkLabel(
-            status_frame,
+            footer,
             textvariable=self.status_var,
             anchor="w",
             font=ctk.CTkFont(size=12),
             text_color=THEME["text_muted"],
             justify="left",
-            wraplength=1110,
         )
-        self.status_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 9))
+        self.status_label.grid(row=0, column=1, sticky="w")
+
+        self.add_neighbor_button = ctk.CTkButton(
+            footer,
+            text="🏘 Добавить соседа на чертёж",
+            height=38,
+            width=225,
+            fg_color=THEME["btn_neighbor"],
+            hover_color=THEME["btn_neighbor_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: self._start(parse_only=False, force_neighbor=True),
+        )
+        self.add_neighbor_button.grid(row=0, column=2, padx=(8, 6))
+
+        self.draw_button = ctk.CTkButton(
+            footer,
+            text="▶  Начертить участок в AutoCAD   F5",
+            height=42,
+            width=300,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=lambda: self._start(parse_only=False),
+        )
+        self.draw_button.grid(row=0, column=3, padx=(6, 16), pady=11, sticky="e")
 
     # --------------------------------------------------- ящик ключей и ИИ ---
     def _configured_keys_count(self) -> int:
@@ -1582,24 +2289,343 @@ class SurveyApp(ctk.CTk):
 
     def _refresh_keys_drawer(self) -> None:
         n_keys = self._configured_keys_count()
-        arrow = "▴" if self._keys_drawer_open else "▾"
         if n_keys > 0:
             self.keys_toggle_button.configure(
-                text=f"🔑 API-ключи: готовы ({n_keys}) {arrow}",
+                text=f"⚙ Настройки   🔑 готовы ({n_keys})",
                 border_color=THEME["ok"] if not self._keys_drawer_open else THEME["border_active"],
             )
         else:
             self.keys_toggle_button.configure(
-                text=f"🔑 Ввести API-ключи {arrow}",
+                text="⚙ Настройки   🔑 Ввести API-ключи",
                 border_color=THEME["warn"],
             )
+        shell = getattr(self, "settings_drawer_shell", None)
+        if shell is None:
+            return
         if self._keys_drawer_open:
-            self.keys_drawer.grid(row=1, column=0, sticky="ew", padx=16, pady=(10, 0))
+            shell.grid(row=0, column=0, rowspan=10, sticky="nsew")
+            try:
+                shell.lift()
+            except Exception:  # noqa: BLE001
+                pass
         else:
-            self.keys_drawer.grid_remove()
+            shell.grid_remove()
 
     def _on_use_llm_toggled(self) -> None:
         self._refresh_consensus_rows()
+        self._refresh_engine_card()
+
+    # -------------------------------------------------- Spectrum UX helpers --
+    def _on_source_mode_changed(self, _label: str = "") -> None:
+        """Переключает левую колонку между режимами Текст / PDF / Фото."""
+        mode = str(self.source_mode_var.get() or "📝 Текст")
+        frames = {
+            "📝 Текст": self.text_editor_card,
+            "📄 PDF": self.pdf_mode_card,
+            "📷 Фото": self.visual_bar,
+        }
+        for label, frame in frames.items():
+            if label == mode:
+                rowspan = 2
+                frame.grid(row=2, column=0, rowspan=rowspan, sticky="nsew" if label == "📝 Текст" else "new", padx=16)
+            else:
+                frame.grid_remove()
+        self._refresh_visual_bar()
+
+    def _current_source_mode(self) -> str:
+        return str(self.source_mode_var.get() or "📝 Текст")
+
+    def _run_regex_only(self) -> None:
+        """Быстрый офлайн-разбор без вызова LLM (regex, бесплатно)."""
+        was_on = bool(self.use_llm_var.get())
+        self.use_llm_var.set(False)
+        try:
+            self._start(parse_only=True)
+        finally:
+            self.use_llm_var.set(was_on)
+
+    def _refresh_engine_card(self) -> None:
+        """Обновляет мини-карточку активного ИИ-движка в левой колонке."""
+        if not hasattr(self, "engine_model_var"):
+            return
+        try:
+            model = self.current_model()
+        except Exception:  # noqa: BLE001
+            model = "—"
+        passes = self.current_passes_count()
+        provider = self._pid_to_label.get(self._active_provider_id, self._active_provider_id)
+        extra = f" + ещё {passes - 1}" if passes > 1 else ""
+        self.engine_model_var.set(f"{model}  ·  {provider}{extra}")
+        badge = getattr(self, "ask_on_doubt_badge", None)
+        if badge is not None:
+            if self.ask_on_doubt_var.get():
+                badge.grid()
+            else:
+                badge.grid_remove()
+
+    def _switch_result_tab(self) -> None:
+        """Переключает вкладки правой колонки «Результат»."""
+        tab = str(self.result_tab_var.get() or "📋 Ведомость")
+        frames = {
+            "📋 Ведомость": self.sheet_tab_frame,
+            "🛡 Проверки": self.checks_tab_frame,
+            "🏘 Соседи": self.neighbors_tab_frame,
+            "🧾 Журнал": self.log_tab_frame,
+        }
+        for label, frame in frames.items():
+            if label == tab:
+                frame.grid(row=0, column=0, sticky="nsew")
+            else:
+                frame.grid_remove()
+        if tab == "🧾 Журнал":
+            self._refresh_log_view()
+
+    def _clear_log(self) -> None:
+        """Очищает журнал операций (вкладка «Журнал»)."""
+        try:
+            self._log = []
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_log_view()
+
+    def _refresh_log_view(self) -> None:
+        box = getattr(self, "log_box", None)
+        if box is None:
+            return
+        target = getattr(box, "_textbox", box)
+        try:
+            target.configure(state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        box.delete("1.0", "end")
+        lines = list(getattr(self, "_log", []))[-300:]
+        content = "\n".join(reversed(lines)) if lines else "Журнал пуст"
+        box.insert("1.0", content)
+        try:
+            target.configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear_neighbors_scene(self) -> None:
+        """Убирает всех соседей со сцены предпросмотра и из вкладки «Соседи»."""
+        self._preview_neighbor_plans.clear()
+        self._neighbor_report = None
+        self._refresh_neighbor_verify_button()
+        self._refresh_neighbors_list()
+        main_plan = self._preview_main_plan
+        if main_plan is not None:
+            self._set_inspector_text(self._build_inspector_report(main_plan))
+        elif not self._last_active_plan:
+            self._render_empty_inspector()
+        self._redraw_preview_canvas()
+        self._set_status("Соседние участки убраны со сцены.")
+
+    def _copy_neighbor_act(self) -> None:
+        """Копирует акт геодезической сверки с соседями в буфер обмена."""
+        rep = self._neighbor_report
+        if rep is None or not getattr(rep, "pair_reports", None):
+            self._set_status("Акт сверки пуст — добавьте соседние участки.")
+            return
+        self._copy_text_report(rep.format_report(), "📋 Акт геодезической сверки скопирован в буфер обмена.")
+
+    def _copy_text_report(self, text: str, ok_message: str) -> None:
+        clip_fn = getattr(self, "clipboard_clear", None)
+        append_fn = getattr(self, "clipboard_append", None)
+        if callable(clip_fn) and callable(append_fn) and text.strip():
+            clip_fn()
+            append_fn(text)
+        self._set_status(ok_message)
+
+    def _refresh_neighbors_list(self) -> None:
+        """Перерисовывает карточки соседних участков во вкладке «Соседи»."""
+        holder = getattr(self, "neighbors_scroll_frame", None)
+        if holder is None:
+            return
+        try:
+            for child in holder.winfo_children():
+                child.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        holder.grid_columnconfigure(0, weight=1)
+        plans = list(self._preview_neighbor_plans)
+        if not plans:
+            ctk.CTkLabel(
+                holder,
+                text=(
+                    "Соседей нет.\nДобавьте соседний участок — он встанет стенка к стенке "
+                    "и сразу проверится на щели, клинья и наложения."
+                ),
+                font=ctk.CTkFont(size=11),
+                text_color=THEME["text_dim"],
+                justify="left",
+            ).grid(row=0, column=0, sticky="w", pady=14)
+            return
+        for idx, plan in enumerate(plans):
+            pair = None
+            if self._neighbor_report is not None:
+                for pr in getattr(self._neighbor_report, "pair_reports", []):
+                    if getattr(pr, "neighbor_plan", None) is plan:
+                        pair = pr
+                        break
+            has_issue = bool(pair is not None and getattr(pair, "has_issue", False))
+            card = ctk.CTkFrame(
+                holder,
+                fg_color=THEME["warn_bg"] if has_issue else THEME["teal_soft_bg"],
+                corner_radius=8,
+                border_width=1,
+                border_color=THEME["warn_border"] if has_issue else THEME["btn_neighbor"],
+            )
+            card.grid(row=idx, column=0, sticky="ew", pady=(0, 6))
+            card.grid_columnconfigure(0, weight=1)
+            title_color = THEME["warn"] if has_issue else THEME["ok"]
+            headline = pair.headline() if pair is not None and hasattr(pair, "headline") else ""
+            ctk.CTkLabel(
+                card,
+                text=f"Сосед #{idx + 1}: {plan.description.main_street or 'участок'}",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=THEME["text_main"],
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=10, pady=(7, 1))
+            detail = headline or (
+                f"{len(plan.boundary_lines)} отр. LINE · Closure {plan.closure.distance:.3f} ft"
+            )
+            ctk.CTkLabel(
+                card,
+                text=detail,
+                font=ctk.CTkFont(size=10),
+                text_color=title_color,
+                anchor="w",
+                justify="left",
+                wraplength=300,
+            ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+
+    def _refresh_checks_list(self) -> None:
+        """Перерисовывает карточки диагностики подозрительности во вкладке «Проверки»."""
+        holder = getattr(self, "checks_scroll_frame", None)
+        if holder is None:
+            return
+        try:
+            for child in holder.winfo_children():
+                child.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        holder.grid_columnconfigure(0, weight=1)
+        rep = self._last_suspicion_report
+        items = list(getattr(rep, "items", []) or []) if rep is not None else []
+        if not items:
+            txt = (
+                "Проверок пока нет — разберите описание.\n"
+                "Замыкание, сумма углов, теоремы для четырёхугольников, "
+                "самопересечения и потерянные точки проверяются автоматически."
+                if rep is None
+                else "✓ Все автоматические проверки пройдены — подозрительных мест не найдено."
+            )
+            ctk.CTkLabel(
+                holder,
+                text=txt,
+                font=ctk.CTkFont(size=11),
+                text_color=THEME["text_dim"] if rep is None else THEME["ok"],
+                justify="left",
+            ).grid(row=0, column=0, sticky="w", pady=14)
+            return
+        for idx, item in enumerate(items):
+            is_err = getattr(item, "severity", "warn") == "error"
+            card = ctk.CTkFrame(
+                holder,
+                fg_color=THEME["warn_bg"] if not is_err else "#2b1010",
+                corner_radius=8,
+                border_width=1,
+                border_color=THEME["warn_border"] if not is_err else THEME["err_border"],
+            )
+            card.grid(row=idx, column=0, sticky="ew", pady=(0, 6))
+            card.grid_columnconfigure(0, weight=1)
+            icon = "⛔" if is_err else "⚠"
+            ctk.CTkLabel(
+                card,
+                text=f"{icon} {getattr(item, 'title', 'Подозрение')}",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=THEME["text_main"],
+                anchor="w",
+                justify="left",
+                wraplength=310,
+            ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+            detail = str(getattr(item, "detail", "") or getattr(item, "message", "") or "")
+            if detail:
+                ctk.CTkLabel(
+                    card,
+                    text=detail,
+                    font=ctk.CTkFont(size=10),
+                    text_color=THEME["text_muted"],
+                    anchor="w",
+                    justify="left",
+                    wraplength=310,
+                ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+
+    def _refresh_stepper(self) -> None:
+        """Обновляет степпер 1→4 в шапке по текущему состоянию сценария."""
+        if not getattr(self, "_step_chips", None):
+            return
+        text_filled = bool(str(self.text_box.get("1.0", "end") or "").strip())
+        has_plan = self._last_active_plan is not None or self._preview_main_plan is not None
+        has_conflict = self.pending_conflict is not None
+        suspicious = bool(
+            self._last_suspicion_report is not None
+            and getattr(self._last_suspicion_report, "is_suspicious", False)
+        )
+        drawn = self.draw_result is not None and not has_conflict
+        states = [
+            "done" if text_filled else "active",
+            "done" if has_plan else ("active" if text_filled or self._busy else "todo"),
+            "done" if has_plan and not has_conflict and not suspicious else ("active" if has_plan else "todo"),
+            "done" if drawn else ("active" if has_plan and not has_conflict else "todo"),
+        ]
+        colors = {
+            "done": (THEME["ok"], THEME["ok_bg"], THEME["ok"]),
+            "active": ("#ffffff", THEME["blue_soft_bg"], THEME["blue_soft_fg"]),
+            "todo": (THEME["text_dim"], "transparent", THEME["text_dim"]),
+        }
+        for idx, state in enumerate(states):
+            chip, lbl = self._step_chips[idx]
+            dot = self._step_dots[idx]
+            fg_label, chip_bg, dot_color = colors[state]
+            chip.configure(fg_color=chip_bg if state != "todo" else "transparent")
+            dot.configure(
+                text="✓" if state == "done" else str(idx + 1),
+                fg_color=THEME["btn_emerald"] if state == "done" else (THEME["btn_primary"] if state == "active" else THEME["border_subtle"]),
+                text_color="#06281c" if state == "done" else ("#ffffff" if state == "active" else THEME["text_dim"]),
+            )
+            lbl.configure(text_color=fg_label)
+
+    def _refresh_result_stats(self, plan: DrawPlan | None) -> None:
+        """Обновляет KPI-карточки вкладки «Ведомость» и привязку POB."""
+        if not hasattr(self, "stat_closure_var"):
+            return
+        if plan is None:
+            self.stat_closure_var.set("—")
+            self.stat_area_var.set("—")
+            self.stat_perimeter_var.set("—")
+            self.stat_text_height_var.set("—")
+            self.tie_info_var.set("Фасад: — · Угол: —\nPOB: (0.00, 0.00) ft")
+            self.closure_label.configure(text_color=THEME["text_muted"])
+            self._refresh_center_badges(None, None)
+            return
+        closure_ft = plan.closure.distance
+        closed_ok = closure_ft <= 0.01
+        self.stat_closure_var.set(f"{closure_ft:.3f} ft")
+        self.closure_label.configure(
+            text_color=THEME["ok"] if closed_ok else (THEME["warn"] if closure_ft < 0.5 else THEME["err"])
+        )
+        self.stat_area_var.set(f"{plan.area_sqft:,.0f} sq ft".replace(",", " "))
+        self.stat_perimeter_var.set(f"{plan.description.perimeter_ft:,.2f} ft".replace(",", " "))
+        self.stat_text_height_var.set(f"{plan.text_height:.2f}")
+        desc = plan.description
+        tie_lines = [
+            f"Фасад: {desc.main_street or '—'}",
+            f"Угол: {desc.cross_street or '—'} · {desc.distance_to_corner_ft:,.2f} ft".replace(",", " "),
+            f"POB (X, Y): {plan.pob[0]:+.2f}, {plan.pob[1]:+.2f} ft",
+        ]
+        self.tie_info_var.set("\n".join(tie_lines))
+        self._refresh_center_badges(plan, closure_ft)
 
     @property
     def key_entry(self) -> Any:
@@ -1650,6 +2676,8 @@ class SurveyApp(ctk.CTk):
         label = self.passes_options[clamped - 1]
         self.passes_label_var.set(label)
         self.passes_switch.set(label)
+        if hasattr(self, "passes_switch_mini"):
+            self.passes_switch_mini.set(label)
         self._on_passes_changed(label)
 
     def _on_passes_changed(self, _selected_label: str = "") -> None:
@@ -1662,24 +2690,32 @@ class SurveyApp(ctk.CTk):
         self.provider_switch.configure(state=state)
         self.model_combo.configure(state=state)
         self.passes_switch.configure(state=state)
+        if hasattr(self, "passes_switch_mini"):
+            self.passes_switch_mini.configure(state=state)
 
         if not use_llm:
             self.llm_policy_row.grid_remove()
             self.pass2_row.grid_remove()
             self.pass3_row.grid_remove()
-            self.regex_mode_badge.grid(row=4, column=0, sticky="w", padx=14, pady=(0, 8))
+            if hasattr(self, "panel_input_frame"):
+                self.regex_mode_badge.grid(row=8, column=0, sticky="w", padx=18, pady=(4, 0))
+            self._refresh_engine_card()
+            self._refresh_stepper()
             return
 
-        self.llm_policy_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        if hasattr(self, "llm_policy_row"):
+            self.llm_policy_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self.regex_mode_badge.grid_remove()
         if count >= 2:
-            self.pass2_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
+            self.pass2_row.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         else:
             self.pass2_row.grid_remove()
         if count >= 3:
-            self.pass3_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 8))
+            self.pass3_row.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         else:
             self.pass3_row.grid_remove()
+        self._refresh_engine_card()
+        self._refresh_stepper()
 
     def current_pass2_provider_id(self) -> str:
         lbl = str(self.pass2_provider_label_var.get() or "")
@@ -1848,12 +2884,29 @@ class SurveyApp(ctk.CTk):
         if not txt:
             self._set_status("Ведомость пуста — нечего копировать.")
             return ""
+        plan = self._last_active_plan or self._preview_main_plan
+        if plan is not None:
+            closure_ft = plan.closure.distance
+            area_txt = f"{plan.area_sqft:,.0f} sq ft".replace(",", " ")
+            perim_txt = f"{plan.description.perimeter_ft:,.2f} ft".replace(",", " ")
+            header = (
+                "ТЕХВЕДОМОСТЬ УЧАСТКА — CAD Survey Bridge v" + str(VERSION) + "\n"
+                + "─" * 60
+                + "\nНевязка: "
+                + f"{closure_ft:.3f} ft"
+                + ("  ✓ замкнутся" if closure_ft <= 0.01 else "  ⚠ требует проверки")
+                + f"\nПлощадь: {area_txt}   ·   Периметр: {perim_txt}\n"
+                + f"Точка POB (X, Y): {plan.pob[0]:+.2f}, {plan.pob[1]:+.2f} ft\n"
+                + "─" * 60
+                + "\n\n"
+            )
+            txt = header + txt
         clip_fn = getattr(self, "clipboard_clear", None)
         append_fn = getattr(self, "clipboard_append", None)
         if callable(clip_fn) and callable(append_fn):
             clip_fn()
             append_fn(txt)
-        self._set_status("📋 Ведомость участка скопирована в буфер обмена.")
+        self._set_status("📋 Техведомость участка (с невязкой, площадью и POB) скопирована в буфер обмена.")
         return txt
 
     def _bind_studio_shortcuts(self) -> None:
@@ -2081,6 +3134,14 @@ class SurveyApp(ctk.CTk):
             self._hovered_seg_idx = None
             self._redraw_preview_canvas()
 
+    def _refresh_text_counter(self) -> None:
+        lbl = getattr(self, "text_counter_label", None)
+        if lbl is None:
+            return
+        n = len(str(self.text_box.get("1.0", "end") or "").strip())
+        lbl.configure(text=f"{n} симв.")
+        self._refresh_stepper()
+
     def _render_empty_inspector(self) -> None:
         hint = (
             "Ведомость участка пока пуста.\n\n"
@@ -2209,7 +3270,8 @@ class SurveyApp(ctk.CTk):
             return
         if not self._has_visual_source():
             self._refresh_auto_orient_warning()
-            self.visual_bar.grid_remove()
+            if self._current_source_mode() == "📷 Фото":
+                self.visual_bar.grid_remove()
             return
         total = self._visual_frame_count()
         while len(self._visual_rotations) < total:
@@ -2223,12 +3285,9 @@ class SurveyApp(ctk.CTk):
         nav_state = "normal" if total > 1 else "disabled"
         self.prev_visual_button.configure(state=nav_state)
         self.next_visual_button.configure(state=nav_state)
-        if self.pdf_path and not self.image_paths and total > 1:
-            self.pdf_pages_box.grid(row=0, column=6, sticky="e", padx=(0, 2))
-        else:
-            self.pdf_pages_box.grid_remove()
         self._refresh_auto_orient_warning()
-        self.visual_bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        if self._current_source_mode() == "📷 Фото":
+            self.visual_bar.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
 
     def _refresh_neighbor_verify_button(self) -> None:
         if not hasattr(self, "verify_neighbors_button"):
@@ -2461,6 +3520,10 @@ class SurveyApp(ctk.CTk):
         self._reset_viewport_state()
         self._refresh_neighbor_verify_button()
         self._refresh_suspicion_badge()
+        self._refresh_result_stats(None)
+        self._refresh_checks_list()
+        self._refresh_neighbors_list()
+        self._refresh_stepper()
         self._render_empty_inspector()
 
     def _record_plan_for_preview(self, plan: DrawPlan, *, warnings: list[str] | None = None) -> None:
@@ -2484,6 +3547,11 @@ class SurveyApp(ctk.CTk):
         self.preview_mode_var.set("📐 Схема CAD")
         self.preview_mode_switch.set("📐 Схема CAD")
         self._set_inspector_text(self._build_inspector_report(plan, extra_warnings=warnings))
+        self._refresh_result_stats(plan)
+        self._refresh_checks_list()
+        self._refresh_neighbors_list()
+        self._refresh_stepper()
+        self._refresh_engine_card()
         self._redraw_preview_canvas()
 
     def _build_inspector_report(
@@ -2758,24 +3826,58 @@ class SurveyApp(ctk.CTk):
             sy = h * 0.5 + self._canvas_pan_y - (pt[1] - cy_w) * scale
             return sx, sy
 
-        # 0. Тонкая инженерная координатная сетка WCS (шаг подбирается автоматически)
+        # 0. Тонкая инженерная сетка WCS: минорные риски + мажорные линии + подписи осей
         grid_step = self._pick_nice_feet_step(68.0 / max(scale, 1e-6))
+        minor_step = grid_step / 5.0
         vis_min_x = cx_w + (0.0 - (w * 0.5 + self._canvas_pan_x)) / scale
         vis_max_x = cx_w + (float(w) - (w * 0.5 + self._canvas_pan_x)) / scale
         vis_min_y = cy_w - (float(h) - (h * 0.5 + self._canvas_pan_y)) / scale
         vis_max_y = cy_w - (0.0 - (h * 0.5 + self._canvas_pan_y)) / scale
+        if minor_step * scale > 14:
+            gx_m = math.floor(vis_min_x / minor_step) * minor_step
+            guard_m = 0
+            while gx_m <= vis_max_x and guard_m < 220:
+                sx_m, _ = to_screen((gx_m, 0.0))
+                if abs((gx_m / grid_step) - round(gx_m / grid_step)) > 1e-6:
+                    canvas.create_line(sx_m, 0, sx_m, h, fill=THEME["cad_grid_minor"], width=1)
+                gx_m += minor_step
+                guard_m += 1
+            gy_m = math.floor(vis_min_y / minor_step) * minor_step
+            guard_m = 0
+            while gy_m <= vis_max_y and guard_m < 220:
+                _, sy_m = to_screen((0.0, gy_m))
+                if abs((gy_m / grid_step) - round(gy_m / grid_step)) > 1e-6:
+                    canvas.create_line(0, sy_m, w, sy_m, fill=THEME["cad_grid_minor"], width=1)
+                gy_m += minor_step
+                guard_m += 1
         gx_val = math.floor(vis_min_x / grid_step) * grid_step
         grid_guard = 0
-        while gx_val <= vis_max_x and grid_guard < 40:
+        while gx_val <= vis_max_x and grid_guard < 60:
             sx_g, _ = to_screen((gx_val, 0.0))
             canvas.create_line(sx_g, 0, sx_g, h, fill=THEME["cad_grid"], width=1)
+            canvas.create_text(
+                sx_g,
+                h - 8,
+                text=f"{gx_val:g}",
+                anchor="s",
+                fill=THEME["grid_axis"],
+                font=("Consolas", 8),
+            )
             gx_val += grid_step
             grid_guard += 1
         gy_val = math.floor(vis_min_y / grid_step) * grid_step
         grid_guard = 0
-        while gy_val <= vis_max_y and grid_guard < 40:
+        while gy_val <= vis_max_y and grid_guard < 60:
             _, sy_g = to_screen((0.0, gy_val))
             canvas.create_line(0, sy_g, w, sy_g, fill=THEME["cad_grid"], width=1)
+            canvas.create_text(
+                8,
+                sy_g - 5,
+                text=f"{gy_val:g}",
+                anchor="w",
+                fill=THEME["grid_axis"],
+                font=("Consolas", 8),
+            )
             gy_val += grid_step
             grid_guard += 1
 
@@ -2788,16 +3890,19 @@ class SurveyApp(ctk.CTk):
                     x1, y1, x2, y2, fill=THEME["cad_street"], width=1, dash=(4, 3)
                 )
 
-        # 2. Перекрёсток улиц (0.0, 0.0)
+        # 2. Перекрёсток улиц (0.0, 0.0): кольцо + перекрестие + подпись
         ox, oy = to_screen((0.0, 0.0))
-        canvas.create_line(ox - 6, oy, ox + 6, oy, fill=THEME["text_muted"], width=1)
-        canvas.create_line(ox, oy - 6, ox, oy + 6, fill=THEME["text_muted"], width=1)
+        canvas.create_oval(
+            ox - 6, oy - 6, ox + 6, oy + 6, outline=THEME["cad_origin"], width=1
+        )
+        canvas.create_line(ox - 10, oy, ox + 10, oy, fill=THEME["cad_origin"], width=1.2)
+        canvas.create_line(ox, oy - 10, ox, oy + 10, fill=THEME["cad_origin"], width=1.2)
         canvas.create_text(
-            ox + 6,
-            oy + 10,
+            ox + 12,
+            oy + 16,
             text="(0,0)",
             anchor="nw",
-            fill=THEME["text_muted"],
+            fill=THEME["cad_origin"],
             font=("Consolas", 8),
         )
 
@@ -2836,6 +3941,7 @@ class SurveyApp(ctk.CTk):
                         if s_idx not in susp_map or s_item.severity == "error":
                             susp_map[s_idx] = col
 
+            create_rect_fn = getattr(canvas, "create_rectangle", None)
             for idx, bl in enumerate(focus_plan.boundary_lines, start=1):
                 x1, y1 = to_screen(bl.start)
                 x2, y2 = to_screen(bl.end)
@@ -2853,35 +3959,52 @@ class SurveyApp(ctk.CTk):
                 line_col = THEME["cad_hover"] if is_hovered else seg_color
                 line_w = 3.6 if is_hovered else 2.4
                 canvas.create_line(x1, y1, x2, y2, fill=line_col, width=line_w)
-                canvas.create_oval(
-                    x2 - 2.3, y2 - 2.3, x2 + 2.3, y2 + 2.3, fill=line_col, outline=""
-                )
+                # Узловые точки вершин: квадратики WCS (как в CADVIEW), fallback — кружочки
+                if callable(create_rect_fn):
+                    for vx, vy in ((x1, y1), (x2, y2)):
+                        create_rect_fn(
+                            vx - 3.0,
+                            vy - 3.0,
+                            vx + 3.0,
+                            vy + 3.0,
+                            fill=THEME["bg_editor"],
+                            outline=seg_color,
+                            width=1.4,
+                        )
+                else:
+                    canvas.create_oval(
+                        x2 - 2.3, y2 - 2.3, x2 + 2.3, y2 + 2.3, fill=line_col, outline=""
+                    )
                 mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-                lbl_txt = f"⚠ #{idx}" if idx in susp_map else f"#{idx}"
-                lbl_col = (
-                    THEME["cad_hover"]
-                    if is_hovered
-                    else susp_map.get(idx, THEME["text_main"])
+                # Круглый бейдж номера стороны по центру отрезка (подсветка «⚠» при подозрении)
+                is_sus = idx in susp_map
+                badge_col = THEME["cad_hover"] if is_hovered else (THEME["cad_tie"] if is_sus else "#1f2c3f")
+                badge_txt = THEME["bg_editor"] if (is_hovered or is_sus) else "#9fb2c9"
+                canvas.create_oval(
+                    mx - 8, my - 8, mx + 8, my + 8, fill=badge_col, outline=""
                 )
                 canvas.create_text(
                     mx,
-                    my - 7,
-                    text=lbl_txt,
-                    fill=lbl_col,
+                    my + 0.5,
+                    text=f"⚠ #{idx}" if is_sus else f"#{idx}",
+                    fill=badge_txt,
                     font=("Consolas", 8, "bold"),
                 )
 
             px, py = to_screen(focus_plan.pob)
             canvas.create_oval(
-                px - 4, py - 4, px + 4, py + 4, fill=THEME["ok"], outline=""
+                px - 4.5, py - 4.5, px + 4.5, py + 4.5, fill=THEME["cad_tie"], outline=""
+            )
+            canvas.create_oval(
+                px - 9, py - 9, px + 9, py + 9, outline=THEME["cad_tie"], width=1
             )
             canvas.create_text(
-                px + 6,
-                py - 8,
+                px + 13,
+                py - 9,
                 text="POB",
                 anchor="sw",
-                fill=THEME["ok"],
-                font=("Consolas", 8, "bold"),
+                fill=THEME["cad_tie"],
+                font=("Segoe UI", 9, "bold"),
             )
 
             if focus_plan.gap_points is not None:
@@ -2909,7 +4032,7 @@ class SurveyApp(ctk.CTk):
                     10,
                     text=focus_plan.description.main_street.upper(),
                     anchor="nw",
-                    fill=THEME["sky"],
+                    fill=THEME["cad_street_text"],
                     font=("Segoe UI", 9, "bold"),
                 )
 
@@ -2954,21 +4077,20 @@ class SurveyApp(ctk.CTk):
                             font=("Consolas", 8, "bold"),
                         )
 
-        # 6. Динамическая масштабная линейка в футах (левый нижний угол)
-        ruler_ft = self._pick_nice_feet_step(58.0 / max(scale, 1e-6))
+        # 6. Динамическая масштабная линейка в футах (левый нижний угол, засечки вверх)
+        ruler_ft = self._pick_nice_feet_step(110.0 / max(scale, 1e-6))
         ruler_px = min(max(ruler_ft * scale, 28.0), max(w * 0.42, 60.0))
-        rx0, ry0 = 12.0, float(h) - 14.0
-        canvas.create_line(rx0, ry0, rx0 + ruler_px, ry0, fill=THEME["text_muted"], width=2)
-        canvas.create_line(rx0, ry0 - 4, rx0, ry0 + 4, fill=THEME["text_muted"], width=1.5)
-        canvas.create_line(
-            rx0 + ruler_px, ry0 - 4, rx0 + ruler_px, ry0 + 4, fill=THEME["text_muted"], width=1.5
-        )
+        rx0, ry0 = 24.0, float(h) - 40.0
+        canvas.create_line(rx0, ry0, rx0 + ruler_px, ry0, fill="#cbd5e1", width=2)
+        canvas.create_line(rx0, ry0 - 5, rx0, ry0, fill="#cbd5e1", width=2)
+        canvas.create_line(rx0 + ruler_px, ry0 - 5, rx0 + ruler_px, ry0, fill="#cbd5e1", width=2)
         canvas.create_text(
-            rx0 + 0.5 * ruler_px,
-            ry0 - 9,
+            rx0,
+            ry0 - 10,
+            anchor="sw",
             text=f"{ruler_ft:g} ft",
-            fill=THEME["text_muted"],
-            font=("Consolas", 8, "bold"),
+            fill="#cbd5e1",
+            font=("Consolas", 9, "bold"),
         )
 
         # 7. Живой HUD координат курсора и подсвеченной стороны (правый нижний угол)
@@ -3007,12 +4129,18 @@ class SurveyApp(ctk.CTk):
                 font=("Consolas", 8),
             )
 
-        # 8. Стрелка на Север в правом верхнем углу схемы
-        nx_c, ny_c = w - 20, 26
-        canvas.create_line(nx_c, ny_c + 10, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
-        canvas.create_line(nx_c - 3.5, ny_c - 3, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
-        canvas.create_line(nx_c + 3.5, ny_c - 3, nx_c, ny_c - 8, fill=THEME["text_muted"], width=1.5)
-        canvas.create_text(nx_c, ny_c - 15, text="N", fill=THEME["text_main"], font=("Consolas", 9, "bold"))
+        # 8. Компасная стрелка на Север (правый верхний угол)
+        nx_c, ny_c = w - 44.0, 70.0
+        canvas.create_line(nx_c, ny_c + 22, nx_c, ny_c - 14, fill="#e2e8f0", width=2)
+        tri_fn = getattr(canvas, "create_polygon", None)
+        if callable(tri_fn):
+            tri_fn(nx_c, ny_c - 22, nx_c - 6, ny_c - 10, nx_c + 6, ny_c - 10, fill="#e2e8f0", outline="")
+        else:
+            canvas.create_line(nx_c - 6, ny_c - 10, nx_c, ny_c - 22, fill="#e2e8f0", width=2)
+            canvas.create_line(nx_c + 6, ny_c - 10, nx_c, ny_c - 22, fill="#e2e8f0", width=2)
+        canvas.create_text(
+            nx_c, ny_c + 30, text="N", fill="#e2e8f0", font=("Segoe UI", 10, "bold")
+        )
 
     # -------------------------------------------------------------- helpers --
     def _on_close(self) -> None:
@@ -3032,6 +4160,12 @@ class SurveyApp(ctk.CTk):
         scale = self._current_scale()
         height = AcadBuilder.text_height_for_scale(scale, self.config_data)
         self.height_label.configure(text=f"текст {height:.3f}'")
+        if (
+            hasattr(self, "stat_text_height_var")
+            and self._last_active_plan is None
+            and self._preview_main_plan is None
+        ):
+            self.stat_text_height_var.set(f"{height:.2f}")
 
     def is_neighbor_mode(self) -> bool:
         """True, если в переключателе выбран режим «Соседний участок»."""
@@ -3040,16 +4174,17 @@ class SurveyApp(ctk.CTk):
     def _on_lot_role_changed(self) -> None:
         if self.is_neighbor_mode():
             self.draw_button.configure(
-                text="Начертить соседа в AutoCAD",
+                text="▶  Начертить соседа в AutoCAD   F5",
                 fg_color=THEME["btn_neighbor"],
                 hover_color=THEME["btn_neighbor_hover"],
             )
         else:
             self.draw_button.configure(
-                text="Начертить участок в AutoCAD",
+                text="▶  Начертить участок в AutoCAD   F5",
                 fg_color=THEME["btn_primary"],
                 hover_color=THEME["btn_primary_hover"],
             )
+        self._refresh_stepper()
 
     def _preview_text_offline_silently(self, sample_text: str) -> None:
         """Мгновенно обновляет правую схему при выборе встроенного примера."""
@@ -3083,6 +4218,7 @@ class SurveyApp(ctk.CTk):
             return
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", sample)
+        self._refresh_text_counter()
         self._reset_visual_sources()
         if "Сосед" in label:
             self.lot_role_var.set("neighbor")
@@ -3101,6 +4237,13 @@ class SurveyApp(ctk.CTk):
         sample = self._sample_presets.get(selected, EXAMPLE_TEXT)
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", sample)
+        self.source_mode_var.set("📝 Текст")
+        try:
+            self.source_mode_switch.set("📝 Текст")
+        except Exception:  # noqa: BLE001
+            pass
+        self._on_source_mode_changed()
+        self._refresh_text_counter()
         self._reset_visual_sources()
         self.pdf_label.configure(
             text=f"Пример: {selected or 'базовый'}",
@@ -3126,6 +4269,11 @@ class SurveyApp(ctk.CTk):
         self._update_closure_badge("Closure Error: —", None)
         self.tokens_var.set("Токены за вызов: —")
         self._set_status("Поле описания и визуальные файлы очищены.")
+        self._refresh_result_stats(None)
+        self._refresh_checks_list()
+        self._refresh_neighbors_list()
+        self._refresh_stepper()
+        self._refresh_text_counter()
         self._render_empty_inspector()
 
     def _apply_loaded_images(self, paths: list[Path]) -> None:
@@ -3138,6 +4286,12 @@ class SurveyApp(ctk.CTk):
         self._visual_rotations = [0] * len(paths)
         self._visual_cursor = 0
         self.use_llm_var.set(True)
+        self.source_mode_var.set("📷 Фото")
+        try:
+            self.source_mode_switch.set("📷 Фото")
+        except Exception:  # noqa: BLE001
+            pass
+        self._on_source_mode_changed()
         self._refresh_consensus_rows()
         self._refresh_visual_bar()
 
@@ -3215,6 +4369,12 @@ class SurveyApp(ctk.CTk):
             self._pdf_needs_vision = False
             self.text_box.delete("1.0", "end")
             self.text_box.insert("1.0", text)
+            self.source_mode_var.set("📄 PDF")
+            try:
+                self.source_mode_switch.set("📄 PDF")
+            except Exception:  # noqa: BLE001
+                pass
+            self._on_source_mode_changed()
             self._refresh_visual_bar()
             self.pdf_label.configure(
                 text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)",
@@ -3238,6 +4398,12 @@ class SurveyApp(ctk.CTk):
                 text=f"PDF Vision: {self.pdf_path.name} ({info['pages']} стр., {tag_detail})",
                 text_color=THEME["warn"],
             )
+            self.source_mode_var.set("📄 PDF")
+            try:
+                self.source_mode_switch.set("📄 PDF")
+            except Exception:  # noqa: BLE001
+                pass
+            self._on_source_mode_changed()
             self._set_preview_mode("🖼 Исходник")
             pages_hint = (
                 " Для выбора отдельных листов укажите диапазон в поле «Стр.:» (напр. 1-4 или все)."
@@ -3405,8 +4571,11 @@ class SurveyApp(ctk.CTk):
     def _log_line(self, message: str) -> None:
         if not hasattr(self, "_log"):
             self._log = []
-        self._log.append(message)
+        stamp = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"{stamp}  {message}")
         del self._log[:-400]
+        if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
+            self._refresh_log_view()
 
     def _set_status(self, message: str, error: bool = False, *, warn: bool = False) -> None:
         self.status_var.set(message)
@@ -3417,19 +4586,54 @@ class SurveyApp(ctk.CTk):
         else:
             color = THEME["text_main"]
         self.status_label.configure(text_color=color)
+        dot = getattr(self, "status_dot", None)
+        if dot is not None:
+            dot.configure(
+                text_color=THEME["err"] if error else (THEME["warn"] if warn else THEME["ok"])
+            )
         self._log_line(message)
+        self._refresh_stepper()
+
+    def _refresh_center_badges(self, plan: DrawPlan | None, closure_ft: float | None) -> None:
+        """Обновляет бейджи консенсуса и невязки в шапке центрального холста."""
+        if not hasattr(self, "center_closure_badge"):
+            return
+        cons = getattr(self, "_last_consensus_label", None)
+        if cons and getattr(self, "consensus_badge", None) is not None:
+            self.consensus_badge.configure(text=f"✨ Консенсус {cons}")
+            self.consensus_badge.grid(row=0, column=2, padx=(0, 6), sticky="e")
+        elif getattr(self, "consensus_badge", None) is not None:
+            self.consensus_badge.grid_remove()
+        if closure_ft is None:
+            self.center_closure_badge.grid_remove()
+            return
+        ok = closure_ft <= 0.01
+        self.center_closure_badge.configure(
+            text=f"Closure {closure_ft:.3f} ft",
+            fg_color=THEME["badge_v1_bg"] if ok else THEME["warn_bg"],
+            text_color=THEME["ok"] if ok else THEME["warn"],
+        )
+        self.center_closure_badge.grid(row=0, column=3, padx=(0, 6), sticky="e")
 
     def _update_closure_badge(self, text: str, distance_ft: float | None) -> None:
         self.closure_var.set(text)
         if distance_ft is None:
             color = THEME["text_muted"]
-        elif distance_ft <= 0.015:
-            color = THEME["ok"]
-        elif distance_ft <= 1.0:
-            color = THEME["warn"]
+            if hasattr(self, "stat_closure_var"):
+                self.stat_closure_var.set("—")
+                self._refresh_center_badges(None, None)
         else:
-            color = THEME["err"]
-        self.closure_label.configure(text_color=color)
+            if distance_ft <= 0.015:
+                color = THEME["ok"]
+            elif distance_ft <= 1.0:
+                color = THEME["warn"]
+            else:
+                color = THEME["err"]
+            if hasattr(self, "stat_closure_var"):
+                self.stat_closure_var.set(f"{distance_ft:.3f} ft")
+                self._refresh_center_badges(self._last_active_plan, distance_ft)
+        if hasattr(self, "closure_label") and self.closure_label is not None:
+            self.closure_label.configure(text_color=color)
 
     # ------------------------------------------------------- асинхронные шаги --
     def _post(self, kind: str, payload: Any) -> None:
@@ -3568,6 +4772,7 @@ class SurveyApp(ctk.CTk):
         self.progress.stop()
         self.progress.set(0)
         self._set_controls_busy(False)
+        self._refresh_stepper()
 
     def _open_neighbor_report_window(self) -> None:
         """Открывает отдельное окно подробного акта сверки с соседними участками."""
@@ -4143,6 +5348,7 @@ class SurveyApp(ctk.CTk):
                 )
                 self._last_valid_secret = key_secret
                 if not consensus.agreed:
+                    self._last_consensus_label = None
                     self._post(
                         "conflict",
                         {
@@ -4157,6 +5363,7 @@ class SurveyApp(ctk.CTk):
                     self._post("done", None)
                     return
                 outcome = consensus.selected_outcome
+                self._last_consensus_label = f"{len(consensus.pass_outcomes)}/{len(consensus.pass_outcomes)}"
                 round_usages: list[TokenUsage | None] = [
                     o.usage for o in consensus.pass_outcomes
                 ]
@@ -4181,6 +5388,7 @@ class SurveyApp(ctk.CTk):
                 )
                 if use_llm:
                     self._last_valid_secret = key_secret
+                self._last_consensus_label = None
                 round_usages = []
                 pre_counted = False
 
@@ -4419,7 +5627,7 @@ class SurveyApp(ctk.CTk):
             )
             self.apply_typo_fix_button.grid_remove()
 
-        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.doubt_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
         report_txt = self._build_doubt_report(doubt_ctx)
         self._set_status(report_txt, warn=True)
         self._log_line(report_txt)
@@ -4788,7 +5996,7 @@ class SurveyApp(ctk.CTk):
         else:
             self.pick_pass3_button.grid_remove()
 
-        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.conflict_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(6, 0))
         self._update_closure_badge(
             "Closure Error по проходам:  "
             + "   |   ".join(
@@ -5241,6 +6449,7 @@ class SurveyApp(ctk.CTk):
         self._update_closure_badge(
             result.closure.short_report(), result.closure.distance
         )
+        self._refresh_stepper()
 
 
 def main() -> None:

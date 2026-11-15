@@ -1,0 +1,81 @@
+ДАМП ЧЕРТЕЖА: for MLP 225 Aspinwall Street, Staten Island.dwg
+Файл: C:\Ser\mlp\4\for MLP 225 Aspinwall Street, Staten Island.dwg
+Область: весь ModelSpace · объектов в ModelSpace: 543 · записано: 543 · ошибок чтения: 0
+Единицы чертежа: INSUNITS = 2 (футы); DIMSCALE = 1; LTSCALE = 1; масштаб аннотаций: 1:1
+Габариты: X 915 410.82 … 915 602.30, Y 122 416.46 … 122 636.02 (191.48 × 219.56)
+
+=== 1. СЛОИ И ОБЪЕКТЫ НА НИХ ===
+Слой '0': BlockReference: 7, MText: 2 | высота текста: 1.2 ×1, 1.5003 ×1 | Примеры текста: ['SCALE: 1"=16\'', 'Home']
+Слой 'D-TOPO-TEXT': MText: 10, Text: 9 | высота текста: 0.9 ×19 | Примеры текста: ['PLANTER', 'O.P.', 'ROOFED O.P.']
+Слой 'M-NTH-ARROW': BlockReference: 1
+Слой 'M-PROPERTY': Line: 3
+Слой 'M-ROW-LINE': Line: 3
+Слой 'PNT-X' [заморожен]: Point: 177
+Слой 'S-CONC-MISC': Line: 19, BlockReference: 1
+Слой 'S-CONC-MISC-ELEV': BlockReference: 22
+Слой 'S-CURB-LINE': BlockReference: 1
+Слой 'S-CURB-LINE-ELEV': BlockReference: 3
+Слой 'S-DWY': BlockReference: 9, Line: 7
+Слой 'S-FENCE': BlockReference: 19, Line: 12
+Слой 'ST-BLDG-LINE': BlockReference: 54, Line: 21
+Слой 'ST-MISC': Line: 58, BlockReference: 43, Hatch: 6, Polyline: 2, Arc: 2
+Слой 'ST-OHED': BlockReference: 6, Line: 3
+Слой 'ST-STEP': Line: 20, BlockReference: 1
+Слой 'ST-STEP-ELEV': BlockReference: 5
+Слой 'ST-WALL': Line: 11, BlockReference: 6
+Слои без записанных объектов (113): AQUESTION, BORDER, BRGTXT, Bldg, CURB LINE, D-BASELINE, D-BASELINE-TIES, D-BORDER, D-KEY-LAYOUT, D-LEGEND, D-MTCH-LINE, D-MTCH-LINE-SHEET1, D-MTCH-LINE-SHEET2, D-NOTES, D-ROAD-MISC, D-VIEW-PORT, Defpoints, ELEV, GRID, LETTER, M-BASE-LINE, M-BULKHEAD-LINE, M-EASEMENT, M-GRADIENT-BX-LINE, M-LEGAL-GRADE, M-PARKS-BNDY-LINE, M-PIERHEAD-BULK-LINE, M-PIERHEAD-LINE, M-REC-ROW-LINE, M-ROW-DIM, M-ROW-TEXT, M-TAX-DIM, M-TAX-LINE, M-TAX-TEXT, P-CENTERLINE, P-GRID, P-HWY-BLDG, P-HWY-BOC, P-HWY-BOC-MED, P-HWY-BOW, P-HWY-ROW, P-HWY-TOC, P-HWY-TOC-MED, P-LEGAL-GRADE, P-SEWR, P-SEWR-COMB, P-SEWR-SAN, P-SEWR-STM, PL, PNTDESC, PNTELEV, PNTNO, PNTS, PT_N, PT_S, S-CD, S-CONT-BASELINE, S-CONT-MON, S-CONT-PNTS, S-CONT-SET, S-CURB-DROP, S-GUIDE-RAIL, S-MHWL, S-MISC-IRON, S-MLWL, S-ROAD-CL, S-ROAD-DWY, S-ROAD-EOP, S-ROAD-JERSEY-BAR, S-ROAD-SW-LINE, S-ROAD-TCURB, S-RR, S-SLOPE-BOT, S-SLOPE-TOP, S-TOPO-MISC, S-TOPO-XSEC, S-TREE, S-TREE-HEDG, S-TREE-PINE, S-TREE-TEXT, S-WETLAND, S-WETLAND-ADJ, ST-BLDG-ELEV, ST-BLDG-HATCH, ST-BLDG-TEXT, ST-SUBW-LIMT-LINE, TXT, U-CABLE-IRON, U-CABLE-LINE, U-ELEC-IRON, U-ELEC-LINE, U-FIRE-IRON, U-FIRE-LINE, U-GAS-IRON, U-GAS-LINE, U-MISC-IRON, U-MISC-OHED, U-SEWR-ELEV, U-SEWR-FLOW, U-SEWR-IRON, U-SEWR-LINE, U-SEWR-LINE-COMB, U-SEWR-LINE-SAN, U-SEWR-LINE-STM, U-STEAM-IRON, U-STEAM-LINE, U-SUBW-IRON, U-SUBW-LINE, U-TELE-IRON, U-TELE-LINE, U-TRAF-IRON, U-WATR-IRON, U-WATR-LINE
+
+=== 2. ТЕКСТОВЫЕ СТИЛИ ===
+  - 'Standard': шрифт romans.shx, высота 0.9, сжатие 1 · текстов: 0
+  - 'ROMANS': шрифт romans.shx, высота 0, сжатие 1 · текстов: 19
+  - 'ROMAND': шрифт romand, высота 0, сжатие 1 · текстов: 0
+  - 'STANDARD2': шрифт Arial, высота 0, сжатие 1 · текстов: 0
+  - 'ROMANT': шрифт romant.shx, высота 0, сжатие 1 · текстов: 0
+  - 'SITELINEDIM': шрифт romant.shx, высота 3.2, сжатие 1 · текстов: 0
+  - 'GOTHICE': шрифт gothice.shx, высота 0, сжатие 1 · текстов: 0
+  - 'RDTEXT': шрифт romans.shx, высота 0, сжатие 1 · текстов: 0
+  - 'ROMAND-I': шрифт romand.shx, высота 0, сжатие 1 · текстов: 0
+  - '': шрифт ltypeshp.shx, высота 0, сжатие 1 · текстов: 0
+  - 'STREETLINEDIM': шрифт romand.shx, высота 2.8, сжатие 1 · текстов: 0
+  - 'ARIAL': шрифт Arial, высота 50, сжатие 0.85 · текстов: 0
+  - 'PTXT': шрифт TXT, высота 0, сжатие 1 · текстов: 0
+  - 'Legend': шрифт Calibri, высота 0, сжатие 1 · текстов: 0
+  - 'TEXT': шрифт Times New Roman, высота 14, сжатие 1 · текстов: 0
+  - 'RDS': шрифт ROMAND.shx, высота 0, сжатие 0.8 · текстов: 1
+  - 'style2': шрифт Times New Roman, высота 1.2, сжатие 1 · текстов: 1
+  - 'RS': шрифт ROMANS.shx, высота 0, сжатие 0.8 · текстов: 0
+  - 'BASE': шрифт Romans.shx, высота 0.1, сжатие 0.85 · текстов: 0
+  - 'BASE-PN': шрифт Romans.shx, высота 0.5, сжатие 0.85 · текстов: 0
+  - 'MtXpl_Times_New_Roma': шрифт Times New Roman, высота 0, сжатие 1 · текстов: 0
+
+=== 3. БЛОКИ (СТРЕЛКА СЕВЕРА, РАМКА) ===
+  - Блок 'NA' ×1 | Слой: 'M-NTH-ARROW' | Поворот: 75.339°
+  - Блок 'SRVPNO5' ×1 | Слой: '0' | Поворот: 0.026°
+  - Блок 'SRVPNO5' ×6 | Слой: '0' | Поворот: 75.394°
+  - Блок 'SRVPNO5' ×9 | Слой: 'S-DWY' | Поворот: 0.026°
+  - Блок 'SRVPNO5' ×6 | Слой: 'S-FENCE' | Поворот: 0.026°
+  - Блок 'SRVPNO5' ×13 | Слой: 'S-FENCE' | Поворот: 75.394°
+  - Блок 'SRVPNO5' ×54 | Слой: 'ST-BLDG-LINE' | Поворот: 75.394°
+  - Блок 'SRVPNO5' ×6 | Слой: 'ST-MISC' | Поворот: 0.026°
+  - Блок 'SRVPNO5' ×11 | Слой: 'ST-MISC' | Поворот: 75.394°
+  - Блок 'SRVPNO5' ×6 | Слой: 'ST-OHED' | Поворот: 75.394°
+  - Блок 'SRVPNO5' ×6 | Слой: 'ST-WALL' | Поворот: 75.394°
+  - Блок 'srvpno3' ×1 | Слой: 'S-CONC-MISC' | Поворот: 75.394°
+  - Блок 'srvpno3' ×20 | Слой: 'S-CONC-MISC-ELEV' | Поворот: 0.026°
+  - Блок 'srvpno3' ×2 | Слой: 'S-CONC-MISC-ELEV' | Поворот: 75.394°
+  - Блок 'srvpno3' ×1 | Слой: 'S-CURB-LINE' | Поворот: 75.394°
+  - Блок 'srvpno3' ×3 | Слой: 'S-CURB-LINE-ELEV' | Поворот: 75.394°
+  - Блок 'srvpno3' ×26 | Слой: 'ST-MISC' | Поворот: 0.026°
+  - Блок 'srvpno3' ×1 | Слой: 'ST-STEP' | Поворот: 0.026°
+  - Блок 'srvpno3' ×4 | Слой: 'ST-STEP-ELEV' | Поворот: 0.026°
+  - Блок 'srvpno3' ×1 | Слой: 'ST-STEP-ELEV' | Поворот: 75.394°
+
+=== 4. ОТДЕЛЬНЫЕ ГРУППЫ ОБЪЕКТОВ (несколько чертежей в одном файле; оценка) ===
+  Группа 1: объектов 496 · X 915 457.24 … 915 575.57, Y 122 454.48 … 122 603.63 · слои: PNT-X (154), ST-MISC (111), ST-BLDG-LINE (58), S-FENCE (31)
+  Группа 2: объектов 8 · X 915 410.82 … 915 421.70, Y 122 596.58 … 122 605.75 · слои: PNT-X (4), ST-BLDG-LINE (3), 0 (1)
+  Группа 3: объектов 6 · X 915 440.28 … 915 440.63, Y 122 499.45 … 122 503.68 · слои: PNT-X (3), ST-OHED (2), ST-BLDG-LINE (1)
+  Группа 4: объектов 6 · X 915 592.03 … 915 602.30, Y 122 593.85 … 122 595.04 · слои: PNT-X (3), ST-BLDG-LINE (2), 0 (1)
+  Мелких групп (меньше 5 объектов): 11, объектов в них: 27
+
+=== 5. ЛИСТЫ ===
+  - 'layout': Viewport: 2 | масштабы видовых экранов: [0.03333333, 1]

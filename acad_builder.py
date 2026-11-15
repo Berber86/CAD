@@ -39,6 +39,7 @@ from feature_labeler import (
     STEP2_VERSION,
     DrawingLine,
     DrawingSnapshot,
+    DrawingSymbol,
     DrawingText,
     Feature,
     FeatureLabelError,
@@ -2859,6 +2860,19 @@ class AcadBuilder:
         атрибута-описания (стрелка севера, знаки) пропускаются.
         """
         if not bool(getattr(entity, "HasAttributes", False)):
+            # Условный знак (столб WUP): блок без атрибутов с известным именем.
+            try:
+                name = str(entity.EffectiveName)
+            except Exception:  # noqa: BLE001 - старые версии AutoCAD
+                name = str(getattr(entity, "Name", "") or "")
+            if name and lookup_pattern_label(name, fcfg.get("symbol_block_labels")) is not None:
+                insertion = entity.InsertionPoint
+                snapshot.symbols.append(
+                    DrawingSymbol(
+                        layer=layer, name=name,
+                        point=(float(insertion[0]), float(insertion[1])),
+                    )
+                )
             return
         tags = fcfg.get("point_block_attribute_tags") or {}
         values = {"number": "", "description": "", "elevation": ""}

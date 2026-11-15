@@ -660,12 +660,27 @@
           "SW",
           "COLUMN",
           "COL",
-          "BBC*"
+          "BBC*",
+          "W U P",
+          "WUP",
+          "U P"
         ],
         "label": ""
       }
     ],
     "narrow_object_max_width_ft": 1.5,
+    "symbol_block_labels": {
+      "WUP": "UTILITY\nPOLE",
+      "UP": "UTILITY\nPOLE"
+    },
+    "symbol_label_scope": "lot",
+    "symbol_lot_tolerance_ft": 1.0,
+    "party_wall_layers": [
+      "0"
+    ],
+    "party_wall_label": "PARTY WALL",
+    "party_wall_max_width_ft": 1.6,
+    "party_wall_min_length_ft": 10.0,
     "fence_atop_wall_format": "{fence} ATOP {wall}",
     "fence_atop_wall_reach_ft": 0.5,
     "fence_atop_wall_min_ft": 4.0,
@@ -805,7 +820,8 @@
     "fence_on_line_tolerance_ft": 0.15,
     "fence_abbreviation_spacing_ft": 4.0,
     "outward_label_categories": [
-      "planter"
+      "planter",
+      "party_wall"
     ],
     "fence_near_lot_ft": 2.0,
     "field_note_surface_radius_ft": 15.0,

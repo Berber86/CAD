@@ -273,9 +273,32 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         # кромка тротуара/дорожки: материал покрытия заказчик берёт с фотографий.
         # COLUMN — колонна у входа, BBC — точка бортового камня: в итоговых
         # чертежах заказчика не подписаны.
-        {"match": ["BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW", "COLUMN", "COL", "BBC*"], "label": ""},
+        # W U P — столб: подписывается его условный знак (symbol_block_labels).
+        {
+            "match": [
+                "BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW", "COLUMN", "COL", "BBC*",
+                "W U P", "WUP", "U P",
+            ],
+            "label": "",
+        },
     ],
     "narrow_object_max_width_ft": 1.5,
+    # --- источник 2в: условные знаки (вставки блоков без атрибутов) ---------
+    #: имя блока -> подпись. Знак подписывается выноской. ``symbol_label_scope``:
+    #: "lot" — только знаки на самом участке (столб во дворе заказчик
+    #: подписывает, столбы на улице — нет), "all" — все в зоне поиска,
+    #: "none" — не подписывать.
+    "symbol_block_labels": {"WUP": "UTILITY\nPOLE", "UP": "UTILITY\nPOLE"},
+    "symbol_label_scope": "lot",
+    "symbol_lot_tolerance_ft": 1.0,
+    # --- общие стены (party wall) -------------------------------------------
+    #: Две параллельные линии этих слоёв, идущие вдоль границы участка не
+    #: дальше ``party_wall_max_width_ft`` друг от друга, — общая с соседом стена
+    #: дома блокированной застройки: подпись вдоль неё со стороны соседа.
+    "party_wall_layers": ["0"],
+    "party_wall_label": "PARTY WALL",
+    "party_wall_max_width_ft": 1.6,
+    "party_wall_min_length_ft": 10.0,
     #: забор, идущий по стене (в пределах ``fence_atop_wall_reach_ft`` от её
     #: контура), подписывается вместе с ней; у стены своей подписи нет
     "fence_atop_wall_format": "{fence} ATOP {wall}",
@@ -408,7 +431,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "fence_abbreviation_spacing_ft": 4.0,
     #: категории, у которых подпись вдоль кромки ставится с внешней стороны
     #: (клумба — полоса между своей кромкой и забором у границы участка)
-    "outward_label_categories": ["planter"],
+    "outward_label_categories": ["planter", "party_wall"],
     "fence_near_lot_ft": 2.0,
     #: заметка о покрытии снимает подпись по слою у такого же покрытия в этом радиусе
     "field_note_surface_radius_ft": 15.0,
@@ -703,6 +726,15 @@ class SurveyPoint:
     block: str = ""
 
 
+@dataclass
+class DrawingSymbol:
+    """Условный знак: вставка блока без атрибутов (столб ``WUP``)."""
+
+    layer: str
+    name: str
+    point: tuple[float, float]
+
+
 #: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
 #: программы работала (описания точек из атрибутов блоков читаются с 2.2).
 STEP2_VERSION = "2.4 (2026-11-14)"
@@ -715,6 +747,7 @@ class DrawingSnapshot:
     lines: list[DrawingLine] = field(default_factory=list)
     texts: list[DrawingText] = field(default_factory=list)
     survey_points: list[SurveyPoint] = field(default_factory=list)
+    symbols: list["DrawingSymbol"] = field(default_factory=list)
     leaders: list[DrawingLine] = field(default_factory=list)
     entity_count: int = 0
     skipped_hidden: int = 0
@@ -1477,6 +1510,11 @@ _CATEGORY_TITLES = {
     "pool": "бассейн",
     "wall": "стена",
     "overhang": "навес/консоль",
+    "cellar_door": "люк подвала",
+    "fire_escape": "пожарная лестница",
+    "awning": "козырёк",
+    "party_wall": "общая стена",
+    "symbol": "условный знак",
     "misc": "объект",
     "point": "точка",
 }
@@ -2989,6 +3027,52 @@ def recognize_features(
             main_house.source = "user"
             main_house.rule = "поле «Описание основного дома»"
 
+    # --- общие стены с соседями ---------------------------------------------
+    party_label = str(fcfg.get("party_wall_label") or "").strip()
+    party_layers = fcfg.get("party_wall_layers")
+    if party_label and party_layers:
+        party_lines: dict[str, list[LineString]] = {}
+        for line in snapshot.lines:
+            if not layer_matches(line.layer, party_layers):
+                continue
+            geom = line_to_shapely(line)
+            if geom is not None and _within_bounds(geom, zone_bounds):
+                party_lines.setdefault(line.layer, []).append(geom)
+        for layer in sorted(party_lines):
+            for axis in _party_wall_axes(
+                party_lines[layer], boundary.polygon,
+                float(fcfg.get("party_wall_max_width_ft") or 0.0),
+                float(fcfg.get("party_wall_min_length_ft") or 0.0),
+            ):
+                result.features.append(
+                    Feature(
+                        feature_id=new_id(), kind="edge", category="party_wall", layer=layer,
+                        geometry=axis, label=party_label, source="layer", rule=PARTY_WALL_RULE,
+                        closed=False,
+                    )
+                )
+
+    # --- условные знаки: вставки блоков (столб во дворе) --------------------
+    scope = str(fcfg.get("symbol_label_scope") or "none").strip().lower()
+    if scope in {"lot", "all"} and snapshot.symbols:
+        lot_reach = boundary.polygon.buffer(
+            max(0.0, float(fcfg.get("symbol_lot_tolerance_ft") or 0.0))
+        )
+        for symbol in snapshot.symbols:
+            mapped_symbol = lookup_pattern_label(symbol.name, fcfg.get("symbol_block_labels"))
+            if mapped_symbol is None or not mapped_symbol[0]:
+                continue
+            spot = Point(symbol.point)
+            if not (lot_reach if scope == "lot" else zone).contains(spot):
+                continue
+            result.features.append(
+                Feature(
+                    feature_id=new_id(), kind="point", category="symbol", layer=symbol.layer,
+                    geometry=spot, label=mapped_symbol[0], source="layer",
+                    rule=f"условный знак, блок {symbol.name}",
+                )
+            )
+
     # --- заметки полевого чертёжника: формулировки заказчика ----------------
     result.field_notes = _collect_field_notes(snapshot, classifier, fcfg, zone)
     _apply_field_notes(result, result.field_notes, fcfg, new_id, tread_layers)
@@ -3032,6 +3116,63 @@ def _normalize_house_text(text: str) -> str:
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\P", "\n")
     lines = [re.sub(r"\s+", " ", line).strip() for line in raw.split("\n")]
     return "\n".join(line for line in lines if line)
+
+
+PARTY_WALL_RULE = "две параллельные линии вдоль границы участка"
+
+
+def _party_wall_axes(
+    lines: Sequence[LineString], lot: Polygon, max_width: float, min_length: float
+) -> list[LineString]:
+    """
+    Оси общих стен: пары параллельных отрезков не дальше ``max_width`` друг от
+    друга, перекрывающиеся не меньше чем на ``min_length`` и идущие вдоль
+    границы участка (ось пары лежит на линии границы).
+    """
+    segments: list[tuple[tuple[float, float], tuple[float, float], float]] = []
+    for line in lines:
+        coords = _clean_coords(line.coords)
+        for start, end in zip(coords, coords[1:]):
+            length = math.hypot(end[0] - start[0], end[1] - start[1])
+            if length >= min_length:
+                segments.append((start, end, length))
+    if len(segments) < 2 or max_width <= 0.0:
+        return []
+    border = lot.exterior.buffer(max_width / 2.0)
+    axes: list[LineString] = []
+    used: set[int] = set()
+    for first in range(len(segments)):
+        if first in used:
+            continue
+        (ax, ay), (bx, by), a_len = segments[first]
+        ux, uy = (bx - ax) / a_len, (by - ay) / a_len
+        for second in range(first + 1, len(segments)):
+            if second in used:
+                continue
+            (cx, cy), (dx, dy), c_len = segments[second]
+            vx, vy = (dx - cx) / c_len, (dy - cy) / c_len
+            if abs(ux * vy - uy * vx) > math.sin(math.radians(3.0)):
+                continue
+            t_start = (cx - ax) * ux + (cy - ay) * uy
+            t_end = (dx - ax) * ux + (dy - ay) * uy
+            low, high = max(0.0, min(t_start, t_end)), min(a_len, max(t_start, t_end))
+            if high - low < min_length:
+                continue
+            # Смещение второй линии поперёк первой (со знаком).
+            offset = -(cx - ax) * uy + (cy - ay) * ux
+            if not (0.2 <= abs(offset) <= max_width):
+                continue
+            nx, ny = -uy * offset / 2.0, ux * offset / 2.0
+            axis = LineString([
+                (ax + ux * low + nx, ay + uy * low + ny),
+                (ax + ux * high + nx, ay + uy * high + ny),
+            ])
+            if axis.intersection(border).length < 0.8 * axis.length:
+                continue
+            axes.append(axis)
+            used.update({first, second})
+            break
+    return axes
 
 
 ROW_HOUSE_RULE = "дом во всю ширину участка: между линиями стен и границами участка"

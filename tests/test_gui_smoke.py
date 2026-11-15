@@ -221,6 +221,18 @@ class _Widget:
             self._global_bindings = {}
         self._global_bindings[event_name] = callback
 
+    def transient(self, *args, **kwargs):
+        return None
+
+    def resizable(self, *args, **kwargs):
+        return None
+
+    def grab_set(self, *args, **kwargs):
+        self._grabbed = True
+
+    def grab_release(self, *args, **kwargs):
+        self._grabbed = False
+
     def clipboard_clear(self):
         self._clipboard = ""
 
@@ -325,6 +337,35 @@ def gui(monkeypatch):
     )
     yield gui_module
     sys.modules.pop("main", None)
+
+
+def _load_pdf_by_role(app):
+    """
+    Порядок «сначала роль, потом файлы». Кнопка PDF теперь открывает набор
+    со списком, но этим порядком по-прежнему пользуются окно сверки, фото и
+    выбор файлов соседей, поэтому открытие одного PDF и прикрепление PDF
+    соседей проверяются через него.
+    """
+    from pathlib import Path
+    from tkinter import filedialog
+    from llm_parser import is_image_file
+
+    role = app._ask_source_role("PDF")
+    if role not in {"main", "neighbor"}:
+        return
+    if role == "neighbor":
+        paths = filedialog.askopenfilenames(title="PDF соседей")
+        if paths:
+            app._attach_neighbor_pdfs([Path(p) for p in paths if str(p).strip()])
+        return
+    path = filedialog.askopenfilename(title="PDF основного участка")
+    if not path:
+        return
+    chosen = Path(path)
+    if is_image_file(chosen):
+        app._apply_loaded_images([chosen])
+        return
+    app._open_single_pdf(chosen)
 
 
 def test_widget_stub_rejects_unsupported_transparency():
@@ -603,7 +644,7 @@ def test_gui_nyc_presets_and_vision_pdf_flow(gui, tmp_path, monkeypatch):
 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(vec_pdf))
     app.use_llm_var.set(False)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._pdf_needs_vision is True
     assert app.use_llm_var.get() is True
     assert "PDF Vision:" in app.pdf_label.cget("text")
@@ -1571,7 +1612,7 @@ def test_text_pdf_defaults_to_local_and_ai_is_an_explicit_choice(gui, tmp_path, 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(text_pdf))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("вызов API не ожидался"))
 
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.pdf_path == text_pdf
     assert app.use_llm_var.get() is False
     assert "бесплатно" in app.parse_button.cget("text").lower()
@@ -1596,7 +1637,7 @@ def test_text_pdf_defaults_to_local_and_ai_is_an_explicit_choice(gui, tmp_path, 
     assert "локальный" in app.regex_link_button.cget("text").lower()
 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(scan_pdf))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._pdf_needs_vision is True
     assert app.use_llm_var.get() is True
     assert "Vision" in app.pdf_label.cget("text")
@@ -1622,7 +1663,7 @@ def test_neighbor_pdf_batch_attaches_without_api_then_builds_distinct_plans(gui,
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("API не должен вызываться"))
     monkeypatch.setattr(gui.AcadBuilder, "draw", lambda *a, **k: pytest.fail("AutoCAD не должен вызываться"))
 
-    app.load_pdf_button.cget("command")()
+    _load_pdf_by_role(app)
     assert app.neighbor_pdf_paths == [first, second]
     assert app.pdf_path is None
     assert app.use_llm_var.get() is False
@@ -1646,7 +1687,7 @@ def test_neighbor_pdf_batch_attaches_without_api_then_builds_distinct_plans(gui,
     # а не добавляет второй экземпляр уже присутствующих планов.
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(first), str(second)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert len(app._preview_neighbor_plans) == 2
@@ -1670,7 +1711,7 @@ def test_mixed_neighbor_pdf_batch_reports_scan_without_silent_ai(gui, tmp_path, 
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(text_pdf), str(scan_pdf)))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("платный запрос без выбора ИИ"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.use_llm_var.get() is False
     assert "потребуют ИИ" in app.status_var.get()
     app._start(parse_only=True)
@@ -1705,7 +1746,7 @@ def test_neighbor_batch_honors_multipass_and_skips_disagreements(gui, tmp_path, 
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.use_llm_var.set(True)
     app.select_passes(2)
     desc, _ = parse_with_regex(sample)
@@ -1749,7 +1790,7 @@ def test_neighbor_pdf_draw_is_separate_and_uses_all_selected_files(gui, tmp_path
         draws.append(plan)
         return DrawResult(plan=plan, text_count=len(plan.items), layers={"neighbor_lot": "NEIGHBOR_LOT"})
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=False)
     assert draws == [] and "Сначала разберите" in app.status_var.get()
     app._start(parse_only=True)
@@ -1780,7 +1821,7 @@ def test_pdf_page_selection_applies_to_every_neighbor_without_vision(gui, tmp_pa
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
     monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -1794,7 +1835,7 @@ def test_pdf_page_selection_applies_to_every_neighbor_without_vision(gui, tmp_pa
     assert all(p.description.distance_to_corner_ft == pytest.approx(365) for p in app._preview_neighbor_plans)
     for path in files:
         _write_test_pdf(path, [right])  # заново прикреплённый путь может содержать новые данные
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._on_verify_neighbors_clicked()
     _wait_for_gui_worker(app)
     assert len(app._preview_neighbor_plans) == 2
@@ -1913,7 +1954,7 @@ def test_single_text_pdf_respects_selected_page_in_gui(gui, tmp_path, monkeypatc
     app = gui.SurveyApp()
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(pdf))
     monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.use_llm_var.get() is False
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
@@ -1990,7 +2031,7 @@ def test_reset_cancels_remaining_neighbor_batch_files(gui, tmp_path, monkeypatch
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     assert started.wait(3)
     app._reset_session()
@@ -2033,7 +2074,7 @@ def test_suspicious_neighbor_is_not_silently_drawn_in_batch(gui, tmp_path, monke
     app = gui.SurveyApp()
     app.ask_on_doubt_var.set(True)
     app.neighbor_lot_radio.select()
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert len(calls) == 2 and len(app._preview_neighbor_plans) == 2
@@ -2118,7 +2159,7 @@ def test_switching_to_text_does_not_reparse_attached_neighbor_pdfs(gui, tmp_path
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert "все PDF" in app.regex_link_button.cget("text")
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2222,7 +2263,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     monkeypatch.setattr(app, "_ask_source_role", lambda kind: events.append(("role", kind)) or None)
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **kw: events.append(("single",)) or "")
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append(("multi",)) or ())
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._load_images()
     assert events == [("role", "PDF"), ("role", "изображениях")]
     assert app.pdf_path is None and not app.image_paths
@@ -2234,7 +2275,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     monkeypatch.setattr(app, "_ask_source_role", lambda kind: events.append(("role", kind)) or "neighbor")
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append(("multi",)) or (str(pdf),))
     app.main_lot_radio.select()  # текстовый переключатель остаётся на «основной»
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert events == [("role", "PDF"), ("multi",)]
     assert app.neighbor_pdf_paths == [pdf] and app.is_neighbor_mode() and not app.role_bar._gridded
     app._start(parse_only=True)
@@ -2258,7 +2299,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     # Отмена выбора файла не меняет ни роль, ни уже прикреплённые файлы.
     monkeypatch.setattr(app, "_ask_source_role", lambda _kind: "main")
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **kw: "")
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.image_paths == [image] and app.is_neighbor_mode()
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2318,7 +2359,7 @@ def test_draw_rejects_changed_pdf_pages_and_partial_batch(gui, tmp_path, monkeyp
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(good), str(scan)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert good in app._neighbor_plan_sources and scan in app._pending_neighbor_pdfs
@@ -2328,7 +2369,7 @@ def test_draw_rejects_changed_pdf_pages_and_partial_batch(gui, tmp_path, monkeyp
 
     # После загрузки только исправного PDF смена страниц делает готовый план устаревшим.
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(good),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     app.pdf_pages_var.set("2")
@@ -2351,7 +2392,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     main_plan = app._preview_main_plan
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(path),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -2466,7 +2507,7 @@ def test_pdf_edited_text_and_selected_pages_cannot_be_drawn_stale(gui, tmp_path,
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
         draws.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
     ))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert app._preview_main_plan is not None
@@ -2591,7 +2632,7 @@ def test_failed_neighbor_pdf_reparse_keeps_old_plan_blocked_until_retry(gui, tmp
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert not app._pending_neighbor_pdfs
@@ -2919,7 +2960,7 @@ def test_direct_batch_cannot_replace_an_attached_pdf_with_different_pages_silent
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, attached)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -2979,13 +3020,13 @@ def test_unreadable_reselected_neighbor_pdf_keeps_old_plan_blocked(gui, tmp_path
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(path),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     old = app._neighbor_plan_sources[path]
 
     path.write_bytes(b"invalid PDF")
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._neighbor_plan_sources[path] is old and path in app._pending_neighbor_files
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2994,7 +3035,7 @@ def test_unreadable_reselected_neighbor_pdf_keeps_old_plan_blocked(gui, tmp_path
     assert "reopened.pdf" in app.status_var.get()
 
     path.write_bytes(valid_bytes)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert app._neighbor_plan_sources[path] is not old

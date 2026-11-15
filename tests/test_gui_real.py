@@ -358,7 +358,7 @@ def test_real_file_role_dialog_and_persistent_severity_tabs(tmp_path, monkeypatc
             events.append("choose-neighbor")
             app._source_role_dialog._role_buttons["neighbor"].invoke()
         app.after(100, choose_neighbor)
-        app._load_pdf()
+        app._load_neighbor_files()
         assert events[-2:] == ["choose-neighbor", "files"]
         assert app._source_role_dialog is None
 

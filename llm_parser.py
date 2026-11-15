@@ -1880,6 +1880,54 @@ def render_image_files_base64(
     return urls, notes
 
 
+# Соглашение с заказчиком об именах PDF: в конце имени «_p» и страница
+# («deed_p17.pdf») либо диапазон через ещё одно подчёркивание
+# («bruklin250_p2_5.pdf» — страницы со 2-й по 5-ю).
+_PDF_NAME_PAGES_RE = re.compile(r"_p(\d{1,4})(?:_(\d{1,4}))?$", re.IGNORECASE)
+
+
+def pages_from_pdf_name(name: str | Path) -> tuple[int, int] | None:
+    """
+    Читает страницы с границами участка из имени PDF: ``…_p17`` → ``(17, 17)``,
+    ``…_p2_5`` → ``(2, 5)``. Без такого окончания возвращает ``None``.
+    Номера 1-based; перепутанный порядок («_p5_2») исправляется.
+    """
+    stem = Path(str(name)).stem.strip()
+    match = _PDF_NAME_PAGES_RE.search(stem)
+    if match is None:
+        return None
+    first = int(match.group(1))
+    last = int(match.group(2)) if match.group(2) is not None else first
+    if first < 1 or last < 1:
+        return None
+    if first > last:
+        first, last = last, first
+    return first, last
+
+
+def has_legal_courses(text: str | None) -> bool:
+    """Есть ли в тексте обход границ (не меньше трёх курсов), пригодный для разбора."""
+    body = str(text or "")
+    if len(body.strip()) < 20:
+        return False
+    return _has_min_courses(_normalize_legal_text(body))
+
+
+def read_pdf_page_texts(pdf_path: str | Path) -> list[str]:
+    """
+    Текстовый слой PDF отдельно по каждой странице (пустая строка для скана
+    или векторного чертежа). Длина списка равна числу страниц документа.
+    """
+    doc, _ = _open_fitz_doc(pdf_path)
+    try:
+        texts = [doc.load_page(index).get_text("text") or "" for index in range(len(doc))]
+    finally:
+        doc.close()
+    if not texts:
+        raise PDFError("PDF не содержит страниц")
+    return texts
+
+
 def _open_fitz_doc(pdf_path: str | Path) -> tuple[Any, Path]:
     path = Path(pdf_path)
     if not path.exists():

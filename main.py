@@ -24,6 +24,7 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -91,6 +92,7 @@ from llm_parser import (
     LLMParseError,
     LegalDescription,
     LegalDescriptionError,
+    PDFError,
     ParseOutcome,
     TokenUsage,
     TypoSuspicion,
@@ -110,6 +112,17 @@ from llm_parser import (
     run_multipass_consensus,
     save_config,
     save_protected_env,
+)
+from pdf_set import (
+    CLOSURE_LIMIT_FT,
+    PdfSetItem,
+    PdfSetJob,
+    PdfSetResult,
+    format_pages,
+    make_item,
+    make_job,
+    read_page_boxes,
+    set_signature,
 )
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
@@ -319,6 +332,15 @@ class SurveyApp(ctk.CTk):
         # Роль файлов выбирается отдельно от переключателя роли текстового ввода.
         self._visual_source_role: str | None = None
         self._visual_source_revision = 0
+        # Набор PDF: наш участок и соседи одним выбором, страницы по каждому файлу.
+        self.pdf_set: list[PdfSetItem] = []
+        self._pdf_set_dialog: Any | None = None
+        # Какие участки на схеме поставлены набором (их набор и обновляет).
+        self._pdf_set_main_plan: DrawPlan | None = None
+        self._pdf_set_scene_neighbors: set[Path] = set()
+        self._pdf_set_main_pending = False
+        self._pdf_set_report_ready = False
+        self._pdf_set_report_window: Any | None = None
         self._ready_source_signature: tuple[Any, ...] | None = None
         self._running_source_signature: tuple[Any, ...] | None = None
         self._running_source_path: Path | None = None
@@ -1319,7 +1341,7 @@ class SurveyApp(ctk.CTk):
 
         self.load_pdf_button = ctk.CTkButton(
             self.pdf_mode_card,
-            text="⭱ Выберите PDF\nТекстовый, векторный или скан · Ctrl+O",
+            text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O",
             height=64,
             fg_color=THEME["bg_field"],
             hover_color=THEME["blue_soft_bg"],
@@ -1341,6 +1363,7 @@ class SurveyApp(ctk.CTk):
         )
         pdfpages_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         pdfpages_row.grid_columnconfigure(0, weight=1)
+        self.pdf_pages_row = pdfpages_row
         ctk.CTkLabel(
             pdfpages_row,
             text="Страницы",
@@ -1360,7 +1383,10 @@ class SurveyApp(ctk.CTk):
         self.pdf_pages_entry.grid(row=0, column=1, sticky="e", padx=10, pady=7)
         self.pdf_info_label = ctk.CTkLabel(
             self.pdf_mode_card,
-            text="Текст обхода — бесплатно и локально. Скан — через ИИ/Vision.",
+            text=(
+                "После выбора откроется список: отметьте наш участок и страницы с границами. "
+                "Текст обхода — бесплатно и локально, скан — через ИИ/Vision."
+            ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1395,6 +1421,32 @@ class SurveyApp(ctk.CTk):
         )
         self.neighbor_pdf_summary.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self.neighbor_pdf_summary.grid_remove()
+
+        # Набор PDF: правка ролей и страниц, итог разбора по каждому участку.
+        self.pdf_set_buttons = ctk.CTkFrame(self.pdf_mode_card, fg_color="transparent")
+        self.pdf_set_buttons.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.pdf_set_buttons.grid_columnconfigure((0, 1), weight=1)
+        self.pdf_set_edit_button = ctk.CTkButton(
+            self.pdf_set_buttons,
+            text="☰ Роли и страницы",
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._edit_pdf_set,
+        )
+        self.pdf_set_edit_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.pdf_set_report_button = ctk.CTkButton(
+            self.pdf_set_buttons,
+            text="📋 Итог разбора",
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._open_pdf_set_report_window,
+        )
+        self.pdf_set_report_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.pdf_set_buttons.grid_remove()
 
         # Пустой режим «📷 Фото» тоже должен позволять выбрать первый файл.
         self.photo_empty_card = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -3180,6 +3232,21 @@ class SurveyApp(ctk.CTk):
         if not hasattr(self, "parse_button"):
             return
         use_llm = bool(self.use_llm_var.get())
+        if self.pdf_set and self._current_source_mode() == "📄 PDF":
+            # В наборе способ разбора выбран у каждого файла отдельно.
+            paid = sum(1 for item in self.pdf_set if item.use_llm)
+            cost = f"ИИ: {paid} файл., платно" if paid else "бесплатно"
+            self.parse_button.configure(
+                text=f"▶ Разобрать набор заново ({cost}) · Ctrl+Enter",
+                fg_color=THEME["btn_primary"],
+                hover_color=THEME["btn_primary_hover"],
+            )
+            self.regex_link_button.configure(
+                text="☰ Изменить набор: роли, страницы, способ разбора",
+                command=self._edit_pdf_set,
+                state="disabled" if self._busy else "normal",
+            )
+            return
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
         if use_llm:
             primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
@@ -3367,6 +3434,16 @@ class SurveyApp(ctk.CTk):
         self._neighbor_plan_sources.clear()
         self._pending_neighbor_files.clear()
         self._neighbor_text_pending = False
+        if self.pdf_set:
+            # Соседи убраны и из набора: в нём остаётся только наш участок.
+            self.pdf_set = [item for item in self.pdf_set if item.is_main]
+            self._pdf_set_scene_neighbors.clear()
+            if not self.pdf_set:
+                self._visual_source_role = None
+                self._pdf_set_report_ready = False
+            self._sync_pdf_set_readiness()
+            self._refresh_pdf_selection_ui()
+            self._refresh_parse_actions()
         self._pending_neighbor_pdfs.update(self.neighbor_pdf_paths)
         self._neighbor_parsed_pages.clear()
         self._neighbor_report = None
@@ -4509,6 +4586,12 @@ class SurveyApp(ctk.CTk):
 
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
+        self._pdf_set_main_plan = None
+        self._pdf_set_scene_neighbors.clear()
+        self._pdf_set_main_pending = False
+        self._pdf_set_report_ready = False
+        for item in self.pdf_set:
+            item.on_scene = False
         self._preview_neighbor_plans.clear()
         self._neighbor_plan_sources.clear()
         self._pending_neighbor_files.clear()
@@ -5227,6 +5310,9 @@ class SurveyApp(ctk.CTk):
             return (mode, text, str(self.lot_role_var.get() or "main"), self._current_text_source_label(text)) if text else None
         if mode == "📄 PDF":
             pages = str(self.pdf_pages_var.get() or "").strip()
+            if self.pdf_set:
+                # В наборе страницы и способ разбора заданы по каждому файлу.
+                return (mode, "set", set_signature(self.pdf_set), self._visual_source_revision)
             if self.neighbor_pdf_paths:
                 return (mode, "neighbor", tuple(self.neighbor_pdf_paths), pages, self._visual_source_revision)
             if self.pdf_path is not None:
@@ -5263,6 +5349,28 @@ class SurveyApp(ctk.CTk):
 
     def _refresh_pdf_selection_ui(self) -> None:
         """Показывает роль и состав последнего выбранного набора PDF."""
+        if self.pdf_set:
+            count = len(self.pdf_set)
+            self.load_pdf_button.configure(
+                text=f"⭱ Набор PDF: {count} файл.\nВыбрать другие файлы · Ctrl+O"
+            )
+            self.neighbor_pdf_summary.configure(text=self._pdf_set_summary_text())
+            self.pdf_pages_row.grid_remove()
+            self.pdf_info_label.grid_remove()
+            self.load_images_button.grid_remove()
+            self.neighbor_pdf_summary.grid()
+            self.pdf_set_buttons.grid()
+            self.pdf_set_report_button.configure(
+                state="normal" if self._pdf_set_report_ready and not self._busy else "disabled"
+            )
+            return
+        # Общее поле страниц относится только к PDF, открытым через выбор роли;
+        # в наборе страницы заданы у каждого файла.
+        if self.pdf_path is not None or self.neighbor_pdf_paths:
+            self.pdf_pages_row.grid()
+        else:
+            self.pdf_pages_row.grid_remove()
+        self.pdf_set_buttons.grid_remove()
         if self._visual_source_role == "neighbor" and self.neighbor_pdf_paths:
             count = len(self.neighbor_pdf_paths)
             title = (
@@ -5286,7 +5394,7 @@ class SurveyApp(ctk.CTk):
                 self.neighbor_pdf_summary.grid_remove()
         else:
             self.load_pdf_button.configure(
-                text="⭱ Выберите PDF\nТекстовый, векторный или скан · Ctrl+O"
+                text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O"
             )
             self.pdf_info_label.grid()
             self.load_images_button.grid()
@@ -5320,6 +5428,10 @@ class SurveyApp(ctk.CTk):
 
     def _reset_visual_sources(self) -> None:
         self.pdf_path = None
+        self.pdf_set = []
+        self._pdf_set_main_plan = None
+        self._pdf_set_scene_neighbors = set()
+        self._pdf_set_report_ready = False
         self.neighbor_pdf_paths = []
         self._pending_neighbor_pdfs.clear()
         self._neighbor_parsed_pages.clear()
@@ -5409,6 +5521,7 @@ class SurveyApp(ctk.CTk):
         was_busy = self._busy
         self._generation += 1
         self._dismiss_conflict_ui()
+        self._close_pdf_set_dialog()
         for win in self._session_windows:
             try:
                 win.destroy()
@@ -5601,39 +5714,626 @@ class SurveyApp(ctk.CTk):
             self._set_status("Выберите либо фотографии одного участка, либо PDF, без смешивания типов.", error=True)
 
     def _load_pdf(self) -> None:
+        """
+        Один выбор для всех PDF: наш участок и соседи вместе.
+
+        Роль не спрашивается заранее — после выбора открывается список, где
+        отмечается наш участок и по каждому файлу задаются страницы.
+        """
         if self._busy or getattr(self, "_source_role_dialog", None) is not None:
             return
         from tkinter import filedialog
 
-        role = self._ask_source_role("PDF")
-        if role not in {"main", "neighbor"}:
-            return
-        if role == "neighbor":
-            paths = filedialog.askopenfilenames(
-                title="Выберите один или несколько PDF соседних участков",
-                filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
-            )
-            if paths:
-                self._attach_neighbor_pdfs([Path(p) for p in paths if str(p).strip()])
-            return
-
         ext_glob = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
-        path = filedialog.askopenfilename(
-            title="Выберите PDF или фото с Legal Description / чертежом Survey",
+        paths = filedialog.askopenfilenames(
+            title="Выберите PDF нашего участка и соседей — можно несколько сразу",
             filetypes=[
-                ("PDF и фото чертежей", f"*.pdf {ext_glob}"),
                 ("PDF", "*.pdf"),
-                ("Фотографии", ext_glob),
+                ("PDF и фото чертежей", f"*.pdf {ext_glob}"),
                 ("Все файлы", "*.*"),
             ],
         )
-        if not path:
+        chosen = [Path(p) for p in (paths or ()) if str(p).strip()]
+        if not chosen:
             return
-        chosen = Path(path)
-        if is_image_file(chosen):
-            self._apply_loaded_images([chosen])
+        images = [path for path in chosen if is_image_file(path)]
+        if images and len(images) == len(chosen):
+            # Фотографии работают по-прежнему: один участок, роль выбирается явно.
+            role = self._ask_source_role("изображениях")
+            if role in {"main", "neighbor"}:
+                self._apply_loaded_images(images, role=role)
             return
-        self._open_single_pdf(chosen)
+        if images:
+            self._set_status(
+                "Выберите либо PDF, либо фотографии одного участка, без смешивания типов.", error=True,
+            )
+            return
+        items, errors = self._make_pdf_set_items(chosen)
+        for error in errors:
+            self._log_line(f"! Не открыт: {error}")
+        if not items:
+            self._set_status(
+                f"Не удалось открыть PDF: {errors[0] if errors else 'файлы не выбраны'}", error=True,
+            )
+            return
+        self._open_pdf_set_dialog(items, fresh=True, notes=errors)
+
+    def _make_pdf_set_items(
+        self, paths: list[Path], *, existing: list[Path] | None = None,
+    ) -> tuple[list[PdfSetItem], list[str]]:
+        """Открывает выбранные PDF; страницы берутся из имени файла (…_p17, …_p2_5)."""
+        limit = int(self.config_data.get("api", {}).get("vision_max_pages") or 8)
+        known = set(existing or [])
+        items: list[PdfSetItem] = []
+        errors: list[str] = []
+        for path in dict.fromkeys(paths):
+            if path in known:
+                continue
+            try:
+                items.append(make_item(path, vision_max_pages=limit))
+            except Exception as exc:  # noqa: BLE001 - один плохой файл не срывает выбор
+                errors.append(f"{path.name}: {exc}")
+        return items, errors
+
+    def _edit_pdf_set(self) -> None:
+        """Открывает список текущего набора: роли, страницы и способ остаются правимыми."""
+        if self._busy or getattr(self, "_source_role_dialog", None) is not None:
+            return
+        if not self.pdf_set:
+            self._load_pdf()
+            return
+        # Правятся копии: отмена окна не меняет набор, уже показанный на схеме.
+        self._open_pdf_set_dialog([dataclasses.replace(item) for item in self.pdf_set], fresh=False)
+
+    def _open_pdf_set_dialog(
+        self, items: list[PdfSetItem], *, fresh: bool, notes: list[str] | None = None,
+    ) -> Any:
+        if getattr(self, "_source_role_dialog", None) is not None:
+            return None
+        dialog = PdfSetDialog(self, items, fresh=fresh, notes=notes)
+        self._pdf_set_dialog = dialog
+        # Открытый список блокирует горячие клавиши разбора и отрисовки.
+        self._source_role_dialog = dialog.win
+        return dialog
+
+    def _close_pdf_set_dialog(self) -> None:
+        dialog = self._pdf_set_dialog
+        if dialog is not None:
+            dialog.close()
+
+    def _submit_pdf_set(self, items: list[PdfSetItem], *, scene_mode: str, fresh: bool) -> None:
+        """
+        Делает набор текущим источником и сразу разбирает все его участки.
+
+        ``scene_mode``: ``replace`` — схема очищается; ``add`` — участки набора
+        добавляются к имеющимся; ``update`` — правка уже показанного набора.
+        """
+        if self._busy or not items:
+            return
+        if self.pending_conflict is not None or self.pending_doubt is not None:
+            self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
+            return
+        own_main = self._pdf_set_main_plan
+        own_neighbors = set(self._pdf_set_scene_neighbors)
+        main_pending = self._pdf_set_main_pending
+        old_paths = {item.path for item in self.pdf_set}
+        if scene_mode == "replace":
+            self._clear_preview_scene()
+            own_main, own_neighbors, main_pending = None, set(), False
+        elif fresh:
+            # Прежние участки остаются на схеме как есть, новый набор их не трогает.
+            if main_pending:
+                # Неразобранный наш участок прежнего набора заменён новым выбором.
+                self._main_analysis_pending = False
+            own_main, own_neighbors, main_pending = None, set(), False
+        self._reset_visual_sources()
+        self._visual_source_role = "set"
+        self.pdf_set = list(items)
+        self._pdf_set_main_plan = own_main
+        self._pdf_set_scene_neighbors = own_neighbors
+        self._pdf_set_main_pending = main_pending
+        # Файлы, убранные из набора, больше не блокируют отрисовку.
+        self._pending_neighbor_files.difference_update(old_paths)
+        self.text_box.delete("1.0", "end")
+        self._refresh_text_counter()
+        self.source_mode_var.set("📄 PDF")
+        try:
+            self.source_mode_switch.set("📄 PDF")
+        except Exception:  # noqa: BLE001
+            pass
+        self._on_source_mode_changed()
+        paid = sum(1 for item in items if item.use_llm)
+        self.pdf_label.configure(
+            text=f"Набор PDF: {len(items)} файл. (ИИ: {paid}, локально: {len(items) - paid})",
+            text_color=THEME["warn"] if paid else THEME["ok"],
+        )
+        self._start_pdf_set()
+
+    def _start_pdf_set(self, *, force: bool = False) -> None:
+        """Разбирает все участки набора одним заданием; AutoCAD запускается отдельно."""
+        if self._busy or not self.pdf_set:
+            return
+        if self.pending_conflict is not None or self.pending_doubt is not None:
+            self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
+            return
+        self._dismiss_conflict_ui()
+        self._running_source_signature = self._source_signature(mode="📄 PDF")
+        self._running_source_path = None
+        self._running_source_label = None
+        self._running_batch_attached = False
+        self._running_pdf_pages = None
+        self._ready_source_signature = None
+        self._input_incomplete = True
+        has_main = any(item.is_main for item in self.pdf_set)
+        if has_main:
+            self._main_analysis_pending = True
+            self._pdf_set_main_pending = True
+        elif self._pdf_set_main_pending:
+            # Наш участок убран из набора: его незавершённый разбор больше не ждём.
+            self._main_analysis_pending = False
+            self._pdf_set_main_pending = False
+        for item in self.pdf_set:
+            if item.is_main:
+                self._pending_neighbor_files.discard(item.path)
+            else:
+                self._pending_neighbor_files.add(item.path)
+        jobs = [make_job(item, force=force) for item in self.pdf_set]
+        cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
+        scale = self._current_scale()
+        has_vision = any(job.source is not None and "pdf_path" in job.source for job in jobs)
+        do_auto_orient = self._consume_one_shot_auto_orient(has_vision)
+        self._pdf_set_report_ready = False
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        reused = sum(1 for job in jobs if job.cached_outcome is not None)
+        paid = sum(1 for job in jobs if job.use_llm and job.cached_outcome is None)
+        local = len(jobs) - reused - paid
+        detail = f"ИИ: {paid}, локально: {local}"
+        if reused:
+            detail += f", без изменений: {reused}"
+        self._set_status(f"Разбор набора PDF: {len(jobs)} файл. ({detail})…")
+        self._log_line(f"--- Набор PDF: {len(jobs)} файл. ({detail}) ---")
+        for job in jobs:
+            self._log_line(
+                f"  {job.role_label}: {job.path.name} · {job.pages_label} · {job.mode_label}"
+                + (" · результат уже есть" if job.cached_outcome is not None else "")
+            )
+        self._start_background(
+            self._pdf_set_worker,
+            args=(jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient),
+        )
+
+    def _parse_pdf_set_job(
+        self, job: PdfSetJob, cfg: dict[str, Any], provider_id: str, model_name: str,
+        api_key: str | None, key_secret: str, do_auto_orient: bool, progress: Any, post: Any,
+    ) -> tuple[ParseOutcome, bool, list[str]]:
+        """
+        Разбирает один файл набора по его страницам.
+
+        Если проходы ИИ разошлись, участок не выбрасывается: берётся проход с
+        лучшим замыканием, а расхождение возвращается замечанием к участку.
+        """
+        source = dict(job.source or {})
+        enhance = bool(cfg.get("api", {}).get("vision_enhance_scans", True))
+        passes = int((cfg.get("api", {}).get("consensus") or {}).get("passes") or 1)
+        auto_orient = bool(do_auto_orient and "pdf_path" in source)
+        if job.use_llm and passes >= 2:
+            consensus = run_multipass_consensus(
+                **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
+                passes=passes, primary_provider=provider_id, primary_model=model_name,
+                primary_api_key=api_key, key_secret=key_secret, progress=progress,
+            )
+            post("round_usages", [out.usage for out in consensus.pass_outcomes])
+            if consensus.agreed:
+                return consensus.selected_outcome, True, []
+            count = len(consensus.pass_outcomes)
+            closures = [consensus.pass_closure_ft(index) for index in range(1, count + 1)]
+            best = min(range(count), key=lambda index: closures[index])
+            issue = (
+                f"проходы ИИ разошлись ({len(consensus.discrepancies)} спорн. мест); взят "
+                f"{consensus.pass_label(best + 1)} с лучшим замыканием ({closures[best]:.3f} ft) — "
+                "сверьте с документом"
+            )
+            chosen = consensus.pass_outcomes[best]
+            outcome = dataclasses.replace(
+                chosen,
+                warnings=[f"⚠ {issue}"] + list(chosen.warnings) + [consensus.discrepancy_report()],
+                usage=consensus.total_usage,
+                provider_label=f"Расхождение {count} проходов",
+            )
+            return outcome, True, [issue]
+        outcome = parse_legal_description_full(
+            **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
+            use_llm=job.use_llm, provider=provider_id, model=model_name, api_key=api_key,
+            key_secret=key_secret, allow_regex_fallback=False, progress=progress,
+        )
+        return outcome, False, []
+
+    def _pdf_set_worker(
+        self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
+        api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
+    ) -> None:
+        """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
+        post = self._worker_poster()
+        builder = AcadBuilder(cfg)
+        results: list[PdfSetResult] = []
+        total = len(jobs)
+        for idx, job in enumerate(jobs, start=1):
+            if not self._worker_is_current():
+                return
+            result = PdfSetResult(path=job.path, is_main=job.is_main, parse_key=job.parse_key)
+            try:
+                if job.cached_outcome is not None:
+                    result.outcome = job.cached_outcome
+                    result.issues = list(job.cached_issues)
+                    result.pre_counted = True
+                    result.cached = True
+                else:
+                    if job.source is None:
+                        raise PDFError(job.source_error or "нет данных для разбора")
+                    post(
+                        "progress",
+                        f"[{idx}/{total}] {job.role_label}: {job.path.name}, {job.pages_label} — {job.mode_label}…",
+                    )
+                    outcome, pre_counted, issues = self._parse_pdf_set_job(
+                        job, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient,
+                        lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
+                    )
+                    if not self._worker_is_current():
+                        return
+                    if job.use_llm:
+                        post("valid_secret", key_secret)
+                    result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
+                plan = builder.plan(result.outcome.data, scale=scale, is_neighbor=not job.is_main)
+                for issue in result.issues:
+                    if issue not in plan.warnings:
+                        plan.warnings.append(issue)
+                result.plan = plan
+            except Exception as exc:  # noqa: BLE001 - ошибка относится только к этому файлу
+                result.error = str(exc) or type(exc).__name__
+                result.outcome = None
+                result.plan = None
+            results.append(result)
+        post("pdf_set_done", results)
+        post("done", None)
+
+    def _drop_main_plan(self) -> None:
+        plan = self._preview_main_plan
+        if plan is None:
+            return
+        self._plan_outcomes.pop(id(plan), None)
+        self._plan_source_labels.pop(id(plan), None)
+        self._preview_main_plan = None
+        if self._last_active_plan is plan:
+            self._last_active_plan = None
+            self._last_suspicion_report = None
+
+    def _drop_neighbor_plan(self, source: Path) -> None:
+        plan = self._neighbor_plan_sources.pop(source, None)
+        if plan is None:
+            return
+        self._preview_neighbor_plans[:] = [p for p in self._preview_neighbor_plans if p is not plan]
+        self._plan_outcomes.pop(id(plan), None)
+        self._plan_source_labels.pop(id(plan), None)
+        if self._last_active_plan is plan:
+            self._last_active_plan = None
+            self._last_suspicion_report = None
+
+    def _pdf_set_plan_for(self, item: PdfSetItem) -> DrawPlan | None:
+        """Участок этого файла на схеме (None, если он не построен)."""
+        if not item.on_scene:
+            return None
+        if item.is_main:
+            plan = self._pdf_set_main_plan
+            return plan if plan is not None and plan is self._preview_main_plan else None
+        if item.path not in self._pdf_set_scene_neighbors:
+            return None
+        return self._neighbor_plan_sources.get(item.path)
+
+    def _pdf_set_issue_lines(self, item: PdfSetItem) -> list[tuple[str, str]]:
+        """Замечания к одному участку набора: (серьёзность, текст)."""
+        plan = self._pdf_set_plan_for(item)
+        if plan is None:
+            return []
+        lines: list[tuple[str, str]] = []
+        if plan.closure.distance > CLOSURE_LIMIT_FT:
+            lines.append(("error", f"невязка {plan.closure.distance:.3f} ft — контур не замыкается"))
+        for diag in self._plan_diagnostic_items(plan):
+            text = diag.title + (f" — {diag.detail}" if diag.detail else "")
+            text = " ".join(text.split())
+            if len(text) > 260:
+                text = text[:257].rstrip() + "…"
+            lines.append(("error" if diag.severity == "error" else "warn", text))
+        if plan.suspicion is None:
+            lines.append(("warn", "проверка формы недоступна"))
+        return lines
+
+    def _sync_pdf_set_readiness(self) -> None:
+        """Набор готов к отрисовке, когда каждый его файл построен при текущих страницах."""
+        complete = bool(self.pdf_set) and all(
+            item.on_scene and not item.error and item.has_fresh_result() for item in self.pdf_set
+        )
+        if complete:
+            self._ready_source_signature = self._source_signature(mode="📄 PDF")
+            self._input_incomplete = False
+        elif self.pdf_set:
+            self._ready_source_signature = None
+            self._input_incomplete = True
+
+    def _handle_pdf_set_done(self, results: list[PdfSetResult]) -> None:
+        """Ставит участки набора на схему и сообщает итог по каждому и по сверке с соседями."""
+        by_path = {item.path: item for item in self.pdf_set}
+        # Прежние участки этого набора снимаются: на схеме остаётся только текущий результат.
+        for path in list(self._pdf_set_scene_neighbors):
+            self._drop_neighbor_plan(path)
+        self._pdf_set_scene_neighbors.clear()
+        if self._pdf_set_main_plan is not None and self._preview_main_plan is self._pdf_set_main_plan:
+            self._drop_main_plan()
+        self._pdf_set_main_plan = None
+        for item in self.pdf_set:
+            item.on_scene = False
+
+        active_plan: DrawPlan | None = None
+        # Соседи первыми, наш участок последним — он остаётся активным в ведомости.
+        for res in sorted(results, key=lambda r: r.is_main):
+            item = by_path.get(res.path)
+            if item is None:
+                continue
+            item.error = res.error
+            item.issues = list(res.issues)
+            if res.error or res.plan is None or res.outcome is None:
+                item.outcome = None
+                item.parsed_key = None
+                if not item.error:
+                    item.error = "участок не построен"
+                self._log_line(f"! {item.path.name}: {item.error}")
+                continue
+            item.outcome = res.outcome
+            item.parsed_key = res.parse_key
+            if res.cached:
+                self.description = res.outcome.data
+            else:
+                self._apply_parsed(res.outcome, already_counted=res.pre_counted)
+            label = f"{item.path.name} · {format_pages(item.first_page, item.last_page)}"
+            # Тот же файл мог стоять на схеме в другой роли.
+            self._drop_neighbor_plan(res.path)
+            self._record_plan_for_preview(
+                res.plan, warnings=res.outcome.warnings, source=res.path,
+                source_label=label, outcome=res.outcome,
+            )
+            if res.is_main:
+                self._pdf_set_main_plan = res.plan
+                self._main_analysis_pending = False
+                self._pdf_set_main_pending = False
+            else:
+                self._pdf_set_scene_neighbors.add(res.path)
+                self._pending_neighbor_files.discard(res.path)
+            item.on_scene = True
+            active_plan = res.plan
+
+        self._sync_pdf_set_readiness()
+        if active_plan is None:
+            # Ни один участок набора не построен: обновляем схему без него.
+            self._recompute_neighbor_verification()
+            self._refresh_suspicion_badge()
+            self._refresh_checks_list()
+            self._refresh_neighbors_list()
+            self._refresh_stepper()
+            remaining = self._preview_main_plan
+            self._refresh_result_stats(remaining)
+            if remaining is not None:
+                self._last_active_plan = remaining
+                self._last_suspicion_report = remaining.suspicion
+                self._set_inspector_text(self._build_inspector_report(remaining))
+                self._update_closure_badge(remaining.closure.short_report(), remaining.closure.distance)
+            else:
+                self._render_empty_inspector()
+                self._update_closure_badge("Closure Error: —", None)
+            self._redraw_preview_canvas()
+        else:
+            self._update_closure_badge(active_plan.closure.short_report(), active_plan.closure.distance)
+
+        total = len(self.pdf_set)
+        built = [item for item in self.pdf_set if item.on_scene]
+        failed = [item for item in self.pdf_set if not item.on_scene]
+        flagged = [item for item in built if self._pdf_set_issue_lines(item)]
+        parts = [f"Набор PDF: построено {len(built)} из {total}"]
+        if flagged:
+            parts.append(f"с замечаниями: {len(flagged)}")
+        if failed:
+            names = ", ".join(item.path.name for item in failed[:3]) + ("…" if len(failed) > 3 else "")
+            parts.append(f"не разобрано: {len(failed)} ({names})")
+        rep = self._neighbor_report
+        verify_bad = rep is not None and bool(rep.pair_reports) and rep.has_issues
+        if rep is not None and rep.pair_reports:
+            parts.append(rep.headline())
+        elif built and not any(item.is_main for item in self.pdf_set) and self._preview_main_plan is None:
+            parts.append("для сверки добавьте наш участок")
+        hard = (failed and not built) or (rep is not None and bool(rep.pair_reports) and rep.overall_status == "error")
+        self._set_status(
+            "  |  ".join(parts),
+            error=bool(hard),
+            warn=bool(not hard and (failed or flagged or verify_bad)),
+        )
+        self._pdf_set_report_ready = True
+        report = self._pdf_set_report_text()
+        for line in report.splitlines():
+            self._log_line(line)
+        self._refresh_pdf_selection_ui()
+        self._refresh_parse_actions()
+        self._open_pdf_set_report_window()
+
+    def _pdf_set_summary_text(self) -> str:
+        """Короткий список набора для левой панели: роль, файл, страницы, состояние."""
+        lines: list[str] = []
+        ordered = sorted(self.pdf_set, key=lambda item: not item.is_main)
+        for item in ordered[:6]:
+            if item.error:
+                mark = "✗"
+            elif not item.on_scene:
+                mark = "…"
+            else:
+                mark = "⚠" if self._pdf_set_issue_lines(item) else "✓"
+            role = "наш" if item.is_main else "сосед"
+            mode = "ИИ" if item.use_llm else "локально"
+            lines.append(
+                f"{mark} {role}: {item.path.name}\n     {item.pages_label()} · {mode}"
+            )
+        if len(ordered) > 6:
+            lines.append(f"… и ещё {len(ordered) - 6} (список — «☰ Роли и страницы»)")
+        if not any(item.is_main for item in self.pdf_set):
+            lines.append("Нашего участка в наборе нет — все файлы соседи.")
+        return "\n".join(lines)
+
+    def _pdf_set_report_text(self) -> str:
+        """Итог разбора набора: ошибки по каждому участку и нашего участка относительно соседей."""
+        items = sorted(self.pdf_set, key=lambda item: not item.is_main)
+        built = [item for item in items if item.on_scene]
+        issue_map = {id(item): self._pdf_set_issue_lines(item) for item in items}
+        flagged = [item for item in built if issue_map[id(item)]]
+        failed = [item for item in items if not item.on_scene]
+        lines = [
+            "ИТОГ РАЗБОРА НАБОРА PDF",
+            f"Файлов: {len(items)} · построено: {len(built)} · с замечаниями: {len(flagged)} "
+            f"· не разобрано: {len(failed)}",
+        ]
+        for item in items:
+            plan = self._pdf_set_plan_for(item)
+            if item.is_main:
+                role = "НАШ УЧАСТОК"
+            elif plan is not None:
+                number = next(
+                    (index for index, known in enumerate(self._preview_neighbor_plans, 1) if known is plan), 0,
+                )
+                role = f"СОСЕД #{number}" if number else "СОСЕД"
+            else:
+                role = "СОСЕД (не построен)"
+            lines.append("")
+            lines.append(f"▸ {role} — {item.path.name}")
+            lines.append(f"   {item.pages_label()} · {item.mode_label()}")
+            if plan is None:
+                lines.append(f"   ✗ не разобран: {' '.join((item.error or 'участок не построен').split())}")
+                continue
+            desc = plan.description
+            facts = (
+                f"сторон {len(desc.segments)}, периметр {desc.perimeter_ft:,.2f} ft, "
+                f"невязка {plan.closure.distance:.3f} ft"
+            )
+            issues = issue_map[id(item)]
+            if not issues:
+                lines.append(f"   ✓ построен без замечаний: {facts}")
+                continue
+            lines.append(f"   ⚠ построен с замечаниями ({len(issues)}): {facts}")
+            for severity, text in issues:
+                lines.append(f"      {'⛔' if severity == 'error' else '⚠'} {text}")
+
+        lines.append("")
+        lines.append("НАШ УЧАСТОК ОТНОСИТЕЛЬНО СОСЕДЕЙ")
+        rep = self._neighbor_report
+        if rep is not None and rep.pair_reports:
+            lines.append(rep.format_report(compact=False))
+        elif self._preview_main_plan is None:
+            if any(item.is_main for item in items):
+                lines.append("Сверка невозможна: наш участок не разобран.")
+            else:
+                lines.append("В наборе нет нашего участка — сверять соседей пока не с чем.")
+        else:
+            lines.append("Соседние участки не построены — сверять не с чем.")
+        if failed:
+            lines.append("")
+            lines.append(
+                "В AutoCAD уйдёт только полный набор. Откройте «☰ Роли и страницы»: исправьте страницы "
+                "или способ разбора у неразобранных файлов либо уберите их из набора — "
+                "готовые участки заново не запрашиваются."
+            )
+        return "\n".join(lines)
+
+    def _open_pdf_set_report_window(self) -> None:
+        """Окно итога: что построено, замечания по каждому участку и сверка с соседями."""
+        if not self.pdf_set or not self._pdf_set_report_ready:
+            return
+        previous = self._pdf_set_report_window
+        if previous is not None:
+            # Итог всегда один: прежнее окно закрывается.
+            try:
+                previous.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            if previous in self._session_windows:
+                self._session_windows.remove(previous)
+            self._pdf_set_report_window = None
+        full_text = self._pdf_set_report_text()
+        built = [item for item in self.pdf_set if item.on_scene]
+        failed = [item for item in self.pdf_set if not item.on_scene]
+        flagged = [item for item in built if self._pdf_set_issue_lines(item)]
+        rep = self._neighbor_report
+        verify_status = rep.overall_status if rep is not None and rep.pair_reports else "ok"
+        if (failed and not built) or verify_status == "error":
+            head_color = THEME["err"]
+        elif failed or flagged or verify_status == "warn":
+            head_color = THEME["warn"]
+        else:
+            head_color = THEME["ok"]
+        headline = f"Построено участков: {len(built)} из {len(self.pdf_set)}"
+        if flagged:
+            headline += f" · с замечаниями: {len(flagged)}"
+        if failed:
+            headline += f" · не разобрано: {len(failed)}"
+
+        win = ctk.CTkToplevel(self)
+        self._session_windows.append(win)
+        win.title("Итог разбора набора PDF — Title Survey AI")
+        win.geometry("900x640")
+        win.configure(fg_color=THEME["bg_root"])
+        win.attributes("-topmost", bool(self.topmost_var.get()))
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            win, text=headline, font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=head_color, anchor="w", justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
+        report_box = ctk.CTkTextbox(
+            win, wrap="word", fg_color=THEME["bg_editor"], text_color=THEME["text_main"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        report_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        report_box.insert("1.0", full_text)
+        target = getattr(report_box, "_textbox", report_box)
+        target.configure(state="disabled")
+        win._report_text = full_text
+        win._report_headline = headline
+
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        bar.grid_columnconfigure(0, weight=1)
+
+        def _copy_report() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(full_text)
+            self._set_status("Итог разбора набора скопирован в буфер обмена.")
+
+        ctk.CTkButton(
+            bar, text="☰ Роли и страницы", width=170, height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=lambda: (win.destroy(), self._edit_pdf_set()),
+        ).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            bar, text="📋 Скопировать итог", width=170, height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=_copy_report,
+        ).grid(row=0, column=2, padx=(0, 8))
+        ctk.CTkButton(
+            bar, text="Закрыть", width=110, height=30,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            command=win.destroy,
+        ).grid(row=0, column=3)
+        self._pdf_set_report_window = win
+        try:
+            win.lift()
+            win.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _attach_neighbor_pdfs(self, paths: list[Path]) -> None:
         """Только прикрепляет PDF; API, расчёт и AutoCAD запускаются отдельно."""
@@ -6230,6 +6930,9 @@ class SurveyApp(ctk.CTk):
                         f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
                         error=True,
                     )
+            elif kind == "pdf_set_done":
+                self._finish_busy()
+                self._handle_pdf_set_done(payload)
             elif kind == "feature_labeled":
                 label_result, label_error, label_mode = payload
                 self._finish_busy()
@@ -6246,6 +6949,10 @@ class SurveyApp(ctk.CTk):
         self.batch_neighbors_button.configure(state=state)
         self.clear_neighbors_button.configure(state=state)
         self.load_pdf_button.configure(state=state)
+        self.pdf_set_edit_button.configure(state=state)
+        self.pdf_set_report_button.configure(
+            state=state if self._pdf_set_report_ready else "disabled"
+        )
         self.load_images_button.configure(state=state)
         self.photo_load_button.configure(state=state)
         self.sample_menu.configure(state=state)
@@ -6799,6 +7506,15 @@ class SurveyApp(ctk.CTk):
             names = ", ".join(path.name for path in sorted(unopened))
             self._set_status(f"Не удалось открыть PDF: {names}. Исправьте выбор файлов перед отрисовкой.", error=True)
             return
+        failed_in_set = [item for item in self.pdf_set if item.error or not item.on_scene]
+        if failed_in_set:
+            names = ", ".join(item.path.name for item in failed_in_set)
+            self._set_status(
+                f"Не все файлы набора разобраны: {names}. Откройте «☰ Роли и страницы»: исправьте страницы "
+                "или способ разбора либо уберите файл из набора — готовые участки заново не запрашиваются.",
+                error=True,
+            )
+            return
         if self._pending_neighbor_files:
             names = ", ".join(path.name for path in sorted(self._pending_neighbor_files))
             self._set_status(
@@ -6903,6 +7619,10 @@ class SurveyApp(ctk.CTk):
             self._set_status("В выбранном режиме нет исходных данных для разбора.", error=True)
             return
         mode = self._current_source_mode()
+        if mode == "📄 PDF" and self.pdf_set:
+            # Кнопка разбора перечитывает весь набор, включая уже готовые файлы.
+            self._start_pdf_set(force=True)
+            return
         # Один соседний PDF разбирается как отдельный участок, чтобы конфликты
         # проходов и опечатки можно было разрешить вручную в привычном диалоге.
         single_neighbor_pdf = (
@@ -8207,6 +8927,410 @@ class SurveyApp(ctk.CTk):
             result.closure.short_report(), result.closure.distance
         )
         self._refresh_stepper()
+
+
+class PdfSetDialog:
+    """
+    Список выбранных PDF: какой файл наш, какие страницы и чем разбирать каждый.
+
+    Все остальные файлы считаются соседями. Страницы подставляются из имени
+    файла (``…_p17``, ``…_p2_5``) и остаются правимыми. Окно работает с
+    копиями: «Отмена» ничего не меняет в программе.
+    """
+
+    MODE_LOCAL = "Локально"
+    MODE_LLM = "ИИ"
+    NO_MAIN = "none"
+
+    def __init__(
+        self, app: "SurveyApp", items: list[PdfSetItem], *, fresh: bool,
+        notes: list[str] | None = None,
+    ) -> None:
+        self.app = app
+        self.items = list(items)
+        self.fresh = fresh
+        self.closed = False
+        # Новый набор при непустой схеме: заменить её или добавить — спрашиваем каждый раз.
+        self.ask_scene = bool(fresh and app._scene_plans())
+        self.vision_limit = int(app.config_data.get("api", {}).get("vision_max_pages") or 8)
+        mains = [index for index, item in enumerate(self.items) if item.is_main]
+        if mains:
+            initial = str(mains[0])
+        elif not fresh:
+            initial = self.NO_MAIN
+        elif len(self.items) == 1 and app._preview_main_plan is None:
+            initial = "0"
+        else:
+            initial = ""
+        self.main_var = ctk.StringVar(value=initial)
+        self.scene_var = ctk.StringVar(value="")
+        self.rows: list[dict[str, Any]] = []
+        self._build()
+        if notes:
+            self._show_message("Не открыты: " + "; ".join(notes), error=True)
+
+    # ---- окно ----
+    def _build(self) -> None:
+        app = self.app
+        win = ctk.CTkToplevel(app)
+        self.win = win
+        win.title("Набор PDF — наш участок и соседи")
+        win.geometry("940x600")
+        win.minsize(820, 420)
+        win.configure(fg_color=THEME["bg_root"])
+        win.transient(app)
+        win.attributes("-topmost", bool(app.topmost_var.get()))
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(win, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            head, text="Отметьте наш участок — остальные файлы будут соседями",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=THEME["text_main"], anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            head,
+            text=(
+                "В разбор идут только указанные страницы — оставьте те, где описаны границы. "
+                "Страницы из имени файла (…_p17 или …_p2_5) подставлены сами, их можно править."
+            ),
+            font=ctk.CTkFont(size=12), text_color=THEME["text_muted"], anchor="w",
+            justify="left", wraplength=880,
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        self.list_frame = ctk.CTkScrollableFrame(win, fg_color=THEME["bg_card"], corner_radius=10)
+        self.list_frame.grid(row=1, column=0, sticky="nsew", padx=14)
+        self.list_frame.grid_columnconfigure(0, weight=1)
+
+        foot = ctk.CTkFrame(win, fg_color="transparent")
+        foot.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 14))
+        foot.grid_columnconfigure(0, weight=1)
+        self.no_main_radio = ctk.CTkRadioButton(
+            foot, text="Нашего участка в этом наборе нет — все файлы соседи",
+            variable=self.main_var, value=self.NO_MAIN, command=self._refresh_notes,
+            font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
+        )
+        self.no_main_radio.grid(row=0, column=0, sticky="w")
+
+        self.scene_frame = ctk.CTkFrame(
+            foot, fg_color=THEME["bg_field"], corner_radius=8,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        self.scene_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ctk.CTkLabel(
+            self.scene_frame, text="На схеме уже есть участки:",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_main"],
+        ).grid(row=0, column=0, sticky="w", padx=(12, 14), pady=8)
+        self.scene_replace_radio = ctk.CTkRadioButton(
+            self.scene_frame, text="заменить схему этим набором",
+            variable=self.scene_var, value="replace", command=self._clear_message,
+            font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
+        )
+        self.scene_replace_radio.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=8)
+        self.scene_add_radio = ctk.CTkRadioButton(
+            self.scene_frame, text="добавить к имеющимся",
+            variable=self.scene_var, value="add", command=self._clear_message,
+            font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
+        )
+        self.scene_add_radio.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=8)
+        if not self.ask_scene:
+            self.scene_frame.grid_remove()
+
+        self.message = ctk.CTkLabel(
+            foot, text="", font=ctk.CTkFont(size=12), text_color=THEME["err"],
+            anchor="w", justify="left", wraplength=880,
+        )
+        self.message.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        buttons = ctk.CTkFrame(foot, fg_color="transparent")
+        buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        buttons.grid_columnconfigure(1, weight=1)
+        self.add_button = ctk.CTkButton(
+            buttons, text="＋ Добавить PDF…", width=150, height=34,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=self.add_files,
+        )
+        self.add_button.grid(row=0, column=0, sticky="w")
+        self.cancel_button = ctk.CTkButton(
+            buttons, text="Отмена", width=110, height=34,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=self.cancel,
+        )
+        self.cancel_button.grid(row=0, column=2, padx=(0, 8))
+        self.submit_button = ctk.CTkButton(
+            buttons, text="▶ Отправить на разбор", width=210, height=34,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"), command=self.submit,
+        )
+        self.submit_button.grid(row=0, column=3)
+
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+        win.bind("<Escape>", lambda _event: self.cancel())
+        self._rebuild_rows()
+        self._grab_input()
+
+    def _grab_input(self, attempt: int = 0) -> None:
+        """Делает список модальным; окно может стать видимым не сразу — тогда повтор."""
+        if self.closed:
+            return
+        try:
+            self.win.grab_set()
+            self.win.lift()
+            self.win.focus_set()
+        except Exception:  # noqa: BLE001 - без захвата окно остаётся рабочим
+            if attempt < 5:
+                self.win.after(120, lambda: self._grab_input(attempt + 1))
+
+    def _rebuild_rows(self) -> None:
+        for row in self.rows:
+            row["frame"].destroy()
+        self.rows = []
+        for index, item in enumerate(self.items):
+            self.rows.append(self._build_row(index, item))
+        self._refresh_notes()
+        self._refresh_submit_text()
+
+    def _build_row(self, index: int, item: PdfSetItem) -> dict[str, Any]:
+        frame = ctk.CTkFrame(
+            self.list_frame, fg_color=THEME["bg_field"], corner_radius=8,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        frame.grid(row=index, column=0, sticky="ew", padx=6, pady=4)
+        frame.grid_columnconfigure(1, weight=1)
+        radio = ctk.CTkRadioButton(
+            frame, text="Наш", width=64, variable=self.main_var, value=str(index),
+            command=self._refresh_notes, font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        radio.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=(10, 2))
+        name = ctk.CTkLabel(
+            frame, text=item.path.name, font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=THEME["text_main"], anchor="w", justify="left", wraplength=330,
+        )
+        name.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(10, 2))
+
+        first_var = ctk.StringVar(value=str(item.first_page))
+        last_var = ctk.StringVar(value=str(item.last_page))
+        ctk.CTkLabel(
+            frame, text="стр. с", font=ctk.CTkFont(size=12), text_color=THEME["text_muted"],
+        ).grid(row=0, column=2, padx=(0, 4), pady=(10, 2))
+        first_entry = ctk.CTkEntry(
+            frame, textvariable=first_var, width=48, height=28, justify="center",
+            fg_color=THEME["bg_editor"], border_color=THEME["border_card"],
+        )
+        first_entry.grid(row=0, column=3, pady=(10, 2))
+        ctk.CTkLabel(
+            frame, text="по", font=ctk.CTkFont(size=12), text_color=THEME["text_muted"],
+        ).grid(row=0, column=4, padx=4, pady=(10, 2))
+        last_entry = ctk.CTkEntry(
+            frame, textvariable=last_var, width=48, height=28, justify="center",
+            fg_color=THEME["bg_editor"], border_color=THEME["border_card"],
+        )
+        last_entry.grid(row=0, column=5, pady=(10, 2))
+        ctk.CTkLabel(
+            frame, text=f"из {item.total_pages}", font=ctk.CTkFont(size=12),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=6, padx=(4, 12), pady=(10, 2))
+
+        mode_var = ctk.StringVar(value=self.MODE_LLM if item.use_llm else self.MODE_LOCAL)
+        mode = ctk.CTkSegmentedButton(
+            frame, values=[self.MODE_LOCAL, self.MODE_LLM], variable=mode_var, height=28,
+            command=lambda value, i=index: self._mode_clicked(i, value),
+        )
+        mode.grid(row=0, column=7, padx=(0, 8), pady=(10, 2))
+        remove = ctk.CTkButton(
+            frame, text="✕", width=30, height=28, fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"], command=lambda i=index: self.remove(i),
+        )
+        remove.grid(row=0, column=8, padx=(0, 10), pady=(10, 2))
+        note = ctk.CTkLabel(
+            frame, text="", font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
+            anchor="w", justify="left", wraplength=840,
+        )
+        note.grid(row=1, column=0, columnspan=9, sticky="ew", padx=12, pady=(0, 9))
+        for entry in (first_entry, last_entry):
+            for event in ("<KeyRelease>", "<FocusOut>"):
+                entry.bind(event, lambda _event, i=index: self.pages_edited(i))
+        return {
+            "frame": frame, "radio": radio, "name": name, "first": first_var, "last": last_var,
+            "first_entry": first_entry, "last_entry": last_entry, "mode_var": mode_var,
+            "mode": mode, "remove": remove, "note": note, "error": "",
+            "default_pages": (item.first_page, item.last_page),
+        }
+
+    # ---- правка строк ----
+    def pages_edited(self, index: int) -> None:
+        """Поля страниц изменены: проверяем их и подстраиваем способ разбора."""
+        if not 0 <= index < len(self.rows):
+            return
+        row, item = self.rows[index], self.items[index]
+        try:
+            first, last = read_page_boxes(row["first"].get(), row["last"].get(), item.total_pages)
+        except ValueError as exc:
+            row["error"] = str(exc)
+        else:
+            row["error"] = ""
+            if (first, last) != (item.first_page, item.last_page):
+                item.set_pages(first, last)
+                wanted = self.MODE_LLM if item.use_llm else self.MODE_LOCAL
+                row["mode_var"].set(wanted)
+                row["mode"].set(wanted)
+        self._refresh_note(index)
+        self._refresh_submit_text()
+
+    def _mode_clicked(self, index: int, value: str) -> None:
+        if not 0 <= index < len(self.items):
+            return
+        self.items[index].set_mode(str(value) == self.MODE_LLM)
+        self._refresh_note(index)
+        self._refresh_submit_text()
+
+    def set_mode(self, index: int, use_llm: bool) -> None:
+        """Выбор способа разбора у файла (то же, что щелчок по переключателю)."""
+        value = self.MODE_LLM if use_llm else self.MODE_LOCAL
+        self.rows[index]["mode_var"].set(value)
+        self.rows[index]["mode"].set(value)
+        self._mode_clicked(index, value)
+
+    def remove(self, index: int) -> None:
+        if not 0 <= index < len(self.items):
+            return
+        choice = str(self.main_var.get() or "")
+        self._pull_pages()
+        main_item = self.items[int(choice)] if choice.isdigit() and int(choice) < len(self.items) else None
+        removed = self.items.pop(index)
+        if main_item is removed:
+            self.main_var.set("")
+        elif main_item is not None:
+            self.main_var.set(str(next(i for i, item in enumerate(self.items) if item is main_item)))
+        self._rebuild_rows()
+        self._clear_message()
+
+    def add_files(self) -> None:
+        from tkinter import filedialog
+
+        paths = filedialog.askopenfilenames(
+            title="Добавьте PDF в набор", filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
+            parent=self.win,
+        )
+        chosen = [Path(p) for p in (paths or ()) if str(p).strip()]
+        if not chosen:
+            return
+        self._pull_pages()
+        new_items, errors = self.app._make_pdf_set_items(
+            chosen, existing=[item.path for item in self.items],
+        )
+        self.items.extend(new_items)
+        self._rebuild_rows()
+        if errors:
+            self._show_message("Не открыты: " + "; ".join(errors), error=True)
+        else:
+            self._clear_message()
+
+    def _pull_pages(self) -> None:
+        """Переносит корректные значения полей в файлы перед перестройкой списка."""
+        for index in range(len(self.rows)):
+            self.pages_edited(index)
+
+    # ---- подписи ----
+    def _row_note(self, index: int) -> tuple[str, str]:
+        row, item = self.rows[index], self.items[index]
+        if row["error"]:
+            return f"⚠ Страницы: {row['error']}", THEME["err"]
+        pages = format_pages(item.first_page, item.last_page)
+        legal = item.has_legal_text()
+        if not item.use_llm and legal:
+            text, color = f"✓ на {pages} найден текст обхода — бесплатный локальный разбор", THEME["ok"]
+        elif not item.use_llm:
+            text, color = (
+                f"⚠ на {pages} нет текста обхода (скан или чертёж) — локально не разобрать; "
+                "выберите ИИ или другие страницы"
+            ), THEME["warn"]
+        elif legal:
+            text, color = f"ИИ получит текст {pages} — платный запрос", THEME["blue_soft_fg"]
+        else:
+            count = item.page_count
+            text, color = f"ИИ / Vision получит изображения: {count} стр. — платный запрос", THEME["blue_soft_fg"]
+            if count > self.vision_limit:
+                text += f"; это больше обычного лимита в {self.vision_limit} стр."
+                color = THEME["warn"]
+        if item.pages_note and (item.first_page, item.last_page) == row["default_pages"]:
+            text += f" · {item.pages_note}"
+        if item.error:
+            text += f"\n✗ прошлый разбор: {' '.join(item.error.split())[:200]}"
+            color = THEME["err"]
+        return text, color
+
+    def _refresh_note(self, index: int) -> None:
+        text, color = self._row_note(index)
+        self.rows[index]["note"].configure(text=text, text_color=color)
+
+    def _refresh_notes(self) -> None:
+        for index in range(len(self.rows)):
+            self._refresh_note(index)
+        self._clear_message()
+
+    def _refresh_submit_text(self) -> None:
+        paid = sum(1 for item in self.items if item.use_llm and not item.has_fresh_result())
+        suffix = f" · ИИ: {paid} файл." if paid else " · бесплатно"
+        self.submit_button.configure(text=f"▶ Отправить на разбор{suffix}")
+
+    def _show_message(self, text: str, *, error: bool = True) -> None:
+        self.message.configure(text=text, text_color=THEME["err"] if error else THEME["text_muted"])
+
+    def _clear_message(self) -> None:
+        if hasattr(self, "message"):
+            self.message.configure(text="")
+
+    # ---- завершение ----
+    def submit(self) -> None:
+        """Проверяет список и отправляет весь набор на разбор."""
+        if self.closed:
+            return
+        self._pull_pages()
+        problems = [
+            f"{self.items[index].path.name}: {row['error']}"
+            for index, row in enumerate(self.rows) if row["error"]
+        ]
+        if not self.items:
+            problems.append("в наборе нет файлов — добавьте PDF")
+        choice = str(self.main_var.get() or "")
+        if self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
+            problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
+        scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
+        if self.ask_scene and scene_mode not in {"replace", "add"}:
+            problems.append("выберите, заменить схему этим набором или добавить к имеющимся участкам")
+        if problems:
+            self._show_message("Исправьте: " + "; ".join(problems) + ".", error=True)
+            return
+        for index, item in enumerate(self.items):
+            item.is_main = choice == str(index)
+        items = list(self.items)
+        self.close()
+        self.app._submit_pdf_set(items, scene_mode=scene_mode, fresh=self.fresh)
+
+    def cancel(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        app = self.app
+        if app._pdf_set_dialog is self:
+            app._pdf_set_dialog = None
+        if getattr(app, "_source_role_dialog", None) is self.win:
+            app._source_role_dialog = None
+        try:
+            self.win.grab_release()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.win.destroy()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main() -> int:

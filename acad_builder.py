@@ -3587,6 +3587,9 @@ class AcadBuilder:
                 title = item.single_line
                 layer_name, style_name = item_layer(item), item_style(item)
                 try:
+                    # Выноска всегда MText + Leader: аннотацией AcDbLeader AutoCAD
+                    # принимает только MText, иначе теряется связь текста со стрелкой
+                    # (заказчик, 15.11.2026). Настройка label_text_kind на неё не влияет.
                     if self._feature_label_text_mode(item, fcfg) == "text":
                         result.created_texts += self._add_feature_texts(
                             model_space, item, layer_name, style_name, fcfg
@@ -6065,7 +6068,8 @@ class FeatureLabelResult:
     created_styles: list[str] = field(default_factory=list)
     #: масштаб типа линий заборов (LinetypeScale): что изменено или что будет
     linetype: FenceLinetypePlan | None = None
-    #: чем созданы подписи: "text" — однострочным TEXT, "mtext" — MText, "mixed" — и так, и так
+    #: чем созданы подписи объектов: "text" — однострочным TEXT, "mtext" — MText.
+    #: Для отладки и тестов; в отчёт не выводится (заказчик: сводной строки хватит).
     text_mode: str = ""
 
     @property
@@ -6188,12 +6192,6 @@ class FeatureLabelResult:
             lines.append(
                 f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
                 f"{self.created_mtexts}, выносок — {self.created_leaders}{how_leaders}"
-            )
-        if self.text_mode == "text":
-            lines.append(
-                "  подписи объектов — однострочный TEXT по центру (в чужих CAD не «пляшет», "
-                "как MText с привязкой middle-center); описание дома и текст выносок — MText, "
-                "как в шаблоне заказчика"
             )
         if rec.house_without_text:
             lines.append(

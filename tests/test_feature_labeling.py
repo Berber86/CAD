@@ -1621,8 +1621,11 @@ def test_object_labels_are_single_line_text_centered_for_other_cad(com):
         if e.TextString == "GATE" and abs(e.TextAlignmentPoint[0] - vinyl.TextAlignmentPoint[0]) < 1e-6
     )
     assert vinyl.TextAlignmentPoint[1] - gate.TextAlignmentPoint[1] == pytest.approx(1.67 * height)
-    # В отчёте сказано, чем созданы подписи.
-    assert "подписи объектов — однострочный TEXT по центру" in result.report()
+    # Сводной строки «чем созданы подписи» в отчёте больше нет (заказчик, 15.11.2026):
+    # осталась короткая строка счётчиков «создано в AutoCAD: AddText — …».
+    report = result.report()
+    assert "подписи объектов — однострочный TEXT по центру" not in report
+    assert f"AddText — {result.created_texts}" in report
 
     # Прежнее поведение возвращается настройкой: вдоль линии — TEXT, остальное — MText.
     legacy, _app2, doc2 = com(build_stafford_scene(), feature_cfg={"label_text_kind": "auto"})
@@ -1631,6 +1634,40 @@ def test_object_labels_are_single_line_text_centered_for_other_cad(com):
     assert old.created_mtexts > result.created_mtexts
     assert "C.L.F.\\PGATE" in {e.TextString for e in doc2.ModelSpace.created
                                  if e.ObjectName == "AcDbMText"}
+
+
+@pytest.mark.parametrize("kind", ["text", "mtext", "auto", "old"])
+def test_leaders_keep_mtext_and_arrow_in_every_label_mode(com, kind):
+    """
+    Выноска — всегда MText + Leader, при любой настройке вида подписей.
+
+    Заказчик, 15.11.2026: «на выносках оставляем MText, однозначно, иначе будет
+    теряться связь стрелочки и текста». Аннотацией объекта Leader AutoCAD принимает
+    только MText, поэтому даже в режиме однострочного TEXT подпись с выноской
+    (``CONC. STEPS`` — ступени в проходе между домом и границей) не превращается в TEXT.
+    """
+    builder, _app, doc = com(build_stafford_scene(), feature_cfg={"label_text_kind": kind})
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
+    assert result.failed == [] and result.warnings == []
+    assert (result.created_leaders, result.created_leader_objects) == (2, 2)
+    assert result.created_leader_attached == 2
+    space = doc.ModelSpace
+    mtexts = [e for e in space.created if e.ObjectName == "AcDbMText"]
+    texts = [e for e in space.created if e.ObjectName == "AcDbText"]
+    leaders = [e for e in space.created if e.ObjectName == "AcDbLeader"]
+    assert len(leaders) == 2
+    # Текст выносок — MText, и именно он привязан к стрелке.
+    annotations = {id(leader.Annotation) for leader in leaders}
+    assert annotations <= {id(entity) for entity in mtexts}
+    assert result.created_leader_attached == len(annotations)
+    # Однострочных TEXT ровно столько, сколько строк у подписей БЕЗ выноски:
+    # подпись с выноской в режиме «text» в TEXT не превращается никогда.
+    expected = sum(
+        len([line for line in item.text.split("\n") if line.strip()]) or 1
+        for item in result.plan.items
+        if builder._feature_label_text_mode(item) == "text"
+    )
+    assert len(texts) == expected
 
 
 def test_stafford_field_drawing_is_labeled_like_the_customer(com):

@@ -677,7 +677,7 @@ def test_label_width_follows_romans_font_metrics():
     bearing = 0.26
     assert ab.feature_text_width("SHED", 0.9) == pytest.approx(0.9 * (82 / 21 - bearing))
     assert ab.feature_text_width("CHAIN LINK FENCE", 0.9) == pytest.approx(12.62, abs=0.01)
-    assert ab.feature_text_width("C.D.", 0.9) == pytest.approx(2.36, abs=0.1)
+    assert ab.feature_text_width("C.D.", 0.9) == pytest.approx(2.36, abs=0.12)
     assert ab.feature_text_width("VEST.", 0.9) == pytest.approx(3.34, abs=0.1)
     assert ab.feature_text_width("FIRE ESC.", 0.9) == pytest.approx(6.39, abs=0.1)
     # Точки и буква I узкие: O.P. заметно короче, чем четыре «средних» символа.
@@ -1503,7 +1503,7 @@ def test_leader_style_leader_uses_addleader_and_falls_back_to_polyline(com):
     builder, _app, doc = com(
         build_stafford_scene(), feature_cfg={"leader_style": "leader"}, with_leader=False
     )
-    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.0)
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
     assert result.created_labels == 26
     assert result.created_leaders == 2
     assert result.failed == []

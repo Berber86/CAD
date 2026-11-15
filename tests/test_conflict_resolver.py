@@ -602,3 +602,57 @@ def test_advisor_is_not_asked_without_a_key_or_when_switched_off(gui, tmp_path, 
     _wait(app)
     assert "ИИ-советник: выключен в настройках" in app._pdf_set_report_window._report_text
     app._on_close()
+
+
+def test_alvine_word_tie_is_placed_on_own_street_and_shared_edge_is_real():
+    from acad_builder import verify_with_neighbors
+    from conflict_resolver import apply_changes
+    from llm_parser import Segment, parse_with_regex
+
+    ours, _ = parse_with_regex(OUR_TEXT)
+    neighbour, _ = parse_with_regex(NEIGHBOUR_TEXT)
+    analysis = _analyse([_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)])
+    ours = apply_changes(ours, analysis.proposals[0].changes)
+    neighbour = neighbour.model_copy(update={"corner_to_pob_bearing": Segment(
+        ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=160, has_bearing=False,
+    )})
+    builder = _builder()
+    main = builder.plan(ours, scale=16)
+    nb = builder.plan(neighbour, scale=16, is_neighbor=True)
+    assert nb.pob == pytest.approx((-61.066, 147.888), abs=0.002)
+    assert main.pob == pytest.approx(nb.vertices[3], abs=0.01)
+    pair = verify_with_neighbors(main, [nb]).pair_reports[0]
+    edge = next(e for e in pair.shared_edges if e.main_seg_index == 1 and e.neighbor_seg_index == 3)
+    assert edge.abs_length_diff_ft == pytest.approx(2.03)
+    assert edge.likely_culprit is None
+    assert not any("ошибка/опечатка допущена" in d for d in edge.diagnoses)
+    assert neighbour.corner_to_pob_bearing.has_bearing is False
+    assert any("словом" in note for note in nb.notes)
+
+
+def test_alvine_explicit_tie_is_not_overwritten_or_matched_to_distant_parallel_edge():
+    from acad_builder import verify_with_neighbors
+    from conflict_resolver import apply_changes
+    from llm_parser import Segment, parse_with_regex
+
+    ours, _ = parse_with_regex(OUR_TEXT)
+    neighbour, _ = parse_with_regex(NEIGHBOUR_TEXT)
+    analysis = _analyse([_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)])
+    ours = apply_changes(ours, analysis.proposals[0].changes)
+    neighbour = neighbour.model_copy(update={"corner_to_pob_bearing": Segment(
+        ns="N", degrees=0, minutes=0, seconds=0, ew="E", distance_ft=160, has_bearing=True,
+    )})
+    builder = _builder()
+    main = builder.plan(ours, scale=16)
+    nb = builder.plan(neighbour, scale=16, is_neighbor=True)
+    assert nb.pob == pytest.approx((0, 160))
+    pair = verify_with_neighbors(main, [nb]).pair_reports[0]
+    assert not any(e.main_seg_index == 1 and e.neighbor_seg_index == 3 for e in pair.shared_edges)
+    assert "отличается" in pair.street_tie_check
+    main_lot = _lot("our.pdf", OUR_TEXT, main=True)
+    main_lot.fixes = (analysis.proposals[0],)
+    nb_lot = _lot("lot30.pdf", NEIGHBOUR_TEXT)
+    nb_lot.description = neighbour
+    remaining = " ".join(_analyse([main_lot, nb_lot]).remaining)
+    assert "отличается" in remaining
+    assert "общая граница" not in remaining

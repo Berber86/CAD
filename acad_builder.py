@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Iterable, Sequence
 
-from llm_parser import LegalDescription, Segment, load_config
+from llm_parser import LegalDescription, Segment, bearing_label, load_config
 
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
 # понятное сообщение об установке зависимостей.
@@ -87,6 +87,8 @@ __all__ = [
     "TextItem",
     "AcadBuilder",
     "audit_lot_suspicion",
+    "TiePlacement",
+    "azimuth_bearing_label",
     "bearing_azimuth_deg",
     "bearing_to_xy",
     "build_boundary_lines",
@@ -107,6 +109,8 @@ __all__ = [
     "resolve_analytical_right_trapezoid",
     "round_ft",
     "select_gap_vertex_index",
+    "street_line_azimuth",
+    "tie_placement",
     "text_rotation",
     "verify_with_neighbors",
 ]
@@ -282,27 +286,207 @@ def point_in_polygon(
     return inside
 
 
+#: Румб привязки POB считается лежащим на линии улицы в пределах этой разницы.
+TIE_ON_STREET_ARCSEC = 2.0
+#: До этой разницы румб привязки — слово из преамбулы («distant 160 feet northerly»),
+#: а не измеренный румб линии улицы: такой POB откладывается по линии улицы.
+TIE_WORD_DIRECTION_DEG = 45.0
+
+
+def azimuth_bearing_label(azimuth_deg: float) -> str:
+    """Азимут 0..360° -> каноничная подпись румба (``N 22°26'12" W``)."""
+    az = float(azimuth_deg) % 360.0
+    if az <= 90.0 + 1e-9:
+        ns, ew, angle = "N", "E", az
+    elif az <= 180.0 + 1e-9:
+        ns, ew, angle = "S", "E", 180.0 - az
+    elif az <= 270.0 + 1e-9:
+        ns, ew, angle = "S", "W", az - 180.0
+    else:
+        ns, ew, angle = "N", "W", 360.0 - az
+    total = int(round(angle * 3600.0))
+    degrees, rest = divmod(total, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return bearing_label(ns, degrees, minutes, float(seconds), ew)
+
+
+def orient_azimuth(azimuth_deg: float, toward_deg: float) -> float:
+    """Та же прямая, но направленная в сторону ``toward_deg`` (сама или развёрнутая на 180°)."""
+    forward = float(azimuth_deg) % 360.0
+    backward = (forward + 180.0) % 360.0
+    diff_f = abs((forward - toward_deg + 180.0) % 360.0 - 180.0)
+    diff_b = abs((backward - toward_deg + 180.0) % 360.0 - 180.0)
+    return forward if diff_f <= diff_b else backward
+
+
+def street_line_sides(description: LegalDescription) -> list[tuple[int, str]]:
+    """Стороны участка вдоль фасадной улицы: ``[(индекс, откуда известно), …]``."""
+    main_key = _normalize_street_key(getattr(description, "main_street", None))
+    found: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
+    def add(index: Any, why: str) -> None:
+        if index is None:
+            return
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            return
+        if not 0 <= idx < len(description.segments) or idx in seen:
+            return
+        seen.add(idx)
+        found.append((idx, why))
+
+    add(getattr(description, "front_segment_index", None), "фасадная сторона")
+    if main_key:
+        for index, seg in enumerate(description.segments):
+            note_key = _normalize_street_key(seg.course_note)
+            if note_key and f" {main_key} " in f" {note_key} ":
+                add(index, "сторона вдоль улицы")
+    return found
+
+
+def street_line_azimuth(description: LegalDescription) -> tuple[float, int, str] | None:
+    """
+    Азимут прямой линии улицы, вдоль которой отмеряется привязка POB.
+
+    Возвращает ``(азимут, индекс стороны, откуда известно)``. Линия улицы — та же
+    прямая, что и указанная фасадная сторона участка. При отсутствии румба
+    фасада направление улицы остаётся неизвестным.
+    """
+    for index, why in street_line_sides(description):
+        seg = description.segments[index]
+        if seg.has_bearing:
+            return (
+                seg.azimuth_deg % 360.0,
+                index,
+                f"{why} #{index + 1} ({seg.bearing_label})",
+            )
+
+    return None
+
+
+@dataclass(frozen=True)
+class TiePlacement:
+    """Куда отложена привязка POB от угла улиц и что об этом сказать геодезисту."""
+
+    #: азимут, по которому POB отложен на схеме
+    azimuth_deg: float
+    #: азимут, напечатанный в описании (может расходиться со схемой, если это слово)
+    printed_azimuth_deg: float | None = None
+    street_side_index: int | None = None
+    street_source: str = ""
+    #: False — привязка не лежит на линии улицы и оставлена как напечатано
+    on_street_line: bool = True
+    note: str = ""
+    warning: str = ""
+
+    @property
+    def label(self) -> str:
+        return azimuth_bearing_label(self.azimuth_deg)
+
+    @property
+    def printed_label(self) -> str:
+        return (
+            azimuth_bearing_label(self.printed_azimuth_deg)
+            if self.printed_azimuth_deg is not None
+            else ""
+        )
+
+
+def tie_placement(description: LegalDescription) -> TiePlacement | None:
+    """
+    Как привязка POB откладывается от угла улиц.
+
+    В преамбуле направление часто задано словом («distant 160.00 feet
+    northerly from the corner…»), а не численным румбом. Такой «румб» — сторона света, а не измеренная линия улицы: если
+    отложить POB по нему, соседние участки одной улицы встают со сдвигом в
+    десятки футов и общая межа не совпадает. Поэтому POB откладывается по румбу
+    линии улицы из этого же описания, а расстояние до угла сохраняется.
+    """
+    tie = getattr(description, "corner_to_pob_bearing", None)
+    dist = float(getattr(description, "distance_to_corner_ft", 0.0) or 0.0)
+    if tie is None or dist <= 1e-6:
+        return None
+    printed_az = float(tie.azimuth_deg) % 360.0
+    # Явный румб (в том числе многоступенчатая привязка) никогда не заменяем.
+    if tie.has_bearing:
+        return TiePlacement(azimuth_deg=printed_az, printed_azimuth_deg=printed_az)
+    street = street_line_azimuth(description)
+    if street is None:
+        note = ""
+        if not tie.has_bearing:
+            note = (
+                "румба линии улицы в описании нет: привязка к углу отложена по направлению "
+                f"«{tie.bearing_label}» ({dist:.2f} ft) — это слово, а не измеренный румб"
+            )
+        return TiePlacement(
+            azimuth_deg=printed_az,
+            printed_azimuth_deg=printed_az,
+            note=note,
+        )
+    axis_az, side_index, where = street
+    diff_arcsec = abs(_signed_axis_diff_arcsec(printed_az, axis_az))
+    on_line_az = orient_azimuth(axis_az, printed_az)
+    if diff_arcsec <= TIE_ON_STREET_ARCSEC:
+        note = ""
+        if not tie.has_bearing:
+            note = (
+                "направление от угла к POB задано в описании словом, поэтому привязка "
+                f"отложена по румбу линии улицы {azimuth_bearing_label(on_line_az)} ({where})"
+            )
+        return TiePlacement(
+            azimuth_deg=printed_az,
+            printed_azimuth_deg=printed_az,
+            street_side_index=side_index,
+            street_source=where,
+            note=note,
+        )
+    if not tie.has_bearing and diff_arcsec <= TIE_WORD_DIRECTION_DEG * 3600.0:
+        head = "направление привязки в описании задано только словом"
+        note = (
+            f"{head}, а линия улицы идёт {azimuth_bearing_label(on_line_az)} ({where}) — "
+            f"расхождение {_format_arcsec_dms(diff_arcsec)}. POB отложен по линии улицы, "
+            f"расстояние {dist:.2f} ft сохранено. Проверьте направление и стык участков"
+        )
+        return TiePlacement(
+            azimuth_deg=on_line_az,
+            printed_azimuth_deg=printed_az,
+            street_side_index=side_index,
+            street_source=where,
+            note=note,
+        )
+    warning = (
+        f"привязка к углу улиц ({azimuth_bearing_label(printed_az)}, {dist:.2f} ft) не лежит "
+        f"на линии улицы {azimuth_bearing_label(on_line_az)} ({where}): расхождение "
+        f"{_format_arcsec_dms(diff_arcsec)} — POB отложен по условному направлению, "
+        "сверьте привязку"
+    )
+    return TiePlacement(
+        azimuth_deg=printed_az,
+        printed_azimuth_deg=printed_az,
+        street_side_index=side_index,
+        street_source=where,
+        on_street_line=False,
+        warning=warning,
+    )
+
+
 def compute_pob_point(description: LegalDescription) -> tuple[float, float]:
     """
     Координаты точки начала (POB) относительно перекрёстка улиц (0.0, 0.0).
 
     Если участок угловой (`distance_to_corner_ft == 0`), POB совпадает с `(0.0, 0.0)`.
-    Иначе от `(0.0, 0.0)` откладывается `distance_to_corner_ft` вдоль румба
-    `corner_to_pob_bearing` — благодаря этому основной и соседние участки
+    Иначе от `(0.0, 0.0)` откладывается `distance_to_corner_ft` вдоль линии улицы
+    (см. :func:`tie_placement`) — благодаря этому основной и соседние участки
     вдоль одной улицы встают в AutoCAD строго стенка к стенке.
     """
-    dist = float(getattr(description, "distance_to_corner_ft", 0.0) or 0.0)
-    tie = getattr(description, "corner_to_pob_bearing", None)
-    if dist <= 1e-6 or tie is None:
+    placement = tie_placement(description)
+    if placement is None:
         return (0.0, 0.0)
-    return bearing_to_xy(
-        tie.ns,
-        tie.degrees,
-        tie.minutes,
-        tie.seconds,
-        tie.ew,
-        dist,
-    )
+    dist = float(getattr(description, "distance_to_corner_ft", 0.0) or 0.0)
+    azimuth = math.radians(placement.azimuth_deg)
+    return dist * math.sin(azimuth), dist * math.cos(azimuth)
 
 
 def polygon_centroid(points: Sequence[tuple[float, float]]) -> tuple[float, float]:
@@ -2072,6 +2256,7 @@ class AcadBuilder:
             else self.text_height_for_scale(scale, self.cfg)
         )
 
+        placement = tie_placement(description)
         pob = compute_pob_point(description)
         orig_segments = list(description.segments)
         raw_traverse = build_polygon_points(orig_segments, start=pob)
@@ -2082,6 +2267,11 @@ class AcadBuilder:
         raw_vertices = raw_traverse[:-1]
         warnings: list[str] = []
         notes: list[str] = []
+        if placement is not None:
+            if placement.note:
+                notes.append(placement.note)
+            if placement.warning:
+                warnings.append(placement.warning)
 
         signed_area = polygon_signed_area(raw_vertices)
         ccw = signed_area > 0.0
@@ -4328,8 +4518,7 @@ def _attribute_error_by_closure(
     edge_vector_diff_ft: float,
 ) -> tuple[str | None, str | None]:
     """
-    Кросс-проверка через собственную невязку полигонов: позволяет определить,
-    в чьих именно данных (наших или соседских) сидит ошибка!
+    Сопоставление невязок: само по себе не устанавливает источник ошибки.
     """
     if edge_vector_diff_ft <= 0.04:
         return None, None
@@ -4343,10 +4532,10 @@ def _attribute_error_by_closure(
             else ""
         )
         return (
-            "neighbor",
+            None,
             f"Кросс-проверка замкнутости: наш участок замкнут идеально ({main_closure_ft:.3f}'), "
             f"а контур соседа имеет внутреннюю невязку {nb_closure_ft:.3f}'{tail} — "
-            "вероятнее всего, ошибка/опечатка допущена в данных СОСЕДА.",
+            "источник расхождения по одной невязке определить нельзя; сверьте оба документа.",
         )
     if nb_ok and not main_ok and main_closure_ft >= 0.08:
         matches_mag = abs(main_closure_ft - edge_vector_diff_ft) <= max(
@@ -4358,10 +4547,10 @@ def _attribute_error_by_closure(
             else ""
         )
         return (
-            "main",
+            None,
             f"Кросс-проверка замкнутости: контур соседа замкнут идеально ({nb_closure_ft:.3f}'), "
             f"а НАШ основной участок имеет невязку {main_closure_ft:.3f}'{tail} — "
-            "высока вероятность, что ошибка находится в НАШЕМ описании!",
+            "источник расхождения по одной невязке определить нельзя; сверьте оба документа.",
         )
     return None, None
 
@@ -4416,6 +4605,46 @@ def _detect_datum_rotation_arcsec(
     return None
 
 
+def _tie_chain_note(main_desc: LegalDescription, nb_desc: LegalDescription) -> str | None:
+    """
+    Цепочка привязок вдоль одной улицы: 160' + 40' = 200'.
+
+    Оба участка отсчитывают POB от одного угла улиц, поэтому разница расстояний до
+    угла должна равняться фасаду одного из них — тогда участки стоят вплотную, а не
+    через промежуточный лот или со сдвигом. Проверка ничего не меняет, только
+    подтверждает (или не подтверждает) стык чисел.
+    """
+    d_m = float(getattr(main_desc, "distance_to_corner_ft", 0.0) or 0.0)
+    d_n = float(getattr(nb_desc, "distance_to_corner_ft", 0.0) or 0.0)
+    if d_m <= 1e-6 or d_n <= 1e-6:
+        return None
+    delta = abs(d_m - d_n)
+    nearer, farther = min(d_m, d_n), max(d_m, d_n)
+    if delta <= 0.05:
+        return (
+            f"оба POB на одном расстоянии от угла ({d_m:.2f}' и {d_n:.2f}') — "
+            "участки отсчитываются от одной точки"
+        )
+    for who, desc in (("наш", main_desc), ("соседа", nb_desc)):
+        for index, _why in street_line_sides(desc):
+            length = float(desc.segments[index].distance_ft)
+            if abs(length - delta) <= 0.05:
+                owner = (
+                    f"наш фасад — сторона #{index + 1} ({length:.2f}')"
+                    if who == "наш"
+                    else f"фасад соседа — его сторона #{index + 1} ({length:.2f}')"
+                )
+                return (
+                    f"цепочка привязок сходится: {nearer:.2f}' + {delta:.2f}' = "
+                    f"{farther:.2f}' — это {owner}; совпадение расстояний само по себе не доказывает стык"
+                )
+    return (
+        f"привязки {nearer:.2f}' и {farther:.2f}' от угла (разница {delta:.2f}') не совпали "
+        "с фасадом ни одного из участков — проверьте, нет ли между ними промежуточного лота "
+        "или сдвига вдоль улицы"
+    )
+
+
 def _check_street_reference_and_frontage(
     main_plan: DrawPlan, nb_plan: DrawPlan
 ) -> tuple[str | None, str | None]:
@@ -4439,36 +4668,38 @@ def _check_street_reference_and_frontage(
             )
             return warn, warn
 
-        # Проверяем румб линии привязки вдоль улицы (если у обоих > 0)
-        tie_m = dm.corner_to_pob_bearing
-        tie_n = dn.corner_to_pob_bearing
-        if (
-            tie_m is not None
-            and tie_n is not None
-            and getattr(tie_m, "has_bearing", True)
-            and getattr(tie_n, "has_bearing", True)
-            and dm.distance_to_corner_ft > 1e-6
-            and dn.distance_to_corner_ft > 1e-6
-        ):
-            az_tm = bearing_azimuth_deg(
-                tie_m.ns, tie_m.degrees, tie_m.minutes, tie_m.seconds, tie_m.ew
+        # Румб линии улицы и цепочка привязок вдоль неё. Сравниваются не подписи в
+        # документах, а те румбы, по которым POB действительно отложен на схеме.
+        placement_m = tie_placement(dm)
+        placement_n = tie_placement(dn)
+        parts = [
+            f"единая улица «{dm.main_street}»"
+            + (f" от угла «{dm.cross_street}»" if dm.cross_street else "")
+        ]
+        if placement_m is not None and placement_n is not None:
+            tie_diff_sec = abs(
+                _signed_axis_diff_arcsec(placement_m.azimuth_deg, placement_n.azimuth_deg)
             )
-            az_tn = bearing_azimuth_deg(
-                tie_n.ns, tie_n.degrees, tie_n.minutes, tie_n.seconds, tie_n.ew
-            )
-            tie_diff_sec = abs(_signed_axis_diff_arcsec(az_tm, az_tn))
-            if tie_diff_sec > 2.0:
+            if tie_diff_sec > TIE_ON_STREET_ARCSEC:
                 msg = (
-                    f"Румб красной линии улицы «{dm.main_street}» отличается на "
-                    f"{_format_arcsec_dms(tie_diff_sec)} ({tie_m.bearing_label} против "
-                    f"{tie_n.bearing_label}) — точки POB расходятся уже на линии улицы!"
+                    f"направление привязки к углу для «{dm.main_street}» отличается: "
+                    f"{placement_m.label} против {placement_n.label} "
+                    f"(расхождение {_format_arcsec_dms(tie_diff_sec)}); проверьте исходные привязки."
                 )
                 return msg, msg
-        return (
-            f"единая улица «{dm.main_street}»"
-            + (f" от угла «{dm.cross_street}»" if dm.cross_street else ""),
-            None,
-        )
+            parts.append(
+                "направление привязки у обоих участков совпадает: "
+                f"{placement_m.label} (расхождение {_format_arcsec_dms(tie_diff_sec)})"
+            )
+            for who, placement in (("наш", placement_m), ("соседа", placement_n)):
+                if placement.note:
+                    parts.append(f"привязка {who}: {placement.note}")
+                if placement.warning:
+                    parts.append(f"привязка {who}: {placement.warning}")
+            chain = _tie_chain_note(dm, dn)
+            if chain:
+                parts.append(chain)
+        return " · ".join(parts), None
 
     if ms_m and ms_n and cs_m and cs_n and {ms_m, cs_m} == {ms_n, cs_n}:
         return (
@@ -4576,7 +4807,7 @@ def verify_with_neighbors(
                 is_collinear_shared = (
                     axis_deg <= 15.0
                     and overlap_1d >= max(2.0, 0.18 * min_len)
-                    and min(p0, p1) <= max(12.0, 0.22 * min_len)
+                    and max(p0, p1) <= min(1.0, 0.05 * min_len)  # поперечное, не продольное расстояние
                 )
                 # Проверка 2: «раскрывшаяся ножницами» общая межа от общей вершины
                 # (например перепутан квадрант E↔W или грубая ошибка в десятках градусов)

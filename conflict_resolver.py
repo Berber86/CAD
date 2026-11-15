@@ -842,7 +842,10 @@ def _conflicts(
                 for finding in pair.findings:
                     lines.append(f"«{other.name}»: {' '.join(finding.split())}")
                 tie = pair.street_tie_check or ""
-                if any(word in tie for word in ("отличается", "РАЗНЫХ", "Внимание")):
+                if any(
+                    word in tie
+                    for word in ("отличается", "РАЗНЫХ", "Внимание", "разная", "расходятся")
+                ):
                     lines.append(f"«{other.name}»: {tie}")
     else:
         keyed = [lot for lot in scene.lots if lot.key in plans]

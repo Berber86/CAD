@@ -2265,12 +2265,12 @@ def test_neighbor_verification_intelligent_diagnostics_all_heuristics():
       1) ошибка OCR в секундах румба (40" -> 48": SECONDS_ONLY_DIFF + «0 ↔ 8»);
       2) опечатка перевёрнутой цифры в минутах (39' -> 36': MINUTES_DIFF + «9 ↔ 6»)
          и в градусах (14° -> 19°: DEGREES_TYPO + «4 ↔ 9»);
-      3) перепутана буква квадранта (E -> W: QUADRANT_LETTER_TYPO + виновник 'neighbor');
+      3) перепутана буква квадранта (E -> W: QUADRANT_LETTER_TYPO);
       4) путаница «дюймы ↔ десятые фута» (100.50' = 100'-6" vs 100.60': FEET_INCHES_CONFUSION)
          и перестановка соседних цифр в длине (105.00' vs 150.00': «05 ↔ 50»);
       5) систематический поворот базиса румбов (+0°18'00" по всем сторонам: DATUM_ROTATION);
       6) параллельная щель Gore (1.50') и параллельный заступ Overlap (150.00 sq ft);
-      7) кросс-проверка замкнутости при ошибке в НАШЕМ участке (likely_culprit == 'main').
+      7) кросс-проверка замкнутости не устанавливает виновника.
     """
     from acad_builder import verify_with_neighbors
     from llm_parser import ASPENWALL_SAMPLES
@@ -2318,7 +2318,7 @@ def test_neighbor_verification_intelligent_diagnostics_all_heuristics():
     )
     ec3 = verify_with_neighbors(pm, [builder.plan(dr_flip, scale=16.0, is_neighbor=True)]).pair_reports[0].shared_edges[0]
     assert "QUADRANT_LETTER_TYPO" in ec3.issue_codes
-    assert ec3.likely_culprit == "neighbor"
+    assert ec3.likely_culprit is None
     assert any("«W» вместо ожидаемого «E»" in d for d in ec3.diagnoses)
 
     # 4) Путаница «дюймы ↔ десятые фута» (100.50' vs 100.60') и перестановка цифр длины (105 vs 150)
@@ -2385,8 +2385,8 @@ def test_neighbor_verification_intelligent_diagnostics_all_heuristics():
         [builder.plan(dl, scale=16.0, is_neighbor=True)],
     )
     ec7 = rep7.pair_reports[0].shared_edges[0]
-    assert ec7.likely_culprit == "main"
-    assert any("НАШЕМ описании" in d for d in ec7.diagnoses)
+    assert ec7.likely_culprit is None
+    assert any("по одной невязке определить нельзя" in d for d in ec7.diagnoses)
 
 
 def test_lot_suspicion_clean_presets_and_oblique_parallelogram() -> None:

@@ -186,7 +186,9 @@
         "WALK_*_SKETCH",
         "GRASS_STRIP_EDGE",
         "S-ROAD-DWY",
-        "S-ROAD-SW-LINE"
+        "S-ROAD-SW-LINE",
+        "S-DWY",
+        "S-CONC-MISC"
       ],
       "misc": [
         "ST-MISC"
@@ -198,6 +200,10 @@
     "ribbon_categories": [
       "wall"
     ],
+    "ribbon_cap_categories": [
+      "misc"
+    ],
+    "ribbon_cap_min_length_ft": 6.0,
     "ribbon_max_width_ft": 1.6,
     "step_tread_layers": [
       "*TREADS*"
@@ -624,6 +630,7 @@
           "PLANTER"
         ],
         "label": "PLANTER",
+        "label_narrow": "PLANT.",
         "category": "planter"
       },
       {
@@ -655,15 +662,26 @@
       },
       {
         "match": [
+          "COLUMN",
+          "COL"
+        ],
+        "label": "",
+        "category": "column"
+      },
+      {
+        "match": [
           "BLC*",
           "BL",
           "TTP*",
           "SPOT GRADE*",
           "CONC SW",
           "SW",
-          "COLUMN",
-          "COL",
           "BBC*",
+          "BC*",
+          "TC*",
+          "EDG CONC",
+          "EDGE CONC",
+          "DW",
           "W U P",
           "WUP",
           "U P"
@@ -672,6 +690,18 @@
       }
     ],
     "narrow_object_max_width_ft": 1.5,
+    "wall_with_columns_format": "{wall} W./COLUMNS",
+    "wall_columns_reach_ft": 1.5,
+    "wall_columns_min_count": 2,
+    "roofed_porch_labels": {
+      "O.P.": "ROOFED\nO.P."
+    },
+    "point_description_ignored_suffixes": [
+      "NE"
+    ],
+    "point_layer_suffixes": [
+      "-ELEV"
+    ],
     "symbol_block_labels": {
       "WUP": "UTILITY\nPOLE",
       "UP": "UTILITY\nPOLE"
@@ -750,7 +780,12 @@
       "VINYL FENCE": [
         "V.FE.",
         "VIN.FE.",
+        "VINYL FE.",
         "PVC FENCE"
+      ],
+      "V.FE.": [
+        "VIN.FE.",
+        "VINYL FE."
       ],
       "WOOD FENCE": [
         "W.FE.",
@@ -792,9 +827,15 @@
         "OPEN PORCH",
         "PORCH"
       ],
+      "PLANTER": [
+        "PLANT."
+      ],
       "STEPS": [
         "STEP",
         "STAIRS"
+      ],
+      "STEP": [
+        "STEPS"
       ]
     },
     "text_height_ft": null,
@@ -839,6 +880,7 @@
     "fence_full_label_ratio": 2.0,
     "fence_on_line_tolerance_ft": 0.15,
     "fence_abbreviation_spacing_ft": 4.0,
+    "fence_label_runs_beyond_lot": true,
     "outward_label_categories": [
       "planter",
       "party_wall"

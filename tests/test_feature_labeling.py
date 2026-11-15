@@ -607,6 +607,7 @@ def north_arrow(rotation_deg, *, name="NA", layer="M-NTH-ARROW", **kwargs):
         (315.0, "up", "up"),         # ровно по диагонали — как по умолчанию
         (45.0, "up", "up"),
         (46.0, "left", "up"),
+        (75.339, "left", "up"),      # полевой «225 Aspinwall Street»: в итоговом 14.6° / 284.6°
         (90.0, "left", "up"),
         (180.0, "down", "up"),
     ],
@@ -1808,6 +1809,11 @@ def load_brooklyn():
     return load_field_fixture("brooklyn_field.txt")
 
 
+def load_aspinwall():
+    """Полевой чертёж «225 Aspinwall Street, Staten Island» (блоки точек SRVPNO5, описания с «NE»)."""
+    return load_field_fixture("aspinwall_field.txt")
+
+
 def ilion_features(result, label, kind=None):
     return [
         f for f in result.features
@@ -1917,8 +1923,8 @@ def test_ilion_descriptions_become_labels():
 
     # Объекты без описания остаются без подписи и попадают в отчёт.
     assert sorted((f.layer, f.kind) for f in result.unlabeled) == [
-        ("S-FENCE", "fence"), ("ST-MISC", "area"), ("ST-MISC", "edge"), ("ST-MISC", "edge"),
-    ]
+        ("S-FENCE", "fence"), ("ST-MISC", "area"), ("ST-MISC", "area"),
+    ]  # вторая площадка ST-MISC — лента из двух линий 13.6 ft с достроенными торцами
     # Точки, рядом с которыми в их слое нет линий.
     assert sorted(code.title for code in result.unbound_descriptions) == [
         "76 PLANTER", "91 BOT WALL",
@@ -1967,6 +1973,7 @@ ILION_FINAL_LABELS = [
     ("C.L.F.", (5045.1, 5027.9), 0.4, 2.5),
     ("C.L.F.", (5044.5, 5052.2), 0.4, 2.5),
     ("C.L.F.", (5041.3, 4993.7), 90.4, 2.5),
+    ("C.L.F.", (5044.6, 5003.9), 0.4, 2.5),  # участок забора, уходящий за границу участка (v2.8)
     ("C.L.F.", (5042.6, 5063.6), 89.2, 5.0),
     ("V.FE.", (4982.7, 4982.9), 67.9, 2.5),
     ("V.FE.", (4983.0, 4988.7), -14.4, 2.5),
@@ -2008,7 +2015,7 @@ def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
     for expected in ("POOL AREA 349 Sq.Ft.", "SHED", "O.P.", "PLANTER", "DRIVEWAY", "STEP", "STEPS",
                      "VINYL FENCE", "C.L.F.", "V.FE.", "CANTIL.", "2 STY FRAME No. 12"):
         assert expected in texts, expected
-    assert len(plan.items) == 30
+    assert len(plan.items) == 31
     assert plan.count_placement("leader") <= 3
     assert plan.survey_point_count == 93
     boxes = [item.box for item in plan.items]
@@ -2444,7 +2451,7 @@ def test_point_description_overrides_the_linear_layer_rule():
         ("DECK", ("DECK", "porch")),
         ("WOOD DECK", ("FRAME\nDECK", "porch")),
         ("METAL DECK", ("METAL\nDECK", "porch")),
-        ("COLUMN", ("", "")),
+        ("COLUMN", ("", "column")),
         ("BBC", ("", "")),
         ("W U P", ("", "")),
         ("BLC21", ("", "")),
@@ -2600,4 +2607,329 @@ def test_front_yard_fence_is_the_owners_fence_labeled_from_the_street():
     (inside,) = [item for item in old.items if item.single_line == "IRON FENCE"]
     assert inside.box.centroid.y > 4924.9
     # Чертёж без красной линии: правило не действует, остальное не меняется.
-    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 30
+    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 31
+
+
+# ---------------------------------------------------------------------------
+# «225 Aspinwall Street, Staten Island»: блоки точек SRVPNO5, описания с «NE»,
+# стрелка севера влево, стенки клумб лентами, стена с колоннами, крытое крыльцо
+# ---------------------------------------------------------------------------
+
+ASPINWALL_HOUSE = "2 STY\nFRAME\nW/CELLAR\nNo. 225"
+#: Итоговый чертёж повёрнут относительно полевого на −75.394° вокруг угла участка.
+ASPINWALL_TURN_DEG = -75.394
+ASPINWALL_FINAL_PIVOT, ASPINWALL_FIELD_PIVOT = (915462.68, 122338.50), (915530.19, 122465.58)
+ASPINWALL_FINAL_DUMP = ROOT / "docs" / "225 Aspinwall Street, Staten Island.final.dump.json"
+
+#: Подписи итогового чертежа заказчика в координатах полевого: (текст программы,
+#: текст заказчика, центр, поворот, допуск по расстоянию). Материалы (BRICK, FRAME,
+#: CONC.) и слово GATE заказчик берёт с фотографий — программа пишет без них.
+ASPINWALL_FINAL_LABELS = [
+    ("VINYL FENCE", "VINYL FENCE", (915477.6, 122541.1), 91.9, 1.0),
+    ("VINYL FENCE", "VINYL FENCE", (915501.7, 122561.5), 0.0, 6.0),
+    ("VINYL FENCE", "VINYL FENCE", (915528.3, 122529.0), 90.0, 1.0),
+    ("V.FE.", "VINYL FE.", (915474.0, 122518.6), 90.0, 2.5),
+    ("V.FE.", "VIN.FE.", (915533.0, 122561.4), 0.0, 1.0),
+    ("V.FE.", "VIN.FE.", (915471.6, 122561.9), 0.0, 1.0),
+    ("V.FE.", "VIN.FE.", (915532.8, 122496.6), 0.0, 2.5),   # у заказчика ещё GATE над линией
+    ("V.FE.", "VIN.FE.", (915471.5, 122510.4), 0.0, 2.5),   # и здесь
+    ("WALL W./COLUMNS", "BRICK WALL W./COLUMNS", (915501.9, 122565.1), 0.0, 4.0),
+    ("ROOFED O.P.", "ROOFED O.P.", (915502.8, 122491.8), 0.0, 3.0),
+    ("O.P.", "O.P.", (915523.0, 122510.6), 0.0, 1.0),
+    ("O.P.", "FRAME DECK", (915502.6, 122538.7), 0.0, 2.5),  # геодезист записал O PORCH
+    ("PLANT.", "PLANT.", (915492.1, 122561.1), 0.0, 3.5),
+    ("PLANT.", "PLANT.", (915523.3, 122553.3), 0.0, 7.0),
+    ("PLANT.", "PLANT.", (915507.9, 122487.7), 0.0, 1.5),
+    ("PLANT.", "PLANT.", (915491.3, 122490.9), 0.0, 2.0),
+    ("PLANT.", "PLANT.", (915485.7, 122491.5), 0.0, 8.5),
+    ("STEPS", "FRAME STEPS", (915524.6, 122496.1), 0.0, 2.5),
+    ("STEPS", "CONC. STEPS", (915500.8, 122484.9), 0.0, 1.0),
+    ("STEP", "FRAME STEPS", (915515.2, 122540.3), 0.0, 3.5),
+]
+
+
+def aspinwall_to_field(point):
+    turn = math.radians(-ASPINWALL_TURN_DEG)
+    dx, dy = point[0] - ASPINWALL_FINAL_PIVOT[0], point[1] - ASPINWALL_FINAL_PIVOT[1]
+    return (
+        ASPINWALL_FIELD_PIVOT[0] + dx * math.cos(turn) - dy * math.sin(turn),
+        ASPINWALL_FIELD_PIVOT[1] + dx * math.sin(turn) + dy * math.cos(turn),
+    )
+
+
+def aspinwall_final_texts(layer="D-TOPO-TEXT"):
+    """Тексты итогового чертежа: (текст в одну строку, центр в координатах полевого, поворот)."""
+    dump = json.loads(ASPINWALL_FINAL_DUMP.read_text(encoding="utf-8"))
+    found = []
+    for entity in dump["entities"]:
+        if entity["type"] not in ("Text", "MText") or entity["layer"] != layer:
+            continue
+        text = " ".join(fl.plain_text(entity["text"].replace("\\P", " ")).split())
+        minx, miny, maxx, maxy = entity["bbox"]
+        center = aspinwall_to_field(((minx + maxx) / 2.0, (miny + maxy) / 2.0))
+        found.append((text, center, (entity["rot_deg"] - ASPINWALL_TURN_DEG) % 360.0))
+    return found
+
+
+def aspinwall_plan(**kwargs):
+    return make_plan(load_aspinwall(), house=ASPINWALL_HOUSE, height=0.9, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("VINYL FENCE NE", "VINYL FENCE"),
+        ("WALL NE", "WALL"),
+        ("O PORCH NE", "O.P."),
+        ("AW OVERH NE", "AWNING"),
+        ("CANTILEVER NE", "CANTIL."),
+        ("COL  NE", None),       # колонна: известна, сама не подписывается
+        ("EDG CONC", None),      # кромка бетона: что по какую сторону, по линии не понять
+        ("DW", None),            # заезд: заказчик пишет материал покрытия (с фотографий)
+        ("BC", None),            # бортовой камень
+        ("NE", None),            # одно слово «NE» — не суффикс, а неизвестное описание
+    ],
+)
+def test_no_elevation_suffix_is_not_part_of_the_object_name(raw, expected):
+    """«NE» в конце описания — точка снята без отметки: к названию объекта не относится."""
+    snap = DrawingSnapshot(
+        lines=[DrawingLine(layer="M-PROPERTY", points=((0, 0), (50, 0), (50, 100), (0, 100)), closed=True)],
+        survey_points=[fl.SurveyPoint(layer="ST-MISC", number="7", description=raw, point=(10.0, 10.0))],
+    )
+    result = recognize(snap, house="")
+    assert [code.label for code in result.point_codes] == [expected]
+    assert result.unknown_codes == ({"NE": 1} if raw == "NE" else {})
+    # Суффикс настраивается: без него описание с «NE» остаётся неизвестным.
+    plain = recognize(snap, house="", cfg={"feature_labeling": {"point_description_ignored_suffixes": []}})
+    assert bool(plain.unknown_codes) == raw.endswith("NE")
+
+
+def test_aspinwall_points_of_both_block_kinds_are_understood():
+    """Блоки SRVPNO5 (без отметок, «… NE») и srvpno3 (слои «…-ELEV») читаются одинаково."""
+    result = recognize(load_aspinwall(), house=ASPINWALL_HOUSE)
+    assert result.unknown_codes == {}
+    assert result.boundary.area_sqft == pytest.approx(55.0 * 97.5, abs=1.0)
+    # Точки ступеней лежат в слое ST-STEP-ELEV, линии — в ST-STEP.
+    steps = [f for f in result.features if f.category == "steps" and f.label]
+    assert sorted(f.label for f in steps) == ["STEP", "STEPS", "STEPS"]
+    assert {f.layer for f in steps} == {"ST-STEP"} and {f.source for f in steps} == {"point_code"}
+    fences = [f for f in result.features if f.kind == "fence"]
+    assert len(fences) == 6 and {f.label for f in fences} == {"VINYL FENCE"}
+    # Кромки бетона и заезда известны, но не подписываются и в «без подписи» не попадают.
+    surfaces = [f for f in result.features if f.category == "surface"]
+    assert len(surfaces) == 5 and {f.skip_reason for f in surfaces} == {fl.SURFACE_EDGE_REASON}
+    # «Без подписи» пусто: соседний дом и обрывок его контура — со своей причиной.
+    assert result.unlabeled == []
+    neighbours = [f for f in result.features if f.skip_reason == fl.OTHER_HOUSE_REASON]
+    assert sorted(f.kind for f in neighbours) == ["area", "edge"]
+    # Точки CANTILEVER сняты в стороне от линий — об этом сказано в отчёте.
+    assert {code.code for code in result.unbound_descriptions} >= {"CANTILEVER"}
+
+
+def test_planter_walls_drawn_as_ribbons_are_labeled_as_narrow_planters():
+    """
+    Стенка клумбы — две линии в 0.8 ft друг от друга без торцов (у заказчика
+    заштрихована). Раньше по ним строилась выпуклая оболочка и «PLANTER»
+    вставал посреди газона; теперь каждая лента — свой объект «PLANT.».
+    """
+    result = recognize(load_aspinwall(), house=ASPINWALL_HOUSE)
+    planters = [f for f in result.features if f.category == "planter"]
+    assert [f.label for f in planters] == ["PLANT."] * 5
+    # Площади лент совпадают с площадями штриховок полевого чертежа (37.6, 15.3, 14.0, 7.0).
+    areas = sorted(round(f.geometry.area, 1) for f in planters)
+    assert areas == pytest.approx([3.4, 3.6, 13.9, 15.3, 37.5], abs=0.15)
+    assert all(fl._mean_width(f.geometry) < 1.0 for f in planters)
+    # Торцы достраиваются только у длинных лент: без них оболочка возвращается.
+    old = recognize(
+        load_aspinwall(), house=ASPINWALL_HOUSE,
+        cfg={"feature_labeling": {"ribbon_cap_categories": []}},
+    )
+    assert max(f.geometry.area for f in old.features if f.category == "planter") > 500.0
+
+
+def test_wall_with_surveyed_columns_and_its_second_line():
+    result = recognize(load_aspinwall(), house=ASPINWALL_HOUSE)
+    walls = [f for f in result.features if f.category == "wall"]
+    (labeled,) = [f for f in walls if f.label]
+    assert labeled.label == "WALL W./COLUMNS" and "колонны (5)" in labeled.rule
+    reasons = sorted(f.skip_reason for f in walls if not f.label)
+    assert reasons == [fl.WALL_SIDE_REASON] * 3 + [fl.WALL_UNDER_FENCE_REASON]
+    columns = [f for f in result.features if f.category == "column"]
+    assert len(columns) == 6 and {f.skip_reason for f in columns} == {fl.NO_LABEL_CODE_REASON}
+    assert all(f.geometry.area == pytest.approx(1.0, abs=0.1) for f in columns)
+    # Правило выключается: пустой шаблон — просто WALL.
+    plain = recognize(
+        load_aspinwall(), house=ASPINWALL_HOUSE,
+        cfg={"feature_labeling": {"wall_with_columns_format": ""}},
+    )
+    assert [f.label for f in plain.features if f.category == "wall" and f.label] == ["WALL"]
+
+
+def test_awning_over_surveyed_porch_points_is_a_roofed_porch():
+    result = recognize(load_aspinwall(), house=ASPINWALL_HOUSE)
+    (roofed,) = [f for f in result.features if f.label == "ROOFED\nO.P."]
+    assert roofed.layer == "ST-OHED" and roofed.category == "porch"
+    assert "AW OVERH" in roofed.rule and "O PORCH NE под козырьком (2 т.)" in roofed.rule
+    assert not [f for f in result.features if f.label == "AWNING"]
+    plain = recognize(
+        load_aspinwall(), house=ASPINWALL_HOUSE, cfg={"feature_labeling": {"roofed_porch_labels": {}}}
+    )
+    assert [f.label for f in plain.features if f.layer == "ST-OHED" and f.label] == ["AWNING"]
+    # Козырёк без точек крыльца под ним («6910 15th Avenue») остаётся AWNING.
+    brooklyn = recognize(load_brooklyn(), house=BROOKLYN_HOUSE)
+    assert [f.label for f in brooklyn.features if f.category == "awning"] == ["AWNING"]
+
+
+def test_two_described_parallel_sides_make_one_platform():
+    """Крыльцо между стеной дома и лестницей снято двумя боковыми сторонами: подпись внутри."""
+    result = recognize(load_aspinwall(), house=ASPINWALL_HOUSE)
+    porches = [f for f in result.features if f.label == "O.P."]
+    assert sorted(f.kind for f in porches) == ["area", "area"]
+    side = min(porches, key=lambda f: f.geometry.area)
+    assert not side.closed and side.geometry.area == pytest.approx(22.3, abs=0.5)
+    assert sorted(code.number for code in side.codes) == ["31", "32"]
+    item = next(i for i in aspinwall_plan().items if i.feature is not None and i.feature.geometry.equals(side.geometry))
+    assert item.placement == "inside"
+
+    def line(points):
+        return [LineString(points)]
+
+    assert fl._opposite_sides(line([(0, 0), (4, 0)]), line([(0, 5), (4, 5)]), 12.0)
+    assert not fl._opposite_sides(line([(0, 0), (4, 0)]), line([(0, 15), (4, 15)]), 12.0)   # далеко
+    assert not fl._opposite_sides(line([(0, 0), (4, 0)]), line([(5, 0.2), (9, 0.2)]), 12.0)  # одна линия
+    assert not fl._opposite_sides(line([(0, 0), (4, 0)]), line([(10, 5), (14, 5)]), 12.0)    # не напротив
+    assert not fl._opposite_sides(line([(0, 0), (4, 0)]), line([(2, 1), (2, 6)]), 12.0)      # поперёк
+    assert not fl._opposite_sides(line([(0, 0), (4, 0), (4, 3)]), line([(0, 5), (4, 5)]), 12.0)  # ломаная
+
+
+def test_aspinwall_plan_matches_the_customer_final_drawing():
+    """Подписи стоят там же и повёрнуты так же, как в итоговом чертеже заказчика."""
+    plan = aspinwall_plan()
+    assert plan.warnings == [] and plan.skipped == []
+    assert len(plan.items) == 21
+    assert sorted(set(item.single_line for item in plan.items)) == [
+        "2 STY FRAME W/CELLAR No. 225", "O.P.", "PLANT.", "ROOFED O.P.", "STEP", "STEPS",
+        "V.FE.", "VINYL FENCE", "WALL W./COLUMNS",
+    ]
+    final = aspinwall_final_texts()
+    used = set()
+    for text, customer_text, point, rotation, tolerance in ASPINWALL_FINAL_LABELS:
+        # Таблица сверена с дампом итогового чертежа.
+        assert any(
+            found_text == customer_text and math.dist(center, point) < 0.2
+            for found_text, center, _rotation in final
+        ), (customer_text, point)
+        found = [
+            (index, item) for index, item in enumerate(plan.items)
+            if index not in used and item.single_line == text
+            and math.dist(item.box.centroid.coords[0], point) <= tolerance
+        ]
+        assert found, (text, point)
+        index, item = min(found, key=lambda pair: math.dist(pair[1].box.centroid.coords[0], point))
+        used.add(index)
+        turn = (math.degrees(item.rotation) - rotation + 180.0) % 360.0 - 180.0
+        assert abs(turn) < 2.0, (text, point, math.degrees(item.rotation))
+    # Все подписи программы, кроме дома, нашли пару в итоговом чертеже.
+    assert len(used) == len(plan.items) - 1 == len(ASPINWALL_FINAL_LABELS)
+    (house,) = [item for item in plan.items if item.feature.is_main_house]
+    (final_house,) = [
+        center for text, center, _rotation in aspinwall_final_texts(layer="0") if "No. 225" in text
+    ]
+    assert math.dist(house.box.centroid.coords[0], final_house) < 1.0
+    boxes = [item.box for item in plan.items]
+    for i, first in enumerate(boxes):
+        for second in boxes[i + 1:]:
+            assert not first.intersects(second)
+
+
+def test_north_arrow_pointing_left_keeps_vertical_text_reading_upwards():
+    """
+    Стрелка севера влево (165° от оси X): вертикальные подписи читаются снизу
+    вверх. Итоговый чертёж заказчика повёрнут севером вверх — его «вертикальные»
+    подписи в координатах полевого стоят под 90°, а не под 270°.
+    """
+    snap = load_aspinwall()
+    arrow = fl.find_north_arrow(snap, {})
+    assert arrow.north_deg == pytest.approx(165.339, abs=0.01) and arrow.side == "left"
+    plan = aspinwall_plan()
+    assert plan.vertical_reads == "up" and "смотрит влево" in plan.vertical_reads_note
+    vertical = [item for item in plan.items if abs(math.sin(item.rotation)) > 0.7]
+    assert len(vertical) == 3 and all(math.sin(item.rotation) > 0.7 for item in vertical)
+    turns = [round(rotation) % 360 for _text, _center, rotation in aspinwall_final_texts()]
+    assert turns.count(90) >= 15 and turns.count(270) == 0
+    # В самом итоговом чертеже (север вверх) те же подписи читаются слева направо.
+    dump = json.loads(ASPINWALL_FINAL_DUMP.read_text(encoding="utf-8"))
+    (final_arrow,) = [e for e in dump["entities"] if e["type"] == "BlockReference" and e["name"] == "NA"]
+    assert final_arrow["rot_deg"] == pytest.approx(0.0, abs=0.1) or final_arrow["rot_deg"] > 359.9
+    assert all(math.cos(math.radians(turn + ASPINWALL_TURN_DEG)) > 0.2 for turn in turns if turn in (90, 92))
+
+
+def test_fence_runs_leaving_the_lot_get_their_own_abbreviation():
+    """Свой забор продолжается за угол участка — этот участок подписан отдельно (VIN.FE.)."""
+    plan = aspinwall_plan()
+    short = [item.box.centroid.coords[0] for item in plan.items if item.single_line == "V.FE."]
+    assert len(short) == 5
+    # Два первых — участки за углом участка: у заказчика VIN.FE. в тех же местах.
+    for expected in [(915472.0, 122562.2), (915472.1, 122512.5), (915476.1, 122518.6),
+                     (915532.4, 122498.7), (915532.9, 122561.5)]:
+        assert any(math.dist(point, expected) < 0.2 for point in short), expected
+    old = aspinwall_plan(cfg={"feature_labeling": {"fence_label_runs_beyond_lot": False}})
+    assert len([item for item in old.items if item.single_line == "V.FE."]) == 3
+
+
+def test_aspinwall_second_run_and_customer_labels_create_nothing_twice(com):
+    """Повторный запуск: 0 новых; подписи заказчика (VIN.FE., PLANT., BRICK WALL…) — дубликаты."""
+    builder, _app, doc = com(load_aspinwall())
+    first = builder.label_features(house_text=ASPINWALL_HOUSE, text_height=0.9)
+    assert first.created_labels == 21
+    second = builder.label_features(house_text=ASPINWALL_HOUSE, text_height=0.9)
+    assert second.created_labels == 0 and len(second.plan.duplicates) >= 15
+
+    snap = load_aspinwall()
+    for text, center, rotation in aspinwall_final_texts():
+        width = ab.feature_text_width(text, 0.9)
+        cos, sin = abs(math.cos(math.radians(rotation))), abs(math.sin(math.radians(rotation)))
+        half_x, half_y = (width * cos + 0.9 * sin) / 2.0, (width * sin + 0.9 * cos) / 2.0
+        snap.texts.append(
+            DrawingText(
+                layer="D-TOPO-TEXT", text=text, point=center, height=0.9,
+                rotation=math.radians(rotation), kind="AcDbText",
+                bbox=(center[0] - half_x, center[1] - half_y, center[0] + half_x, center[1] + half_y),
+            )
+        )
+    plan = make_plan(snap, house="", height=0.9)
+    # Единственное расхождение в названии: геодезист записал «O PORCH», а заказчик
+    # по фотографии написал FRAME DECK — программа добавит своё O.P. рядом.
+    assert [item.single_line for item in plan.items] == ["O.P."]
+    assert plan.items[0].box.centroid.y == pytest.approx(122538.0, abs=0.5)
+    assert len(plan.duplicates) >= 15
+
+
+def test_fixture_converter_expands_arcs_like_the_autocad_reader():
+    """Дуги и дуговые звенья полилиний в записи чертежа — те же точки, что читает программа."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    import dump_to_fixture
+
+    half = dump_to_fixture.polyline_points([(0.0, 0.0), (2.0, 0.0)], [1.0, 0.0], False)
+    assert half[0] == (0.0, 0.0) and half[-1] == (2.0, 0.0) and len(half) == 19  # полуокружность, 18 хорд
+    assert all(math.dist(point, (1.0, 0.0)) == pytest.approx(1.0) for point in half)
+    assert min(point[1] for point in half) == pytest.approx(-1.0)  # bulge > 0 — против часовой стрелки
+    assert dump_to_fixture.polyline_points([(0.0, 0.0), (2.0, 0.0)], [0.0, 0.0], False) == [(0.0, 0.0), (2.0, 0.0)]
+    square = dump_to_fixture.polyline_points([(0, 0), (1, 0), (1, 1), (0, 1)], [], True)
+    assert square[0] == square[-1] and len(square) == 5
+    arc = dump_to_fixture.arc_points((5.0, 5.0), 2.0, 350.0, 80.0)   # через 0°: 90° дуги, 9 хорд
+    assert len(arc) == 10
+    assert arc[0] == pytest.approx((5.0 + 2.0 * math.cos(math.radians(350.0)), 5.0 + 2.0 * math.sin(math.radians(350.0))))
+    assert arc[-1] == pytest.approx((5.0 + 2.0 * math.cos(math.radians(80.0)), 5.0 + 2.0 * math.sin(math.radians(80.0))))
+    # Запись «225 Aspinwall Street» получена этим же преобразованием из дампа.
+    target = ROOT / "tests" / "data" / "aspinwall_field.txt"
+    copy = Path(str(target) + ".check")
+    try:
+        stats = dump_to_fixture.convert(
+            ROOT / "docs" / "for MLP 225 Aspinwall Street, Staten Island.dump.json", copy,
+            "225 Aspinwall Street, Staten Island",
+        )
+        assert copy.read_text(encoding="utf-8") == target.read_text(encoding="utf-8")
+    finally:
+        copy.unlink(missing_ok=True)
+    assert dict(stats) == {"L": 241, "P": 170, "Q": 7, "B": 1, "T": 1, "H": 6}

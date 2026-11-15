@@ -121,6 +121,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
             "GRASS_STRIP_EDGE",
             "S-ROAD-DWY",
             "S-ROAD-SW-LINE",
+            "S-DWY",
+            "S-CONC-MISC",
         ],
         #: «разное» шаблона геодезиста: что это за объект, говорит описание точки
         "misc": ["ST-MISC"],
@@ -130,6 +132,10 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: узкие длинные контуры этих категорий (стена — две линии в футе друг от
     #: друга) подписываются как линия: текст вдоль длинной стороны
     "ribbon_categories": ["wall"],
+    #: слои этих категорий тоже могут содержать ленты из двух линий без торцов
+    #: (стенка клумбы в ST-MISC): торцы достраиваются, лента становится контуром
+    "ribbon_cap_categories": ["misc"],
+    "ribbon_cap_min_length_ft": 6.0,
     "ribbon_max_width_ft": 1.6,
     "step_tread_layers": ["*TREADS*"],
     "label_output_layer": "D-TOPO-TEXT",
@@ -275,10 +281,15 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         },
         {"match": ["SHED"], "label": "SHED", "category": "shed"},
         {"match": ["POOL"], "label": "POOL\nAREA {area} Sq.Ft.", "category": "pool"},
-        {"match": ["PLANTER"], "label": "PLANTER", "category": "planter"},
+        {
+            "match": ["PLANTER"], "label": "PLANTER", "label_narrow": "PLANT.",
+            "category": "planter",
+        },
         {"match": ["BOT WALL", "TOP WALL", "WALL"], "label": "WALL", "category": "wall"},
         {"match": ["CANTILEVER", "OVERHANG"], "label": "CANTIL.", "category": "overhang"},
         {"match": ["EDG DWY", "EDGE DWY", "DWY", "DRIVEWAY"], "label": "DRIVEWAY", "category": "surface"},
+        # COL — колонна: сама не подписывается, но стена с колоннами — «WALL W./COLUMNS».
+        {"match": ["COLUMN", "COL"], "label": "", "category": "column"},
         # BLC — building corner, BL — building line; TTP — точка хода; CONC-SW —
         # кромка тротуара/дорожки: материал покрытия заказчик берёт с фотографий.
         # COLUMN — колонна у входа, BBC — точка бортового камня: в итоговых
@@ -286,13 +297,27 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         # W U P — столб: подписывается его условный знак (symbol_block_labels).
         {
             "match": [
-                "BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW", "COLUMN", "COL", "BBC*",
-                "W U P", "WUP", "U P",
+                "BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW", "BBC*",
+                "BC*", "TC*", "EDG CONC", "EDGE CONC", "DW", "W U P", "WUP", "U P",
             ],
             "label": "",
         },
     ],
     "narrow_object_max_width_ft": 1.5,
+    #: стена, у которой стоят колонны (точки категории column не дальше
+    #: ``wall_columns_reach_ft`` от её линии, не меньше ``wall_columns_min_count``)
+    "wall_with_columns_format": "{wall} W./COLUMNS",
+    "wall_columns_reach_ft": 1.5,
+    "wall_columns_min_count": 2,
+    #: козырёк (AW OVERH), под которым сняты точки крыльца: подпись крыльца -> подпись
+    #: крытого крыльца. Пустой словарь — правило выключено (останется AWNING).
+    "roofed_porch_labels": {"O.P.": "ROOFED\nO.P."},
+    #: слова в конце описания точки, которые к названию объекта не относятся:
+    #: NE — «no elevation», точка снята без отметки («VINYL FENCE NE», «WALL NE»)
+    "point_description_ignored_suffixes": ["NE"],
+    #: точки с отметкой лежат в слое «<слой объекта><суффикс>» (ST-STEP-ELEV,
+    #: S-CONC-MISC-ELEV): описание относится к линиям слоя без суффикса
+    "point_layer_suffixes": ["-ELEV"],
     # --- источник 2в: условные знаки (вставки блоков без атрибутов) ---------
     #: имя блока -> подпись. Знак подписывается выноской. ``symbol_label_scope``:
     #: "lot" — только знаки на самом участке (столб во дворе заказчик
@@ -380,7 +405,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "duplicate_radius_ft": 6.0,
     "label_synonyms": {
         "CHAIN LINK FENCE": ["C.L.F.", "C.L. FENCE", "CHAIN LINK FNC."],
-        "VINYL FENCE": ["V.FE.", "VIN.FE.", "PVC FENCE"],
+        "VINYL FENCE": ["V.FE.", "VIN.FE.", "VINYL FE.", "PVC FENCE"],
+        # сокращение заказчик пишет двумя способами (в итоговых чертежах поровну)
+        "V.FE.": ["VIN.FE.", "VINYL FE."],
         "WOOD FENCE": ["W.FE.", "WD. FENCE", "STOCKADE FENCE"],
         "IRON FENCE": ["I.FE.", "W.I. FENCE"],
         "UTILITY POLE": ["U.P.", "UTIL. POLE", "U. POLE"],
@@ -391,7 +418,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         "DRIVEWAY": ["DRWY.", "D/W"],
         "FRAME DECK": ["WOOD DECK", "WD. DECK"],
         "O.P.": ["OPEN PORCH", "PORCH"],
+        "PLANTER": ["PLANT."],
         "STEPS": ["STEP", "STAIRS"],
+        "STEP": ["STEPS"],
     },
     # --- размещение подписей (acad_builder.py) -------------------------------
     "text_height_ft": None,
@@ -451,6 +480,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: длинном). Одинаковые сокращения — не ближе fence_abbreviation_spacing_ft.
     "fence_on_line_tolerance_ft": 0.15,
     "fence_abbreviation_spacing_ft": 4.0,
+    #: прямой участок своего забора, уходящий за границу участка (вдоль улицы
+    #: или к соседу), подписывается сокращением отдельно
+    "fence_label_runs_beyond_lot": True,
     #: категории, у которых подпись вдоль кромки ставится с внешней стороны
     #: (клумба — полоса между своей кромкой и забором у границы участка)
     "outward_label_categories": ["planter", "party_wall"],
@@ -899,7 +931,7 @@ class NorthArrow:
 
 #: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
 #: программы работала (описания точек из атрибутов блоков читаются с 2.2).
-STEP2_VERSION = "2.7 (2026-11-15)"
+STEP2_VERSION = "2.8 (2026-11-15)"
 
 
 @dataclass
@@ -1914,10 +1946,27 @@ def _collect_point_codes(
 
     # Точки-блоки: описание в атрибуте, слой блока — слой объекта.
     rules = fcfg.get("point_descriptions")
+    ignored_suffixes = {
+        normalize_description(word) for word in _as_patterns(fcfg.get("point_description_ignored_suffixes"))
+    }
+    layer_suffixes = [
+        str(suffix).strip().upper() for suffix in _as_patterns(fcfg.get("point_layer_suffixes"))
+    ]
     for survey in snapshot.survey_points:
         description = normalize_description(survey.description)
+        # «VINYL FENCE NE»: NE — точка снята без отметки (no elevation), не часть названия.
+        words = description.split(" ")
+        while len(words) > 1 and words[-1] in ignored_suffixes:
+            words.pop()
+        description = " ".join(words)
         if not description or not search.contains(Point(survey.point)):
             continue
+        # Точки с отметкой лежат в слое «<слой объекта>-ELEV» (ST-STEP-ELEV -> ST-STEP).
+        point_layer = str(survey.layer or "")
+        for suffix in layer_suffixes:
+            if suffix and point_layer.upper().endswith(suffix) and len(point_layer) > len(suffix):
+                point_layer = point_layer[: -len(suffix)]
+                break
         label: str | None = None
         pattern: str | None = None
         category = ""
@@ -1947,7 +1996,7 @@ def _collect_point_codes(
                 label=label,
                 pattern=pattern,
                 point=(float(survey.point[0]), float(survey.point[1])),
-                layer=survey.layer,
+                layer=point_layer,
                 raw=plain_text(survey.description),
                 is_fence=is_fence,
                 category=category,
@@ -1965,6 +2014,9 @@ def _collect_point_codes(
 #: почему объект намеренно оставлен без подписи
 SURFACE_EDGE_REASON = "кромка покрытия: материал по линиям не определить"
 WALL_UNDER_FENCE_REASON = "стена подписана вместе с забором на ней"
+WALL_SIDE_REASON = "вторая линия подписанной стены"
+NO_LABEL_CODE_REASON = "описание точки подписи не требует"
+ROOFED_PORCH_REASON = "площадка подписана вместе с козырьком над ней"
 
 #: категория «покрытие/грунт»: подпись ставится в точке заметки, без объекта
 GROUND_TARGET = "ground"
@@ -2528,6 +2580,7 @@ def _extract_layer_shapes(
     loose: list[PointCode] | None = None,
     linear: bool = False,
     linear_categories: Iterable[str] = (),
+    described_gap: float = 0.0,
 ) -> list[_LayerShape]:
     """
     Делит линии одного слоя на отдельные объекты: замкнутые контуры, открытые
@@ -2622,6 +2675,18 @@ def _extract_layer_shapes(
                     root_a, root_b = find(i), find(j)
                     if root_a != root_b:
                         parent[root_b] = root_a
+    if described_gap > 0.0 and not linear and len(free) > 1:
+        # Две параллельные стороны одной площадки с одинаковым описанием (крыльцо
+        # между стеной дома и ступенями: сняты только две боковые стороны).
+        for position, i in enumerate(free):
+            for j in free[position + 1:]:
+                if find(i) == find(j) or i not in group_codes or j not in group_codes:
+                    continue
+                first, second = _majority_first(group_codes[i]), _majority_first(group_codes[j])
+                if not first[0].label or first[0].label != second[0].label:
+                    continue
+                if _opposite_sides(groups[i], groups[j], described_gap):
+                    parent[find(j)] = find(i)
     clusters: dict[int, list[int]] = {}
     for index in free:
         clusters.setdefault(find(index), []).append(index)
@@ -2663,6 +2728,158 @@ def _extract_layer_shapes(
                 _LayerShape(geometry=chain, closed=False, is_area=False, codes=near or codes)
             )
     return shapes
+
+
+def _long_ribbon_caps(
+    lines: Sequence[LineString], max_width: float, tolerance: float, min_length: float
+) -> list[LineString]:
+    """
+    Торцы только тех лент, которые после замыкания действительно узкие и
+    длинные: средняя ширина контура не больше ``max_width``, длина не меньше
+    ``min_length`` и четырёх ширин.
+    """
+    caps = _ribbon_caps(lines, max_width, tolerance)
+    if not caps:
+        return []
+    noded = _noded(snap_endpoints(list(lines) + caps, tolerance))
+    polys, _dangles, _cuts, _invalid = polygonize_full(noded)
+    ribbons = []
+    for poly in _polygon_parts(polys):
+        perimeter = poly.exterior.length
+        if perimeter <= 0.0 or poly.area <= 0.0:
+            continue
+        width = 2.0 * poly.area / perimeter
+        if width <= max_width and perimeter / 2.0 >= max(min_length, 4.0 * width):
+            ribbons.append(poly.exterior)
+    kept = []
+    for cap in caps:
+        middle = cap.interpolate(0.5, normalized=True)
+        if any(ring.distance(middle) <= max(tolerance, 1e-6) for ring in ribbons):
+            kept.append(cap)
+    return kept
+
+
+def _opposite_sides(
+    first: Sequence[LineString], second: Sequence[LineString], max_gap: float
+) -> bool:
+    """
+    Две прямые линии — противоположные стороны одной площадки: параллельны
+    (в пределах 15°), лежат напротив друг друга (перекрытие проекций не меньше
+    половины короткой) и не дальше ``max_gap``, но и не на одной прямой.
+    """
+    chains = []
+    for group in (first, second):
+        merged = merge_lines(list(group), 0.0) or list(group)
+        if len(merged) != 1:
+            return False
+        coords = _clean_coords(merged[0].coords)
+        if len(coords) != 2:
+            return False
+        chains.append(coords)
+    (a0, a1), (b0, b1) = chains
+    length_a = math.hypot(a1[0] - a0[0], a1[1] - a0[1])
+    length_b = math.hypot(b1[0] - b0[0], b1[1] - b0[1])
+    if length_a <= 0.0 or length_b <= 0.0:
+        return False
+    ux, uy = (a1[0] - a0[0]) / length_a, (a1[1] - a0[1]) / length_a
+    cross = abs(ux * (b1[1] - b0[1]) - uy * (b1[0] - b0[0])) / length_b
+    if cross > math.sin(math.radians(15.0)):
+        return False
+    gap = abs(-uy * (b0[0] - a0[0]) + ux * (b0[1] - a0[1]))
+    if gap < 1.0 or gap > max_gap:
+        return False
+    start, end = sorted(
+        (ux * (point[0] - a0[0]) + uy * (point[1] - a0[1])) for point in (b0, b1)
+    )
+    overlap = min(length_a, end) - max(0.0, start)
+    return overlap >= 0.5 * min(length_a, length_b)
+
+
+def _walls_with_columns(
+    result: "RecognitionResult", codes: Sequence[PointCode], fcfg: dict[str, Any], ribbon_width: float
+) -> None:
+    """
+    Стена с колоннами: у линии стены сняты точки колонн (``COL``) — подпись
+    «WALL W./COLUMNS». Вторая линия той же стены (между колоннами она идёт
+    отрезками) и квадраты самих колонн своей подписи не требуют.
+    """
+    walls = [
+        feature for feature in result.features
+        if feature.category == "wall" and feature.kind in {"edge", "area"}
+    ]
+    labeled = [wall for wall in walls if wall.label and " ATOP " not in wall.label]
+    template = str(fcfg.get("wall_with_columns_format") or "").strip()
+    reach = max(0.0, float(fcfg.get("wall_columns_reach_ft") or 0.0))
+    minimum = max(1, int(fcfg.get("wall_columns_min_count") or 1))
+    columns = [Point(code.point) for code in codes if code.category == "column"]
+    if template and columns:
+        for wall in labeled:
+            near = [point for point in columns if wall.geometry.distance(point) <= reach]
+            # Колонна снята двумя-четырьмя точками: считаются места, а не точки.
+            places: list[Point] = []
+            for point in near:
+                if all(point.distance(other) > 3.0 for other in places):
+                    places.append(point)
+            if len(places) < minimum:
+                continue
+            try:
+                wall.label = template.format(wall=wall.label, WALL=wall.label)
+            except (KeyError, IndexError, ValueError):
+                continue
+            wall.rule = f"{wall.rule} + колонны ({len(places)})"
+    if ribbon_width <= 0.0:
+        return
+    for wall in walls:
+        if wall.label or wall.skip_reason or wall.kind != "edge":
+            continue
+        for other in labeled:
+            if other is wall:
+                continue
+            band = other.geometry.buffer(ribbon_width, cap_style=2)
+            if wall.geometry.intersection(band).length >= 0.8 * wall.geometry.length:
+                wall.skip_reason = WALL_SIDE_REASON
+                break
+
+
+def _roofed_porches(
+    result: "RecognitionResult", codes: Sequence[PointCode], fcfg: dict[str, Any]
+) -> None:
+    """
+    Крытое крыльцо: под контуром козырька (``AW OVERH``) сняты точки крыльца
+    (``O PORCH``) — геодезист показал и площадку, и крышу над ней. Заказчик
+    пишет ``ROOFED O.P.`` вместо ``AWNING``.
+    """
+    mapping = fcfg.get("roofed_porch_labels")
+    if not isinstance(mapping, dict) or not mapping:
+        return
+    roofed = {" ".join(str(key).split()): str(value) for key, value in mapping.items() if value}
+    for awning in result.features:
+        if awning.category != "awning" or awning.kind != "area" or not awning.label:
+            continue
+        cover = awning.geometry.buffer(0.3)
+        under = [
+            code for code in codes
+            if code.category == "porch" and code.label
+            and " ".join(str(code.label).split()) in roofed
+            and cover.contains(Point(code.point))
+        ]
+        if not under:
+            continue
+        porch_label = " ".join(str(under[0].label).split())
+        awning.rule = f"{awning.rule} + {under[0].raw} под козырьком ({len(under)} т.)"
+        awning.label = roofed[porch_label]
+        awning.category = "porch"
+        # Площадка того же крыльца, если у неё есть свой контур под козырьком.
+        for porch in result.features:
+            if porch is awning or porch.category != "porch" or porch.kind != "area" or not porch.label:
+                continue
+            try:
+                inside = porch.geometry.intersection(cover).area
+            except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+                continue
+            if inside >= 0.6 * porch.geometry.area:
+                porch.label = None
+                porch.skip_reason = ROOFED_PORCH_REASON
 
 
 def _ribbon_caps(
@@ -3097,7 +3314,7 @@ def recognize_features(
     # Описания точек съёмки (блоки с атрибутами): точка лежит в слое объекта.
     described: dict[str, list[PointCode]] = {}
     for code in codes:
-        if code.from_block and code.label and not code.is_fence:
+        if code.from_block and (code.label or code.category) and not code.is_fence:
             described.setdefault(code.layer.strip().upper(), []).append(code)
     feature_reach = max(0.0, float(fcfg.get("point_to_feature_max_ft") or 0.0))
     linear_categories = {
@@ -3106,6 +3323,9 @@ def recognize_features(
     }
     ribbon_categories = {
         str(name).strip().lower() for name in _as_patterns(fcfg.get("ribbon_categories"))
+    }
+    ribbon_cap_categories = {
+        str(name).strip().lower() for name in _as_patterns(fcfg.get("ribbon_cap_categories"))
     }
     ribbon_width = max(0.0, float(fcfg.get("ribbon_max_width_ft") or 0.0))
     narrow_width = max(0.0, float(fcfg.get("narrow_object_max_width_ft") or 0.0))
@@ -3116,6 +3336,13 @@ def recognize_features(
         layer_lines = structure_lines[layer]
         if category in ribbon_categories:
             layer_lines = layer_lines + _ribbon_caps(layer_lines, ribbon_width, tolerance)
+        elif category in ribbon_cap_categories:
+            # В слое «разного» торец достраивается только у настоящей ленты
+            # (стенка клумбы), а не у любых двух близких концов линий.
+            layer_lines = layer_lines + _long_ribbon_caps(
+                layer_lines, ribbon_width, tolerance,
+                max(0.0, float(fcfg.get("ribbon_cap_min_length_ft") or 0.0)),
+            )
         shapes = _extract_layer_shapes(
             layer_lines,
             tolerance=tolerance,
@@ -3127,6 +3354,7 @@ def recognize_features(
             ),
             points=described.pop(layer.strip().upper(), []),
             point_reach=feature_reach,
+            described_gap=pair_gap,
             loose=loose_points,
             linear=category in linear_categories,
             linear_categories=linear_categories,
@@ -3154,7 +3382,9 @@ def recognize_features(
             )
             if shape.codes:
                 # Описание точки важнее имени слоя: слой — класс, описание — объект.
-                first = shape.codes[0]
+                first = next((code for code in shape.codes if code.label), shape.codes[0])
+                if not first.label:
+                    feature.skip_reason = NO_LABEL_CODE_REASON  # колонна: известна, не подписывается
                 feature.label = first.label
                 feature.source = "point_code"
                 feature.rule = f"{first.raw} → {first.pattern}"
@@ -3190,6 +3420,8 @@ def recognize_features(
             result.features.append(feature)
 
     _fences_atop_walls(result, wall_shapes, fcfg, new_id)
+    _walls_with_columns(result, codes, fcfg, ribbon_width)
+    _roofed_porches(result, codes, fcfg)
 
     # --- основной дом: текст из окна программы ------------------------------
     # Дом блокированной застройки: замкнутого контура нет, дом — часть участка
@@ -3245,6 +3477,16 @@ def recognize_features(
             continue
         if on_lot < 0.5 * other.geometry.area:
             other.skip_reason = OTHER_HOUSE_REASON
+    # Обрывок контура соседнего дома (линия уходит за край съёмки) — тоже не «слой без правила».
+    for piece in result.features:
+        if piece.category != "house" or piece.kind != "edge" or piece.label or piece.skip_reason:
+            continue
+        try:
+            on_lot = piece.geometry.intersection(boundary.polygon).length
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            continue
+        if on_lot < 0.5 * piece.geometry.length:
+            piece.skip_reason = OTHER_HOUSE_REASON
     if house_label:
         if main_house is None:
             house_layers = ", ".join(

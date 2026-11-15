@@ -1,6 +1,7 @@
 """
 Сжимает дамп inspect_dwg.py (``*.dump.json``) в текстовую запись полевого чертежа
-для тестов Шага 2 (``tests/data/*_field.txt``): отрезки, блоки точек съёмки с
+для тестов Шага 2 (``tests/data/*_field.txt``): отрезки (дуги и дуговые звенья
+полилиний — хордами по 10°, как их читает программа), блоки точек съёмки с
 описаниями, тексты. Формат читает ``load_field_fixture`` в test_feature_labeling.py.
 
     python tests/dump_to_fixture.py "docs/for MLP 6910 15th Avenue, Brooklyn.dump.json" \
@@ -10,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -26,6 +28,31 @@ HEADER = """\
 """
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Дуги и дуговые звенья полилиний раскладываются теми же функциями, которыми
+# программа читает чертёж из AutoCAD: запись совпадает с тем, что увидит Шаг 2.
+from acad_builder import _arc_points, _expand_polyline_bulges  # noqa: E402
+
+
+def arc_points(center, radius, start_deg, end_deg):
+    """Дуга AcDbArc (против часовой стрелки, углы в градусах) — точками через 10°."""
+    return _arc_points(
+        (float(center[0]), float(center[1])), float(radius),
+        math.radians(float(start_deg)), math.radians(float(end_deg)),
+    )
+
+
+def polyline_points(points, bulges, closed):
+    """Вершины LWPOLYLINE с дуговыми звеньями (bulge) — ломаной; замкнутая — с повтором начала."""
+    path = _expand_polyline_bulges(points, bulges, closed) if any(bulges) else list(points)
+    if closed:
+        path = path + [path[0]]
+    return path
+
+
 def convert(source: Path, target: Path, title: str) -> Counter:
     dump = json.loads(source.read_text(encoding="utf-8"))
     rows: list[str] = []
@@ -35,9 +62,14 @@ def convert(source: Path, target: Path, title: str) -> Counter:
         kind, layer = entity["type"], entity["layer"].replace(" ", "_")
         if kind in {"Line", "Polyline"} and isinstance(entity.get("pts"), list):
             points = [(p[0], p[1]) for p in entity["pts"]]
-            if entity.get("closed"):
-                points.append(points[0])
-            for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            bulges = [float(value) for value in (entity.get("bulges") or [])]
+            path = polyline_points(points, bulges, bool(entity.get("closed")))
+            for (x0, y0), (x1, y1) in zip(path, path[1:]):
+                rows.append(f"L {layer} {x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}")
+                stats["L"] += 1
+        elif kind == "Arc" and entity.get("center"):
+            path = arc_points(entity["center"], entity["radius"], entity["start_deg"], entity["end_deg"])
+            for (x0, y0), (x1, y1) in zip(path, path[1:]):
                 rows.append(f"L {layer} {x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}")
                 stats["L"] += 1
         elif kind == "BlockReference":

@@ -6318,6 +6318,13 @@ class _LabelPlacer:
             x, y = base[0] + ux * step * factor, base[1] + uy * step * factor
             if region.contains(Point(x, y)):
                 add(x, y)
+        # Мелкие сдвиги поперёк текста: в неглубокой площадке (крытое крыльцо
+        # между стеной дома и верхней ступенью) двухстрочная подпись встаёт,
+        # отодвинувшись от линии на полвысоты буквы.
+        for factor in (0.4, -0.4, 0.8, -0.8):
+            x, y = base[0] - uy * self.h * factor, base[1] + ux * self.h * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
         return points
 
     # -- дедупликация ---------------------------------------------------------
@@ -6538,6 +6545,10 @@ class _LabelPlacer:
                         continue
                     if self._structure_blocks(rect, feature) or not self.zone.contains(rect):
                         continue
+                    if rect.distance(region) > 2.0 * self.h:
+                        # Изогнутая лента (стенка клумбы углом): середина стороны её
+                        # габарита далеко от самой ленты — понятнее выноска.
+                        continue
                     item = FeatureLabelItem(
                         feature=feature, text=variant, kind="mtext", placement="beside",
                         point=center, height=self.h, rotation=angle,
@@ -6703,6 +6714,8 @@ class _LabelPlacer:
             self._commit(item)
             items.append(item)
         if items:
+            if short_text is not None and not front:
+                items += self._label_runs_beyond_lot(feature, short_text, runs, reach)
             return items
         if duplicate is not None:
             self.duplicates.append(
@@ -6738,8 +6751,55 @@ class _LabelPlacer:
                     if self._same_label_near(short_text, found[1].point, spacing) is not None:
                         return []
                     self._commit(found[1])
-                    return [found[1]]
+                    extra_items = (
+                        [] if front
+                        else self._label_runs_beyond_lot(feature, short_text, runs[1:], reach)
+                    )
+                    return [found[1]] + extra_items
         return None
+
+    def _label_runs_beyond_lot(
+        self,
+        feature: Feature,
+        short_text: str,
+        runs: list[tuple[tuple[float, float], tuple[float, float], float]],
+        reach: float,
+    ) -> list[FeatureLabelItem]:
+        """
+        Сокращение на прямых участках своего забора, уходящих за границу
+        участка (забор продолжается вдоль улицы или к соседу): заказчик
+        подписывает такой участок отдельно (``VIN.FE.`` за углом участка).
+        """
+        if not bool(self.fcfg.get("fence_label_runs_beyond_lot", True)):
+            return []
+        on_line = float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0)
+        spacing = float(self.fcfg.get("fence_abbreviation_spacing_ft") or 0.0)
+        short_width, _h = self._text_size(short_text)
+        try:
+            lot = self.lot.buffer(on_line)
+        except Exception:  # noqa: BLE001
+            return []
+        items: list[FeatureLabelItem] = []
+        for run in runs:
+            if run[2] < short_width + 1.0:
+                continue
+            segment = LineString([run[0], run[1]])
+            try:
+                inside = segment.intersection(lot).length
+            except Exception:  # noqa: BLE001
+                continue
+            if inside >= 0.5 * run[2]:
+                continue
+            if self._run_label(short_text, run[0], run[1], reach) is not None:
+                continue
+            found = self._along_run(feature, short_text, run)
+            if found is None or found[0] > 0:
+                continue
+            if self._same_label_near(short_text, found[1].point, spacing) is not None:
+                continue
+            self._commit(found[1])
+            items.append(found[1])
+        return items
 
     def _fence_short_label(self, text: str) -> str | None:
         """``CHAIN LINK FENCE`` -> ``C.L.F.``; ``… ATOP WALL`` сокращается так же."""

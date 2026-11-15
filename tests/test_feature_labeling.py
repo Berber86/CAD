@@ -575,11 +575,125 @@ def test_vertical_text_direction_is_configurable():
     assert math.degrees(ab.label_rotation(math.radians(270.418), "up")) == pytest.approx(90.418)
     assert math.degrees(ab.label_rotation(math.radians(250.836), "up")) == pytest.approx(70.836)
     assert math.degrees(ab.label_rotation(math.radians(180.418), "up")) == pytest.approx(0.418)
-    # По умолчанию — снизу вверх; настройка возвращает чтение сверху вниз.
-    assert fl.DEFAULT_FEATURE_CONFIG["vertical_text_reads"] == "up"
-    assert math.degrees(item_for(make_plan(build_scene()), "FENCE_WOOD_RIGHT").rotation) == pytest.approx(90.0)
+    # Без стрелки севера — снизу вверх; настройка задаёт направление жёстко.
+    assert fl.DEFAULT_FEATURE_CONFIG["vertical_text_reads"] == "auto"
+    plan = make_plan(build_scene())
+    assert math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation) == pytest.approx(90.0)
+    assert plan.vertical_reads == "up" and "стрелка севера не найдена" in plan.vertical_reads_note
     plan = make_plan(build_scene(), cfg={"feature_labeling": {"vertical_text_reads": "down"}})
     assert math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation) == pytest.approx(-90.0)
+    assert plan.vertical_reads == "down" and "настройка vertical_text_reads" in plan.vertical_reads_note
+
+
+def north_arrow(rotation_deg, *, name="NA", layer="M-NTH-ARROW", **kwargs):
+    return fl.DrawingSymbol(
+        layer=layer, name=name, point=(-40.0, 140.0), rotation=math.radians(rotation_deg), **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("rotation_deg", "side", "reads"),
+    [
+        (0.0, "up", "up"),
+        (350.326, "up", "up"),       # итоговый чертёж «12 Ilion Place»: текст 0° / 90°
+        (349.908, "up", "up"),       # полевой чертёж «12 Ilion Place»
+        (308.237, "right", "down"),  # полевой чертёж «6910 15th Avenue»
+        (304.718, "right", "down"),  # итоговый «6910 15th Avenue»: текст 356.5° / 266.5°
+        (270.0, "right", "down"),
+        (226.0, "right", "down"),
+        (315.0, "up", "up"),         # ровно по диагонали — как по умолчанию
+        (45.0, "up", "up"),
+        (46.0, "left", "up"),
+        (90.0, "left", "up"),
+        (180.0, "down", "up"),
+    ],
+)
+def test_north_arrow_decides_how_vertical_text_reads(rotation_deg, side, reads):
+    """Лист держат севером вверх: стрелка вправо — вертикальный текст сверху вниз."""
+    snap = fl.DrawingSnapshot(symbols=[north_arrow(rotation_deg)])
+    arrow = fl.find_north_arrow(snap, {})
+    assert arrow.north_deg == pytest.approx((rotation_deg + 90.0) % 360.0)
+    assert arrow.side == side
+    found, note = fl.vertical_text_direction(snap, {})
+    assert found == reads
+    assert "блок NA, слой M-NTH-ARROW" in note
+    assert ("сверху вниз" in note) == (reads == "down")
+    # Проверка правила: после поворота листа севером вверх вертикальная подпись
+    # читается слева направо (0°), а не справа налево (180°).
+    if side in {"right", "left"}:
+        text_deg = -90.0 if reads == "down" else 90.0
+        turn_deg = 90.0 if side == "right" else -90.0  # поворот листа до «север вверху»
+        assert (text_deg + turn_deg) % 360.0 == pytest.approx(0.0)
+
+
+def test_north_arrow_is_found_by_block_name_or_layer():
+    wup = fl.DrawingSymbol(layer="U-TRAF-IRON", name="WUP", point=(0.0, 0.0), rotation=math.radians(270.0))
+    assert fl.find_north_arrow(fl.DrawingSnapshot(symbols=[wup]), {}) is None
+    assert fl.vertical_text_direction(fl.DrawingSnapshot(symbols=[wup]), {})[0] == "up"
+    # По имени блока в любом слое; по слою при любом имени блока.
+    by_name = fl.DrawingSnapshot(symbols=[wup, north_arrow(270.0, name="North Arrow 2", layer="0")])
+    assert fl.find_north_arrow(by_name, {}).side == "right"
+    by_layer = fl.DrawingSnapshot(symbols=[wup, north_arrow(270.0, name="A$C1F2", layer="m-nth-arrow")])
+    assert fl.find_north_arrow(by_layer, {}).side == "right"
+    # Блок с именем стрелки важнее чужого блока в её слое.
+    mixed = fl.DrawingSnapshot(symbols=[
+        north_arrow(0.0, name="LOGO", layer="M-NTH-ARROW"), north_arrow(270.0, name="NA", layer="0"),
+    ])
+    assert fl.find_north_arrow(mixed, {}).name == "NA"
+    # Зеркальная вставка и блок, где север нарисован вдоль +X.
+    assert fl.find_north_arrow(fl.DrawingSnapshot(symbols=[north_arrow(0.0, y_scale=-0.3)]), {}).side == "down"
+    assert fl.find_north_arrow(fl.DrawingSnapshot(symbols=[north_arrow(0.0, x_scale=-0.3)]), {}).side == "up"
+    along_x = {"feature_labeling": {"north_arrow_block_north_deg": 0.0}}
+    assert fl.find_north_arrow(fl.DrawingSnapshot(symbols=[north_arrow(0.0)]), along_x).side == "right"
+    # Жёсткая настройка сильнее стрелки.
+    right = fl.DrawingSnapshot(symbols=[north_arrow(270.0)])
+    assert fl.vertical_text_direction(right, {"feature_labeling": {"vertical_text_reads": "up"}})[0] == "up"
+
+
+def test_vertical_labels_follow_the_north_arrow_of_the_drawing():
+    def fence_rotation(rotation_deg, cfg=None):
+        snap = build_scene()
+        snap.symbols.append(north_arrow(rotation_deg))
+        plan = make_plan(snap, cfg=cfg)
+        return plan, math.degrees(item_for(plan, "FENCE_WOOD_RIGHT").rotation)
+
+    plan, rotation = fence_rotation(0.0)
+    assert (plan.vertical_reads, rotation) == ("up", pytest.approx(90.0))
+    plan, rotation = fence_rotation(270.0)       # север справа
+    assert (plan.vertical_reads, rotation) == ("down", pytest.approx(-90.0))
+    plan, rotation = fence_rotation(90.0)        # север слева
+    assert (plan.vertical_reads, rotation) == ("up", pytest.approx(90.0))
+    plan, rotation = fence_rotation(270.0, {"feature_labeling": {"vertical_text_reads": "up"}})
+    assert (plan.vertical_reads, rotation) == ("up", pytest.approx(90.0))
+    # Горизонтальные подписи от стрелки не зависят.
+    for arrow_deg in (0.0, 270.0):
+        plan, _rotation = fence_rotation(arrow_deg)
+        rear = item_for(plan, "CODE_CREW", "VINYL FENCE")
+        assert math.degrees(rear.rotation) == pytest.approx(0.0, abs=1e-6)
+    # Реальные чертежи: Ilion — север вверху, Бруклин — справа (как в итоговых у заказчика).
+    assert make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).vertical_reads == "up"
+    brooklyn = brooklyn_plan()
+    assert brooklyn.vertical_reads == "down"
+    assert "смотрит вправо, 52° по часовой от верха листа" in brooklyn.vertical_reads_note
+
+
+def test_north_arrow_rotation_is_read_from_autocad(com):
+    builder, _app, doc = com(load_brooklyn())
+    read = builder.read_drawing_snapshot(doc)
+    (arrow,) = [symbol for symbol in read.symbols if symbol.name == "NA"]
+    assert math.degrees(arrow.rotation) == pytest.approx(308.237)
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert result.failed == []
+    assert (
+        "Направление текста: стрелка севера (блок NA, слой M-NTH-ARROW) смотрит вправо"
+        in result.report()
+    )
+    vertical = [
+        e for e in doc.ModelSpace.created
+        if e.ObjectName == "AcDbText" and e.TextString in {"PARTY WALL", "C.L.F. ATOP WALL"}
+    ]
+    assert len(vertical) == 3
+    assert all(math.degrees(e.Rotation) % 360.0 == pytest.approx(270.0, abs=0.2) for e in vertical)
 
 
 def test_fence_text_moves_away_from_parallel_property_line():
@@ -1199,7 +1313,8 @@ def fake_autocad(snapshot, *, with_leader=True, font_scale=None):
             FakeEntity(
                 "AcDbBlockReference", symbol.layer, HasAttributes=False,
                 InsertionPoint=(symbol.point[0], symbol.point[1], 0.0),
-                EffectiveName=symbol.name,
+                EffectiveName=symbol.name, Rotation=symbol.rotation,
+                XScaleFactor=symbol.x_scale, YScaleFactor=symbol.y_scale,
             )
         )
     return FakeApp(doc), doc
@@ -1597,7 +1712,8 @@ def load_field_fixture(name):
             # Вставка блока без атрибутов: условный знак (столб WUP, стрелка севера).
             snap.symbols.append(
                 fl.DrawingSymbol(layer=parts[1], name=parts[2],
-                                 point=(float(parts[3]), float(parts[4])))
+                                 point=(float(parts[3]), float(parts[4])),
+                                 rotation=math.radians(float(parts[5])) if len(parts) > 5 else 0.0)
             )
     return snap
 
@@ -1832,7 +1948,10 @@ def test_point_blocks_are_read_from_autocad_even_with_frozen_attribute_layers(co
         doc.Layers.items[name].Freeze = True
     space = doc.ModelSpace
     # Блоки, которые точками съёмки не являются: без атрибутов и с пустым описанием.
-    space.entities.append(FakeEntity("AcDbBlockReference", "M-NTH-ARROW", HasAttributes=False))
+    space.entities.append(FakeEntity(
+        "AcDbBlockReference", "0", HasAttributes=False, EffectiveName="LOGO",
+        InsertionPoint=(5060.0, 5100.0, 0.0),
+    ))
     space.entities.append(
         fake_point_block(fl.SurveyPoint(layer="0", number="1", description="", point=(4999.83, 4999.22)))
     )
@@ -2080,7 +2199,9 @@ def test_brooklyn_plan_matches_the_customer_final_drawing():
     # Общие стены — вдоль границы, со стороны соседей; столб — выноской.
     party = [item for item in plan.items if item.single_line == "PARTY WALL"]
     assert sorted(round(item.point[0], 1) for item in party) == [4992.7, 5015.7]
-    assert all(math.degrees(item.rotation) == pytest.approx(90.0, abs=0.1) for item in party)
+    # Стрелка севера смотрит вправо — вертикальный текст сверху вниз (у заказчика 270°).
+    assert all(math.degrees(item.rotation) == pytest.approx(-90.0, abs=0.1) for item in party)
+    assert math.degrees(by_text["C.L.F. ATOP WALL"].rotation) == pytest.approx(-89.9, abs=0.2)
     pole = by_text["UTILITY POLE"]
     assert (pole.kind, pole.text) == ("leader", "UTILITY\nPOLE")
     assert math.dist(pole.leader_points[0], (4997.49, 5017.47)) < 1.5  # знак WUP
@@ -2137,7 +2258,9 @@ def test_symbol_blocks_are_labeled_only_on_the_lot(com):
     # Из AutoCAD знак читается как вставка блока без атрибутов.
     builder, _app, doc = com(load_brooklyn())
     read = builder.read_drawing_snapshot(doc)
-    assert [(symbol.name, symbol.layer) for symbol in read.symbols] == [("WUP", "U-TRAF-IRON")]
+    assert [(symbol.name, symbol.layer) for symbol in read.symbols] == [
+        ("WUP", "U-TRAF-IRON"), ("NA", "M-NTH-ARROW"),
+    ]
     assert len(read.survey_points) == 43
 
 

@@ -799,7 +799,23 @@
     },
     "text_height_ft": null,
     "text_height_factor": 1.0,
-    "vertical_text_reads": "up",
+    "vertical_text_reads": "auto",
+    "north_arrow_block_names": [
+      "NA",
+      "NORTH",
+      "NORTH?ARROW*",
+      "NORTHARROW*",
+      "N?ARROW*",
+      "NARROW*"
+    ],
+    "north_arrow_layers": [
+      "M-NTH-ARROW",
+      "*NTH?ARROW*",
+      "*NORTH?ARROW*",
+      "*NORTHARROW*"
+    ],
+    "north_arrow_block_north_deg": 90.0,
+    "north_arrow_side_sector_deg": 45.0,
     "hide_field_notes_after_labeling": true,
     "fence_min_extra_length_ft": 4.0,
     "fence_text_offset_factor": 1.1,

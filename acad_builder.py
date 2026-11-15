@@ -48,6 +48,7 @@ from feature_labeler import (
     SurveyPoint,
     feature_settings,
     find_property_polygon,
+    is_north_arrow_block,
     is_file_reference,
     labels_similar,
     layer_matches,
@@ -56,6 +57,7 @@ from feature_labeler import (
     plain_text,
     property_polygon_from_selection,
     recognize_features,
+    vertical_text_direction,
 )
 from shapely import affinity as shapely_affinity
 from shapely.geometry import LineString, Point
@@ -2859,18 +2861,32 @@ class AcadBuilder:
         видно): описание точки — исходные данные распознавания. Блоки без
         атрибута-описания (стрелка севера, знаки) пропускаются.
         """
-        if not bool(getattr(entity, "HasAttributes", False)):
-            # Условный знак (столб WUP): блок без атрибутов с известным именем.
-            try:
-                name = str(entity.EffectiveName)
-            except Exception:  # noqa: BLE001 - старые версии AutoCAD
-                name = str(getattr(entity, "Name", "") or "")
-            if name and lookup_pattern_label(name, fcfg.get("symbol_block_labels")) is not None:
+        try:
+            name = str(entity.EffectiveName)
+        except Exception:  # noqa: BLE001 - старые версии AutoCAD
+            name = str(getattr(entity, "Name", "") or "")
+        has_attributes = bool(getattr(entity, "HasAttributes", False))
+        is_north = is_north_arrow_block(name, layer, fcfg)
+        if is_north or not has_attributes:
+            # Условный знак (столб WUP) — блок без атрибутов с известным именем;
+            # стрелка севера — по имени блока или слою, нужен её поворот.
+            known = bool(name) and lookup_pattern_label(name, fcfg.get("symbol_block_labels")) is not None
+            if is_north or known:
                 insertion = entity.InsertionPoint
+
+                def number(attribute: str, default: float) -> float:
+                    try:
+                        return float(getattr(entity, attribute))
+                    except Exception:  # noqa: BLE001 - свойства может не быть
+                        return default
+
                 snapshot.symbols.append(
                     DrawingSymbol(
                         layer=layer, name=name,
                         point=(float(insertion[0]), float(insertion[1])),
+                        rotation=number("Rotation", 0.0),
+                        x_scale=number("XScaleFactor", 1.0),
+                        y_scale=number("YScaleFactor", 1.0),
                     )
                 )
             return
@@ -5545,6 +5561,9 @@ class FeatureLabelPlan:
     width_scale: float = 1.0
     #: точек съёмки с описанием (блоки с атрибутами)
     survey_point_count: int = 0
+    #: как читается вертикальный текст ("up" / "down") и откуда это взято
+    vertical_reads: str = "up"
+    vertical_reads_note: str = ""
 
     def count_placement(self, placement: str) -> int:
         return sum(1 for item in self.items if item.placement == placement)
@@ -5629,6 +5648,10 @@ class FeatureLabelResult:
             f"полевых заметок {len(rec.field_notes)}",
             f"Точек съёмки с описанием в атрибутах блоков: {plan.survey_point_count}",
             f"Версия Шага 2: {STEP2_VERSION}",
+        ]
+        if plan.vertical_reads_note:
+            lines.append("Направление текста: " + plan.vertical_reads_note)
+        lines += [
             "",
             f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
             f"  • по заметкам полевого чертёжника (перевод в формулировки заказчика): {rec.by_notes}",
@@ -5955,7 +5978,7 @@ class _LabelPlacer:
         self.line_clear = float(self.fcfg.get("line_clearance_factor") or 0.0) * self.h
         self.inside_clear = float(self.fcfg.get("inside_clearance_factor") or 0.0) * self.h
         self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
-        self.reads = str(self.fcfg.get("vertical_text_reads") or "up")
+        self.reads, self.reads_note = vertical_text_direction(snapshot, self.fcfg)
         self.leader_style = str(self.fcfg.get("leader_style") or "arc").strip().lower()
         # Описание основного дома: свой слой, стиль и высота (как у заказчика).
         self.house_layer = str(self.fcfg.get("house_label_layer") or "").strip()
@@ -7072,4 +7095,6 @@ def plan_feature_labels(
         text_count=len(snapshot.texts),
         width_scale=placer.width_scale,
         survey_point_count=len(snapshot.survey_points),
+        vertical_reads=placer.reads,
+        vertical_reads_note=placer.reads_note,
     )

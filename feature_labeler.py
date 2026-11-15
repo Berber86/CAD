@@ -51,6 +51,10 @@ __all__ = [
     "DEFAULT_FEATURE_CONFIG",
     "DrawingLine",
     "DrawingSnapshot",
+    "NorthArrow",
+    "find_north_arrow",
+    "is_north_arrow_block",
+    "vertical_text_direction",
     "DrawingText",
     "Feature",
     "FieldNote",
@@ -392,9 +396,18 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- размещение подписей (acad_builder.py) -------------------------------
     "text_height_ft": None,
     "text_height_factor": 1.0,
-    #: вертикальный текст читается снизу вверх ("up", как в итоговом чертеже
-    #: заказчика: поворот +90°) или сверху вниз ("down", −90°)
-    "vertical_text_reads": "up",
+    #: вертикальный текст: "auto" — по стрелке севера (лист держат севером
+    #: вверх: стрелка смотрит вверх или влево — текст читается снизу вверх,
+    #: поворот +90°; стрелка смотрит вправо — сверху вниз, −90°); "up" / "down" —
+    #: всегда снизу вверх / всегда сверху вниз
+    "vertical_text_reads": "auto",
+    #: стрелка севера: вставка блока с таким именем или в таком слое
+    "north_arrow_block_names": ["NA", "NORTH", "NORTH?ARROW*", "NORTHARROW*", "N?ARROW*", "NARROW*"],
+    "north_arrow_layers": ["M-NTH-ARROW", "*NTH?ARROW*", "*NORTH?ARROW*", "*NORTHARROW*"],
+    #: куда смотрит север в собственных координатах блока (90° = вдоль +Y блока)
+    "north_arrow_block_north_deg": 90.0,
+    #: стрелка «смотрит вправо», если отклонена от оси +X меньше чем на столько градусов
+    "north_arrow_side_sector_deg": 45.0,
     #: после подписания выключить слои полевых заметок (их заменили подписи)
     "hide_field_notes_after_labeling": True,
     "fence_min_extra_length_ft": 4.0,
@@ -477,6 +490,108 @@ def feature_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
                 continue
             result[key] = copy.deepcopy(value)
     return result
+
+
+def _north_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Готовые настройки Шага 2 не копируются заново (вызов на каждую вставку блока)."""
+    if isinstance(cfg, dict) and "north_arrow_block_names" in cfg and "vertical_text_reads" in cfg:
+        return cfg
+    return feature_settings(cfg)
+
+
+def is_north_arrow_block(name: str, layer: str, cfg: dict[str, Any] | None) -> bool:
+    """Вставка блока — стрелка севера (по имени блока или по слою)."""
+    fcfg = _north_settings(cfg)
+    return layer_matches(name, fcfg.get("north_arrow_block_names")) or layer_matches(
+        layer, fcfg.get("north_arrow_layers")
+    )
+
+
+def find_north_arrow(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = None) -> "NorthArrow | None":
+    """
+    Стрелка севера среди вставок блоков чертежа (``snapshot.symbols``).
+
+    Блок, найденный по имени, важнее найденного только по слою. Направление —
+    поворот вставки плюс направление севера в самом блоке
+    (``north_arrow_block_north_deg``), с учётом зеркальной вставки.
+    """
+    fcfg = _north_settings(cfg)
+    names = fcfg.get("north_arrow_block_names")
+    layers = fcfg.get("north_arrow_layers")
+    by_name = [s for s in snapshot.symbols if layer_matches(s.name, names)]
+    by_layer = [s for s in snapshot.symbols if layer_matches(s.layer, layers)]
+    both = [s for s in by_name if s in by_layer]
+    found = both or by_name or by_layer
+    if not found:
+        return None
+    symbol = found[0]
+    try:
+        own = math.radians(float(fcfg.get("north_arrow_block_north_deg")))
+    except (TypeError, ValueError):
+        own = math.pi / 2.0
+    x_sign = -1.0 if symbol.x_scale < 0 else 1.0
+    y_sign = -1.0 if symbol.y_scale < 0 else 1.0
+    local = math.atan2(y_sign * math.sin(own), x_sign * math.cos(own))
+    north = math.degrees(float(symbol.rotation) + local) % 360.0
+    try:
+        sector = float(fcfg.get("north_arrow_side_sector_deg"))
+    except (TypeError, ValueError):
+        sector = 45.0
+    sector = min(max(sector, 0.0), 90.0)
+
+    def off(axis_deg: float) -> float:
+        return abs((north - axis_deg + 180.0) % 360.0 - 180.0)
+
+    if off(0.0) < sector:
+        side = "right"
+    elif off(180.0) < sector:
+        side = "left"
+    elif off(270.0) <= 90.0 - sector and off(270.0) < off(90.0):
+        side = "down"
+    else:
+        side = "up"
+    return NorthArrow(layer=symbol.layer, name=symbol.name, point=symbol.point, north_deg=north, side=side)
+
+
+def vertical_text_direction(
+    snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = None
+) -> tuple[str, str]:
+    """
+    Как читается вертикальный текст: ``("up" | "down", пояснение для отчёта)``.
+
+    Готовый лист держат стрелкой севера вверх. Если на экране стрелка смотрит
+    вправо, лист поворачивают против часовой стрелки — и вертикальная подпись
+    читается слева направо, только когда на экране она написана сверху вниз.
+    В остальных случаях (стрелка вверх или влево, стрелки нет) — снизу вверх.
+    """
+    fcfg = _north_settings(cfg)
+    setting = str(fcfg.get("vertical_text_reads") or "auto").strip().lower()
+    if setting in {"up", "down"}:
+        how = "снизу вверх" if setting == "up" else "сверху вниз"
+        return setting, f"вертикальные подписи читаются {how} (настройка vertical_text_reads: \"{setting}\")"
+    arrow = find_north_arrow(snapshot, fcfg)
+    if arrow is None:
+        return "up", (
+            "стрелка севера не найдена (блок NA, слой M-NTH-ARROW) — "
+            "вертикальные подписи читаются снизу вверх"
+        )
+    words = {"up": "вверх", "right": "вправо", "left": "влево", "down": "вниз"}
+    turn = arrow.clockwise_from_up_deg
+    if abs(turn) < 0.5:
+        tilt = "ровно вверх"
+    else:
+        tilt = f"{abs(turn):.0f}° {'по часовой' if turn > 0 else 'против часовой'} от верха листа"
+    reads = "down" if arrow.side == "right" else "up"
+    how = "снизу вверх" if reads == "up" else "сверху вниз"
+    tail = ""
+    if arrow.side == "right":
+        tail = ": лист читают, повернув севером вверх"
+    elif arrow.side == "down":
+        tail = " (стрелка вниз — проверьте поворот чертежа)"
+    return reads, (
+        f"стрелка севера (блок {arrow.name}, слой {arrow.layer}) смотрит {words[arrow.side]}, {tilt} — "
+        f"вертикальные подписи читаются {how}{tail}"
+    )
 
 
 class FeatureLabelError(RuntimeError):
@@ -742,11 +857,34 @@ class DrawingSymbol:
     layer: str
     name: str
     point: tuple[float, float]
+    #: поворот вставки, радианы, и знаки масштабов (зеркальная вставка)
+    rotation: float = 0.0
+    x_scale: float = 1.0
+    y_scale: float = 1.0
+
+
+@dataclass
+class NorthArrow:
+    """Стрелка севера чертежа и вывод из неё для вертикального текста."""
+
+    layer: str
+    name: str
+    point: tuple[float, float]
+    #: направление на север: градусы от оси +X против часовой стрелки, [0, 360)
+    north_deg: float
+    #: куда смотрит стрелка на экране: "up" / "right" / "down" / "left"
+    side: str
+
+    @property
+    def clockwise_from_up_deg(self) -> float:
+        """Отклонение стрелки от верха листа по часовой стрелке, (−180, 180]."""
+        value = (90.0 - self.north_deg) % 360.0
+        return value - 360.0 if value > 180.0 else value
 
 
 #: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
 #: программы работала (описания точек из атрибутов блоков читаются с 2.2).
-STEP2_VERSION = "2.5 (2026-11-14)"
+STEP2_VERSION = "2.6 (2026-11-14)"
 
 
 @dataclass

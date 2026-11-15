@@ -554,17 +554,23 @@ def test_long_fence_gets_text_parallel_to_line_with_offset():
     assert (item.kind, item.placement) == ("text", "along")
     # Вертикальный текст читается снизу вверх, как в итоговом чертеже заказчика.
     assert math.degrees(item.rotation) == pytest.approx(90.0, abs=1e-6)
-    # Отступ от линии забора = 1.1 * высоты текста, текст со стороны участка:
-    # между линией и буквами остаётся зазор в 0.6 высоты текста.
-    assert abs(item.point[0] - 39.8) == pytest.approx(1.1, abs=1e-6)
-    assert item.box.distance(LineString([(39.8, 0.0), (39.8, 100.0)])) == pytest.approx(0.6)
+    # Правило заказчика: между линией забора и буквами 0.7 ft при тексте 0.9 ft
+    # (масштаб 1"=16'), для другой высоты текста — пропорционально; текст со
+    # стороны участка.
+    gap = 0.7 * item.height / 0.9
+    assert item.box.distance(LineString([(39.8, 0.0), (39.8, 100.0)])) == pytest.approx(gap)
+    assert abs(item.point[0] - 39.8) == pytest.approx(gap + item.height / 2.0, abs=1e-6)
+    # Прежнее правило (доля высоты текста) остаётся настройкой.
+    old = make_plan(build_scene(), cfg={"feature_labeling": {"along_line_gaps_ft": {}}})
+    old_item = item_for(old, "FENCE_WOOD_RIGHT")
+    assert abs(old_item.point[0] - 39.8) == pytest.approx(1.1 * old_item.height, abs=1e-6)
     assert item.point[0] < 39.8
     assert 5.0 < item.point[1] < 95.0
 
     rear = item_for(plan, "CODE_CREW", "VINYL FENCE")
     assert (rear.kind, rear.placement) == ("text", "along")
     assert math.degrees(rear.rotation) == pytest.approx(0.0, abs=1e-6)
-    assert rear.point[1] == pytest.approx(99.6 - 1.1, abs=1e-6)
+    assert rear.point[1] == pytest.approx(99.6 - gap - rear.height / 2.0, abs=1e-6)
 
 
 def test_vertical_text_direction_is_configurable():
@@ -878,9 +884,10 @@ def test_fence_text_keeps_clear_of_fence_and_lot_lines():
     ):
         item = item_for(plan, layer)
         assert item.text == "CHAIN LINK FENCE" and item.placement == "along"
-        # Между линией забора и буквами — 0.6 высоты текста; текст внутри участка.
-        assert item.box.distance(fence) == pytest.approx(0.6 * 0.9, abs=1e-6), layer
-        assert item.box.distance(lot_line) > 0.5 * 0.9, layer
+        # Между линией забора и буквами — 0.7 ft, до границы участка — не меньше
+        # 0.8 ft (правило заказчика для 1"=16'); текст внутри участка.
+        assert item.box.distance(fence) == pytest.approx(0.7, abs=1e-6), layer
+        assert item.box.distance(lot_line) >= 0.8 - 1e-6, layer
         assert plan.recognition.boundary.polygon.contains(item.box), layer
 
 
@@ -1515,13 +1522,13 @@ def test_leader_is_a_spline_leader_object_like_the_customers(com):
     for leader in leaders:
         assert leader.Type == ab.AC_LEADER_SPLINE_WITH_ARROW == 3
         assert len(leader.Coordinates) == 6  # остриё у объекта и конец у текста
-        # Текст сбоку от выноски привязан к ней; текст над концом выноски — нет.
-        assert leader.Annotation is None or id(leader.Annotation) in texts
+        # Текст привязан к выноске (QLEADER): при переносе текста она идёт за ним.
+        assert id(leader.Annotation) in texts
         assert leader.Layer == "D-TOPO-TEXT"
         # В заглушке размерного стиля нет: стрелка 1.333 высоты текста (1.2 ft при 0.9 ft).
         assert leader.ArrowheadSize == pytest.approx(1.1 * 1.333) and leader.ScaleFactor == 1.0
-    assert [e for e in leaders if e.Annotation is not None]
-    assert "выносок — 2 (объектов Leader: 2)" in result.report()
+    assert result.created_leader_attached == 2
+    assert "выносок — 2 (объектов Leader: 2, из них с привязанным текстом (QLEADER): 2)" in result.report()
 
     # Стрелка размерного стиля чертежа, соразмерная тексту, не трогается.
     builder, _app, doc = com(build_stafford_scene())
@@ -2035,7 +2042,8 @@ def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
         assert expected in texts, expected
     # 32-я подпись — STEPS внутри лестницы бассейна: её контур замкнут (стык линий
     # сведён в общую точку), а замкнутый контур с описанием подписывается сам.
-    assert len(plan.items) == 32
+    # 33-я — вторая STEP у длинной ступени с изломом (правило заказчика).
+    assert len(plan.items) == 33
     assert plan.count_placement("leader") <= 3
     assert plan.survey_point_count == 93
     boxes = [item.box for item in plan.items]
@@ -2311,7 +2319,7 @@ def test_brooklyn_plan_matches_the_customer_final_drawing():
     })
     # Общие стены — вдоль границы, со стороны соседей; столб — выноской.
     party = [item for item in plan.items if item.single_line == "PARTY WALL"]
-    assert sorted(round(item.point[0], 1) for item in party) == [4992.7, 5015.7]
+    assert sorted(round(item.point[0], 1) for item in party) == [4992.7, 5015.8]
     # Стрелка севера смотрит вправо — вертикальный текст сверху вниз (у заказчика 270°).
     assert all(math.degrees(item.rotation) == pytest.approx(-90.0, abs=0.1) for item in party)
     assert math.degrees(by_text["C.L.F. ATOP CONC. WALL"].rotation) == pytest.approx(-89.9, abs=0.2)
@@ -2590,7 +2598,10 @@ def test_text_size_model_matches_what_autocad_really_drew():
     assert worst < 0.13
     # План по записи чертежа и результат в AutoCAD: те же тексты на тех же местах.
     # (с настройками версии 2.6, которая их создала)
-    v26 = {"front_yard_depth_ft": 0.0, "leader_text_gap_factor": 0.5, "fence_atop_wall_default": ""}
+    v26 = {
+        "front_yard_depth_ft": 0.0, "leader_text_gap_factor": 0.5, "fence_atop_wall_default": "",
+        "along_line_gaps_ft": {}, "leader_min_length_factor": 2.5,
+    }
     plan = brooklyn_plan(house="", cfg={"feature_labeling": v26})
     assert sorted(item.single_line for item in plan.items) == sorted(
         entity["text"].replace("\\P", " ") for entity in labels
@@ -2655,7 +2666,7 @@ def test_front_yard_fence_is_the_owners_fence_labeled_from_the_street():
     (inside,) = [item for item in old.items if item.single_line == "IRON FENCE"]
     assert inside.box.centroid.y > 4924.9
     # Чертёж без красной линии: правило не действует, остальное не меняется.
-    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 32
+    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 33
 
 
 # ---------------------------------------------------------------------------
@@ -2676,7 +2687,8 @@ ASPINWALL_FINAL_LABELS = [
     ("VINYL FENCE", "VINYL FENCE", (915477.6, 122541.1), 91.9, 1.0),
     ("VINYL FENCE", "VINYL FENCE", (915501.7, 122561.5), 0.0, 6.0),
     ("VINYL FENCE", "VINYL FENCE", (915528.3, 122529.0), 90.0, 1.0),
-    ("V.FE.", "VINYL FE.", (915474.0, 122518.6), 90.0, 2.5),
+    # у заказчика — за забором; программа ставит на участке, в 0.8 ft от границы
+    ("V.FE.", "VINYL FE.", (915474.0, 122518.6), 90.0, 2.8),
     ("V.FE.", "VIN.FE.", (915533.0, 122561.4), 0.0, 1.0),
     ("V.FE.", "VIN.FE.", (915471.6, 122561.9), 0.0, 1.0),
     ("V.FE.", "VIN.FE.", (915532.8, 122496.6), 0.0, 2.5),   # у заказчика ещё GATE над линией
@@ -2918,7 +2930,7 @@ def test_fence_runs_leaving_the_lot_get_their_own_abbreviation():
     short = [item.box.centroid.coords[0] for item in plan.items if item.single_line == "V.FE."]
     assert len(short) == 5
     # Два первых — участки за углом участка: у заказчика VIN.FE. в тех же местах.
-    for expected in [(915472.0, 122562.2), (915472.1, 122512.5), (915476.1, 122518.6),
+    for expected in [(915472.0, 122562.0), (915472.1, 122512.6), (915476.5, 122518.6),
                      (915532.4, 122498.7), (915532.9, 122561.5)]:
         assert any(math.dist(point, expected) < 0.2 for point in short), expected
     old = aspinwall_plan(cfg={"feature_labeling": {"fence_label_runs_beyond_lot": False}})
@@ -3298,3 +3310,254 @@ def test_drawing_is_regenerated_after_labeling(com):
     builder, _app, doc = com(load_brooklyn(), feature_cfg={"regen_after_labeling": False})
     builder.label_features(house_text=BROOKLYN_HOUSE)
     assert not getattr(doc, "regens", [])
+
+
+# ---------------------------------------------------------------------------
+# Правила заказчика от 15.11.2026 (вторая часть): просветы до линий, сторона
+# подписи забора, DRIVEWAY вдоль движения, длинная ступень с изломом, O.P. по
+# центру площадки, выноска QLEADER со стрелкой.
+# ---------------------------------------------------------------------------
+
+def fence_strip_scene(fence_x):
+    """Участок 40 × 100 ft с домом и сетчатым забором вдоль правой границы (x = 40)."""
+    snap = small_house_scene(20.0, 30.0)
+    snap.lines.append(DrawingLine("FENCE_CHAIN_RIGHT", ((fence_x, 30.0), (fence_x, 80.0))))
+    return snap
+
+
+def chain_label(plan):
+    (item,) = [i for i in plan.items if i.feature.layer == "FENCE_CHAIN_RIGHT"]
+    assert item.placement == "along"
+    return item
+
+
+def test_text_along_a_line_keeps_the_customers_gaps():
+    """
+    0.7 ft от линии забора, 0.8 ft от границы участка (масштаб 1"=16', текст 0.9 ft);
+    для других масштабов — пропорционально высоте текста.
+    """
+    assert fl.DEFAULT_FEATURE_CONFIG["along_line_gaps_ft"] == {
+        "fence": 0.7, "house": 0.7, "property": 0.8, "other": 0.55,
+    }
+    lot_line = LineString([(40.0, 0.0), (40.0, 100.0)])
+    # Забор далеко от границы: текст на стороне участка, ровно в 0.7 ft от линии.
+    item = chain_label(make_plan(fence_strip_scene(35.0), house=ASPINWALL_HOUSE, height=0.9))
+    fence = LineString([(35.0, 30.0), (35.0, 80.0)])
+    assert item.box.centroid.x < 35.0
+    assert item.box.distance(fence) == pytest.approx(0.7, abs=1e-6)
+    # Забор в 0.1 ft от границы: текст отодвинут так, чтобы до границы было 0.8 ft.
+    item = chain_label(make_plan(fence_strip_scene(39.9), house=ASPINWALL_HOUSE, height=0.9))
+    assert item.box.centroid.x < 39.9
+    assert 0.8 - 1e-6 <= item.box.distance(lot_line) < 0.8 + 0.06 * 0.9
+    # Масштаб 1"=20': текст 1.125 ft, просветы 0.875 и 1.0 ft.
+    height = 0.9 * 20.0 / 16.0
+    item = chain_label(make_plan(fence_strip_scene(35.0), house=ASPINWALL_HOUSE, height=height))
+    assert item.box.distance(fence) == pytest.approx(0.7 * 20.0 / 16.0, abs=1e-6)
+    item = chain_label(make_plan(fence_strip_scene(39.9), house=ASPINWALL_HOUSE, height=height))
+    assert item.box.distance(lot_line) >= 0.8 * 20.0 / 16.0 - 1e-6
+
+
+def test_fence_label_is_not_squeezed_between_the_fence_and_the_lot_line():
+    """
+    Забор за забором: между его линией и границей участка 1.8 ft — подпись с
+    просветами 0.7 и 0.8 ft туда не помещается и ставится за линию забора.
+    """
+    snap = fence_strip_scene(41.8)
+    item = chain_label(make_plan(snap, house=ASPINWALL_HOUSE, height=0.9))
+    assert item.box.bounds[0] >= 41.8 + 0.7 - 1e-6           # справа от забора, не в полосе
+    # Прежнее правило ставило подпись в полосу, вплотную к обеим линиям.
+    old = chain_label(make_plan(
+        snap, house=ASPINWALL_HOUSE, height=0.9, cfg={"feature_labeling": {"along_line_gaps_ft": {}}},
+    ))
+    assert 40.0 < old.box.centroid.x < 41.8
+
+    # «12 Ilion Place»: C.L.F. справа от дома, напротив его середины (замечание заказчика).
+    plan = make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)
+    (label,) = [
+        i for i in plan.items
+        if i.single_line == "C.L.F." and i.placement == "along" and abs(i.box.centroid.y - 5040.1) < 1.0
+    ]
+    assert label.box.bounds[0] > 5041.8 + 0.6                # за линией забора (x ≈ 5041.8)
+
+
+def test_driveway_text_runs_along_the_direction_of_travel():
+    """DRIVEWAY пишется вдоль движения по заезду; не хватает места — DRIVE."""
+    assert fl.DEFAULT_FEATURE_CONFIG["travel_direction_labels"] == {"DRIVEWAY": "DRIVE"}
+    plan = make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)
+    (item,) = [i for i in plan.items if i.single_line == "DRIVEWAY"]
+    # Заезд 9.7 ft поперёк и 17.4 ft вдоль: текст вертикальный (у заказчика 90.4°).
+    assert item.placement == "inside"
+    assert math.degrees(item.rotation) == pytest.approx(90.0, abs=1.0)
+    # Без правила текст стоял по горизонтали — поперёк движения.
+    old = make_plan(
+        load_ilion(), house=ILION_HOUSE, height=0.9,
+        cfg={"feature_labeling": {"travel_direction_labels": {}}},
+    )
+    (item,) = [i for i in old.items if i.single_line == "DRIVEWAY"]
+    assert math.degrees(item.rotation) == pytest.approx(0.0, abs=1.0)
+
+    def driveway_item(width, length):
+        snap = small_house_scene(20.0, 30.0)
+        snap.lines.append(DrawingLine(
+            "DRIVEWAY_EDGE",
+            ((30.0, 5.0), (30.0 + width, 5.0), (30.0 + width, 5.0 + length), (30.0, 5.0 + length)),
+            closed=True,
+        ))
+        plan = make_plan(snap, house=ASPINWALL_HOUSE, height=0.9)
+        (item,) = [i for i in plan.items if i.feature.layer == "DRIVEWAY_EDGE"]
+        return item
+
+    # Заезд 5 × 6.5 ft: вдоль движения полное слово (6.1 ft) не помещается — DRIVE.
+    item = driveway_item(5.0, 6.5)
+    assert item.text == "DRIVE" and math.degrees(item.rotation) == pytest.approx(90.0, abs=0.1)
+    synonyms = fl.DEFAULT_FEATURE_CONFIG["label_synonyms"]
+    assert fl.labels_similar("DRIVE", "DRIVEWAY", synonyms) and fl.labels_similar("DRIVEWAY", "DRIVE", synonyms)
+    # Заезд 6 × 20 ft: DRIVEWAY вдоль.
+    item = driveway_item(6.0, 20.0)
+    assert item.text == "DRIVEWAY" and math.degrees(item.rotation) == pytest.approx(90.0, abs=0.1)
+
+
+def test_long_step_with_a_jog_is_labeled_at_the_middle_of_each_long_run():
+    """
+    Ступень через весь задний двор: два длинных участка, соединённых коротким.
+    STEP ставится дважды — у середины каждого длинного участка (у заказчика так же).
+    """
+    plan = make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)
+    long_step = [
+        i for i in plan.items if i.single_line == "STEP" and i.feature.geometry.length > 80.0
+    ]
+    assert len(long_step) == 2 and all(i.placement == "beside" for i in long_step)
+    centers = sorted(i.box.centroid.coords[0] for i in long_step)
+    # Подписи заказчика: (5003.8, 5009.3) и (5025.2, 5005.7).
+    assert math.dist(centers[0], (5003.8, 5009.3)) < 2.5
+    assert math.dist(centers[1], (5025.2, 5005.7)) < 2.5
+    step = long_step[0].feature.geometry
+    for item in long_step:
+        assert math.degrees(item.rotation) == pytest.approx(0.0, abs=1.0)
+        assert item.box.distance(step) == pytest.approx(0.55, abs=0.05)   # «прочие линии» — 0.55 ft
+    # Правило выключено — одна подпись, как раньше.
+    old = make_plan(
+        load_ilion(), house=ILION_HOUSE, height=0.9,
+        cfg={"feature_labeling": {"arm_label_categories": []}},
+    )
+    assert len([
+        i for i in old.items if i.single_line == "STEP" and i.feature.geometry.length > 80.0
+    ]) == 1
+
+
+def test_open_porch_label_sits_in_the_middle_of_the_porch_itself():
+    """
+    Крыльцо обведено вместе со ступенями (три проступи в том же слое): O.P.
+    ставится по центру самой площадки, а не общего контура.
+    """
+    plan = make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)
+    (item,) = [i for i in plan.items if i.single_line == "O.P."]
+    porch = shapely_box(5002.81, 5039.79, 5006.23, 5046.07)   # площадка без ступеней
+    assert item.placement == "inside" and porch.contains(item.box)
+    center = item.box.centroid
+    assert (center.x, center.y) == pytest.approx((porch.centroid.x, porch.centroid.y), abs=0.1)
+    # Раньше подпись стояла в центре контура «площадка + ступени», у самой проступи.
+    old = make_plan(
+        load_ilion(), house=ILION_HOUSE, height=0.9,
+        cfg={"feature_labeling": {"main_cell_categories": []}},
+    )
+    (item,) = [i for i in old.items if i.single_line == "O.P."]
+    assert item.box.centroid.y == pytest.approx(5044.43, abs=0.1)
+
+
+def test_every_leader_is_long_enough_for_its_arrowhead_and_carries_its_text(com):
+    """
+    AutoCAD рисует стрелку объекта Leader, только если выноска длиннее двух
+    стрелок (2 × 1.2 = 2.4 ft). У заказчика самая короткая выноска — 2.50 ft,
+    текст всегда привязан к выноске (QLEADER).
+    """
+    for name, plan in (
+        ("ilion", make_plan(load_ilion(), house=ILION_HOUSE, height=0.9)),
+        ("brooklyn", brooklyn_plan()),
+        ("aspinwall", aspinwall_plan()),
+    ):
+        leaders = [i for i in plan.items if i.kind == "leader"]
+        assert leaders, name
+        for item in leaders:
+            length = math.dist(item.leader_points[0], item.leader_points[1])
+            assert length >= 2.5, (name, item.single_line, length)
+            assert item.attach_annotation, (name, item.single_line)
+
+    # Чужая настройка с короткой выноской: стрелка уменьшается, чтобы AutoCAD её нарисовал.
+    builder, _app, doc = com(load_ilion(), feature_cfg={"leader_min_length_factor": 1.5})
+    original = doc.ModelSpace.AddLeader
+
+    def styled_leader(coordinates, annotation, leader_type):
+        leader = original(coordinates, annotation, leader_type)
+        leader.ArrowheadSize, leader.ScaleFactor = 1.2, 1.0
+        return leader
+
+    doc.ModelSpace.AddLeader = styled_leader
+    result = builder.label_features(house_text=ILION_HOUSE, text_height=0.9)
+    leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
+    assert leaders and result.created_leader_attached == len(leaders)
+    short = 0
+    for leader in leaders:
+        x0, y0, _z0, x1, y1, _z1 = leader.Coordinates
+        length = math.hypot(x1 - x0, y1 - y0)
+        assert length >= 2.1 * leader.ArrowheadSize - 1e-9
+        short += leader.ArrowheadSize < 1.2
+    assert short >= 1
+
+    # AutoCAD не принял текст в AddLeader: Leader создаётся без него, текст
+    # привязывается свойством Annotation.
+    builder, _app, doc = com(load_ilion())
+    original = doc.ModelSpace.AddLeader
+
+    def picky_leader(coordinates, annotation, leader_type):
+        if annotation is not None:
+            raise RuntimeError("Invalid argument Annotation")
+        return original(coordinates, annotation, leader_type)
+
+    doc.ModelSpace.AddLeader = picky_leader
+    result = builder.label_features(house_text=ILION_HOUSE, text_height=0.9)
+    leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
+    assert result.warnings == [] and result.created_leader_attached == len(leaders) == 3
+    assert all(leader.Annotation is not None for leader in leaders)
+
+    # Привязать текст не удалось вовсе — отчёт говорит об этом и называет причину.
+    class LooseLeader(FakeLeader):
+        @property
+        def Annotation(self):
+            return None
+
+        @Annotation.setter
+        def Annotation(self, value):
+            if value is not None:
+                raise RuntimeError("Annotation is read-only")
+
+    builder, _app, doc = com(load_ilion())
+
+    def loose_leader(coordinates, annotation, leader_type):
+        if annotation is not None:
+            raise RuntimeError("Invalid argument Annotation")
+        return doc.ModelSpace._created(
+            LooseLeader("AcDbLeader", "0", Coordinates=list(coordinates), Type=leader_type)
+        )
+
+    doc.ModelSpace.AddLeader = loose_leader
+    result = builder.label_features(house_text=ILION_HOUSE, text_height=0.9)
+    assert (result.created_leader_objects, result.created_leader_attached) == (3, 0)
+    (warning,) = [w for w in result.warnings if "Leader" in w]
+    assert "не привязал к нему текст" in warning
+    assert "Invalid argument Annotation" in warning and "Annotation is read-only" in warning
+    assert "объектов Leader: 3, из них с привязанным текстом (QLEADER): 0" in result.report()
+
+
+def test_fence_on_wall_duplicate_check_knows_abbreviations_both_ways():
+    """Полное название на чертеже и сокращение в новой подписи (и наоборот) — одна и та же подпись."""
+    synonyms = fl.DEFAULT_FEATURE_CONFIG["label_synonyms"]
+    for existing, label in (
+        ("CHAIN LINK FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL"),
+        ("C.L.F. ATOP C.WALL", "CHAIN LINK FENCE ATOP CONC. WALL"),
+        ("C.L.F. ATOP CONC. WALL", "C.L.F. ATOP C.WALL"),
+        ("VINYL FENCE ATOP MASONRY WALL", "V.FE. ATOP CONC. WALL"),
+    ):
+        assert fl.labels_similar(existing, label, synonyms), (existing, label)
+    assert not fl.labels_similar("VINYL FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL", synonyms)
+    assert not fl.labels_similar("C.L.F. ATOP CONC. WALL", "C.L.F.", synonyms)

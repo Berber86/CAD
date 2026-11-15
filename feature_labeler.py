@@ -438,7 +438,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         "MANHOLE": ["M.H."],
         "HYDRANT": ["HYD."],
         "CONC. WALK": ["CONCRETE WALK", "CONCRETE SIDEWALK", "CONC. SIDEWALK"],
-        "DRIVEWAY": ["DRWY.", "D/W"],
+        "DRIVEWAY": ["DRWY.", "D/W", "DRIVE"],
+        "DRIVE": ["DRIVEWAY"],
         "FRAME DECK": ["WOOD DECK", "WD. DECK"],
         "O.P.": ["OPEN PORCH", "PORCH"],
         "PLANTER": ["PLANT."],
@@ -466,7 +467,35 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: после подписания выключить слои полевых заметок (их заменили подписи)
     "hide_field_notes_after_labeling": True,
     "fence_min_extra_length_ft": 4.0,
+    #: Открытое крыльцо, обведённое вместе со ступенями (ступени отделены линиями
+    #: того же слоя): подпись ставится по центру самой площадки — наибольшей
+    #: части контура, если она занимает не меньше этой доли его площади.
+    "main_cell_categories": ["porch"],
+    "main_cell_min_share": 0.5,
+    #: Длинная ступень с изломом (два длинных участка, соединённых коротким) —
+    #: правило заказчика: подпись у середины каждого длинного участка.
+    #: Категории объектов, наименьшая длина участка и наибольшая ширина ленты, ft.
+    "arm_label_categories": ["steps"],
+    "arm_label_min_length_ft": 8.0,
+    "arm_label_max_width_ft": 3.0,
+    #: Подписи, которые пишутся вдоль направления движения (правило заказчика):
+    #: ``DRIVEWAY`` — вдоль заезда, а не поперёк. Значение — короткая форма на
+    #: случай, когда полное слово вдоль заезда не помещается (``DRIVE``).
+    #: Направление движения — длинная сторона контура заезда; у почти квадратного
+    #: контура (стороны отличаются меньше чем в ``travel_axis_min_ratio`` раз)
+    #: направление не определяется и текст ставится как обычно.
+    "travel_direction_labels": {"DRIVEWAY": "DRIVE"},
+    "travel_axis_min_ratio": 1.25,
+    #: Просвет между линией и текстом, написанным вдоль неё (правило заказчика), ft
+    #: при масштабе 1"=16' — для других масштабов пропорционально высоте текста:
+    #: забор 0.7, линия дома 0.7, граница участка 0.8 (чтобы подпись не сливалась с
+    #: толстой линией при печати), остальные линии 0.55. Те же просветы подпись
+    #: держит до соседних линий сбоку: между забором и границей в 1.8 ft она не
+    #: встаёт, а переносится за забор. Пустой словарь — прежнее правило
+    #: (``fence_text_offset_factor`` и общий ``line_clearance_factor``).
+    "along_line_gaps_ft": {"fence": 0.7, "house": 0.7, "property": 0.8, "other": 0.55},
     #: расстояние от линии забора до середины текста, в высотах текста
+    #: (действует, когда ``along_line_gaps_ft`` пуст)
     "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
     #: зазор между концом текста вдоль линии и поперечной линией, в высотах текста
@@ -522,7 +551,10 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: Если AutoCAD не создаёт Leader, чертится полилиния.
     "leader_style": "spline",
     "leader_arc_bulge": 0.25,
-    "leader_min_length_factor": 2.5,
+    #: Наименьшая длина выноски, в высотах текста. AutoCAD рисует стрелку объекта
+    #: Leader, только если выноска длиннее двух стрелок (2 x 1.2 = 2.4 ft при
+    #: 1"=16'); у заказчика самая короткая из 42 выносок — 2.50 ft. 2.8 x 0.9 = 2.52 ft.
+    "leader_min_length_factor": 2.8,
     "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
     #: зазор между концом выноски и текстом (у заказчика 0.30 ft при тексте 0.9 ft)
@@ -534,6 +566,12 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: 2.2 высоты текста — ставится такая, в высотах текста
     "leader_object_arrow_factor": 1.333,
     "leader_attach_annotation": True,
+    #: Текст над (под) концом выноски вместо текста сбоку — запасной вариант:
+    #: у заказчика текст всегда сбоку. Штраф в «высотах текста длины выноски».
+    "leader_stacked_penalty": 2.0,
+    #: выноска короче этого числа стрелок осталась бы без стрелки — стрелка такой
+    #: выноски уменьшается (страховка для чужого размерного стиля)
+    "leader_min_length_arrows": 2.1,
     #: текстовый стиль подписей: стиль чертежа заказчика, если он есть; если
     #: нет — стиль программы (drawing.text_style, шрифт romans.shx)
     "label_text_style": "ROMANS",
@@ -1134,10 +1172,14 @@ def labels_similar(existing_text: str, label: str, synonyms: Any = None) -> bool
             any(token.endswith("WALL") for token in tokens[cut + 1:])
             for tokens, cut in ((existing, cut_existing), (wanted_tokens, cut_wanted))
         ]
-        if all(walls) and cut_existing > 0 and cut_wanted > 0 and labels_similar(
-            " ".join(existing[:cut_existing]), " ".join(wanted_tokens[:cut_wanted]), synonyms
-        ):
-            return True
+        if all(walls) and cut_existing > 0 and cut_wanted > 0:
+            fences = (" ".join(existing[:cut_existing]), " ".join(wanted_tokens[:cut_wanted]))
+            # В обе стороны: на чертеже полное название, а новая подпись — сокращение
+            # («CHAIN LINK FENCE ATOP MASONRY WALL» и «C.L.F. ATOP CONC. WALL»), и наоборот.
+            if labels_similar(fences[0], fences[1], synonyms) or labels_similar(
+                fences[1], fences[0], synonyms
+            ):
+                return True
     variants = [label]
     if isinstance(synonyms, dict):
         wanted_key = " ".join(label_tokens(label))

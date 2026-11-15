@@ -840,7 +840,11 @@
       ],
       "DRIVEWAY": [
         "DRWY.",
-        "D/W"
+        "D/W",
+        "DRIVE"
+      ],
+      "DRIVE": [
+        "DRIVEWAY"
       ],
       "FRAME DECK": [
         "WOOD DECK",
@@ -883,6 +887,25 @@
     "regen_after_labeling": true,
     "hide_field_notes_after_labeling": true,
     "fence_min_extra_length_ft": 4.0,
+    "main_cell_categories": [
+      "porch"
+    ],
+    "main_cell_min_share": 0.5,
+    "arm_label_categories": [
+      "steps"
+    ],
+    "arm_label_min_length_ft": 8.0,
+    "arm_label_max_width_ft": 3.0,
+    "travel_direction_labels": {
+      "DRIVEWAY": "DRIVE"
+    },
+    "travel_axis_min_ratio": 1.25,
+    "along_line_gaps_ft": {
+      "fence": 0.7,
+      "house": 0.7,
+      "property": 0.8,
+      "other": 0.55
+    },
     "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
     "fence_text_end_gap_factor": 0.15,
@@ -913,13 +936,15 @@
     "field_note_surface_radius_ft": 15.0,
     "leader_style": "spline",
     "leader_arc_bulge": 0.25,
-    "leader_min_length_factor": 2.5,
+    "leader_min_length_factor": 2.8,
     "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
     "leader_text_gap_factor": 0.333,
     "leader_arrow_size_factor": 0.8,
     "leader_object_arrow_factor": 1.333,
     "leader_attach_annotation": true,
+    "leader_stacked_penalty": 2.0,
+    "leader_min_length_arrows": 2.1,
     "label_text_style": "ROMANS",
     "front_yard_depth_ft": 15.0
   }

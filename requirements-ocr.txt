@@ -1,9 +1,14 @@
-# Локальное распознавание сканов (бесплатно, без ИИ и без интернета).
+# Local OCR of scanned deeds (free, offline, no API keys).
 #
-# Необязательно: без этих пакетов программа работает как раньше — скан уходит
-# в платный ИИ/Vision. С ними скан распознаётся на месте (RapidOCR, ONNX, CPU):
-# 4–6 с на страницу, румбы и длины читаются, ошибку в цифрах ловит замыкание.
+# ASCII only! pip on Windows reads requirements files in the system locale
+# (cp1251 on a Russian Windows), so Cyrillic comments break the install.
+# The Russian explanation lives in README.md.
 #
-# Вес: сам пакет ~16 МБ + onnxruntime ~78 МБ + opencv ~70 МБ.
-# Установка:  .venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
+# Optional: without it the program behaves as before and scans go to the paid
+# AI/Vision pass. With it a scan is recognised on the machine (RapidOCR on
+# ONNX, CPU): about 5 seconds per page at 400 dpi, bearings and distances read
+# reliably, and a misread digit is caught by the closure check.
+#
+# Weight: ~16 MB package + ~78 MB onnxruntime + ~70 MB opencv.
+# Install:  .venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
 rapidocr-onnxruntime>=1.4

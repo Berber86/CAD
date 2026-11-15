@@ -1,7 +1,7 @@
-# Title Survey AI (v3.10)
+# Title Survey AI (v3.10.1)
 
 > Версия программы одна на всё приложение и задаётся в `version.py`: она стоит в левом верхнем углу
-> окна (`v3.10 · STUDIO`), в заголовке окна (с датой) и в отчёте Шага 2 (`Версия Шага 2: 3.10 (…)`).
+> окна (`v3.10.1 · STUDIO`), в заголовке окна (с датой) и в отчёте Шага 2 (`Версия Шага 2: 3.10.1 (…)`).
 > Правила заказчика, по которым работает Шаг 2, и те, что ждут своей очереди, — в
 > [docs/customer_rules.md](docs/customer_rules.md).
 
@@ -439,6 +439,24 @@ docs/samples/example-1-metes-and-bounds.txt docs/preview-example.png`
    py -3.11 -m venv .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    .venv\Scripts\python.exe main.py
+   ```
+
+   **Только ASCII в `requirements*.txt`.** Файлы зависимостей pip читает в кодировке
+   системы, а не в UTF-8: на русской Windows это cp1251, и русский комментарий в UTF-8
+   роняет установку с `UnicodeDecodeError: 'charmap' codec can't decode byte 0x98 … decoding
+   with 'cp1251' codec failed`. Поэтому в `requirements.txt` и `requirements-ocr.txt`
+   комментарии только латиницей (по-русски — здесь, в README), а за этим следит
+   `tests/test_requirements.py`. Сам `run.bat` в UTF-8 — ему кодировка не мешает, он
+   переключает консоль на 65001.
+
+   **Локальный OCR — необязательный набор.** `requirements.txt` ставит программу, а
+   `requirements-ocr.txt` (`rapidocr-onnxruntime`, ~166 МБ) — бесплатное распознавание
+   сканов. `run.bat` пробует его доставить и, если не вышло (нет интернета, старая
+   версия Python), **не срывает запуск**: пишет «Локальный OCR не установлен — сканы
+   пойдут в ИИ» и продолжает. Поставить позже можно вручную:
+
+   ```bat
+   .venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
    ```
 
 3. Запустите **AutoCAD** и откройте рабочий DWG-чертёж (единицы чертежа — футы).

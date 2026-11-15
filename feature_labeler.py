@@ -354,6 +354,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- зона поиска и допуски геометрии ------------------------------------
     "search_buffer_ft": 50.0,
     "min_property_area_sqft": 200.0,
+    #: два контура участка в разных слоях (граница Шага 1 и участок геодезиста)
+    #: считаются расходящимися, если их общая площадь меньше этой доли объединённой
+    "property_mismatch_overlap": 0.85,
     "boundary_snap_tolerance_ft": 0.05,
     "boundary_gap_tolerance_ft": 2.0,
     "merge_tolerance_ft": 0.05,
@@ -1265,6 +1268,33 @@ def _choose_property_candidate(
     return scored[0][2], ambiguous
 
 
+def _boundary_mismatch_note(
+    chosen: PropertyBoundary, other: PropertyBoundary, limit: float
+) -> str:
+    """
+    Предупреждение, если два контура участка из разных слоёв расходятся:
+    общая площадь меньше ``limit`` от объединённой (IoU). Пусто — совпадают.
+    """
+    if limit <= 0.0:
+        return ""
+    try:
+        union = chosen.polygon.union(other.polygon).area
+        common = chosen.polygon.intersection(other.polygon).area
+    except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+        return ""
+    if union <= 0.0 or common / union >= limit:
+        return ""
+    chosen_area = f"{chosen.area_sqft:,.0f}".replace(",", " ")
+    other_area = f"{other.area_sqft:,.0f}".replace(",", " ")
+    return (
+        f"ВНИМАНИЕ: граница слоя {chosen.layer} ({chosen_area} sq ft) расходится с "
+        f"участком слоя {other.layer} ({other_area} sq ft): совпадают на "
+        f"{100.0 * common / union:.0f} %. Подписи рассчитаны по {chosen.layer}; проверьте "
+        f"посадку этой границы. Если верен контур {other.layer}, запустите Шаг 2 в режиме "
+        "«указать границу в AutoCAD» и выберите его линии"
+    )
+
+
 def find_property_polygon(
     snapshot: DrawingSnapshot, cfg: dict[str, Any] | None = None
 ) -> PropertyBoundary:
@@ -1306,6 +1336,8 @@ def find_property_polygon(
     survey_lines: list[LineString] | None = None
     seen: list[str] = []
     empty: PropertyBoundary | None = None  # контур, внутри которого ничего не снято
+    primary: PropertyBoundary | None = None  # выбранный контур
+    mismatch_limit = float(fcfg.get("property_mismatch_overlap") or 0.0)
     for rank in sorted(by_rank):
         layers = by_rank[rank]
         layer_name = ", ".join(sorted(layers))
@@ -1348,9 +1380,21 @@ def find_property_polygon(
             )
         gap = float(gaps.get(index, 0.0))
         if gap > 0.0:
-            notes.append(
-                f"контур границы не был замкнут: разрыв {gap:.2f} ft закрыт автоматически"
-            )
+            note = f"контур границы не был замкнут: разрыв {gap:.2f} ft закрыт автоматически"
+            if closers and not closed_by:
+                # Недостающая сторона — фасадная: она начерчена красной линией улицы.
+                own = unary_union(lines).buffer(max(snap_tol, 0.05))
+                rest = polygon.exterior.difference(own)
+                street = unary_union(
+                    [geom for group in closers.values() for geom in group]
+                ).buffer(0.1)
+                if rest.length > 0.0 and rest.difference(street).length <= 0.05 * rest.length:
+                    note = (
+                        f"в слое {layer_name} граница не замкнута: недостающая сторона "
+                        f"({gap:.2f} ft) идёт по линии слоя {', '.join(sorted(closers))} "
+                        "(красная линия улицы)"
+                    )
+            notes.append(note)
         if len(polygons) > 1:
             notes.append(
                 f"в слое {layer_name} найдено замкнутых контуров: {len(polygons)}; выбран "
@@ -1362,16 +1406,26 @@ def find_property_polygon(
             candidates=len(polygons), closed_gap_ft=gap, notes=notes,
         )
         if not survey_lines or _activity_score(polygon, survey_lines) > 0.0:
+            if primary is not None:
+                # Второй контур участка в другом слое (граница Шага 1 и участок
+                # геодезиста): если они заметно расходятся — предупреждение.
+                mismatch = _boundary_mismatch_note(primary, found, mismatch_limit)
+                if mismatch:
+                    primary.notes.append(mismatch)
+                break
             if empty is not None:
                 found.notes.append(
                     f"контур слоя {empty.layer} пропущен: внутри него нет снятых заборов и "
                     f"строений (он начерчен в стороне от съёмки); взят слой {layer_name}"
                 )
-            return found
+            primary = found
+            continue
         # Контур есть, но съёмки внутри нет (например, граница Шага 1 начерчена
         # в стороне): смотрим следующие слои, этот оставляем запасным.
-        if empty is None:
+        if empty is None and primary is None:
             empty = found
+    if primary is not None:
+        return primary
     if empty is not None:
         return empty
     raise FeatureLabelError(

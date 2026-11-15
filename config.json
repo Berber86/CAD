@@ -723,6 +723,7 @@
     "step_count_label_format_single": "{n} STEP",
     "search_buffer_ft": 50.0,
     "min_property_area_sqft": 200.0,
+    "property_mismatch_overlap": 0.85,
     "boundary_snap_tolerance_ft": 0.05,
     "boundary_gap_tolerance_ft": 2.0,
     "merge_tolerance_ft": 0.05,

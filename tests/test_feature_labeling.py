@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from shapely.geometry import LineString
+from shapely.geometry import box as shapely_box
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -1192,6 +1193,15 @@ def fake_autocad(snapshot, *, with_leader=True, font_scale=None):
     for survey in snapshot.survey_points:
         doc.Layers.items.setdefault(survey.layer, FakeLayer(survey.layer))
         space.entities.append(fake_point_block(survey))
+    for symbol in snapshot.symbols:
+        doc.Layers.items.setdefault(symbol.layer, FakeLayer(symbol.layer))
+        space.entities.append(
+            FakeEntity(
+                "AcDbBlockReference", symbol.layer, HasAttributes=False,
+                InsertionPoint=(symbol.point[0], symbol.point[1], 0.0),
+                EffectiveName=symbol.name,
+            )
+        )
     return FakeApp(doc), doc
 
 
@@ -1283,12 +1293,13 @@ def test_label_features_draws_into_d_topo_text(com):
         "C.L.F.", "CHAIN LINK FENCE", "GRASS", "VINYL FENCE", "WOOD FENCE",
     ]
     assert all(e.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for e in texts)
-    assert all(e.Height == pytest.approx(0.9) for e in texts + mtexts)
+    assert all(e.Height == pytest.approx(0.9) for e in texts + mtexts if e.Layer != "0")
     wood = next(e for e in texts if e.TextString == "WOOD FENCE")
     assert math.degrees(wood.Rotation) == pytest.approx(90.0)  # вертикальный текст — снизу вверх
 
     house = next(e for e in mtexts if e.TextString == HOUSE)
     assert house.AttachmentPoint == ab.AC_ATTACHMENT_MIDDLE_CENTER
+    assert (house.Layer, house.Height) == ("0", pytest.approx(1.5, abs=0.01))
     assert house.InsertionPoint[:2] == pytest.approx([23.0, 46.0])
     assert house.Width == 0.0
     assert {e.TextString for e in mtexts} >= {
@@ -1553,10 +1564,13 @@ def test_feature_text_height_follows_scale_and_config():
 ILION_HOUSE = "2 STY\nFRAME\nNo. 12"
 
 
-def load_ilion():
-    """Полевой чертёж «12 Ilion Place» из дампа inspect_dwg.py (tests/data/ilion_field.txt)."""
+def load_field_fixture(name):
+    """
+    Полевой чертёж из сжатой записи дампа inspect_dwg.py (``tests/data/<name>``;
+    запись делает ``tests/dump_to_fixture.py``).
+    """
     snap = DrawingSnapshot()
-    for raw in (ROOT / "tests" / "data" / "ilion_field.txt").read_text(encoding="utf-8").splitlines():
+    for raw in (ROOT / "tests" / "data" / name).read_text(encoding="utf-8").splitlines():
         row = raw.strip()
         if not row or row.startswith("#"):
             continue
@@ -1579,7 +1593,23 @@ def load_ilion():
                             height=float(height), rotation=math.radians(float(rotation)),
                             kind="AcDbMText")
             )
+        elif parts[0] == "B":
+            # Вставка блока без атрибутов: условный знак (столб WUP, стрелка севера).
+            snap.symbols.append(
+                fl.DrawingSymbol(layer=parts[1], name=parts[2],
+                                 point=(float(parts[3]), float(parts[4])))
+            )
     return snap
+
+
+def load_ilion():
+    """Полевой чертёж «12 Ilion Place, Staten Island» (отдельно стоящий дом)."""
+    return load_field_fixture("ilion_field.txt")
+
+
+def load_brooklyn():
+    """Полевой чертёж «6910 15th Avenue, Brooklyn» (дом блокированной застройки)."""
+    return load_field_fixture("brooklyn_field.txt")
 
 
 def ilion_features(result, label, kind=None):
@@ -1909,3 +1939,337 @@ def test_short_codes_in_block_attributes_use_the_code_dictionary():
     (fence,) = [f for f in result.features if f.kind == "fence"]
     assert fence.label == "VINYL FENCE" and fence.source == "point_code"
     assert result.unknown_codes == {"GAZEBO": 1}
+
+
+# ---------------------------------------------------------------------------
+# Дом блокированной застройки: «6910 15th Avenue, Brooklyn»
+# ---------------------------------------------------------------------------
+
+BROOKLYN_HOUSE = "3 STY\nBRICK\nW/CELLAR\nNo. 6910"
+
+#: Подписи итогового чертежа заказчика (docs/6910 15th Avenue, Brooklyn.final.dump.json),
+#: пересчитанные в координаты полевого чертежа (итоговый повёрнут на −3.52°):
+#: текст Шага 2, центр рамки у заказчика, допуск в ft. В комментарии — текст
+#: заказчика, если он отличается (материал и отступы берутся не из съёмки).
+BROOKLYN_FINAL_LABELS = [
+    ("3 STY BRICK W/CELLAR No. 6910", (5003.9, 4956.2), 2.5),
+    ("PARTY WALL", (4992.7, 4957.6), 1.0),
+    ("PARTY WALL", (5015.7, 4957.6), 1.0),
+    ("C.D.", (5010.3, 4928.7), 1.5),
+    ("C.D.", (4999.0, 4987.6), 1.5),
+    ("C.D.", (4991.8, 4927.4), 1.5),
+    ("FIRE ESC.", (5005.7, 4987.2), 1.5),
+    ("FIRE ESC.", (5021.3, 4986.8), 2.0),
+    ("VEST.", (5019.3, 4990.7), 1.5),
+    ("AWNING", (5017.8, 4928.5), 1.5),
+    ("DECK", (4988.2, 4988.2), 3.0),                # METAL DECK
+    ("CHAIN LINK FENCE", (5004.1, 5019.1), 2.0),    # CHAIN LINK FENCE 0.4'E
+    ("IRON FENCE", (5003.7, 4923.9), 3.0),          # IRON FENCE 5.4'E
+    ("WALL", (5015.6, 5002.6), 1.5),                # CONC. WALL ALONG LINE
+    ("WALL", (5000.1, 5004.6), 3.5),                # CONC. WALL
+    ("UTILITY POLE", (5002.4, 5015.2), 4.0),
+]
+
+
+def brooklyn_plan(**kwargs):
+    kwargs.setdefault("house", BROOKLYN_HOUSE)
+    kwargs.setdefault("height", 0.9)
+    return make_plan(load_brooklyn(), **kwargs)
+
+
+def test_brooklyn_fixture_is_the_compact_copy_of_the_dump(tmp_path):
+    """Запись чертежа в tests/data получена из дампа скриптом dump_to_fixture.py."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    try:
+        import dump_to_fixture
+    finally:
+        sys.path.pop(0)
+    target = tmp_path / "brooklyn.txt"
+    stats = dump_to_fixture.convert(
+        ROOT / "docs" / "for MLP 6910 15th Avenue, Brooklyn.dump.json", target,
+        "6910 15th Avenue, Brooklyn",
+    )
+    assert dict(stats) == {"L": 57, "P": 43, "Q": 5, "H": 3, "T": 1, "B": 2}
+    assert target.read_text(encoding="utf-8") == (
+        ROOT / "tests" / "data" / "brooklyn_field.txt"
+    ).read_text(encoding="utf-8")
+    snap = load_brooklyn()
+    assert (len(snap.lines), len(snap.survey_points)) == (57, 43)
+    assert [symbol.name for symbol in snap.symbols] == ["WUP", "NA"]
+
+
+def test_brooklyn_lot_is_closed_by_the_street_line():
+    boundary = fl.find_property_polygon(load_brooklyn(), {})
+    assert boundary.layer == "M-PROPERTY"
+    assert boundary.area_sqft == pytest.approx(1800.0, abs=0.5)  # 20 × 90 ft
+    (note,) = boundary.notes
+    assert "недостающая сторона (20.00 ft) идёт по линии слоя M-ROW-LINE" in note
+
+
+def test_row_house_is_the_part_of_the_lot_between_the_wall_lines():
+    """
+    Замкнутого контура дома нет: в ST-BLDG-LINE только линии переднего и заднего
+    фасадов, продолженные на соседние дома; боковые стены — общие, по границам.
+    """
+    result = recognize(load_brooklyn(), house=BROOKLYN_HOUSE)
+    (house,) = [f for f in result.features if f.is_main_house]
+    assert (house.kind, house.category, house.layer) == ("area", "house", "ST-BLDG-LINE")
+    assert (house.source, house.closed) == ("user", False)
+    # Участок 20 ft шириной, дом — от красной линии до заднего фасада (54.8 ft).
+    assert house.geometry.area == pytest.approx(20.0 * 54.83, abs=3.0)
+    assert house.geometry.bounds == pytest.approx((4994.21, 4930.36, 5014.21, 4985.23), abs=0.1)
+    assert [note for note in result.notes if "блокированная застройка" in note]
+    # Линии фасадов в «без подписи» не попадают; дом соседа сзади — остаётся.
+    walls = [f for f in result.features if f.skip_reason == fl.ROW_HOUSE_WALL_REASON]
+    assert len(walls) == 2
+    assert [(f.kind, f.category) for f in result.unlabeled] == [("area", "house")]
+
+    # Без текста дома контур найден, но подписи у него нет.
+    plain = recognize(load_brooklyn(), house="")
+    assert not [f for f in plain.features if f.is_main_house]
+    (found,) = [f for f in plain.unlabeled if f.rule == fl.ROW_HOUSE_RULE]
+    assert found.geometry.equals(house.geometry)
+
+
+def test_row_house_needs_wall_lines_on_two_sides_and_an_empty_interior():
+    lot = shapely_box(0.0, 0.0, 20.0, 90.0)
+    front = LineString([(-10.0, 0.05), (30.0, 0.05)])
+    rear = LineString([(-10.0, 55.0), (30.0, 55.0)])
+    fence = LineString([(0.5, 56.0), (0.5, 89.0), (19.5, 89.0)])
+    shed = LineString([(5.0, 70.0), (15.0, 70.0), (15.0, 80.0), (5.0, 80.0), (5.0, 70.0)])
+    house = fl._row_house_polygon(lot, [front, rear], [fence, shed], min_area=50.0)
+    assert house.bounds == pytest.approx((0.0, 0.05, 20.0, 55.0), abs=0.01)
+    # Линии фасадов на полфута не доходят до боковых границ — участок всё равно делится.
+    short = [LineString([(0.5, 0.05), (19.5, 0.05)]), LineString([(0.4, 55.0), (19.6, 55.0)])]
+    assert fl._row_house_polygon(lot, short, [fence, shed], min_area=50.0).area == pytest.approx(
+        20.0 * 54.95, abs=0.5
+    )
+    # Одна линия фасада: обе части участка ограничены ею только с одной стороны.
+    assert fl._row_house_polygon(lot, [rear], [fence, shed], min_area=50.0) is None
+    # Внутри «дома» сняты объекты — это двор, а не дом.
+    busy = LineString([(5.0, 20.0), (15.0, 20.0)])
+    assert fl._row_house_polygon(lot, [front, rear], [fence, shed, busy], min_area=50.0) is None
+    # Отдельно стоящий дом: его линии участок не делят.
+    detached = LineString([(5.0, 20.0), (15.0, 20.0), (15.0, 50.0), (5.0, 50.0), (5.0, 20.0)])
+    assert fl._row_house_polygon(lot, [detached], [fence], min_area=50.0) is None
+
+
+def test_brooklyn_plan_matches_the_customer_final_drawing():
+    plan = brooklyn_plan()
+    assert plan.skipped == [] and plan.warnings == []
+    for text, point, tolerance in BROOKLYN_FINAL_LABELS:
+        found = [
+            item for item in plan.items
+            if item.single_line == text and math.dist(item.box.centroid.coords[0], point) <= tolerance
+        ]
+        assert len(found) == 1, (
+            text, point, [i.box.centroid.coords[0] for i in plan.items if i.single_line == text]
+        )
+    texts = sorted(item.single_line for item in plan.items)
+    assert texts == sorted(
+        [text for text, _point, _tolerance in BROOKLYN_FINAL_LABELS]
+        + ["C.L.F. ATOP WALL", "I.FE.", "I.FE."]
+    )
+    by_text = {item.single_line: item for item in plan.items}
+    # Узкая площадка соседа — в две строки, своя длинная — в одну, рядом с люком.
+    lines = sorted(item.text for item in plan.items if item.single_line == "FIRE ESC.")
+    assert lines == ["FIRE\nESC.", "FIRE ESC."]
+    assert all(item.placement == "inside" for item in plan.items if item.single_line in {
+        "C.D.", "FIRE ESC.", "VEST.", "AWNING", "DECK",
+    })
+    # Общие стены — вдоль границы, со стороны соседей; столб — выноской.
+    party = [item for item in plan.items if item.single_line == "PARTY WALL"]
+    assert sorted(round(item.point[0], 1) for item in party) == [4992.7, 5015.7]
+    assert all(math.degrees(item.rotation) == pytest.approx(90.0, abs=0.1) for item in party)
+    pole = by_text["UTILITY POLE"]
+    assert (pole.kind, pole.text) == ("leader", "UTILITY\nPOLE")
+    assert math.dist(pole.leader_points[0], (4997.49, 5017.47)) < 1.5  # знак WUP
+    # Забор на стене подписан вместе с ней; у стены под забором своей подписи нет.
+    atop = by_text["C.L.F. ATOP WALL"]
+    assert atop.feature.geometry.length == pytest.approx(34.2, abs=0.2)
+
+
+def test_house_description_goes_to_layer_zero_in_a_larger_style(com):
+    """Описание дома у заказчика — MText в слое 0, стиль RDS, 1.5 ft при подписях 0.9 ft."""
+    builder, _app, doc = com(load_brooklyn())
+    doc.TextStyles.Add("RDS")
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert result.failed == [] and result.created_labels == len(result.plan.items) == 19
+    created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
+    (house,) = [e for e in created if e.Layer == "0"]
+    assert house.TextString == "3 STY\\PBRICK\\PW/CELLAR\\PNo. 6910"
+    assert house.Height == pytest.approx(1.5, abs=0.01) and house.StyleName == "RDS"
+    assert house.InsertionPoint[:2] == pytest.approx([5004.2, 4957.8], abs=0.3)
+    others = [e for e in created if e.Layer != "0"]
+    assert {e.Layer for e in others} == {"D-TOPO-TEXT"}
+    assert all(e.Height == pytest.approx(0.9) for e in others)
+    assert "RDS" not in {e.StyleName for e in others}
+    assert "«3 STY BRICK W/CELLAR No. 6910»: слой 0, высота 1.50 ft, стиль RDS" in result.report()
+    # Повторный запуск видит описание дома в слое 0 и ничего не добавляет.
+    again = builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert again.created_labels == 0 and len(again.plan.duplicates) >= 15
+    assert "3 STY BRICK W/CELLAR No. 6910" in [d.existing_text for d in again.plan.duplicates]
+
+    # Стиля RDS в чертеже нет — общий стиль подписей; слой можно вернуть настройкой.
+    builder, _app, doc = com(load_brooklyn(), feature_cfg={"house_label_layer": ""})
+    builder.label_features(house_text=BROOKLYN_HOUSE)
+    created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
+    assert {e.Layer for e in created} == {"D-TOPO-TEXT"}
+    (house,) = [e for e in created if "6910" in e.TextString]
+    assert house.Height == pytest.approx(1.5, abs=0.01) and house.StyleName != "RDS"
+
+
+def test_symbol_blocks_are_labeled_only_on_the_lot(com):
+    snap = load_brooklyn()
+    snap.symbols.append(fl.DrawingSymbol(layer="U-TRAF-IRON", name="WUP", point=(5004.0, 4915.0)))
+    poles = [f for f in recognize(snap, house="").features if f.category == "symbol"]
+    assert [(f.kind, f.label, f.geometry.coords[0]) for f in poles] == [
+        ("point", "UTILITY\nPOLE", (4997.49, 5017.47)),
+    ]  # столб на улице не подписан, стрелка севера (NA) — не знак
+    everywhere = recognize(snap, house="", cfg={"feature_labeling": {"symbol_label_scope": "all"}})
+    assert len([f for f in everywhere.features if f.category == "symbol"]) == 2
+    nowhere = recognize(snap, house="", cfg={"feature_labeling": {"symbol_label_scope": "none"}})
+    assert not [f for f in nowhere.features if f.category == "symbol"]
+    # Код точки «W U P» известен (в отчёте «коды не из словаря» его нет), подписи не даёт.
+    assert "W U P" not in everywhere.unknown_codes and "COLUMN" not in everywhere.unknown_codes
+    assert everywhere.unknown_codes == {}
+
+    # Из AutoCAD знак читается как вставка блока без атрибутов.
+    builder, _app, doc = com(load_brooklyn())
+    read = builder.read_drawing_snapshot(doc)
+    assert [(symbol.name, symbol.layer) for symbol in read.symbols] == [("WUP", "U-TRAF-IRON")]
+    assert len(read.survey_points) == 43
+
+
+def test_party_wall_is_a_pair_of_lines_along_the_lot_line():
+    lot = shapely_box(0.0, 0.0, 20.0, 90.0)
+    pair = [LineString([(-0.5, 0.0), (-0.5, 55.0)]), LineString([(0.5, 0.0), (0.5, 50.0)])]
+    (axis,) = fl._party_wall_axes(pair, lot, 1.6, 10.0)
+    assert [value for point in axis.coords for value in point] == pytest.approx([0.0, 0.0, 0.0, 50.0])
+    # Одна линия, пара в стороне от границы, слишком широкая или короткая пара — не стена.
+    assert fl._party_wall_axes(pair[:1], lot, 1.6, 10.0) == []
+    inside = [LineString([(9.5, 0.0), (9.5, 50.0)]), LineString([(10.5, 0.0), (10.5, 50.0)])]
+    assert fl._party_wall_axes(inside, lot, 1.6, 10.0) == []
+    wide = [LineString([(-1.5, 0.0), (-1.5, 50.0)]), LineString([(1.5, 0.0), (1.5, 50.0)])]
+    assert fl._party_wall_axes(wide, lot, 1.6, 10.0) == []
+    stub = [LineString([(-0.5, 0.0), (-0.5, 8.0)]), LineString([(0.5, 0.0), (0.5, 8.0)])]
+    assert fl._party_wall_axes(stub, lot, 1.6, 10.0) == []
+
+    result = recognize(load_brooklyn(), house="")
+    walls = [f for f in result.features if f.category == "party_wall"]
+    assert [(f.kind, f.layer, f.label, f.source) for f in walls] == [
+        ("edge", "0", "PARTY WALL", "layer")
+    ] * 2
+    assert sorted(round(f.geometry.centroid.x, 2) for f in walls) == [4994.21, 5014.21]
+    off = recognize(load_brooklyn(), house="", cfg={"feature_labeling": {"party_wall_layers": []}})
+    assert not [f for f in off.features if f.category == "party_wall"]
+
+
+def test_wall_drawn_as_two_open_lines_becomes_a_ribbon():
+    """Стена у границы снята двумя сторонами без торцов: забор на ней подписан с ней вместе."""
+    left = LineString([(0.0, 0.0), (0.0, 30.0)])
+    right = LineString([(0.7, 0.0), (0.7, 30.0)])
+    caps = fl._ribbon_caps([left, right], 1.6, 0.05)
+    assert sorted(sorted(cap.coords) for cap in caps) == [
+        [(0.0, 0.0), (0.7, 0.0)], [(0.0, 30.0), (0.7, 30.0)],
+    ]
+    # Торец уже начерчен, линии шире стены или идут в разные стороны — ничего не добавляется.
+    closed = [left, right, LineString([(0.0, 0.0), (0.7, 0.0)]), LineString([(0.0, 30.0), (0.7, 30.0)])]
+    assert fl._ribbon_caps(closed, 1.6, 0.05) == []
+    assert fl._ribbon_caps([left, LineString([(3.0, 0.0), (3.0, 30.0)])], 1.6, 0.05) == []
+    assert fl._ribbon_caps([left, LineString([(0.7, 0.0), (0.7, -30.0)])], 1.6, 0.05) == []
+
+    result = recognize(load_brooklyn(), house="")
+    walls = [f for f in result.features if f.category == "wall"]
+    assert sorted((f.label or "", f.skip_reason) for f in walls) == [
+        ("", fl.WALL_UNDER_FENCE_REASON), ("WALL", ""), ("WALL", ""),
+    ]
+    assert [f.flat_label for f in result.features if " ATOP " in f.flat_label] == [
+        "CHAIN LINK FENCE ATOP WALL"
+    ]
+    # «C.L.F. ATOP WALL» рядом не считается подписью соседней стены «WALL».
+    assert not fl.labels_similar("C.L.F. ATOP WALL", "WALL")
+    assert fl.labels_similar("C.L.F. ATOP WALL", "CHAIN LINK FENCE ATOP WALL", {
+        "CHAIN LINK FENCE ATOP WALL": ["C.L.F. ATOP WALL"],
+    })
+
+
+def test_corner_of_two_sides_is_completed_to_a_rectangle():
+    """Тамбур в углу между домом и соседом снят двумя сторонами: контур — прямоугольник."""
+    corner = [LineString([(0.0, 8.0), (4.0, 8.0)]), LineString([(4.0, 8.0), (4.0, 0.0)])]
+    shape = fl._shape_from_open_lines(corner, 0.75)
+    assert shape.area == pytest.approx(32.0) and shape.bounds == (0.0, 0.0, 4.0, 8.0)
+    # Почти прямая ломаная прямоугольником не становится.
+    flat = [LineString([(0.0, 0.0), (10.0, 0.0)]), LineString([(10.0, 0.0), (20.0, 1.0)])]
+    assert fl._shape_from_open_lines(flat, 0.75) is None
+
+    result = recognize(load_brooklyn(), house="")
+    areas = {
+        (f.label, round(f.geometry.area)) for f in result.features
+        if f.kind == "area" and f.label in {"VEST.", "DECK", "AWNING"}
+    }
+    assert areas == {("VEST.", 31), ("DECK", 53), ("AWNING", 19)}
+
+
+def test_point_description_overrides_the_linear_layer_rule():
+    """ST-OHED — слой линейных навесов (CANTIL. вдоль линии), но FIRESCAPE и AWNING — площадки."""
+    result = recognize(load_brooklyn(), house="")
+    overhead = [f for f in result.features if f.layer == "ST-OHED"]
+    assert sorted((f.kind, f.category, f.label) for f in overhead) == [
+        ("area", "awning", "AWNING"),
+        ("area", "fire_escape", "FIRE ESC."),
+        ("area", "fire_escape", "FIRE ESC."),
+    ]
+    # Консоль дома в том же слое остаётся линией (12 Ilion Place).
+    ilion = recognize(load_ilion(), house=ILION_HOUSE)
+    assert {f.kind for f in ilion.features if f.label == "CANTIL."} == {"edge"}
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("CELDOOR", ("C.D.", "cellar_door")),
+        ("VESTIBULE", ("VEST.", "porch")),
+        ("FIRESCAPE", ("FIRE ESC.", "fire_escape")),
+        ("AW OVERH", ("AWNING", "awning")),
+        ("I P F", ("IRON FENCE", "fence")),
+        ("DECK", ("DECK", "porch")),
+        ("WOOD DECK", ("FRAME\nDECK", "porch")),
+        ("METAL DECK", ("METAL\nDECK", "porch")),
+        ("COLUMN", ("", "")),
+        ("BBC", ("", "")),
+        ("W U P", ("", "")),
+        ("BLC21", ("", "")),
+    ],
+)
+def test_brooklyn_point_descriptions(raw, expected):
+    label, category, _pattern = fl.translate_description(
+        raw, fl.DEFAULT_FEATURE_CONFIG["point_descriptions"]
+    )
+    assert (label, category) == expected
+
+
+def test_step1_boundary_that_disagrees_with_the_surveyed_lot_is_reported(com):
+    """Граница Шага 1 посажена криво: подписи считаются по ней, но отчёт предупреждает."""
+    snap = load_ilion()
+    crooked = [(4975.0, 4975.0), (5075.0, 4980.0), (5070.0, 5090.0), (4970.0, 5085.0)]
+    snap.lines.append(DrawingLine("PROPERTY_LINE", tuple(crooked), kind="AcDbPolyline", closed=True))
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.layer == "PROPERTY_LINE"
+    (note,) = boundary.notes
+    assert note.startswith(
+        "ВНИМАНИЕ: граница слоя PROPERTY_LINE (11 025 sq ft) расходится с участком слоя "
+        "M-PROPERTY (4 339 sq ft): совпадают на 39 %"
+    )
+    builder, _app, _doc = com(snap)
+    assert "расходится с участком слоя M-PROPERTY" in builder.label_features(
+        house_text=ILION_HOUSE, dry_run=True
+    ).report()
+
+    # Граница Шага 1 точно по участку геодезиста — предупреждения нет.
+    exact = load_ilion()
+    lot = fl.find_property_polygon(exact, {}).polygon
+    exact.lines.append(
+        DrawingLine("PROPERTY_LINE", tuple(lot.exterior.coords), kind="AcDbPolyline", closed=True)
+    )
+    assert fl.find_property_polygon(exact, {}).notes == []

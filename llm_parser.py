@@ -70,6 +70,7 @@ __all__ = [
     "PROVIDERS_CATALOG",
     "ParseOutcome",
     "Segment",
+    "ask_llm_json",
     "TokenUsage",
     "TypoSuspicion",
     "bearing_label",
@@ -218,6 +219,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
             "pass3_provider": "routerai",
             "pass3_model": "openai/gpt-4.1",
+        },
+        # ИИ-советник по конфликтам между участками набора PDF (Шаг 1).
+        "conflict_advisor": {
+            "enabled": True,
+            "max_images": 16,
         },
     },
     "drawing": {
@@ -2573,6 +2579,122 @@ def _extract_with_llm(
     )
 
 
+def _json_object_from_reply(raw: str) -> dict[str, Any]:
+    """JSON-объект из свободного ответа модели: без <think>, без ```json и без текста вокруг."""
+    text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in text.lower():
+        text = text[text.lower().rfind("</think>") + len("</think>") :].strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text, idx)
+                break
+            except json.JSONDecodeError:
+                continue
+    if isinstance(parsed, list) and len(parsed) == 1:
+        parsed = parsed[0]
+    if not isinstance(parsed, dict):
+        raise ValueError("в ответе модели нет JSON-объекта")
+    return parsed
+
+
+def ask_llm_json(
+    system_prompt: str,
+    user_text: str,
+    cfg: dict[str, Any],
+    *,
+    image_data_urls: Sequence[str] | None = None,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    key_secret: str = "",
+    progress: Callable[[str], None] | None = None,
+    task_label: str = "вопрос",
+) -> tuple[dict[str, Any], TokenUsage]:
+    """
+    Свободный вопрос к модели (не разбор описания) с ответом в виде JSON-объекта.
+
+    Нужен там, где модель рассуждает и советует, а проверяет совет Python:
+    так работает ИИ-советник по конфликтам между участками. Возвращает
+    ``(объект, TokenUsage)``; при невозможности получить JSON — ``LLMParseError``.
+    """
+    api_cfg = cfg["api"]
+    target = resolve_api_target(
+        cfg, provider=provider, model=model, api_key=api_key, key_secret=key_secret
+    )
+    model_name = target["model"]
+    provider_label = target["provider_label"]
+    client = _make_client(api_cfg, target=target)
+    images = list(image_data_urls or [])
+    if images:
+        user_content: Any = [{"type": "text", "text": user_text}] + [
+            {"type": "image_url", "image_url": {"url": url}} for url in images
+        ]
+    else:
+        user_content = user_text
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    if progress:
+        tag = f", изображений: {len(images)}" if images else ""
+        progress(f"{task_label}: запрос к {provider_label}: {model_name}{tag} …")
+
+    prompt_acc = completion_acc = total_acc = 0
+    saw_usage = False
+    errors: list[str] = []
+    for extra in ({"response_format": {"type": "json_object"}}, {}):
+        try:
+            completion = _call_with_temperature(
+                client.chat.completions.create,
+                model=model_name,
+                messages=messages,
+                temperature=api_cfg.get("temperature", 0.0),
+                **extra,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_error(exc):
+                raise LLMParseError(
+                    f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+                ) from exc
+            errors.append(f"{'json_object' if extra else 'prompt-json'}: {exc}")
+            continue
+        counts = _extract_usage_counts(completion)
+        if counts is not None:
+            saw_usage = True
+            prompt_acc += counts[0]
+            completion_acc += counts[1]
+            total_acc += counts[2]
+        content = completion.choices[0].message.content or ""
+        try:
+            data = _json_object_from_reply(content)
+        except ValueError as exc:
+            errors.append(f"{'json_object' if extra else 'prompt-json'}: {exc}")
+            continue
+        usage = TokenUsage(
+            prompt_tokens=prompt_acc,
+            completion_tokens=completion_acc,
+            total_tokens=total_acc,
+            provider=target["provider"],
+            provider_label=provider_label,
+            model=model_name,
+            available=saw_usage,
+        )
+        return data, usage
+    raise LLMParseError(
+        f"не удалось получить ответ от {provider_label} ({model_name}): " + " | ".join(errors[-2:])
+    )
+
+
 # ---------------------------------------------------------------------------
 # Локальный regex-парсер (аварийный путь без LLM)
 # ---------------------------------------------------------------------------
@@ -2929,6 +3051,56 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
     return segments, []
 
 
+_WORDY_COURSE_DIRECTION_RE = re.compile(
+    r"\b(?P<dir>north(?:east|west)?(?:erly|ward)?|south(?:east|west)?(?:erly|ward)?|"
+    r"east(?:erly|ward)?|west(?:erly|ward)?)\b(?!\s+(?:side|line|corner|boundary)\b)",
+    re.IGNORECASE,
+)
+
+
+def _wordy_street_courses(
+    text: str, matches: Sequence[re.Match[str]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """
+    Курсы обхода без румба среди курсов с румбами: «THENCE southerly along the
+    easterly line of Alvine Avenue 40 feet to the point of BEGINNING».
+
+    Направление такого курса задано только словом, поэтому сторона получает
+    номинальный азимут (southerly = S 0° E) и ``has_bearing=False`` — точный
+    румб линии улицы можно взять из описания соседа или из замыкания контура.
+    Возвращает ``[(позиция в тексте, сторона), …]``.
+    """
+    found: list[tuple[int, dict[str, Any]]] = []
+    marks = list(re.finditer(r"\b(?:RUNNING\s+)?THENCE\b", text, flags=re.IGNORECASE))
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+        clause = text[mark.end() : end]
+        if any(mark.end() <= match.start() < end for match in matches):
+            continue
+        if not re.search(r"\balong\b", clause, re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:curve|arc|radius|chord)\b", clause, re.IGNORECASE):
+            continue
+        distance = _distance_after(clause)
+        direction = _WORDY_COURSE_DIRECTION_RE.search(clause)
+        if distance is None or direction is None:
+            continue
+        word = direction.group("dir").lower().replace("ward", "erly")
+        nominal = _CARDINAL_AZIMUTH.get(word)
+        if nominal is None:
+            continue
+        number = _FEET_INCHES_STR_RE.search(clause) or _DISTANCE_RE.search(clause)
+        note = clause[: number.start()] if number else clause
+        note = re.sub(r"\s+", " ", note).strip(" ,;:.")
+        note = re.sub(r"[\s,]*\b(?:a\s+)?distance\s+of$", "", note, flags=re.IGNORECASE).strip(" ,;:.")
+        seg = _azimuth_to_quadrant_dict(nominal)
+        seg["distance_ft"] = distance
+        seg["has_bearing"] = False
+        seg["course_note"] = note or None
+        found.append((mark.start(), seg))
+    return found
+
+
 def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     matches = _bearing_matches(text)
@@ -2938,9 +3110,13 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
             return rel_segments, rel_warnings
         return [], ["в тексте не найдено ни одного румба (N 45°00'00\" E) — формат не распознан"]
 
-    raw_segments: list[dict[str, Any]] = []
+    wordy = _wordy_street_courses(text, matches)
+    wordy_starts = [position for position, _ in wordy]
+    placed: list[tuple[int, dict[str, Any]]] = list(wordy)
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        # Длина этой стороны не ищется в следующем курсе без румба.
+        end = min([end] + [start for start in wordy_starts if start > match.end()])
         chunk = text[match.end() : end]
         distance = _distance_after(chunk)
         if distance is None:
@@ -2964,19 +3140,23 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
         if ns not in {"N", "S"} or ew not in {"E", "W"}:
             warnings.append(f"сторона #{index + 1}: некорректный румб — пропущена")
             continue
-        raw_segments.append(
-            {
-                "ns": ns,
-                "degrees": degrees,
-                "minutes": minutes,
-                "seconds": seconds,
-                "ew": ew,
-                "distance_ft": distance,
-                "has_bearing": True,
-            }
+        placed.append(
+            (
+                match.start(),
+                {
+                    "ns": ns,
+                    "degrees": degrees,
+                    "minutes": minutes,
+                    "seconds": seconds,
+                    "ew": ew,
+                    "distance_ft": distance,
+                    "has_bearing": True,
+                },
+            )
         )
 
-    return raw_segments, warnings
+    placed.sort(key=lambda entry: entry[0])
+    return [seg for _, seg in placed], warnings
 
 
 def _street_mentions(text: str) -> list[tuple[int, str]]:
@@ -3135,10 +3315,10 @@ def _extract_nyc_metadata(
         "lot_number": None,
         "borough_or_city": None,
     }
-    blk = re.search(r"\bBlock\s*#?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
+    blk = re.search(r"\bBlock\s*[#:]?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
     if blk:
         meta["block_number"] = blk.group(1)
-    lot = re.search(r"\bLot\s*#?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
+    lot = re.search(r"\bLot\s*[#:]?\s*(\d+[A-Za-z-]*)\b", full_text, re.IGNORECASE)
     if lot:
         meta["lot_number"] = lot.group(1)
     boro = re.search(

@@ -87,6 +87,9 @@ class PdfSetItem:
     issues: list[str] = field(default_factory=list)
     error: str = ""
     on_scene: bool = False
+    #: Правки по данным соседей, принятые пользователем (``conflict_resolver.Proposal``).
+    #: Относятся к текущему разбору файла: новый разбор их сбрасывает.
+    fixes: list[Any] = field(default_factory=list)
 
     @property
     def total_pages(self) -> int:
@@ -144,6 +147,7 @@ class PdfSetItem:
         self.issues = []
         self.error = ""
         self.on_scene = False
+        self.fixes = []
 
     def parse_source(self) -> dict[str, Any]:
         """
@@ -180,6 +184,8 @@ class PdfSetJob:
     source_error: str = ""
     cached_outcome: Any = None
     cached_issues: tuple[str, ...] = ()
+    #: Принятые правки; действуют только вместе с готовым результатом разбора.
+    fixes: tuple[Any, ...] = ()
 
     @property
     def role_label(self) -> str:
@@ -222,6 +228,7 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         source_error=source_error,
         cached_outcome=item.outcome if reuse else None,
         cached_issues=tuple(item.issues) if reuse else (),
+        fixes=tuple(item.fixes) if reuse else (),
     )
 
 

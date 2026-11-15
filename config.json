@@ -70,6 +70,10 @@
       "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
       "pass3_provider": "routerai",
       "pass3_model": "openai/gpt-4.1"
+    },
+    "conflict_advisor": {
+      "enabled": true,
+      "max_images": 16
     }
   },
   "drawing": {

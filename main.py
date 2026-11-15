@@ -76,6 +76,14 @@ from acad_builder import (
     house_label_height,
     verify_with_neighbors,
 )
+from conflict_resolver import (
+    AdvisorReply,
+    ConflictAnalysis,
+    LotInput,
+    analyse_conflicts,
+    apply_changes,
+    fix_changes,
+)
 from feature_labeler import feature_settings
 from version import APP_DATE, APP_VERSION
 from llm_parser import (
@@ -96,6 +104,7 @@ from llm_parser import (
     ParseOutcome,
     TokenUsage,
     TypoSuspicion,
+    ask_llm_json,
     clean_provider_key,
     inspect_pdf,
     is_image_file,
@@ -109,6 +118,7 @@ from llm_parser import (
     protect_api_key,
     recheck_consensus_discrepancies,
     recheck_typo_suspicion,
+    resolve_api_target,
     run_multipass_consensus,
     save_config,
     save_protected_env,
@@ -341,6 +351,9 @@ class SurveyApp(ctk.CTk):
         self._pdf_set_main_pending = False
         self._pdf_set_report_ready = False
         self._pdf_set_report_window: Any | None = None
+        # Сверка описаний между собой: находки по данным соседей и ответ ИИ-советника.
+        self._pdf_set_analysis: ConflictAnalysis | None = None
+        self._pdf_set_advice: dict[str, AdvisorReply] = {}
         self._ready_source_signature: tuple[Any, ...] | None = None
         self._running_source_signature: tuple[Any, ...] | None = None
         self._running_source_path: Path | None = None
@@ -3438,6 +3451,7 @@ class SurveyApp(ctk.CTk):
             # Соседи убраны и из набора: в нём остаётся только наш участок.
             self.pdf_set = [item for item in self.pdf_set if item.is_main]
             self._pdf_set_scene_neighbors.clear()
+            self._pdf_set_analysis = None
             if not self.pdf_set:
                 self._visual_source_role = None
                 self._pdf_set_report_ready = False
@@ -4590,6 +4604,7 @@ class SurveyApp(ctk.CTk):
         self._pdf_set_scene_neighbors.clear()
         self._pdf_set_main_pending = False
         self._pdf_set_report_ready = False
+        self._pdf_set_analysis = None
         for item in self.pdf_set:
             item.on_scene = False
         self._preview_neighbor_plans.clear()
@@ -5432,6 +5447,7 @@ class SurveyApp(ctk.CTk):
         self._pdf_set_main_plan = None
         self._pdf_set_scene_neighbors = set()
         self._pdf_set_report_ready = False
+        self._pdf_set_analysis = None
         self.neighbor_pdf_paths = []
         self._pending_neighbor_pdfs.clear()
         self._neighbor_parsed_pages.clear()
@@ -5849,8 +5865,13 @@ class SurveyApp(ctk.CTk):
         )
         self._start_pdf_set()
 
-    def _start_pdf_set(self, *, force: bool = False) -> None:
-        """Разбирает все участки набора одним заданием; AutoCAD запускается отдельно."""
+    def _start_pdf_set(self, *, force: bool = False, ask_advisor: bool = False) -> None:
+        """
+        Разбирает все участки набора одним заданием; AutoCAD запускается отдельно.
+
+        ``ask_advisor`` — отправить ИИ-советнику вопрос о расхождениях заново,
+        даже если ответ для этого разбора уже есть или набор разобран локально.
+        """
         if self._busy or not self.pdf_set:
             return
         if self.pending_conflict is not None or self.pending_doubt is not None:
@@ -5901,7 +5922,10 @@ class SurveyApp(ctk.CTk):
             )
         self._start_background(
             self._pdf_set_worker,
-            args=(jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient),
+            args=(
+                jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient,
+                dict(self._pdf_set_advice), ask_advisor,
+            ),
         )
 
     def _parse_pdf_set_job(
@@ -5953,6 +5977,7 @@ class SurveyApp(ctk.CTk):
     def _pdf_set_worker(
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
+        advice: dict[str, AdvisorReply] | None = None, ask_advisor: bool = False,
     ) -> None:
         """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
         post = self._worker_poster()
@@ -5985,18 +6010,94 @@ class SurveyApp(ctk.CTk):
                     if job.use_llm:
                         post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
-                plan = builder.plan(result.outcome.data, scale=scale, is_neighbor=not job.is_main)
+                # Принятые правки по данным соседей входят в построение, разбор не меняют.
+                description = apply_changes(result.outcome.data, fix_changes(job.fixes))
+                plan = builder.plan(description, scale=scale, is_neighbor=not job.is_main)
                 for issue in result.issues:
                     if issue not in plan.warnings:
                         plan.warnings.append(issue)
+                for fix in job.fixes:
+                    plan.notes.append(f"Принята правка по данным соседей: {fix.title} (откуда: {fix.source})")
                 result.plan = plan
             except Exception as exc:  # noqa: BLE001 - ошибка относится только к этому файлу
                 result.error = str(exc) or type(exc).__name__
                 result.outcome = None
                 result.plan = None
             results.append(result)
-        post("pdf_set_done", results)
+        if not self._worker_is_current():
+            return
+        analysis = self._analyse_pdf_set_conflicts(
+            jobs, results, builder, cfg, provider_id, model_name, api_key, key_secret, scale,
+            advice or {}, ask_advisor, post,
+        )
+        if not self._worker_is_current():
+            return
+        post("pdf_set_done", (results, analysis))
         post("done", None)
+
+    def _analyse_pdf_set_conflicts(
+        self, jobs: list[PdfSetJob], results: list[PdfSetResult], builder: AcadBuilder,
+        cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None,
+        key_secret: str, scale: float, advice: dict[str, AdvisorReply], ask_advisor: bool, post: Any,
+    ) -> ConflictAnalysis:
+        """
+        Сверяет описания участков набора между собой (в фоне).
+
+        Сначала правила Python: чего не хватает одному описанию и есть ли это
+        у соседа. Если серьёзный конфликт остался — платный вопрос ИИ-советнику;
+        его советы тоже проверяются геометрией. Данные участков не меняются.
+        """
+        try:
+            lots: list[LotInput] = []
+            for job, res in zip(jobs, results):
+                if res.outcome is None or res.plan is None:
+                    continue
+                outcome = res.outcome
+                lots.append(LotInput(
+                    key=str(job.path), name=job.path.name, is_main=job.is_main,
+                    description=outcome.data, fixes=tuple(job.fixes),
+                    source_text=str(getattr(outcome, "prepared_text", "") or ""),
+                    images=tuple(getattr(outcome, "prepared_images", None) or ()),
+                    used_ai=bool(job.use_llm),
+                ))
+            advisor_cfg = cfg.get("api", {}).get("conflict_advisor") or {}
+            advisor = None
+            note = ""
+            if not ask_advisor and not advisor_cfg.get("enabled", True):
+                note = "выключен в настройках (api.conflict_advisor.enabled)"
+            elif not ask_advisor and not any(lot.used_ai for lot in lots):
+                note = (
+                    "не запрошен — набор разобран локально и бесплатно. "
+                    "Кнопка «🧠 Спросить ИИ-советника» отправит платный запрос."
+                )
+            else:
+                try:
+                    has_key = bool(resolve_api_target(
+                        cfg, provider=provider_id, model=model_name, api_key=api_key, key_secret=key_secret,
+                    )["api_key"])
+                except Exception:  # noqa: BLE001 - ключ не расшифровался
+                    has_key = False
+                if not has_key:
+                    note = "не запрошен — не задан API-ключ выбранного провайдера"
+                else:
+                    def ask_model(system: str, user_text: str, images: list[str]) -> tuple[Any, Any]:
+                        data, usage = ask_llm_json(
+                            system, user_text, cfg, image_data_urls=images, api_key=api_key,
+                            provider=provider_id, model=model_name, key_secret=key_secret,
+                            progress=lambda message: post("progress", message), task_label="ИИ-советник",
+                        )
+                        post("round_usages", [usage])
+                        post("valid_secret", key_secret)
+                        return data, usage
+
+                    advisor = ask_model
+            return analyse_conflicts(
+                builder, lots, scale=scale, advisor=advisor, advisor_note=note, advisor_cache=advice,
+                force_advisor=ask_advisor, max_images=int(advisor_cfg.get("max_images") or 16),
+                progress=lambda message: post("progress", message),
+            )
+        except Exception as exc:  # noqa: BLE001 - сбой анализа не срывает разбор набора
+            return ConflictAnalysis(error=str(exc) or type(exc).__name__)
 
     def _drop_main_plan(self) -> None:
         plan = self._preview_main_plan
@@ -6061,8 +6162,18 @@ class SurveyApp(ctk.CTk):
             self._ready_source_signature = None
             self._input_incomplete = True
 
-    def _handle_pdf_set_done(self, results: list[PdfSetResult]) -> None:
+    def _handle_pdf_set_done(self, payload: Any) -> None:
         """Ставит участки набора на схему и сообщает итог по каждому и по сверке с соседями."""
+        results: list[PdfSetResult]
+        analysis: ConflictAnalysis | None
+        if isinstance(payload, tuple):
+            results, analysis = payload
+        else:
+            results, analysis = payload, None
+        self._pdf_set_analysis = analysis
+        if analysis is not None and analysis.advisor_status == "ok" and analysis.advisor_reply is not None:
+            # Ответ советника хранится для этого разбора: правки его заново не запрашивают.
+            self._pdf_set_advice[analysis.advisor_key] = analysis.advisor_reply
         by_path = {item.path: item for item in self.pdf_set}
         # Прежние участки этого набора снимаются: на схеме остаётся только текущий результат.
         for path in list(self._pdf_set_scene_neighbors):
@@ -6091,6 +6202,9 @@ class SurveyApp(ctk.CTk):
                 continue
             item.outcome = res.outcome
             item.parsed_key = res.parse_key
+            if not res.cached:
+                # Файл разобран заново: прежние правки относились к старому разбору.
+                item.fixes = []
             if res.cached:
                 self.description = res.outcome.data
             else:
@@ -6150,6 +6264,8 @@ class SurveyApp(ctk.CTk):
             parts.append(rep.headline())
         elif built and not any(item.is_main for item in self.pdf_set) and self._preview_main_plan is None:
             parts.append("для сверки добавьте наш участок")
+        if analysis is not None and analysis.proposals:
+            parts.append(f"💡 находок по данным соседей: {len(analysis.proposals)} — см. итог")
         hard = (failed and not built) or (rep is not None and bool(rep.pair_reports) and rep.overall_status == "error")
         self._set_status(
             "  |  ".join(parts),
@@ -6223,10 +6339,12 @@ class SurveyApp(ctk.CTk):
             issues = issue_map[id(item)]
             if not issues:
                 lines.append(f"   ✓ построен без замечаний: {facts}")
-                continue
-            lines.append(f"   ⚠ построен с замечаниями ({len(issues)}): {facts}")
-            for severity, text in issues:
-                lines.append(f"      {'⛔' if severity == 'error' else '⚠'} {text}")
+            else:
+                lines.append(f"   ⚠ построен с замечаниями ({len(issues)}): {facts}")
+                for severity, text in issues:
+                    lines.append(f"      {'⛔' if severity == 'error' else '⚠'} {text}")
+            for fix in item.fixes:
+                lines.append(f"   ✎ принята правка по данным соседей: {fix.title}")
 
         lines.append("")
         lines.append("НАШ УЧАСТОК ОТНОСИТЕЛЬНО СОСЕДЕЙ")
@@ -6240,6 +6358,11 @@ class SurveyApp(ctk.CTk):
                 lines.append("В наборе нет нашего участка — сверять соседей пока не с чем.")
         else:
             lines.append("Соседние участки не построены — сверять не с чем.")
+        analysis = self._pdf_set_analysis
+        if analysis is not None and analysis.has_content:
+            lines.append("")
+            lines.append("АНАЛИЗ КОНФЛИКТОВ: ЧТО МОЖНО ВЗЯТЬ ИЗ ОПИСАНИЙ СОСЕДЕЙ")
+            lines.append(analysis.format_report())
         if failed:
             lines.append("")
             lines.append(
@@ -6248,6 +6371,86 @@ class SurveyApp(ctk.CTk):
                 "готовые участки заново не запрашиваются."
             )
         return "\n".join(lines)
+
+    def _pdf_set_item_by_key(self, key: str) -> PdfSetItem | None:
+        return next((item for item in self.pdf_set if str(item.path) == key), None)
+
+    def _apply_pdf_set_fix(self, proposal_id: str) -> None:
+        """
+        Принимает находку: участок перестраивается с данными соседа.
+
+        Разбор файла не трогается и заново не запрашивается — правка хранится
+        рядом с ним и снимается кнопкой «Вернуть как в документе».
+        """
+        analysis = self._pdf_set_analysis
+        if self._busy or analysis is None:
+            return
+        chain = analysis.with_requirements(proposal_id)
+        if not chain:
+            return
+        self._accept_pdf_set_fixes(chain)
+
+    def _apply_all_pdf_set_fixes(self) -> None:
+        """Принимает все находки, подтверждённые геометрией."""
+        analysis = self._pdf_set_analysis
+        if self._busy or analysis is None:
+            return
+        chain: list[Any] = []
+        for proposal in analysis.proposals:
+            if proposal.verified:
+                chain.extend(analysis.with_requirements(proposal.id))
+        self._accept_pdf_set_fixes(chain)
+
+    def _accept_pdf_set_fixes(self, proposals: list[Any]) -> None:
+        if self.pending_conflict is not None or self.pending_doubt is not None:
+            self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
+            return
+        accepted: list[str] = []
+        for proposal in proposals:
+            item = self._pdf_set_item_by_key(proposal.lot_key)
+            if item is None or not item.has_fresh_result():
+                continue
+            taken = {change.slot for fix in item.fixes for change in fix.changes}
+            if any(fix.id == proposal.id for fix in item.fixes) or any(c.slot in taken for c in proposal.changes):
+                # Та же сторона уже исправлена другой находкой.
+                continue
+            item.fixes = list(item.fixes) + [proposal]
+            accepted.append(f"«{item.path.name}»: {proposal.title}")
+        if not accepted:
+            self._set_status("Правка не применена: участок изменился или эта сторона уже исправлена.", warn=True)
+            return
+        for text in accepted:
+            self._log_line(f"✎ Принята правка по данным соседей — {text}")
+        # Участки перестраиваются из готовых результатов: платных запросов нет.
+        self._start_pdf_set()
+
+    def _revert_pdf_set_fix(self, lot_key: str, proposal_id: str) -> None:
+        """Снимает принятую правку: участок снова строится как в документе."""
+        item = self._pdf_set_item_by_key(lot_key)
+        if self._busy or item is None:
+            return
+        kept = [fix for fix in item.fixes if fix.id != proposal_id]
+        if len(kept) == len(item.fixes):
+            return
+        dropped = next(fix for fix in item.fixes if fix.id == proposal_id)
+        item.fixes = kept
+        self._log_line(f"↩ Правка снята — «{item.path.name}»: {dropped.title}")
+        self._start_pdf_set()
+
+    def _ask_pdf_set_advisor(self) -> None:
+        """Платный вопрос ИИ-советнику о расхождениях набора (по кнопке — всегда заново)."""
+        if self._busy or not self.pdf_set:
+            return
+        from tkinter import messagebox
+
+        if not messagebox.askyesno(
+            "ИИ-советник",
+            "Отправить нейросети данные участков набора, их тексты или страницы и акт сверки?\n\n"
+            "Это платный запрос. Советник объяснит расхождения и предложит правки; каждая "
+            "проверяется геометрией и применяется только после вашего подтверждения.",
+        ):
+            return
+        self._start_pdf_set(ask_advisor=True)
 
     def _open_pdf_set_report_window(self) -> None:
         """Окно итога: что построено, замечания по каждому участку и сверка с соседями."""
@@ -6280,11 +6483,14 @@ class SurveyApp(ctk.CTk):
             headline += f" · с замечаниями: {len(flagged)}"
         if failed:
             headline += f" · не разобрано: {len(failed)}"
+        analysis = self._pdf_set_analysis
+        if analysis is not None and analysis.headline():
+            headline += f"\n💡 {analysis.headline()}"
 
         win = ctk.CTkToplevel(self)
         self._session_windows.append(win)
         win.title("Итог разбора набора PDF — Title Survey AI")
-        win.geometry("900x640")
+        win.geometry("1000x760" if analysis is not None and (analysis.proposals or analysis.applied) else "1000x640")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
         win.grid_columnconfigure(0, weight=1)
@@ -6304,9 +6510,72 @@ class SurveyApp(ctk.CTk):
         win._report_text = full_text
         win._report_headline = headline
 
+        # Находки по данным соседей: данные участка меняются только кнопкой.
+        win._fix_buttons = {}
+        win._revert_buttons = {}
+        fix_rows: list[tuple[str, Any]] = []
+        if analysis is not None:
+            fix_rows += [("apply", proposal) for proposal in analysis.proposals]
+            fix_rows += [("revert", fix) for fix in analysis.applied]
+        if fix_rows:
+            panel = ctk.CTkScrollableFrame(
+                win, fg_color=THEME["bg_card"], corner_radius=8, height=min(190, 58 * len(fix_rows)),
+                label_text="Находки по данным соседей — участок меняется только после «Применить»",
+                label_font=ctk.CTkFont(size=12, weight="bold"), label_text_color=THEME["sky"],
+            )
+            panel.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+            panel.grid_columnconfigure(0, weight=1)
+            for row_index, (kind, proposal) in enumerate(fix_rows):
+                if kind == "apply":
+                    mark = "✔" if proposal.verified else "◐"
+                    text = (
+                        f"[{analysis.number(proposal)}] {mark} «{proposal.lot_name}»: {proposal.title}\n"
+                        f"     {proposal.verdict_label()}: {proposal.metrics_line()}"
+                    )
+                    color = THEME["ok"] if proposal.verified else THEME["warn"]
+                else:
+                    text = f"✎ принято — «{proposal.lot_name}»: {proposal.title}"
+                    color = THEME["text_muted"]
+                ctk.CTkLabel(
+                    panel, text=text, anchor="w", justify="left", wraplength=640,
+                    text_color=color, font=ctk.CTkFont(size=12),
+                ).grid(row=row_index, column=0, sticky="ew", padx=(8, 8), pady=3)
+                if kind == "apply":
+                    button = ctk.CTkButton(
+                        panel, text="Применить", width=150, height=28,
+                        fg_color=THEME["btn_emerald"], hover_color=THEME["btn_emerald_hover"],
+                        command=lambda pid=proposal.id: self._apply_pdf_set_fix(pid),
+                    )
+                    win._fix_buttons[proposal.id] = button
+                else:
+                    button = ctk.CTkButton(
+                        panel, text="Вернуть как в документе", width=190, height=28,
+                        fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+                        command=lambda key=proposal.lot_key, pid=proposal.id: self._revert_pdf_set_fix(key, pid),
+                    )
+                    win._revert_buttons[proposal.id] = button
+                button.grid(row=row_index, column=1, padx=(0, 8), pady=3)
+
         bar = ctk.CTkFrame(win, fg_color="transparent")
-        bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        bar.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
         bar.grid_columnconfigure(0, weight=1)
+        left = ctk.CTkFrame(bar, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="w")
+        win._advisor_button = ctk.CTkButton(
+            left, text="🧠 Спросить ИИ-советника", width=200, height=30,
+            fg_color=THEME["btn_amber"], hover_color=THEME["btn_amber_hover"],
+            command=self._ask_pdf_set_advisor,
+        )
+        win._advisor_button.grid(row=0, column=0, padx=(0, 8))
+        verified = [p for p in analysis.proposals if p.verified] if analysis is not None else []
+        win._apply_all_button = None
+        if len(verified) > 1:
+            win._apply_all_button = ctk.CTkButton(
+                left, text=f"Применить все подтверждённые ({len(verified)})", width=240, height=30,
+                fg_color=THEME["btn_emerald"], hover_color=THEME["btn_emerald_hover"],
+                command=self._apply_all_pdf_set_fixes,
+            )
+            win._apply_all_button.grid(row=0, column=1, padx=(0, 8))
 
         def _copy_report() -> None:
             self.clipboard_clear()

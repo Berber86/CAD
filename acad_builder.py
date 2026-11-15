@@ -60,7 +60,8 @@ from feature_labeler import (
     vertical_text_direction,
 )
 from shapely import affinity as shapely_affinity
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 from shapely.geometry import box as shapely_box
 from shapely.strtree import STRtree
 
@@ -118,6 +119,7 @@ AC_ATTACHMENT_MIDDLE_LEFT = 4
 AC_ATTACHMENT_MIDDLE_CENTER = 5
 AC_ATTACHMENT_MIDDLE_RIGHT = 6
 AC_LEADER_LINE_WITH_ARROW = 2
+AC_LEADER_SPLINE_WITH_ARROW = 3
 
 #: линейные объекты DWG, из которых собираются участок, заборы и строения
 _FEATURE_LINE_KINDS = frozenset(
@@ -3073,6 +3075,19 @@ class AcadBuilder:
                 continue
         return hidden
 
+    def _label_text_style(self, doc: Any) -> tuple[str, bool]:
+        """
+        Текстовый стиль подписей Шага 2: ``(имя, это стиль самого чертежа)``.
+
+        В чертежах заказчика подписи ``D-TOPO-TEXT`` набраны стилем ``ROMANS``
+        (``label_text_style``); если такой стиль в чертеже есть, он берётся как
+        есть, без изменений. Иначе — стиль программы (``drawing.text_style``).
+        """
+        wanted = str(feature_settings(self.cfg).get("label_text_style") or "").strip()
+        if wanted and self._text_style_exists(doc, wanted):
+            return wanted, True
+        return self._ensure_text_style(doc), False
+
     @staticmethod
     def _text_style_exists(doc: Any, name: str) -> bool:
         """Есть ли в чертеже текстовый стиль ``name`` (стили шаблона заказчика)."""
@@ -3094,7 +3109,7 @@ class AcadBuilder:
             return 1.0
         entity = None
         try:
-            style = self._ensure_text_style(doc)
+            style, _native = self._label_text_style(doc)
             entity = _com_retry(
                 doc.ModelSpace.AddText, TEXT_WIDTH_PROBE, _variant_point((0.0, 0.0)), float(height)
             )
@@ -3153,13 +3168,19 @@ class AcadBuilder:
         """
         Выноска со стрелкой. Возвращает ``(объект, предупреждение)``.
 
-        ``leader_style = "arc"`` (по умолчанию) — короткая дуга полилинией с
-        клиновидной стрелкой, как на чертежах заказчика. ``"leader"`` —
-        ``AddLeader`` с привязанным MText -> ``AddLeader`` без аннотации ->
-        полилиния со стрелкой (если AddLeader недоступен).
+        ``leader_style = "spline"`` (по умолчанию) — объект Leader, как у
+        заказчика: сплайн со стрелкой по двум точкам, MText привязан к выноске
+        (QLEADER). ``"leader"`` — Leader из прямых отрезков с полкой. Порядок
+        попыток: ``AddLeader`` с привязанным MText -> ``AddLeader`` без
+        аннотации -> полилиния со стрелкой (если AddLeader недоступен).
+        ``"arc"`` — сразу дуга полилинией с клиновидной стрелкой.
         """
         fcfg = feature_settings(self.cfg)
-        use_leader = str(fcfg.get("leader_style") or "arc").strip().lower() == "leader"
+        style = str(fcfg.get("leader_style") or "spline").strip().lower()
+        use_leader = style in {"leader", "spline"}
+        leader_type = (
+            AC_LEADER_SPLINE_WITH_ARROW if style == "spline" else AC_LEADER_LINE_WITH_ARROW
+        )
         points3d = [(x, y, 0.0) for x, y in item.leader_points]
         coordinates = _variant_points(points3d)
         leader: Any = None
@@ -3177,15 +3198,22 @@ class AcadBuilder:
             for candidate in attempts:
                 try:
                     leader = _com_retry(
-                        model_space.AddLeader, coordinates, candidate, AC_LEADER_LINE_WITH_ARROW,
+                        model_space.AddLeader, coordinates, candidate, leader_type,
                         attempts=2,
                     )
                     break
                 except Exception:  # noqa: BLE001 - пробуем следующий вариант
                     leader = None
         if leader is not None:
-            arrow_factor = float(fcfg.get("leader_arrow_size_factor") or 0.0)
-            if arrow_factor > 0.0:
+            # Стрелка — из текущего размерного стиля чертежа (у заказчика
+            # CURB-DIM 1-16: 1.2 ft); своя — только если та несоразмерна тексту.
+            arrow_factor = float(fcfg.get("leader_object_arrow_factor") or 0.0)
+            try:
+                current = float(leader.ArrowheadSize) * float(leader.ScaleFactor)
+            except Exception:  # noqa: BLE001 - свойства недоступны
+                current = 0.0
+            fits = 0.6 * float(item.height) <= current <= 2.2 * float(item.height)
+            if arrow_factor > 0.0 and not fits:
                 try:
                     leader.ScaleFactor = 1.0
                     leader.ArrowheadSize = float(item.height) * arrow_factor
@@ -3230,7 +3258,10 @@ class AcadBuilder:
             pass
         polyline.Layer = layer
         if use_leader:
-            warning = "AddLeader недоступен — выноска начерчена полилинией со стрелкой"
+            warning = (
+                "AutoCAD не создал объект Leader (AddLeader) — выноска начерчена "
+                "полилинией со стрелкой"
+            )
         return polyline, warning
 
     def draw_feature_labels(
@@ -3246,7 +3277,8 @@ class AcadBuilder:
         if not plan.items:
             return result
 
-        style = self._ensure_text_style(doc)
+        style, result.text_style_native = self._label_text_style(doc)
+        result.text_style = style
         layer = self._ensure_feature_layer(
             doc, plan.output_layer, int(fcfg.get("label_output_layer_color") or 7)
         )
@@ -3309,10 +3341,12 @@ class AcadBuilder:
                         result.created_mtexts += 1
                         if item.kind == "leader" and len(item.leader_points) >= 2:
                             try:
-                                _leader, note = self._add_leader(
+                                leader, note = self._add_leader(
                                     model_space, item, mtext, layer_name
                                 )
                                 result.created_leaders += 1
+                                if str(getattr(leader, "ObjectName", "")) == "AcDbLeader":
+                                    result.created_leader_objects += 1
                                 if note and not leader_warned:
                                     result.warnings.append(note)
                                     leader_warned = True
@@ -5579,6 +5613,11 @@ class FeatureLabelResult:
     created_texts: int = 0
     created_mtexts: int = 0
     created_leaders: int = 0
+    #: из них объектов Leader (остальные — полилинии со стрелкой)
+    created_leader_objects: int = 0
+    #: текстовый стиль подписей и взят ли он из самого чертежа
+    text_style: str = ""
+    text_style_native: bool = False
     failed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     mode: str = "auto"
@@ -5651,6 +5690,12 @@ class FeatureLabelResult:
         ]
         if plan.vertical_reads_note:
             lines.append("Направление текста: " + plan.vertical_reads_note)
+        if self.text_style:
+            lines.append(
+                f"Стиль текста подписей: {self.text_style} "
+                + ("(стиль чертежа)" if self.text_style_native
+                   else "(создан программой, шрифт romans.shx: стиля заказчика в чертеже нет)")
+            )
         lines += [
             "",
             f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
@@ -5669,10 +5714,30 @@ class FeatureLabelResult:
             f"{sum(plan.count_placement(kind) for kind in ('beside', 'gate', 'spot'))}, "
             f"выноска: {plan.count_placement('leader')})"
         )
+        if done > len(rec.labeled):
+            lines.append(
+                "  подписей больше, чем объектов: забор подписывается на каждом длинном прямом участке"
+            )
         if not self.dry_run:
+            how_leaders = ""
+            if self.created_leaders:
+                objects = self.created_leader_objects
+                polylines = self.created_leaders - objects
+                parts = []
+                if objects:
+                    parts.append(f"объектов Leader: {objects}")
+                if polylines:
+                    parts.append(f"полилиний со стрелкой: {polylines}")
+                how_leaders = f" ({', '.join(parts)})"
             lines.append(
                 f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
-                f"{self.created_mtexts}, выносок — {self.created_leaders}"
+                f"{self.created_mtexts}, выносок — {self.created_leaders}{how_leaders}"
+            )
+        if rec.house_without_text:
+            lines.append(
+                "ДОМ НЕ ПОДПИСАН: поле «Текст для основного дома» пустое. Впишите описание "
+                "(например, 3 STY BRICK W/CELLAR No. 6910) и запустите Шаг 2 ещё раз — "
+                "добавится только подпись дома."
             )
         for item in plan.items:
             if item.layer and item.layer.upper() != str(plan.output_layer).upper():
@@ -5979,7 +6044,7 @@ class _LabelPlacer:
         self.inside_clear = float(self.fcfg.get("inside_clearance_factor") or 0.0) * self.h
         self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
         self.reads, self.reads_note = vertical_text_direction(snapshot, self.fcfg)
-        self.leader_style = str(self.fcfg.get("leader_style") or "arc").strip().lower()
+        self.leader_style = str(self.fcfg.get("leader_style") or "spline").strip().lower()
         # Описание основного дома: свой слой, стиль и высота (как у заказчика).
         self.house_layer = str(self.fcfg.get("house_label_layer") or "").strip()
         self.house_style = str(self.fcfg.get("house_label_text_style") or "").strip()
@@ -6010,6 +6075,7 @@ class _LabelPlacer:
         self.lines.append(LineString(list(self.lot.exterior.coords)))
         self.tree = STRtree(self.lines)
         self.new_lines: list[Any] = []
+        self.front_strip = self._front_yard_strip(snapshot)
 
         # --- существующие тексты: препятствия и источник дубликатов ----------
         self.text_boxes: list[Any] = []
@@ -6057,6 +6123,62 @@ class _LabelPlacer:
         axes = [0.0 if abs(value) < math.radians(0.05) else value for value in axes]
         axes.sort(key=abs)
         return axes
+
+    def _front_yard_strip(self, snapshot: DrawingSnapshot) -> Any:
+        """
+        Полоса перед красной линией в створе участка (палисадник, приямок у
+        рядового дома) глубиной ``front_yard_depth_ft``; ``None`` — улицы нет.
+
+        Сторона участка «уличная», если идёт по линии слоя
+        ``property_closing_layers`` (``M-ROW-LINE``).
+        """
+        depth = float(self.fcfg.get("front_yard_depth_ft") or 0.0)
+        if depth <= 0.0:
+            return None
+        closing = self.fcfg.get("property_closing_layers")
+        street: list[Any] = []
+        for line in snapshot.lines:
+            if not layer_matches(line.layer, closing):
+                continue
+            geom = line_to_shapely(line)
+            if geom is not None and self._in_bounds(geom):
+                street.append(geom)
+        if not street:
+            return None
+        tolerance = max(float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0), 0.25)
+        try:
+            street_zone = unary_union(street).buffer(tolerance)
+            coords = [(float(x), float(y)) for x, y, *_rest in self.lot.exterior.coords]
+            strips: list[Any] = []
+            for a, b in zip(coords, coords[1:]):
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                if length < 1.0:
+                    continue
+                if LineString([a, b]).intersection(street_zone).length < 0.9 * length:
+                    continue
+                nx, ny = -(b[1] - a[1]) / length, (b[0] - a[0]) / length
+                mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+                if self.lot.contains(Point(mid[0] + nx * 0.1, mid[1] + ny * 0.1)):
+                    nx, ny = -nx, -ny
+                strips.append(Polygon([
+                    a, b, (b[0] + nx * depth, b[1] + ny * depth), (a[0] + nx * depth, a[1] + ny * depth),
+                ]))
+            if not strips:
+                return None
+            # Возвраты ограды идут по продолжению боковых границ: полоса чуть шире.
+            return unary_union(strips).buffer(max(tolerance, 0.5))
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            return None
+
+    def _front_yard_fence(self, geometry: Any) -> bool:
+        """Забор стоит перед красной линией в створе участка (своя ограда палисадника)."""
+        if self.front_strip is None:
+            return False
+        try:
+            inside = geometry.intersection(self.front_strip).length
+        except Exception:  # noqa: BLE001
+            return False
+        return inside >= 0.6 * geometry.length
 
     def _in_bounds(self, geom: Any) -> bool:
         minx, miny, maxx, maxy = geom.bounds
@@ -6486,6 +6608,9 @@ class _LabelPlacer:
             # Кромка клумбы: сама клумба — полоса между этой линией и забором у
             # границы, подпись ставится в неё, а не во двор.
             first_side = -first_side
+        elif feature.kind == "fence" and self._front_yard_fence(feature.geometry):
+            # Ограда палисадника: внутри тесно (люки, калитка) — подпись со стороны улицы.
+            first_side = -first_side
         max_shift = max(0.0, (length - width) / 2.0 - margin)
         best: tuple[int, FeatureLabelItem] | None = None
         # Рядом с забором часто идёт граница участка (FE. 0.3'): если вплотную
@@ -6545,7 +6670,9 @@ class _LabelPlacer:
         # Полоса вдоль линии, в которой может стоять подпись этого участка.
         reach = (float(self.fcfg.get("fence_text_offset_factor") or 0.8) + 2.0) * self.h
         short_text = self._fence_short_label(text) if feature.kind == "fence" else None
-        if short_text is not None and self._neighbour_fence(feature.geometry):
+        # Ограда палисадника перед красной линией — своя, хотя и стоит за участком.
+        front = feature.kind == "fence" and self._front_yard_fence(feature.geometry)
+        if short_text is not None and not front and self._neighbour_fence(feature.geometry):
             # Забор за линией участка (соседский): заказчик пишет его сокращением
             # на каждом прямом участке, включая отводы; полностью — только на
             # длинном участке.

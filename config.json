@@ -845,13 +845,16 @@
     ],
     "fence_near_lot_ft": 2.0,
     "field_note_surface_radius_ft": 15.0,
-    "leader_style": "arc",
+    "leader_style": "spline",
     "leader_arc_bulge": 0.25,
     "leader_min_length_factor": 2.5,
     "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
-    "leader_text_gap_factor": 0.5,
+    "leader_text_gap_factor": 0.333,
     "leader_arrow_size_factor": 0.8,
-    "leader_attach_annotation": true
+    "leader_object_arrow_factor": 1.333,
+    "leader_attach_annotation": true,
+    "label_text_style": "ROMANS",
+    "front_yard_depth_ft": 15.0
   }
 }

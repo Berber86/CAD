@@ -114,6 +114,8 @@ APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1440x940"
 VERSION = "1.0.0"
 RESULT_PANEL_DEFAULT_WIDTH = 384
+#: Размер шрифта журнала и отчёта Шага 2 (остальные тексты правой панели — 10–11).
+LOG_FONT_SIZE = 13
 RESULT_PANEL_MIN_WIDTH = 340
 CENTER_PANEL_MIN_WIDTH = 260
 RESULT_SPLITTER_WIDTH = 12
@@ -494,6 +496,8 @@ class SurveyApp(ctk.CTk):
         self._result_font_base = {
             "body": 11, "body_bold": 11, "small": 10, "small_bold": 10,
             "mono": 11, "mono_small": 10, "stat": 15,
+            # Журнал и отчёт Шага 2 читают подолгу: шрифт крупнее остальных.
+            "log": LOG_FONT_SIZE,
         }
         self._result_fonts = {
             "body": ctk.CTkFont(size=11),
@@ -503,6 +507,7 @@ class SurveyApp(ctk.CTk):
             "mono": ctk.CTkFont(family="Consolas", size=11),
             "mono_small": ctk.CTkFont(family="Consolas", size=10),
             "stat": ctk.CTkFont(family="Consolas", size=15, weight="bold"),
+            "log": ctk.CTkFont(family="Consolas", size=LOG_FONT_SIZE),
         }
 
         self._build_ui()
@@ -2372,8 +2377,8 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
             corner_radius=8,
-            text_color=THEME["text_muted"],
-            font=self._result_fonts["mono_small"],
+            text_color=THEME["text_main"],
+            font=self._result_fonts["log"],
         )
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
@@ -2763,8 +2768,8 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
             corner_radius=8,
-            text_color=THEME["text_muted"],
-            font=self._result_fonts["mono_small"],
+            text_color=THEME["text_main"],
+            font=self._result_fonts["log"],
         )
         self.step2_report_box.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self._set_step2_report(STEP2_EMPTY_REPORT)

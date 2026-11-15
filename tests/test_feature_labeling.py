@@ -433,7 +433,10 @@ def test_recognition_sources_and_counters(angle, gap):
     assert len(result.point_codes) == 8
 
     # Слои без правила найдены, но остаются без подписи.
-    assert {f.layer for f in result.unlabeled} == {"ST-WALL", "REF_VEC_BUILDING"}
+    assert {f.layer for f in result.unlabeled} == {"ST-WALL"}
+    # Соседний дом — не «слой без правила»: его описание вписывают вручную.
+    (neighbour,) = [f for f in result.features if f.layer == "REF_VEC_BUILDING"]
+    assert neighbour.label is None and neighbour.skip_reason == fl.OTHER_HOUSE_REASON
     assert (result.by_notes, result.by_point_codes, result.by_layers, result.by_user) == (0, 2, 15, 1)
     assert len(result.labeled) == 18
 
@@ -886,7 +889,10 @@ def test_code_crew_lines_without_fence_code_are_silent():
     crew = [f for f in rec.features if f.layer == "CODE_CREW"]
     assert len(crew) == 2 and all(f.label is None for f in crew)
     assert all(f.skip_reason == fl.CODE_LINEWORK_REASON for f in crew)
-    assert [f.layer for f in rec.unlabeled] == ["BUILDING_OUTLINE"]  # соседний дом
+    assert rec.unlabeled == []
+    assert [f.layer for f in rec.features if f.skip_reason == fl.OTHER_HOUSE_REASON] == [
+        "BUILDING_OUTLINE"  # соседний дом
+    ]
 
 
 def test_surface_note_replaces_layer_label_of_the_same_surface():
@@ -1470,7 +1476,8 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
 
     report = result.report()
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 23" in report
-    assert "БЕЗ ПОДПИСИ (для слоя нет правила): 1 — BUILDING_OUTLINE (1)" in report  # без CODE_CREW
+    assert "БЕЗ ПОДПИСИ" not in report  # ни CODE_CREW, ни соседнего дома
+    assert "ДОМ НЕ ПОДПИСАН" not in report
     assert "короткий забор за пределами участка" not in report  # они подписаны сокращениями
     assert "Слои полевых заметок выключены" in report
     assert "Заметки, которые не переносятся по правилам: «HOUSE»; «LOW TIMBER EDGE»; «NEIGHBOUR HOUSE»" in report
@@ -1486,9 +1493,81 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
     assert len(space.created) == created
 
 
-def test_arc_leader_is_a_polyline_with_wedge_arrow(com):
-    """Выноска — дуговая полилиния с клиновидной стрелкой (AddLeader не используется)."""
+def test_leader_is_a_spline_leader_object_like_the_customers(com):
+    """
+    У заказчика выноска — объект Leader (QLEADER): сплайн со стрелкой по двум
+    точкам, MText привязан к выноске, стрелка — из размерного стиля чертежа.
+    """
+    assert fl.DEFAULT_FEATURE_CONFIG["leader_style"] == "spline"
     builder, _app, doc = com(build_stafford_scene())
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
+    assert result.failed == [] and result.warnings == []
+    assert (result.created_leaders, result.created_leader_objects) == (2, 2)
+    space = doc.ModelSpace
+    assert not [e for e in space.created if e.ObjectName == "AcDbPolyline"]
+    leaders = [e for e in space.created if e.ObjectName == "AcDbLeader"]
+    assert len(leaders) == 2
+    texts = {id(e) for e in space.created if e.ObjectName == "AcDbMText"}
+    for leader in leaders:
+        assert leader.Type == ab.AC_LEADER_SPLINE_WITH_ARROW == 3
+        assert len(leader.Coordinates) == 6  # остриё у объекта и конец у текста
+        # Текст сбоку от выноски привязан к ней; текст над концом выноски — нет.
+        assert leader.Annotation is None or id(leader.Annotation) in texts
+        assert leader.Layer == "D-TOPO-TEXT"
+        # В заглушке размерного стиля нет: стрелка 1.333 высоты текста (1.2 ft при 0.9 ft).
+        assert leader.ArrowheadSize == pytest.approx(1.1 * 1.333) and leader.ScaleFactor == 1.0
+    assert [e for e in leaders if e.Annotation is not None]
+    assert "выносок — 2 (объектов Leader: 2)" in result.report()
+
+    # Стрелка размерного стиля чертежа, соразмерная тексту, не трогается.
+    builder, _app, doc = com(build_stafford_scene())
+    original = doc.ModelSpace.AddLeader
+
+    def styled_leader(coordinates, annotation, leader_type):
+        leader = original(coordinates, annotation, leader_type)
+        leader.ArrowheadSize, leader.ScaleFactor = 1.2, 1.0
+        return leader
+
+    doc.ModelSpace.AddLeader = styled_leader
+    builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
+    leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
+    assert [e.ArrowheadSize for e in leaders] == [1.2, 1.2]
+
+    # AutoCAD не создал Leader: дуга полилинией и одно предупреждение.
+    builder, _app, doc = com(build_stafford_scene(), with_leader=False)
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
+    assert result.failed == [] and result.created_labels == 26
+    assert (result.created_leaders, result.created_leader_objects) == (2, 0)
+    assert len(result.warnings) == 1 and "полилинией" in result.warnings[0]
+    arrows = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbPolyline"]
+    assert len(arrows) == 2 and all(set(e.bulges) == {0, 1} for e in arrows)
+    assert "выносок — 2 (полилиний со стрелкой: 2)" in result.report()
+
+
+def test_labels_use_the_text_style_of_the_drawing(com):
+    """Подписи заказчика набраны стилем ROMANS: если он есть в чертеже, свой стиль не создаётся."""
+    builder, _app, doc = com(load_brooklyn())
+    doc.TextStyles.Add("ROMANS")
+    doc.TextStyles.Add("RDS")
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert result.failed == [] and (result.text_style, result.text_style_native) == ("ROMANS", True)
+    created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
+    assert {e.StyleName for e in created if e.Layer == "D-TOPO-TEXT"} == {"ROMANS"}
+    assert {e.StyleName for e in created if e.Layer == "0"} == {"RDS"}
+    assert "AI_BOUNDARY" not in doc.TextStyles.items
+    assert "Стиль текста подписей: ROMANS (стиль чертежа)" in result.report()
+
+    # Стиля заказчика нет — создаётся стиль программы.
+    builder, _app, doc = com(load_brooklyn())
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert (result.text_style, result.text_style_native) == ("AI_BOUNDARY", False)
+    assert "AI_BOUNDARY" in doc.TextStyles.items
+    assert "Стиль текста подписей: AI_BOUNDARY (создан программой" in result.report()
+
+
+def test_arc_leader_is_a_polyline_with_wedge_arrow(com):
+    """``leader_style: "arc"`` — дуговая полилиния с клиновидной стрелкой (AddLeader не используется)."""
+    builder, _app, doc = com(build_stafford_scene(), feature_cfg={"leader_style": "arc"})
     result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
     assert result.failed == [] and result.warnings == []
     assert result.created_labels == 26 and result.created_leaders == 2
@@ -1643,6 +1722,7 @@ def test_leader_style_leader_uses_addleader_and_falls_back_to_polyline(com):
     assert result.created_leaders == 2
     assert result.failed == []
     assert len(result.warnings) == 1 and "полилинией" in result.warnings[0]
+    assert result.created_leader_objects == 0
     arrows = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbPolyline"]
     assert len(arrows) == 2
     assert {e.Layer for e in arrows} == {"D-TOPO-TEXT"}
@@ -2083,7 +2163,7 @@ BROOKLYN_FINAL_LABELS = [
     ("AWNING", (5017.8, 4928.5), 1.5),
     ("DECK", (4988.2, 4988.2), 3.0),                # METAL DECK
     ("CHAIN LINK FENCE", (5004.1, 5019.1), 2.0),    # CHAIN LINK FENCE 0.4'E
-    ("IRON FENCE", (5003.7, 4923.9), 3.0),          # IRON FENCE 5.4'E
+    ("IRON FENCE", (5003.7, 4923.9), 0.5),          # IRON FENCE 5.4'E
     ("WALL", (5015.6, 5002.6), 1.5),                # CONC. WALL ALONG LINE
     ("WALL", (5000.1, 5004.6), 3.5),                # CONC. WALL
     ("UTILITY POLE", (5002.4, 5015.2), 4.0),
@@ -2141,12 +2221,17 @@ def test_row_house_is_the_part_of_the_lot_between_the_wall_lines():
     # Линии фасадов в «без подписи» не попадают; дом соседа сзади — остаётся.
     walls = [f for f in result.features if f.skip_reason == fl.ROW_HOUSE_WALL_REASON]
     assert len(walls) == 2
-    assert [(f.kind, f.category) for f in result.unlabeled] == [("area", "house")]
+    assert result.unlabeled == [] and not result.house_without_text
+    assert [(f.kind, f.category) for f in result.features if f.skip_reason == fl.OTHER_HOUSE_REASON] == [
+        ("area", "house")
+    ]
 
     # Без текста дома контур найден, но подписи у него нет.
     plain = recognize(load_brooklyn(), house="")
     assert not [f for f in plain.features if f.is_main_house]
-    (found,) = [f for f in plain.unlabeled if f.rule == fl.ROW_HOUSE_RULE]
+    assert plain.house_without_text and plain.unlabeled == []
+    (found,) = [f for f in plain.features if f.rule == fl.ROW_HOUSE_RULE]
+    assert found.label is None and found.skip_reason == fl.HOUSE_TEXT_MISSING_REASON
     assert found.geometry.equals(house.geometry)
 
 
@@ -2187,7 +2272,7 @@ def test_brooklyn_plan_matches_the_customer_final_drawing():
     texts = sorted(item.single_line for item in plan.items)
     assert texts == sorted(
         [text for text, _point, _tolerance in BROOKLYN_FINAL_LABELS]
-        + ["C.L.F. ATOP WALL", "I.FE.", "I.FE."]
+        + ["C.L.F. ATOP WALL", "I.FE."]
     )
     by_text = {item.single_line: item for item in plan.items}
     # Узкая площадка соседа — в две строки, своя длинная — в одну, рядом с люком.
@@ -2215,7 +2300,7 @@ def test_house_description_goes_to_layer_zero_in_a_larger_style(com):
     builder, _app, doc = com(load_brooklyn())
     doc.TextStyles.Add("RDS")
     result = builder.label_features(house_text=BROOKLYN_HOUSE)
-    assert result.failed == [] and result.created_labels == len(result.plan.items) == 19
+    assert result.failed == [] and result.created_labels == len(result.plan.items) == 18
     created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
     (house,) = [e for e in created if e.Layer == "0"]
     assert house.TextString == "3 STY\\PBRICK\\PW/CELLAR\\PNo. 6910"
@@ -2396,3 +2481,123 @@ def test_step1_boundary_that_disagrees_with_the_surveyed_lot_is_reported(com):
         DrawingLine("PROPERTY_LINE", tuple(lot.exterior.coords), kind="AcDbPolyline", closed=True)
     )
     assert fl.find_property_polygon(exact, {}).notes == []
+
+
+# ------------------------------------------- реальный результат в AutoCAD (дамп)
+
+EDITED_BROOKLYN_DUMP = ROOT / "docs" / "edited for MLP 6910 15th Avenue, Brooklyn.dump.json"
+
+
+def real_brooklyn_labels():
+    """Подписи, которые версия 2.6 создала в AutoCAD (дамп inspect_dwg.py после Шага 2)."""
+    dump = json.loads(EDITED_BROOKLYN_DUMP.read_text(encoding="utf-8"))
+    return [
+        entity for entity in dump["entities"]
+        if entity["layer"] == "D-TOPO-TEXT" and entity["type"] in {"Text", "MText"}
+    ]
+
+
+def labeled_brooklyn_snapshot():
+    """Полевой чертёж вместе с подписями, созданными программой в AutoCAD."""
+    snap = load_brooklyn()
+    for entity in real_brooklyn_labels():
+        snap.texts.append(
+            DrawingText(
+                layer=entity["layer"], text=fl.plain_text(entity["text"]),
+                point=(entity["pt"][0], entity["pt"][1]), height=entity["h"],
+                rotation=math.radians(entity["rot_deg"]), bbox=tuple(entity["bbox"]),
+                kind="AcDbMText" if entity["type"] == "MText" else "AcDbText",
+            )
+        )
+    return snap
+
+
+def test_text_size_model_matches_what_autocad_really_drew():
+    """
+    Габариты подписей, созданных программой в настоящем AutoCAD (GetBoundingBox
+    из дампа), совпадают с расчётными: расстановка считается по верным размерам.
+    """
+    labels = real_brooklyn_labels()
+    assert len(labels) == 18
+    assert {entity["h"] for entity in labels} == {0.9}
+    worst = 0.0
+    for entity in labels:
+        lines = entity["text"].split("\\P")
+        expected = max(ab.feature_text_width(line, 0.9) for line in lines)
+        minx, miny, maxx, maxy = entity["bbox"]
+        vertical = abs(math.sin(math.radians(entity["rot_deg"]))) > 0.7
+        measured = (maxy - miny) if vertical else (maxx - minx)
+        across = (maxx - minx) if vertical else (maxy - miny)
+        worst = max(worst, abs(measured - expected))
+        assert measured == pytest.approx(expected, abs=0.15), entity["text"]
+        # Высота строки 0.9 ft; у двух строк — шаг строк MText 1.5 высоты.
+        assert across == pytest.approx(0.9 + 1.5 * (len(lines) - 1), abs=0.06), entity["text"]
+    assert worst < 0.13
+    # План по записи чертежа и результат в AutoCAD: те же тексты на тех же местах.
+    # (с настройками версии 2.6, которая их создала)
+    v26 = {"front_yard_depth_ft": 0.0, "leader_text_gap_factor": 0.5}
+    plan = brooklyn_plan(house="", cfg={"feature_labeling": v26})
+    assert sorted(item.single_line for item in plan.items) == sorted(
+        entity["text"].replace("\\P", " ") for entity in labels
+    )
+    for item in plan.items:
+        center = item.box.centroid
+        nearest = min(
+            math.dist(
+                (center.x, center.y),
+                ((e["bbox"][0] + e["bbox"][2]) / 2.0, (e["bbox"][1] + e["bbox"][3]) / 2.0),
+            )
+            for e in labels if e["text"].replace("\\P", " ") == item.single_line
+        )
+        # VEST. в AutoCAD встал на 0.5 ft выше: запись чертежа округлена до 0.01 ft.
+        assert nearest < (0.6 if item.single_line == "VEST." else 0.1), item.single_line
+
+
+def test_second_run_on_the_really_labeled_drawing_adds_only_the_house():
+    """Повторный запуск на чертеже, уже подписанном программой в AutoCAD."""
+    plan = make_plan(labeled_brooklyn_snapshot(), house="", height=0.9)
+    assert plan.items == [] and plan.warnings == []
+    assert len(plan.duplicates) >= 16
+    assert plan.recognition.house_without_text
+    # В первый раз текст дома не ввели: теперь добавляется только он.
+    plan = make_plan(labeled_brooklyn_snapshot(), house=BROOKLYN_HOUSE, height=0.9)
+    assert [item.single_line for item in plan.items] == ["3 STY BRICK W/CELLAR No. 6910"]
+    assert (plan.items[0].layer, plan.items[0].height) == ("0", pytest.approx(1.5, abs=0.01))
+
+
+def test_report_says_that_the_house_text_was_not_entered(com):
+    builder, _app, _doc = com(load_brooklyn())
+    result = builder.label_features(house_text="")
+    report = result.report()
+    assert result.failed == [] and result.created_labels == 17
+    assert "ДОМ НЕ ПОДПИСАН: поле «Текст для основного дома» пустое" in report
+    assert "БЕЗ ПОДПИСИ" not in report  # дом без текста и дом соседа — не «слой без правила»
+    assert "подписей больше, чем объектов" not in report
+    rec = result.plan.recognition
+    assert rec.house_without_text and rec.unlabeled == []
+    reasons = sorted(f.skip_reason for f in rec.features if f.category == "house" and f.kind == "area")
+    assert reasons == sorted([fl.HOUSE_TEXT_MISSING_REASON, fl.OTHER_HOUSE_REASON])
+    # С текстом дома строки нет.
+    builder, _app, _doc = com(load_brooklyn())
+    assert "ДОМ НЕ ПОДПИСАН" not in builder.label_features(house_text=BROOKLYN_HOUSE).report()
+
+
+def test_front_yard_fence_is_the_owners_fence_labeled_from_the_street():
+    """
+    Ограда палисадника стоит перед красной линией, за участком, но она своя:
+    одна подпись на длинной стороне, со стороны улицы (у заказчика
+    «IRON FENCE 5.4'E» ниже ограды), возвраты не подписываются.
+    """
+    plan = brooklyn_plan()
+    (fence,) = [item for item in plan.items if item.single_line == "IRON FENCE"]
+    assert fence.box.centroid.y == pytest.approx(4923.9, abs=0.2)  # ограда на y = 4924.9, улица ниже
+    assert math.dist(fence.box.centroid.coords[0], (5003.7, 4923.9)) < 0.5
+    short = [item for item in plan.items if item.single_line == "I.FE."]
+    assert len(short) == 1 and short[0].box.centroid.x < 4994.0  # только ограда соседа
+    # Без правила палисадника ограда считалась соседской: сокращения на возвратах.
+    old = brooklyn_plan(cfg={"feature_labeling": {"front_yard_depth_ft": 0.0}})
+    assert len([item for item in old.items if item.single_line == "I.FE."]) == 2
+    (inside,) = [item for item in old.items if item.single_line == "IRON FENCE"]
+    assert inside.box.centroid.y > 4924.9
+    # Чертёж без красной линии: правило не действует, остальное не меняется.
+    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 30

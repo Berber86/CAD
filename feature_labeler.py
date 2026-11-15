@@ -457,16 +457,31 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "fence_near_lot_ft": 2.0,
     #: заметка о покрытии снимает подпись по слою у такого же покрытия в этом радиусе
     "field_note_surface_radius_ft": 15.0,
-    #: "arc" — короткая дуговая выноска полилинией со стрелкой (как у заказчика);
-    #: "leader" — объект AddLeader с полкой
-    "leader_style": "arc",
+    #: "spline" — объект Leader, как у заказчика (QLEADER: сплайн со стрелкой,
+    #: две точки, MText привязан к выноске; размерный стиль — текущий);
+    #: "leader" — объект Leader из прямых отрезков с полкой;
+    #: "arc" — дуга полилинией с клиновидной стрелкой (не объект Leader).
+    #: Если AutoCAD не создаёт Leader, чертится полилиния.
+    "leader_style": "spline",
     "leader_arc_bulge": 0.25,
     "leader_min_length_factor": 2.5,
     "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
-    "leader_text_gap_factor": 0.5,
+    #: зазор между концом выноски и текстом (у заказчика 0.30 ft при тексте 0.9 ft)
+    "leader_text_gap_factor": 0.333,
+    #: стрелка-клин полилинии, в высотах текста
     "leader_arrow_size_factor": 0.8,
+    #: стрелка объекта Leader берётся из размерного стиля чертежа (у заказчика
+    #: CURB-DIM 1-16: 1.2 ft при тексте 0.9 ft); если она меньше 0.6 или больше
+    #: 2.2 высоты текста — ставится такая, в высотах текста
+    "leader_object_arrow_factor": 1.333,
     "leader_attach_annotation": True,
+    #: текстовый стиль подписей: стиль чертежа заказчика, если он есть; если
+    #: нет — стиль программы (drawing.text_style, шрифт romans.shx)
+    "label_text_style": "ROMANS",
+    #: забор перед красной линией в створе участка (палисадник, приямок) — свой:
+    #: одна подпись на длинной стороне, со стороны улицы; глубина полосы, ft
+    "front_yard_depth_ft": 15.0,
 }
 
 
@@ -884,7 +899,7 @@ class NorthArrow:
 
 #: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
 #: программы работала (описания точек из атрибутов блоков читаются с 2.2).
-STEP2_VERSION = "2.6 (2026-11-14)"
+STEP2_VERSION = "2.7 (2026-11-15)"
 
 
 @dataclass
@@ -1782,12 +1797,19 @@ class Feature:
         return self.skip_reason or "нет правила"
 
 
+#: Причины, по которым дом остаётся без подписи.
+HOUSE_TEXT_MISSING_REASON = "поле «Текст для основного дома» пустое"
+OTHER_HOUSE_REASON = "строение не на участке (соседний дом) — описание вписывается вручную"
+
+
 @dataclass
 class RecognitionResult:
     """Итог распознавания: участок, зона поиска и объекты с подписями."""
 
     boundary: PropertyBoundary
     zone: Polygon
+    #: основной дом найден, но текст для него не введён
+    house_without_text: bool = False
     features: list[Feature] = field(default_factory=list)
     point_codes: list[PointCode] = field(default_factory=list)
     unknown_codes: dict[str, int] = field(default_factory=dict)
@@ -3210,6 +3232,19 @@ def recognize_features(
             )
 
     house_label = _normalize_house_text(house_text)
+    if not house_label and main_house is not None:
+        # Дом найден, но описывать его нечем: это не «слой без правила».
+        main_house.skip_reason = HOUSE_TEXT_MISSING_REASON
+        result.house_without_text = True
+    for other in house_candidates:
+        if other is main_house or other.label or other.skip_reason:
+            continue
+        try:
+            on_lot = other.geometry.intersection(boundary.polygon).area
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            continue
+        if on_lot < 0.5 * other.geometry.area:
+            other.skip_reason = OTHER_HOUSE_REASON
     if house_label:
         if main_house is None:
             house_layers = ", ".join(

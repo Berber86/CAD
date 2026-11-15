@@ -12,7 +12,12 @@
    * румб такого курса вычисляется как замыкающий по остальным сторонам —
      это независимая проверка, а без соседа ещё и запасной источник;
    * контур не замыкается, а та же общая граница у соседа записана иначе, и
-     со значением соседа контур замыкается.
+     со значением соседа контур замыкается;
+   * у стороны напечатаны две длины («174.89 feet (deed) 176.92 feet
+     (tax map)»), и второе значение совпадает с общей межой соседа: тогда
+     предлагается перейти на ту систему, которая стыкуется с соседом, —
+     вместе с остальными сторонами, напечатанными так же, иначе контур
+     перестаёт замыкаться.
 
 2. **ИИ-советник.** Если после находок Python конфликт остался, нейросети
    отправляются данные участков, тексты или страницы документов и акт
@@ -52,6 +57,12 @@ WORD_DIRECTION_TOLERANCE_DEG = 50.0
 CLOSING_LENGTH_TOLERANCE_FT = 0.10
 #: Наложение, с которого соседние участки без нашего считаются конфликтующими.
 HARD_OVERLAP_SQFT = 6.0
+#: Насколько второе напечатанное значение должно совпасть с межой соседа.
+ALTERNATE_MATCH_TOLERANCE_FT = 0.02
+#: Расхождение румбов, при котором общая межа считается одной и той же линией.
+ALTERNATE_AXIS_TOLERANCE_ARCSEC = 60.0
+#: Остаток невязки (4″), который ещё объясняется округлением напечатанных длин.
+ALTERNATE_RESIDUAL_LIMIT_FT = 0.35
 
 Components = tuple[str, int, int, float, str]
 
@@ -476,6 +487,20 @@ class _Scene:
                 found.append((other, plan))
         return found
 
+    def shared_edges(
+        self, lot: LotInput, extra: Sequence[Change] = (), *, state: dict[str, tuple[Change, ...]] | None = None,
+    ) -> list[tuple[LotInput, Any]]:
+        """Общие межи участка с соседями при пробной правке: ``(сосед, SharedEdgeCheck)``."""
+        state = state or {}
+        plan = self.plan(lot, state.get(lot.key, ()) + tuple(extra))
+        if plan is None:
+            return []
+        found: list[tuple[LotInput, Any]] = []
+        for other, other_plan in self._others(lot, state):
+            pair = verify_with_neighbors(plan, [other_plan]).pair_reports[0]
+            found.extend((other, edge) for edge in pair.shared_edges)
+        return found
+
     def metrics(
         self, lot: LotInput, extra: Sequence[Change] = (), *, state: dict[str, tuple[Change, ...]] | None = None,
     ) -> Metrics | None:
@@ -797,6 +822,271 @@ def _neighbor_value_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
 
 
 # ---------------------------------------------------------------------------
+# Правило 3: у стороны напечатаны две длины (deed / tax map) — берём ту,
+#            что совпадает с общей межой соседа, и держим контур замкнутым
+# ---------------------------------------------------------------------------
+
+#: Слова, которыми в описаниях помечают второе (альтернативное) значение длины.
+_ALTERNATE_LABEL_RE = re.compile(
+    r"deed|tax\s*map|u\.?\s*s\.?\s*standard|us\s*standard|actual|record|measured|"
+    r"survey|title|assessor|map",
+    re.IGNORECASE,
+)
+
+#: «174.89 feet (deed) 176.92 feet (tax map)» — два значения с пометками.
+_TWO_LABELLED_LENGTHS_RE = re.compile(
+    r"(?P<first>\d+(?:\.\d+)?)\s*(?:feet|foot|ft)\s*\(\s*(?P<label1>[^()]{1,40}?)\s*\)"
+    r"\s*[,;]?\s*(?P<second>\d+(?:\.\d+)?)\s*(?:feet|foot|ft)\s*\(\s*(?P<label2>[^()]{1,40}?)\s*\)",
+    re.IGNORECASE,
+)
+
+#: «198.83 feet (196.60 feet U.S. Standard)» — второе значение в скобках.
+_BRACKETED_LENGTH_RE = re.compile(
+    r"(?P<first>\d+(?:\.\d+)?)\s*(?:feet|foot|ft)\s*\(\s*(?P<second>\d+(?:\.\d+)?)\s*"
+    r"(?:feet|foot|ft)?\s*[,;]?\s*(?P<label2>[^()]{0,40})\)",
+    re.IGNORECASE,
+)
+
+
+def printed_alternate_lengths(
+    description: LegalDescription, source_text: str
+) -> dict[int, tuple[float, str, str]]:
+    """
+    Вторые (альтернативные) длины сторон, напечатанные в самом описании:
+    ``{индекс стороны: (длина, пометка, как напечатано)}``.
+
+    В нью-йоркских deeds длины нередко даны двумя системами рядом:
+    ``174.89 feet (deed) 176.92 feet (tax map)`` или
+    ``198.83 feet (196.60 feet U.S. Standard)``. Напечатаны обе, чертится одна.
+    """
+    text = " ".join((source_text or "").split())
+    if not text or not description.segments:
+        return {}
+    found: dict[int, tuple[float, str, str]] = {}
+    for pattern in (_TWO_LABELLED_LENGTHS_RE, _BRACKETED_LENGTH_RE):
+        for match in pattern.finditer(text):
+            first = float(match.group("first"))
+            second = float(match.group("second"))
+            label = " ".join((match.group("label2") or "").split())
+            if abs(second - first) < 0.005:
+                continue
+            if pattern is _BRACKETED_LENGTH_RE and not _ALTERNATE_LABEL_RE.search(label):
+                continue
+            index = next(
+                (
+                    i for i, seg in enumerate(description.segments)
+                    if abs(seg.distance_ft - first) <= 0.005
+                ),
+                None,
+            )
+            if index is None or index in found:
+                continue
+            found[index] = (second, label, " ".join(match.group(0).split()))
+    return found
+
+
+def _distance_change(index: int, seg: Segment, value: float) -> Change:
+    return Change(
+        target="side", index=index, field="distance", distance_ft=value,
+        old_label=f"{seg.distance_ft:.2f}'", new_label=f"{value:.2f}'",
+    )
+
+
+def _alternate_verdict(
+    before: Metrics | None,
+    after: Metrics | None,
+    *,
+    span_ft: float = 40.0,
+    neighbour_closure_ft: float = 0.0,
+) -> str:
+    """
+    Оценка переключения системы длин.
+
+    ``verified`` — контур замыкается в допуске; ``partial`` — общая межа с соседом
+    сходится точно, а остаток невязки не больше, чем у самого описания соседа
+    (доли фута от округления tax map, а не от правки); ``rejected`` — стало хуже.
+    """
+    if before is None or after is None:
+        return "rejected"
+    # Тонкий «волосяной» клин вдоль общей межи — это отвод гэпа в угол, а не наложение.
+    if after.overlap_sqft > 1.0 and after.overlap_sqft / max(span_ft, 10.0) > 0.12:
+        return "rejected"
+    if after.closure_ft <= CLOSURE_LIMIT_FT:
+        return "verified"
+    if (
+        after.closure_ft <= ALTERNATE_RESIDUAL_LIMIT_FT
+        and after.closure_ft <= neighbour_closure_ft + 0.05
+    ):
+        return "partial"
+    return "rejected"
+
+
+def _printed_alternate_proposals(
+    scene: _Scene,
+    lot: LotInput,
+    *,
+    state: dict[str, tuple[Change, ...]] | None = None,
+    pending: Sequence[Proposal] = (),
+) -> list[Proposal]:
+    """
+    Правило 3: сторона напечатана дважды (deed / tax map), и второе значение
+    совпадает с общей межой соседа — предлагается перейти на ту систему,
+    которая стыкуется с соседом.
+
+    Так участок и сосед встают стенка к стенке без щели: у обоих одна и та же
+    длина общей межи. Остальные стороны, напечатанные в том же виде, переходят
+    вместе с ней — иначе контур перестаёт замыкаться. Решение подтверждается
+    геометрией (невязка в допуске, наложения нет) и остаётся за геодезистом:
+    данные меняются только кнопкой «Применить».
+    """
+    state = state or {}
+    base = tuple(state.get(lot.key, ()))
+    description = scene.description(lot, base)
+    plan = scene.plan(lot, base)
+    if description is None or plan is None:
+        return []
+    alternates = printed_alternate_lengths(description, lot.source_text)
+    if not alternates:
+        return []
+    before = scene.metrics(lot, base, state=state)
+    if before is None:
+        return []
+    plan_segments = plan.description.segments
+
+    # Общие межи, у которых второе напечатанное значение совпадает с межой соседа.
+    confirmed: dict[int, tuple[LotInput, Any]] = {}
+    checked: set[int] = set()
+    for donor, edge in scene.shared_edges(lot, base, state=state):
+        index = edge.main_seg_index - 1
+        if index not in alternates or index in checked or not 0 <= index < len(plan_segments):
+            continue
+        checked.add(index)
+        if edge.abs_length_diff_ft <= 0.015:
+            continue  # межа уже сходится — менять нечего
+        if abs(alternates[index][0] - edge.neighbor_length_ft) > ALTERNATE_MATCH_TOLERANCE_FT:
+            continue
+        if edge.angle_diff_arcsec > ALTERNATE_AXIS_TOLERANCE_ARCSEC:
+            continue  # расходится не только длина: это не переключение систем
+        confirmed[index] = (donor, edge)
+    if not confirmed:
+        return []
+
+    candidates: list[frozenset[int]] = [frozenset({index}) for index in sorted(confirmed)]
+    full = frozenset(alternates)
+    if len(full) > 1 and full not in candidates:
+        candidates.append(full)
+
+    span_ft = max((edge.overlap_span_ft for _, edge in confirmed.values()), default=40.0)
+    donors = {donor.key: donor for donor, _ in confirmed.values()}
+    neighbour_closure = min(
+        (
+            donor_plan.closure.distance
+            for donor in donors.values()
+            if (donor_plan := scene.plan(donor, state.get(donor.key, ()))) is not None
+        ),
+        default=0.0,
+    )
+
+    found: list[Proposal] = []
+    rejected: dict[frozenset[int], float] = {}
+    for ids in candidates:
+        changes = tuple(
+            _distance_change(index, plan_segments[index], alternates[index][0])
+            for index in sorted(ids)
+        )
+        after = scene.metrics(lot, base + changes, state=state)
+        verdict = _alternate_verdict(
+            before, after, span_ft=span_ft, neighbour_closure_ft=neighbour_closure
+        )
+        if verdict == "rejected" or after is None:
+            if after is not None:
+                rejected[ids] = after.closure_ft
+            continue
+
+        switched = ", ".join(
+            f"#{index + 1} {plan_segments[index].distance_ft:.2f}' → {alternates[index][0]:.2f}'"
+            for index in sorted(ids)
+        )
+        labels: list[str] = []
+        for index in sorted(ids):
+            label = alternates[index][1]
+            if label and label not in labels:
+                labels.append(label)
+        system = " / ".join(labels) if labels else "второе напечатанное значение"
+        donor = next((confirmed[i][0] for i in sorted(ids) if i in confirmed), None)
+        edge = next((confirmed[i][1] for i in sorted(ids) if i in confirmed), None)
+
+        title = f"Длины по {system}: {switched}"
+        if donor is not None:
+            title += f" — общая межа сходится с «{donor.name}»"
+
+        reasons: list[str] = []
+        if donor is not None and edge is not None:
+            index = edge.main_seg_index - 1
+            reasons.append(
+                f"общая граница с «{donor.name}» не сходится: у нас {edge.main_length_ft:.2f}', "
+                f"у соседа {edge.neighbor_length_ft:.2f}' — расхождение "
+                f"{edge.abs_length_diff_ft:.2f}' ({edge.abs_length_diff_ft * 12.0:.1f}″)"
+            )
+            reasons.append(
+                f"в нашем же описании у этой стороны напечатано второе значение — "
+                f"«{alternates[index][2]}»: {alternates[index][0]:.2f}' "
+                f"({alternates[index][1] or 'второе значение'}) совпадает с общей межой соседа"
+            )
+        if len(ids) > 1:
+            extra = ", ".join(
+                f"#{index + 1} {plan_segments[index].distance_ft:.2f}' → {alternates[index][0]:.2f}'"
+                for index in sorted(ids) if index not in confirmed
+            )
+            text = (
+                "вместе с ней берутся вторые значения остальных сторон, напечатанных так же"
+                + (f" ({extra})" if extra else "")
+                + f": невязка {before.closure_ft:.3f} → {after.closure_ft:.3f} ft"
+            )
+            single = next((value for key, value in rejected.items() if len(key) == 1), None)
+            if single is not None and math.isfinite(single):
+                text += f" (одна только общая межа даёт невязку {single:.3f} ft)"
+            reasons.append(text)
+        if verdict == "partial":
+            reasons.append(
+                f"контур после переключения замыкается с невязкой {after.closure_ft:.3f} ft — это "
+                f"округление напечатанных значений (у соседа в его описании невязка "
+                f"{neighbour_closure:.3f} ft), а не следствие правки: общая межа сходится точно, "
+                "остаток отводится в угол — сверьте с оригиналом чертежа"
+            )
+        reasons.append(
+            "deed и tax map — две системы одного описания, а не опечатка: чертится одна. "
+            "Здесь выбрана та, что сходится с описанием соседа; вторая остаётся в документе"
+        )
+
+        quotes = "; ".join(
+            f"#{index + 1}: «{alternates[index][2]}»" for index in sorted(ids)
+        )
+        source = f"напечатано в нашем описании — {quotes}"
+        if edge is not None and donor is not None:
+            source += (
+                f"; у соседа «{donor.name}», сторона #{edge.neighbor_seg_index} — "
+                f"{edge.neighbor_length_ft:.2f}'"
+            )
+
+        requires: tuple[str, ...] = ()
+        alone = scene.metrics(lot, changes)
+        if alone is None or alone.closure_ft > CLOSURE_LIMIT_FT:
+            requires = tuple(
+                proposal.id for proposal in pending
+                if proposal.verified and proposal.lot_key == lot.key
+            )
+
+        found.append(Proposal(
+            id=_proposal_id(lot, changes), lot_key=lot.key, lot_name=lot.name,
+            kind="printed_alternate", origin="rule", title=title,
+            changes=changes, source=source, reasons=tuple(reasons),
+            before=before, after=after, verdict=verdict, requires=requires,
+        ))
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Что сейчас конфликтует
 # ---------------------------------------------------------------------------
 
@@ -872,7 +1162,7 @@ WORK THROUGH THIS CHECKLIST FOR EVERY REMAINING CONFLICT:
 2. Misread characters (the sources are often scans): N/S or E/W letter, 6-9, 3-8, 5-6, 1-7, 0-8, a dropped digit, feet-and-inches read as decimal feet. A boundary shared by two lots must have the same bearing (reversed) in both documents, and the same length unless one lot is deeper than the other.
 3. Tie problems: a different reference corner, a distance measured along the other side of the street, lots on opposite sides of a street, a distance to the corner that contradicts the neighbours' frontages (for example 160 + 40 = 200).
 4. A different bearing basis: all bearings of one document rotated by the same angle against the other.
-5. Alternate lengths printed side by side: "(deed)" and "(tax map)", "(U.S. Standard)", "(actual)", "(record)" and "(measured)". These are NOT errors. Do NOT propose switching a lot from one system to the other. Say which system each lot was built with and which printed alternate value would match the neighbour. This is an explanation only: the customer decides which system to draw.
+5. Alternate lengths printed side by side: "(deed)" and "(tax map)", "(U.S. Standard)", "(actual)", "(record)" and "(measured)". These are NOT errors. Do NOT invent a system that is not printed. Python itself offers the switch when the neighbour's side of a shared boundary is printed as the alternate value in our document and the contour stays closed (it is listed among Python's findings, applied by the surveyor with one button); say which system each lot was built with, and which printed alternate would match the neighbour when Python did not already offer it. Never switch a lot to an alternate value that Python's geometry check rejected.
 6. The lots are not actually adjacent, or the wrong page or the wrong parcel was parsed.
 7. A genuine conflict between the recorded documents (the overlap or gap exists on paper). Say so plainly.
 
@@ -1190,6 +1480,25 @@ def advisor_cache_key(lots: Sequence[LotInput]) -> str:
 AdvisorCall = Callable[[str, str, list[str]], tuple[Any, Any]]
 
 
+def _accept_in_mind(scene: _Scene, proposals: Sequence[Proposal]) -> list[Proposal]:
+    """
+    Подтверждённые находки принимаются «в уме»: остаток расхождений считается
+    так, как будто геодезист нажал «Применить». Данные участков не меняются.
+    """
+    chosen: list[Proposal] = []
+    taken: set[tuple[str, tuple[str, int, str]]] = set()
+    for proposal in proposals:
+        slots = {(proposal.lot_key, change.slot) for change in proposal.changes}
+        if proposal.verified and not (slots & taken):
+            chosen.append(proposal)
+            taken |= slots
+    virtual: dict[str, list[Change]] = {}
+    for proposal in chosen:
+        virtual.setdefault(proposal.lot_key, []).extend(proposal.changes)
+    scene.virtual = {key: tuple(changes) for key, changes in virtual.items()}
+    return chosen
+
+
 def analyse_conflicts(
     builder: AcadBuilder,
     lots: Sequence[LotInput],
@@ -1223,19 +1532,15 @@ def analyse_conflicts(
         proposals.extend(_street_bearing_proposals(scene, lot))
         proposals.extend(_neighbor_value_proposals(scene, lot))
     proposals.sort(key=lambda p: (not p.verified, p.after.closure_ft))
+    chosen = _accept_in_mind(scene, proposals)
 
-    # Подтверждённые находки принимаются «в уме»: остаток считается после них.
-    chosen: list[Proposal] = []
-    taken: set[tuple[str, tuple[str, int, str]]] = set()
-    for proposal in proposals:
-        slots = {(proposal.lot_key, change.slot) for change in proposal.changes}
-        if proposal.verified and not (slots & taken):
-            chosen.append(proposal)
-            taken |= slots
-    virtual: dict[str, list[Change]] = {}
-    for proposal in chosen:
-        virtual.setdefault(proposal.lot_key, []).extend(proposal.changes)
-    scene.virtual = {key: tuple(changes) for key, changes in virtual.items()}
+    # Второй проход: длины, напечатанные дважды (deed / tax map), сверяются уже
+    # с учётом подтверждённых находок первого прохода — румб улицы ставит POB
+    # на линию улицы, и общая межа соседа встаёт на своё место.
+    for lot in sorted(lots, key=lambda lot: not lot.is_main):
+        proposals.extend(_printed_alternate_proposals(scene, lot, state=scene.virtual, pending=proposals))
+    proposals.sort(key=lambda p: (not p.verified, p.after.closure_ft))
+    chosen = _accept_in_mind(scene, proposals)
 
     analysis.conflicts, _, _ = _conflicts(scene, {})
     analysis.remaining, analysis.remaining_hard, report = _conflicts(scene, scene.virtual)
@@ -1268,7 +1573,15 @@ def analyse_conflicts(
                 analysis.advisor_status = "ok"
             except Exception as exc:  # noqa: BLE001 - сбой советника не срывает разбор набора
                 analysis.advisor_status = "error"
-                analysis.advisor_note = f"запрос не удался — {' '.join(str(exc).split()) or type(exc).__name__}"
+                reason = " ".join(str(exc).split()) or type(exc).__name__
+                # «ИИ отвечает криво: …» говорит само за себя — не приписываем
+                # к нему ещё и «запрос не удался».
+                if reason.lower().startswith("ии отвечает криво"):
+                    # «ИИ-советник: отвечает криво: …» — без повторного «ИИ».
+                    reason = re.sub(r"^ИИ\s+", "", reason, count=1)
+                    analysis.advisor_note = f"{reason}. Находки Python от советника не зависят и остаются на месте"
+                else:
+                    analysis.advisor_note = f"запрос не удался — {reason}"
     if reply is not None:
         analysis.advisor_reply = reply
         accepted, analysis.advisor_rejected = _advisor_proposals(scene, reply, labels, chosen)

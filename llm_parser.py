@@ -221,8 +221,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "pass3_model": "openai/gpt-4.1",
         },
         # ИИ-советник по конфликтам между участками набора PDF (Шаг 1).
+        # ``enabled`` — выключатель, ``auto`` — спрашивать без кнопки (по умолчанию
+        # выключено: платный вопрос только с разрешения пользователя),
+        # ``attempts`` — сколько раз переспрашивать, если ответ оборвался.
         "conflict_advisor": {
             "enabled": True,
+            "auto": False,
+            "attempts": 3,
+            "max_tokens": None,
             "max_images": 16,
         },
     },
@@ -1521,6 +1527,126 @@ LegalDescriptionData = LegalDescription
 
 
 # ---------------------------------------------------------------------------
+# Румб привязки POB и линия улицы
+# ---------------------------------------------------------------------------
+
+#: Румб привязки идёт ВДОЛЬ улицы: с этого расхождения он уже не параллелен ей.
+TIE_STREET_AXIS_TOLERANCE_DEG = 0.5
+#: Дальше этого расхождения «своя» улица у привязки не угадывается — привязка не трогается.
+TIE_STREET_AXIS_MAX_FIX_DEG = 60.0
+
+
+def tie_street_axes(description: "LegalDescription") -> list[tuple[str, Segment, str]]:
+    """
+    Линии улиц самого описания, вдоль которых может лежать привязка к углу:
+    ``(улица, сторона с напечатанным румбом, откуда взято)``.
+
+    Привязка от перекрёстка откладывается по линии фасадной улицы, поэтому её
+    румб обязан быть параллелен одной из напечатанных линий улицы этого же
+    описания (фасад, сторона по пересекаемой улице, курс «along <улица>»).
+    """
+    items: list[tuple[str, Segment, str]] = []
+    seen: set[int] = set()
+
+    def add(index: int | None, street: str, where: str) -> None:
+        if index is None or not 0 <= index < len(description.segments) or index in seen:
+            return
+        seg = description.segments[index]
+        if not seg.has_bearing:
+            return
+        seen.add(index)
+        items.append((street, seg, where))
+
+    add(description.front_segment_index, description.main_street or "", "фасад")
+    add(description.cross_street_side_index, description.cross_street or "", "сторона по пересекаемой улице")
+    main_key = _canonical_street_key(description.main_street)
+    cross_key = _canonical_street_key(description.cross_street)
+    for index, seg in enumerate(description.segments):
+        note_key = _canonical_street_key(seg.course_note)
+        if not note_key:
+            continue
+        for key, street in ((main_key, description.main_street), (cross_key, description.cross_street)):
+            if key and f" {key} " in f" {note_key} ":
+                add(index, street or "", f"курс вдоль «{street}»")
+    return items
+
+
+def _tie_bearing_is_nominal(tie: Segment | None) -> bool:
+    """
+    Румб привязки «пустой»: либо румба в документе нет (``has_bearing=False``),
+    либо модель вернула нули вместо ``null`` (``N 0°00' E``).
+    """
+    if tie is None:
+        return False
+    if not tie.has_bearing:
+        return True
+    return (
+        int(tie.degrees) == 0
+        and int(tie.minutes) == 0
+        and round(float(tie.seconds), 2) == 0.0
+    )
+
+
+def align_corner_tie_to_street(
+    description: "LegalDescription",
+) -> tuple["LegalDescription", str | None]:
+    """
+    Ставит «пустой» румб привязки POB на линию улицы из этого же описания.
+
+    Привязка отмеряется от перекрёстка ВДОЛЬ улицы, поэтому нулевой румб
+    (``N 0°00' E``, который модель отдаёт вместо ``null``) уводит точку начала
+    с улицы: участок встаёт со сдвигом в десятки футов и не стыкуется стенка к
+    стенке с соседом. В этом случае румб привязки берётся с напечатанной линии
+    улицы (те же градусы/минуты/секунды) и направляется к POB.
+
+    Напечатанный румб привязки не меняется: точка начала может быть привязана
+    курсом от дальнего перекрёстка («COMMENCING AT … 1,542.23 feet to the POB»),
+    и такой румб вовсе не обязан идти вдоль улицы.
+
+    Возвращает ``(описание, пояснение)``; пояснение — ``None``, если правки нет.
+    """
+    if description.distance_to_corner_ft <= 1e-6 or not description.segments:
+        return description, None
+    tie = description.corner_to_pob_bearing
+    if tie is None or not _tie_bearing_is_nominal(tie):
+        return description, None
+
+    axes = tie_street_axes(description)
+    if not axes:
+        return description, None
+
+    def axis_diff(a: float, b: float) -> float:
+        return min(_angle_diff_deg(a, b), 180.0 - _angle_diff_deg(a, b))
+
+    inferred = infer_corner_to_pob_bearing(
+        description.segments,
+        distance_to_corner_ft=description.distance_to_corner_ft,
+        front_segment_index=description.front_segment_index,
+        front_side=description.front_side,
+    )
+    if inferred is None or not inferred.has_bearing:
+        return description, None
+    street, seg, where = min(
+        axes, key=lambda item: axis_diff(inferred.azimuth_deg, item[1].azimuth_deg)
+    )
+    if axis_diff(inferred.azimuth_deg, seg.azimuth_deg) > TIE_STREET_AXIS_TOLERANCE_DEG:
+        return description, None
+
+    new_tie = _make_tie_segment_like(
+        seg,
+        distance_ft=description.distance_to_corner_ft,
+        flip_180=_angle_diff_deg(seg.azimuth_deg, inferred.azimuth_deg) > 90.0,
+    )
+    note = (
+        "румб привязки к углу в описании не напечатан — взята линия улицы"
+        f"{f' «{street}»' if street else ''} из этого же описания ({where} — "
+        f"{seg.bearing_label}): привязка POB — {new_tie.bearing_label}. Иначе точка начала "
+        "уходит с линии улицы, и участок не стыкуется с соседями стенка к стенке"
+    )
+    return description.model_copy(update={"corner_to_pob_bearing": new_tie}), note
+
+
+# ---------------------------------------------------------------------------
 # Чтение и рендер PDF и фотоархивов чертежей (JPG/PNG/TIFF/WEBP + 1980s scans)
 # ---------------------------------------------------------------------------
 
@@ -2607,6 +2733,42 @@ def _json_object_from_reply(raw: str) -> dict[str, Any]:
     return parsed
 
 
+#: Сколько раз переспрашивать модель, если ответ обрывается на полуслове.
+JSON_ATTEMPTS = 3
+#: Сколько токенов просить на ответ во второй и третьей попытке (если провайдер молчит).
+JSON_RETRY_MAX_TOKENS = 8000
+
+#: Просьба к модели отвечать короче — добавляется к вопросу при повторе.
+_JSON_BRIEF_NOTE = (
+    "\n\nIMPORTANT: the previous answer was cut off in the middle. Reply with ONE compact "
+    "JSON object and nothing else. Keep every string under 200 characters. If the answer "
+    "does not fit, leave out `explanations` and keep `analysis` and `proposals`."
+)
+_JSON_SHORTEST_NOTE = (
+    "\n\nIMPORTANT: the previous answers were cut off. Reply with the SHORTEST possible "
+    "JSON object: `analysis` (one sentence) and at most ONE item in `proposals`. "
+    "No `explanations`, no prose before or after the JSON."
+)
+
+
+def _reply_looks_cut(raw: str) -> bool:
+    """
+    Оборван ли ответ на полуслове: целый JSON-объект кончается на ``}``.
+
+    Модель могла обернуть ответ в ```json … ``` — тогда смотрим на последний
+    значимый символ после снятия обёртки и ``<think>``.
+    """
+    text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in text.lower():
+        text = text[text.lower().rfind("</think>") + len("</think>") :].strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)(?:```|$)", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    if not text:
+        return True
+    return text.rstrip().rstrip("`").strip()[-1:] not in {"}", "]"} or text.count("{") > text.count("}")
+
+
 def ask_llm_json(
     system_prompt: str,
     user_text: str,
@@ -2619,6 +2781,9 @@ def ask_llm_json(
     key_secret: str = "",
     progress: Callable[[str], None] | None = None,
     task_label: str = "вопрос",
+    attempts: int = JSON_ATTEMPTS,
+    max_tokens: int | None = None,
+    on_usage: Callable[[TokenUsage], None] | None = None,
 ) -> tuple[dict[str, Any], TokenUsage]:
     """
     Свободный вопрос к модели (не разбор описания) с ответом в виде JSON-объекта.
@@ -2626,6 +2791,12 @@ def ask_llm_json(
     Нужен там, где модель рассуждает и советует, а проверяет совет Python:
     так работает ИИ-советник по конфликтам между участками. Возвращает
     ``(объект, TokenUsage)``; при невозможности получить JSON — ``LLMParseError``.
+
+    Оборванный ответ — не ответ: если модель не договорила (``finish_reason ==
+    "length"`` или JSON без закрывающей скобки), вопрос повторяется — до
+    ``attempts`` раз, с просьбой отвечать короче и с запасом по длине ответа.
+    Каждая попытка отдаётся в ``on_usage``, чтобы потраченные токены попали в
+    журнал, даже если ответа так и не получилось.
     """
     api_cfg = cfg["api"]
     target = resolve_api_target(
@@ -2641,57 +2812,109 @@ def ask_llm_json(
         ]
     else:
         user_content = user_text
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
+
+    def messages_for(text: str) -> list[dict[str, Any]]:
+        content: Any = text if not images else (
+            [{"type": "text", "text": text}]
+            + [{"type": "image_url", "image_url": {"url": url}} for url in images]
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
     if progress:
         tag = f", изображений: {len(images)}" if images else ""
         progress(f"{task_label}: запрос к {provider_label}: {model_name}{tag} …")
 
+    rounds = max(1, min(int(attempts or 1), 5))
     prompt_acc = completion_acc = total_acc = 0
     saw_usage = False
     errors: list[str] = []
-    for extra in ({"response_format": {"type": "json_object"}}, {}):
-        try:
-            completion = _call_with_temperature(
-                client.chat.completions.create,
+    for round_no in range(1, rounds + 1):
+        text_round = user_text
+        if round_no == 2:
+            text_round = user_text + _JSON_BRIEF_NOTE
+        elif round_no > 2:
+            text_round = user_text + _JSON_SHORTEST_NOTE
+        limit = None
+        if max_tokens:
+            limit = int(max_tokens)
+        if round_no > 1:
+            limit = max(limit or 0, JSON_RETRY_MAX_TOKENS)
+        variants: list[dict[str, Any]] = [{"response_format": {"type": "json_object"}}]
+        if limit:
+            variants[0]["max_tokens"] = limit
+            variants.append({"max_tokens": limit})
+        variants.append({})
+        cut = False
+        for extra in variants:
+            try:
+                completion = _call_with_temperature(
+                    client.chat.completions.create,
+                    model=model_name,
+                    messages=messages_for(text_round),
+                    temperature=api_cfg.get("temperature", 0.0),
+                    **extra,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_auth_error(exc):
+                    raise LLMParseError(
+                        f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
+                    ) from exc
+                label = "json_object" if "response_format" in extra else "plain"
+                if "max_tokens" in extra:
+                    label += "+max_tokens"
+                errors.append(f"{label}: {exc}")
+                continue
+            counts = _extract_usage_counts(completion)
+            if counts is not None:
+                saw_usage = True
+                prompt_acc += counts[0]
+                completion_acc += counts[1]
+                total_acc += counts[2]
+                if on_usage is not None:
+                    on_usage(TokenUsage(
+                        prompt_tokens=counts[0], completion_tokens=counts[1], total_tokens=counts[2],
+                        provider=target["provider"], provider_label=provider_label,
+                        model=model_name, available=True,
+                    ))
+            choice = completion.choices[0]
+            content = getattr(choice.message, "content", "") or ""
+            finish = getattr(choice, "finish_reason", None)
+            label = "json_object" if "response_format" in extra else "plain"
+            if finish == "length" or _reply_looks_cut(content):
+                errors.append(
+                    f"{label}: ответ оборвался (finish_reason={finish or '—'}, "
+                    f"{len(content)} символов)"
+                )
+                cut = True
+                break  # повторять тот же вопрос бессмысленно: следующий круг — короче
+            try:
+                data = _json_object_from_reply(content)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            usage = TokenUsage(
+                prompt_tokens=prompt_acc,
+                completion_tokens=completion_acc,
+                total_tokens=total_acc,
+                provider=target["provider"],
+                provider_label=provider_label,
                 model=model_name,
-                messages=messages,
-                temperature=api_cfg.get("temperature", 0.0),
-                **extra,
+                available=saw_usage,
             )
-        except Exception as exc:  # noqa: BLE001
-            if _is_auth_error(exc):
-                raise LLMParseError(
-                    f"{provider_label}: ошибка авторизации (проверьте API-ключ): {exc}"
-                ) from exc
-            errors.append(f"{'json_object' if extra else 'prompt-json'}: {exc}")
-            continue
-        counts = _extract_usage_counts(completion)
-        if counts is not None:
-            saw_usage = True
-            prompt_acc += counts[0]
-            completion_acc += counts[1]
-            total_acc += counts[2]
-        content = completion.choices[0].message.content or ""
-        try:
-            data = _json_object_from_reply(content)
-        except ValueError as exc:
-            errors.append(f"{'json_object' if extra else 'prompt-json'}: {exc}")
-            continue
-        usage = TokenUsage(
-            prompt_tokens=prompt_acc,
-            completion_tokens=completion_acc,
-            total_tokens=total_acc,
-            provider=target["provider"],
-            provider_label=provider_label,
-            model=model_name,
-            available=saw_usage,
-        )
-        return data, usage
+            return data, usage
+        if cut and progress and round_no < rounds:
+            progress(
+                f"{task_label}: ответ оборвался на попытке {round_no} из {rounds} — "
+                "прошу ответить короче и повторяю запрос …"
+            )
+    detail = " | ".join(errors[-2:])
     raise LLMParseError(
-        f"не удалось получить ответ от {provider_label} ({model_name}): " + " | ".join(errors[-2:])
+        f"ИИ отвечает криво: за {rounds} попытки целого JSON не пришло ({detail}). "
+        "Ответы обрываются на полуслове — проверьте модель и провайдера в настройках "
+        "и повторите запрос."
     )
 
 
@@ -3684,6 +3907,9 @@ def parse_with_regex(
         raise LegalDescriptionError(
             f"локальный парсер вернул некорректные данные: {exc}"
         ) from exc
+    model, tie_note = align_corner_tie_to_street(model)
+    if tie_note:
+        warnings.append(tie_note)
     return model, warnings
 
 
@@ -4583,6 +4809,9 @@ def _repair_llm_geometry(
 
     if updates:
         model = model.model_copy(update=updates)
+    model, tie_note = align_corner_tie_to_street(model)
+    if tie_note:
+        notes.append(tie_note)
     return model, notes
 
 

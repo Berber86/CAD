@@ -89,7 +89,7 @@ def test_street_bearing_is_taken_from_the_neighbour_and_checked_by_geometry():
 
     ours, neighbour = _lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)
     analysis = _analyse([ours, neighbour])
-    assert len(analysis.proposals) == 1
+    assert [p.kind for p in analysis.proposals] == ["street_bearing", "printed_alternate"]
     found = analysis.proposals[0]
     assert (found.kind, found.origin, found.verdict, found.lot_key) == ("street_bearing", "rule", "verified", "our.pdf")
     assert "S 22°26'12\" E" in found.title and "«lot30.pdf»" in found.title
@@ -115,23 +115,25 @@ def test_street_bearing_is_taken_from_the_neighbour_and_checked_by_geometry():
     assert fixed.corner_to_pob_bearing.bearing_label == "N 22°26'12\" W"
     assert ours.description.segments[3].bearing_label == "S 0°00' E"
 
-    # Что остаётся после находки: двойные длины программа не переключает.
+    # Двойные длины программа сама не переключает: общая межа остаётся в остатке,
+    # а второе напечатанное значение — только отдельной находкой (см. ниже).
     remaining = " ".join(analysis.remaining)
     assert "174.89'" in remaining and "176.92'" in remaining and analysis.remaining_hard
-    assert all(change.field == "bearing" for p in analysis.proposals for change in p.changes)
+    assert all(change.field == "bearing" for change in found.changes)
     report = analysis.format_report()
     assert "[1] ✔" in report and "Данные участков НЕ изменены" in report and "После находок остаётся" in report
 
-    # После принятия правки находка больше не предлагается.
+    # После принятия правки она больше не предлагается: в остатке только двойные
+    # длины — их отдельная находка ждёт решения геодезиста.
     ours.fixes = (found,)
     again = _analyse([ours, neighbour])
-    assert again.proposals == [] and again.applied == [found]
+    assert [p.kind for p in again.proposals] == ["printed_alternate"] and again.applied == [found]
     assert "Принятые правки" in again.format_report()
 
 
 def test_without_a_neighbour_the_bearing_is_computed_from_closure_and_marked_as_computed():
     analysis = _analyse([_lot("our.pdf", OUR_TEXT, main=True)])
-    assert len(analysis.proposals) == 1
+    assert [p.kind for p in analysis.proposals] == ["closing_course"]
     found = analysis.proposals[0]
     assert found.kind == "closing_course" and found.verified
     assert found.changes[0].new_label == "S 22°26'38\" E" and found.after.closure_ft < 0.01
@@ -142,7 +144,7 @@ def test_without_a_neighbour_the_bearing_is_computed_from_closure_and_marked_as_
     assert odd != NEIGHBOUR_TEXT
     analysis = _analyse([_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", odd)])
     assert [(p.kind, p.verdict) for p in analysis.proposals] == [
-        ("closing_course", "verified"), ("street_bearing", "partial"),
+        ("closing_course", "verified"), ("printed_alternate", "partial"), ("street_bearing", "partial"),
     ]
     assert "не подтверждается замыканием" in " ".join(analysis.proposals[0].reasons)
     # Слово «southerly» не допускает румб поперёк улицы: такой сосед не используется.
@@ -154,7 +156,7 @@ def test_without_a_neighbour_the_bearing_is_computed_from_closure_and_marked_as_
 def test_the_gap_may_be_in_the_neighbour_and_the_value_in_our_lot():
     # Роли наоборот: румба нет у соседа, а в нашем описании он есть.
     analysis = _analyse([_lot("lot30.pdf", NEIGHBOUR_TEXT, main=True), _lot("lot32.pdf", OUR_TEXT)])
-    assert len(analysis.proposals) == 1
+    assert [p.kind for p in analysis.proposals] == ["street_bearing", "printed_alternate"]
     found = analysis.proposals[0]
     assert found.lot_key == "lot32.pdf" and found.verified and "«lot30.pdf»" in found.title
 
@@ -192,6 +194,107 @@ def test_judge_accepts_only_what_improves_the_geometry():
     assert judge(good, Metrics(2.03, 0.0, 0, 0)) == "rejected"  # контур перестал замыкаться
     assert judge(good, Metrics(0.006, 300.0, 0, 0)) == "rejected"  # появилось наложение
     assert judge(good, Metrics(0.01, 0.0, 0, 0)) == "verified"  # ушла ошибка общей границы
+
+
+def test_second_lengths_printed_in_the_deed_are_read_for_each_side():
+    from conflict_resolver import printed_alternate_lengths
+    from llm_parser import parse_with_regex
+
+    desc, _ = parse_with_regex(OUR_TEXT)
+    assert printed_alternate_lengths(desc, OUR_TEXT) == {
+        0: (176.92, "tax map", "174.89 feet (deed) 176.92 feet (tax map)"),
+        1: (45.42, "tax map", "45.30 feet (deed) 45.42 feet (tax map)"),
+        2: (155.33, "tax map", "153.64 feet (deed) 155.33 feet (tax map)"),
+    }
+    # «198.83 feet (196.60 feet U.S. Standard)» — второе значение в скобках.
+    neighbour, _ = parse_with_regex(NEIGHBOUR_TEXT)
+    assert printed_alternate_lengths(neighbour, NEIGHBOUR_TEXT)[0] == (
+        196.6, "U.S. Standard", "198.83 feet (196.60 feet U.S. Standard)",
+    )
+    # Без второго значения находки нет: длина одна, переключать нечего.
+    plain = NEIGHBOUR_TEXT.replace(" (196.60 feet U.S. Standard)", "")
+    assert 0 not in printed_alternate_lengths(neighbour, plain)
+
+
+def test_tax_map_lengths_join_the_lot_with_the_neighbour_wall_to_wall():
+    """Общая межа 174.89' против 176.92': берём tax map — участки стыкуются."""
+    from acad_builder import verify_with_neighbors
+    from conflict_resolver import apply_changes, fix_changes
+
+    ours, neighbour = _lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)
+    analysis = _analyse([ours, neighbour])
+    doubles = analysis.proposals[1]
+    assert (doubles.kind, doubles.verdict, doubles.lot_key) == ("printed_alternate", "partial", "our.pdf")
+    # Меняются ровно те стороны, у которых напечатано второе значение.
+    assert [(c.index, c.old_label, c.new_label) for c in doubles.changes] == [
+        (0, "174.89'", "176.92'"), (1, "45.30'", "45.42'"), (2, "153.64'", "155.33'"),
+    ]
+    # Одна общая межа без остальных сторон контур не замыкает — так и написано.
+    assert "одна только общая межа даёт невязку 2.025 ft" in " ".join(doubles.reasons)
+    assert "у соседа в его описании невязка 0.609 ft" in " ".join(doubles.reasons)
+    assert "deed и tax map" in " ".join(doubles.reasons)
+    # Находка опирается на правку румба улицы: без неё POB стоит не на улице.
+    assert doubles.requires == (analysis.proposals[0].id,)
+    assert "в нашем описании" in doubles.source and "«LOT 30.pdf»" not in doubles.source
+    assert "176.92 feet (tax map)" in doubles.source
+
+    # Обе правки вместе: общая межа совпадает, участки встают стенка к стенке.
+    builder = _builder()
+    fixed = apply_changes(ours.description, fix_changes((analysis.proposals[0], doubles)))
+    main_plan = builder.plan(fixed, scale=16)
+    nb_plan = builder.plan(neighbour.description, scale=16, is_neighbor=True)
+    assert main_plan.closure.distance == pytest.approx(0.300, abs=0.01)
+    report = verify_with_neighbors(main_plan, [nb_plan])
+    edge = report.pair_reports[0].shared_edges[0]
+    assert edge.abs_length_diff_ft < 0.01 and edge.angle_diff_arcsec < 1.0
+    assert edge.lateral_offset_start_ft < 0.01 and edge.lateral_offset_end_ft < 0.01
+    assert edge.status == "ok"
+    # Тонкая полоса вдоль межи — отвод гэпа в угол, а не наложение участков.
+    pair = report.pair_reports[0]
+    assert pair.overlap_area_sqft == 0 and report.overall_status == "ok"
+    assert any("отвод открытого гэпа" in text for text in pair.findings)
+
+
+def test_empty_tie_bearing_from_the_model_is_put_on_the_street_line():
+    """Модель вернула N 0°00' E вместо null — POB уезжал с улицы на 61 ft."""
+    from acad_builder import verify_with_neighbors
+    from conflict_resolver import apply_changes
+    from llm_parser import align_corner_tie_to_street, parse_with_regex
+
+    street = _analyse([_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)]).proposals[0]
+    neighbour, _ = parse_with_regex(NEIGHBOUR_TEXT)
+    empty = neighbour.segments[0].model_copy(update={
+        "ns": "N", "degrees": 0, "minutes": 0, "seconds": 0.0, "ew": "E",
+        "distance_ft": 160.0, "has_bearing": True, "bearing_label": None,
+    })
+    broken = neighbour.model_copy(update={"corner_to_pob_bearing": empty})
+    fixed, note = align_corner_tie_to_street(broken)
+    assert fixed.corner_to_pob_bearing.bearing_label == "N 22°26'12\" W"
+    assert "не напечатан" in note and "S 22°26'12\" E" in note
+
+    builder = _builder()
+    # Наш участок — уже с принятой правкой румба улицы, как после «Применить».
+    fixed_ours = apply_changes(_lot("our.pdf", OUR_TEXT, main=True).description, street.changes)
+    ours = builder.plan(fixed_ours, scale=16)
+    broken_plan = builder.plan(broken, scale=16, is_neighbor=True)
+    assert broken_plan.pob == pytest.approx((0.0, 160.0))  # как было до правки
+    report = verify_with_neighbors(ours, [broken_plan])
+    assert "разнесены на 61.07'" in report.pair_reports[0].street_tie_check
+    assert "у соседа румб привязки не напечатан" in report.pair_reports[0].street_tie_check
+    # После правки привязка соседа стоит на линии улицы и участки стыкуются.
+    good_plan = builder.plan(fixed, scale=16, is_neighbor=True)
+    assert good_plan.pob == pytest.approx((-61.07, 147.89), abs=0.01)
+    assert "единая улица" in verify_with_neighbors(ours, [good_plan]).pair_reports[0].street_tie_check
+
+
+def test_printed_tie_bearing_is_left_alone():
+    """POB может быть привязан курсом от дальнего перекрёстка — такой румб не трогаем."""
+    from llm_parser import NYC_SAMPLES, align_corner_tie_to_street, parse_with_regex
+
+    desc, warnings = parse_with_regex(NYC_SAMPLES["283 Jamie Lane (Staten Island)"])
+    assert warnings == []
+    assert desc.corner_to_pob_bearing.bearing_label == "S 4°43'12\" W"
+    assert align_corner_tie_to_street(desc) == (desc, None)
 
 
 @pytest.mark.parametrize(
@@ -252,10 +355,11 @@ def test_advisor_is_asked_only_about_what_python_left_and_its_advice_is_checked(
     assert "174.89 feet (deed) 176.92 feet (tax map)" in user_text  # текст документа
     assert "closure error 0.006 ft" in user_text and "15.570" in user_text
     assert "накладываются" not in user_text  # наложение Python уже снял
-    # Правила для модели: не выдумывать числа и не переключать двойные длины.
-    assert "Never invent numbers" in system and "Do NOT propose switching" in system
+    # Правила для модели: не выдумывать числа и не менять систему длин, которую
+    # геометрия отклонила; переход на второе напечатанное значение — только его.
+    assert "Never invent numbers" in system and "Never switch a lot to an alternate value" in system
 
-    assert [p.kind for p in analysis.proposals] == ["street_bearing"]
+    assert [p.kind for p in analysis.proposals] == ["street_bearing", "printed_alternate"]
     rejected = " ".join(analysis.advisor_rejected)
     assert "Сторона 1 по tax map" in rejected and "невязка 0.006 → 2.025 ft" in rejected
     assert "стороны #9 у участка нет" in rejected and "не указан участок" in rejected
@@ -304,7 +408,9 @@ def test_advisor_finding_becomes_a_proposal_only_after_the_geometry_check():
     # После этой правки остаётся знакомый пробел, который закрывает правило Python.
     lots[0].fixes = (found,)
     after = _analyse(lots)
-    assert [(p.kind, p.verified) for p in after.proposals] == [("street_bearing", True)]
+    assert [(p.kind, p.verified) for p in after.proposals] == [
+        ("street_bearing", True), ("printed_alternate", False),
+    ]
 
     # Совет без опоры в данных участков помечается для сверки с документом.
     def inventing(_system, _user_text, _images):
@@ -324,7 +430,7 @@ def test_advisor_failure_or_absence_does_not_break_the_analysis():
         raise RuntimeError("timeout")
 
     analysis = _analyse(lots, advisor=failing)
-    assert analysis.advisor_status == "error" and len(analysis.proposals) == 1
+    assert analysis.advisor_status == "error" and len(analysis.proposals) == 2
     assert "ИИ-советник: запрос не удался — timeout" in analysis.format_report()
     analysis = _analyse(lots, advisor=None, advisor_note="не запрошен — не задан API-ключ")
     assert analysis.advisor_status == "skipped" and "не задан API-ключ" in analysis.format_report()
@@ -337,6 +443,27 @@ def test_advisor_failure_or_absence_does_not_break_the_analysis():
     assert images == ["data:image/png;base64,AAA", "data:image/png;base64,BBB"]
     assert "document pages: attached images 1–2" in user_text
     assert "to a point or the easterly side of Alvine Avenue" in user_text  # сосед — текстом
+
+
+def test_a_cut_off_advisor_answer_is_reported_and_python_findings_stay():
+    from llm_parser import LLMParseError
+
+    lots = [_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)]
+
+    def cut_off(*_args):
+        raise LLMParseError(
+            "ИИ отвечает криво: за 3 попытки целого JSON не пришло "
+            "(json_object: ответ оборвался (finish_reason=length, 812 символов))"
+        )
+
+    analysis = _analyse(lots, advisor=cut_off)
+    assert analysis.advisor_status == "error"
+    report = analysis.format_report()
+    # Сказано прямо, без двойного «запрос не удался», и находки Python на месте.
+    assert "ИИ-советник: отвечает криво: за 3 попытки целого JSON не пришло" in report
+    assert "запрос не удался" not in report
+    assert "Находки Python от советника не зависят" in report
+    assert [p.kind for p in analysis.proposals] == ["street_bearing", "printed_alternate"]
 
 
 def test_json_question_to_the_model_reads_wrapped_answers(monkeypatch):
@@ -371,6 +498,79 @@ def test_json_question_to_the_model_reads_wrapped_answers(monkeypatch):
     blocks = seen[-1]["messages"][1]["content"]
     assert blocks[0] == {"type": "text", "text": "question"} and blocks[1]["type"] == "image_url"
     assert seen[-1]["messages"][0] == {"role": "system", "content": "system"}
+
+
+def _fake_json_client(monkeypatch, replies):
+    """Подставной клиент OpenAI: отдаёт заданные ответы по порядку и запоминает запросы."""
+    import openai
+
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content, finish = replies[min(len(calls) - 1, len(replies) - 1)]
+            message = type("M", (), {"content": content})
+            choice = type("Ch", (), {"message": message, "finish_reason": finish})
+            usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+            return type("C", (), {"choices": [choice], "usage": usage})
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", lambda *a, **kw: _Client(**kw))
+    return calls
+
+
+def test_a_cut_off_advisor_reply_is_asked_again_and_the_retry_is_shorter(monkeypatch):
+    import llm_parser
+
+    calls = _fake_json_client(monkeypatch, [
+        ('{"analysis": "Сосед построен по tax map, у нас deed — поэт', "length"),
+        ('{"analysis": "ok", "proposals": []}', "stop"),
+    ])
+    cfg = llm_parser.load_config()
+    seen: list[str] = []
+    data, usage = llm_parser.ask_llm_json(
+        "system", "question", cfg, api_key="test-key",
+        progress=seen.append, task_label="ИИ-советник",
+    )
+    assert data == {"analysis": "ok", "proposals": []}
+    assert usage.total_tokens == 30  # оба запроса посчитаны, деньги не теряются
+    # Первый ответ оборвался — повторяем с просьбой ответить короче и с запасом длины.
+    assert len(calls) == 2
+    assert calls[0]["messages"][1]["content"] == "question"
+    assert "previous answer was cut off" in calls[1]["messages"][1]["content"]
+    assert calls[1]["max_tokens"] == llm_parser.JSON_RETRY_MAX_TOKENS
+    assert "ответ оборвался на попытке 1 из 3" in " ".join(seen)
+
+
+def test_three_cut_off_replies_say_plainly_that_the_ai_answers_badly(monkeypatch):
+    import llm_parser
+
+    calls = _fake_json_client(monkeypatch, [('{"analysis": "начал и не', "length")])
+    cfg = llm_parser.load_config()
+    usages = []
+    with pytest.raises(llm_parser.LLMParseError) as excinfo:
+        llm_parser.ask_llm_json(
+            "system", "question", cfg, api_key="test-key",
+            attempts=3, on_usage=usages.append,
+        )
+    message = str(excinfo.value)
+    assert message.startswith("ИИ отвечает криво: за 3 попытки целого JSON не пришло")
+    assert "finish_reason=length" in message
+    assert len(calls) == 3  # ровно три попытки, не больше
+    assert len(usages) == 3  # потраченные токены записаны по каждой попытке
+
+
+def test_a_reply_that_ends_mid_json_is_not_taken_for_an_answer():
+    import llm_parser
+
+    assert llm_parser._reply_looks_cut('{"analysis": "всё хорошо", "proposals": [')
+    assert llm_parser._reply_looks_cut("```json\n{\"analysis\": \"обрыв")
+    assert not llm_parser._reply_looks_cut('{"analysis": "ok", "proposals": []}')
+    assert not llm_parser._reply_looks_cut('Вот ответ:\n```json\n{"analysis": "ok"}\n```')
 
 
 # ---------------------------------------------------------------- окно
@@ -416,17 +616,21 @@ def test_set_report_offers_the_neighbour_bearing_and_changes_the_lot_only_on_req
     assert main_plan.closure.distance == pytest.approx(15.570, abs=0.001)
     assert main_plan.pob == pytest.approx((0.0, 200.0))
     analysis = app._pdf_set_analysis
-    assert len(analysis.proposals) == 1 and analysis.proposals[0].verified
+    assert [p.kind for p in analysis.proposals] == ["street_bearing", "printed_alternate"]
     found = analysis.proposals[0]
+    doubles = analysis.proposals[1]
+    assert found.verified and not doubles.verified
     win = app._pdf_set_report_window
     report = win._report_text
     assert "АНАЛИЗ КОНФЛИКТОВ: ЧТО МОЖНО ВЗЯТЬ ИЗ ОПИСАНИЙ СОСЕДЕЙ" in report
     assert "[1] ✔ Сторона #4" in report and "румб S 22°26'12\" E — из описания «LOT 30.pdf»" in report
     assert "невязка 15.570 → 0.006 ft" in report and "1,536.4 → 0.0 sq ft" in report
-    assert "ИИ-советник: не запрошен — набор разобран локально и бесплатно" in report
-    assert "Находок по данным соседей: 1" in win._report_headline
-    assert "находок по данным соседей: 1" in app.status_var.get()
-    assert list(win._fix_buttons) == [found.id] and win._revert_buttons == {}
+    assert "[2] ◐ Длины по tax map: #1 174.89' → 176.92'" in report
+    assert "общая межа сходится с «LOT 30.pdf»" in report
+    assert "ИИ-советник: не запрошен — платный вопрос задаётся только кнопкой" in report
+    assert "Находок по данным соседей: 2 (подтверждено геометрией: 1)" in win._report_headline
+    assert "находок по данным соседей: 2" in app.status_var.get()
+    assert list(win._fix_buttons) == [found.id, doubles.id] and win._revert_buttons == {}
     assert win._fix_buttons[found.id].cget("text") == "Применить" and win._apply_all_button is None
     assert len(parses) == 2
 
@@ -450,8 +654,10 @@ def test_set_report_offers_the_neighbour_bearing_and_changes_the_lot_only_on_req
     report = win._report_text
     assert "✎ принята правка по данным соседей: Сторона #4" in report
     assert "Принятые правки (участки построены с ними; каждую можно вернуть)" in report
-    assert "[1] ✔" not in report and "Расхождения, которые остаются" in report
-    assert win._fix_buttons == {} and list(win._revert_buttons) == [found.id]
+    assert "[1] ✔" not in report and "[1] ◐ Длины по tax map" in report
+    assert "После находок остаётся" in report
+    # Двойные длины остаются отдельной находкой: она ждёт решения геодезиста.
+    assert list(win._fix_buttons) == [doubles.id] and list(win._revert_buttons) == [found.id]
     assert "Принята правка по данным соседей" in app.log_text()
 
     # В AutoCAD уходит рассчитанная схема — уже с принятой правкой.
@@ -472,7 +678,7 @@ def test_set_report_offers_the_neighbour_bearing_and_changes_the_lot_only_on_req
     _wait(app)
     assert len(parses) == 2 and item.fixes == []
     assert app._preview_main_plan.closure.distance == pytest.approx(15.570, abs=0.001)
-    assert list(app._pdf_set_report_window._fix_buttons) == [found.id]
+    assert list(app._pdf_set_report_window._fix_buttons) == [found.id, doubles.id]
     assert "Правка снята" in app.log_text()
 
     # Новый разбор файла (другие страницы или способ) сбрасывает правки этого файла.
@@ -486,7 +692,7 @@ def test_set_report_offers_the_neighbour_bearing_and_changes_the_lot_only_on_req
     app._on_close()
 
 
-def test_advisor_runs_once_for_an_ai_parsed_set_and_again_only_on_request(gui, tmp_path, monkeypatch):
+def test_advisor_is_asked_only_after_the_button_is_confirmed(gui, tmp_path, monkeypatch):
     from tkinter import messagebox
 
     from llm_parser import ParseOutcome, TokenUsage, parse_with_regex
@@ -529,7 +735,24 @@ def test_advisor_runs_once_for_an_ai_parsed_set_and_again_only_on_request(gui, t
     dialog.submit()
     _wait(app)
 
-    # Python нашёл румб у соседа, а о том, что осталось, спросил советника — один раз.
+    # Даже набор, разобранный через ИИ, сам платный вопрос не задаёт: сначала
+    # разрешение пользователя.
+    assert asked == []
+    analysis = app._pdf_set_analysis
+    assert analysis.advisor_status == "skipped"
+    report = app._pdf_set_report_window._report_text
+    assert "не запрошен — платный вопрос задаётся только кнопкой" in report
+    assert len(analysis.proposals) == 1  # находка Python от советника не зависит
+
+    button = app._pdf_set_report_window._advisor_button
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: False)
+    button.cget("command")()
+    assert not app._busy and asked == []  # отказались — запроса нет
+
+    # Согласились — один платный запрос, советник виден в итоге и в журнале.
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    button.cget("command")()
+    _wait(app)
     assert len(asked) == 1
     user_text, kwargs = asked[0]
     assert kwargs["image_data_urls"] == ["data:image/png;base64,PAGE1", "data:image/png;base64,PAGE2"]
@@ -548,22 +771,12 @@ def test_advisor_runs_once_for_an_ai_parsed_set_and_again_only_on_request(gui, t
     assert len(asked) == 1 and app._preview_main_plan.closure.distance < 0.01
     assert app._pdf_set_analysis.advisor_status == "cached"
     assert "получено ранее для этого же разбора" in app._pdf_set_report_window._report_text
-
-    # Кнопка «Спросить ИИ-советника» — платный запрос только после подтверждения.
-    button = app._pdf_set_report_window._advisor_button
-    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: False)
-    button.cget("command")()
-    assert not app._busy and len(asked) == 1
-    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
-    button.cget("command")()
-    _wait(app)
-    assert len(asked) == 2 and app._pdf_set_analysis.advisor_status == "ok"
-    # Второй вопрос задан уже о состоянии с принятой правкой.
-    assert "changed by a verified finding" in asked[1][0] or "taken by a verified finding" in asked[1][0]
     app._on_close()
 
 
-def test_advisor_is_not_asked_without_a_key_or_when_switched_off(gui, tmp_path, monkeypatch):
+def test_advisor_asks_nothing_without_a_key_or_when_switched_off(gui, tmp_path, monkeypatch):
+    from tkinter import messagebox
+
     from llm_parser import ParseOutcome, parse_with_regex
 
     ours = tmp_path / "our scan.pdf"
@@ -578,27 +791,32 @@ def test_advisor_is_not_asked_without_a_key_or_when_switched_off(gui, tmp_path, 
         gui, "parse_legal_description_full",
         lambda **kw: ParseOutcome(data=our_desc, source="llm-vision") if kw["use_llm"] else real(**kw),
     )
-    monkeypatch.setattr(gui, "ask_llm_json", lambda *a, **k: pytest.fail("советник без ключа или выключенный"))
+    monkeypatch.setattr(gui, "ask_llm_json", lambda *a, **k: pytest.fail("советник без ключа"))
     monkeypatch.setattr(gui, "resolve_api_target", lambda *a, **k: {"api_key": ""})
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: True)  # согласие есть, ключа нет
     dialog = _open_set(app, monkeypatch, ours, neighbour)
     dialog.rows[0]["radio"].select()
     dialog.submit()
+    _wait(app)
+    app._pdf_set_report_window._advisor_button.cget("command")()
     _wait(app)
     assert app._pdf_set_analysis.advisor_status == "skipped"
     assert "ИИ-советник: не запрошен — не задан API-ключ" in app._pdf_set_report_window._report_text
     assert len(app._pdf_set_analysis.proposals) == 1  # находка Python от советника не зависит
 
-    # Выключатель в настройках: ключ есть, но автоматического вопроса нет.
+    # Выключатель в настройках действует и на автоматический вопрос (auto = true).
     monkeypatch.setattr(gui, "resolve_api_target", lambda *a, **k: {"api_key": "test-key"})
     real_config = app._build_runtime_config
 
     def switched_off():
         cfg, *rest = real_config()
-        cfg["api"]["conflict_advisor"] = {"enabled": False}
+        cfg["api"]["conflict_advisor"] = {"enabled": False, "auto": True}
         return (cfg, *rest)
 
     monkeypatch.setattr(app, "_build_runtime_config", switched_off)
     app._start_pdf_set()
     _wait(app)
     assert "ИИ-советник: выключен в настройках" in app._pdf_set_report_window._report_text
+    assert "ИИ-советник: не запрошен — не задан API-ключ" not in app._pdf_set_report_window._report_text
     app._on_close()
+

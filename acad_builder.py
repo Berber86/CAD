@@ -4018,6 +4018,15 @@ class NeighborVerificationReport:
         return "\n".join(lines)
 
 
+def _open_gap_length(plan: DrawPlan) -> float:
+    """Длина открытого гэпа контура (0.0, если контур сомкнут)."""
+    points = getattr(plan, "gap_points", None)
+    if not points:
+        return 0.0
+    (x1, y1), (x2, y2) = points
+    return math.hypot(x2 - x1, y2 - y1)
+
+
 def _neighbor_display_title(plan: DrawPlan, idx: int) -> str:
     d = plan.description
     parts: list[str] = []
@@ -4416,6 +4425,103 @@ def _detect_datum_rotation_arcsec(
     return None
 
 
+def _street_line_through_pob(plan: DrawPlan) -> tuple[tuple[float, float], float] | None:
+    """
+    Линия улицы, на которой стоит POB участка: ``(точка POB, азимут линии)``.
+
+    Берётся напечатанный фасад участка (сторона по улице); если фасада в данных
+    нет — румб привязки от перекрёстка.
+    """
+    desc = plan.description
+    index = desc.front_segment_index
+    if index is not None and 0 <= index < len(plan.boundary_lines):
+        line = plan.boundary_lines[index]
+        dx = line.end[0] - line.start[0]
+        dy = line.end[1] - line.start[1]
+        if math.hypot(dx, dy) > 1e-6:
+            return plan.pob, math.degrees(math.atan2(dx, dy)) % 360.0
+    tie = desc.corner_to_pob_bearing
+    if tie is not None and tie.has_bearing:
+        return plan.pob, tie.azimuth_deg
+    return None
+
+
+def _lateral_offset_ft(point: tuple[float, float], line: tuple[tuple[float, float], float]) -> float:
+    """Расстояние от точки до прямой (по нормали), в футах."""
+    (x0, y0), azimuth_deg = line
+    azimuth = math.radians(azimuth_deg)
+    ux, uy = math.sin(azimuth), math.cos(azimuth)
+    vx, vy = point[0] - x0, point[1] - y0
+    return abs(vx * uy - vy * ux)
+
+
+def _tie_along_street(plan: DrawPlan) -> bool | None:
+    """
+    Идёт ли привязка вдоль своей улицы: ``True`` — да (или румб «пустой»),
+    ``False`` — напечатанный румб уводит POB с линии улицы, ``None`` — не понять.
+    """
+    line = _street_line_through_pob(plan)
+    desc = plan.description
+    tie = desc.corner_to_pob_bearing
+    if line is None or tie is None or desc.distance_to_corner_ft <= 1e-6:
+        return None
+    if not tie.has_bearing:
+        return True
+    if int(tie.degrees) == 0 and int(tie.minutes) == 0 and round(float(tie.seconds), 2) == 0.0:
+        return True
+    return abs(_signed_axis_diff_arcsec(tie.azimuth_deg, line[1])) <= 1800.0
+
+
+def _tie_geometry_note(main_plan: DrawPlan, nb_plan: DrawPlan) -> str | None:
+    """
+    Стоят ли точки POB обоих участков на ОДНОЙ линии улицы.
+
+    Привязка отмеряется вдоль улицы, поэтому «пустой» румб (``N 0°00' E``,
+    который модель отдаёт вместо ``null``) уводит точку начала в сторону на
+    десятки футов: участки не встают стенка к стенке. Если румб привязки
+    напечатан и не идёт вдоль улицы (POB привязан курсом от дальнего
+    перекрёстка), сравнивать нечего — проверка пропускается.
+    """
+    along_m = _tie_along_street(main_plan)
+    along_n = _tie_along_street(nb_plan)
+    if along_m is False or along_n is False:
+        return None
+    line_m = _street_line_through_pob(main_plan)
+    line_n = _street_line_through_pob(nb_plan)
+    if line_m is None or line_n is None:
+        return None
+    if abs(_signed_axis_diff_arcsec(line_m[1], line_n[1])) > 15.0 * 3600.0:
+        # Фасады идут по разным улицам (угловое соседство) — сравнивать нечего.
+        return None
+    lateral_m = _lateral_offset_ft(nb_plan.pob, line_m)
+    lateral_n = _lateral_offset_ft(main_plan.pob, line_n)
+    if max(lateral_m, lateral_n) <= 0.25:
+        return None
+
+    street = main_plan.description.main_street or nb_plan.description.main_street or "улицы"
+    blame: list[str] = []
+    for role, plan in (("нашего участка", main_plan), ("соседа", nb_plan)):
+        desc = plan.description
+        tie = desc.corner_to_pob_bearing
+        if desc.distance_to_corner_ft <= 1e-6 or tie is None:
+            continue
+        # «Пустой» румб: его нет в документе либо модель вернула нули вместо null.
+        if tie.has_bearing and (int(tie.degrees) or int(tie.minutes) or round(float(tie.seconds), 2)):
+            continue
+        blame.append(
+            f"у {role} румб привязки не напечатан (в данных "
+            f"{format_bearing(tie, use_control_code=False)}) — POB отложен по номинальному "
+            "направлению"
+        )
+    msg = (
+        f"Точки POB стоят на разных линиях улицы «{street}»: линии разнесены на "
+        f"{max(lateral_m, lateral_n):.2f}' — стенка к стенке участки не встанут. "
+        + ("; ".join(blame) + ". " if blame else "")
+        + "Проверьте румб и расстояние привязки от перекрёстка."
+    )
+    return msg
+
+
 def _check_street_reference_and_frontage(
     main_plan: DrawPlan, nb_plan: DrawPlan
 ) -> tuple[str | None, str | None]:
@@ -4439,6 +4545,12 @@ def _check_street_reference_and_frontage(
             )
             return warn, warn
 
+        # Главная проверка — геометрическая: обе точки POB должны стоять на одной
+        # линии улицы. Она же называет виновника (у кого румб привязки не на месте).
+        geometry_note = _tie_geometry_note(main_plan, nb_plan)
+        if geometry_note is not None:
+            return geometry_note, geometry_note
+
         # Проверяем румб линии привязки вдоль улицы (если у обоих > 0)
         tie_m = dm.corner_to_pob_bearing
         tie_n = dn.corner_to_pob_bearing
@@ -4460,8 +4572,10 @@ def _check_street_reference_and_frontage(
             if tie_diff_sec > 2.0:
                 msg = (
                     f"Румб красной линии улицы «{dm.main_street}» отличается на "
-                    f"{_format_arcsec_dms(tie_diff_sec)} ({tie_m.bearing_label} против "
-                    f"{tie_n.bearing_label}) — точки POB расходятся уже на линии улицы!"
+                    f"{_format_arcsec_dms(tie_diff_sec)} "
+                    f"({format_bearing(tie_m, use_control_code=False)} против "
+                    f"{format_bearing(tie_n, use_control_code=False)}) — точки POB "
+                    "расходятся уже на линии улицы!"
                 )
                 return msg, msg
         return (
@@ -4799,11 +4913,28 @@ def verify_with_neighbors(
         # возникающие при секундном округлении на длинных 100-футовых стенах
         ref_span = max([c.overlap_span_ft for c in shared_checks] or [40.0])
         eff_overlap_width = overlap_sqft / max(ref_span, 10.0)
+        gap_note = ""
         if overlap_sqft <= 0.5 or eff_overlap_width <= 0.025:
+            overlap_sqft = 0.0
+            eff_overlap_width = 0.0
+        elif (
+            max(_open_gap_length(main_plan), _open_gap_length(nb_plan)) > 0.02
+            and eff_overlap_width <= 0.15
+        ):
+            # Открытый гэп контура отведён в угол: вдоль общей межи остаётся тонкая
+            # полоса «наложения» шириной с сам гэп. Это разрыв контура, а не заступ.
+            gap_note = (
+                f"Тонкая полоса вдоль общей межи ({overlap_sqft:,.1f} sq ft, ширина "
+                f"{eff_overlap_width * 12.0:.1f}″) — это отвод открытого гэпа "
+                f"{max(_open_gap_length(main_plan), _open_gap_length(nb_plan)):.3f} ft в угол, "
+                "а не наложение (заступа) участков: контуры стыкуются по меже."
+            )
             overlap_sqft = 0.0
             eff_overlap_width = 0.0
 
         findings: list[str] = []
+        if gap_note:
+            findings.append(gap_note)
         for bend_msg in continuation_bends:
             if bend_msg not in findings:
                 findings.append(bend_msg)

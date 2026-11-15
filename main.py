@@ -6063,7 +6063,16 @@ class SurveyApp(ctk.CTk):
             advisor_cfg = cfg.get("api", {}).get("conflict_advisor") or {}
             advisor = None
             note = ""
-            if not ask_advisor and not advisor_cfg.get("enabled", True):
+            # Платный вопрос задаётся только с разрешения пользователя: кнопкой
+            # «🧠 Спросить ИИ-советника» (она спрашивает подтверждение) или
+            # настройкой api.conflict_advisor.auto = true, включённой вручную.
+            auto_advisor = bool(advisor_cfg.get("auto", False))
+            if not ask_advisor and not auto_advisor:
+                note = (
+                    "не запрошен — платный вопрос задаётся только кнопкой "
+                    "«🧠 Спросить ИИ-советника», с вашего подтверждения"
+                )
+            elif not ask_advisor and not advisor_cfg.get("enabled", True):
                 note = "выключен в настройках (api.conflict_advisor.enabled)"
             elif not ask_advisor and not any(lot.used_ai for lot in lots):
                 note = (
@@ -6081,12 +6090,16 @@ class SurveyApp(ctk.CTk):
                     note = "не запрошен — не задан API-ключ выбранного провайдера"
                 else:
                     def ask_model(system: str, user_text: str, images: list[str]) -> tuple[Any, Any]:
+                        # Каждая попытка (в том числе оборванная) учитывается в журнале:
+                        # токены потрачены, даже если целого ответа так и не пришло.
                         data, usage = ask_llm_json(
                             system, user_text, cfg, image_data_urls=images, api_key=api_key,
                             provider=provider_id, model=model_name, key_secret=key_secret,
                             progress=lambda message: post("progress", message), task_label="ИИ-советник",
+                            attempts=int(advisor_cfg.get("attempts") or 3),
+                            max_tokens=int(advisor_cfg.get("max_tokens") or 0) or None,
+                            on_usage=lambda got: post("round_usages", [got]),
                         )
-                        post("round_usages", [usage])
                         post("valid_secret", key_secret)
                         return data, usage
 

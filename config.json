@@ -73,6 +73,9 @@
     },
     "conflict_advisor": {
       "enabled": true,
+      "auto": false,
+      "attempts": 3,
+      "max_tokens": null,
       "max_images": 16
     }
   },

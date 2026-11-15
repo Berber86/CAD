@@ -388,7 +388,10 @@ def test_gui_builds_and_reports(gui):
     app = gui.SurveyApp()
 
     # Масштабы и высота текста
-    assert app.scale_options == ['1"=10\'', '1"=16\'', '1"=20\'', '1"=30\'']
+    # Масштабы заказчика: 16 — основной, ещё 10, 20, 30, 40, 50, 60.
+    assert app.scale_options == [
+        '1"=10\'', '1"=16\'', '1"=20\'', '1"=30\'', '1"=40\'', '1"=50\'', '1"=60\'',
+    ]
     assert app.scale_var.get() == '1"=16\''
     app.scale_var.set('1"=10\'')
     app._refresh_height_label()
@@ -1435,7 +1438,14 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
     )
 
     app = gui.SurveyApp()
-    assert gui.VERSION == "1.0.0"
+    # Версия в углу окна — та же, что печатает отчёт Шага 2 (version.py).
+    import feature_labeler
+    import version
+
+    assert gui.VERSION == version.APP_VERSION != "1.0.0"
+    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_DATE})"
+    assert app.version_badge.cget("text") == f"v{version.APP_VERSION} · STUDIO"
+    assert gui.APP_DATE == version.APP_DATE
     assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings

@@ -36,6 +36,8 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
+from version import APP_DATE, APP_VERSION
+
 try:
     from shapely.geometry import LineString, Point, Polygon, box as shapely_box
     from shapely.geometry.base import BaseGeometry
@@ -145,7 +147,18 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: в чертеже (иначе — общий стиль подписей). Пустой слой — как все подписи.
     "house_label_layer": "0",
     "house_label_text_style": "RDS",
-    "house_label_height_factor": 1.667,
+    #: Стиль описания дома создаётся с этими параметрами, если его в чертеже нет
+    #: (так он задан в шаблоне заказчика: ROMAND.shx, сжатие 0.8, наклон 20°).
+    "house_label_style_definition": {"font": "romand.shx", "width_factor": 0.8, "oblique_deg": 20.0},
+    #: Высоты текста заказчика при масштабе 1"=16' (``drawing.base_scale``), ft:
+    #: 0.9 — подписи объектов, 1.1 — отступы (offsets) до дома, 1.5 — описание дома.
+    #: Для другого масштаба все три умножаются на масштаб / 16
+    #: (1"=10' ×0.625, 20 ×1.25, 30 ×1.875, 40 ×2.5, 50 ×3.125, 60 ×3.75).
+    "standard_text_heights_ft": {"label": 0.9, "house_offset": 1.1, "house": 1.5},
+    #: Описание дома, не помещающееся в контур, уменьшается шагами по
+    #: ``house_label_height_step_ft`` (при 1"=16'), но не мельче обычной подписи.
+    "house_label_shrink_to_fit": True,
+    "house_label_height_step_ft": 0.1,
     #: слои готовых подписей (итоговый чертёж): по ним проверяются дубликаты
     "existing_label_layers": ["D-TOPO-TEXT"],
     # --- источник 1: заметки полевого чертёжника -----------------------------
@@ -337,6 +350,12 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: забор, идущий по стене (в пределах ``fence_atop_wall_reach_ft`` от её
     #: контура), подписывается вместе с ней; у стены своей подписи нет
     "fence_atop_wall_format": "{fence} ATOP {wall}",
+    #: Стена под забором почти всегда бетонная: стена без материала в описании
+    #: (``fence_atop_plain_wall_names``) пишется «CONC. WALL», а там, где подпись
+    #: не помещается вдоль забора, — «C.WALL». Пустая строка — писать как снято.
+    "fence_atop_plain_wall_names": ["WALL"],
+    "fence_atop_wall_default": "CONC. WALL",
+    "fence_atop_wall_compact": {"CONC. WALL": "C.WALL", "CONCRETE WALL": "C.WALL"},
     "fence_atop_wall_reach_ft": 0.5,
     "fence_atop_wall_min_ft": 4.0,
     #: общая подпись ставится, если забор идёт по стене не короче этой длины;
@@ -441,6 +460,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "north_arrow_block_north_deg": 90.0,
     #: стрелка «смотрит вправо», если отклонена от оси +X меньше чем на столько градусов
     "north_arrow_side_sector_deg": 45.0,
+    #: после подписания перерисовать чертёж (как команда _REGENALL): типы линий
+    #: заборов и новые подписи показываются сразу
+    "regen_after_labeling": True,
     #: после подписания выключить слои полевых заметок (их заменили подписи)
     "hide_field_notes_after_labeling": True,
     "fence_min_extra_length_ft": 4.0,
@@ -933,9 +955,9 @@ class NorthArrow:
         return value - 360.0 if value > 180.0 else value
 
 
-#: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
-#: программы работала (описания точек из атрибутов блоков читаются с 2.2).
-STEP2_VERSION = "2.9 (2026-11-15)"
+#: Версия программы (``version.py``) с датой: печатается в отчёте Шага 2, чтобы
+#: было видно, какая сборка работала. Тот же номер стоит в углу окна.
+STEP2_VERSION = f"{APP_VERSION} ({APP_DATE})"
 
 
 @dataclass
@@ -1104,6 +1126,18 @@ def labels_similar(existing_text: str, label: str, synonyms: Any = None) -> bool
     # «C.L.F. ATOP WALL» — подпись забора на стене, а не соседней стены «WALL».
     if ("ATOP" in existing) != ("ATOP" in wanted_tokens):
         return False
+    if "ATOP" in existing:
+        # Забор на стене: сравнивается забор; материал стены заказчик пишет по
+        # фотографии («MASONRY WALL», «CONC. WALL», «C.WALL») — он может не совпасть.
+        cut_existing, cut_wanted = existing.index("ATOP"), wanted_tokens.index("ATOP")
+        walls = [
+            any(token.endswith("WALL") for token in tokens[cut + 1:])
+            for tokens, cut in ((existing, cut_existing), (wanted_tokens, cut_wanted))
+        ]
+        if all(walls) and cut_existing > 0 and cut_wanted > 0 and labels_similar(
+            " ".join(existing[:cut_existing]), " ".join(wanted_tokens[:cut_wanted]), synonyms
+        ):
+            return True
     variants = [label]
     if isinstance(synonyms, dict):
         wanted_key = " ".join(label_tokens(label))
@@ -3286,6 +3320,10 @@ def _fences_atop_walls(
     min_length = float(fcfg.get("min_feature_length_ft") or 0.0)
     if not template or not wall_shapes:
         return
+    default_wall = " ".join(str(fcfg.get("fence_atop_wall_default") or "").split())
+    plain_walls = {
+        " ".join(str(name).upper().split()) for name in _as_patterns(fcfg.get("fence_atop_plain_wall_names"))
+    }
     walls = {f.feature_id: f for f in result.features if f.feature_id in wall_shapes}
     wall_names = {wall_id: wall.label for wall_id, wall in walls.items()}
     for wall_id, polygon in wall_shapes.items():
@@ -3308,6 +3346,10 @@ def _fences_atop_walls(
             if not atop:
                 continue  # короткий участок стены под забором: только забор
             wall_name = " ".join(str(wall_names.get(wall_id) or "WALL").split())
+            assumed = ""
+            if default_wall and wall_name.upper() in plain_walls:
+                wall_name = default_wall
+                assumed = f"; материал стены не снят — принят {default_wall} (проверьте по фото)"
             try:
                 label = template.format(fence=fence.flat_label, wall=wall_name)
             except (KeyError, IndexError, ValueError):
@@ -3320,7 +3362,7 @@ def _fences_atop_walls(
                     Feature(
                         feature_id=new_id(), kind="fence", category="fence", layer=fence.layer,
                         geometry=part, label=label, source=fence.source,
-                        rule=f"{fence.rule}; на стене {wall.layer}", codes=fence.codes,
+                        rule=f"{fence.rule}; на стене {wall.layer}{assumed}", codes=fence.codes,
                     )
                 )
             for part in rest:

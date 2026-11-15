@@ -223,7 +223,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "drawing": {
         "base_scale": 16.0,
         "base_text_height": 0.9,
-        "available_scales": [10.0, 16.0, 20.0, 30.0],
+        "available_scales": [10.0, 16.0, 20.0, 30.0, 40.0, 50.0, 60.0],
         "text_offset_factor": 1.8,
         "street_offset_factor": 6.5,
         "street_height_factor": 1.9,

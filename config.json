@@ -79,7 +79,10 @@
       10.0,
       16.0,
       20.0,
-      30.0
+      30.0,
+      40.0,
+      50.0,
+      60.0
     ],
     "text_offset_factor": 1.8,
     "street_offset_factor": 6.5,
@@ -212,7 +215,18 @@
     "label_output_layer_color": 7,
     "house_label_layer": "0",
     "house_label_text_style": "RDS",
-    "house_label_height_factor": 1.667,
+    "house_label_style_definition": {
+      "font": "romand.shx",
+      "width_factor": 0.8,
+      "oblique_deg": 20.0
+    },
+    "standard_text_heights_ft": {
+      "label": 0.9,
+      "house_offset": 1.1,
+      "house": 1.5
+    },
+    "house_label_shrink_to_fit": true,
+    "house_label_height_step_ft": 0.1,
     "existing_label_layers": [
       "D-TOPO-TEXT"
     ],
@@ -715,6 +729,14 @@
     "party_wall_max_width_ft": 1.6,
     "party_wall_min_length_ft": 10.0,
     "fence_atop_wall_format": "{fence} ATOP {wall}",
+    "fence_atop_plain_wall_names": [
+      "WALL"
+    ],
+    "fence_atop_wall_default": "CONC. WALL",
+    "fence_atop_wall_compact": {
+      "CONC. WALL": "C.WALL",
+      "CONCRETE WALL": "C.WALL"
+    },
     "fence_atop_wall_reach_ft": 0.5,
     "fence_atop_wall_min_ft": 4.0,
     "fence_atop_wall_label_min_ft": 10.0,
@@ -858,6 +880,7 @@
     ],
     "north_arrow_block_north_deg": 90.0,
     "north_arrow_side_sector_deg": 45.0,
+    "regen_after_labeling": true,
     "hide_field_notes_after_labeling": true,
     "fence_min_extra_length_ft": 4.0,
     "fence_text_offset_factor": 1.1,

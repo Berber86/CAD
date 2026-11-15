@@ -120,6 +120,8 @@ AC_ATTACHMENT_MIDDLE_CENTER = 5
 AC_ATTACHMENT_MIDDLE_RIGHT = 6
 AC_LEADER_LINE_WITH_ARROW = 2
 AC_LEADER_SPLINE_WITH_ARROW = 3
+#: AcRegenType.acAllViewports — то же, что команда _REGENALL
+AC_REGEN_ALL_VIEWPORTS = 1
 
 #: линейные объекты DWG, из которых собираются участок, заборы и строения
 _FEATURE_LINE_KINDS = frozenset(
@@ -3089,6 +3091,39 @@ class AcadBuilder:
         return self._ensure_text_style(doc), False
 
     @staticmethod
+    def _create_house_style(doc: Any, name: str, fcfg: dict[str, Any]) -> bool:
+        """
+        Создаёт стиль описания дома (``RDS``), как он задан в шаблоне заказчика
+        (``house_label_style_definition``): шрифт, сжатие, наклон. ``False`` —
+        стиль не задан в настройках либо AutoCAD его не создал.
+        """
+        definition = fcfg.get("house_label_style_definition")
+        if not isinstance(definition, dict) or not str(definition.get("font") or "").strip():
+            return False
+        try:
+            style_obj = _com_retry(doc.TextStyles.Add, name)
+        except Exception:  # noqa: BLE001
+            return False
+        font = str(definition.get("font")).strip()
+        try:
+            style_obj.fontFile = font
+        except Exception:  # noqa: BLE001
+            try:
+                style_obj.SetFont(font, False, False, 0, 0)
+            except Exception:  # noqa: BLE001
+                pass
+        for attribute, value in (
+            ("Height", 0.0),
+            ("Width", float(definition.get("width_factor") or 1.0)),
+            ("ObliqueAngle", math.radians(float(definition.get("oblique_deg") or 0.0))),
+        ):
+            try:
+                setattr(style_obj, attribute, value)
+            except Exception:  # noqa: BLE001 - параметр не критичен
+                pass
+        return True
+
+    @staticmethod
     def _text_style_exists(doc: Any, name: str) -> bool:
         """Есть ли в чертеже текстовый стиль ``name`` (стили шаблона заказчика)."""
         try:
@@ -3297,6 +3332,7 @@ class AcadBuilder:
         leader_warned = False
         own_layers: dict[str, str] = {}
         own_styles: dict[str, str] = {}
+        house_style = str(fcfg.get("house_label_text_style") or "").strip()
 
         def item_layer(item: FeatureLabelItem) -> str:
             """Слой подписи: общий либо собственный (описание дома — слой 0)."""
@@ -3318,7 +3354,13 @@ class AcadBuilder:
             if not name:
                 return style
             if name not in own_styles:
-                own_styles[name] = name if self._text_style_exists(doc, name) else style
+                if self._text_style_exists(doc, name):
+                    own_styles[name] = name
+                elif name.upper() == house_style.upper() and self._create_house_style(doc, name, fcfg):
+                    own_styles[name] = name
+                    result.created_styles.append(name)
+                else:
+                    own_styles[name] = style
             return own_styles[name]
 
         try:
@@ -3367,6 +3409,13 @@ class AcadBuilder:
             app.Update()
         except Exception:  # noqa: BLE001 - обновление экрана не критично
             pass
+        if bool(fcfg.get("regen_after_labeling", True)):
+            # То же, что команда _REGENALL: типы линий (крестики забора) и новые
+            # подписи перерисовываются во всех видовых экранах.
+            try:
+                doc.Regen(AC_REGEN_ALL_VIEWPORTS)
+            except Exception:  # noqa: BLE001 - перерисовка не критична
+                pass
         return result
 
     def label_features(
@@ -5626,6 +5675,8 @@ class FeatureLabelResult:
     mode: str = "auto"
     dry_run: bool = False
     hidden_layers: list[str] = field(default_factory=list)  # выключенные слои заметок
+    #: текстовые стили, созданные программой (стиль описания дома RDS, если его не было)
+    created_styles: list[str] = field(default_factory=list)
 
     @property
     def recognition(self) -> RecognitionResult:
@@ -5752,7 +5803,12 @@ class FeatureLabelResult:
             if item.layer and item.layer.upper() != str(plan.output_layer).upper():
                 lines.append(
                     f"  «{item.single_line}»: слой {item.layer}, высота {item.height:.2f} ft"
-                    + (f", стиль {item.style} (если есть в чертеже)" if item.style else "")
+                    + (f", стиль {item.style}" if item.style else "")
+                    + (
+                        " (создан программой: в чертеже его не было)"
+                        if item.style and item.style in self.created_styles else ""
+                    )
+                    + (f" — {item.note}" if item.note.startswith("высота уменьшена") else "")
                 )
         lines.append(
             f"ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: {len(plan.duplicates)}"
@@ -5881,6 +5937,37 @@ _ROMANS_ADVANCE: dict[str, float] = {
         "*": 16, "\"": 16, "?": 18, "%": 24, "@": 27, "<": 24, ">": 24, "°": 14,
     }.items()
 }
+
+
+def standard_text_heights(fcfg: dict[str, Any]) -> dict[str, float]:
+    """
+    Высоты текста заказчика при базовом масштабе 1"=16' (``standard_text_heights_ft``):
+    ``label`` 0.9 — подписи объектов, ``house_offset`` 1.1 — отступы до дома,
+    ``house`` 1.5 — описание дома.
+    """
+    result = {"label": 0.9, "house_offset": 1.1, "house": 1.5}
+    custom = fcfg.get("standard_text_heights_ft")
+    if isinstance(custom, dict):
+        for key in result:
+            try:
+                value = float(custom.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                result[key] = value
+    return result
+
+
+def house_label_height(text_height: float, fcfg: dict[str, Any]) -> float:
+    """Высота описания дома при высоте подписей ``text_height``: 1.5 ft при 0.9 ft."""
+    heights = standard_text_heights(fcfg)
+    return float(text_height) * heights["house"] / heights["label"]
+
+
+def house_offset_height(text_height: float, fcfg: dict[str, Any]) -> float:
+    """Высота отступов (offsets) до дома при высоте подписей ``text_height``: 1.1 ft при 0.9 ft."""
+    heights = standard_text_heights(fcfg)
+    return float(text_height) * heights["house_offset"] / heights["label"]
 
 
 def feature_text_width(
@@ -6057,8 +6144,7 @@ class _LabelPlacer:
         # Описание основного дома: свой слой, стиль и высота (как у заказчика).
         self.house_layer = str(self.fcfg.get("house_label_layer") or "").strip()
         self.house_style = str(self.fcfg.get("house_label_text_style") or "").strip()
-        house_factor = float(self.fcfg.get("house_label_height_factor") or 1.0)
-        self.house_h = self.h * (house_factor if house_factor > 0 else 1.0)
+        self.house_h = house_label_height(self.h, self.fcfg)
         classifier = LayerClassifier(self.fcfg)
         self.classifier = classifier
 
@@ -6743,10 +6829,14 @@ class _LabelPlacer:
             # Возврат или продолжение соседского забора в стороне от участка.
             self.skipped.append((feature, "короткий забор за пределами участка"))
             return []
-        if short_text is not None:
-            short_width, _h = self._text_size(short_text)
+        # Забор на стене: «C.L.F. ATOP CONC. WALL», а где не помещается — «C.L.F. ATOP C.WALL».
+        compact_text = self._fence_compact_label(short_text)
+        for attempt in (short_text, compact_text):
+            if attempt is None:
+                continue
+            short_width, _h = self._text_size(attempt)
             if runs[0][2] >= short_width + 1.0:
-                already = self._run_label(short_text, runs[0][0], runs[0][1], reach)
+                already = self._run_label(attempt, runs[0][0], runs[0][1], reach)
                 if already is not None:
                     self.duplicates.append(
                         FeatureDuplicate(
@@ -6755,9 +6845,9 @@ class _LabelPlacer:
                         )
                     )
                     return []
-                found = self._along_run(feature, short_text, runs[0])
+                found = self._along_run(feature, attempt, runs[0])
                 if found is not None and found[0] == 0:
-                    if self._same_label_near(short_text, found[1].point, spacing) is not None:
+                    if self._same_label_near(attempt, found[1].point, spacing) is not None:
                         return []
                     self._commit(found[1])
                     extra_items = (
@@ -6811,12 +6901,36 @@ class _LabelPlacer:
         return items
 
     def _fence_short_label(self, text: str) -> str | None:
-        """``CHAIN LINK FENCE`` -> ``C.L.F.``; ``… ATOP WALL`` сокращается так же."""
+        """``CHAIN LINK FENCE`` -> ``C.L.F.``; ``… ATOP CONC. WALL`` сокращается так же."""
         base, separator, tail = text.partition(" ATOP ")
         short = lookup_pattern_label(base, self.fcfg.get("fence_abbreviations"))
         if short is None:
             return None
         return f"{short[0]} ATOP {tail}" if separator else short[0]
+
+    def _fence_compact_label(self, short_text: str | None) -> str | None:
+        """
+        Самая короткая запись забора на стене: ``C.L.F. ATOP CONC. WALL`` ->
+        ``C.L.F. ATOP C.WALL`` (``fence_atop_wall_compact``). ``None`` — короче некуда.
+        """
+        if not short_text or " ATOP " not in short_text:
+            return None
+        base, _separator, tail = short_text.partition(" ATOP ")
+        compact = self.fcfg.get("fence_atop_wall_compact")
+        if not isinstance(compact, dict):
+            return None
+        wanted = " ".join(tail.upper().split())
+        for full, brief in compact.items():
+            if " ".join(str(full).upper().split()) == wanted and str(brief).strip():
+                return f"{base} ATOP {str(brief).strip()}"
+        return None
+
+    def _short_for_run(self, short_text: str, length: float) -> str:
+        """Сокращение, которое помещается на прямом участке длиной ``length``."""
+        compact = self._fence_compact_label(short_text)
+        if compact is None or length >= self._text_size(short_text)[0] + 1.0:
+            return short_text
+        return compact
 
     def _neighbour_fence(self, geometry: Any) -> bool:
         """Больше половины длины забора идёт за линией участка (забор соседа)."""
@@ -6839,7 +6953,8 @@ class _LabelPlacer:
         spacing = float(self.fcfg.get("fence_abbreviation_spacing_ft") or 0.0)
         full_spacing = float(self.fcfg.get("fence_label_spacing_ft") or 0.0)
         width, _h = self._text_size(text)
-        short_width, _h = self._text_size(short_text)
+        # На коротком участке забор на стене пишется короче: «C.L.F. ATOP C.WALL».
+        short_width, _h = self._text_size(self._fence_compact_label(short_text) or short_text)
         extra = float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
         ratio = float(self.fcfg.get("fence_full_label_ratio") or 0.0)
         full_from = max(width + extra, ratio * width)
@@ -6859,7 +6974,7 @@ class _LabelPlacer:
                 break
             fitted = True
             full = run[2] > full_from
-            label = text if full else short_text
+            label = text if full else self._short_for_run(short_text, run[2])
             already = self._run_label(label, run[0], run[1], reach)
             if already is not None:
                 duplicate = duplicate or already
@@ -7212,21 +7327,57 @@ class _LabelPlacer:
                 continue
             self._commit(self.place_leader(feature))
 
+    def _house_heights(self) -> list[float]:
+        """Высоты описания дома от стандартной (1.5 ft при 1"=16') вниз до высоты обычной подписи."""
+        heights = [self.house_h]
+        if not bool(self.fcfg.get("house_label_shrink_to_fit", True)) or self.house_h <= self.h:
+            return heights
+        base = standard_text_heights(self.fcfg)
+        step = float(self.fcfg.get("house_label_height_step_ft") or 0.0) * self.h / base["label"]
+        if step <= 1e-9:
+            return heights
+        value = self.house_h - step
+        while value > self.h + 1e-9:
+            heights.append(value)
+            value -= step
+        heights.append(self.h)
+        return heights
+
     def _place_house(self, feature: Feature) -> FeatureLabelItem | None:
         """
-        Описание основного дома: по центру контура, высотой
-        ``house_label_height_factor`` от высоты подписей, в слое
-        ``house_label_layer`` стилем ``house_label_text_style``.
+        Описание основного дома: по центру контура, в слое ``house_label_layer``
+        стилем ``house_label_text_style``, высотой 1.5 ft при масштабе 1"=16'
+        (``standard_text_heights_ft``). Если оно не помещается в контур, высота
+        уменьшается (заказчик это допускает) — но не мельче обычной подписи.
         """
         normal = self.h
-        self.h = self.house_h
+        heights = self._house_heights()
+        item: FeatureLabelItem | None = None
         try:
-            item = self.place_inside(feature, force=True)
+            # 1) чисто внутри контура; 2) задевая одну-две внутренние линии;
+            # 3) как получится — самой мелкой высотой, с предупреждением.
+            for soft in (False, True):
+                for height in heights:
+                    self.h = height
+                    item = self.place_inside(feature, soft_only=soft)
+                    if item is not None:
+                        break
+                if item is not None:
+                    break
+            if item is None:
+                self.h = heights[-1]
+                item = self.place_inside(feature, force=True)
         finally:
             self.h = normal
         if item is not None:
             item.layer = self.house_layer
             item.style = self.house_style
+            if item.height < self.house_h - 1e-9:
+                reduced = (
+                    f"высота уменьшена с {self.house_h:.2f} до {item.height:.2f} ft: "
+                    "описание не помещается в контур дома"
+                )
+                item.note = f"{reduced}; {item.note}" if item.note else reduced
         return item
 
     def _skip_duplicate(self, feature: Feature) -> bool:

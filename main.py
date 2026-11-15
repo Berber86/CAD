@@ -72,9 +72,11 @@ from acad_builder import (
     SuspicionItem,
     compute_pob_point,
     format_distance,
+    house_label_height,
     verify_with_neighbors,
 )
 from feature_labeler import feature_settings
+from version import APP_DATE, APP_VERSION
 from llm_parser import (
     ASPENWALL_SAMPLES,
     CONFIG_PATH,
@@ -112,7 +114,8 @@ from llm_parser import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1440x940"
-VERSION = "1.0.0"
+#: Версия программы — из version.py (одна на окно, отчёт Шага 2 и ведомость).
+VERSION = APP_VERSION
 RESULT_PANEL_DEFAULT_WIDTH = 384
 #: Размер шрифта журнала и отчёта Шага 2 (остальные тексты правой панели — 10–11).
 LOG_FONT_SIZE = 13
@@ -203,7 +206,7 @@ THEME: dict[str, str] = {
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
     """Список подписей масштаба из конфига -> ['1"=10\'', …]."""
-    values = cfg.get("drawing", {}).get("available_scales") or [10, 16, 20, 30]
+    values = cfg.get("drawing", {}).get("available_scales") or [10, 16, 20, 30, 40, 50, 60]
     return [f'1"={float(value):g}\'' for value in values]
 
 
@@ -291,7 +294,7 @@ class SurveyApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.configure(fg_color=THEME["bg_root"])
 
-        self.title(f"{APP_TITLE}  v{VERSION}")
+        self.title(f"{APP_TITLE}  v{VERSION} ({APP_DATE})")
         self.geometry(APP_GEOMETRY)
         self.minsize(1100, 760)
 
@@ -2826,16 +2829,19 @@ class SurveyApp(ctk.CTk):
             auto = AcadBuilder(self.config_data).feature_text_height(scale)
         except Exception:  # noqa: BLE001 - некорректное значение в настройках
             return
+        fcfg = feature_settings(self.config_data)
         if manual is not None:
+            house = house_label_height(manual, fcfg)
             text = (
                 f"Подписи будут высотой {manual:.3f} ft (задано вручную; авто по масштабу "
-                f"1\" = {scale:g}' — {auto:.3f} ft)."
+                f"1\" = {scale:g}' — {auto:.3f} ft). Описание дома — {house:.3f} ft."
             )
         else:
+            house = house_label_height(auto, fcfg)
             text = (
                 f"Поле пустое — высота {auto:.3f} ft по масштабу 1\" = {scale:g}' из шапки "
-                "окна (как у подписей границы). Нужен текст мельче или крупнее — впишите "
-                "высоту в футах."
+                f"окна (как у подписей границы); описание дома — {house:.3f} ft, стиль RDS. "
+                "Нужен текст мельче или крупнее — впишите высоту в футах."
             )
         label.configure(text=text, text_color=THEME["sky"])
 

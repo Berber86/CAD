@@ -694,7 +694,7 @@ def test_north_arrow_rotation_is_read_from_autocad(com):
     )
     vertical = [
         e for e in doc.ModelSpace.created
-        if e.ObjectName == "AcDbText" and e.TextString in {"PARTY WALL", "C.L.F. ATOP WALL"}
+        if e.ObjectName == "AcDbText" and e.TextString in {"PARTY WALL", "C.L.F. ATOP CONC. WALL"}
     ]
     assert len(vertical) == 3
     assert all(math.degrees(e.Rotation) % 360.0 == pytest.approx(270.0, abs=0.2) for e in vertical)
@@ -1266,6 +1266,9 @@ class FakeDoc:
     def EndUndoMark(self):
         self.undo_marks.append("end")
 
+    def Regen(self, which):
+        self.regens = getattr(self, "regens", []) + [which]
+
 
 class FakeApp:
     def __init__(self, doc):
@@ -1281,10 +1284,10 @@ class FakeApp:
 
 
 def assert_house_label_on_layer_zero(created, text_height):
-    """Описание дома — MText в слое 0 высотой 1.667 от подписей; остальное — D-TOPO-TEXT."""
+    """Описание дома — MText в слое 0 высотой 1.5 ft при подписях 0.9 ft; остальное — D-TOPO-TEXT."""
     on_zero = [entity for entity in created if entity.Layer == "0"]
     assert len(on_zero) == 1 and on_zero[0].ObjectName == "AcDbMText"
-    assert on_zero[0].Height == pytest.approx(1.667 * text_height)
+    assert on_zero[0].Height == pytest.approx(1.5 / 0.9 * text_height)
     assert {entity.Layer for entity in created if entity.Layer != "0"} == {"D-TOPO-TEXT"}
 
 
@@ -1949,10 +1952,12 @@ def test_ilion_fences_follow_the_point_descriptions():
 def test_ilion_fence_on_a_wall_is_one_label():
     """Заказчик пишет «VINYL FENCE ATOP MASONRY WALL», а не забор и стену отдельно."""
     result = recognize(load_ilion(), house=ILION_HOUSE)
-    (vinyl,) = ilion_features(result, "VINYL FENCE ATOP WALL")
+    # Материал стены в поле не снят: под забором она считается бетонной (правило заказчика).
+    (vinyl,) = ilion_features(result, "VINYL FENCE ATOP CONC. WALL")
     assert vinyl.kind == "fence" and vinyl.geometry.length == pytest.approx(69.4, abs=0.2)
     assert "на стене ST-WALL" in vinyl.rule
-    chain = ilion_features(result, "CHAIN LINK FENCE ATOP WALL")
+    assert "материал стены не снят — принят CONC. WALL (проверьте по фото)" in vinyl.rule
+    chain = ilion_features(result, "CHAIN LINK FENCE ATOP CONC. WALL")
     assert sorted(round(f.geometry.length, 1) for f in chain) == [14.6, 20.7]
     # 8 ft сетки над короткой стеной у сарая: общей подписи нет, стена молчит,
     # забор остаётся целым (33.1 ft).
@@ -1963,6 +1968,10 @@ def test_ilion_fence_on_a_wall_is_one_label():
     plain = recognize(load_ilion(), house=ILION_HOUSE, cfg={"feature_labeling": {"fence_atop_wall_format": ""}})
     assert not [f for f in plain.features if " ATOP " in f.flat_label]
     assert len(ilion_features(plain, "WALL")) == 3
+    # Без материала по умолчанию стена пишется как снята.
+    bare = recognize(load_ilion(), house=ILION_HOUSE, cfg={"feature_labeling": {"fence_atop_wall_default": ""}})
+    assert len(ilion_features(bare, "VINYL FENCE ATOP WALL")) == 1
+    assert "материал стены" not in ilion_features(bare, "VINYL FENCE ATOP WALL")[0].rule
 
 
 #: Подписи итогового чертежа заказчика (docs/12 Ilion Place…final.dump.json),
@@ -1983,6 +1992,11 @@ ILION_FINAL_LABELS = [
     ("O.P.", (5004.4, 5044.0), 90.4, 2.5),
     ("STEP", (5012.8, 5014.1), 0.4, 2.5),
     ("PLANTER", (5038.2, 4993.0), 89.4, 4.0),
+    # Забор на стене (с 3.0): «CONC. WALL», на коротком участке «C.WALL», на выноске в две
+    # строки — у заказчика на этих же местах «C.L.F. ATOP C.WALL» и «C.L.F. ATOP / CONC. WALL».
+    ("C.L.F. ATOP C.WALL", (4998.5, 5069.5), 90.4, 4.0),
+    ("C.L.F. ATOP CONC. WALL", (5044.3, 5075.2), 0.4, 1.5),
+    ("VINYL FENCE ATOP CONC. WALL", (5018.4, 4982.7), 0.4, 7.0),  # VINYL FENCE ATOP MASONRY WALL
 ]
 
 
@@ -1998,14 +2012,18 @@ def test_ilion_plan_matches_the_customer_final_drawing():
         # Полевой чертёж повёрнут относительно итогового на 0.4°.
         assert math.degrees(found[0].rotation) == pytest.approx(rotation, abs=1.5), text
     texts = [item.single_line for item in plan.items]
-    assert "VINYL FENCE ATOP WALL" in texts and texts.count("C.L.F. ATOP WALL") == 2
+    assert "VINYL FENCE ATOP CONC. WALL" in texts
+    assert "C.L.F. ATOP C.WALL" in texts and "C.L.F. ATOP CONC. WALL" in texts
     assert "POOL AREA 349 Sq.Ft." in texts
     # Того, чего в итоговом чертеже нет: отдельной стены, тротуара, полного «CANTILEVER».
     for absent in ("WALL", "CONC. WALK", "CANTILEVER", "CHAIN LINK FENCE"):
         assert absent not in texts, absent
     # Короткая сетка у стены: сокращение на выноске в две строки, как у заказчика.
-    (atop,) = [item for item in plan.items if item.text == "C.L.F. ATOP\nWALL"]
+    (atop,) = [item for item in plan.items if item.text == "C.L.F. ATOP\nCONC. WALL"]
     assert atop.placement == "leader"
+    # Вдоль 20-футового участка «C.L.F. ATOP CONC. WALL» не помещается — пишется «C.WALL».
+    (compact,) = [item for item in plan.items if item.text == "C.L.F. ATOP C.WALL"]
+    assert compact.placement == "along" and compact.feature.geometry.length == pytest.approx(20.7, abs=0.2)
 
 
 def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
@@ -2176,6 +2194,7 @@ BROOKLYN_FINAL_LABELS = [
     ("WALL", (5015.6, 5002.6), 1.5),                # CONC. WALL ALONG LINE
     ("WALL", (5000.1, 5004.6), 3.5),                # CONC. WALL
     ("UTILITY POLE", (5002.4, 5015.2), 4.0),
+    ("C.L.F. ATOP CONC. WALL", (4995.2, 5003.5), 3.0),
 ]
 
 
@@ -2281,7 +2300,7 @@ def test_brooklyn_plan_matches_the_customer_final_drawing():
     texts = sorted(item.single_line for item in plan.items)
     assert texts == sorted(
         [text for text, _point, _tolerance in BROOKLYN_FINAL_LABELS]
-        + ["C.L.F. ATOP WALL", "I.FE."]
+        + ["I.FE."]
     )
     by_text = {item.single_line: item for item in plan.items}
     # Узкая площадка соседа — в две строки, своя длинная — в одну, рядом с люком.
@@ -2295,12 +2314,12 @@ def test_brooklyn_plan_matches_the_customer_final_drawing():
     assert sorted(round(item.point[0], 1) for item in party) == [4992.7, 5015.7]
     # Стрелка севера смотрит вправо — вертикальный текст сверху вниз (у заказчика 270°).
     assert all(math.degrees(item.rotation) == pytest.approx(-90.0, abs=0.1) for item in party)
-    assert math.degrees(by_text["C.L.F. ATOP WALL"].rotation) == pytest.approx(-89.9, abs=0.2)
+    assert math.degrees(by_text["C.L.F. ATOP CONC. WALL"].rotation) == pytest.approx(-89.9, abs=0.2)
     pole = by_text["UTILITY POLE"]
     assert (pole.kind, pole.text) == ("leader", "UTILITY\nPOLE")
     assert math.dist(pole.leader_points[0], (4997.49, 5017.47)) < 1.5  # знак WUP
     # Забор на стене подписан вместе с ней; у стены под забором своей подписи нет.
-    atop = by_text["C.L.F. ATOP WALL"]
+    atop = by_text["C.L.F. ATOP CONC. WALL"]
     assert atop.feature.geometry.length == pytest.approx(34.2, abs=0.2)
 
 
@@ -2325,13 +2344,23 @@ def test_house_description_goes_to_layer_zero_in_a_larger_style(com):
     assert again.created_labels == 0 and len(again.plan.duplicates) >= 15
     assert "3 STY BRICK W/CELLAR No. 6910" in [d.existing_text for d in again.plan.duplicates]
 
-    # Стиля RDS в чертеже нет — общий стиль подписей; слой можно вернуть настройкой.
+    # Стиля RDS в чертеже нет — программа создаёт его таким, как в шаблоне заказчика
+    # (ROMAND.shx, сжатие 0.8, наклон 20°); слой можно вернуть настройкой.
     builder, _app, doc = com(load_brooklyn(), feature_cfg={"house_label_layer": ""})
-    builder.label_features(house_text=BROOKLYN_HOUSE)
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
     created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
     assert {e.Layer for e in created} == {"D-TOPO-TEXT"}
     (house,) = [e for e in created if "6910" in e.TextString]
-    assert house.Height == pytest.approx(1.5, abs=0.01) and house.StyleName != "RDS"
+    assert house.Height == pytest.approx(1.5) and house.StyleName == "RDS"
+    style = doc.TextStyles.items["RDS"]
+    assert (style.fontFile, style.Width, style.Height) == ("romand.shx", 0.8, 0.0)
+    assert math.degrees(style.ObliqueAngle) == pytest.approx(20.0)
+    assert result.created_styles == ["RDS"]
+    # Определение стиля убрано из настроек — описание дома пишется общим стилем подписей.
+    builder, _app, doc = com(load_brooklyn(), feature_cfg={"house_label_style_definition": {}})
+    result = builder.label_features(house_text=BROOKLYN_HOUSE)
+    (house,) = [e for e in doc.ModelSpace.created if getattr(e, "Layer", "") == "0"]
+    assert house.StyleName != "RDS" and "RDS" not in doc.TextStyles.items and result.created_styles == []
 
 
 def test_symbol_blocks_are_labeled_only_on_the_lot(com):
@@ -2402,8 +2431,25 @@ def test_wall_drawn_as_two_open_lines_becomes_a_ribbon():
         ("", fl.WALL_UNDER_FENCE_REASON), ("WALL", ""), ("WALL", ""),
     ]
     assert [f.flat_label for f in result.features if " ATOP " in f.flat_label] == [
-        "CHAIN LINK FENCE ATOP WALL"
+        "CHAIN LINK FENCE ATOP CONC. WALL"
     ]
+    # Забор на стене сравнивается по забору: материал стены заказчик берёт с фотографий.
+    for existing in ("C.L.F. ATOP CONC. WALL", "C.L.F. ATOP C.WALL", "C.L.F. ATOP\\PCONC. WALL",
+                     "C.L.F. ATOP WALL"):
+        for wanted in ("CHAIN LINK FENCE ATOP CONC. WALL", "C.L.F. ATOP CONC. WALL", "C.L.F. ATOP C.WALL"):
+            assert fl.labels_similar(
+                existing, wanted, fl.DEFAULT_FEATURE_CONFIG["label_synonyms"]
+            ), (existing, wanted)
+    assert fl.labels_similar(
+        "CHAIN LINK FENCE ATOP MASONRY WALL", "CHAIN LINK FENCE ATOP CONC. WALL",
+        fl.DEFAULT_FEATURE_CONFIG["label_synonyms"],
+    )
+    assert not fl.labels_similar(
+        "VINYL FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL", fl.DEFAULT_FEATURE_CONFIG["label_synonyms"]
+    )
+    assert not fl.labels_similar("C.L.F.", "C.L.F. ATOP CONC. WALL") and not fl.labels_similar(
+        "CONC. WALL", "C.L.F. ATOP CONC. WALL"
+    )
     # «C.L.F. ATOP WALL» рядом не считается подписью соседней стены «WALL».
     assert not fl.labels_similar("C.L.F. ATOP WALL", "WALL")
     assert fl.labels_similar("C.L.F. ATOP WALL", "CHAIN LINK FENCE ATOP WALL", {
@@ -2544,7 +2590,7 @@ def test_text_size_model_matches_what_autocad_really_drew():
     assert worst < 0.13
     # План по записи чертежа и результат в AutoCAD: те же тексты на тех же местах.
     # (с настройками версии 2.6, которая их создала)
-    v26 = {"front_yard_depth_ft": 0.0, "leader_text_gap_factor": 0.5}
+    v26 = {"front_yard_depth_ft": 0.0, "leader_text_gap_factor": 0.5, "fence_atop_wall_default": ""}
     plan = brooklyn_plan(house="", cfg={"feature_labeling": v26})
     assert sorted(item.single_line for item in plan.items) == sorted(
         entity["text"].replace("\\P", " ") for entity in labels
@@ -3134,3 +3180,121 @@ def test_gate_is_never_guessed_from_a_short_fence_return():
     # Явная команда — полевая заметка или слой калиток — работает как раньше.
     gates = [item for item in stafford_plan().items if "GATE" in item.single_line]
     assert gates and all(item.feature.category == "gate" for item in gates)
+
+
+# ---------------------------------------------------------------------------
+# Правила заказчика о высотах текста и стене под забором (версия 3.0)
+# ---------------------------------------------------------------------------
+
+def test_text_heights_follow_the_customer_table_for_every_scale():
+    """
+    0.9 — подписи объектов, 1.1 — отступы до дома, 1.5 — описание дома при 1"=16';
+    для масштабов 10, 20, 30, 40, 50, 60 — коэффициенты 0.625, 1.25, 1.875, 2.5, 3.125, 3.75.
+    """
+    builder = ab.AcadBuilder({})
+    fcfg = fl.feature_settings({})
+    assert fcfg["standard_text_heights_ft"] == {"label": 0.9, "house_offset": 1.1, "house": 1.5}
+    factors = {10: 0.625, 16: 1.0, 20: 1.25, 30: 1.875, 40: 2.5, 50: 3.125, 60: 3.75}
+    for scale, factor in factors.items():
+        label = builder.feature_text_height(scale)
+        assert label == pytest.approx(0.9 * factor)
+        assert ab.house_offset_height(label, fcfg) == pytest.approx(1.1 * factor)
+        assert ab.house_label_height(label, fcfg) == pytest.approx(1.5 * factor)
+    # Масштабы заказчика есть в списке окна программы.
+    import json
+
+    shipped = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    assert shipped["drawing"]["available_scales"] == [10.0, 16.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    # В плане: дом ровно 1.5 ft (раньше 0.9 × 1.667 = 1.5003), при масштабе 20 — 1.875 ft.
+    (house,) = [item for item in aspinwall_plan().items if item.feature.is_main_house]
+    assert house.height == 1.5 and (house.layer, house.style) == ("0", "RDS")
+    plan20 = make_plan(load_aspinwall(), house=ASPINWALL_HOUSE, height=builder.feature_text_height(20))
+    (house20,) = [item for item in plan20.items if item.feature.is_main_house]
+    assert house20.height == pytest.approx(1.875)
+    assert {round(item.height, 3) for item in plan20.items if not item.feature.is_main_house} == {1.125}
+
+
+def small_house_scene(width, depth):
+    snap = DrawingSnapshot()
+    snap.lines.append(DrawingLine("M-PROPERTY", ((0.0, 0.0), (40.0, 0.0), (40.0, 100.0), (0.0, 100.0), (0.0, 0.0))))
+    snap.lines.append(DrawingLine(
+        "ST-BLDG-LINE", ((10.0, 40.0), (10.0 + width, 40.0), (10.0 + width, 40.0 + depth), (10.0, 40.0 + depth)),
+        closed=True,
+    ))
+    return snap
+
+
+def test_house_description_is_made_smaller_when_it_does_not_fit_the_outline():
+    """«Если надпись дома плохо вмещается в контур дома, допускается уменьшать высоту»."""
+    def house_item(width, depth, **cfg):
+        plan = make_plan(
+            small_house_scene(width, depth), house=ASPINWALL_HOUSE, height=0.9,
+            cfg={"feature_labeling": cfg} if cfg else None,
+        )
+        (item,) = plan.items
+        return plan, item
+
+    plan, item = house_item(25.0, 30.0)
+    assert item.height == 1.5 and item.note == "" and plan.warnings == []
+    # Контур 10 × 9 ft: 1.5 ft не помещается — высота снижается по 0.1 ft, пока не поместится.
+    plan, item = house_item(10.0, 9.0)
+    assert item.height == pytest.approx(1.2) and plan.warnings == []
+    assert item.note == "высота уменьшена с 1.50 до 1.20 ft: описание не помещается в контур дома"
+    assert shapely_box(10.0, 40.0, 20.0, 49.0).contains(item.box)
+    report = ab.FeatureLabelResult(plan=plan, layer=plan.output_layer, dry_run=True).report()
+    assert "слой 0, высота 1.20 ft, стиль RDS — высота уменьшена с 1.50 до 1.20 ft" in report
+    # Мельче обычной подписи (0.9 ft) описание не делается: дальше — предупреждение.
+    plan, item = house_item(5.0, 5.0)
+    assert item.height == pytest.approx(0.9) and len(plan.warnings) == 1
+    # Правило выключается настройкой: тогда как раньше — полной высотой с предупреждением.
+    plan, item = house_item(10.0, 9.0, house_label_shrink_to_fit=False)
+    assert item.height == 1.5 and len(plan.warnings) == 1
+
+
+def test_fence_on_a_wall_is_written_with_a_concrete_wall():
+    """
+    «C.L.F. ATOP WALL» пишется «C.L.F. ATOP CONC. WALL», а где места мало —
+    «C.L.F. ATOP C.WALL»: стена под забором почти всегда бетонная.
+    """
+    def scene(length, wall_code="WALL"):
+        snap = DrawingSnapshot()
+        snap.lines.append(DrawingLine("M-PROPERTY", ((0.0, 0.0), (60.0, 0.0), (60.0, 100.0), (0.0, 100.0), (0.0, 0.0))))
+        snap.lines.append(DrawingLine("ST-BLDG-LINE", ((15.0, 40.0), (45.0, 40.0), (45.0, 70.0), (15.0, 70.0)), closed=True))
+        x0, x1 = 30.0 - length / 2.0, 30.0 + length / 2.0
+        snap.lines.append(DrawingLine("ST-WALL", ((x0, 90.0), (x1, 90.0), (x1, 90.8), (x0, 90.8)), closed=True))
+        snap.lines.append(DrawingLine("S-FENCE", ((x0, 90.4), (x1, 90.4))))
+        for number, x, description, layer in (
+            ("1", x0, "F E C", "S-FENCE"), ("2", x1, "F E C", "S-FENCE"),
+            ("3", x0, wall_code, "ST-WALL"), ("4", x1, wall_code, "ST-WALL"),
+        ):
+            y = 90.4 if layer == "S-FENCE" else 90.0
+            snap.survey_points.append(fl.SurveyPoint(
+                layer=layer, number=number, description=description, point=(x, y),
+                elevation="100.00", block="srvpno3",
+            ))
+        return snap
+
+    def atop_texts(length, **kwargs):
+        plan = make_plan(scene(length, **kwargs), house="2 STY", height=0.9)
+        return [(item.text, item.placement) for item in plan.items if " ATOP" in item.text]
+
+    # Длинный участок — полное название; короче — сокращение; ещё короче — «C.WALL»;
+    # совсем коротко — выноска в две строки (на ней места хватает для «CONC. WALL»).
+    assert atop_texts(56.0) == [("CHAIN LINK FENCE ATOP CONC. WALL", "along")]
+    assert atop_texts(30.0) == [("C.L.F. ATOP CONC. WALL", "along")]
+    assert atop_texts(17.0) == [("C.L.F. ATOP C.WALL", "along")]
+    assert atop_texts(12.0) == [("C.L.F. ATOP\nCONC. WALL", "leader")]
+    # Стена, названная иначе, чем просто «WALL», пишется как названа; правило выключается.
+    for cfg in ({"fence_atop_plain_wall_names": []}, {"fence_atop_wall_default": ""}):
+        plan = make_plan(scene(30.0), house="2 STY", height=0.9, cfg={"feature_labeling": cfg})
+        assert [item.text for item in plan.items if " ATOP" in item.text] == ["C.L.F. ATOP WALL"]
+
+
+def test_drawing_is_regenerated_after_labeling(com):
+    """После создания подписей — то же, что _REGENALL: видны типы линий заборов."""
+    builder, _app, doc = com(load_brooklyn())
+    builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert doc.regens == [ab.AC_REGEN_ALL_VIEWPORTS] == [1]
+    builder, _app, doc = com(load_brooklyn(), feature_cfg={"regen_after_labeling": False})
+    builder.label_features(house_text=BROOKLYN_HOUSE)
+    assert not getattr(doc, "regens", [])

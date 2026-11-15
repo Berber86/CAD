@@ -137,7 +137,14 @@ def test_without_a_neighbour_the_bearing_is_computed_from_closure_and_marked_as_
     found = analysis.proposals[0]
     assert found.kind == "closing_course" and found.verified
     assert found.changes[0].new_label == "S 22°26'38\" E" and found.after.closure_ft < 0.01
-    assert "расчётное" in " ".join(found.reasons) and "расчёт" in found.source
+    reasons = " ".join(found.reasons)
+    assert "расчётное" in reasons and "расчёт" in found.source
+    # Соседей в наборе нет — так и говорим, а не «в описаниях соседей не найден»
+    # (заказчик, 15.11.2026: «он рассказал, что не в порядке, подсмотрев у соседей,
+    # хотя соседей я не загружал»).
+    assert "соседей в наборе нет" in reasons and "их описания не загружены" in reasons
+    assert "в описаниях соседей румб этой линии не найден" not in reasons
+    assert "не подтверждается замыканием" not in reasons
 
     # Румб соседа, который не сходится с нашим контуром, не выдаётся за подтверждённый.
     odd = NEIGHBOUR_TEXT.replace(STREET_BEARING, "South 10 degrees 26 minutes 12 seconds East")

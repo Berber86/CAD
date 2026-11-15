@@ -310,6 +310,38 @@ EXAMPLE_TEXT = (
 )
 
 
+def ocr_closure_note(plan: Any, limit: float = CLOSURE_LIMIT_FT) -> tuple[str, str]:
+    """
+    Что сказать про участок, чей текст получен локальным OCR.
+
+    Возвращает ``(куда, текст)``: ``"issue"`` — повод проверить распознавание,
+    ``"note"`` — просто пояснение, ``""`` — говорить нечего.
+
+    Тонкость, на которой мы уже обожглись: большая невязка не всегда означает
+    ошибку чтения цифр. Если в описании есть сторона без румба («southerly along
+    the easterly line of …»), контур и не должен замыкаться — это документ так
+    написан, и румб закрывает правило 1 «румб из замыкания». Гнать человека в
+    платный Vision в таком случае бессмысленно: цифры прочитаны верно.
+    """
+    distance = float(getattr(getattr(plan, "closure", None), "distance", 0.0) or 0.0)
+    if distance <= limit:
+        return "", ""
+    description = getattr(plan, "description", None)
+    segments = list(getattr(description, "segments", ()) or ())
+    gaps = [index + 1 for index, seg in enumerate(segments) if not getattr(seg, "has_bearing", True)]
+    if gaps:
+        sides = ", ".join(f"#{number}" for number in gaps)
+        return "note", (
+            f"распознано локальным OCR; невязка {distance:.2f} ft — от стороны без румба "
+            f"({sides}): так написано в документе, её закрывает правило «румб из замыкания». "
+            "Распознавание здесь ни при чём, платный ИИ не нужен"
+        )
+    return "issue", (
+        f"распознано локальным OCR, невязка {distance:.2f} ft (больше {limit} ft) — "
+        "вероятно, ошибка чтения цифр; переключите файл на ИИ (Vision) и сравните страницы"
+    )
+
+
 class SurveyApp(ctk.CTk):
     """Главное окно приложения (Dark CAD Studio UI)."""
 
@@ -6045,14 +6077,14 @@ class SurveyApp(ctk.CTk):
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
                 description = apply_changes(result.outcome.data, fix_changes(job.fixes))
                 plan = builder.plan(description, scale=scale, is_neighbor=not job.is_main)
-                if result.ocr and plan.closure.distance > CLOSURE_LIMIT_FT:
-                    # Геометрия — детектор ошибок распознавания: настоящий deed
-                    # замыкается в сотые, значит цифры прочитаны неверно.
-                    result.issues.append(
-                        f"распознано локальным OCR, невязка {plan.closure.distance:.2f} ft "
-                        f"(больше {CLOSURE_LIMIT_FT} ft) — вероятно, ошибка чтения цифр; "
-                        "переключите файл на ИИ (Vision) и сравните страницы"
-                    )
+                if result.ocr:
+                    # Геометрия — детектор ошибок распознавания, но не любой невязки:
+                    # сторона без румба даёт гэп и без ошибок чтения (см. ocr_closure_note).
+                    where, note = ocr_closure_note(plan)
+                    if where == "issue":
+                        result.issues.append(note)
+                    elif where == "note":
+                        plan.notes.append(note)
                 for issue in result.issues:
                     if issue not in plan.warnings:
                         plan.warnings.append(issue)

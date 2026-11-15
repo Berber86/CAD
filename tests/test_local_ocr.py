@@ -328,6 +328,69 @@ def test_scan_in_the_set_is_read_locally_and_built(gui, tmp_path, monkeypatch):
     assert "локально, OCR" in app.neighbor_pdf_summary.cget("text")
 
 
+def _plan_stub(distance, bearings):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        closure=SimpleNamespace(distance=distance),
+        description=SimpleNamespace(
+            segments=[SimpleNamespace(has_bearing=flag) for flag in bearings]
+        ),
+        notes=[],
+    )
+
+
+def test_ocr_warning_does_not_blame_the_scanner_for_a_side_without_bearing(gui):
+    """
+    «24 Alvine Avenue»: сторона #4 записана словами («southerly along the easterly
+    line of Alvine Avenue»), поэтому контур и не замыкается — невязка 15.57 ft.
+    Это не ошибка распознавания: цифры прочитаны верно, румб закрывает правило 1.
+    """
+    where, note = gui.ocr_closure_note(_plan_stub(15.5696, [True, True, True, False]))
+    assert where == "note"
+    assert "#4" in note and "так написано в документе" in note
+    assert "платный ИИ не нужен" in note
+    assert "вероятно, ошибка чтения цифр" not in note
+
+    # Все стороны с румбами, а контур не сходится — вот теперь повод проверить OCR.
+    where, note = gui.ocr_closure_note(_plan_stub(3.41, [True, True, True, True]))
+    assert where == "issue"
+    assert "переключите файл на ИИ" in note and "вероятно, ошибка чтения цифр" in note
+
+    # Всё сошлось — молчим.
+    assert gui.ocr_closure_note(_plan_stub(0.006, [True, True, True, False])) == ("", "")
+
+
+def test_scan_with_a_bearingless_side_is_explained_not_blamed(gui, tmp_path, monkeypatch):
+    """Сквозная проверка: скан «нашего» участка с такой стороной — пояснение, не замечание."""
+    import ocr_pages as local_ocr
+    from test_conflict_resolver import OUR_TEXT
+
+    monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(local_ocr, "_available", True)
+    monkeypatch.setattr(local_ocr, "_engine", FakeEngine(OUR_TEXT))
+    monkeypatch.setattr(gui.ocr_pages, "available", lambda: True)
+    scan = _scan_pdf(tmp_path / "alvine.pdf", OUR_TEXT, fontsize=9)
+
+    app = gui.SurveyApp()
+    from tkinter import filedialog
+
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(scan),))
+    app._load_pdf()
+    dialog = app._pdf_set_dialog
+    assert dialog is not None, app.status_var.get()
+    dialog.rows[0]["radio"].select()
+    dialog.submit()
+    __import__("test_gui_smoke", fromlist=["_wait_for_gui_worker"])._wait_for_gui_worker(app, timeout=20)
+
+    item = app.pdf_set[0]
+    assert item.ocr_used is True and item.on_scene is True
+    plan = app._pdf_set_main_plan
+    notes = " ".join(plan.notes)
+    assert "от стороны без румба" in notes and "платный ИИ не нужен" in notes
+    assert not any("вероятно, ошибка чтения цифр" in issue for issue in item.issues)
+
+
 @pytest.mark.skipif(not ocr_pages.available(), reason="локальный OCR не установлен")
 def test_real_engine_reads_bearings_and_distances(tmp_path, monkeypatch):
     """Настоящий движок: румбы и длины читаются (фразы и регистр нам не важны)."""

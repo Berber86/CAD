@@ -183,8 +183,8 @@ docs/samples/example-1-metes-and-bounds.txt docs/preview-example.png`
   **«225 Aspinwall Street, Staten Island»** (`docs/225 Aspinwall Street, Staten Island.final.dump.json`,
   сравнение — [docs/step2_aspinwall_preview.png](docs/step2_aspinwall_preview.png), тест
   `test_aspinwall_plan_matches_the_customer_final_drawing`: у каждой из 20 подписей объектов есть
-  подпись заказчика о том же объекте — 17 в пределах 4 ft, три в 5–8 ft; по словам заказчика, остальное в этом итоговом чертеже взято с
-  фотографий — их чтение запланировано отдельным шагом):
+  подпись заказчика о том же объекте — 17 в пределах 4 ft, три в 5–8 ft; слова материала, покрытия, отступы и размеры
+  не сравниваются):
 
   - **Стенка клумбы — лента.** Две линии слоя `ST-MISC` в 0.8 ft друг от друга без торцов (у заказчика
     заштрихованы) замыкаются сами, если лента длиннее `ribbon_cap_min_length_ft` = 6 ft

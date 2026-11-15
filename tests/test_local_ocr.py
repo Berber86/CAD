@@ -29,13 +29,13 @@ DESCRIPTION = (
 )
 
 
-def _scan_pdf(path, text, *, fontsize=11):
+def _scan_pdf(path, text, *, fontsize=11, dpi=150):
     """PDF, в котором есть только картинка страницы (как документ из ACRIS)."""
     pymupdf = pytest.importorskip("pymupdf")
     source = pymupdf.open()
     page = source.new_page()
     page.insert_textbox(pymupdf.Rect(36, 36, 560, 760), text, fontsize=fontsize)
-    pixmap = page.get_pixmap(dpi=150)
+    pixmap = page.get_pixmap(dpi=dpi)
     image = path.with_suffix(".png")
     pixmap.save(str(image))
     scan = pymupdf.open()
@@ -50,6 +50,32 @@ def _scan_pdf(path, text, *, fontsize=11):
     finally:
         check.close()
     return path
+
+
+class SizeAwareEngine:
+    """Как настоящий OCR «не справляется» с плотной страницей, но читает куски."""
+
+    def __init__(self, text, *, wide_from=1500):
+        self.text = text
+        self.wide_from = wide_from
+        self.calls = 0
+        self.widths = []
+
+    def __call__(self, image_path):
+        from PIL import Image
+
+        self.calls += 1
+        with Image.open(image_path) as image:
+            width = image.width
+        self.widths.append(width)
+        source = "COVER PAGE\nno courses here" if width >= self.wide_from else self.text
+        lines = [line for line in source.splitlines() if line.strip()]
+        result = [
+            ([(0.0, float(index * 20)), (100.0, float(index * 20)),
+              (100.0, float(index * 20 + 12)), (0.0, float(index * 20 + 12))], line, 0.99)
+            for index, line in enumerate(lines)
+        ]
+        return result, 0.0
 
 
 def _text_pdf(path, text):
@@ -172,6 +198,52 @@ def test_recognised_pages_are_cached_and_not_read_twice(tmp_path, ocr_ready):
     # Второй раз страница не рендерилась и не распознавалась: текст из кэша.
     assert ocr_ready.calls == 1
     assert (tmp_path / "ocr_cache").is_dir()
+
+
+def test_render_dpi_never_goes_above_the_embedded_image(tmp_path, ocr_ready):
+    """Скан — это картинка: рендерить выше её собственного разрешения бессмысленно."""
+    pymupdf = pytest.importorskip("pymupdf")
+
+    assert ocr_pages.DEFAULT_DPI == 400
+    low = _scan_pdf(tmp_path / "low.pdf", DESCRIPTION, dpi=150)  # ≈150 dpi картинки
+    high = _scan_pdf(tmp_path / "high.pdf", DESCRIPTION, dpi=350)  # ≈350 dpi картинки
+    doc = pymupdf.open(str(low))
+    try:
+        assert ocr_pages.page_render_dpi(doc[0], 400) == ocr_pages.MIN_DPI
+        assert ocr_pages.page_render_dpi(doc[0], 600) == ocr_pages.MIN_DPI
+    finally:
+        doc.close()
+    doc = pymupdf.open(str(high))
+    try:
+        # Просили 400 и 600 — рендерим 350: больше в файле нет.
+        assert ocr_pages.page_render_dpi(doc[0], 400) == 350
+        assert ocr_pages.page_render_dpi(doc[0], 600) == 350
+        assert ocr_pages.page_render_dpi(doc[0], 250) == 250  # меньше — можно
+    finally:
+        doc.close()
+    # Векторная страница: картинок нет, берём запрошенное разрешение.
+    text_pdf = _text_pdf(tmp_path / "vector.pdf", DESCRIPTION)
+    doc = pymupdf.open(str(text_pdf))
+    try:
+        assert ocr_pages.native_dpi(doc[0]) == 0.0
+        assert ocr_pages.page_render_dpi(doc[0], 400) == 400
+    finally:
+        doc.close()
+
+
+def test_unreadable_page_is_retried_in_tiles(tmp_path, monkeypatch):
+    """Плотная страница не читается целиком — второй заход по кускам 2×2."""
+    from pdf_set import resolve_ocr_source
+
+    monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(ocr_pages, "_available", True)
+    engine = SizeAwareEngine(DESCRIPTION, wide_from=1500)
+    monkeypatch.setattr(ocr_pages, "_engine", engine)
+    scan = _scan_pdf(tmp_path / "dense.pdf", DESCRIPTION, dpi=200)  # 1700 px по ширине
+
+    resolved = resolve_ocr_source({"ocr_path": scan, "ocr_pages": "1"})
+    assert has_legal_courses(resolved["text"]) and "176.92" in resolved["text"]
+    assert engine.calls > 1 and min(engine.widths) < 1500  # куски действительно мельче
 
 
 def test_ocr_sorts_lines_top_down():

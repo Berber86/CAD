@@ -24,9 +24,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-#: Разрешение рендера страницы. 300 dpi — компромисс между качеством и временем
-#: (на песочнице 4–6 с на страницу); 200 dpi быстрее, но мельче шрифт.
-DEFAULT_DPI = 300
+#: Разрешение рендера страницы. 400 dpi: замеры показали, что это бесплатно —
+#: время на странице не растёт (движок всё равно приводит строки к своей высоте),
+#: а мелкий и бледный шрифт читается чуть надёжнее. 600 dpi не даёт ничего и
+#: иногда вредит (см. docs/ocr_probe.py), поэтому выше 400 не поднимаемся.
+DEFAULT_DPI = 400
+
+#: Ниже этого разрешения страницу рендерить смысла нет: узнаватель строк
+#: приводит кроп к 48 пикселям по высоте, слишком мелкая картинка теряет цифры.
+MIN_DPI = 200
 
 #: Пояснение для окна и отчёта: чем распознаём.
 ENGINE_LABEL = "RapidOCR (локально, бесплатно)"
@@ -103,14 +109,14 @@ def _engine_or_raise() -> Any:
     return _engine
 
 
-def _cache_key(path: Path, first: int, last: int, dpi: int) -> str:
-    """Ключ кэша: файл, его время и размер, страницы и разрешение."""
+def _cache_key(path: Path, first: int, last: int, dpi: int, tile: int = 1) -> str:
+    """Ключ кэша: файл, его время и размер, страницы, разрешение и нарезка."""
     try:
         stat = path.stat()
         stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
     except OSError:
         stamp = "?"
-    raw = f"{path.resolve()}|{stamp}|{first}-{last}|{dpi}|{ENGINE_LABEL}"
+    raw = f"{path.resolve()}|{stamp}|{first}-{last}|{dpi}|{tile}|{ENGINE_LABEL}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -145,6 +151,41 @@ def clear_cache() -> int:
     return count
 
 
+def native_dpi(page: Any) -> float:
+    """
+    Какое разрешение реально лежит в странице (dpi встроенной картинки).
+
+    Скан ACRIS — это картинка внутри PDF: рендер выше её собственного разрешения
+    ничего не добавляет, только растягивает пиксели. Для векторной страницы
+    картинок нет — вернём 0 (рендерить можно с любым dpi).
+    """
+    try:
+        images = page.get_images(full=True)
+        width_in = float(page.rect.width) / 72.0
+        height_in = float(page.rect.height) / 72.0
+    except Exception:  # noqa: BLE001 - страница без картинок нам не мешает
+        return 0.0
+    best = 0.0
+    for image in images or []:
+        try:
+            width_px, height_px = int(image[2]), int(image[3])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if width_in <= 0 or height_in <= 0:
+            continue
+        best = max(best, width_px / width_in, height_px / height_in)
+    return best
+
+
+def page_render_dpi(page: Any, requested: int = DEFAULT_DPI) -> int:
+    """Сколько dpi имеет смысл рендерить: не выше встроенной картинки и не ниже MIN_DPI."""
+    native = native_dpi(page)
+    wanted = max(MIN_DPI, int(requested))
+    if native <= 0:
+        return wanted
+    return int(max(MIN_DPI, min(wanted, round(native))))
+
+
 def _lines_to_text(result: Any) -> str:
     """
     Строки OCR в текст сверху вниз.
@@ -171,6 +212,28 @@ def _lines_to_text(result: Any) -> str:
     return "\n".join(text for _y, _x, text in rows)
 
 
+def _page_tiles(page: Any, dpi: int, tile: int, folder: Path) -> list[Path]:
+    """Куски страницы в порядке чтения (слева направо, сверху вниз)."""
+    import pymupdf  # noqa: PLC0415 - уже зависимость программы
+
+    grid = max(1, int(tile))
+    rect = page.rect
+    paths: list[Path] = []
+    for row in range(grid):
+        for col in range(grid):
+            clip = pymupdf.Rect(
+                rect.x0 + rect.width * col / grid,
+                rect.y0 + rect.height * row / grid,
+                rect.x0 + rect.width * (col + 1) / grid,
+                rect.y0 + rect.height * (row + 1) / grid,
+            )
+            pixmap = page.get_pixmap(dpi=int(dpi), clip=clip)
+            out = folder / f"p{page.number + 1}_{row}{col}.png"
+            pixmap.save(str(out))
+            paths.append(out)
+    return paths
+
+
 def ocr_pdf_pages(
     path: str | Path,
     first: int,
@@ -179,18 +242,24 @@ def ocr_pdf_pages(
     dpi: int = DEFAULT_DPI,
     progress: Progress | None = None,
     use_cache: bool = True,
+    tile: int = 1,
 ) -> str:
     """
     Распознаёт страницы ``first``–``last`` PDF и возвращает их текст.
 
     Кэш по файлу и страницам: повторный запуск (правка подписей, второй проход)
     не тратит ни секунды. Ошибки движка и рендера — ``OcrError``/``OcrUnavailable``.
+
+    ``tile`` — на сколько кусков резать страницу перед распознаванием. Аналог
+    «600 dpi», но честный: мелкий шрифт становится крупнее для узнавателя, а
+    время растёт пропорционально числу кусков. Обычно 1; второй проход с 2×2
+    включается, только если страница не читается целиком.
     """
     pdf = Path(path)
     first, last = int(first), int(last)
     if first < 1 or last < first:
         raise OcrError(f"неверные страницы для распознавания: {first}–{last}")
-    key = _cache_key(pdf, first, last, int(dpi))
+    key = _cache_key(pdf, first, last, int(dpi), int(tile))
     if use_cache:
         cached = _read_cache(key)
         if cached is not None:
@@ -212,22 +281,30 @@ def ocr_pdf_pages(
         if last > total:
             last = total
         for page_no in range(first, last + 1):
+            page = doc.load_page(page_no - 1)
+            # Выше собственного разрешения картинки рендерить незачем: только пиксели растягиваем.
+            page_dpi = page_render_dpi(page, dpi)
             if progress:
-                progress(f"распознаю страницу {page_no} из {last} (OCR, локально)…")
-            try:
-                pixmap = doc.load_page(page_no - 1).get_pixmap(dpi=int(dpi))
-            except Exception as exc:  # noqa: BLE001
-                raise OcrError(f"страница {page_no} не рендерится: {exc}") from exc
+                where = "целиком" if int(tile) <= 1 else f"кусками {int(tile)}×{int(tile)}"
+                progress(
+                    f"распознаю страницу {page_no} из {last} (OCR, локально, {page_dpi} dpi, {where})…"
+                )
             with tempfile.TemporaryDirectory() as tmp:
-                image = Path(tmp) / f"page{page_no}.png"
                 try:
-                    pixmap.save(str(image))
-                    result, _elapsed = engine(str(image))
+                    images = _page_tiles(page, page_dpi, tile, Path(tmp))
                 except Exception as exc:  # noqa: BLE001
-                    raise OcrError(f"страница {page_no} не распознана: {exc}") from exc
-            text = _lines_to_text(result)
-            if text.strip():
-                parts.append(text)
+                    raise OcrError(f"страница {page_no} не рендерится: {exc}") from exc
+                page_parts: list[str] = []
+                for image in images:
+                    try:
+                        result, _elapsed = engine(str(image))
+                    except Exception as exc:  # noqa: BLE001
+                        raise OcrError(f"страница {page_no} не распознана: {exc}") from exc
+                    text = _lines_to_text(result)
+                    if text.strip():
+                        page_parts.append(text)
+            if page_parts:
+                parts.append("\n".join(page_parts))
     finally:
         doc.close()
     if not parts:

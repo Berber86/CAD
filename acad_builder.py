@@ -3198,6 +3198,78 @@ class AcadBuilder:
         mtext.Layer = layer
         return mtext
 
+    def _feature_label_text_mode(
+        self, item: FeatureLabelItem, fcfg: dict[str, Any] | None = None
+    ) -> str:
+        """
+        Чем создавать подпись объекта: ``"text"`` — однострочным TEXT, ``"mtext"`` — MText.
+
+        Настройка ``feature_labeling.label_text_kind``:
+
+        * ``"text"`` (по умолчанию) — все подписи объектов однострочным TEXT; подпись
+          из двух строк создаётся двумя TEXT друг под другом с тем же шагом, что у
+          MText. Так надписи не «пляшут» в чужих CAD (Carlson Survey), где MText с
+          привязкой middle-center встаёт по левой линии. Описание дома (свой слой и
+          стиль RDS) остаётся MText, как в шаблоне заказчика;
+        * ``"mtext"`` — всё MText (как было до 3.7);
+        * ``"auto"`` — прежнее правило: вдоль линии — TEXT, остальное — MText.
+
+        Выноска всегда идёт с MText: аннотацией объекта ``Leader`` может быть
+        только MText (TEXT к выноске AutoCAD не привязывает).
+        """
+        fcfg = fcfg if fcfg is not None else feature_settings(self.cfg)
+        mode = str(fcfg.get("label_text_kind") or "text").strip().lower()
+        if item.kind == "leader":
+            return "mtext"
+        if item.layer or item.style:
+            return "mtext"  # описание дома — как в шаблоне заказчика
+        if mode == "mtext":
+            return "mtext"
+        if mode == "auto":
+            return "text" if item.kind == "text" else "mtext"
+        if mode == "old":
+            return "text" if item.kind == "text" else "mtext"
+        return "text"
+
+    def _add_feature_texts(
+        self,
+        model_space: Any,
+        item: FeatureLabelItem,
+        layer: str,
+        style: str,
+        fcfg: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Создаёт подпись объекта однострочными TEXT, выровненными по центру.
+
+        Каждая строка — отдельный ``AcDbText`` с ``Alignment = acAlignmentMiddleCenter``
+        и ``TextAlignmentPoint`` в её центре: так надпись стоит по центру, а не по
+        левой линии, в любом CAD. Строки двухстрочной подписи разнесены на
+        ``mtext_line_spacing_factor`` высот — габарит тот же, что программа отводит
+        при раскладке. Возвращает число созданных объектов.
+        """
+        fcfg = fcfg if fcfg is not None else feature_settings(self.cfg)
+        lines = [line for line in item.text.split("\n") if line.strip()] or [item.single_line]
+        spacing = float(fcfg.get("mtext_line_spacing_factor") or 1.67) * float(item.height)
+        # «Вверх» повёрнутого текста: rotation отсчитывается от +X против часовой.
+        up = (-math.sin(float(item.rotation)), math.cos(float(item.rotation)))
+        offset = spacing * (len(lines) - 1) / 2.0
+        for index, line in enumerate(lines):
+            shift = offset - index * spacing
+            point = (
+                float(item.point[0]) + up[0] * shift,
+                float(item.point[1]) + up[1] * shift,
+            )
+            self._add_text(
+                model_space,
+                TextItem(
+                    text=line, point=point, rotation=float(item.rotation),
+                    kind="feature", height=float(item.height),
+                ),
+                float(item.height), layer, style,
+            )
+        return len(lines)
+
     def _add_leader(
         self,
         model_space: Any,
@@ -3515,16 +3587,10 @@ class AcadBuilder:
                 title = item.single_line
                 layer_name, style_name = item_layer(item), item_style(item)
                 try:
-                    if item.kind == "text":
-                        self._add_text(
-                            model_space,
-                            TextItem(
-                                text=item.text, point=item.point, rotation=item.rotation,
-                                kind="feature", height=item.height,
-                            ),
-                            item.height, layer_name, style_name,
+                    if self._feature_label_text_mode(item, fcfg) == "text":
+                        result.created_texts += self._add_feature_texts(
+                            model_space, item, layer_name, style_name, fcfg
                         )
-                        result.created_texts += 1
                     else:
                         mtext = self._add_mtext(model_space, item, layer_name, style_name)
                         result.created_mtexts += 1
@@ -3568,6 +3634,20 @@ class AcadBuilder:
             except Exception:  # noqa: BLE001 - перерисовка не критична
                 pass
         return result
+
+    def _plan_text_mode(self, plan: FeatureLabelPlan) -> str:
+        """
+        Чем создаются подписи плана: ``"text"`` — однострочным TEXT, ``"mtext"`` — MText.
+
+        Решает настройка ``label_text_kind``, а не разбор готовых подписей: описание
+        дома и выноски остаются MText и при режиме ``"text"``.
+        """
+        if not plan.items:
+            return ""
+        if not any(self._feature_label_text_mode(item) == "text" for item in plan.items):
+            return "mtext"
+        mode = str(feature_settings(self.cfg).get("label_text_kind") or "text").lower()
+        return "mtext" if mode == "mtext" else "text"
 
     @staticmethod
     def _fence_segments(snapshot: DrawingSnapshot) -> list[tuple[str, float]]:
@@ -3677,9 +3757,11 @@ class AcadBuilder:
                 result.linetype = fence_linetype_plan(
                     self._fence_segments(snapshot), self.cfg, scale=scale
                 )
+                result.text_mode = self._plan_text_mode(plan)
             else:
                 notify(f"Создаю подписи в слое {plan.output_layer}: {len(plan.items)} шт.…")
                 result = self.draw_feature_labels(app, doc, plan, mode=mode, scale=scale)
+                result.text_mode = result.text_mode or self._plan_text_mode(plan)
                 if hide_field_notes is None:
                     hide_field_notes = bool(fcfg.get("hide_field_notes_after_labeling", False))
                 if hide_field_notes and recognition.by_notes > 0:
@@ -5983,6 +6065,8 @@ class FeatureLabelResult:
     created_styles: list[str] = field(default_factory=list)
     #: масштаб типа линий заборов (LinetypeScale): что изменено или что будет
     linetype: FenceLinetypePlan | None = None
+    #: чем созданы подписи: "text" — однострочным TEXT, "mtext" — MText, "mixed" — и так, и так
+    text_mode: str = ""
 
     @property
     def recognition(self) -> RecognitionResult:
@@ -6104,6 +6188,12 @@ class FeatureLabelResult:
             lines.append(
                 f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
                 f"{self.created_mtexts}, выносок — {self.created_leaders}{how_leaders}"
+            )
+        if self.text_mode == "text":
+            lines.append(
+                "  подписи объектов — однострочный TEXT по центру (в чужих CAD не «пляшет», "
+                "как MText с привязкой middle-center); описание дома и текст выносок — MText, "
+                "как в шаблоне заказчика"
             )
         if rec.house_without_text:
             lines.append(

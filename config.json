@@ -954,6 +954,7 @@
     "leader_min_length_arrows": 2.1,
     "label_text_style": "ROMANS",
     "front_yard_depth_ft": 15.0,
+    "label_text_kind": "text",
     "linetype_scale_rules": {
       "S-FENCE": {
         "fixed": 5.0,

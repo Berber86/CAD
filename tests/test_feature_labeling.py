@@ -1545,7 +1545,8 @@ def test_label_features_draws_into_d_topo_text(com):
     assert result.layer == "D-TOPO-TEXT"
     assert result.failed == [] and result.warnings == []
     assert result.created_labels == 18
-    assert (result.created_texts, result.created_mtexts, result.created_leaders) == (5, 13, 0)
+    # С 3.7 подписи объектов — однострочный TEXT, MText только описание дома (слой 0).
+    assert (result.created_texts, result.created_mtexts, result.created_leaders) == (19, 1, 0)
     assert result.plan.text_height == pytest.approx(0.9)
     # Все подписи — в D-TOPO-TEXT; описание дома — в слое 0, как у заказчика.
     assert_house_label_on_layer_zero(space.created, result.plan.text_height)
@@ -1557,10 +1558,13 @@ def test_label_features_draws_into_d_topo_text(com):
 
     texts = [e for e in space.created if e.ObjectName == "AcDbText"]
     mtexts = [e for e in space.created if e.ObjectName == "AcDbMText"]
-    assert sorted(e.TextString for e in texts) == [
-        "C.L.F.", "CHAIN LINK FENCE", "GRASS", "VINYL FENCE", "WOOD FENCE",
+    assert sorted(set(e.TextString for e in texts)) == [
+        "C.L.F.", "CHAIN LINK FENCE", "CONC. WALK", "DECK", "DRIVEWAY", "FRAME", "GATE",
+        "GRASS", "O.P.", "PLANTER", "SHED", "STEPS", "VINYL FENCE", "WOOD FENCE",
     ]
+    # Каждый TEXT выровнен по центру (не по левой линии, как MText в чужих CAD).
     assert all(e.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for e in texts)
+    assert all(e.TextAlignmentPoint for e in texts)
     assert all(e.Height == pytest.approx(0.9) for e in texts + mtexts if e.Layer != "0")
     wood = next(e for e in texts if e.TextString == "WOOD FENCE")
     assert math.degrees(wood.Rotation) == pytest.approx(90.0)  # вертикальный текст — снизу вверх
@@ -1570,8 +1574,12 @@ def test_label_features_draws_into_d_topo_text(com):
     assert (house.Layer, house.Height) == ("0", pytest.approx(1.5, abs=0.01))
     assert house.InsertionPoint[:2] == pytest.approx([23.0, 46.0])
     assert house.Width == 0.0
-    assert {e.TextString for e in mtexts} >= {
-        "SHED", "FRAME\\PDECK", "O.P.", "STEPS", "DRIVEWAY", "CONC. WALK", "PLANTER", "C.L.F.\\PGATE",
+    assert [e.Layer for e in mtexts if e is not house] == []  # MText — только дом
+    # Двухстрочная подпись калитки — два TEXT друг под другом, а не один MText.
+    gates = [e for e in texts if e.TextString == "GATE"]
+    assert gates and all(e.Layer == "D-TOPO-TEXT" for e in gates)
+    assert {e.TextString for e in texts} >= {
+        "SHED", "FRAME", "DECK", "O.P.", "STEPS", "DRIVEWAY", "CONC. WALK", "PLANTER",
     }
     # Столбы, колодцы и LOW TIMBER EDGE заказчик не подписывает.
     created = {e.TextString for e in texts + mtexts}
@@ -1583,9 +1591,56 @@ def test_label_features_draws_into_d_topo_text(com):
     assert "ПОДПИСАНО: 18" in report
 
 
-def test_stafford_field_drawing_is_labeled_like_the_customer(com):
-    """Полевой чертёж «87 Stafford»: заметки полевика -> подписи заказчика в D-TOPO-TEXT."""
+def test_object_labels_are_single_line_text_centered_for_other_cad(com):
+    """
+    Подписи объектов — однострочный TEXT по центру (с 3.7).
+
+    В Carlson Survey и чужих версиях AutoCAD MText с привязкой middle-center встаёт
+    по левой линии и «разъезжается»; однострочный TEXT с Alignment = MiddleCenter
+    стоит на месте. Двухстрочная подпись (калитка) — два TEXT друг под другом с тем
+    же шагом, что у MText; описание дома остаётся MText, как в шаблоне заказчика.
+    """
     builder, _app, doc = com(build_stafford_scene())
+    result = builder.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
+    space = doc.ModelSpace
+    texts = [entity for entity in space.created if entity.ObjectName == "AcDbText"]
+    mtexts = [entity for entity in space.created if entity.ObjectName == "AcDbMText"]
+    assert result.text_mode == "text"
+    # MText остался только у описания дома (слой 0, крупный стиль RDS).
+    assert [(entity.Layer, entity.TextString) for entity in mtexts] == [
+        ("0", "1 STY\\PFRAME\\P(BRICK FACE)\\PW/BSMNT\\PNo. 87")
+    ]
+    # Каждый TEXT выровнен по центру и имеет точку выравнивания — не по левой линии.
+    assert all(entity.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for entity in texts)
+    assert all(entity.TextAlignmentPoint for entity in texts)
+    # Калитка «V.FE. / GATE»: две строки на расстоянии 1.67 высоты, верхняя — V.FE.
+    height = result.plan.text_height
+    vinyl = next(e for e in texts if e.TextString == "V.FE." and e.Rotation == 0.0)
+    gate = next(
+        e for e in texts
+        if e.TextString == "GATE" and abs(e.TextAlignmentPoint[0] - vinyl.TextAlignmentPoint[0]) < 1e-6
+    )
+    assert vinyl.TextAlignmentPoint[1] - gate.TextAlignmentPoint[1] == pytest.approx(1.67 * height)
+    # В отчёте сказано, чем созданы подписи.
+    assert "подписи объектов — однострочный TEXT по центру" in result.report()
+
+    # Прежнее поведение возвращается настройкой: вдоль линии — TEXT, остальное — MText.
+    legacy, _app2, doc2 = com(build_stafford_scene(), feature_cfg={"label_text_kind": "auto"})
+    old = legacy.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
+    assert old.text_mode == "text"  # в «auto» тоже есть TEXT — строка отчёта не врёт
+    assert old.created_mtexts > result.created_mtexts
+    assert "C.L.F.\\PGATE" in {e.TextString for e in doc2.ModelSpace.created
+                                 if e.ObjectName == "AcDbMText"}
+
+
+def test_stafford_field_drawing_is_labeled_like_the_customer(com):
+    """Полевой чертёж «87 Stafford»: заметки полевика -> подписи заказчика в D-TOPO-TEXT.
+
+    Здесь проверяется состав подписей, поэтому взят режим ``auto`` (как до 3.7):
+    двухстрочная подпись лежит одним MText и её текст сравнивается целиком. Вид
+    объектов по умолчанию (однострочный TEXT) проверяет следующий тест.
+    """
+    builder, _app, doc = com(build_stafford_scene(), feature_cfg={"label_text_kind": "auto"})
     result = builder.label_features(house_text=STAFFORD_HOUSE, scale=16.0)
     assert result.failed == [] and result.warnings == []
     rec = result.recognition

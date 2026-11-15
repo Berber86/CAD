@@ -2015,7 +2015,9 @@ def test_ilion_plan_has_no_overlaps_and_report_names_the_source():
     for expected in ("POOL AREA 349 Sq.Ft.", "SHED", "O.P.", "PLANTER", "DRIVEWAY", "STEP", "STEPS",
                      "VINYL FENCE", "C.L.F.", "V.FE.", "CANTIL.", "2 STY FRAME No. 12"):
         assert expected in texts, expected
-    assert len(plan.items) == 31
+    # 32-я подпись — STEPS внутри лестницы бассейна: её контур замкнут (стык линий
+    # сведён в общую точку), а замкнутый контур с описанием подписывается сам.
+    assert len(plan.items) == 32
     assert plan.count_placement("leader") <= 3
     assert plan.survey_point_count == 93
     boxes = [item.box for item in plan.items]
@@ -2607,7 +2609,7 @@ def test_front_yard_fence_is_the_owners_fence_labeled_from_the_street():
     (inside,) = [item for item in old.items if item.single_line == "IRON FENCE"]
     assert inside.box.centroid.y > 4924.9
     # Чертёж без красной линии: правило не действует, остальное не меняется.
-    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 31
+    assert len(make_plan(load_ilion(), house=ILION_HOUSE, height=0.9).items) == 32
 
 
 # ---------------------------------------------------------------------------
@@ -2633,13 +2635,13 @@ ASPINWALL_FINAL_LABELS = [
     ("V.FE.", "VIN.FE.", (915471.6, 122561.9), 0.0, 1.0),
     ("V.FE.", "VIN.FE.", (915532.8, 122496.6), 0.0, 2.5),   # у заказчика ещё GATE над линией
     ("V.FE.", "VIN.FE.", (915471.5, 122510.4), 0.0, 2.5),   # и здесь
-    ("WALL W./COLUMNS", "BRICK WALL W./COLUMNS", (915501.9, 122565.1), 0.0, 4.0),
+    ("WALL W./COLUMNS", "BRICK WALL W./COLUMNS", (915501.9, 122565.1), 0.0, 8.0),
     ("ROOFED O.P.", "ROOFED O.P.", (915502.8, 122491.8), 0.0, 3.0),
     ("O.P.", "O.P.", (915523.0, 122510.6), 0.0, 1.0),
     ("O.P.", "FRAME DECK", (915502.6, 122538.7), 0.0, 2.5),  # геодезист записал O PORCH
     ("PLANT.", "PLANT.", (915492.1, 122561.1), 0.0, 3.5),
     ("PLANT.", "PLANT.", (915523.3, 122553.3), 0.0, 7.0),
-    ("PLANT.", "PLANT.", (915507.9, 122487.7), 0.0, 1.5),
+    ("PLANT.", "PLANT.", (915507.9, 122487.7), 0.0, 3.5),
     ("PLANT.", "PLANT.", (915491.3, 122490.9), 0.0, 2.0),
     ("PLANT.", "PLANT.", (915485.7, 122491.5), 0.0, 8.5),
     ("STEPS", "FRAME STEPS", (915524.6, 122496.1), 0.0, 2.5),
@@ -2927,9 +2929,208 @@ def test_fixture_converter_expands_arcs_like_the_autocad_reader():
     try:
         stats = dump_to_fixture.convert(
             ROOT / "docs" / "for MLP 225 Aspinwall Street, Staten Island.dump.json", copy,
-            "225 Aspinwall Street, Staten Island",
+            "225 Aspinwall Street, Staten Island", digits=4,
         )
         assert copy.read_text(encoding="utf-8") == target.read_text(encoding="utf-8")
     finally:
         copy.unlink(missing_ok=True)
     assert dict(stats) == {"L": 241, "P": 170, "Q": 7, "B": 1, "T": 1, "H": 6}
+
+
+# ---------------------------------------------------------------------------
+# Стыки линий: настоящий чертёж не совпадает «точка в точку» (версия 2.9)
+# ---------------------------------------------------------------------------
+
+def snapped(*lines):
+    snap = DrawingSnapshot()
+    for layer, points in lines:
+        snap.lines.append(DrawingLine(layer=layer, points=tuple(points)))
+    moved = fl.snap_snapshot_vertices(snap, {})
+    return snap, moved
+
+
+def test_line_ends_closer_than_the_tolerance_become_one_point():
+    snap, moved = snapped(
+        ("S-FENCE", [(0.0, 0.0), (10.0, 0.0)]),
+        ("S-FENCE", [(10.00003, 0.00002), (10.0, 8.0)]),
+        ("S-FENCE", [(10.0, 8.01), (0.0, 8.0)]),       # 0.01 ft — уже не «тот же» конец
+    )
+    assert moved == 1 and snap.vertices_snapped == 1
+    assert snap.lines[1].points[0] == (10.0, 0.0)
+    assert snap.lines[2].points[0] == (10.0, 8.01)
+    assert len(fl.merge_lines([fl.line_to_shapely(line) for line in snap.lines], 0.0)) == 2
+    # Повторный вызов ничего не меняет; допуск 0 выключает стягивание.
+    assert fl.snap_snapshot_vertices(snap, {}) == 0
+    raw = DrawingSnapshot(lines=[DrawingLine("S-FENCE", ((0.0, 0.0), (1.0, 0.0))),
+                                 DrawingLine("S-FENCE", ((1.00001, 0.0), (2.0, 0.0)))])
+    assert fl.snap_snapshot_vertices(raw, {"feature_labeling": {"vertex_snap_tolerance_ft": 0}}) == 0
+    assert raw.lines[1].points[0] == (1.00001, 0.0)
+
+
+def test_line_end_that_stops_short_of_another_line_gets_a_common_point():
+    """Т-образный стык: конец не дошёл до линии на 0.00005 ft — как у стенки клумбы в Aspinwall."""
+    snap, moved = snapped(
+        ("ST-MISC", [(0.0, 0.0), (10.0, 0.0)]),
+        ("ST-MISC", [(4.0, 0.00005), (4.0, 3.0)]),
+        ("ST-MISC", [(6.0, -0.00004), (6.0, 3.0)]),
+        ("ST-MISC", [(4.0, 3.0), (6.0, 3.0)]),
+    )
+    assert moved == 2
+    assert snap.lines[0].points == ((0.0, 0.0), (4.0, 0.0), (6.0, 0.0), (10.0, 0.0))  # прямая осталась прямой
+    assert snap.lines[1].points[0] == (4.0, 0.0) and snap.lines[2].points[0] == (6.0, 0.0)
+    faces = fl._polygonize([fl.line_to_shapely(line) for line in snap.lines])
+    assert len(faces) == 1 and faces[0].area == pytest.approx(6.0)
+    # Без стягивания контур не замыкается.
+    loose = [LineString(points) for points in (
+        [(0.0, 0.0), (10.0, 0.0)], [(4.0, 0.00005), (4.0, 3.0)], [(6.0, -0.00004), (6.0, 3.0)],
+        [(4.0, 3.0), (6.0, 3.0)],
+    )]
+    assert fl._polygonize(loose) == []
+
+
+def test_lot_corners_stay_where_the_surveyor_put_them():
+    """Точки границы участка не сдвигаются: к ним подтягиваются остальные линии."""
+    snap, _moved = snapped(
+        ("S-FENCE", [(0.003, 0.002), (0.0, 50.0)]),            # начерчен раньше границы
+        ("M-PROPERTY", [(0.0, 0.0), (40.0, 0.0)]),
+        ("M-PROPERTY", [(40.0, 0.0), (40.0, 100.0), (0.0, 100.0), (0.0, 0.0)]),
+        ("ST-MISC", [(20.0, 0.004), (20.0, 5.0)]),              # упирается в границу
+        ("M-PROPERTY", [(40.0, 60.0), (39.997, 60.0)]),         # точка границы у чужой линии
+        ("S-FENCE", [(39.999, 55.0), (39.999, 65.0)]),
+    )
+    by_layer = {}
+    for line in snap.lines:
+        by_layer.setdefault(line.layer, []).append(line.points)
+    assert by_layer["S-FENCE"][0][0] == (0.0, 0.0)
+    assert by_layer["ST-MISC"][0][0] == (20.0, 0.0)
+    assert by_layer["M-PROPERTY"][0] == ((0.0, 0.0), (20.0, 0.0), (40.0, 0.0))
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.area_sqft == pytest.approx(4000.0, abs=1e-6)
+    assert boundary.vertex_count == 4       # точки примыкания на прямой стороне — не углы
+
+
+def test_fence_is_not_cut_where_another_fence_joins_it():
+    """Забор, к которому сбоку примыкает возврат, остаётся одной линией (Aspinwall: 118.4 ft)."""
+    lines = [
+        LineString([(0.0, 0.0), (30.0, 0.0)]), LineString([(30.0, 0.0), (60.0, 0.5)]),
+        LineString([(30.0, 0.0), (30.0, -6.0)]),
+    ]
+    assert sorted(round(line.length, 1) for line in fl.merge_lines(lines, 0.0)) == [6.0, 30.0, 30.0]
+    through = fl.merge_lines(lines, 0.0, through_turn_deg=20.0)
+    assert sorted(round(line.length, 1) for line in through) == [6.0, 60.0]
+    # Угол забора (поворот 90°) с примыкающим третьим забором — три отдельные линии.
+    corner = [
+        LineString([(0.0, 0.0), (30.0, 0.0)]), LineString([(30.0, 0.0), (30.0, 20.0)]),
+        LineString([(30.0, 0.0), (45.0, -15.0)]),
+    ]
+    assert len(fl.merge_lines(corner, 0.0, through_turn_deg=20.0)) == 3
+    # Перекрёсток: обе линии проходят насквозь.
+    cross = [LineString([(0.0, 0.0), (10.0, 0.0)]), LineString([(5.0, -5.0), (5.0, 5.0)])]
+    assert sorted(round(line.length, 1) for line in fl.merge_lines(cross, 0.0, through_turn_deg=20.0)) == [10.0, 10.0]
+
+
+def test_stair_drawn_as_a_comb_is_one_object_even_when_a_cell_closes():
+    """
+    Лестница снята «гребёнкой»: проступи упираются в боковую линию. Замкнулась
+    только средняя ячейка — она не отдельный объект, а часть той же лестницы.
+    """
+    snap = DrawingSnapshot()
+    for points in (
+        [(0.0, 0.0), (40.0, 0.0), (40.0, 100.0), (0.0, 100.0), (0.0, 0.0)],
+    ):
+        snap.lines.append(DrawingLine("M-PROPERTY", tuple(points)))
+    snap.lines.append(DrawingLine("ST-BLDG-LINE", ((5.0, 30.0), (35.0, 30.0), (35.0, 70.0), (5.0, 70.0)), closed=True))
+    for points in (
+        [(10.0, 29.0), (16.0, 29.0)], [(10.0, 28.0), (16.0, 28.0)], [(10.0, 27.0), (16.0, 27.0)],
+        [(10.0, 26.0), (16.0, 26.0)],
+        [(16.0, 30.0), (16.0, 26.0)],            # правая боковая — целиком
+        [(10.0, 29.0), (10.0, 28.0)],            # левая — только у средней ячейки
+    ):
+        snap.lines.append(DrawingLine("ST-STEP", tuple(points)))
+    for number, point in (("1", (10.0, 26.0)), ("2", (16.0, 26.0))):
+        snap.survey_points.append(
+            fl.SurveyPoint(layer="ST-STEP", number=number, description="STEP", point=point,
+                           elevation="100.00", block="srvpno3")
+        )
+    result = recognize(snap, house="2 STY")
+    steps = [f for f in result.features if f.category == "steps"]
+    assert len(steps) == 1, [(f.kind, f.label, f.geometry.bounds) for f in steps]
+    assert steps[0].kind == "area" and steps[0].flat_label == "STEPS"
+    assert steps[0].geometry.bounds == pytest.approx((10.0, 26.0, 16.0, 30.0))
+    assert sorted(code.number for code in steps[0].codes) == ["1", "2"]
+
+
+def noisy_aspinwall(seed, amplitude=5e-5):
+    """Чертёж с координатами, сдвинутыми в пятом знаке, — как их хранит AutoCAD."""
+    import random
+
+    randomizer = random.Random(seed)
+    snap = load_aspinwall()
+    snap.lines[:] = [
+        DrawingLine(
+            layer=line.layer, closed=line.closed,
+            points=tuple(
+                (x + randomizer.uniform(-amplitude, amplitude), y + randomizer.uniform(-amplitude, amplitude))
+                for x, y in line.points
+            ),
+        )
+        for line in snap.lines
+    ]
+    return snap
+
+
+def plan_signature(plan):
+    return sorted(
+        (item.single_line, item.placement, round(item.box.centroid.x), round(item.box.centroid.y))
+        for item in plan.items
+    )
+
+
+def test_result_does_not_depend_on_the_last_digits_of_coordinates():
+    """
+    Запуск 2.8 в AutoCAD дал PLANTER посреди газона и разорванный забор: в дампе
+    координаты округлены до 4-го знака, в чертеже концы линий расходятся в 5-м.
+    Теперь сдвиг в 5-м знаке результата не меняет.
+    """
+    expected = plan_signature(aspinwall_plan())
+    for seed in range(4):
+        plan = make_plan(noisy_aspinwall(seed), house=ASPINWALL_HOUSE, height=0.9)
+        assert plan_signature(plan) == expected, seed
+        assert plan.warnings == [] and plan.recognition.unlabeled == []
+    # Со стягиванием, выключенным в настройках, тот же чертёж даёт то, что вышло в AutoCAD.
+    off = {"feature_labeling": {"vertex_snap_tolerance_ft": 0}}
+    broken = [
+        make_plan(noisy_aspinwall(seed), house=ASPINWALL_HOUSE, height=0.9, cfg=off) for seed in range(4)
+    ]
+    assert any(plan_signature(plan) != expected for plan in broken)
+    assert any("PLANTER" in [item.single_line for item in plan.items] for plan in broken)
+
+
+def test_report_counts_the_joined_line_ends():
+    plan = aspinwall_plan()
+    assert plan.junctions_snapped > 0 and plan.junction_tolerance == pytest.approx(0.005)
+    report = ab.FeatureLabelResult(plan=plan, layer=plan.output_layer, dry_run=True).report()
+    assert f"Стыки линий: {plan.junctions_snapped} сведено в общие точки" in report
+    assert "меньше чем на 0.005 ft" in report
+    # В чертеже с точными стыками строки нет.
+    clean = make_plan(build_scene(0.0))
+    if not clean.junctions_snapped:
+        assert "Стыки линий" not in ab.FeatureLabelResult(
+            plan=clean, layer=clean.output_layer, dry_run=True
+        ).report()
+
+
+def test_gate_is_never_guessed_from_a_short_fence_return():
+    """
+    Ответ заказчика: калитку снимают как обычный забор, GATE в точках съёмки нет —
+    её определяют по эскизу, фото или street view. Без явной команды GATE не ставится.
+    """
+    plan = aspinwall_plan()
+    assert not any("GATE" in item.single_line for item in plan.items)
+    assert not any(feature.category == "gate" for feature in plan.recognition.features)
+    # Возвраты забора от дома к боковой линии (у заказчика VIN.FE. / GATE) — просто V.FE.
+    short = [item for item in plan.items if item.single_line == "V.FE." and item.feature.geometry.length < 8.0]
+    assert len(short) >= 2
+    # Явная команда — полевая заметка или слой калиток — работает как раньше.
+    gates = [item for item in stafford_plan().items if "GATE" in item.single_line]
+    assert gates and all(item.feature.category == "gate" for item in gates)

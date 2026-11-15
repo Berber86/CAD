@@ -61,7 +61,7 @@ def put(ax, fig, x, y, text, height, rot, color="black"):
     p0, p1 = ax.transData.transform((0, 0)), ax.transData.transform((0, height))
     points = (p1[1] - p0[1]) * 72.0 / fig.dpi / 0.72
     ax.text(x, y, text, fontsize=points, rotation=rot, rotation_mode="anchor", ha="center",
-            va="center", color=color, family="DejaVu Sans Mono", linespacing=1.25)
+            va="center", color=color, family="DejaVu Sans Mono", linespacing=1.25, clip_on=True)
 
 
 def draw_north(ax, point, north_deg):

@@ -6,6 +6,8 @@
 
     python tests/dump_to_fixture.py "docs/for MLP 6910 15th Avenue, Brooklyn.dump.json" \
         tests/data/brooklyn_field.txt "6910 15th Avenue, Brooklyn"
+    python tests/dump_to_fixture.py "docs/for MLP 225 Aspinwall Street, Staten Island.dump.json" \
+        tests/data/aspinwall_field.txt "225 Aspinwall Street, Staten Island" 4
 """
 
 from __future__ import annotations
@@ -53,7 +55,13 @@ def polyline_points(points, bulges, closed):
     return path
 
 
-def convert(source: Path, target: Path, title: str) -> Counter:
+def convert(source: Path, target: Path, title: str, digits: int = 2) -> Counter:
+    """
+    ``digits`` — знаков после запятой у координат линий и точек. Двух знаков
+    хватает, чтобы узнать объекты; четыре (точность дампа) сохраняют стыки линий
+    такими, какими их видит программа в AutoCAD: конец отрезка, не дошедший до
+    соседней линии на 0.00005 ft, после округления до сотых «уезжает» на 0.005 ft.
+    """
     dump = json.loads(source.read_text(encoding="utf-8"))
     rows: list[str] = []
     stats: Counter = Counter()
@@ -65,18 +73,18 @@ def convert(source: Path, target: Path, title: str) -> Counter:
             bulges = [float(value) for value in (entity.get("bulges") or [])]
             path = polyline_points(points, bulges, bool(entity.get("closed")))
             for (x0, y0), (x1, y1) in zip(path, path[1:]):
-                rows.append(f"L {layer} {x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}")
+                rows.append(f"L {layer} {x0:.{digits}f} {y0:.{digits}f} {x1:.{digits}f} {y1:.{digits}f}")
                 stats["L"] += 1
         elif kind == "Arc" and entity.get("center"):
             path = arc_points(entity["center"], entity["radius"], entity["start_deg"], entity["end_deg"])
             for (x0, y0), (x1, y1) in zip(path, path[1:]):
-                rows.append(f"L {layer} {x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}")
+                rows.append(f"L {layer} {x0:.{digits}f} {y0:.{digits}f} {x1:.{digits}f} {y1:.{digits}f}")
                 stats["L"] += 1
         elif kind == "BlockReference":
             x, y = entity["pt"][0], entity["pt"][1]
             attributes = {a["tag"]: str(a.get("text", "")).strip() for a in entity.get("attributes", [])}
             if attributes.get("DESC2"):
-                rows.append(f"P {layer} {attributes.get('PT#', '?')} {x:.2f} {y:.2f} | {attributes['DESC2']}")
+                rows.append(f"P {layer} {attributes.get('PT#', '?')} {x:.{digits}f} {y:.{digits}f} | {attributes['DESC2']}")
                 stats["P"] += 1
             elif attributes:
                 rows.append(f"Q {attributes.get('PT#', '?')} {x:.2f} {y:.2f}")
@@ -98,6 +106,8 @@ def convert(source: Path, target: Path, title: str) -> Counter:
         else:
             skipped[f"{kind} в слое {layer}"] += 1
     header = HEADER.format(title=title, count=len(dump["entities"]))
+    if digits != 2:
+        header = header.replace("футы, 2 знака", f"футы, {digits} знака")
     for name, count in sorted(skipped.items()):
         header += f"# В запись не вошли: {name} — {count}\n"
     target.write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
@@ -105,6 +115,9 @@ def convert(source: Path, target: Path, title: str) -> Counter:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
-    print(dict(convert(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3])))
+    print(dict(convert(
+        Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3],
+        digits=int(sys.argv[4]) if len(sys.argv) == 5 else 2,
+    )))

@@ -5595,6 +5595,9 @@ class FeatureLabelPlan:
     width_scale: float = 1.0
     #: точек съёмки с описанием (блоки с атрибутами)
     survey_point_count: int = 0
+    #: стыков линий, сведённых в общую точку, и допуск (``vertex_snap_tolerance_ft``)
+    junctions_snapped: int = 0
+    junction_tolerance: float = 0.0
     #: как читается вертикальный текст ("up" / "down") и откуда это взято
     vertical_reads: str = "up"
     vertical_reads_note: str = ""
@@ -5688,6 +5691,12 @@ class FeatureLabelResult:
             f"Точек съёмки с описанием в атрибутах блоков: {plan.survey_point_count}",
             f"Версия Шага 2: {STEP2_VERSION}",
         ]
+        if plan.junctions_snapped:
+            lines.insert(
+                -2,
+                f"Стыки линий: {plan.junctions_snapped} сведено в общие точки "
+                f"(концы расходились меньше чем на {plan.junction_tolerance:g} ft)",
+            )
         if plan.vertical_reads_note:
             lines.append("Направление текста: " + plan.vertical_reads_note)
         if self.text_style:
@@ -7282,6 +7291,8 @@ def plan_feature_labels(
         text_count=len(snapshot.texts),
         width_scale=placer.width_scale,
         survey_point_count=len(snapshot.survey_points),
+        junctions_snapped=int(getattr(snapshot, "vertices_snapped", 0) or 0),
+        junction_tolerance=float(getattr(snapshot, "vertex_snap_ft", 0.0) or 0.0),
         vertical_reads=placer.reads,
         vertical_reads_note=placer.reads_note,
     )

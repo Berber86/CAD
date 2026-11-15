@@ -37,7 +37,7 @@ from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
 try:
-    from shapely.geometry import LineString, Point, Polygon
+    from shapely.geometry import LineString, Point, Polygon, box as shapely_box
     from shapely.geometry.base import BaseGeometry
     from shapely.ops import linemerge, polygonize, polygonize_full, substring, unary_union
     from shapely.strtree import STRtree
@@ -389,6 +389,10 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "boundary_snap_tolerance_ft": 0.05,
     "boundary_gap_tolerance_ft": 2.0,
     "merge_tolerance_ft": 0.05,
+    # Стыки линий: вершины ближе этого допуска друг к другу считаются одной точкой, а
+    # вершина ближе допуска к чужому отрезку — лежащей на нём. В AutoCAD концы соседних
+    # отрезков расходятся в 5–8-м знаке после запятой — без этого объект рвётся на куски.
+    "vertex_snap_tolerance_ft": 0.005,
     "min_feature_length_ft": 0.5,
     "min_area_width_ft": 0.75,
     "edge_pair_max_gap_ft": 12.0,
@@ -931,7 +935,7 @@ class NorthArrow:
 
 #: Версия правил Шага 2: печатается в отчёте, чтобы было видно, какая сборка
 #: программы работала (описания точек из атрибутов блоков читаются с 2.2).
-STEP2_VERSION = "2.8 (2026-11-15)"
+STEP2_VERSION = "2.9 (2026-11-15)"
 
 
 @dataclass
@@ -950,6 +954,9 @@ class DrawingSnapshot:
     #: блоки с атрибутами, в которых не нашлось описания точки, и их теги
     blocks_without_description: int = 0
     block_tags: dict[str, int] = field(default_factory=dict)
+    #: допуск, с которым вершины линий уже стянуты (``snap_snapshot_vertices``), и их число
+    vertex_snap_ft: float = 0.0
+    vertices_snapped: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1244,144 @@ def snap_endpoints(lines: Sequence[LineString], tolerance: float) -> list[LineSt
     return result
 
 
+def snap_snapshot_vertices(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = None) -> int:
+    """
+    Сводит стыки линий чертежа в общие точки (допуск ``vertex_snap_tolerance_ft``)
+    и возвращает число исправленных стыков.
+
+    В настоящем чертеже конец отрезка совпадает с концом соседнего или лежит на
+    соседней линии не «точка в точку», а с точностью до 5–8-го знака. Для
+    ``linemerge`` / ``polygonize`` это не стык: забор или стенка клумбы
+    распадаются на куски, а результат зависит от последних знаков координат.
+
+    1. Вершины ближе допуска друг к другу становятся одной точкой.
+    2. Вершина, лежащая на чужом отрезке (ближе допуска, но не у его концов),
+       переносится на этот отрезок и добавляется в него: Т-образный стык
+       получает общую точку, отрезок остаётся прямым.
+
+    Вершины границы участка (``property_line_layers``, ``property_closing_layers``)
+    не сдвигаются: к ним подтягиваются остальные линии. Линии снимка заменяются
+    на месте; повторный вызов ничего не меняет.
+    """
+    fcfg = feature_settings(cfg)
+    tolerance = float(fcfg.get("vertex_snap_tolerance_ft") or 0.0)
+    if tolerance <= 0.0 or snapshot.vertex_snap_ft >= tolerance:
+        return 0
+    classifier = LayerClassifier(fcfg)
+    closing_layers = _as_patterns(fcfg.get("property_closing_layers"))
+
+    def is_fixed(layer: str) -> bool:
+        return classifier.is_property(layer) or layer_matches(layer, closing_layers)
+
+    grid: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    moved = 0
+
+    def snap(point: tuple[float, float]) -> tuple[float, float]:
+        nonlocal moved
+        gx, gy = math.floor(point[0] / tolerance), math.floor(point[1] / tolerance)
+        best: tuple[float, float] | None = None
+        best_distance = tolerance
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for anchor in grid.get((gx + dx, gy + dy), ()):
+                    distance = math.hypot(anchor[0] - point[0], anchor[1] - point[1])
+                    if distance <= best_distance:
+                        best, best_distance = anchor, distance
+        if best is None:
+            grid.setdefault((gx, gy), []).append(point)
+            return point
+        if best != point:
+            moved += 1
+        return best
+
+    # --- 1. общие вершины (сначала граница участка: её точки — опорные) --------------
+    fixed_flags = [is_fixed(line.layer) for line in snapshot.lines]
+    order = sorted(range(len(snapshot.lines)), key=lambda index: (not fixed_flags[index], index))
+    snapped: dict[int, list[tuple[float, float]]] = {}
+    fixed_points: set[tuple[float, float]] = set()
+    for index in order:
+        line = snapshot.lines[index]
+        points: list[tuple[float, float]] = []
+        for x, y, *_rest in line.points:
+            point = snap((float(x), float(y)))
+            if not points or point != points[-1]:
+                points.append(point)
+        if line.closed and len(points) > 2 and points[0] == points[-1]:
+            points.pop()
+        if len(points) < 2:
+            continue  # отрезок короче допуска: линии здесь нет
+        snapped[index] = points
+        if fixed_flags[index]:
+            fixed_points.update(points)
+
+    # --- 2. Т-образные стыки ----------------------------------------------------
+    segments: list[tuple[int, int, tuple[float, float], tuple[float, float]]] = []
+    for index, points in snapped.items():
+        closed = snapshot.lines[index].closed and len(points) > 2
+        for position in range(len(points) if closed else len(points) - 1):
+            segments.append((index, position, points[position], points[(position + 1) % len(points)]))
+    inserts: dict[tuple[int, int], list[tuple[float, tuple[float, float]]]] = {}
+    relocated: dict[tuple[float, float], tuple[float, float]] = {}
+    if segments:
+        tree = STRtree([LineString([start, end]) for _line, _position, start, end in segments])
+        for vertex in sorted(point for anchors in grid.values() for point in anchors):
+            area = shapely_box(
+                vertex[0] - tolerance, vertex[1] - tolerance,
+                vertex[0] + tolerance, vertex[1] + tolerance,
+            )
+            best_hit: tuple[float, int, float, tuple[float, float]] | None = None
+            for found in sorted(int(value) for value in tree.query(area)):
+                _line, _position, start, end = segments[found]
+                if vertex == start or vertex == end:
+                    continue
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                length_sq = dx * dx + dy * dy
+                if length_sq <= 0.0:
+                    continue
+                along = ((vertex[0] - start[0]) * dx + (vertex[1] - start[1]) * dy) / length_sq
+                if not 0.0 < along < 1.0:
+                    continue
+                foot = (start[0] + along * dx, start[1] + along * dy)
+                offset = math.hypot(foot[0] - vertex[0], foot[1] - vertex[1])
+                if offset > tolerance:
+                    continue
+                # Вершина ложится на все отрезки, рядом с которыми она стоит (например,
+                # на две линии, начерченные одна поверх другой); переносится — на ближайший.
+                inserts.setdefault((segments[found][0], segments[found][1]), []).append((along, vertex))
+                if best_hit is None or offset < best_hit[0]:
+                    best_hit = (offset, found, along, foot)
+            if best_hit is None:
+                continue
+            target_fixed = fixed_flags[segments[best_hit[1]][0]]
+            if vertex in fixed_points and not target_fixed:
+                continue  # точка границы участка остаётся на месте: изгибается чужая линия
+            relocated[vertex] = best_hit[3]
+
+    lines: list[DrawingLine] = []
+    for index, line in enumerate(snapshot.lines):
+        points = snapped.get(index)
+        if points is None:
+            continue
+        joined: list[tuple[float, float]] = []
+        for position, point in enumerate(points):
+            for candidate in [point] + [
+                vertex for _along, vertex in sorted(set(inserts.get((index, position), ())))
+            ]:
+                candidate = relocated.get(candidate, candidate)
+                if not joined or candidate != joined[-1]:
+                    joined.append(candidate)
+        if line.closed and len(joined) > 2 and joined[0] == joined[-1]:
+            joined.pop()
+        if len(joined) < 2:
+            continue
+        lines.append(line if tuple(joined) == tuple(line.points) else replace(line, points=tuple(joined)))
+    moved += sum(len(found) for found in inserts.values())
+    snapshot.lines[:] = lines
+    snapshot.vertex_snap_ft = tolerance
+    snapshot.vertices_snapped += moved
+    return moved
+
+
 def _noded(lines: Sequence[LineString]) -> list[LineString]:
     """Разрезает линии во всех взаимных пересечениях и убирает дубликаты."""
     if not lines:
@@ -1244,19 +1389,78 @@ def _noded(lines: Sequence[LineString]) -> list[LineString]:
     return _line_parts(unary_union(list(lines)))
 
 
-def merge_lines(lines: Sequence[LineString], tolerance: float) -> list[LineString]:
+def merge_lines(
+    lines: Sequence[LineString], tolerance: float, through_turn_deg: float = 0.0
+) -> list[LineString]:
     """
     Объединяет смежные сегменты в цельные ломаные (``shapely.ops.linemerge``).
 
     Сегменты одного забора, начерченные отдельными отрезками, становятся одной
-    линией; в тройных стыках линии остаются раздельными.
+    линией; в тройных стыках линии остаются раздельными. Если задан
+    ``through_turn_deg``, в стыке трёх и более линий две, идущие «напрямую»
+    (поворот не больше этого угла), остаются одной линией: забор, к которому
+    сбоку примыкает другой, не рвётся в месте примыкания.
     """
     noded = _noded(snap_endpoints(lines, tolerance))
     if not noded:
         return []
     if len(noded) == 1:
         return list(noded)
+    if through_turn_deg > 0.0:
+        noded = _join_through(noded, through_turn_deg)
+        if len(noded) == 1:
+            return list(noded)
     return _line_parts(linemerge(noded))
+
+
+def _join_through(noded: Sequence[LineString], max_turn_deg: float) -> list[LineString]:
+    """
+    В узлах, где сходятся три и более линий, соединяет пары, продолжающие друг
+    друга (поворот не больше ``max_turn_deg``; сначала самые прямые пары).
+    """
+    pieces: list[list[tuple[float, float]] | None] = []
+    for line in noded:
+        coords = [(float(x), float(y)) for x, y, *_rest in line.coords]
+        pieces.append(coords if len(coords) >= 2 else None)
+    limit = math.cos(math.radians(max_turn_deg))
+    while True:
+        nodes: dict[tuple[float, float], list[tuple[int, bool]]] = {}
+        for index, coords in enumerate(pieces):
+            if coords is None or coords[0] == coords[-1]:
+                continue  # замкнутое кольцо в стыках не участвует
+            nodes.setdefault(coords[0], []).append((index, True))
+            nodes.setdefault(coords[-1], []).append((index, False))
+        best: tuple[float, int, bool, int, bool] | None = None
+        for node in sorted(nodes):
+            ends = nodes[node]
+            if len(ends) < 3:
+                continue
+            directions = []
+            for index, at_start in ends:
+                coords = pieces[index]
+                inner = coords[1] if at_start else coords[-2]
+                length = math.hypot(inner[0] - node[0], inner[1] - node[1])
+                directions.append(
+                    ((inner[0] - node[0]) / length, (inner[1] - node[1]) / length) if length > 0.0 else None
+                )
+            for first in range(len(ends)):
+                for second in range(first + 1, len(ends)):
+                    if ends[first][0] == ends[second][0]:
+                        continue
+                    a, b = directions[first], directions[second]
+                    if a is None or b is None:
+                        continue
+                    straight = -(a[0] * b[0] + a[1] * b[1])  # 1.0 — точно напрямую
+                    if straight >= limit and (best is None or straight > best[0] + 1e-12):
+                        best = (straight, ends[first][0], ends[first][1], ends[second][0], ends[second][1])
+        if best is None:
+            break
+        _straight, first, first_at_start, second, second_at_start = best
+        head = pieces[first] if not first_at_start else list(reversed(pieces[first]))
+        tail = pieces[second] if second_at_start else list(reversed(pieces[second]))
+        pieces[first] = head + tail[1:]
+        pieces[second] = None
+    return [LineString(coords) for coords in pieces if coords is not None]
 
 
 def _dangling_nodes(noded: Sequence[LineString]) -> list[tuple[float, float]]:
@@ -1398,7 +1602,11 @@ class PropertyBoundary:
 
     @property
     def vertex_count(self) -> int:
-        return max(0, len(self.polygon.exterior.coords) - 1)
+        """Число углов участка: точки примыкания чужих линий на прямой стороне не считаются."""
+        corners = self.polygon.simplify(0.001)
+        if corners.geom_type != "Polygon" or corners.is_empty:
+            corners = self.polygon
+        return max(0, len(corners.exterior.coords) - 1)
 
 
 def _normalize_polygon(polygon: Polygon | None) -> Polygon | None:
@@ -1492,6 +1700,7 @@ def find_property_polygon(
     всего снятых бригадой заборов и строений.
     """
     fcfg = feature_settings(cfg)
+    snap_snapshot_vertices(snapshot, cfg)
     classifier = LayerClassifier(fcfg)
     by_rank: dict[int, dict[str, list[LineString]]] = {}
     closing_layers = _as_patterns(fcfg.get("property_closing_layers"))
@@ -1633,6 +1842,7 @@ def property_polygon_from_selection(
     же слоёв и слоёв границы участка.
     """
     fcfg = feature_settings(cfg)
+    snap_snapshot_vertices(snapshot, cfg)
     classifier = LayerClassifier(fcfg)
     picked = [geom for geom in (line_to_shapely(line) for line in selected) if geom is not None]
     if not picked:
@@ -2275,7 +2485,9 @@ def _apply_field_notes(
                 if distance > radius:
                     continue
                 size = feature.geometry.area if feature.kind == "area" else feature.geometry.length
-                key = (round(distance, 2), size, index)
+                # Размер — с точностью до 0.1: выбор между двумя одинаковыми заборами не
+                # должен зависеть от тысячных долей фута.
+                key = (round(distance, 2), round(size, 1), index)
                 if best is None or key < best[0]:
                     best = (key, index)
             if target == GROUND_TARGET:
@@ -2481,6 +2693,9 @@ def _shape_from_open_lines(lines: Sequence[LineString], min_width: float) -> Pol
     candidate: Polygon | None = None
     if len(merged) == 1:
         coords = _clean_coords(merged[0].coords)
+        corner = _clean_coords(merged[0].simplify(0.05).coords)
+        if len(corner) == 3:
+            coords = corner
         if len(coords) == 3 and _corner_angle_deg(*coords) >= 45.0:
             (ax, ay), (bx, by), (cx, cy) = coords
             coords = [coords[0], coords[1], coords[2], (ax + cx - bx, ay + cy - by)]
@@ -2623,11 +2838,55 @@ def _extract_layer_shapes(
         if loose is not None:
             loose.extend(missed)
 
+    # --- контур — часть объекта, начерченного незамкнутыми линиями -----------------
+    # Лестница снята «гребёнкой»: проступи примыкают к боковой линии, а замкнута
+    # только случайная ячейка между двумя проступями. Ячейка без своего описания
+    # (или с тем же описанием), к которой примыкают незамкнутые линии с описанием, —
+    # не отдельный объект, а часть той же лестницы.
+    owner: dict[int, int] = {}
+    links: list[tuple[int, int]] = []
+    if group_codes and faces and not linear:
+        group_label = {
+            index: str(_majority_first(found)[0].label or "") for index, found in group_codes.items()
+        }
+        face_label = {
+            index: str(_majority_first(found)[0].label or "") for index, found in face_codes.items()
+        }
+        for group_index in sorted(group_codes):
+            label = group_label[group_index]
+            if not label:
+                continue
+            for index, face in enumerate(faces):
+                if group_geoms[group_index].distance(face) > reach:
+                    continue
+                if index in face_label and face_label[index] != label:
+                    continue
+                if index not in owner:
+                    owner[index] = group_index
+                elif group_label[owner[index]] == label:
+                    links.append((owner[index], group_index))
+        # Соседние ячейки без описания (следующие проступи) — тоже её части, если
+        # они не примыкают к контуру другого описанного объекта.
+        others = [faces[index] for index in face_codes if index not in owner]
+        frontier = list(owner)
+        while frontier:
+            current = frontier.pop()
+            for index, face in enumerate(faces):
+                if index in owner or index in face_codes:
+                    continue
+                if face.distance(faces[current]) > reach:
+                    continue
+                if any(face.distance(other) <= reach for other in others):
+                    continue
+                owner[index] = owner[current]
+                frontier.append(index)
+
     shapes: list[_LayerShape] = []
     # --- замкнутые контуры --------------------------------------------------
-    plain_faces = list(range(len(faces)))
-    if face_codes:
-        for index in sorted(face_codes):
+    plain_faces = [index for index in range(len(faces)) if index not in owner]
+    described_faces = [index for index in sorted(face_codes) if index not in owner]
+    if described_faces:
+        for index in described_faces:
             shapes.append(
                 _LayerShape(
                     geometry=faces[index], closed=True, is_area=True,
@@ -2635,8 +2894,8 @@ def _extract_layer_shapes(
                 )
             )
         # Контуры без точек, примыкающие (и по цепочке) к описанному, — его детали.
-        detail = set(face_codes)
-        frontier = list(face_codes)
+        detail = set(described_faces) | set(owner)
+        frontier = list(described_faces)
         while frontier:
             current = faces[frontier.pop()]
             for index, face in enumerate(faces):
@@ -2654,8 +2913,17 @@ def _extract_layer_shapes(
     # Хвосты без описания, примыкающие к замкнутому контуру, — детали того же объекта.
     free: list[int] = []
     for index, geom in enumerate(group_geoms):
-        if index in group_codes or not any(geom.distance(face) <= reach for face in faces):
+        if index in group_codes:
             free.append(index)
+            continue
+        touched = [number for number, face in enumerate(faces) if geom.distance(face) <= reach]
+        absorbed = [number for number in touched if number in owner]
+        if not touched:
+            free.append(index)
+        elif absorbed:
+            # хвост у ячейки лестницы — часть той же лестницы
+            free.append(index)
+            links.append((owner[absorbed[0]], index))
     if not free:
         return shapes
 
@@ -2687,14 +2955,21 @@ def _extract_layer_shapes(
                     continue
                 if _opposite_sides(groups[i], groups[j], described_gap):
                     parent[find(j)] = find(i)
+    for first, second in links:
+        root_a, root_b = find(first), find(second)
+        if root_a != root_b:
+            parent[root_b] = root_a
     clusters: dict[int, list[int]] = {}
     for index in free:
         clusters.setdefault(find(index), []).append(index)
 
     for members in clusters.values():
         cluster = [line for index in members for line in groups[index]]
+        cells = sorted(index for index, group_index in owner.items() if group_index in members)
+        cluster += [LineString(faces[index].exterior.coords) for index in cells]
         codes = _majority_first(
             [code for index in members for code in group_codes.get(index, [])]
+            + [code for index in cells for code in face_codes.get(index, [])]
         )
         chains = merge_lines(cluster, 0.0) or cluster
         # Кромки покрытия с описанием («CONC-SW» по трём линиям тротуара): выпуклая
@@ -2772,7 +3047,7 @@ def _opposite_sides(
         merged = merge_lines(list(group), 0.0) or list(group)
         if len(merged) != 1:
             return False
-        coords = _clean_coords(merged[0].coords)
+        coords = _clean_coords(merged[0].simplify(0.05).coords)
         if len(coords) != 2:
             return False
         chains.append(coords)
@@ -3087,6 +3362,7 @@ def recognize_features(
     источник 3 — имя слоя. Описание основного дома берётся из ``house_text``.
     """
     fcfg = feature_settings(cfg)
+    snap_snapshot_vertices(snapshot, cfg)
     classifier = LayerClassifier(fcfg)
     buffer_ft = max(0.0, float(fcfg.get("search_buffer_ft") or 0.0))
     zone = boundary.polygon.buffer(buffer_ft) if buffer_ft > 0 else boundary.polygon
@@ -3136,7 +3412,8 @@ def recognize_features(
     # --- заборы: объединение сегментов и привязка кодов ---------------------
     fence_parts: list[tuple[str, LineString]] = []
     for layer in sorted(fence_lines):
-        for merged in merge_lines(fence_lines[layer], tolerance):
+        # Забор, к которому сбоку примыкает другой, остаётся одной линией.
+        for merged in merge_lines(fence_lines[layer], tolerance, through_turn_deg=20.0):
             for part in _clip_lines(merged, zone, min_length):
                 fence_parts.append((layer, part))
 

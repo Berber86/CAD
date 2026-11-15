@@ -517,7 +517,10 @@
       {
         "match": [
           "IRON FENCE",
-          "I FENCE"
+          "I FENCE",
+          "I P F",
+          "IRON PICKET FENCE",
+          "F E I"
         ],
         "label": "IRON FENCE",
         "category": "fence"
@@ -533,12 +536,61 @@
       },
       {
         "match": [
-          "DECK",
           "WOOD DECK",
           "FRAME DECK"
         ],
         "label": "FRAME\nDECK",
         "category": "porch"
+      },
+      {
+        "match": [
+          "METAL DECK",
+          "IRON DECK"
+        ],
+        "label": "METAL\nDECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "DECK"
+        ],
+        "label": "DECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "VESTIBULE",
+          "VEST"
+        ],
+        "label": "VEST.",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "CELDOOR",
+          "CEL DOOR",
+          "CELLAR DOOR"
+        ],
+        "label": "C.D.",
+        "category": "cellar_door"
+      },
+      {
+        "match": [
+          "FIRESCAPE",
+          "FIRE ESCAPE",
+          "FIRE ESC"
+        ],
+        "label": "FIRE ESC.",
+        "category": "fire_escape"
+      },
+      {
+        "match": [
+          "AW OVERH",
+          "AWNING",
+          "AWN"
+        ],
+        "label": "AWNING",
+        "category": "awning"
       },
       {
         "match": [
@@ -605,7 +657,10 @@
           "TTP*",
           "SPOT GRADE*",
           "CONC SW",
-          "SW"
+          "SW",
+          "COLUMN",
+          "COL",
+          "BBC*"
         ],
         "label": ""
       }
@@ -730,6 +785,7 @@
     "fence_min_extra_length_ft": 4.0,
     "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
+    "fence_text_end_gap_factor": 0.15,
     "fence_label_every_run_min_ft": 25.0,
     "fence_label_spacing_ft": 15.0,
     "fence_min_label_length_ft": 3.0,
@@ -740,7 +796,8 @@
     "mtext_line_spacing_factor": 1.67,
     "char_width_factor": 0.92,
     "space_width_factor": 1.0,
-    "narrow_char_width_factor": 0.5,
+    "narrow_char_width_factor": 0.48,
+    "text_bearing_factor": 0.26,
     "narrow_chars": ".,'`:;!|",
     "measure_text_in_autocad": true,
     "label_short_fences_outside_lot": true,

@@ -5734,6 +5734,10 @@ def feature_text_width(
     ``char_width_factor / 0.92``; пробел и узкие знаки (``. , ' :``) — по
     ``space_width_factor`` и ``narrow_char_width_factor``. ``scale`` — поправка,
     измеренная в AutoCAD пробным текстом (другой шрифт стиля).
+
+    Результат — ширина видимого текста (габарит в AutoCAD): из суммы шагов
+    символов вычитаются поля первого и последнего символа
+    (``text_bearing_factor`` высоты; подобрано по текстам итоговых чертежей).
     """
     fcfg = fcfg or {}
     letter_scale = float(fcfg.get("char_width_factor") or 0.92) / 0.92
@@ -5749,6 +5753,10 @@ def feature_text_width(
             width += narrow
         else:
             width += _ROMANS_ADVANCE.get(char.upper(), 20.0 / 21.0) * letter_scale
+    bearing = fcfg.get("text_bearing_factor")
+    bearing = 0.26 if bearing is None else max(0.0, float(bearing))
+    if len(display) >= 2:
+        width = max(width - bearing, 0.5 * width)
     return width * float(text_height) * (float(scale) if scale and scale > 0 else 1.0)
 
 
@@ -6084,6 +6092,13 @@ class _LabelPlacer:
             x, y = base[0] - uy * across * factor, base[1] + ux * across * factor
             if region.contains(Point(x, y)):
                 add(x, y)
+        # Мелкие сдвиги вдоль текста: в длинной площадке, часть которой занята
+        # другим объектом (люк подвала под пожарной лестницей), подпись встаёт
+        # рядом с ним в одну строку, а не переносится на две.
+        for factor in (0.25, -0.25, 0.5, -0.5, 0.75, -0.75):
+            x, y = base[0] + ux * step * factor, base[1] + uy * step * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
         return points
 
     # -- дедупликация ---------------------------------------------------------
@@ -6359,6 +6374,7 @@ class _LabelPlacer:
         width, height = self._text_size(text)
         offset = float(self.fcfg.get("fence_text_offset_factor") or 0.8) * self.h
         margin = float(self.fcfg.get("fence_end_margin_ft") or 0.0)
+        end_gap = max(0.0, float(self.fcfg.get("fence_text_end_gap_factor") or 0.0)) * self.h
         centroid = self.lot.centroid
         ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
         nx, ny = -uy, ux
@@ -6391,7 +6407,9 @@ class _LabelPlacer:
                     rect = _rotated_box(center, width, height, rotation)
                     if self._hits_text(rect):
                         continue
-                    hits = self._line_hits(rect, ignore=feature.geometry)
+                    # У концов текста — дополнительный зазор до поперечных линий.
+                    probe = _rotated_box(center, width + 2.0 * end_gap, height, rotation)
+                    hits = self._line_hits(probe, ignore=feature.geometry)
                     if best is None or hits < best[0]:
                         best = (
                             hits,

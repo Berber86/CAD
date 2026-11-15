@@ -245,9 +245,20 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         {"match": ["VINYL FENCE", "V FENCE", "PVC FENCE"], "label": "VINYL FENCE", "category": "fence"},
         {"match": ["F E C", "CHAIN LINK FENCE", "C L F"], "label": "CHAIN LINK FENCE", "category": "fence"},
         {"match": ["WOOD FENCE", "W FENCE", "STOCKADE FENCE"], "label": "WOOD FENCE", "category": "fence"},
-        {"match": ["IRON FENCE", "I FENCE"], "label": "IRON FENCE", "category": "fence"},
+        {
+            "match": ["IRON FENCE", "I FENCE", "I P F", "IRON PICKET FENCE", "F E I"],
+            "label": "IRON FENCE", "category": "fence",
+        },
         {"match": ["O PORCH", "OPEN PORCH", "PORCH"], "label": "O.P.", "category": "porch"},
-        {"match": ["DECK", "WOOD DECK", "FRAME DECK"], "label": "FRAME\nDECK", "category": "porch"},
+        # Материал настила в коде «DECK» не записан (у заказчика бывает и FRAME
+        # DECK, и METAL DECK) — без уточнения пишется просто DECK.
+        {"match": ["WOOD DECK", "FRAME DECK"], "label": "FRAME\nDECK", "category": "porch"},
+        {"match": ["METAL DECK", "IRON DECK"], "label": "METAL\nDECK", "category": "porch"},
+        {"match": ["DECK"], "label": "DECK", "category": "porch"},
+        {"match": ["VESTIBULE", "VEST"], "label": "VEST.", "category": "porch"},
+        {"match": ["CELDOOR", "CEL DOOR", "CELLAR DOOR"], "label": "C.D.", "category": "cellar_door"},
+        {"match": ["FIRESCAPE", "FIRE ESCAPE", "FIRE ESC"], "label": "FIRE ESC.", "category": "fire_escape"},
+        {"match": ["AW OVERH", "AWNING", "AWN"], "label": "AWNING", "category": "awning"},
         {
             "match": ["STEPS", "STEP", "STAIRS"], "label": "STEPS", "label_narrow": "STEP",
             "category": "steps",
@@ -260,7 +271,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         {"match": ["EDG DWY", "EDGE DWY", "DWY", "DRIVEWAY"], "label": "DRIVEWAY", "category": "surface"},
         # BLC — building corner, BL — building line; TTP — точка хода; CONC-SW —
         # кромка тротуара/дорожки: материал покрытия заказчик берёт с фотографий.
-        {"match": ["BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW"], "label": ""},
+        # COLUMN — колонна у входа, BBC — точка бортового камня: в итоговых
+        # чертежах заказчика не подписаны.
+        {"match": ["BLC*", "BL", "TTP*", "SPOT GRADE*", "CONC SW", "SW", "COLUMN", "COL", "BBC*"], "label": ""},
     ],
     "narrow_object_max_width_ft": 1.5,
     #: забор, идущий по стене (в пределах ``fence_atop_wall_reach_ft`` от её
@@ -356,6 +369,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: расстояние от линии забора до середины текста, в высотах текста
     "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
+    #: зазор между концом текста вдоль линии и поперечной линией, в высотах текста
+    "fence_text_end_gap_factor": 0.15,
     #: подпись ставится на каждом прямом участке забора не короче этой длины
     "fence_label_every_run_min_ft": 25.0,
     #: одинаковые подписи заборов не ставятся ближе этого расстояния
@@ -372,7 +387,9 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: уточняются измерением пробного текста (measure_text_in_autocad).
     "char_width_factor": 0.92,
     "space_width_factor": 1.0,
-    "narrow_char_width_factor": 0.5,
+    "narrow_char_width_factor": 0.48,
+    #: поля первого и последнего символа, не входящие в габарит текста
+    "text_bearing_factor": 0.26,
     "narrow_chars": ".,'`:;!|",
     "measure_text_in_autocad": True,
     #: короткие заборы целиком за пределами участка (возвраты и продолжения
@@ -2122,11 +2139,26 @@ def _ribbon_polygon(first: LineString, second: LineString) -> Polygon | None:
     return best
 
 
+def _corner_angle_deg(
+    first: Sequence[float], corner: Sequence[float], last: Sequence[float]
+) -> float:
+    """Угол между сторонами ``corner-first`` и ``corner-last`` (0…180°); 90° — прямой угол."""
+    ux, uy = first[0] - corner[0], first[1] - corner[1]
+    vx, vy = last[0] - corner[0], last[1] - corner[1]
+    norm = math.hypot(ux, uy) * math.hypot(vx, vy)
+    if norm <= 0.0:
+        return 0.0
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, (ux * vx + uy * vy) / norm))))
+    return min(angle, 180.0 - angle)
+
+
 def _shape_from_open_lines(lines: Sequence[LineString], min_width: float) -> Polygon | None:
     """
     Приближённая площадь объекта с незамкнутым контуром.
 
     * одна ломаная (терраса из трёх сторон у стены дома) — замыкается по концам;
+    * угол из двух сторон (навес или тамбур в углу между домом и соседом: сняты
+      только две свободные стороны) — достраивается до параллелограмма;
     * две кромки (дорожка, заезд) — полоса между ними;
     * иначе — выпуклая оболочка.
     Слишком узкий результат (прямая линия) отбрасывается.
@@ -2135,6 +2167,9 @@ def _shape_from_open_lines(lines: Sequence[LineString], min_width: float) -> Pol
     candidate: Polygon | None = None
     if len(merged) == 1:
         coords = _clean_coords(merged[0].coords)
+        if len(coords) == 3 and _corner_angle_deg(*coords) >= 45.0:
+            (ax, ay), (bx, by), (cx, cy) = coords
+            coords = [coords[0], coords[1], coords[2], (ax + cx - bx, ay + cy - by)]
         if len(coords) >= 3:
             closed = Polygon(coords)
             if closed.is_valid and closed.area > 0.0:
@@ -2230,6 +2265,7 @@ def _extract_layer_shapes(
     point_reach: float = 0.0,
     loose: list[PointCode] | None = None,
     linear: bool = False,
+    linear_categories: Iterable[str] = (),
 ) -> list[_LayerShape]:
     """
     Делит линии одного слоя на отдельные объекты: замкнутые контуры, открытые
@@ -2243,7 +2279,11 @@ def _extract_layer_shapes(
 
     ``linear`` — слой линейных объектов (пунктир консоли вокруг дома): площадь
     по незамкнутым линиям не строится, объект — каждая ломаная длиннее 5 ft.
+    Если описание точки относит объект к категории не из ``linear_categories``
+    (пожарная лестница или козырёк в слое навесов ST-OHED), это площадка:
+    контур строится как обычно, подпись ставится внутри.
     """
+    linear_set = {str(name).strip().lower() for name in linear_categories}
     noded = _noded(snap_endpoints(lines, tolerance))
     if not noded:
         if loose is not None:
@@ -2332,14 +2372,17 @@ def _extract_layer_shapes(
         chains = merge_lines(cluster, 0.0) or cluster
         # Кромки покрытия с описанием («CONC-SW» по трём линиям тротуара): выпуклая
         # оболочка накрыла бы чужие объекты, подпись ставится вдоль длинной кромки.
-        edges_only = linear or (
+        is_linear = linear and not (
+            bool(codes) and bool(codes[0].category) and codes[0].category not in linear_set
+        )
+        edges_only = is_linear or (
             bool(codes) and codes[0].category == "surface" and len(chains) > 2
         )
         if edges_only:
             longest = max(chains, key=lambda chain: chain.length)
             # Пунктир консоли идёт вдоль нескольких стен дома — подпись у каждой;
             # у кромок покрытия подписывается одна, самая длинная.
-            kept = [chain for chain in chains if chain.length >= 5.0] if linear else []
+            kept = [chain for chain in chains if chain.length >= 5.0] if is_linear else []
             for chain in kept or [longest]:
                 shapes.append(
                     _LayerShape(geometry=chain, closed=False, is_area=False, codes=codes)
@@ -2750,6 +2793,7 @@ def recognize_features(
             point_reach=feature_reach,
             loose=loose_points,
             linear=category in linear_categories,
+            linear_categories=linear_categories,
         )
         mapped = classifier.layer_label(layer)
         for shape in shapes:

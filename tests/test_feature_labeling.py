@@ -651,8 +651,8 @@ def test_gate_label_is_stacked_across_the_gate_line():
 
 
 def test_leader_is_short_arc_when_no_room_beside():
-    # Текст высотой 1.0 ft в проход между домом и границей (4.9 ft) уже не входит.
-    plan = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE, height=1.0)
+    # Текст высотой 1.1 ft в проход между домом и границей (4.9 ft) уже не входит.
+    plan = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE, height=1.1)
     assert plan.count_placement("leader") == 2
     item = item_for(plan, "NEIGHBOUR_SIDE_STAIR")
     assert (item.text, item.kind, item.placement) == ("CONC.\nSTEPS", "leader", "leader")
@@ -671,15 +671,23 @@ def stafford_plan(**kwargs):
 
 
 def test_label_width_follows_romans_font_metrics():
-    # Замеры по чертежу заказчика (текст 0.9 ft): SHED ~3.3 ft, CHAIN LINK FENCE ~13 ft.
-    assert ab.feature_text_width("SHED", 0.9) == pytest.approx(0.9 * 82 / 21)
-    assert ab.feature_text_width("CHAIN LINK FENCE", 0.9) == pytest.approx(12.86, abs=0.01)
+    # Ширина — габарит видимого текста: сумма шагов символов минус поля крайних
+    # символов (0.26 высоты). Замеры по чертежам заказчика (текст 0.9 ft):
+    # SHED ~3.3 ft, CHAIN LINK FENCE ~12.6 ft, C.D. 2.36 ft, VEST. 3.34 ft.
+    bearing = 0.26
+    assert ab.feature_text_width("SHED", 0.9) == pytest.approx(0.9 * (82 / 21 - bearing))
+    assert ab.feature_text_width("CHAIN LINK FENCE", 0.9) == pytest.approx(12.62, abs=0.01)
+    assert ab.feature_text_width("C.D.", 0.9) == pytest.approx(2.36, abs=0.1)
+    assert ab.feature_text_width("VEST.", 0.9) == pytest.approx(3.34, abs=0.1)
+    assert ab.feature_text_width("FIRE ESC.", 0.9) == pytest.approx(6.39, abs=0.1)
     # Точки и буква I узкие: O.P. заметно короче, чем четыре «средних» символа.
-    assert ab.feature_text_width("O.P.", 1.0) == pytest.approx((22 + 21) / 21 + 2 * 0.5)
+    assert ab.feature_text_width("O.P.", 1.0) == pytest.approx((22 + 21) / 21 + 2 * 0.48 - bearing)
     assert ab.feature_text_width("O.P.", 1.0) < 0.8 * ab.feature_text_width("SHED", 1.0)
-    assert ab.feature_text_width("SHED", 1.0, scale=1.2) == pytest.approx(1.2 * 82 / 21)
-    # Ключи раздела feature_labeling меняют ширину букв и пробела.
-    wide = ab.feature_text_width("A A", 1.0, {"char_width_factor": 1.84, "space_width_factor": 2.0})
+    assert ab.feature_text_width("SHED", 1.0, scale=1.2) == pytest.approx(1.2 * (82 / 21 - bearing))
+    # Ключи раздела feature_labeling меняют ширину букв и пробела и поля.
+    wide = ab.feature_text_width(
+        "A A", 1.0, {"char_width_factor": 1.84, "space_width_factor": 2.0, "text_bearing_factor": 0.0}
+    )
     assert wide == pytest.approx(2 * 2 * 18 / 21 + 2.0)
 
 
@@ -1346,7 +1354,7 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
 def test_arc_leader_is_a_polyline_with_wedge_arrow(com):
     """Выноска — дуговая полилиния с клиновидной стрелкой (AddLeader не используется)."""
     builder, _app, doc = com(build_stafford_scene())
-    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.0)
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
     assert result.failed == [] and result.warnings == []
     assert result.created_labels == 26 and result.created_leaders == 2
     space = doc.ModelSpace
@@ -1481,9 +1489,9 @@ def test_cancelled_job_does_not_draw(com):
 
 def test_leader_style_leader_uses_addleader_and_falls_back_to_polyline(com):
     # leader_style = "leader": объект AddLeader вместо дуговой полилинии.
-    # Текст 1.0 ft: двум подписям ступеней нужна выноска.
+    # Текст 1.1 ft: двум подписям ступеней нужна выноска.
     builder, _app, doc = com(build_stafford_scene(), feature_cfg={"leader_style": "leader"})
-    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.0)
+    result = builder.label_features(house_text=STAFFORD_HOUSE, text_height=1.1)
     assert result.created_leaders == 2 and result.warnings == []
     leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
     assert len(leaders) == 2

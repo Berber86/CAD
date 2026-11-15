@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import ocr_pages
 from llm_parser import (
     PDFError,
     has_legal_courses,
@@ -75,6 +76,10 @@ class PdfSetItem:
     last_page: int = 1
     is_main: bool = False
     use_llm: bool = False
+    #: Локальный OCR доступен и разрешён: скан разбирается бесплатно, без ИИ.
+    ocr_ok: bool = False
+    #: Этот файл уже распознавался локальным OCR (для отчёта).
+    ocr_used: bool = False
     #: Способ ещё не выбирали вручную — он следует за страницами.
     auto_mode: bool = True
     #: Страницы, прочитанные из имени файла (None — в имени их нет).
@@ -117,8 +122,18 @@ class PdfSetItem:
 
     def mode_label(self) -> str:
         if not self.use_llm:
-            return "локально, бесплатно"
+            if self.has_legal_text():
+                return "локально, бесплатно"
+            if self.ocr_used:
+                return "локальный OCR, распознано (бесплатно)"
+            if self.ocr_ok:
+                return "локальный OCR, бесплатно"
+            return "локально, бесплатно (текста нет)"
         return "ИИ по тексту страниц" if self.has_legal_text() else "ИИ / Vision по изображению страниц"
+
+    def uses_ocr(self) -> bool:
+        """Файл пойдёт в локальный OCR: локальный разбор, текста обхода нет, OCR есть."""
+        return bool(self.ocr_ok and not self.use_llm and not self.has_legal_text())
 
     def parse_key(self) -> tuple[Any, ...]:
         """От чего зависит результат разбора; роль на него не влияет."""
@@ -134,7 +149,8 @@ class PdfSetItem:
         """Меняет страницы; пока способ не выбран вручную, он подстраивается."""
         self.first_page, self.last_page = first, last
         if self.auto_mode:
-            self.use_llm = not self.has_legal_text()
+            # Скан при доступном локальном OCR остаётся бесплатным; иначе — как раньше, ИИ.
+            self.use_llm = not (self.has_legal_text() or self.ocr_ok)
 
     def set_mode(self, use_llm: bool) -> None:
         """Способ выбран пользователем и больше не меняется сам."""
@@ -160,6 +176,13 @@ class PdfSetItem:
         text = self.selected_text()
         if not self.use_llm:
             if len(text.strip()) < 20:
+                if self.ocr_ok:
+                    # Скан: текст страниц появится в фоне из локального OCR (бесплатно).
+                    return {
+                        "ocr_path": self.path,
+                        "ocr_pages": self.pages_spec(),
+                        "ocr_dpi": int(ocr_pages.DEFAULT_DPI),
+                    }
                 raise PDFError(
                     f"на {self.pages_label()} нет текстового слоя (скан или чертёж). "
                     "Переключите файл на ИИ или укажите другие страницы."
@@ -186,6 +209,8 @@ class PdfSetJob:
     cached_issues: tuple[str, ...] = ()
     #: Принятые правки; действуют только вместе с готовым результатом разбора.
     fixes: tuple[Any, ...] = ()
+    #: Файл — скан: текст появится из локального OCR (бесплатно), уже в фоне.
+    ocr: bool = False
 
     @property
     def role_label(self) -> str:
@@ -203,6 +228,8 @@ class PdfSetResult:
     plan: Any = None
     pre_counted: bool = False
     cached: bool = False
+    #: Текст страниц получен локальным OCR (бесплатно), ИИ не вызывался.
+    ocr: bool = False
     issues: list[str] = field(default_factory=list)
     error: str = ""
 
@@ -229,10 +256,66 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         cached_outcome=item.outcome if reuse else None,
         cached_issues=tuple(item.issues) if reuse else (),
         fixes=tuple(item.fixes) if reuse else (),
+        ocr=bool(source is not None and "ocr_path" in source),
     )
 
 
-def make_item(path: str | Path, *, vision_max_pages: int = 8) -> PdfSetItem:
+def pages_from_spec(spec: Any) -> tuple[int, int]:
+    """Страницы из спецификации ``"3"`` / ``"3-5"`` (как в ``_p3-5`` в имени файла)."""
+    text = str(spec if spec is not None else "").strip()
+    first_raw, _, last_raw = text.partition("-")
+    try:
+        first = int(first_raw)
+        last = int(last_raw) if last_raw.strip() else first
+    except ValueError as exc:
+        raise PDFError(f"непонятные страницы: «{text}»") from exc
+    if first < 1 or last < first:
+        raise PDFError(f"непонятные страницы: «{text}»")
+    return first, last
+
+
+def resolve_ocr_source(
+    source: dict[str, Any], *, progress: Callable[[str], None] | None = None
+) -> dict[str, Any]:
+    """
+    Достаёт текст скана локальным OCR — и только в фоне, не в окне.
+
+    ``parse_source`` для скана возвращает не текст, а отметку «это надо
+    распознать»: рендер страниц и OCR занимают секунды на страницу, и делать это
+    в потоке окна нельзя. Фоновый разбор вызывает эту функцию, получает текст и
+    дальше идёт обычным путём бесплатного разбора. Если распознать не удалось,
+    ``PDFError`` говорит прямо, что делать: переключить файл на ИИ.
+    """
+    if "ocr_path" not in source:
+        return source
+    path = Path(str(source["ocr_path"]))
+    first, last = pages_from_spec(source.get("ocr_pages"))
+    dpi = int(source.get("ocr_dpi") or ocr_pages.DEFAULT_DPI)
+    try:
+        text = ocr_pages.ocr_pdf_pages(
+            path, first, last, dpi=dpi, progress=progress
+        )
+    except ocr_pages.OcrUnavailable as exc:
+        raise PDFError(
+            f"локальный OCR недоступен ({exc}). "
+            "Переключите файл на ИИ или установите rapidocr-onnxruntime."
+        ) from exc
+    except ocr_pages.OcrError as exc:
+        raise PDFError(
+            f"локальный OCR не прочитал «{path.name}»: {exc}. Переключите файл на ИИ."
+        ) from exc
+    if not has_legal_courses(text):
+        raise PDFError(
+            f"локальный OCR не нашёл обхода границ на {format_pages(first, last)} "
+            f"файла «{path.name}» (распознано {len(text)} симв.). "
+            "Переключите файл на ИИ или укажите другие страницы."
+        )
+    return {"text": text, "ocr": True}
+
+
+def make_item(
+    path: str | Path, *, vision_max_pages: int = 8, ocr_available: bool = False
+) -> PdfSetItem:
     """
     Открывает PDF и подбирает страницы и способ разбора по умолчанию.
 
@@ -245,7 +328,10 @@ def make_item(path: str | Path, *, vision_max_pages: int = 8) -> PdfSetItem:
         raise PDFError(f"ожидался PDF, получено: {pdf.name}")
     texts = read_pdf_page_texts(pdf)
     total = len(texts)
-    item = PdfSetItem(path=pdf, page_texts=texts, first_page=1, last_page=total)
+    item = PdfSetItem(
+        path=pdf, page_texts=texts, first_page=1, last_page=total,
+        ocr_ok=bool(ocr_available),
+    )
     named = pages_from_pdf_name(pdf.name)
     item.name_pages = named
     limit = max(1, int(vision_max_pages or 8))

@@ -329,6 +329,11 @@ def gui(monkeypatch):
 
     # В старых тестах выбор роли эмулируется текстовым переключателем; тесты
     # самого диалога и независимости ролей задают явный ответ отдельно.
+    # Локальный OCR зависит от машины (установлен пакет или нет), а поведение окна
+    # должно быть одинаковым: в тестах он выключен. Путь с OCR проверяют
+    # tests/test_local_ocr.py (движок подменён) и отдельный тест окна.
+    if hasattr(gui_module, "ocr_pages"):
+        monkeypatch.setattr(gui_module.ocr_pages, "available", lambda: False)
     monkeypatch.setattr(
         gui_module.SurveyApp, "_ask_source_role",
         lambda app, source: (

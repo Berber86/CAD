@@ -29,6 +29,11 @@ rem pip не обновляет уже подходящие версии; инт
 echo [2/3] Проверяю зависимости ...
 ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt || goto :error
 
+rem Локальный OCR сканов — необязательный набор: без него сканы уходят в ИИ.
+if exist "requirements-ocr.txt" (
+    ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements-ocr.txt
+    if errorlevel 1 echo [2/3] Локальный OCR не установлен - сканы пойдут в ИИ.
+)
 echo [3/3] Запускаю приложение ...
 ".venv\Scripts\python.exe" main.py
 if not "%errorlevel%"=="0" goto :launch_error

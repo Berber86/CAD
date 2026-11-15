@@ -968,5 +968,10 @@
     "linetype_scale_short_below_ft": 5.0,
     "linetype_scale_halve_from_ft": 8.0,
     "linetype_scale_halve_to_ft": 10.0
+  },
+  "ocr": {
+    "enabled": true,
+    "dpi": 300,
+    "comment": "локальное распознавание сканов (бесплатно, без ИИ): rapidocr-onnxruntime; dpi — разрешение рендера страницы"
   }
 }

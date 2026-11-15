@@ -123,6 +123,7 @@ from llm_parser import (
     save_config,
     save_protected_env,
 )
+import ocr_pages
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
@@ -132,6 +133,7 @@ from pdf_set import (
     make_item,
     make_job,
     read_page_boxes,
+    resolve_ocr_source,
     set_signature,
 )
 
@@ -5774,11 +5776,20 @@ class SurveyApp(ctk.CTk):
             return
         self._open_pdf_set_dialog(items, fresh=True, notes=errors)
 
+    def _local_ocr_available(self) -> bool:
+        """
+        Можно ли распознавать сканы локально (бесплатно) — настройка ``ocr.enabled``
+        и установленный пакет. Без него программа работает как раньше: сканы в ИИ.
+        """
+        enabled = bool((self.config_data.get("ocr") or {}).get("enabled", True))
+        return bool(enabled and ocr_pages.available())
+
     def _make_pdf_set_items(
         self, paths: list[Path], *, existing: list[Path] | None = None,
     ) -> tuple[list[PdfSetItem], list[str]]:
         """Открывает выбранные PDF; страницы берутся из имени файла (…_p17, …_p2_5)."""
         limit = int(self.config_data.get("api", {}).get("vision_max_pages") or 8)
+        ocr_ok = self._local_ocr_available()
         known = set(existing or [])
         items: list[PdfSetItem] = []
         errors: list[str] = []
@@ -5786,7 +5797,9 @@ class SurveyApp(ctk.CTk):
             if path in known:
                 continue
             try:
-                items.append(make_item(path, vision_max_pages=limit))
+                items.append(
+                    make_item(path, vision_max_pages=limit, ocr_available=ocr_ok)
+                )
             except Exception as exc:  # noqa: BLE001 - один плохой файл не срывает выбор
                 errors.append(f"{path.name}: {exc}")
         return items, errors
@@ -5910,7 +5923,10 @@ class SurveyApp(ctk.CTk):
         reused = sum(1 for job in jobs if job.cached_outcome is not None)
         paid = sum(1 for job in jobs if job.use_llm and job.cached_outcome is None)
         local = len(jobs) - reused - paid
+        by_ocr = sum(1 for job in jobs if job.ocr and job.cached_outcome is None)
         detail = f"ИИ: {paid}, локально: {local}"
+        if by_ocr:
+            detail += f" (из них OCR: {by_ocr})"
         if reused:
             detail += f", без изменений: {reused}"
         self._set_status(f"Разбор набора PDF: {len(jobs)} файл. ({detail})…")
@@ -5997,6 +6013,22 @@ class SurveyApp(ctk.CTk):
                 else:
                     if job.source is None:
                         raise PDFError(job.source_error or "нет данных для разбора")
+                    if job.ocr:
+                        # Скан без текстового слоя: сначала бесплатный локальный OCR.
+                        # Занимает секунды на страницу, поэтому только здесь, в фоне.
+                        post(
+                            "progress",
+                            f"[{idx}/{total}] {job.path.name}: распознаю страницы локально (OCR)…",
+                        )
+                        recognized = resolve_ocr_source(
+                            job.source,
+                            progress=lambda msg, i=idx, name=job.path.name: post(
+                                "progress", f"[{i}/{total}] {name}: {msg}"
+                            ),
+                        )
+                        # Отметка «это OCR» — для отчёта, в парсер она не идёт.
+                        result.ocr = bool(recognized.pop("ocr", False))
+                        job = dataclasses.replace(job, source=recognized)
                     post(
                         "progress",
                         f"[{idx}/{total}] {job.role_label}: {job.path.name}, {job.pages_label} — {job.mode_label}…",
@@ -6013,6 +6045,14 @@ class SurveyApp(ctk.CTk):
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
                 description = apply_changes(result.outcome.data, fix_changes(job.fixes))
                 plan = builder.plan(description, scale=scale, is_neighbor=not job.is_main)
+                if result.ocr and plan.closure.distance > CLOSURE_LIMIT_FT:
+                    # Геометрия — детектор ошибок распознавания: настоящий deed
+                    # замыкается в сотые, значит цифры прочитаны неверно.
+                    result.issues.append(
+                        f"распознано локальным OCR, невязка {plan.closure.distance:.2f} ft "
+                        f"(больше {CLOSURE_LIMIT_FT} ft) — вероятно, ошибка чтения цифр; "
+                        "переключите файл на ИИ (Vision) и сравните страницы"
+                    )
                 for issue in result.issues:
                     if issue not in plan.warnings:
                         plan.warnings.append(issue)
@@ -6206,6 +6246,7 @@ class SurveyApp(ctk.CTk):
                 continue
             item.error = res.error
             item.issues = list(res.issues)
+            item.ocr_used = bool(res.ocr) and not res.error
             if res.error or res.plan is None or res.outcome is None:
                 item.outcome = None
                 item.parsed_key = None
@@ -6305,7 +6346,12 @@ class SurveyApp(ctk.CTk):
             else:
                 mark = "⚠" if self._pdf_set_issue_lines(item) else "✓"
             role = "наш" if item.is_main else "сосед"
-            mode = "ИИ" if item.use_llm else "локально"
+            if item.use_llm:
+                mode = "ИИ"
+            elif item.ocr_used:
+                mode = "локально, OCR"
+            else:
+                mode = "локально"
             lines.append(
                 f"{mark} {role}: {item.path.name}\n     {item.pages_label()} · {mode}"
             )
@@ -6327,6 +6373,13 @@ class SurveyApp(ctk.CTk):
             f"Файлов: {len(items)} · построено: {len(built)} · с замечаниями: {len(flagged)} "
             f"· не разобрано: {len(failed)}",
         ]
+        by_ocr = [item for item in items if item.ocr_used]
+        if by_ocr:
+            lines.append(
+                f"Сканов распознано локально (OCR, бесплатно): {len(by_ocr)} — "
+                f"это {', '.join(item.path.name for item in by_ocr[:4])}"
+                + ("…" if len(by_ocr) > 4 else "")
+            )
         for item in items:
             plan = self._pdf_set_plan_for(item)
             if item.is_main:
@@ -6341,6 +6394,10 @@ class SurveyApp(ctk.CTk):
             lines.append("")
             lines.append(f"▸ {role} — {item.path.name}")
             lines.append(f"   {item.pages_label()} · {item.mode_label()}")
+            if item.ocr_used:
+                lines.append(
+                    "   🔍 текст страниц получен локальным OCR — платный запрос ИИ не делался"
+                )
             if plan is None:
                 lines.append(f"   ✗ не разобран: {' '.join((item.error or 'участок не построен').split())}")
                 continue
@@ -9525,6 +9582,11 @@ class PdfSetDialog:
         legal = item.has_legal_text()
         if not item.use_llm and legal:
             text, color = f"✓ на {pages} найден текст обхода — бесплатный локальный разбор", THEME["ok"]
+        elif not item.use_llm and item.ocr_ok:
+            text, color = (
+                f"🔍 скан: {pages} распознаются локально (OCR), бесплатно — около 5 с на "
+                "страницу; если текст не прочитается, выберите ИИ"
+            ), THEME["text_muted"]
         elif not item.use_llm:
             text, color = (
                 f"⚠ на {pages} нет текста обхода (скан или чертёж) — локально не разобрать; "

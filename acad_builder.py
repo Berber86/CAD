@@ -3057,6 +3057,15 @@ class AcadBuilder:
                 continue
         return hidden
 
+    @staticmethod
+    def _text_style_exists(doc: Any, name: str) -> bool:
+        """Есть ли в чертеже текстовый стиль ``name`` (стили шаблона заказчика)."""
+        try:
+            doc.TextStyles.Item(name)
+        except Exception:  # noqa: BLE001 - стиля нет либо коллекция недоступна
+            return False
+        return True
+
     def _measure_text_width_scale(self, doc: Any, height: float) -> float:
         """
         Поправка ширины текста: пробная строка создаётся стилем подписей,
@@ -3088,8 +3097,8 @@ class AcadBuilder:
                     pass
         if bbox is None:
             return 1.0
-        # Габарит не включает поля по краям строки (около 0.25 высоты текста).
-        measured = (bbox[2] - bbox[0]) + 0.25 * float(height)
+        # И расчёт, и GetBoundingBox — габарит видимого текста (без полей по краям).
+        measured = bbox[2] - bbox[0]
         ratio = measured / expected
         if not math.isfinite(ratio) or not (0.5 <= ratio <= 1.8):
             return 1.0
@@ -3238,9 +3247,36 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001 - группировка отмены не критична
             pass
         leader_warned = False
+        own_layers: dict[str, str] = {}
+        own_styles: dict[str, str] = {}
+
+        def item_layer(item: FeatureLabelItem) -> str:
+            """Слой подписи: общий либо собственный (описание дома — слой 0)."""
+            name = str(item.layer or "").strip()
+            if not name or name.upper() == str(layer).upper():
+                return layer
+            if name not in own_layers:
+                own_layers[name] = (
+                    name if name == "0"
+                    else self._ensure_feature_layer(
+                        doc, name, int(fcfg.get("label_output_layer_color") or 7)
+                    )
+                )
+            return own_layers[name]
+
+        def item_style(item: FeatureLabelItem) -> str:
+            """Стиль подписи: собственный, если он есть в чертеже, иначе общий."""
+            name = str(item.style or "").strip()
+            if not name:
+                return style
+            if name not in own_styles:
+                own_styles[name] = name if self._text_style_exists(doc, name) else style
+            return own_styles[name]
+
         try:
             for item in plan.items:
                 title = item.single_line
+                layer_name, style_name = item_layer(item), item_style(item)
                 try:
                     if item.kind == "text":
                         self._add_text(
@@ -3249,15 +3285,17 @@ class AcadBuilder:
                                 text=item.text, point=item.point, rotation=item.rotation,
                                 kind="feature", height=item.height,
                             ),
-                            item.height, layer, style,
+                            item.height, layer_name, style_name,
                         )
                         result.created_texts += 1
                     else:
-                        mtext = self._add_mtext(model_space, item, layer, style)
+                        mtext = self._add_mtext(model_space, item, layer_name, style_name)
                         result.created_mtexts += 1
                         if item.kind == "leader" and len(item.leader_points) >= 2:
                             try:
-                                _leader, note = self._add_leader(model_space, item, mtext, layer)
+                                _leader, note = self._add_leader(
+                                    model_space, item, mtext, layer_name
+                                )
                                 result.created_leaders += 1
                                 if note and not leader_warned:
                                     result.warnings.append(note)
@@ -5449,6 +5487,10 @@ class FeatureLabelItem:
     note: str = ""
     attach_annotation: bool = True  # False — выноска без привязки к MText (без «полки»)
     leader_bulge: float = 0.0  # кривизна дуговой выноски (bulge полилинии), 0 — прямая
+    #: слой и текстовый стиль, если они отличаются от общих (описание дома
+    #: заказчик держит в слое 0 крупным шрифтом RDS); пусто — как у всех подписей
+    layer: str = ""
+    style: str = ""
 
     @property
     def single_line(self) -> str:
@@ -5609,6 +5651,12 @@ class FeatureLabelResult:
                 f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
                 f"{self.created_mtexts}, выносок — {self.created_leaders}"
             )
+        for item in plan.items:
+            if item.layer and item.layer.upper() != str(plan.output_layer).upper():
+                lines.append(
+                    f"  «{item.single_line}»: слой {item.layer}, высота {item.height:.2f} ft"
+                    + (f", стиль {item.style} (если есть в чертеже)" if item.style else "")
+                )
         lines.append(
             f"ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: {len(plan.duplicates)}"
             + ("" if plan.skip_existing else "  (проверка надписей чертежа выключена)")
@@ -5909,6 +5957,11 @@ class _LabelPlacer:
         self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
         self.reads = str(self.fcfg.get("vertical_text_reads") or "up")
         self.leader_style = str(self.fcfg.get("leader_style") or "arc").strip().lower()
+        # Описание основного дома: свой слой, стиль и высота (как у заказчика).
+        self.house_layer = str(self.fcfg.get("house_label_layer") or "").strip()
+        self.house_style = str(self.fcfg.get("house_label_text_style") or "").strip()
+        house_factor = float(self.fcfg.get("house_label_height_factor") or 1.0)
+        self.house_h = self.h * (house_factor if house_factor > 0 else 1.0)
         classifier = LayerClassifier(self.fcfg)
         self.classifier = classifier
 
@@ -5948,9 +6001,16 @@ class _LabelPlacer:
             if not self._in_bounds(rect):
                 continue
             is_point = classifier.is_point_label(text.layer)
-            is_label = classifier.is_existing_label(text.layer)
+            # Слой описания дома — тоже слой готовых подписей (повторный запуск).
+            on_house_layer = bool(self.house_layer) and (
+                str(text.layer).strip().upper() == self.house_layer.upper()
+            )
+            is_label = classifier.is_existing_label(text.layer) or on_house_layer
             # Препятствие — только текст, который останется в итоговом чертеже.
-            keeps = classifier.is_text_obstacle(text.layer) or (avoid_points and is_point)
+            keeps = (
+                classifier.is_text_obstacle(text.layer) or on_house_layer
+                or (avoid_points and is_point)
+            )
             if not text.hidden and keeps:
                 self.text_boxes.append(rect)
             if is_label:
@@ -6909,7 +6969,7 @@ class _LabelPlacer:
                 continue
             item: FeatureLabelItem | None = None
             if feature.is_main_house:
-                item = self.place_inside(feature, force=True)
+                item = self._place_house(feature)
             elif feature.kind == "area":
                 item = (
                     self.place_inside(feature)
@@ -6932,6 +6992,23 @@ class _LabelPlacer:
             if self._skip_duplicate(feature):
                 continue
             self._commit(self.place_leader(feature))
+
+    def _place_house(self, feature: Feature) -> FeatureLabelItem | None:
+        """
+        Описание основного дома: по центру контура, высотой
+        ``house_label_height_factor`` от высоты подписей, в слое
+        ``house_label_layer`` стилем ``house_label_text_style``.
+        """
+        normal = self.h
+        self.h = self.house_h
+        try:
+            item = self.place_inside(feature, force=True)
+        finally:
+            self.h = normal
+        if item is not None:
+            item.layer = self.house_layer
+            item.style = self.house_style
+        return item
 
     def _skip_duplicate(self, feature: Feature) -> bool:
         known = self.find_duplicate(feature)

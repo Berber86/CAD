@@ -130,6 +130,12 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "step_tread_layers": ["*TREADS*"],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
+    #: Описание основного дома в итоговых чертежах заказчика — MText в слое 0,
+    #: стиль RDS, высота 1.5 ft при подписях 0.9 ft. Стиль берётся, если он есть
+    #: в чертеже (иначе — общий стиль подписей). Пустой слой — как все подписи.
+    "house_label_layer": "0",
+    "house_label_text_style": "RDS",
+    "house_label_height_factor": 1.667,
     #: слои готовых подписей (итоговый чертёж): по ним проверяются дубликаты
     "existing_label_layers": ["D-TOPO-TEXT"],
     # --- источник 1: заметки полевого чертёжника -----------------------------

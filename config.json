@@ -204,6 +204,9 @@
     ],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
+    "house_label_layer": "0",
+    "house_label_text_style": "RDS",
+    "house_label_height_factor": 1.667,
     "existing_label_layers": [
       "D-TOPO-TEXT"
     ],

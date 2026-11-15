@@ -1015,7 +1015,7 @@ class FakeModelSpace:
         entity.Delete = delete
         if self.font_scale is not None:
             # Габарит текста, как его вернул бы AutoCAD для шрифта другой ширины.
-            width = ab.feature_text_width(text, height) * self.font_scale - 0.25 * height
+            width = ab.feature_text_width(text, height) * self.font_scale
             entity.GetBoundingBox = lambda: (
                 (point[0], point[1], 0.0), (point[0] + width, point[1] + height, 0.0)
             )
@@ -1158,6 +1158,14 @@ class FakeApp:
         self.updated += 1
 
 
+def assert_house_label_on_layer_zero(created, text_height):
+    """Описание дома — MText в слое 0 высотой 1.667 от подписей; остальное — D-TOPO-TEXT."""
+    on_zero = [entity for entity in created if entity.Layer == "0"]
+    assert len(on_zero) == 1 and on_zero[0].ObjectName == "AcDbMText"
+    assert on_zero[0].Height == pytest.approx(1.667 * text_height)
+    assert {entity.Layer for entity in created if entity.Layer != "0"} == {"D-TOPO-TEXT"}
+
+
 def fake_autocad(snapshot, *, with_leader=True, font_scale=None):
     """Переносит синтетический чертёж в заглушку ModelSpace (как объекты AutoCAD)."""
     doc = FakeDoc(with_leader=with_leader, font_scale=font_scale)
@@ -1261,7 +1269,8 @@ def test_label_features_draws_into_d_topo_text(com):
     assert result.created_labels == 18
     assert (result.created_texts, result.created_mtexts, result.created_leaders) == (5, 13, 0)
     assert result.plan.text_height == pytest.approx(0.9)
-    assert {entity.Layer for entity in space.created} == {"D-TOPO-TEXT"}
+    # Все подписи — в D-TOPO-TEXT; описание дома — в слое 0, как у заказчика.
+    assert_house_label_on_layer_zero(space.created, result.plan.text_height)
     assert "D-TOPO-TEXT" in doc.Layers.items
     assert doc.undo_marks == ["start", "end"]
     assert app.updated == 1
@@ -1317,7 +1326,7 @@ def test_stafford_field_drawing_is_labeled_like_the_customer(com):
         "BRICK\\PSTEPS", "CONC. WALK",
         "C.L.F.\\PGATE", "V.FE.\\PGATE", "V.FE.\\PGATE", "V.FE.\\PGATE",
     ])
-    assert {e.Layer for e in space.created} == {"D-TOPO-TEXT"}
+    assert_house_label_on_layer_zero(space.created, result.plan.text_height)
     assert not [e for e in space.created if e.ObjectName in {"AcDbLeader", "AcDbPolyline"}]
     # Пробный текст измерения ширины шрифта создан и сразу удалён.
     assert [e.TextString for e in space.probes] == [ab.TEXT_WIDTH_PROBE]
@@ -1815,7 +1824,8 @@ def test_label_features_on_point_block_drawing_creates_labels(com):
     result = builder.label_features(house_text=ILION_HOUSE)
     created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
     assert result.created_labels == len(result.plan.items) > 20
-    assert created and {e.Layer for e in created} == {"D-TOPO-TEXT"}
+    assert created
+    assert_house_label_on_layer_zero(created, result.plan.text_height)
     # Повторный запуск ничего не добавляет.
     again = builder.label_features(house_text=ILION_HOUSE)
     assert again.created_labels == 0

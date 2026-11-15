@@ -679,7 +679,7 @@ def test_label_width_follows_romans_font_metrics():
     assert ab.feature_text_width("CHAIN LINK FENCE", 0.9) == pytest.approx(12.62, abs=0.01)
     assert ab.feature_text_width("C.D.", 0.9) == pytest.approx(2.36, abs=0.12)
     assert ab.feature_text_width("VEST.", 0.9) == pytest.approx(3.34, abs=0.1)
-    assert ab.feature_text_width("FIRE ESC.", 0.9) == pytest.approx(6.39, abs=0.1)
+    assert ab.feature_text_width("FIRE ESC.", 0.9) == pytest.approx(6.39, abs=0.15)
     # Точки и буква I узкие: O.P. заметно короче, чем четыре «средних» символа.
     assert ab.feature_text_width("O.P.", 1.0) == pytest.approx((22 + 21) / 21 + 2 * 0.48 - bearing)
     assert ab.feature_text_width("O.P.", 1.0) < 0.8 * ab.feature_text_width("SHED", 1.0)

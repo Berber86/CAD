@@ -864,7 +864,11 @@ def labels_similar(existing_text: str, label: str, synonyms: Any = None) -> bool
     if not existing:
         return False
     # «C.L.F. GATE» — подпись калитки, а не забора из той же сетки.
-    if ("GATE" in existing) != ("GATE" in label_tokens(label)):
+    wanted_tokens = label_tokens(label)
+    if ("GATE" in existing) != ("GATE" in wanted_tokens):
+        return False
+    # «C.L.F. ATOP WALL» — подпись забора на стене, а не соседней стены «WALL».
+    if ("ATOP" in existing) != ("ATOP" in wanted_tokens):
         return False
     variants = [label]
     if isinstance(synonyms, dict):
@@ -2403,6 +2407,77 @@ def _extract_layer_shapes(
     return shapes
 
 
+def _ribbon_caps(
+    lines: Sequence[LineString], max_width: float, tolerance: float
+) -> list[LineString]:
+    """
+    Торцы стен, начерченных двумя параллельными линиями без замыкания.
+
+    Стена у дома или у границы участка часто снята только двумя длинными
+    сторонами: концы линий «висят». Два висящих конца разных линий, лежащие
+    напротив друг друга не дальше ``max_width``, соединяются отрезком — стена
+    становится замкнутой лентой, как и начерченная с торцами.
+    """
+    if max_width <= 0.0:
+        return []
+    reach = max(tolerance, 1e-6)
+    ends: list[tuple[tuple[float, float], tuple[float, float], int]] = []
+    for index, line in enumerate(lines):
+        coords = _clean_coords(line.coords)
+        if len(coords) < 2:
+            continue
+        ends.append((coords[0], coords[1], index))
+        ends.append((coords[-1], coords[-2], index))
+    everything = unary_union(list(lines)) if lines else None
+    dangling: list[tuple[tuple[float, float], tuple[float, float], int]] = []
+    for point, inner, index in ends:
+        # Конец «висит», если к нему не подходит никакая другая линия слоя.
+        touching = sum(
+            1 for other_index, other in enumerate(lines)
+            if other_index != index and other.distance(Point(point)) <= reach
+        )
+        if touching == 0:
+            dangling.append((point, inner, index))
+    caps: list[LineString] = []
+    used: set[int] = set()
+    for first in range(len(dangling)):
+        if first in used:
+            continue
+        (ax, ay), (aix, aiy), a_index = dangling[first]
+        a_dir = (aix - ax, aiy - ay)
+        a_len = math.hypot(*a_dir)
+        best: tuple[float, int] | None = None
+        for second in range(first + 1, len(dangling)):
+            if second in used:
+                continue
+            (bx, by), (bix, biy), b_index = dangling[second]
+            if b_index == a_index:
+                continue
+            gap = math.hypot(bx - ax, by - ay)
+            if gap > max_width or gap <= reach:
+                continue
+            b_dir = (bix - bx, biy - by)
+            b_len = math.hypot(*b_dir)
+            if a_len <= 0.0 or b_len <= 0.0:
+                continue
+            # Линии идут рядом в одну сторону, торец — поперёк них.
+            along = (a_dir[0] * b_dir[0] + a_dir[1] * b_dir[1]) / (a_len * b_len)
+            across = abs((bx - ax) * a_dir[0] + (by - ay) * a_dir[1]) / (gap * a_len)
+            if along < math.cos(math.radians(10.0)) or across > math.cos(math.radians(60.0)):
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, second)
+        if best is None:
+            continue
+        (bx, by), _inner, _index = dangling[best[1]]
+        cap = LineString([(ax, ay), (bx, by)])
+        if everything is not None and cap.crosses(everything):
+            continue
+        used.update({first, best[1]})
+        caps.append(cap)
+    return caps
+
+
 def _ribbon_side(polygon: Polygon, max_width: float) -> LineString | None:
     """
     Длинная сторона узкого контура-ленты (стена из двух параллельных линий).
@@ -2780,8 +2855,11 @@ def recognize_features(
     loose_points: list[PointCode] = []
     for layer in sorted(structure_lines):
         category = classifier.structure_category(layer) or "structure"
+        layer_lines = structure_lines[layer]
+        if category in ribbon_categories:
+            layer_lines = layer_lines + _ribbon_caps(layer_lines, ribbon_width, tolerance)
         shapes = _extract_layer_shapes(
-            structure_lines[layer],
+            layer_lines,
             tolerance=tolerance,
             min_width=min_width,
             pair_gap=(

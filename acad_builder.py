@@ -5742,7 +5742,7 @@ def feature_text_width(
     fcfg = fcfg or {}
     letter_scale = float(fcfg.get("char_width_factor") or 0.92) / 0.92
     space = float(fcfg.get("space_width_factor") or 1.0)
-    narrow = float(fcfg.get("narrow_char_width_factor") or 0.5)
+    narrow = float(fcfg.get("narrow_char_width_factor") or 0.48)
     narrow_chars = str(fcfg.get("narrow_chars") or ".,'`:;!|")
     display = re.sub(r"%%[dpc]", "°", str(text), flags=re.IGNORECASE)
     width = 0.0

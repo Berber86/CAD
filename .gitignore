@@ -15,3 +15,7 @@ config.local.json
 # дампы чертежей (inspect_dwg.py)
 *.dump.json
 *.dump.txt
+
+# кэш снимков участка (Google/Mapillary/ортофото) — см. docs/site_imagery_plan.md
+imagery_cache/
+*_site/

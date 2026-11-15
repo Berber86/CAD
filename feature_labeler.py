@@ -2934,9 +2934,47 @@ def recognize_features(
     _fences_atop_walls(result, wall_shapes, fcfg, new_id)
 
     # --- основной дом: текст из окна программы ------------------------------
+    # Дом блокированной застройки: замкнутого контура нет, дом — часть участка
+    # между линиями фасадов (боковые стены общие с соседями, идут по границам).
+    main_house = _select_main_house(house_candidates, boundary.polygon, classifier)
+    if main_house is None:
+        house_layers = sorted(
+            layer for layer in structure_lines
+            if classifier.structure_category(layer) == "house"
+        )
+        row_house = _row_house_polygon(
+            boundary.polygon,
+            [line for layer in house_layers for line in structure_lines[layer]],
+            [line for layer, lines in structure_lines.items() if layer not in house_layers
+             for line in lines]
+            + [line for lines in fence_lines.values() for line in lines]
+            + tread_lines,
+            min_area=max(50.0, 0.05 * boundary.polygon.area),
+        )
+        if row_house is not None:
+            border = row_house.exterior.buffer(0.3)
+            for wall_line in result.features:
+                if (
+                    wall_line.category == "house" and wall_line.kind == "edge"
+                    and not wall_line.label
+                    and wall_line.geometry.intersection(border).length >= 2.0
+                ):
+                    wall_line.skip_reason = ROW_HOUSE_WALL_REASON
+            main_house = Feature(
+                feature_id=new_id(), kind="area", category="house",
+                layer=min(house_layers, key=classifier.structure_rank),
+                geometry=row_house, label=None, source=None, rule=ROW_HOUSE_RULE,
+                closed=False,
+            )
+            house_candidates.append(main_house)
+            result.features.append(main_house)
+            result.notes.append(
+                "замкнутого контура дома на участке нет — дом взят как часть участка "
+                f"между линиями стен ({row_house.area:.0f} sq ft, блокированная застройка)"
+            )
+
     house_label = _normalize_house_text(house_text)
     if house_label:
-        main_house = _select_main_house(house_candidates, boundary.polygon, classifier)
         if main_house is None:
             house_layers = ", ".join(
                 _as_patterns((fcfg.get("structure_layers") or {}).get("house"))
@@ -2994,6 +3032,90 @@ def _normalize_house_text(text: str) -> str:
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\P", "\n")
     lines = [re.sub(r"\s+", " ", line).strip() for line in raw.split("\n")]
     return "\n".join(line for line in lines if line)
+
+
+ROW_HOUSE_RULE = "дом во всю ширину участка: между линиями стен и границами участка"
+ROW_HOUSE_WALL_REASON = "линия стены дома (контур дома замкнут границами участка)"
+
+
+def _extend_line(line: LineString, distance: float) -> LineString:
+    """Ломаная, продлённая с обоих концов на ``distance`` по направлению крайних звеньев."""
+    coords = _clean_coords(line.coords)
+    if len(coords) < 2 or distance <= 0.0:
+        return line
+
+    def beyond(end: tuple[float, float], inner: tuple[float, float]) -> tuple[float, float]:
+        length = math.hypot(end[0] - inner[0], end[1] - inner[1])
+        if length <= 0.0:
+            return end
+        return (
+            end[0] + (end[0] - inner[0]) / length * distance,
+            end[1] + (end[1] - inner[1]) / length * distance,
+        )
+
+    return LineString([beyond(coords[0], coords[1])] + coords + [beyond(coords[-1], coords[-2])])
+
+
+def _row_house_polygon(
+    lot: Polygon,
+    house_lines: Sequence[LineString],
+    other_lines: Sequence[LineString],
+    *,
+    min_area: float,
+    reach: float = 1.0,
+    quiet_margin: float = 1.5,
+) -> Polygon | None:
+    """
+    Контур дома блокированной застройки (row house).
+
+    Дом занимает участок во всю ширину: боковые стены — общие с соседями и идут
+    по боковым границам, отдельно не сняты; в слое строений есть только линии
+    переднего и заднего фасадов, пересекающие участок (и продолженные на
+    соседние дома). Такие линии делят участок на части; дом — часть, которая
+
+    * ограничена линиями фасадов не меньше чем с двух сторон и
+    * внутри пуста: ни заборов, ни стен, ни других снятых объектов (двор за
+      домом, наоборот, заполнен ими).
+
+    ``None`` — участок линиями строений не делится либо подходящей части нет.
+    """
+    if lot.is_empty or not house_lines:
+        return None
+    near = lot.buffer(reach)
+    cutters = [
+        _extend_line(chain, reach)
+        for chain in merge_lines([line for line in house_lines if line.intersects(near)], 0.0)
+        if chain.length >= 2.0
+    ]
+    if not cutters:
+        return None
+    try:
+        noded = unary_union([LineString(lot.exterior.coords)] + cutters)
+        faces = [face for face in polygonize(noded) if face.area >= min_area]
+    except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+        return None
+    inside = lot.buffer(0.05)
+    faces = [face for face in faces if inside.contains(face.representative_point())]
+    if not faces or (len(faces) == 1 and faces[0].area >= 0.98 * lot.area):
+        return None  # линии строений не делят участок
+    candidates: list[Polygon] = []
+    for face in faces:
+        border = face.exterior.buffer(0.3)
+        sides = sum(1 for cutter in cutters if cutter.intersection(border).length >= 2.0)
+        if sides < 2:
+            continue
+        core = face.buffer(-quiet_margin)
+        if core.is_empty:
+            continue
+        busy = sum(
+            line.intersection(core).length for line in other_lines if line.intersects(core)
+        )
+        if busy > 0.5:
+            continue
+        candidates.append(face)
+    if not candidates:
+        return None
+    return _normalize_polygon(max(candidates, key=lambda face: face.area))
 
 
 def _select_main_house(

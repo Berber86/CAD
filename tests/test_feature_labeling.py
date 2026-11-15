@@ -257,6 +257,142 @@ def labels_of(result, layer):
     return sorted(str(f.label) for f in result.features if f.layer == layer)
 
 
+# ------------------------------------- масштаб типа линий заборов (3.6)
+
+def test_fence_linetype_scale_follows_the_customer_rule():
+    """Правило заказчика: короткий отрезок — по длине, 8–10 ft — половина, остальное — 5."""
+    fcfg = fl.feature_settings({})
+    fence = fl.fence_linetype_rule("S-FENCE", fcfg)
+    rail = fl.fence_linetype_rule("s-fence-rail", fcfg)
+    assert (fence["fixed"], fence["divisor"]) == (5.0, 1.0)
+    assert (rail["fixed"], rail["divisor"]) == (0.62, 8.06)
+
+    def value(length, rule=fence, **kwargs):
+        return fl.fence_linetype_scale(length, rule, fcfg, base_scale=16.0, **kwargs)[0]
+
+    # короче 5 ft — масштаб равен длине, вниз до сотой (иначе крестика не видно)
+    assert value(4.999) == 4.99
+    assert value(4.5) == 4.5
+    assert value(0.5) == 0.5
+    # от 8 до 10 ft — половина длины (при масштабе 5 видно одно перекрестие, просятся два)
+    assert value(9.15) == 4.57  # 9.15 / 2 = 4.575, вниз
+    assert value(8.0) == 4.0
+    assert value(10.0) == 5.0
+    # остальные — масштаб слоя по умолчанию, 5
+    assert value(5.0) == 5.0  # ровно 5 — уже не «меньше 5»
+    assert value(7.99) == 5.0
+    assert value(10.01) == 5.0
+    assert value(40.0) == 5.0
+    # S-FENCE-RAIL: те же условия, но результат делён на 8.06 и тоже вниз до сотой
+    assert value(12.0, rail) == 0.62
+    assert value(4.5, rail) == 0.55  # 4.5 / 8.06 = 0.5583 → 0.55
+    assert value(9.15, rail) == 0.56  # 4.57 / 8.06 = 0.567 → 0.56
+    assert value(8.0, rail) == 0.49  # 4.0 / 8.06 = 0.4963 → 0.49
+    # другой масштаб чертежа: всё умножено на scale / 16 (как высоты текста)
+    assert value(4.999, scale=20) == 6.2375  # 4.99 × 1.25
+    assert value(12.0, rail, scale=20) == 0.775  # 0.62 × 1.25
+    # чужой слой правилом не считается: подписи и граница не трогаются
+    assert fl.fence_linetype_rule("FENCE", fcfg) is None
+    assert fl.fence_linetype_rule("PROPERTY_LINE", fcfg) is None
+    # шаблон в правилах тоже работает, если его вписали в config.json
+    wild = fl.feature_settings({"feature_labeling": {"linetype_scale_rules": {"S-FENCE*": {"fixed": 4.0}}}})
+    assert fl.fence_linetype_rule("S-FENCE-RAIL", wild)["fixed"] == 4.0
+
+
+def test_fence_linetype_plan_groups_segments_by_layer_and_reason():
+    plan = fl.fence_linetype_plan(
+        [
+            ("S-FENCE", 4.5), ("S-FENCE", 9.15), ("S-FENCE", 30.0), ("S-FENCE", 6.0),
+            ("S-FENCE-RAIL", 4.0), ("S-FENCE-RAIL", 12.0),
+            ("PROPERTY_LINE", 4.5),  # не забор — правила для слоя нет
+        ],
+        {},
+    )
+    assert (plan.count("S-FENCE", "short"), plan.count("S-FENCE", "halved"),
+            plan.count("S-FENCE", "fixed")) == (1, 1, 2)
+    assert (plan.count("S-FENCE-RAIL", "short"), plan.count("S-FENCE-RAIL", "fixed")) == (1, 1)
+    assert plan.changed == 6
+    text = "\n".join(plan.lines())
+    assert "МАСШТАБ ТИПА ЛИНИЙ ЗАБОРОВ" in text
+    assert "слой S-FENCE: изменён у 4 отрезков" in text
+    assert "короче 5 ft: 1 (4.5' → 4.5)" in text
+    assert "8–10 ft: 1 (9.15' → 4.57)" in text
+    assert "слой S-FENCE-RAIL: изменён у 2 отрезков" in text
+    assert "будет изменён" in "\n".join(plan.lines(dry_run=True))
+
+
+def test_fence_linetype_scale_is_written_into_autocad(com):
+    snap = fl.DrawingSnapshot(lines=[
+        fl.DrawingLine("S-FENCE", ((0.0, 0.0), (4.5, 0.0))),
+        fl.DrawingLine("S-FENCE", ((0.0, 10.0), (9.15, 10.0))),
+        fl.DrawingLine("S-FENCE", ((0.0, 20.0), (30.0, 20.0))),
+        fl.DrawingLine("S-FENCE-RAIL", ((0.0, 30.0), (12.0, 30.0))),
+        fl.DrawingLine("S-FENCE-RAIL", ((0.0, 34.0), (4.0, 34.0))),
+        fl.DrawingLine("PROPERTY_LINE", ((0.0, 40.0), (3.0, 40.0))),
+    ])
+    builder, _app, doc = com(snap)
+    plan = builder.apply_fence_linetype_scales(doc)
+    values = {round(entity.LinetypeScale, 4) for entity in doc.ModelSpace.entities
+              if entity.Layer == "S-FENCE"}
+    assert values == {4.5, 4.57, 5.0}
+    rail = sorted(round(entity.LinetypeScale, 4) for entity in doc.ModelSpace.entities
+                  if entity.Layer == "S-FENCE-RAIL")
+    assert rail == [0.49, 0.62]
+    assert not hasattr(next(
+        entity for entity in doc.ModelSpace.entities if entity.Layer == "PROPERTY_LINE"
+    ), "LinetypeScale")  # чужой слой не тронут
+    assert plan.changed == 5 and plan.failed == []
+
+    # Второй прогон ничего не меняет: масштабы уже стоят нужные.
+    again = builder.apply_fence_linetype_scales(doc)
+    assert again.changed == 0 and again.unchanged == 5
+
+
+def test_fence_linetype_scale_changes_with_the_drawing_scale(com):
+    snap = fl.DrawingSnapshot(lines=[fl.DrawingLine("S-FENCE", ((0.0, 0.0), (4.5, 0.0)))])
+    builder, _app, doc = com(snap)
+    plan = builder.apply_fence_linetype_scales(doc, scale=20.0)
+    assert plan.factor == pytest.approx(1.25)
+    assert doc.ModelSpace.entities[0].LinetypeScale == pytest.approx(5.625)  # 4.5 × 1.25
+    assert "рисунок ×1.25" in "\n".join(plan.lines())
+
+
+def test_fence_linetype_scale_reports_a_locked_layer(com):
+    snap = fl.DrawingSnapshot(lines=[fl.DrawingLine("S-FENCE", ((0.0, 0.0), (4.5, 0.0)))])
+
+    class Locked(FakeEntity):
+        def __setattr__(self, name, value):
+            if name == "LinetypeScale":
+                raise RuntimeError("слой заблокирован")
+            super().__setattr__(name, value)
+
+    builder, _app, doc = com(snap)
+    doc.ModelSpace.entities[0].__class__ = Locked
+    plan = builder.apply_fence_linetype_scales(doc)
+    assert plan.changed == 0 and len(plan.failed) == 1
+    assert "слой S-FENCE, отрезок 4.50 ft" in plan.failed[0]
+    assert "ОШИБКА" in "\n".join(plan.lines())
+
+
+def test_step2_fixes_fence_linetype_scale_and_says_so(com):
+    """Шаг 2 правит масштаб типа линий заборов вместе с подписями (и в пробном расчёте)."""
+    builder, app, doc = com(load_ilion())
+    fences = [entity for entity in doc.ModelSpace.entities
+              if entity.Layer == "S-FENCE" and entity.ObjectName == "AcDbLine"]
+    assert fences, "в чертеже Ilion есть линии забора S-FENCE"
+    probe = builder.label_features(house_text=ILION_HOUSE, scale=16.0, dry_run=True)
+    assert probe.linetype is not None and probe.linetype.changed == len(fences)
+    assert all(not hasattr(entity, "LinetypeScale") for entity in fences)  # пробный расчёт не меняет
+    assert "будет изменён" in probe.report()
+
+    result = builder.label_features(house_text=ILION_HOUSE, scale=16.0)
+    assert result.failed == []
+    assert result.linetype is not None and result.linetype.changed == len(fences)
+    assert all(hasattr(entity, "LinetypeScale") for entity in fences)
+    assert "МАСШТАБ ТИПА ЛИНИЙ ЗАБОРОВ" in result.report()
+    assert "Масштаб типа линий заборов — S-FENCE:" in result.summary()
+
+
 # ----------------------------------------------------------------- настройки
 
 def test_shipped_config_mirrors_feature_defaults():

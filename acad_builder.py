@@ -43,10 +43,15 @@ from feature_labeler import (
     DrawingText,
     Feature,
     FeatureLabelError,
+    FenceLinetypeItem,
+    FenceLinetypePlan,
     LayerClassifier,
     RecognitionResult,
     SurveyPoint,
     feature_settings,
+    fence_linetype_plan,
+    fence_linetype_rule,
+    fence_linetype_scale,
     find_property_polygon,
     is_north_arrow_block,
     is_file_reference,
@@ -3334,8 +3339,101 @@ class AcadBuilder:
                 warning += " (" + "; ".join(errors) + ")"
         return polyline, warning, False
 
+    @staticmethod
+    def _entity_segment_lengths(entity: Any, kind: str) -> list[float]:
+        """Длины сегментов линейного объекта (у ``AcDbLine`` — одна)."""
+        geometry = AcadBuilder._entity_polyline(entity, kind)
+        if geometry is None:
+            return []
+        points, closed = geometry
+        if len(points) < 2:
+            return []
+        pairs = list(zip(points, points[1:])) + ([(points[-1], points[0])] if closed else [])
+        lengths = [
+            math.hypot(end[0] - start[0], end[1] - start[1]) for start, end in pairs
+        ]
+        return [length for length in lengths if length > 1e-6]
+
+    def apply_fence_linetype_scales(
+        self,
+        doc: Any,
+        *,
+        scale: float | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> FenceLinetypePlan:
+        """
+        Правит масштаб типа линий (``LinetypeScale``) у линий заборов.
+
+        Правило заказчика: на слое ``S-FENCE`` забор чертится с масштабом типа
+        линий 5; у отрезка короче 5 ft при этом не видно ни одного перекрестия,
+        а на 8–10 ft просятся два вместо одного. Поэтому короткому отрезку
+        масштаб ставится равным его длине, отрезку 8–10 ft — половине длины, а
+        остальным — масштаб слоя (``linetype_scale_rules``). У ``S-FENCE-RAIL``
+        узор мельче в 8.06 раза: там те же условия, но результат делится на
+        8.06, а по умолчанию стоит 0.62. Правила даны для 1"=16'; для другого
+        масштаба чертежа масштаб типа линий умножается на scale / 16.
+
+        Меняются только свойства объектов — геометрия, слои и подписи не
+        трогаются. У полилинии масштаб один на весь объект: он считается по
+        самому короткому сегменту, иначе на коротком участке крестик пропадёт.
+        """
+        fcfg = feature_settings(self.cfg)
+        base_scale = float(self.drawing_cfg.get("base_scale", 16.0) or 16.0)
+        plan = FenceLinetypePlan(scale=float(scale or base_scale), base_scale=base_scale)
+        if not fcfg.get("linetype_scale_rules"):
+            return plan
+        try:
+            model_space = doc.ModelSpace
+        except Exception as exc:  # noqa: BLE001
+            plan.failed.append(f"не удалось получить ModelSpace: {exc}")
+            return plan
+        for entity in self._iter_com(model_space):
+            if should_continue is not None and not should_continue():
+                raise AcadBuilderError("операция отменена: чертёж не изменён")
+            try:
+                layer = str(entity.Layer)
+            except Exception:  # noqa: BLE001 - прокси-объекты
+                continue
+            rule = fence_linetype_rule(layer, fcfg)
+            if rule is None:
+                continue
+            try:
+                kind = str(entity.ObjectName)
+                if kind not in _FEATURE_LINE_KINDS:
+                    continue  # блоки и тексты на слое забора — не линии
+                lengths = self._entity_segment_lengths(entity, kind)
+            except Exception:  # noqa: BLE001 - повреждённый примитив
+                lengths = []
+            if not lengths:
+                plan.skipped += 1
+                continue
+            length = min(lengths)
+            value, why = fence_linetype_scale(
+                length, rule, fcfg, scale=plan.scale, base_scale=base_scale
+            )
+            try:
+                current = float(getattr(entity, "LinetypeScale", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001 - свойства может не быть
+                current = 0.0
+            if abs(current - value) <= 1e-4:
+                plan.unchanged += 1
+                continue
+            try:
+                entity.LinetypeScale = value
+            except Exception as exc:  # noqa: BLE001 - слой заблокирован и т. п.
+                plan.failed.append(
+                    f"слой {layer}, отрезок {length:.2f} ft: не удалось задать "
+                    f"масштаб типа линий {value:g} — {exc}"
+                )
+                continue
+            plan.items.append(
+                FenceLinetypeItem(layer=layer, length_ft=length, value=value, why=why)
+            )
+        return plan
+
     def draw_feature_labels(
-        self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto"
+        self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto",
+        scale: float | None = None,
     ) -> FeatureLabelResult:
         """Создаёт запланированные подписи в целевом слое (одна отмена Undo на всё)."""
         fcfg = feature_settings(self.cfg)
@@ -3345,6 +3443,20 @@ class AcadBuilder:
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
         if not plan.items:
+            # Подписей нет — но масштаб типа линий заборов всё равно правится.
+            try:
+                doc.StartUndoMark()
+                undo = True
+            except Exception:  # noqa: BLE001 - группировка отмены не критична
+                undo = False
+            try:
+                result.linetype = self.apply_fence_linetype_scales(doc, scale=scale)
+            finally:
+                if undo:
+                    try:
+                        doc.EndUndoMark()
+                    except Exception:  # noqa: BLE001
+                        pass
             return result
 
         style, result.text_style_native = self._label_text_style(doc)
@@ -3436,6 +3548,8 @@ class AcadBuilder:
                     result.created_labels += 1
                 except Exception as exc:  # noqa: BLE001
                     result.failed.append(f"не удалось создать подпись «{title}»: {exc}")
+            # Масштаб типа линий заборов — в том же Undo, что и подписи.
+            result.linetype = self.apply_fence_linetype_scales(doc, scale=scale)
         finally:
             if undo_open:
                 try:
@@ -3454,6 +3568,23 @@ class AcadBuilder:
             except Exception:  # noqa: BLE001 - перерисовка не критична
                 pass
         return result
+
+    @staticmethod
+    def _fence_segments(snapshot: DrawingSnapshot) -> list[tuple[str, float]]:
+        """Пары ``(слой, длина)`` по снимку — для пробного расчёта масштаба типа линий."""
+        segments: list[tuple[str, float]] = []
+        for line in snapshot.lines:
+            points = line.points or ()
+            if len(points) < 2:
+                continue
+            lengths = [
+                math.hypot(end[0] - start[0], end[1] - start[1])
+                for start, end in zip(points, points[1:])
+            ]
+            lengths = [length for length in lengths if length > 1e-6]
+            if lengths:
+                segments.append((str(line.layer), min(lengths)))
+        return segments
 
     def label_features(
         self,
@@ -3543,9 +3674,12 @@ class AcadBuilder:
                 result = FeatureLabelResult(
                     plan=plan, layer=plan.output_layer, mode=mode, dry_run=True
                 )
+                result.linetype = fence_linetype_plan(
+                    self._fence_segments(snapshot), self.cfg, scale=scale
+                )
             else:
                 notify(f"Создаю подписи в слое {plan.output_layer}: {len(plan.items)} шт.…")
-                result = self.draw_feature_labels(app, doc, plan, mode=mode)
+                result = self.draw_feature_labels(app, doc, plan, mode=mode, scale=scale)
                 if hide_field_notes is None:
                     hide_field_notes = bool(fcfg.get("hide_field_notes_after_labeling", False))
                 if hide_field_notes and recognition.by_notes > 0:
@@ -5847,6 +5981,8 @@ class FeatureLabelResult:
     hidden_layers: list[str] = field(default_factory=list)  # выключенные слои заметок
     #: текстовые стили, созданные программой (стиль описания дома RDS, если его не было)
     created_styles: list[str] = field(default_factory=list)
+    #: масштаб типа линий заборов (LinetypeScale): что изменено или что будет
+    linetype: FenceLinetypePlan | None = None
 
     @property
     def recognition(self) -> RecognitionResult:
@@ -5870,7 +6006,8 @@ class FeatureLabelResult:
 
     @property
     def has_issues(self) -> bool:
-        return bool(self.failed or self.warnings or self.plan.warnings)
+        linetype_errors = bool(self.linetype is not None and self.linetype.failed)
+        return bool(self.failed or self.warnings or self.plan.warnings or linetype_errors)
 
     def summary(self) -> str:
         rec = self.recognition
@@ -5886,6 +6023,8 @@ class FeatureLabelResult:
         ]
         if self.plan.duplicates:
             parts.append(f"пропущено уже подписанных: {len(self.plan.duplicates)}")
+        if self.linetype is not None and self.linetype.has_work():
+            parts.append(self.linetype.summary())
         if self.failed:
             parts.append(f"ошибок AutoCAD: {len(self.failed)}")
         return ". ".join(parts) + "."
@@ -6053,6 +6192,10 @@ class FeatureLabelResult:
         if problems:
             lines += ["", "Предупреждения:"]
             lines += [f"  ! {problem}" for problem in problems]
+        if self.linetype is not None:
+            section = self.linetype.lines(dry_run=self.dry_run)
+            if section:
+                lines += [""] + section
         return "\n".join(lines)
 
 

@@ -65,8 +65,12 @@ __all__ = [
     "PointCode",
     "PropertyBoundary",
     "RecognitionResult",
+    "FenceLinetypeItem",
+    "FenceLinetypePlan",
     "bridge_gaps",
     "feature_settings",
+    "fence_linetype_plan",
+    "fence_linetype_scale",
     "find_property_polygon",
     "label_tokens",
     "labels_similar",
@@ -578,6 +582,26 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: забор перед красной линией в створе участка (палисадник, приямок) — свой:
     #: одна подпись на длинной стороне, со стороны улицы; глубина полосы, ft
     "front_yard_depth_ft": 15.0,
+    # --- масштаб типа линий (LinetypeScale) для линий заборов -----------------
+    #: Правила заказчика по слоям. ``fixed`` — масштаб типа линий, с которым
+    #: забор чертится всегда (он же — для отрезков, не попавших под особые
+    #: условия); ``divisor`` — во сколько раз узор этого слоя мельче забора
+    #: (у S-FENCE-RAIL крестики нарисованы в 8.06 раза чаще, поэтому его
+    #: значения — это значения S-FENCE, делённые на 8.06).
+    "linetype_scale_rules": {
+        "S-FENCE": {"fixed": 5.0, "divisor": 1.0},
+        "S-FENCE-RAIL": {"fixed": 0.62, "divisor": 8.06},
+    },
+    #: отрезок короче этого — масштаб равен его длине: иначе на нём не видно ни
+    #: одного крестика. Округление вниз до одной сотой.
+    "linetype_scale_short_below_ft": 5.0,
+    #: отрезок в этом промежутке (включительно) — половина его длины: при
+    #: масштабе 5 на нём видно одно перекрестие, а просятся два.
+    "linetype_scale_halve_from_ft": 8.0,
+    "linetype_scale_halve_to_ft": 10.0,
+    #: Особые условия даны для масштаба чертежа 1"=16' (``drawing.base_scale``);
+    #: для другого масштаба масштаб типа линий умножается на scale / 16 —
+    #: так же, как высоты текста.
 }
 
 
@@ -601,6 +625,222 @@ def feature_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
                 continue
             result[key] = copy.deepcopy(value)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Масштаб типа линий забора (LinetypeScale по каждому отрезку)
+# ---------------------------------------------------------------------------
+
+def _segments_word(count: int) -> str:
+    """«у 1 отрезка / у 2 отрезков / у 21 отрезка» — родительный падеж для отчёта."""
+    return "отрезка" if count % 10 == 1 and count % 100 != 11 else "отрезков"
+
+
+def _floor_hundredths(value: float) -> float:
+    """Округление ВНИЗ до одной сотой (как просит заказчик: 4.999 → 4.99)."""
+    return math.floor(float(value) * 100.0 + 1e-9) / 100.0
+
+
+def fence_linetype_rule(layer: str, fcfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Правило слоя из ``linetype_scale_rules`` (точное имя или шаблон ``*``), иначе ``None``."""
+    rules = fcfg.get("linetype_scale_rules") or {}
+    if not isinstance(rules, dict) or not layer:
+        return None
+    if layer in rules and isinstance(rules[layer], dict):
+        return rules[layer]
+    upper = layer.upper()
+    for name, rule in rules.items():
+        if isinstance(rule, dict) and str(name).upper() == upper:
+            return rule
+    for name, rule in rules.items():
+        if isinstance(rule, dict) and layer_matches(layer, [name]):
+            return rule
+    return None
+
+
+def fence_linetype_scale(
+    length_ft: float,
+    rule: dict[str, Any],
+    fcfg: dict[str, Any],
+    *,
+    scale: float | None = None,
+    base_scale: float | None = None,
+) -> tuple[float, str]:
+    """
+    Масштаб типа линий для одного отрезка забора: ``(значение, почему)``.
+
+    Правило заказчика (масштаб 1"=16'):
+
+    * отрезок короче 5 ft — масштаб равен длине (вниз до 0.01): при масштабе 5
+      крестиков на нём не видно вообще;
+    * отрезок от 8 до 10 ft — половина длины: при масштабе 5 видно одно
+      перекрестие, а для забора просятся два;
+    * остальные — масштаб слоя по умолчанию (``fixed``: 5 у S-FENCE, 0.62 у
+      S-FENCE-RAIL, где узор мельче в 8.06 раза).
+
+    Для слоя с ``divisor`` > 1 (S-FENCE-RAIL) посчитанное значение делится на
+    него и снова округляется вниз до сотой: «те же условия, но результат
+    разделён на 8.06» (4.5 ft → 4.5 / 8.06 = 0.5583 → 0.55). Для другого
+    масштаба чертежа всё умножается на ``scale / base_scale``.
+    """
+    fixed = float(rule.get("fixed", 0.0) or 0.0)
+    divisor = float(rule.get("divisor", 1.0) or 1.0)
+    if divisor <= 0:
+        divisor = 1.0
+    short = float(fcfg.get("linetype_scale_short_below_ft", 5.0) or 0.0)
+    halve_from = float(fcfg.get("linetype_scale_halve_from_ft", 8.0) or 0.0)
+    halve_to = float(fcfg.get("linetype_scale_halve_to_ft", 10.0) or 0.0)
+    length = max(0.0, float(length_ft))
+    if short > 0 and length < short:
+        value, why = _floor_hundredths(length) / divisor, "short"
+    elif halve_from > 0 and halve_from <= length <= halve_to:
+        value, why = _floor_hundredths(length / 2.0) / divisor, "halved"
+    else:
+        value, why = fixed, "fixed"
+    if why != "fixed" and divisor > 1:
+        # «результат разделён на 8.06» — и тоже вниз до сотой (ответ заказчика):
+        # 4.5 ft на S-FENCE-RAIL → 4.5 / 8.06 = 0.5583 → 0.55.
+        value = _floor_hundredths(value)
+    factor = 1.0
+    if scale and base_scale and float(base_scale) > 0:
+        factor = float(scale) / float(base_scale)
+    return round(value * factor, 4), why
+
+
+@dataclass
+class FenceLinetypeItem:
+    """Один отрезок забора и масштаб типа линий, который ему положен."""
+
+    layer: str
+    length_ft: float
+    value: float
+    why: str  # "short" | "halved" | "fixed"
+
+
+@dataclass
+class FenceLinetypePlan:
+    """Что программа сделает с масштабом типа линий заборов (или уже сделала)."""
+
+    items: list[FenceLinetypeItem] = field(default_factory=list)
+    #: отрезки, которым масштаб не понадобился: уже стоит нужный
+    unchanged: int = 0
+    #: объекты слоя, длину которых прочитать не удалось
+    skipped: int = 0
+    failed: list[str] = field(default_factory=list)
+    scale: float = 16.0
+    base_scale: float = 16.0
+
+    @property
+    def changed(self) -> int:
+        """Сколько отрезков получат новый масштаб (в пробном расчёте — получат)."""
+        return len(self.items)
+
+    @property
+    def factor(self) -> float:
+        """Коэффициент масштаба чертежа против 1"=16' (для других масштабов)."""
+        return self.scale / self.base_scale if self.base_scale > 0 else 1.0
+
+    def by_layer(self) -> dict[str, list[FenceLinetypeItem]]:
+        found: dict[str, list[FenceLinetypeItem]] = {}
+        for item in self.items:
+            found.setdefault(item.layer, []).append(item)
+        return found
+
+    def count(self, layer: str, why: str) -> int:
+        return sum(1 for item in self.items if item.layer == layer and item.why == why)
+
+    def has_work(self) -> bool:
+        return bool(self.items or self.failed)
+
+    def summary(self) -> str:
+        """Строка для статуса и журнала: «S-FENCE: 6 из 24 отрезков»."""
+        if not self.items:
+            return "масштаб типа линий заборов менять не нужно"
+        parts = [
+            f"{layer}: {len(items)} из {len(items) + self.unchanged}"
+            for layer, items in sorted(self.by_layer().items())
+        ]
+        return "Масштаб типа линий заборов — " + ", ".join(parts) + " отрезков"
+
+    def _examples(self, items: Sequence[FenceLinetypeItem], limit: int = 3) -> str:
+        shown = [
+            f"{round(item.length_ft, 3):g}' → {item.value:g}" for item in items[:limit]
+        ]
+        rest = len(items) - len(shown)
+        return ", ".join(shown) + (f" и ещё {rest}" if rest > 0 else "")
+
+    def lines(self, *, dry_run: bool = False) -> list[str]:
+        """Подробные строки отчёта Шага 2 (по слоям и условиям правила)."""
+        if not self.items and not self.failed and not self.skipped:
+            if self.unchanged:
+                return [
+                    "МАСШТАБ ТИПА ЛИНИЙ ЗАБОРОВ: уже стоит как нужно у "
+                    f"{self.unchanged} {_segments_word(self.unchanged)} "
+                    "(правила заказчика по длине отрезка)"
+                ]
+            return []
+        verb = "будет изменён" if dry_run else "изменён"
+        out = [
+            "МАСШТАБ ТИПА ЛИНИЙ ЗАБОРОВ (LinetypeScale у каждого отрезка): короче "
+            "5 ft — равен длине отрезка, 8–10 ft — половина длины, остальные — "
+            "масштаб слоя по умолчанию; всё вниз до 0.01"
+            + (
+                f"; правила даны для 1\"=16', рисунок ×{self.factor:g} под этот масштаб"
+                if abs(self.factor - 1.0) > 1e-9 else ""
+            )
+        ]
+        for layer, items in sorted(self.by_layer().items()):
+            counts: list[str] = []
+            for why, title in (("short", "короче 5 ft"), ("halved", "8–10 ft")):
+                group = [item for item in items if item.why == why]
+                if group:
+                    counts.append(f"{title}: {len(group)} ({self._examples(group)})")
+            fixed = [item for item in items if item.why == "fixed"]
+            if fixed:
+                counts.append(f"по умолчанию: {len(fixed)} ({self._examples(fixed)})")
+            text = f"  • слой {layer}: {verb} у {len(items)} {_segments_word(len(items))}"
+            if counts:
+                text += " — " + "; ".join(counts)
+            if self.unchanged:
+                text += f"; уже стоял нужный у {self.unchanged}"
+            out.append(text)
+        if self.skipped:
+            out.append(
+                f"  • не удалось прочитать длину объектов слоя забора: {self.skipped} "
+                "(масштаб типа линий у них не тронут)"
+            )
+        for message in self.failed:
+            out.append(f"  • ОШИБКА: {message}")
+        return out
+
+
+def fence_linetype_plan(
+    segments: Iterable[tuple[str, float]],
+    cfg: dict[str, Any] | None,
+    *,
+    scale: float | None = None,
+) -> FenceLinetypePlan:
+    """
+    Пробный расчёт масштаба типа линий заборов по снимку чертежа.
+
+    ``segments`` — пары ``(слой, длина отрезка в футах)``; для полилинии
+    передаётся длина её самого короткого сегмента: у полилинии масштаб типа
+    линий один на весь объект, и по короткому сегменту крестик будет виден на
+    всех.
+    """
+    fcfg = feature_settings(cfg)
+    drawing = (cfg or {}).get("drawing", {}) if isinstance(cfg, dict) else {}
+    base_scale = float(drawing.get("base_scale", 16.0) or 16.0) if isinstance(drawing, dict) else 16.0
+    plan = FenceLinetypePlan(scale=float(scale or base_scale), base_scale=base_scale)
+    for layer, length in segments:
+        rule = fence_linetype_rule(layer, fcfg)
+        if rule is None:
+            continue
+        value, why = fence_linetype_scale(
+            length, rule, fcfg, scale=scale, base_scale=base_scale
+        )
+        plan.items.append(FenceLinetypeItem(layer=layer, length_ft=float(length), value=value, why=why))
+    return plan
 
 
 def _north_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:

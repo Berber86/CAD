@@ -101,6 +101,10 @@ def _user32():  # noqa: ANN202 - ctypes object
         user32.GetForegroundWindow.restype = wintypes.HWND
         user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
         user32.ShowWindow.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+        user32.BringWindowToTop.restype = wintypes.BOOL
         user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
         user32.SetForegroundWindow.restype = wintypes.BOOL
         user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
@@ -206,14 +210,49 @@ def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None) -> Op
     return None
 
 
-def foreground(handle: int) -> bool:
-    """Активирует конкретно найденное окно браузера и подтверждает фокус."""
+def foreground(handle: int, *, timeout: float = 1.5) -> bool:
+    """Activate the exact supported browser and wait for Windows to grant focus."""
+    if not any(
+        window.handle == int(handle)
+        and is_supported_browser(window.executable, window.image_path)
+        for window in list_windows()
+    ):
+        return False
     user32 = _user32()
     if user32 is None:
         return False
     try:
-        user32.ShowWindow(handle, 9)  # SW_RESTORE, только после строгой проверки браузера
-        user32.SetForegroundWindow(handle)
+        # Do not restore a maximized browser to its small remembered window size on
+        # every keystroke. Restore only when minimized, then retry activation briefly:
+        # Windows can defer SetForegroundWindow while the caller is a worker thread.
+        if user32.IsIconic(handle):
+            user32.ShowWindow(handle, 9)  # SW_RESTORE
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            user32.BringWindowToTop(handle)
+            user32.SetForegroundWindow(handle)
+            if int(user32.GetForegroundWindow()) == int(handle):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def maximize_browser_window(handle: int) -> bool:
+    """Maximize a verified supported-browser window without opening another tab/window."""
+    if not any(
+        window.handle == int(handle)
+        and is_supported_browser(window.executable, window.image_path)
+        for window in list_windows()
+    ):
+        return False
+    user32 = _user32()
+    if user32 is None:
+        return False
+    try:
+        user32.ShowWindow(handle, 3)  # SW_MAXIMIZE
         return int(user32.GetForegroundWindow()) == int(handle)
     except Exception:  # noqa: BLE001
         return False

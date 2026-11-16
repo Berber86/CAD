@@ -100,6 +100,7 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
     monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _handle: (0, 0, 1000, 800))
     clicks = []
     keys = []
@@ -159,6 +160,7 @@ def test_portal_driver_stops_on_challenge_without_keypress(tmp_path, monkeypatch
     monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
     monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _handle, path: Path(path))
     monkeypatch.setattr(
         nyc_portal, "_screen_ocr",
@@ -180,6 +182,7 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _handle: (0, 0, 1000, 800))
     typed = []
     key_events = []
@@ -261,6 +264,7 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
     monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _handle: (0, 0, 1000, 800))
     clicks, keys = [], []
     waits = []

@@ -158,3 +158,57 @@ def test_portal_click_requires_the_selected_browser_to_be_foreground(monkeypatch
     monkeypatch.setattr(browser_save, "active_window_handle", lambda: 99)
     assert not browser_save.click_browser_window(10, 100, 200)
     assert calls == []
+
+
+def test_foreground_retries_until_windows_switches_to_verified_browser(monkeypatch):
+    import browser_save
+
+    calls = []
+    active = iter((99, 10))
+
+    class User32:
+        def IsIconic(self, handle):
+            assert handle == 10
+            return False
+
+        def BringWindowToTop(self, handle):
+            calls.append(("top", handle))
+            return True
+
+        def SetForegroundWindow(self, handle):
+            calls.append(("activate", handle))
+            return True
+
+        def GetForegroundWindow(self):
+            return next(active)
+
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [_yandex()])
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _delay: None)
+    assert browser_save.foreground(10, timeout=0.1)
+    assert calls == [("top", 10), ("activate", 10), ("top", 10), ("activate", 10)]
+
+
+def test_maximize_only_targets_a_verified_browser_window(monkeypatch):
+    import browser_save
+
+    shown = []
+
+    class User32:
+        def ShowWindow(self, handle, command):
+            shown.append((handle, command))
+            return True
+
+        def GetForegroundWindow(self):
+            return 10
+
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [_yandex()])
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    assert browser_save.maximize_browser_window(10)
+    assert shown == [(10, 3)]
+
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [
+        BrowserWindow(10, "Other", "notepad.exe", r"C:\Windows\notepad.exe")
+    ])
+    assert not browser_save.maximize_browser_window(10)
+    assert shown == [(10, 3)]

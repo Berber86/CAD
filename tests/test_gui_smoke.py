@@ -221,6 +221,11 @@ class _Widget:
             self._global_bindings = {}
         self._global_bindings[event_name] = callback
 
+    def bind_class(self, class_name, event_name, callback, *args, **kwargs):
+        if not hasattr(self, "_class_bindings"):
+            self._class_bindings = {}
+        self._class_bindings[(class_name, event_name)] = callback
+
     def transient(self, *args, **kwargs):
         return None
 
@@ -320,12 +325,24 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
 
 @pytest.fixture()
-def gui(monkeypatch):
+def gui(monkeypatch, tmp_path):
     for name, module in _fake_modules().items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.syspath_prepend(str(ROOT))
     monkeypatch.delitem(sys.modules, "main", raising=False)
     import main as gui_module  # noqa: PLC0415 - импорт после подмены модулей
+
+    # GUI now autosaves provider/model choices. Isolate those writes from the checked-in
+    # sample config while preserving its real defaults for every smoke test.
+    import llm_parser
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes((ROOT / "config.json").read_bytes())
+    local_config_path = tmp_path / "config.local.json"
+    env_path = tmp_path / ".env"
+    for module in (llm_parser, gui_module):
+        monkeypatch.setattr(module, "CONFIG_PATH", config_path)
+        monkeypatch.setattr(module, "LOCAL_CONFIG_PATH", local_config_path)
+        monkeypatch.setattr(module, "ENV_PATH", env_path)
 
     # В старых тестах выбор роли эмулируется текстовым переключателем; тесты
     # самого диалога и независимости ролей задают явный ответ отдельно.
@@ -3737,3 +3754,67 @@ def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_pa
     assert app._session_llm_calls == 1
     assert any("соседи слева/справа 68 / 72" in line for line in app._step0_lines)
     assert app.step0_run_button.cget("state") == "normal"
+
+
+def test_clipboard_shortcuts_paste_into_inputs_and_copy_selected_output(gui):
+    app = gui.SurveyApp()
+
+    class EntryWidget:
+        value = "old"
+        clipboard = "new address"
+
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "normal"
+
+        def clipboard_get(self):
+            return self.clipboard
+
+        def selection_present(self):
+            return True
+
+        def delete(self, _first, _last):
+            self.value = ""
+
+        def insert(self, _where, text):
+            self.value += text
+
+        def selection_get(self):
+            return "selected address"
+
+        def clipboard_clear(self):
+            self.clipboard = ""
+
+        def clipboard_append(self, text):
+            self.clipboard += text
+
+    entry = EntryWidget()
+    event = type("Event", (), {"widget": entry})()
+    assert gui.SurveyApp._paste_text_event(event) == "break"
+    assert entry.value == "new address"
+    assert gui.SurveyApp._copy_text_event(event) == "break"
+    assert entry.clipboard == "selected address"
+    assert ("Entry", "<Control-v>") in app._class_bindings
+    assert ("Text", "<Control-c>") in app._class_bindings
+
+
+def test_provider_and_model_preferences_autosave_and_survive_restart(gui, tmp_path, monkeypatch):
+    import llm_parser
+
+    config_path = tmp_path / "config.json"
+    local_path = tmp_path / "config.local.json"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_path)
+
+    first = gui.SurveyApp()
+    first.select_provider("OpenRouter")
+    first._on_model_selected("stepfun/step-3.5-flash:free")
+    first._on_close()
+
+    assert config_path.is_file()
+    second = gui.SurveyApp()
+    assert second.current_provider_id() == "openrouter"
+    assert second.current_model() == "stepfun/step-3.5-flash:free"
+    second._on_close()

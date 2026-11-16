@@ -24,6 +24,7 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 from datetime import datetime
 import json
@@ -628,6 +629,8 @@ class SurveyApp(ctk.CTk):
         }
 
         self._build_ui()
+        self._bind_text_clipboard_shortcuts()
+        self._bind_model_preference_autosave()
         self._bind_studio_shortcuts()
         self._refresh_height_label()
         self._refresh_provider_highlights()
@@ -1269,7 +1272,7 @@ class SurveyApp(ctk.CTk):
             button_color=THEME["btn_secondary"],
             button_hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(family="Consolas", size=11),
-            command=lambda val: self.pass2_model_var.set(str(val or "").strip()),
+            command=lambda val: self._on_pass_model_selected(2, val),
         )
         self.pass2_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
@@ -1297,7 +1300,7 @@ class SurveyApp(ctk.CTk):
             button_color=THEME["btn_secondary"],
             button_hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(family="Consolas", size=11),
-            command=lambda val: self.pass3_model_var.set(str(val or "").strip()),
+            command=lambda val: self._on_pass_model_selected(3, val),
         )
         self.pass3_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
@@ -4634,6 +4637,7 @@ class SurveyApp(ctk.CTk):
         self.pass2_model_combo.configure(values=models)
         self.pass2_model_var.set(chosen)
         self.pass2_model_combo.set(chosen)
+        self._persist_ai_preferences()
 
     def _on_pass3_provider_changed(self, selected_label: str) -> None:
         new_pid = self._label_to_pid.get(selected_label)
@@ -4645,6 +4649,7 @@ class SurveyApp(ctk.CTk):
         self.pass3_model_combo.configure(values=models)
         self.pass3_model_var.set(chosen)
         self.pass3_model_combo.set(chosen)
+        self._persist_ai_preferences()
 
     def select_pass2_target(
         self, provider_or_label: str, model: str | None = None
@@ -4695,12 +4700,14 @@ class SurveyApp(ctk.CTk):
         self.model_var.set(chosen)
         self.model_combo.set(chosen)
         self._refresh_provider_highlights()
+        self._persist_ai_preferences()
 
     def _on_model_selected(self, chosen_model: str) -> None:
         clean = str(chosen_model or "").strip()
         if clean:
             self.model_var.set(clean)
             self._selected_models[self._active_provider_id] = clean
+            self._persist_ai_preferences()
 
     def _refresh_provider_highlights(self) -> None:
         active = self._active_provider_id
@@ -4793,6 +4800,153 @@ class SurveyApp(ctk.CTk):
             append_fn(txt)
         self._set_status("📋 Техведомость участка (с невязкой, площадью и POB) скопирована в буфер обмена.")
         return txt
+
+    @staticmethod
+    def _paste_text_event(event: Any) -> str | None:
+        """Paste clipboard text into focused Tk Entry/Text widgets, replacing selection."""
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return None
+        widget_class = str(widget.winfo_class())
+        if widget_class not in {"Entry", "Text"}:
+            return None
+        try:
+            state = str(widget.cget("state"))
+            if state in {"disabled", "readonly"}:
+                return "break"
+            text = str(widget.clipboard_get())
+            if widget_class == "Entry":
+                if widget.selection_present():
+                    widget.delete("sel.first", "sel.last")
+                widget.insert("insert", text)
+            else:
+                selection = widget.tag_ranges("sel")
+                if selection:
+                    widget.delete(selection[0], selection[1])
+                widget.insert("insert", text)
+            return "break"
+        except Exception:  # noqa: BLE001 - empty clipboard or a widget without text support
+            return "break"
+
+    @staticmethod
+    def _copy_text_event(event: Any) -> str | None:
+        """Copy selected text from editable or read-only Tk Entry/Text widgets."""
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return None
+        widget_class = str(widget.winfo_class())
+        try:
+            if widget_class == "Entry":
+                if not widget.selection_present():
+                    return None
+                text = widget.selection_get()
+            elif widget_class == "Text":
+                selection = widget.tag_ranges("sel")
+                if not selection:
+                    return None
+                text = widget.get(selection[0], selection[1])
+            else:
+                return None
+            widget.clipboard_clear()
+            widget.clipboard_append(str(text))
+            return "break"
+        except Exception:  # noqa: BLE001 - no selection or clipboard unavailable
+            return None
+
+    def _bind_text_clipboard_shortcuts(self) -> None:
+        """Make paste/copy shortcuts consistent in all app Entry and Text controls."""
+        bind_class = getattr(self, "bind_class", None)
+        if not callable(bind_class):
+            return
+        for class_name in ("Entry", "Text"):
+            for sequence in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
+                bind_class(class_name, sequence, SurveyApp._paste_text_event)
+            for sequence in ("<Control-c>", "<Control-C>"):
+                bind_class(class_name, sequence, SurveyApp._copy_text_event)
+
+    def _bind_model_preference_autosave(self) -> None:
+        """Persist editable model names when a combobox loses focus or Enter is pressed."""
+        for slot, combo, variable in (
+            (1, self.model_combo, self.model_var),
+            (2, self.pass2_model_combo, self.pass2_model_var),
+            (3, self.pass3_model_combo, self.pass3_model_var),
+        ):
+            entry = getattr(combo, "_entry", None)
+            binder = getattr(entry, "bind", None)
+            if not callable(binder):
+                continue
+            callback = lambda event, slot=slot, variable=variable: self._commit_model_entry(
+                slot, variable, event,
+            )
+            binder("<FocusOut>", callback, add="+")
+            binder("<Return>", callback, add="+")
+
+    def _commit_model_entry(self, slot: int, variable: Any, event: Any = None) -> None:
+        widget = getattr(event, "widget", None)
+        getter = getattr(widget, "get", None)
+        value = str(getter() if callable(getter) else variable.get() or "").strip()
+        if value:
+            variable.set(value)
+            if slot == 1:
+                self._selected_models[self.current_provider_id()] = value
+            self._persist_ai_preferences()
+
+    def _persist_ai_preferences(self, *, report_error: bool = True) -> bool:
+        """Save provider/model selections without touching API keys or other settings."""
+        try:
+            cfg = copy.deepcopy(self.config_data)
+            api = cfg.setdefault("api", {})
+            active_pid = self.current_provider_id()
+            active_model = self.current_model()
+            if not active_model:
+                return True
+            self._selected_models[active_pid] = active_model
+            api["provider"] = active_pid
+            api["model"] = active_model
+            providers = api.setdefault("providers", {})
+            for pid, selected in self._selected_models.items():
+                model = str(selected or "").strip()
+                if not model:
+                    continue
+                provider_cfg = providers.setdefault(pid, {})
+                provider_cfg["selected_model"] = model
+                models = [str(value) for value in (provider_cfg.get("models") or [])]
+                if model not in models:
+                    provider_cfg["models"] = [model, *models]
+
+            pass2_pid = self.current_pass2_provider_id()
+            pass2_model = self.current_pass2_model()
+            pass3_pid = self.current_pass3_provider_id()
+            pass3_model = self.current_pass3_model()
+            for pid, model in ((pass2_pid, pass2_model), (pass3_pid, pass3_model)):
+                provider_cfg = providers.setdefault(pid, {})
+                models = [str(value) for value in (provider_cfg.get("models") or [])]
+                if model and model not in models:
+                    provider_cfg["models"] = [model, *models]
+            api["consensus"] = {
+                "passes": self.current_passes_count(),
+                "pass2_provider": pass2_pid,
+                "pass2_model": pass2_model,
+                "pass3_provider": pass3_pid,
+                "pass3_model": pass3_model,
+            }
+            save_config(cfg)
+            self.config_data = cfg
+            return True
+        except Exception as exc:  # noqa: BLE001 - retain UI operation if disk is read-only
+            if report_error:
+                self._set_status(
+                    f"Не удалось автоматически сохранить выбор провайдера/модели: {exc}. "
+                    "Откройте настройки и нажмите «Сохранить».",
+                    warn=True,
+                )
+            return False
+
+    def _on_pass_model_selected(self, slot: int, chosen_model: str) -> None:
+        value = str(chosen_model or "").strip()
+        if value:
+            (self.pass2_model_var if slot == 2 else self.pass3_model_var).set(value)
+            self._persist_ai_preferences()
 
     def _bind_studio_shortcuts(self) -> None:
         """Привязывает студийные горячие клавиши для быстрой повседневной работы."""
@@ -6089,6 +6243,7 @@ class SurveyApp(ctk.CTk):
 
     # -------------------------------------------------------------- helpers --
     def _on_close(self) -> None:
+        self._persist_ai_preferences(report_error=False)
         self._closing = True
         self._generation += 1
         try:

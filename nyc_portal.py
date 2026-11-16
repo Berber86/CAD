@@ -330,6 +330,10 @@ def _drive_portal(
         )
     window = _portal_window()
     _focus(window.handle)
+    maximize = getattr(browser_save, "maximize_browser_window", None)
+    if callable(maximize) and not maximize(window.handle):
+        raise PortalLookupError("Не удалось развернуть окно поддерживаемого браузера на весь экран.")
+    _focus(window.handle)
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
             progress("открываю NYC Property Information Portal в текущей вкладке браузера")

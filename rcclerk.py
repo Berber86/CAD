@@ -541,6 +541,10 @@ def _drop_our_pending(path: Path, downloads_dir: Path) -> None:
         return
 
 
+class DownloadStopped(Exception):
+    """Пользователь нажал «Стоп» во время ожидания загрузки — это не ошибка документа."""
+
+
 def download_with_fallback(
     endorsement_id: int | str,
     destination: str | Path,
@@ -553,6 +557,7 @@ def download_with_fallback(
     poll: float = 1.0,
     auto_save=None,
     on_step=None,
+    should_stop=None,
 ) -> tuple[Path, str]:
     """
     Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
@@ -578,6 +583,11 @@ def download_with_fallback(
         if on_step is not None:
             on_step(message)
 
+    def check_stop() -> None:
+        if should_stop is not None and should_stop():
+            raise DownloadStopped("остановлено пользователем")
+
+    check_stop()
     step("1/3 пробую скачать напрямую…")
     try:
         return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
@@ -611,6 +621,7 @@ def download_with_fallback(
 
     deadline = time.monotonic() + max(0.0, float(watch_timeout))
     while True:
+        check_stop()
         found = find_new_pdf(folder, since=since)
         if found is not None:
             shutil.copyfile(found, target)

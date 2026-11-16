@@ -126,7 +126,14 @@ def _default_downloader(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, 
     return rcclerk.download_with_fallback(row.endorsement_id, destination)
 
 
-def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, base_url: str = rcclerk.BASE_URL):
+def make_downloader(
+    *,
+    auto_save=None,
+    downloads_dir: str | Path | None = None,
+    base_url: str = rcclerk.BASE_URL,
+    progress: Progress | None = None,
+    should_stop: StopCheck | None = None,
+):
     """
     Загрузчик по лестнице; при поддержке Windows безопасно нажимает Ctrl+S в
     браузере только после того, как просмотрщик PDF уже загружен.
@@ -136,6 +143,10 @@ def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, 
         options: dict = {"base": base_url}
         if downloads_dir is not None:
             options["downloads_dir"] = downloads_dir
+        if progress is not None:
+            options["on_step"] = progress  # шаги лестницы видны в журнале Шага 0
+        if should_stop is not None:
+            options["should_stop"] = should_stop  # «Стоп» прерывает ожидание сразу
         if auto_save is not None:
             options["auto_save"] = auto_save
         return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
@@ -193,7 +204,8 @@ def collect_deeds(
 
     fetch = fetch_list or _default_fetch_list
     download = downloader or make_downloader(
-        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url
+        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url,
+        progress=progress, should_stop=should_stop,
     )
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
@@ -288,6 +300,8 @@ def _collect_one(
         raw = Path(tmp) / f"{name}.pdf"
         try:
             result = download(row, raw)
+        except rcclerk.DownloadStopped as exc:
+            raise IntakeCancelled(str(exc) or "сбор описаний остановлен") from exc
         except (rcclerk.CloudflareBlocked, rcclerk.ManualStepNeeded) as exc:
             missing.append(f"{name}: нужен ручной шаг — {exc}")
             return None

@@ -635,3 +635,52 @@ def test_description_search_uses_second_half_only_when_first_has_no_match(tmp_pa
     assert calls == [1, 2, 3, 4, 5]
     assert any("части 1/2" in line and "стр. 1–2" in line for line in progress)
     assert any("части 2/2" in line and "стр. 3–5" in line for line in progress)
+
+
+def test_stop_interrupts_the_browser_wait_at_once(tmp_path):
+    """«Стоп» во время ожидания Cloudflare/браузера прерывает ожидание, а не ждёт 300 с."""
+    import time
+
+    stop = {"flag": False}
+    steps: list[str] = []
+
+    def open_browser(url):
+        stop["flag"] = True  # пользователь нажал «Стоп», пока браузер открывается
+
+    started = time.monotonic()
+    with pytest.raises(rcclerk.DownloadStopped):
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=open_browser,
+            downloads_dir=tmp_path / "downloads",
+            watch_timeout=300.0, poll=0.05,
+            on_step=steps.append,
+            should_stop=lambda: stop["flag"],
+        )
+    assert time.monotonic() - started < 5.0
+    assert any("2/3" in step for step in steps)  # ступень браузера видна в журнале
+
+
+def test_stop_during_the_wait_is_a_clean_cancel_for_the_intake(tmp_path, monkeypatch):
+    """В сборе «Стоп» во время ожидания даёт IntakeCancelled, а не запись «не скачался»."""
+    import deed_intake
+
+    def stopping_downloader(row, destination):
+        raise rcclerk.DownloadStopped("остановлено пользователем")
+
+    outcome_missing: list[str] = []
+    with pytest.raises(deed_intake.IntakeCancelled):
+        deed_intake._collect_one(
+            block_no=5711, lot_value=34, role="our", row=_row_for_test(), tag="",
+            target_dir=tmp_path, base_url=rcclerk.BASE_URL,
+            download=stopping_downloader, find_pages=lambda pdf: None, ocr_dpi=200,
+            say=lambda message: None, missing=outcome_missing,
+        )
+    assert outcome_missing == []
+
+
+def _row_for_test():
+    import datetime as _dt
+
+    return rcclerk.DeedRow(endorsement_id=NEWEST_ID, doc_type="DEED", doc_date=_dt.date(2023, 9, 5))

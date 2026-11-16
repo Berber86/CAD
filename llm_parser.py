@@ -3773,6 +3773,14 @@ def _extract_streets(
         warnings.append("фасадная улица не распознана — подпись улицы не будет нанесена")
     if cross_street and distance_to_corner is None:
         warnings.append("пересекаемая улица найдена, но расстояние до угла не распознано")
+    if main_street and distance_to_corner is None and not re.search(
+        r"corner\s+formed|intersection\s+of", body, re.IGNORECASE
+    ):
+        # Без расстояния точка начала молча ставится к углу улицы — это надо сказать вслух.
+        warnings.append(
+            "расстояние от угла до точки начала не найдено — участок построен от угла улицы; "
+            "сверьте с документом"
+        )
     return main_street, cross_street, distance_to_corner, front_side, tie_note, warnings
 
 

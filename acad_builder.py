@@ -4741,6 +4741,10 @@ def _tie_geometry_note(main_plan: DrawPlan, nb_plan: DrawPlan) -> str | None:
     return msg
 
 
+#: Смещение точки POB, при котором разница румба улицы — пояснение, а не ошибка (≈ 1/4 дюйма).
+TIE_OFFSET_NOTE_FT = 0.02
+
+
 def _check_street_reference_and_frontage(
     main_plan: DrawPlan, nb_plan: DrawPlan
 ) -> tuple[str | None, str | None]:
@@ -4788,6 +4792,18 @@ def _check_street_reference_and_frontage(
                 tie_n.ns, tie_n.degrees, tie_n.minutes, tie_n.seconds, tie_n.ew
             )
             tie_diff_sec = abs(_signed_axis_diff_arcsec(az_tm, az_tn))
+            # Смещение конца привязки от разницы румба: 10″ на 161 ft — 0.008 ft, это не ошибка.
+            tie_len = max(dm.distance_to_corner_ft, dn.distance_to_corner_ft)
+            tie_offset_ft = tie_len * math.sin(math.radians(tie_diff_sec / 3600.0))
+            if tie_diff_sec > 2.0 and tie_offset_ft <= TIE_OFFSET_NOTE_FT:
+                note = (
+                    f"Румб линии улицы «{dm.main_street}» различается на "
+                    f"{_format_arcsec_dms(tie_diff_sec)} "
+                    f"({format_bearing(tie_m, use_control_code=False)} против "
+                    f"{format_bearing(tie_n, use_control_code=False)}): смещение точки POB "
+                    f"{tie_offset_ft:.3f} ft — незначимо; сверьте написание в актах"
+                )
+                return note, None
             if tie_diff_sec > 2.0:
                 msg = (
                     f"Румб красной линии улицы «{dm.main_street}» отличается на "
@@ -4854,6 +4870,8 @@ def verify_with_neighbors(
         # Ищем кандидатов в общие границы между основным участком и этим соседом
         candidates: list[tuple[float, float, int, int, dict[str, Any]]] = []
         continuation_bends: list[str] = []
+        #: Изломы, которые по смещению не значимы (≤ TIE_OFFSET_NOTE_FT): пояснение, не замечание.
+        continuation_notes: list[str] = []
 
         for i_m, bl_m in enumerate(main_plan.boundary_lines):
             dx_m = bl_m.end[0] - bl_m.start[0]
@@ -4958,12 +4976,23 @@ def verify_with_neighbors(
                 if corner_touch <= 0.5 and overlap_1d < 0.5 and 2.0 < axis_arcsec <= 10.0 * 3600.0:
                     seg_m_c = main_plan.description.segments[i_m]
                     seg_n_c = nb_plan.description.segments[j_n]
-                    continuation_bends.append(
-                        f"Излом на продолжении общей линии границ (наша сторона #{i_m + 1} "
-                        f"«{_segment_display_bearing(seg_m_c, bl_m)}» и сторона соседа #{j_n + 1} "
-                        f"«{_segment_display_bearing(seg_n_c, bl_n)}»): угловое расхождение "
-                        f"{_format_arcsec_dms(axis_arcsec)}!"
-                    )
+                    bend_len = max(len_m, len_n)
+                    bend_offset_ft = bend_len * math.sin(math.radians(axis_arcsec / 3600.0))
+                    if bend_offset_ft <= TIE_OFFSET_NOTE_FT:
+                        continuation_notes.append(
+                            f"Излом на продолжении общей линии (наша сторона #{i_m + 1} "
+                            f"«{_segment_display_bearing(seg_m_c, bl_m)}» и сторона соседа #{j_n + 1} "
+                            f"«{_segment_display_bearing(seg_n_c, bl_n)}»): угловое расхождение "
+                            f"{_format_arcsec_dms(axis_arcsec)}, смещение {bend_offset_ft:.3f} ft — "
+                            "незначимо; сверьте написание в актах"
+                        )
+                    else:
+                        continuation_bends.append(
+                            f"Излом на продолжении общей линии границ (наша сторона #{i_m + 1} "
+                            f"«{_segment_display_bearing(seg_m_c, bl_m)}» и сторона соседа #{j_n + 1} "
+                            f"«{_segment_display_bearing(seg_n_c, bl_n)}»): угловое расхождение "
+                            f"{_format_arcsec_dms(axis_arcsec)}!"
+                        )
 
         # Жадный выбор лучших попарных соответствий общих стен
         candidates.sort(key=lambda item: (item[0], item[1]))
@@ -5157,6 +5186,9 @@ def verify_with_neighbors(
         for bend_msg in continuation_bends:
             if bend_msg not in findings:
                 findings.append(bend_msg)
+        for note_msg in continuation_notes:
+            if note_msg not in findings:
+                findings.append(note_msg)
 
         if not shared_checks:
             if overlap_sqft > 0.5:

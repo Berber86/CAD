@@ -827,3 +827,75 @@ def test_advisor_asks_nothing_without_a_key_or_when_switched_off(gui, tmp_path, 
     assert "ИИ-советник: не запрошен — не задан API-ключ" not in app._pdf_set_report_window._report_text
     app._on_close()
 
+
+
+# ------------------------------------------- привязка к углу улицы (LOT 68 / OUR 70)
+
+STAFFORD_68 = (DATA / "stafford_lot68_legal.txt").read_text(encoding="utf-8")
+STAFFORD_70 = (DATA / "stafford_lot70_legal.txt").read_text(encoding="utf-8")
+STAFFORD_TIE_70 = (
+    "distant 201.00 feet southwesterly from the corner formed by the intersection of the "
+    "northwesterly side of Stafford Avenue and the southwesterly side of Carlton Boulevard"
+)
+
+
+def test_advisor_can_propose_the_distance_from_the_corner_and_the_gap_closes():
+
+    # OCR потерял расстояние до угла у нашего участка: участок построен от угла улицы.
+    lost_tie = STAFFORD_70.replace(STAFFORD_TIE_70, "at a point")
+    assert lost_tie != STAFFORD_70
+    assert _lot("our70", lost_tie, main=True).description.distance_to_corner_ft == 0.0
+
+    def advisor(_system, _user_text, _images):
+        return {
+            "analysis": "У участка L1 нет привязки к углу улицы.",
+            "proposals": [{
+                "lot": "L1", "title": "Привязка L1: 201.00 ft от угла",
+                "reason": "сосед L2 стоит на 161 ft, наш фасад начинается после него",
+                "source_lot": None, "source_quote": None,
+                "changes": [{"target": "tie", "bearing": "S 33°23'48\" W", "distance_ft": 201.0}],
+            }],
+        }, None
+
+    lots = [_lot("our70.pdf", lost_tie, main=True), _lot("lot68.pdf", STAFFORD_68)]
+    # Совет нужен явно: остаток здесь мягкий (расхождение румба), без force он не запрашивается.
+    before = _analyse(lots, advisor=advisor, force_advisor=True)
+    assert len(before.proposals) == 1
+    found = before.proposals[0]
+    assert (found.origin, found.kind, found.verdict) == ("ai", "advisor", "partial")
+    assert any("201" in c.describe() for c in found.changes), [c.describe() for c in found.changes]
+    assert found.before.overlap_sqft == pytest.approx(0.0, abs=0.5)
+    assert found.after.overlap_sqft == pytest.approx(0.0, abs=0.5)
+    # Разрыв до соседа уменьшился: это и есть основание принять совет.
+    assert found.after.gap_ft < found.before.gap_ft - 1.0
+
+    # Принятая правка действительно ставит расстояние и румб, а разрыв исчезает.
+    lots[0].fixes = (found,)
+    after = _analyse(lots)
+    assert not any("не имеет общей границы" in line for line in after.remaining), after.remaining
+    assert not any("минимальное расстояние" in line for line in after.remaining), after.remaining
+
+
+def test_distance_fix_is_applied_to_the_tie_not_to_a_side():
+    from conflict_resolver import Change, apply_changes
+
+    lost_tie = STAFFORD_70.replace(STAFFORD_TIE_70, "at a point")
+    model = _lot("our70", lost_tie, main=True).description
+    change = Change(target="tie", index=-1, field="distance", distance_ft=201.0)
+    fixed = apply_changes(model, [change])
+    assert fixed.distance_to_corner_ft == pytest.approx(201.0)
+    # Стороны участка не трогаются, исходное описание тоже.
+    assert [s.bearing_label for s in fixed.segments] == [s.bearing_label for s in model.segments]
+    assert model.distance_to_corner_ft == 0.0
+
+
+def test_ten_arcseconds_on_a_short_line_is_a_note_not_a_conflict():
+    """Регресс: 10″ на стороне 40 ft (0.002 ft) и на линии улицы 161 ft (0.008 ft) — пояснение, не ошибка."""
+    lots = [_lot("our70.pdf", STAFFORD_70, main=True), _lot("lot68.pdf", STAFFORD_68)]
+    analysis = _analyse(lots)
+    bend_or_tie = [line for line in analysis.remaining if "Излом" in line or "Румб" in line or "расходятся" in line]
+    # Если такие строки и остались в списке, они обязаны быть пояснениями «незначимо», а не ошибками.
+    assert all("незначимо" in line for line in bend_or_tie), bend_or_tie
+    assert not any("расходятся уже на линии улицы" in line for line in analysis.remaining), analysis.remaining
+    assert not any("не имеет общей границы" in line for line in analysis.remaining), analysis.remaining
+    assert not analysis.remaining_hard

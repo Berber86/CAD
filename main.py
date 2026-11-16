@@ -134,7 +134,7 @@ import ocr_pages
 import rcclerk
 from pdf_set import (
     CLOSURE_LIMIT_FT,
-    ESCALATION_DPI,
+    ESCALATION_DPIS,
     PdfSetItem,
     PdfSetJob,
     PdfSetResult,
@@ -7411,17 +7411,17 @@ class SurveyApp(ctk.CTk):
                                 last_exc = exc
 
                         if self._has_severe_shape_issues(best_plan, best_issues):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально на {ESCALATION_DPI} dpi…")
+                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально без кеша (до {max(ESCALATION_DPIS)} dpi)…")
                             # Реальная ступень 2: выбранные страницы, OCR, при пустом обходе — кусками 2×2.
                             # Ошибка не глотается: она попадает в отчёт и в причину отказа.
                             esc = escalate_ocr(
-                                job.path, job.source, dpi=ESCALATION_DPI,
+                                job.path, job.source,
                                 progress=lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"),
                             )
-                            post("progress", f"[{idx}/{total}] {job.path.name}: OCR {ESCALATION_DPI} dpi — {esc.summary()}")
+                            post("progress", f"[{idx}/{total}] {job.path.name}: OCR — {esc.summary()}")
                             if esc.error:
-                                last_exc = PDFError(f"ступень 2 (локальный OCR {ESCALATION_DPI} dpi): {esc.error}")
-                                best_issues.append(f"Локальный OCR {ESCALATION_DPI} dpi не выполнен: {esc.error}")
+                                last_exc = PDFError(f"ступень 2 (локальный OCR): {esc.error}")
+                                best_issues.append(f"Локальный OCR не выполнен: {esc.error}")
                             text_400 = esc.text
                             if text_400 and text_400 != cached_text:
                                 try:

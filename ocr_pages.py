@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +38,9 @@ UPSAMPLE_FLOOR_DPI = 200
 
 #: Пояснение для окна и отчёта: чем распознаём.
 ENGINE_LABEL = "RapidOCR (локально, бесплатно)"
+#: Версия разбора текста. Меняется, когда меняется то, что получается из движка
+#: (например, восстановление пробелов): старые записи кеша тогда не используются.
+TEXT_VERSION = "3-streetjoin"
 
 Progress = Callable[[str], None]
 
@@ -110,14 +114,15 @@ def _engine_or_raise() -> Any:
     return _engine
 
 
-def _cache_key(path: Path, first: int, last: int, dpi: int, tile: int = 1) -> str:
+def _cache_key(path: Path, first: int, last: int, dpi: int, tile: int = 1, exact: bool = False) -> str:
     """Ключ кэша: файл, его время и размер, страницы, разрешение и нарезка."""
     try:
         stat = path.stat()
         stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
     except OSError:
         stamp = "?"
-    raw = f"{path.resolve()}|{stamp}|{first}-{last}|{dpi}|{tile}|{ENGINE_LABEL}"
+    mode = "exact" if exact else "capped"
+    raw = f"{path.resolve()}|{stamp}|{first}-{last}|{dpi}|{mode}|{tile}|{ENGINE_LABEL}|{TEXT_VERSION}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -127,17 +132,6 @@ def _read_cache(key: str) -> str | None:
         return file.read_text(encoding="utf-8") if file.is_file() else None
     except OSError:
         return None
-
-
-def effective_dpi(path: str | Path, page_no: int, dpi: int = DEFAULT_DPI) -> int:
-    """Реальное разрешение рендера страницы (с учётом потолка по нативному dpi скана)."""
-    import pymupdf  # noqa: PLC0415
-
-    doc = pymupdf.open(str(path))
-    try:
-        return page_render_dpi(doc.load_page(int(page_no) - 1), int(dpi))
-    finally:
-        doc.close()
 
 
 def _write_cache(key: str, text: str) -> None:
@@ -205,6 +199,92 @@ def page_render_dpi(page: Any, requested: int = DEFAULT_DPI) -> int:
     return min(wanted, max(UPSAMPLE_FLOOR_DPI, native))
 
 
+#: Слова, из которых склеенные OCR-строки собираются обратно. Только то, что
+#: встречается в описаниях границ и подписях (плюс общеупотребительные связки).
+_VOCAB = {
+    "all", "that", "certain", "plot", "piece", "or", "parcel", "of", "land", "with", "buildings",
+    "and", "improvements", "thereon", "erected", "situate", "situated", "lying", "being", "in",
+    "the", "borough", "county", "city", "state", "new", "york", "richmond", "staten", "island",
+    "bounded", "described", "as", "follows", "beginning", "at", "a", "point", "on", "place",
+    "northwesterly", "northeasterly", "southwesterly", "southeasterly", "northerly", "southerly",
+    "easterly", "westerly", "north", "south", "east", "west", "northwest", "northeast",
+    "southwest", "southeast", "side", "sides", "street", "avenue", "boulevard", "road", "laid",
+    "out", "to", "width", "feet", "foot", "ft", "distant", "from", "corner", "formed", "by",
+    "intersection", "thence", "running", "runs", "continuing", "commencing", "degrees", "minutes",
+    "seconds", "along", "containing", "said", "premises", "more", "particularly", "commonly",
+    "known", "thereof", "contains", "square", "line", "lines", "right", "way", "chains", "tie",
+    "is", "are", "be", "by", "it", "for", "an", "as", "this", "then", "distance", "inches",
+    "carlton", "stafford", "alvine", "lot", "block", "section", "each", "other", "side", "out",
+    "westerly", "northward", "southward", "eastward", "westward", "will", "upon", "which",
+    "where", "between", "thereto", "subject", "easement", "deed", "map", "survey", "bearing",
+    "beginning", "closing", "and", "not", "no", "so", "there", "here", "it", "its", "his",
+}
+_VOCAB_SORTED = sorted(_VOCAB, key=len, reverse=True)
+_SHORT_OK = {"a", "i", "o", "to", "of", "in", "on", "at", "by", "or", "is", "be", "an", "as", "it", "no", "so", "to", "up"}
+
+
+def _segment(token: str) -> list[str] | None:
+    """Разбивает слитную строку букв на слова словаря; None, если целиком не выходит."""
+    lower = token.lower()
+    n = len(lower)
+    # best[i] = (score, pieces) для префикса длиной i; score — сумма квадратов длин слов.
+    best: list[tuple[float, list[str]] | None] = [None] * (n + 1)
+    best[0] = (0.0, [])
+    for i in range(n):
+        if best[i] is None:
+            continue
+        score_i, pieces_i = best[i]
+        for word in _VOCAB_SORTED:
+            j = i + len(word)
+            if j > n or lower[i:j] != word:
+                continue
+            if len(word) < 3 and word not in _SHORT_OK:
+                continue
+            cand = (score_i + len(word) ** 2, pieces_i + [token[i:j]])
+            if best[j] is None or cand[0] > best[j][0]:
+                best[j] = cand
+    result = best[n]
+    return result[1] if result else None
+
+
+#: «Carlton. Boulevard»: имя с заглавной буквы, точка или дефис, суффикс улицы.
+_STREET_JOIN_RE = re.compile(
+    r"\b([A-Z][a-z]{2,})[.\-]\s*(?=(?:Boulevard|Avenue|Street|Road|Drive|Place|Lane|Court|Parkway|"
+    r"Blvd|Ave|St|Rd|Dr|Pl|Ln|Ct|Pkwy)\b)"
+)
+
+
+def restore_word_breaks(text: str) -> str:
+    """
+    Возвращает пробелы, которые OCR съел между словами и числами.
+
+    Меняются только слитные последовательности, которые целиком раскладываются на
+    слова из словаря; числа и незнакомые слова не трогаются. Цифры «40.O0» и
+    одиночные буквы в числах сохраняются.
+    """
+    if not text:
+        return text
+    # Число и слово слиплись: «161.00feet», «38seconds», «100.00feet».
+    out = re.sub(r"(?<=\d)(?=[A-Za-z]{2,})", " ", text)
+    # Слово и число слиплись: «north56», но не «O0» внутри числа.
+    out = re.sub(r"(?<=[A-Za-z]{3})(?=\d)", " ", out)
+    # Дробь с пробелом: «161. 00» -> «161.00».
+    out = re.sub(r"(\d)\.\s+(\d{2}\b)", r"\1.\2", out)
+    # Точка без пробела между словами: «Carlton.Boulevard».
+    out = re.sub(r"(?<=[A-Za-z]{3})\.(?=[A-Za-z]{3})", ". ", out)
+    # Название улицы с точкой или дефисом вместо пробела: «Carlton. Boulevard», «Carlton-Boulevard».
+    out = _STREET_JOIN_RE.sub(r"\1 ", out)
+
+    def fix(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if len(token) < 6 or token.lower() in _VOCAB:
+            return token
+        pieces = _segment(token)
+        return " ".join(pieces) if pieces and len(pieces) > 1 else token
+
+    return re.sub(r"[A-Za-z]{6,}", fix, out)
+
+
 def _lines_to_text(result: Any) -> str:
     """
     Строки OCR в текст сверху вниз.
@@ -262,6 +342,7 @@ def ocr_pdf_pages(
     progress: Progress | None = None,
     use_cache: bool = True,
     tile: int = 1,
+    exact_dpi: bool = False,
 ) -> str:
     """
     Распознаёт страницы ``first``–``last`` PDF и возвращает их текст.
@@ -278,7 +359,7 @@ def ocr_pdf_pages(
     first, last = int(first), int(last)
     if first < 1 or last < first:
         raise OcrError(f"неверные страницы для распознавания: {first}–{last}")
-    key = _cache_key(pdf, first, last, int(dpi), int(tile))
+    key = _cache_key(pdf, first, last, int(dpi), int(tile), bool(exact_dpi))
     if use_cache:
         cached = _read_cache(key)
         if cached is not None:
@@ -302,7 +383,9 @@ def ocr_pdf_pages(
         for page_no in range(first, last + 1):
             page = doc.load_page(page_no - 1)
             # Выше собственного разрешения картинки рендерить незачем: только пиксели растягиваем.
-            page_dpi = page_render_dpi(page, dpi)
+            # exact_dpi: эскалация просит именно dpi. Потолок по нативному разрешению
+            # скана режет рендер (OUR 70: 219 вместо 400) — и OCR теряет строки.
+            page_dpi = int(dpi) if exact_dpi else page_render_dpi(page, dpi)
             if progress:
                 where = "целиком" if int(tile) <= 1 else f"кусками {int(tile)}×{int(tile)}"
                 progress(
@@ -328,7 +411,7 @@ def ocr_pdf_pages(
         doc.close()
     if not parts:
         raise OcrError("на этих страницах ничего не распознано")
-    text = "\n".join(parts)
+    text = restore_word_breaks("\n".join(parts))
     if use_cache:
         _write_cache(key, text)
     return text

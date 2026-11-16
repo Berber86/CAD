@@ -405,3 +405,11 @@ def test_real_engine_reads_bearings_and_distances(tmp_path, monkeypatch):
     compact = "".join(text.split())
     for probe in ("176.92", "100.05", "40.00", "22°26"):
         assert probe in compact, (probe, text)
+
+
+def test_street_name_split_by_a_dot_or_dash_is_joined():
+    """Регресс OUR 70: «Carlton. Boulevard» и «Carlton-Boulevard» из OCR — одно название улицы."""
+    assert "Carlton Boulevard" in ocr_pages.restore_word_breaks("southwesterly side of Carlton. Boulevard; running")
+    assert "Carlton Boulevard" in ocr_pages.restore_word_breaks("Carlton-Boulevard; running")
+    # Обычная фраза со строчным словом не склеивается.
+    assert "the end. Street was" in ocr_pages.restore_word_breaks("the end. Street was")

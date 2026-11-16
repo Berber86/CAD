@@ -31,6 +31,20 @@ LEGAL = (
     "point or place of BEGINNING."
 )
 GARBAGE_CACHE = "COVER PAGE\nRECORDING AND ENDORSEMENT\nno courses here 1 2 3"
+# Текст с расстоянием до угла (как у LOT 68) — «чистый» разбор.
+CLEAN = (
+    "ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on the northwesterly "
+    "side of Stafford Avenue, distant 161.00 feet southwesterly from the corner formed by the "
+    "intersection of the northwesterly side of Stafford Avenue and the southwesterly side of "
+    "Carlton Boulevard; RUNNING THENCE North 56 degrees 36 minutes 12 seconds West 100.00 feet "
+    "to a point; THENCE South 33 degrees 23 minutes 48 seconds West 40.00 feet to a point; "
+    "THENCE South 56 degrees 36 minutes 12 seconds East 100.00 feet to a point; THENCE North "
+    "33 degrees 23 minutes 48 seconds East 40.00 feet to the point or place of BEGINNING."
+)
+# Те же стороны, но без расстояния до угла.
+NO_TIE = CLEAN.replace("distant 161.00 feet southwesterly from the corner formed by the "
+                       "intersection of the northwesterly side of Stafford Avenue and the "
+                       "southwesterly side of Carlton Boulevard", "at a point")
 
 
 @pytest.fixture()
@@ -48,8 +62,9 @@ def ocr_calls(monkeypatch, tmp_path):
     state = {"plain": LEGAL, "tiled": LEGAL, "raise": None}
 
     def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
-                 use_cache=True, tile=1):
-        calls.append({"first": first, "last": last, "dpi": dpi, "tile": tile, "use_cache": use_cache})
+                 use_cache=True, tile=1, exact_dpi=False):
+        calls.append({"first": first, "last": last, "dpi": dpi, "tile": tile,
+                      "use_cache": use_cache, "exact": exact_dpi})
         if state["raise"] is not None:
             raise state["raise"]
         return state["tiled"] if tile > 1 else state["plain"]
@@ -96,7 +111,7 @@ def test_ocr_error_is_reported_not_swallowed(fake_pdf, ocr_calls):
 def test_tiled_pass_runs_when_whole_page_has_no_courses(fake_pdf, ocr_calls):
     calls, state = ocr_calls
     state["plain"] = "COVER PAGE\nno courses here"
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"}, dpis=(400,))
     assert [c["tile"] for c in calls] == [1, 2]
     assert all(c["use_cache"] is False for c in calls)
     assert result.tiled is True
@@ -104,12 +119,81 @@ def test_tiled_pass_runs_when_whole_page_has_no_courses(fake_pdf, ocr_calls):
     assert "2×2" in result.summary()
 
 
-def test_summary_says_fresh_recognition_and_real_render_dpi(fake_pdf, ocr_calls, monkeypatch):
-    monkeypatch.setattr(pdf_set.ocr_pages, "effective_dpi", lambda path, page, dpi: 200)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"}, dpi=400)
-    text = result.summary()
-    assert "без кеша" in text
-    assert "200 dpi (запрошено 400" in text
+def test_escalation_renders_the_requested_dpi_not_the_native_cap(fake_pdf, ocr_calls):
+    """Регресс: OUR 70 нативно 219 dpi; «400» не должно рендериться на 219."""
+    calls, _ = ocr_calls
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"}, dpis=(400,))
+    assert all(call["exact"] is True for call in calls)
+    assert result.dpi == 400
+    assert "рендер 400 dpi" in result.summary()
+
+
+def test_escalation_default_tries_400_first_and_stops_on_clean_parse(fake_pdf, ocr_calls, monkeypatch):
+    """Основной проход — 400 dpi (как требует задача); чистый разбор → остальные не запускаются."""
+    calls, _ = ocr_calls
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages",
+                        lambda *a, **k: (calls.append({"dpi": k.get("dpi"), "tile": k.get("tile", 1)}),
+                                         CLEAN)[1])
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    assert pdf_set.ESCALATION_DPIS[0] == 400
+    assert [c["dpi"] for c in calls] == [400]
+    assert result.dpi == 400
+    assert result.tried == ("400 dpi — сторон 4",)
+
+
+def test_escalation_falls_back_to_600_when_400_is_not_clean(fake_pdf, monkeypatch):
+    """400 dpi без расстояния до угла → пробуем 600 dpi, он чистый → берём его."""
+    calls: list[tuple[int, int]] = []
+    texts = {400: NO_TIE, 600: CLEAN}
+
+    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+               use_cache=True, tile=1, exact_dpi=False):
+        calls.append((dpi, tile))
+        assert use_cache is False and exact_dpi is True
+        return texts.get(dpi, "")
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    assert [d for d, t in calls if t == 1] == [400, 600]
+    assert result.dpi == 600
+    assert result.text == CLEAN
+    assert len(result.tried) == 2
+
+
+def test_escalation_keeps_best_pass_when_none_is_clean(fake_pdf, monkeypatch):
+    """Ни один проход не чистый → берём лучший: сначала полнота сторон, затем расстояние."""
+    three_sides_with_tie = CLEAN.replace(
+        " THENCE North 33 degrees 23 minutes 48 seconds East 40.00 feet to the point or place of BEGINNING.",
+        " to the point or place of BEGINNING.",
+    )
+    texts = {400: NO_TIE, 600: three_sides_with_tie, 300: "COVER PAGE\nno courses here"}
+
+    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+               use_cache=True, tile=1, exact_dpi=False):
+        return texts.get(dpi, "")
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    # 400 dpi даёт 4 стороны (без расстояния), 600 — 3 стороны с расстоянием: полнота важнее.
+    assert result.dpi == 400
+    assert result.text == NO_TIE
+    assert len(result.tried) == 3
+
+
+def test_escalation_reports_error_when_every_pass_fails(fake_pdf, monkeypatch):
+    def broken(*args, **kwargs):
+        raise IndexError("string index out of range")
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", broken)
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    assert result.text == ""
+    assert "IndexError" in result.error
+    assert len(result.tried) == len(pdf_set.ESCALATION_DPIS)
+
+
+def test_summary_says_fresh_recognition(fake_pdf, ocr_calls):
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    assert "без кеша" in result.summary()
 
 
 def test_bad_page_spec_is_reported(fake_pdf, ocr_calls):
@@ -196,7 +280,7 @@ def test_background_worker_runs_stage_two_and_reports_it(gui, tmp_path, monkeypa
     results, _ = done["payload"]
     assert results[0].error == ""
     assert results[0].plan is not None
-    assert any("OCR 400 dpi —" in line and "без кеша" in line for line in progress), progress
+    assert any("OCR —" in line and "без кеша" in line for line in progress), progress
 
 
 def test_background_worker_reports_stage_two_error(gui, tmp_path, monkeypatch):
@@ -226,7 +310,7 @@ def test_background_worker_reports_stage_two_error(gui, tmp_path, monkeypatch):
     results, _ = done["payload"]
     assert results[0].outcome is None
     assert "IndexError" in results[0].error
-    assert any("OCR 400 dpi —" in line and "ошибка" in line for line in progress), progress
+    assert any("OCR —" in line and "ошибка" in line for line in progress), progress
 
 
 def test_real_ocr_ignores_a_poisoned_cache(tmp_path, monkeypatch):
@@ -252,8 +336,17 @@ def test_real_ocr_ignores_a_poisoned_cache(tmp_path, monkeypatch):
     key = ocr_pages._cache_key(image_pdf, 1, 1, 400, 1)
     ocr_pages._write_cache(key, GARBAGE_CACHE)
 
-    result = pdf_set.escalate_ocr(image_pdf, {"ocr_pages": "1"}, dpi=400)
+    result = pdf_set.escalate_ocr(image_pdf, {"ocr_pages": "1"}, dpis=(400,))
     assert result.error == ""
     assert result.text != GARBAGE_CACHE
     assert has_legal_courses(result.text)
     assert result.seconds > 0.5, "настоящее распознавание занимает время, а не 0.0 с"
+
+
+def test_text_quality_counts_courses_when_the_parser_cannot_read_the_text():
+    """Регресс LOT 72: «on hundred feet» роняет разбор, но 4 курса в тексте всё равно видны."""
+    broken = CLEAN.replace("100.00 feet", "hundred feet").replace("40.00 feet", "40 feet")
+    sides, has_tie, _ = pdf_set.text_quality(broken)
+    assert sides == 4
+    assert has_tie == 1
+    assert pdf_set.text_quality("COVER PAGE\nno courses here") == (0, 0, 0)

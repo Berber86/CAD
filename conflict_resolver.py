@@ -87,6 +87,8 @@ class Change:
     distance_ft: float = 0.0
     old_label: str = ""
     new_label: str = ""
+    #: Для привязки к углу с новой длиной: задан ли и румб (иначе румб выводится сам).
+    bearing_set: bool = False
 
     @property
     def slot(self) -> tuple[str, int, str]:
@@ -109,6 +111,8 @@ class Metrics:
     overlap_sqft: float
     edge_errors: int
     edge_warnings: int
+    #: Расстояние до ближайшего соседнего контура (0 — общая граница есть).
+    gap_ft: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,8 @@ class Proposal:
                 f"наложение на соседние участки {self.before.overlap_sqft:,.1f} → "
                 f"{self.after.overlap_sqft:,.1f} sq ft"
             )
+        if max(self.before.gap_ft, self.after.gap_ft) > 0.5:
+            parts.append(f"разрыв до соседа {self.before.gap_ft:,.2f} → {self.after.gap_ft:,.2f} ft")
         return " · ".join(parts)
 
 
@@ -415,6 +421,19 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
         return description
     data = description.model_dump()
     for change in changes:
+        if change.target == "tie" and change.field == "distance":
+            # Расстояние от угла улицы до POB. Румб: если советник дал — ставим его, иначе
+            # валидатор выведет румб по улице (или оставит прежний, если привязка уже есть).
+            data["distance_to_corner_ft"] = change.distance_ft
+            if change.bearing_set:
+                data["corner_to_pob_bearing"] = {
+                    "ns": change.ns, "degrees": change.degrees, "minutes": change.minutes,
+                    "seconds": change.seconds, "ew": change.ew,
+                    "distance_ft": change.distance_ft, "has_bearing": True,
+                }
+            elif data.get("corner_to_pob_bearing"):
+                data["corner_to_pob_bearing"]["distance_ft"] = change.distance_ft
+            continue
         if change.target == "tie":
             node = data.get("corner_to_pob_bearing")
             if not node:
@@ -509,17 +528,41 @@ class _Scene:
             return None
         others = [p for _, p in self._others(lot, state or {})]
         overlap, errors, warnings = 0.0, 0, 0
+        gap = 0.0
         if others:
             report = verify_with_neighbors(plan, others)
             overlap = sum(pair.overlap_area_sqft for pair in report.pair_reports)
             errors, warnings = report.error_count, report.warning_count
-        return Metrics(plan.closure.distance, overlap, errors, warnings)
+            gap = _nearest_gap_ft(plan, others)
+        return Metrics(plan.closure.distance, overlap, errors, warnings, gap)
+
+
+def _nearest_gap_ft(plan: DrawPlan, others: Sequence[DrawPlan]) -> float:
+    """Расстояние от контура участка до ближайшего соседнего контура (0 — касаются)."""
+    from shapely.geometry import Polygon
+
+    try:
+        mine = Polygon(plan.vertices)
+        if not mine.is_valid:
+            mine = mine.buffer(0)
+        gaps = []
+        for other in others:
+            poly = Polygon(other.vertices)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            gaps.append(mine.distance(poly))
+        return float(min(gaps)) if gaps else 0.0
+    except Exception:  # noqa: BLE001 - метрика не должна ломать разбор
+        return 0.0
 
 
 def judge(before: Metrics | None, after: Metrics | None) -> str:
     """
     Оценка пробной правки: ``verified`` — контур замыкается и хуже не стало,
     ``partial`` — стало заметно лучше, но не всё сошлось, ``rejected`` — пользы нет.
+
+    Правка, которая только ставит участок к соседу (уменьшает разрыв до него), —
+    ``partial``: её подтверждает человек, она не применяется «все подтверждённые».
     """
     if before is None or after is None:
         return "rejected"
@@ -531,10 +574,13 @@ def judge(before: Metrics | None, after: Metrics | None) -> str:
     overlap_better = overlap_gain > max(1.0, 0.5 * before.overlap_sqft)
     overlap_worse = overlap_gain < -max(1.0, 0.05 * before.overlap_sqft)
     edges_better = after.edge_errors < before.edge_errors and not overlap_worse and closure_gain > -0.02
-    if closure_worse or not (closure_better or overlap_better or edges_better):
+    gap_better = (before.gap_ft - after.gap_ft) > 1.0 and not overlap_worse
+    if closure_worse or not (closure_better or overlap_better or edges_better or gap_better):
         return "rejected"
     if overlap_worse and not closure_better:
         return "rejected"
+    if gap_better and not (closure_better or overlap_better or edges_better):
+        return "partial"
     return "verified" if closure_ok and not overlap_worse else "partial"
 
 
@@ -1208,7 +1254,11 @@ OUTPUT: exactly one JSON object and nothing else:
     }
   ]
 }
-"target" is "side" (then "side" is the 1-based number of the side of that lot) or "tie" (the bearing from the street corner to the point of beginning). Give "bearing" in the traverse direction of that side, or null to keep it. Give "distance_ft" in decimal feet, or null to keep it. "source_lot" and "source_quote" may be null when the value is computed."""
+"target" is "side" (then "side" is the 1-based number of the side of that lot) or "tie" (the point of beginning relative to the street corner). For a side: "bearing" in the traverse direction of that side, or null to keep it; "distance_ft" in decimal feet, or null to keep it.
+For "tie" there are two operations:
+  - the distance from the street corner to the point of beginning, printed as "distant N feet <direction> from the corner": give "distance_ft": N (a number, decimal feet). Use this when the lot has no tie or the tie distance is wrong. Give "bearing" as the quadrant bearing of the course from the corner to the point of beginning if the document or a neighbour gives it, otherwise null (it is then derived from the street).
+  - only the bearing of an existing tie: "bearing" with "distance_ft": null.
+"source_lot" and "source_quote" may be null when the value is computed."""
 
 
 def _lot_block(
@@ -1344,6 +1394,13 @@ def read_advisor_reply(data: Any) -> AdvisorReply:
 
 def _value_origin(scene: _Scene, lot: LotInput, change: Change) -> str | None:
     """Есть ли предложенное значение в разобранных данных какого-либо участка набора."""
+    if change.target == "tie" and change.field == "distance":
+        for other in scene.lots:
+            if other is lot:
+                continue
+            if abs(other.description.distance_to_corner_ft - change.distance_ft) <= 0.006:
+                return f"«{other.name}», привязка к углу ({other.description.distance_to_corner_ft:.2f}')"
+        return None
     for other in scene.lots:
         desc = other.description
         if change.field == "bearing":
@@ -1388,10 +1445,41 @@ def _advisor_proposals(
             if not isinstance(raw, dict):
                 continue
             target = "tie" if str(raw.get("target") or "side").strip().lower() == "tie" else "side"
+            if target == "tie" and raw.get("distance_ft") not in (None, "", "null"):
+                # Советник задаёт расстояние от угла улицы до POB (и, если знает, румб привязки).
+                try:
+                    tie_distance = float(str(raw.get("distance_ft")).replace(",", ""))
+                except ValueError:
+                    problem = f"не удалось прочитать расстояние до угла «{raw.get('distance_ft')}»"
+                    break
+                if tie_distance <= 0:
+                    problem = "расстояние до угла должно быть больше нуля"
+                    break
+                if abs(tie_distance - desc.distance_to_corner_ft) <= 1e-6:
+                    continue
+                bearing_parts = None
+                if raw.get("bearing") not in (None, "", "null"):
+                    bearing_parts = parse_bearing_text(raw.get("bearing"))
+                    if bearing_parts is None:
+                        problem = f"не удалось прочитать румб привязки «{raw.get('bearing')}»"
+                        break
+                old_tie = desc.corner_to_pob_bearing
+                changes.append(Change(
+                    target="tie", index=-1, field="distance", distance_ft=tie_distance,
+                    ns=bearing_parts[0] if bearing_parts else (old_tie.ns if old_tie else "N"),
+                    degrees=bearing_parts[1] if bearing_parts else (old_tie.degrees if old_tie else 0),
+                    minutes=bearing_parts[2] if bearing_parts else (old_tie.minutes if old_tie else 0),
+                    seconds=bearing_parts[3] if bearing_parts else (old_tie.seconds if old_tie else 0.0),
+                    ew=bearing_parts[4] if bearing_parts else (old_tie.ew if old_tie else "E"),
+                    bearing_set=bearing_parts is not None,
+                    old_label=f"{desc.distance_to_corner_ft:.2f}'",
+                    new_label=f"{tie_distance:.2f}'" + (f" {_label(bearing_parts)}" if bearing_parts else ""),
+                ))
+                continue
             if target == "tie":
                 index, old = -1, desc.corner_to_pob_bearing
                 if old is None:
-                    problem = "у участка нет привязки к углу"
+                    problem = "у участка нет привязки к углу — дайте расстояние от угла (distance_ft)"
                     break
             else:
                 try:

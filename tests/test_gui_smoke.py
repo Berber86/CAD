@@ -221,11 +221,50 @@ class _Widget:
             self._global_bindings = {}
         self._global_bindings[event_name] = callback
 
+    def bind_class(self, class_name, event_name, callback, *args, **kwargs):
+        if not hasattr(self, "_class_bindings"):
+            self._class_bindings = {}
+        self._class_bindings[(class_name, event_name)] = callback
+
+    def transient(self, *args, **kwargs):
+        return None
+
+    def resizable(self, *args, **kwargs):
+        return None
+
+    def grab_set(self, *args, **kwargs):
+        self._grabbed = True
+
+    def grab_release(self, *args, **kwargs):
+        self._grabbed = False
+
     def clipboard_clear(self):
         self._clipboard = ""
 
     def clipboard_append(self, text):
         self._clipboard = str(getattr(self, "_clipboard", "") or "") + str(text)
+
+
+class _FakeMenu:
+    """Заглушка tkinter.Menu для проверки контекстного меню Копировать/Вставить."""
+
+    instances: list["_FakeMenu"] = []
+
+    def __init__(self, master=None, tearoff=0, **kwargs):
+        self.master = master
+        self.items: list[dict] = []
+        self.popups: list[tuple[int, int]] = []
+        self.released = False
+        _FakeMenu.instances.append(self)
+
+    def add_command(self, label="", command=None, state="normal", **kwargs):
+        self.items.append({"label": label, "command": command, "state": state})
+
+    def tk_popup(self, x_root, y_root):
+        self.popups.append((x_root, y_root))
+
+    def grab_release(self):
+        self.released = True
 
 
 class _FakeCanvas(_Widget):
@@ -290,6 +329,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
     tkinter = types.ModuleType("tkinter")
     tkinter.Canvas = _FakeCanvas
+    tkinter.Menu = _FakeMenu
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
     filedialog.askopenfilenames = lambda **kwargs: ()
@@ -308,15 +348,32 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
 
 @pytest.fixture()
-def gui(monkeypatch):
+def gui(monkeypatch, tmp_path):
     for name, module in _fake_modules().items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.syspath_prepend(str(ROOT))
     monkeypatch.delitem(sys.modules, "main", raising=False)
     import main as gui_module  # noqa: PLC0415 - импорт после подмены модулей
 
+    # GUI now autosaves provider/model choices. Isolate those writes from the checked-in
+    # sample config while preserving its real defaults for every smoke test.
+    import llm_parser
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes((ROOT / "config.json").read_bytes())
+    local_config_path = tmp_path / "config.local.json"
+    env_path = tmp_path / ".env"
+    for module in (llm_parser, gui_module):
+        monkeypatch.setattr(module, "CONFIG_PATH", config_path)
+        monkeypatch.setattr(module, "LOCAL_CONFIG_PATH", local_config_path)
+        monkeypatch.setattr(module, "ENV_PATH", env_path)
+
     # В старых тестах выбор роли эмулируется текстовым переключателем; тесты
     # самого диалога и независимости ролей задают явный ответ отдельно.
+    # Локальный OCR зависит от машины (установлен пакет или нет), а поведение окна
+    # должно быть одинаковым: в тестах он выключен. Путь с OCR проверяют
+    # tests/test_local_ocr.py (движок подменён) и отдельный тест окна.
+    if hasattr(gui_module, "ocr_pages"):
+        monkeypatch.setattr(gui_module.ocr_pages, "available", lambda: False)
     monkeypatch.setattr(
         gui_module.SurveyApp, "_ask_source_role",
         lambda app, source: (
@@ -325,6 +382,35 @@ def gui(monkeypatch):
     )
     yield gui_module
     sys.modules.pop("main", None)
+
+
+def _load_pdf_by_role(app):
+    """
+    Порядок «сначала роль, потом файлы». Кнопка PDF теперь открывает набор
+    со списком, но этим порядком по-прежнему пользуются окно сверки, фото и
+    выбор файлов соседей, поэтому открытие одного PDF и прикрепление PDF
+    соседей проверяются через него.
+    """
+    from pathlib import Path
+    from tkinter import filedialog
+    from llm_parser import is_image_file
+
+    role = app._ask_source_role("PDF")
+    if role not in {"main", "neighbor"}:
+        return
+    if role == "neighbor":
+        paths = filedialog.askopenfilenames(title="PDF соседей")
+        if paths:
+            app._attach_neighbor_pdfs([Path(p) for p in paths if str(p).strip()])
+        return
+    path = filedialog.askopenfilename(title="PDF основного участка")
+    if not path:
+        return
+    chosen = Path(path)
+    if is_image_file(chosen):
+        app._apply_loaded_images([chosen])
+        return
+    app._open_single_pdf(chosen)
 
 
 def test_widget_stub_rejects_unsupported_transparency():
@@ -388,7 +474,10 @@ def test_gui_builds_and_reports(gui):
     app = gui.SurveyApp()
 
     # Масштабы и высота текста
-    assert app.scale_options == ['1"=10\'', '1"=16\'', '1"=20\'', '1"=30\'']
+    # Масштабы заказчика: 16 — основной, ещё 10, 20, 30, 40, 50, 60.
+    assert app.scale_options == [
+        '1"=10\'', '1"=16\'', '1"=20\'', '1"=30\'', '1"=40\'', '1"=50\'', '1"=60\'',
+    ]
     assert app.scale_var.get() == '1"=16\''
     app.scale_var.set('1"=10\'')
     app._refresh_height_label()
@@ -600,7 +689,7 @@ def test_gui_nyc_presets_and_vision_pdf_flow(gui, tmp_path, monkeypatch):
 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(vec_pdf))
     app.use_llm_var.set(False)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._pdf_needs_vision is True
     assert app.use_llm_var.get() is True
     assert "PDF Vision:" in app.pdf_label.cget("text")
@@ -1435,7 +1524,14 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
     )
 
     app = gui.SurveyApp()
-    assert gui.VERSION == "1.0.0"
+    # Версия в углу окна — та же, что печатает отчёт Шага 2 (version.py).
+    import feature_labeler
+    import version
+
+    assert gui.VERSION == version.APP_VERSION != "1.0.0"
+    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_DATE})"
+    assert app.version_badge.cget("text") == f"v{version.APP_VERSION} · STUDIO"
+    assert gui.APP_DATE == version.APP_DATE
     assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings
@@ -1561,7 +1657,7 @@ def test_text_pdf_defaults_to_local_and_ai_is_an_explicit_choice(gui, tmp_path, 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(text_pdf))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("вызов API не ожидался"))
 
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.pdf_path == text_pdf
     assert app.use_llm_var.get() is False
     assert "бесплатно" in app.parse_button.cget("text").lower()
@@ -1586,7 +1682,7 @@ def test_text_pdf_defaults_to_local_and_ai_is_an_explicit_choice(gui, tmp_path, 
     assert "локальный" in app.regex_link_button.cget("text").lower()
 
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(scan_pdf))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._pdf_needs_vision is True
     assert app.use_llm_var.get() is True
     assert "Vision" in app.pdf_label.cget("text")
@@ -1612,7 +1708,7 @@ def test_neighbor_pdf_batch_attaches_without_api_then_builds_distinct_plans(gui,
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("API не должен вызываться"))
     monkeypatch.setattr(gui.AcadBuilder, "draw", lambda *a, **k: pytest.fail("AutoCAD не должен вызываться"))
 
-    app.load_pdf_button.cget("command")()
+    _load_pdf_by_role(app)
     assert app.neighbor_pdf_paths == [first, second]
     assert app.pdf_path is None
     assert app.use_llm_var.get() is False
@@ -1636,7 +1732,7 @@ def test_neighbor_pdf_batch_attaches_without_api_then_builds_distinct_plans(gui,
     # а не добавляет второй экземпляр уже присутствующих планов.
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(first), str(second)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert len(app._preview_neighbor_plans) == 2
@@ -1660,7 +1756,7 @@ def test_mixed_neighbor_pdf_batch_reports_scan_without_silent_ai(gui, tmp_path, 
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(text_pdf), str(scan_pdf)))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("платный запрос без выбора ИИ"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.use_llm_var.get() is False
     assert "потребуют ИИ" in app.status_var.get()
     app._start(parse_only=True)
@@ -1695,7 +1791,7 @@ def test_neighbor_batch_honors_multipass_and_skips_disagreements(gui, tmp_path, 
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.use_llm_var.set(True)
     app.select_passes(2)
     desc, _ = parse_with_regex(sample)
@@ -1739,7 +1835,7 @@ def test_neighbor_pdf_draw_is_separate_and_uses_all_selected_files(gui, tmp_path
         draws.append(plan)
         return DrawResult(plan=plan, text_count=len(plan.items), layers={"neighbor_lot": "NEIGHBOR_LOT"})
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=False)
     assert draws == [] and "Сначала разберите" in app.status_var.get()
     app._start(parse_only=True)
@@ -1770,7 +1866,7 @@ def test_pdf_page_selection_applies_to_every_neighbor_without_vision(gui, tmp_pa
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
     monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -1784,7 +1880,7 @@ def test_pdf_page_selection_applies_to_every_neighbor_without_vision(gui, tmp_pa
     assert all(p.description.distance_to_corner_ft == pytest.approx(365) for p in app._preview_neighbor_plans)
     for path in files:
         _write_test_pdf(path, [right])  # заново прикреплённый путь может содержать новые данные
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._on_verify_neighbors_clicked()
     _wait_for_gui_worker(app)
     assert len(app._preview_neighbor_plans) == 2
@@ -1903,7 +1999,7 @@ def test_single_text_pdf_respects_selected_page_in_gui(gui, tmp_path, monkeypatc
     app = gui.SurveyApp()
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **_: str(pdf))
     monkeypatch.setattr(llm_parser, "render_pdf_pages_base64", lambda *a, **k: pytest.fail("Vision не нужен"))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.use_llm_var.get() is False
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
@@ -1980,7 +2076,7 @@ def test_reset_cancels_remaining_neighbor_batch_files(gui, tmp_path, monkeypatch
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, files)))
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     assert started.wait(3)
     app._reset_session()
@@ -2023,7 +2119,7 @@ def test_suspicious_neighbor_is_not_silently_drawn_in_batch(gui, tmp_path, monke
     app = gui.SurveyApp()
     app.ask_on_doubt_var.set(True)
     app.neighbor_lot_radio.select()
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert len(calls) == 2 and len(app._preview_neighbor_plans) == 2
@@ -2108,7 +2204,7 @@ def test_switching_to_text_does_not_reparse_attached_neighbor_pdfs(gui, tmp_path
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert "все PDF" in app.regex_link_button.cget("text")
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2212,7 +2308,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     monkeypatch.setattr(app, "_ask_source_role", lambda kind: events.append(("role", kind)) or None)
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **kw: events.append(("single",)) or "")
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append(("multi",)) or ())
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._load_images()
     assert events == [("role", "PDF"), ("role", "изображениях")]
     assert app.pdf_path is None and not app.image_paths
@@ -2224,7 +2320,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     monkeypatch.setattr(app, "_ask_source_role", lambda kind: events.append(("role", kind)) or "neighbor")
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: events.append(("multi",)) or (str(pdf),))
     app.main_lot_radio.select()  # текстовый переключатель остаётся на «основной»
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert events == [("role", "PDF"), ("multi",)]
     assert app.neighbor_pdf_paths == [pdf] and app.is_neighbor_mode() and not app.role_bar._gridded
     app._start(parse_only=True)
@@ -2248,7 +2344,7 @@ def test_file_role_is_chosen_before_dialog_independent_of_text_switch(gui, tmp_p
     # Отмена выбора файла не меняет ни роль, ни уже прикреплённые файлы.
     monkeypatch.setattr(app, "_ask_source_role", lambda _kind: "main")
     monkeypatch.setattr(filedialog, "askopenfilename", lambda **kw: "")
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app.image_paths == [image] and app.is_neighbor_mode()
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2308,7 +2404,7 @@ def test_draw_rejects_changed_pdf_pages_and_partial_batch(gui, tmp_path, monkeyp
     app = gui.SurveyApp()
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(good), str(scan)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert good in app._neighbor_plan_sources and scan in app._pending_neighbor_pdfs
@@ -2318,7 +2414,7 @@ def test_draw_rejects_changed_pdf_pages_and_partial_batch(gui, tmp_path, monkeyp
 
     # После загрузки только исправного PDF смена страниц делает готовый план устаревшим.
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: (str(good),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     app.pdf_pages_var.set("2")
@@ -2341,7 +2437,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     main_plan = app._preview_main_plan
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(path),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -2456,7 +2552,7 @@ def test_pdf_edited_text_and_selected_pages_cannot_be_drawn_stale(gui, tmp_path,
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
         draws.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
     ))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert app._preview_main_plan is not None
@@ -2581,7 +2677,7 @@ def test_failed_neighbor_pdf_reparse_keeps_old_plan_blocked_until_retry(gui, tmp
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **kw: tuple(map(str, paths)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert not app._pending_neighbor_pdfs
@@ -2909,7 +3005,7 @@ def test_direct_batch_cannot_replace_an_attached_pdf_with_different_pages_silent
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: tuple(map(str, attached)))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app.pdf_pages_var.set("2")
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
@@ -2969,13 +3065,13 @@ def test_unreadable_reselected_neighbor_pdf_keeps_old_plan_blocked(gui, tmp_path
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
     app.neighbor_lot_radio.select()
     monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(path),))
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     old = app._neighbor_plan_sources[path]
 
     path.write_bytes(b"invalid PDF")
-    app._load_pdf()
+    _load_pdf_by_role(app)
     assert app._neighbor_plan_sources[path] is old and path in app._pending_neighbor_files
     app.source_mode_var.set("📝 Текст")
     app._on_source_mode_changed()
@@ -2984,7 +3080,7 @@ def test_unreadable_reselected_neighbor_pdf_keeps_old_plan_blocked(gui, tmp_path
     assert "reopened.pdf" in app.status_var.get()
 
     path.write_bytes(valid_bytes)
-    app._load_pdf()
+    _load_pdf_by_role(app)
     app._start(parse_only=True)
     _wait_for_gui_worker(app)
     assert app._neighbor_plan_sources[path] is not old
@@ -2998,9 +3094,13 @@ def _step2_result(skip_existing=True):
     """Готовый FeatureLabelResult на синтетическом чертеже (без AutoCAD)."""
     import acad_builder as ab
     import feature_labeler as fl
+    from feature_labeler import DrawingLine, DrawingText
     from test_feature_labeling import HOUSE, build_scene
 
     snap = build_scene(with_existing=True)
+    # Заметка полевика с выноской к террасе: WOOD PORCH -> FRAME DECK.
+    snap.texts.append(DrawingText("ENTRANCE_TEXT", "WOOD PORCH", (-14.0, 66.0), height=1.3))
+    snap.lines.append(DrawingLine("ENTRANCE_TEXT", ((-4.0, 66.6), (15.0, 67.0))))
     boundary = fl.find_property_polygon(snap, {})
     recognition = fl.recognize_features(snap, boundary, {}, HOUSE)
     plan = ab.plan_feature_labels(recognition, snap, {}, text_height=0.9, skip_existing=skip_existing)
@@ -3026,7 +3126,9 @@ def _wait_idle(app):
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
+    # Шаг 0 стоит перед Шагом 1: документы участка собираются до посадки границы.
     assert gui.STEP_TABS == (
+        "Шаг 0. Документы участка",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
     )
@@ -3043,9 +3145,16 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
         "Не дублировать уже существующие на чертеже надписи"
     )
     assert app.skip_existing_labels_var.get() is True
+    assert app.hide_field_notes_check.cget("text") == (
+        "Выключить слои полевых заметок после подписания"
+    )
+    assert app.hide_field_notes_var.get() is True
+    assert "FENCE_NOTE" in app.step2_notes_hint.cget("text")
     assert "Автопоиск участка и подписание объектов" in app.feature_auto_button.cget("text")
     assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
     assert "0.900 ft" in app.step2_height_label.cget("text")
+    assert app.step2_height_entry.cget("placeholder_text") == "авто"
+    assert app.feature_text_height_var.get() == ""
 
     app._select_step_tab(gui.STEP_TAB_LABELS)
     assert app.main_wrap._gridded is False
@@ -3115,24 +3224,28 @@ def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
     assert calls[0]["mode"] == mode
     assert calls[0]["house_text"] == "2 STY. BRK. & FR.\nNo. 87"
     assert calls[0]["skip_existing"] is True
+    assert calls[0]["hide_field_notes"] is True
     assert calls[0]["scale"] == pytest.approx(20.0)
     assert app.feature_auto_button.cget("state") == "normal"
     assert app.feature_pick_button.cget("state") == "normal"
     assert app.feature_label_result is prepared
 
     # Счётчики и подробный отчёт на вкладке Шага 2.
-    assert app.step2_stat_vars["codes"].get() == "4"
-    assert app.step2_stat_vars["layers"].get() == "13"
+    assert app.step2_stat_vars["notes"].get() == "1"
+    assert app.step2_stat_vars["codes"].get() == "2"
+    assert app.step2_stat_vars["layers"].get() == "14"
     assert app.step2_stat_vars["labeled"].get() == "15"
     assert app.step2_stat_vars["skipped"].get() == "3"
     report = app.step2_report_box.get("1.0", "end")
-    assert "по кодам точек (POINT_LABELS): 4" in report
-    assert "по именам слоёв: 13" in report
+    assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 1" in report
+    assert "по кодам и описаниям точек съёмки: 2" in report
+    assert "по именам слоёв: 14" in report
     assert "ПОДПИСАНО: 15" in report
+    assert "полевая заметка «WOOD PORCH»" in report
     # Тот же отчёт — в журнале операций (лог-панель).
     log = "\n".join(app._log)
-    assert "Шаг 2 · • по кодам точек (POINT_LABELS): 4" in log
-    assert "Шаг 2 · • по именам слоёв: 13" in log
+    assert "Шаг 2 · • по кодам и описаниям точек съёмки: 2" in log
+    assert "Шаг 2 · • по именам слоёв: 14" in log
     assert "Шаг 2 · ПОДПИСАНО: 15" in log
     assert "Подписано объектов: 15 в слое D-TOPO-TEXT" in app.status_var.get()
 
@@ -3154,12 +3267,45 @@ def test_step2_passes_dedup_checkbox_state(gui, monkeypatch):
     )
     app = gui.SurveyApp()
     app.skip_existing_labels_var.set(False)
+    app.hide_field_notes_var.set(False)
     app._start_feature_labeling("auto")
     _wait_idle(app)
     assert calls[0]["skip_existing"] is False
+    assert calls[0]["hide_field_notes"] is False
     assert calls[0]["house_text"] == ""
     assert app.step2_stat_vars["skipped"].get() == "0"
     assert app.step2_stat_vars["labeled"].get() == "18"
+
+
+def test_step2_text_height_field_overrides_scale(gui, monkeypatch):
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    calls = []
+    monkeypatch.setattr(
+        gui.AcadBuilder, "label_features",
+        lambda builder, **kwargs: calls.append(kwargs) or _step2_result(),
+    )
+    app = gui.SurveyApp()
+    # Пустое поле — высота по масштабу.
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert calls[-1]["text_height"] is None
+
+    # Запятая как десятичный разделитель и знак фута допустимы.
+    app.feature_text_height_var.set("0,45'")
+    app._refresh_step2_height_label()
+    assert "0.450 ft (задано вручную" in app.step2_height_label.cget("text")
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert calls[-1]["text_height"] == pytest.approx(0.45)
+
+    # Не число — запуск не начинается, AutoCAD не трогается.
+    app.feature_text_height_var.set("мелко")
+    app._start_feature_labeling("auto")
+    _wait_idle(app)
+    assert len(calls) == 2
+    assert app._busy is False
+    assert "Высота текста подписей указана неверно" in app.step2_report_box.get("1.0", "end")
+    assert "неверная высота текста" in app.status_var.get()
 
 
 def test_step2_error_is_shown_in_report_and_status(gui, monkeypatch):
@@ -3189,3 +3335,754 @@ def test_step2_requires_windows_autocad(gui, monkeypatch):
     _wait_idle(app)
     assert "только в Windows" in app.step2_report_box.get("1.0", "end")
     assert "Шаг 2 не выполнен" in app.status_var.get()
+
+
+# --------------------------------------------------- Шаг 0: документы участка
+
+
+def _step0_pdf(path):
+    """PDF на две страницы: обложка и описание (текстовый слой, без OCR)."""
+    import pymupdf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    doc.new_page().insert_textbox(pymupdf.Rect(36, 36, 560, 760), "COVER", fontsize=10)
+    doc.new_page().insert_textbox(
+        pymupdf.Rect(36, 36, 560, 760),
+        "BEGINNING AT A POINT on the easterly side of Alvine Avenue; RUNNING THENCE "
+        "N 67 33 48 E, 174.89 feet; THENCE N 50 25 10 W, 45.30 feet; THENCE "
+        "S 67 33 48 W, 153.64 feet; THENCE S 22 26 12 E, 40.00 feet to the point "
+        "of BEGINNING.",
+        fontsize=9,
+    )
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def _fill_step0(app, *, block="6323", lot="32", neighbours="30", folder=""):
+    app.step0_block_var.set(block)
+    app.step0_lot_var.set(lot)
+    app.step0_neighbours_var.set(neighbours)
+    if folder:
+        app.step0_folder_var.set(str(folder))
+    return app
+
+
+def _wait_step0(app):
+    """Сбор идёт в фоновом потоке: ждём его, прокачивая очередь событий."""
+    import time
+
+    for _ in range(300):
+        app._drain_events()
+        if not app._step0_running:
+            return
+        time.sleep(0.01)
+    raise AssertionError("сбор Шага 0 не завершился")
+
+
+def test_step0_tab_is_first_and_hides_step1_workspace(gui):
+    app = gui.SurveyApp()
+    assert app.step0_page._gridded is False
+    app._select_step_tab(gui.STEP_TAB_DEEDS)
+    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы участка"
+    assert app.step0_page._gridded is True
+    assert app.main_wrap._gridded is False
+    assert app.step2_page._gridded is False
+    assert app.draw_button._gridded is False
+    assert app.add_neighbor_button._gridded is False
+    assert app.step_tab_buttons[gui.STEP_TAB_DEEDS].cget("fg_color") == gui.THEME["btn_primary"]
+    # Клавиши Шага 1 на вкладке Шага 0 не запускают разбор границы.
+    started = []
+    app._start = lambda **kwargs: started.append(kwargs)
+    app._global_bindings["<F5>"]()
+    assert started == []
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.main_wrap._gridded is True and app.step0_page._gridded is False
+
+
+def test_step0_screen_shows_the_customer_scheme(gui):
+    app = gui.SurveyApp()
+    assert "Собрать описания" in app.step0_run_button.cget("text")
+    assert app.step0_manual_role_menu.cget("values") == list(gui.STEP0_MANUAL_ROLES)
+    assert list(gui.STEP0_MANUAL_ROLES) == ["Наш участок", "Сосед"]
+    assert app.step0_manual_role_var.get() == "Наш участок"
+    report = app.step0_report_box.get("1.0", "end")
+    assert "LOT 30 NEW.pdf" in report and "сосед" in report
+    assert "Cloudflare" in report
+
+
+def test_step0_rejects_non_numeric_block_or_lot(gui):
+    app = gui.SurveyApp()
+    _fill_step0(app, block="шесть", lot="32")
+    app._start_step0_intake()
+    assert "block и lot" in app.status_var.get()
+    _fill_step0(app, block="6323", lot="тридцать два")
+    app._start_step0_intake()
+    assert "block и lot" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_rejects_junk_in_the_neighbours_field(gui):
+    app = gui.SurveyApp()
+    _fill_step0(app, neighbours="30, сосед")
+    app._start_step0_intake()
+    assert "соседи" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
+    app = gui.SurveyApp()
+    collected = {}
+
+    def fake_collect(**kwargs):
+        collected.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = fake_collect
+    try:
+        _fill_step0(app, neighbours="32, 30", folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert collected["neighbours"] == [30]
+    assert "соседи: 30" in app._step0_lines[0]
+    assert "32" not in app._step0_lines[0].split("соседи:")[1]
+
+
+def test_step0_success_enables_handover_to_step1(gui, tmp_path):
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=folder,
+        records=[
+            gui.deed_store.StoredDeed(file="OUR 32 NEW.pdf", role="our", lot="32", pages="2"),
+        ],
+    )
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = lambda **kwargs: outcome
+    try:
+        _fill_step0(app, folder=folder)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert app.step0_to_step1_button.cget("state") == "normal"
+    assert "OUR 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
+    assert "собрано документов — 1" in app.status_var.get()
+
+
+def test_step0_failure_keeps_the_button_for_another_try(gui, tmp_path):
+    app = gui.SurveyApp()
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=tmp_path, missing=["наш участок (лот 32): список не открылся — таймаут"],
+    )
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = lambda **kwargs: outcome
+    try:
+        _fill_step0(app, folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert app.step0_to_step1_button.cget("state") == "disabled"
+    assert app.step0_run_button.cget("state") == "normal"
+    assert "наш участок не собран" in app.status_var.get()
+
+
+def test_step0_stop_leaves_the_window_usable(gui):
+    app = gui.SurveyApp()
+    app._step0_running = True
+    app.step0_run_button.configure(state="disabled")
+    app._stop_step0_intake()
+    app._finish_step0("cancelled", None)
+    assert app._step0_running is False
+    assert app.step0_run_button.cget("state") == "normal"
+    assert "сбор остановлен" in app.status_var.get()
+
+
+def test_step0_crash_is_reported_not_swallowed(gui, tmp_path):
+    app = gui.SurveyApp()
+
+    def boom(**kwargs):
+        raise RuntimeError("нет сети")
+
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = boom
+    try:
+        _fill_step0(app, folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert "нет сети" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_takes_a_hand_downloaded_pdf_and_names_it_as_a_neighbour(
+    gui, tmp_path, monkeypatch
+):
+    app = gui.SurveyApp()
+    downloads = tmp_path / "Downloads"
+    _step0_pdf(downloads / "ViewContent.pdf")
+    monkeypatch.setattr(gui.rcclerk, "_default_downloads_dir", lambda: downloads)
+    _fill_step0(app, neighbours="30", folder=tmp_path / "01_описания")
+    app.step0_manual_role_var.set("Сосед")
+    app.step0_manual_lot_var.set("30")
+    app._adopt_step0_download()
+    assert (tmp_path / "01_описания" / "LOT 30 NEW.pdf").is_file()
+    assert "LOT 30 NEW.pdf" in app.status_var.get()
+    assert "Из «Загрузок» принят файл" in app.step0_report_box.get("1.0", "end")
+
+
+def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "full.pdf"),
+        role="our", lot=32, tag="NEW", block=6323, pages="2",
+        trimmed_source=_step0_pdf(tmp_path / "trim.pdf"),
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "nb.pdf"), role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+    _fill_step0(app, folder=folder)
+    app._step0_to_step1()
+    assert app._pdf_set_dialog is not None
+    items = app._pdf_set_dialog.items
+    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
+    trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
+    assert trimmed.name_pages == (2, 2)
+
+
+def test_step0_handover_without_files_explains_itself(gui, tmp_path):
+    app = gui.SurveyApp()
+    _fill_step0(app, folder=tmp_path / "пустая")
+    app._step0_to_step1()
+    assert "нет файлов для Шага 1" in app.status_var.get()
+
+
+def test_step0_deed_collection_does_not_call_the_paid_model(gui):
+    """The address-preflight Vision call is separate from document collection/OCR."""
+    import pathlib
+
+    text = pathlib.Path(gui.__file__).read_text(encoding="utf-8")
+    start = text.index("    def _step0_worker(")
+    end = text.index("    def _stop_step0_intake(")
+    body = text[start:end]
+    for forbidden in ("ask_llm_json", "run_multipass_consensus", "parse_legal_description_full"):
+        assert forbidden not in body
+
+
+def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    seen: dict[str, object] = {}
+    hook = lambda endorsement_id: None
+
+    def fake_collect(**kwargs):
+        seen.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
+    monkeypatch.setattr(
+        gui.browser_save, "auto_save_hook",
+        lambda folder, on_attempt: seen.setdefault("attempt_notice", on_attempt) and hook,
+    )
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
+    app._step0_worker(6323, 32, [], tmp_path, False)
+    _wait_step0(app)
+    assert seen["downloads_dir"] == gui.rcclerk.default_downloads_dir()
+    assert seen["auto_save"] is hook
+    assert callable(seen["attempt_notice"])
+    assert any("Ctrl+S" in line for line in app._step0_lines)
+
+
+def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(gui, tmp_path):
+    import json
+
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our-new.pdf"),
+        role="our", lot=32, tag="NEW", block=6323, pages="2",
+        trimmed_source=_step0_pdf(tmp_path / "our-new-trim.pdf"),
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our-old.pdf"),
+        role="our", lot=32, tag="OLD", block=6323,
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "neighbour.pdf"),
+        role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+
+    manifest_path = folder / gui.deed_store.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["items"] = [item for item in manifest["items"] if item["role"] != "neighbour"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fill_step0(app, folder=folder, neighbours="30")
+    app._step0_to_step1()
+    names = sorted(item.path.name for item in app._pdf_set_dialog.items)
+    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf", "OUR 32 OLD.pdf"]
+    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in app._step0_lines)
+    assert any("Отправляю в Шаг 1 (3 PDF)" in line for line in app._step0_lines)
+
+
+def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gui, tmp_path):
+    import json
+
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our.pdf"),
+        role="our", lot=32, tag="NEW", block=6323,
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "neighbour.pdf"),
+        role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+    manifest_path = folder / gui.deed_store.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    neighbour = next(item for item in manifest["items"] if item["role"] == "neighbour")
+    neighbour["trimmed"] = "LOT 30 NEW_p1.pdf"  # повреждённая ссылка, полный PDF существует
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fill_step0(app, folder=folder, neighbours="30")
+    app._step0_to_step1()
+    names = sorted(item.path.name for item in app._pdf_set_dialog.items)
+    assert "LOT 30 NEW.pdf" in names
+    assert any("отсутствует; передаю полный документ LOT 30 NEW.pdf" in line
+               for line in app._step0_lines)
+
+
+def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
+    import re
+
+    app = gui.SurveyApp()
+    monkeypatch.setattr(gui.browser_save, "available", lambda: False)
+
+    def fake_collect(**kwargs):
+        kwargs["progress"]("читаю список документов")
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
+    _fill_step0(app, folder=tmp_path)
+    app._start_step0_intake()
+    _wait_step0(app)
+    lines = [line for line in app._step0_lines if "список документов" in line]
+    assert lines and re.match(r"^\[\d{2}:\d{2}:\d{2}\]", lines[0])
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", app._step0_lines[0])
+
+
+def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    captured: dict[str, object] = {}
+    saved_configs = []
+
+    def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    monkeypatch.setattr(gui.browser_save, "available", lambda: False)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
+    monkeypatch.setattr(
+        gui, "save_config", lambda config: saved_configs.append(config.copy()) or tmp_path / "config.json",
+    )
+    app.step0_ocr_dpi_var.set("88")
+    _fill_step0(app, folder=tmp_path)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert captured["ocr_dpi"] == 88
+    assert saved_configs and saved_configs[-1]["ocr"]["dpi"] == 88
+    assert any("OCR: 88 dpi" in line for line in app._step0_lines)
+
+
+def test_step0_rejects_invalid_ocr_dpi(gui):
+    app = gui.SurveyApp()
+    app.step0_ocr_dpi_var.set("20")
+    _fill_step0(app)
+    app._start_step0_intake()
+    assert "от 50 до 1200" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_portal_lookup_requires_address_and_configured_vision_key(gui, monkeypatch):
+    app = gui.SurveyApp()
+    app._start_step0_portal_lookup()
+    assert "введите адрес" in app.status_var.get().lower()
+
+    app.step0_address_var.set("87 Stafford Ave")
+    monkeypatch.setattr(
+        app, "_build_runtime_config",
+        lambda: ({"api": {}}, "hydra", "vision-model", None, ""),
+    )
+    monkeypatch.setattr(
+        gui, "resolve_api_target",
+        lambda *args, **kwargs: {"api_key": ""},
+    )
+    called = []
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lambda *a, **k: called.append(True))
+    app._start_step0_portal_lookup()
+    assert "api-ключ" in app.status_var.get().lower()
+    assert not called
+    assert app._step0_portal_running is False
+
+
+def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_path, monkeypatch):
+    import time
+
+    app = gui.SurveyApp()
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_folder_var.set(str(tmp_path))
+    usage = gui.TokenUsage(
+        prompt_tokens=20, completion_tokens=8, total_tokens=28,
+        provider="hydra", provider_label="Hydra AI", model="vision", available=True,
+    )
+    result = gui.nyc_portal.ParcelLookup(
+        block="5712", lot="70", borough="Staten Island",
+        left_neighbour="68", right_neighbour="72",
+        confidence="high", notes="Visible on the map.",
+        map_image=tmp_path / "NYC_Portal_map.png", usage=usage,
+    )
+    monkeypatch.setattr(
+        app, "_build_runtime_config",
+        lambda: ({"api": {}}, "hydra", "vision-model", "key", "pin"),
+    )
+    monkeypatch.setattr(
+        gui, "resolve_api_target", lambda *args, **kwargs: {"api_key": "key"},
+    )
+    captured = {}
+
+    def lookup(address, folder, **kwargs):
+        captured.update(address=address, folder=folder, **kwargs)
+        return result
+
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lookup)
+    app._start_step0_portal_lookup()
+    for _ in range(300):
+        app._drain_events()
+        if not app._step0_portal_running:
+            break
+        time.sleep(0.01)
+    assert not app._step0_portal_running
+    assert captured["address"] == "87 Stafford Ave"
+    assert captured["provider"] == "hydra" and captured["model"] == "vision-model"
+    assert app.step0_borough_var.get() == "Staten Island"
+    assert app.step0_block_var.get() == "5712"
+    assert app.step0_lot_var.get() == "70"
+    assert app.step0_neighbours_var.get() == "68, 72"
+    assert app._session_llm_calls == 1
+    assert any("соседи слева/справа 68 / 72" in line for line in app._step0_lines)
+    assert app.step0_run_button.cget("state") == "normal"
+
+
+def test_clipboard_shortcuts_paste_into_inputs_and_copy_selected_output(gui):
+    app = gui.SurveyApp()
+
+    class EntryWidget:
+        value = "old"
+        clipboard = "new address"
+
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "normal"
+
+        def clipboard_get(self):
+            return self.clipboard
+
+        def selection_present(self):
+            return True
+
+        def delete(self, _first, _last):
+            self.value = ""
+
+        def insert(self, _where, text):
+            self.value += text
+
+        def selection_get(self):
+            return "selected address"
+
+        def clipboard_clear(self):
+            self.clipboard = ""
+
+        def clipboard_append(self, text):
+            self.clipboard += text
+
+    entry = EntryWidget()
+    event = type("Event", (), {"widget": entry})()
+    assert gui.SurveyApp._paste_text_event(event) == "break"
+    assert entry.value == "new address"
+    assert gui.SurveyApp._copy_text_event(event) == "break"
+    assert entry.clipboard == "selected address"
+
+    # Russian layout maps the physical C/V positions to Cyrillic keysyms; Ctrl
+    # shortcuts must still copy/paste from the same controls.
+    russian_copy = type("Event", (), {
+        "widget": entry, "state": 0x4, "keycode": 67,
+        "keysym": "Cyrillic_es", "char": "\x03",
+    })()
+    assert gui.SurveyApp._clipboard_control_event(russian_copy) == "break"
+    entry.clipboard = "вставка на русской раскладке"
+    russian_paste = type("Event", (), {
+        "widget": entry, "state": 0x4, "keycode": 86,
+        "keysym": "Cyrillic_em", "char": "\x16",
+    })()
+    assert gui.SurveyApp._clipboard_control_event(russian_paste) == "break"
+    assert entry.value == "вставка на русской раскладке"
+    assert ("Entry", "<Control-KeyPress>") in app._class_bindings
+    assert ("Text", "<Control-c>") in app._class_bindings
+
+
+def test_right_click_shows_copy_cut_paste_menu_on_editable_entry(gui):
+    app = gui.SurveyApp()
+    gui.tk.Menu.instances.clear()
+
+    class EntryWidget:
+        value = "old"
+        clipboard = "clipboard text"
+        focused = False
+
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "normal"
+
+        def clipboard_get(self):
+            return self.clipboard
+
+        def selection_present(self):
+            return True
+
+        def selection_get(self):
+            return "selected text"
+
+        def delete(self, _first, _last):
+            self.value = ""
+
+        def insert(self, _where, text):
+            self.value += text
+
+        def clipboard_clear(self):
+            self.clipboard = ""
+
+        def clipboard_append(self, text):
+            self.clipboard += text
+
+        def focus_set(self):
+            self.focused = True
+
+    entry = EntryWidget()
+    event = type("Event", (), {"widget": entry, "x_root": 120, "y_root": 80})()
+    assert ("Entry", "<Button-3>") in app._class_bindings
+    handler = app._class_bindings[("Entry", "<Button-3>")]
+    assert handler(event) == "break"
+    assert entry.focused is True
+
+    created_menu = gui.tk.Menu.instances[-1]
+    assert created_menu.popups == [(120, 80)]
+    assert created_menu.released is True
+    labels = {item["label"]: item for item in created_menu.items}
+    assert labels["Копировать"]["state"] == "normal"
+    assert labels["Вырезать"]["state"] == "normal"
+    assert "Вставить" in labels
+
+    labels["Копировать"]["command"]()
+    assert entry.clipboard == "selected text"
+    entry.clipboard = "new clipboard text"
+    labels["Вставить"]["command"]()
+    assert entry.value == "new clipboard text"  # selection_present() replaces the selection
+
+
+def test_right_click_disables_paste_and_cut_on_readonly_entry_without_selection(gui):
+    app = gui.SurveyApp()
+    gui.tk.Menu.instances.clear()
+
+    class ReadonlyEntry:
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "readonly"
+
+        def selection_present(self):
+            return False
+
+        def focus_set(self):
+            return None
+
+    entry = ReadonlyEntry()
+    event = type("Event", (), {"widget": entry, "x_root": 10, "y_root": 20})()
+    handler = app._class_bindings[("Entry", "<Button-3>")]
+    assert handler(event) == "break"
+    created_menu = gui.tk.Menu.instances[-1]
+    labels = {item["label"]: item for item in created_menu.items}
+    assert labels["Копировать"]["state"] == "disabled"
+    assert "Вырезать" not in labels
+    assert "Вставить" not in labels
+
+
+def test_provider_and_model_preferences_autosave_and_survive_restart(gui, tmp_path, monkeypatch):
+    import llm_parser
+
+    config_path = tmp_path / "config.json"
+    local_path = tmp_path / "config.local.json"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_path)
+
+    first = gui.SurveyApp()
+    first.select_provider("OpenRouter")
+    first._on_model_selected("stepfun/step-3.5-flash:free")
+    first._on_close()
+
+    assert config_path.is_file()
+    second = gui.SurveyApp()
+    assert second.current_provider_id() == "openrouter"
+    assert second.current_model() == "stepfun/step-3.5-flash:free"
+    second._on_close()
+
+
+def test_update_section_is_the_first_scrollable_settings_entry_not_buried_at_the_bottom(gui):
+    """Regression: the update controls used to sit after the API-keys/PIN vault
+    sections with no scrolling, so they were unreachable on a short window and
+    the user could not find them. The settings body must scroll, and the update
+    card must be the very first thing inside it."""
+    app = gui.SurveyApp()
+
+    update_row = app.update_source_entry.master
+    drawer_body = update_row.master
+    assert isinstance(drawer_body, gui.ctk.CTkScrollableFrame)
+    assert drawer_body.winfo_children()[0] is update_row
+    assert app.update_source_entry in update_row.winfo_children()
+    assert app.update_version_button in update_row.winfo_children()
+
+
+def test_update_version_requires_a_source_url_before_running(gui):
+    app = gui.SurveyApp()
+    app.update_source_var.set("")
+    app._start_update_version()
+    assert not app._update_running
+    assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
+
+
+def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+        assert source == "https://github.com/Berber86/CAD/tree/main"
+        if progress:
+            progress("скачиваю архив обновления: https://codeload.github.com/...")
+            progress("обновление завершено: заменено файлов — 7")
+        return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=7, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    assert "7" in app.update_status_label.cget("text")
+    assert "перезапустите" in app.update_status_label.cget("text").lower()
+
+
+def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+        return gui.app_updater.UpdateResult(
+            zip_url="https://codeload...",
+            files_written=42,
+            app_dir=str(app_dir),
+            protected_skipped=("config.json",),
+        )
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    status_text = app.update_status_label.cget("text")
+    assert "42" in status_text
+    assert "config.json" in status_text
+    assert "сохранены" in status_text.lower()
+
+
+def test_update_version_declined_confirmation_does_not_run(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: False)
+    calls = []
+    monkeypatch.setattr(gui.app_updater, "apply_update", lambda *a, **kw: calls.append(True))
+    app._start_update_version()
+    assert not calls
+    assert not app._update_running
+
+
+def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def boom(source, app_dir, *, progress=None, timeout=60.0):
+        raise gui.app_updater.UpdateError("сеть недоступна")
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", boom)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    assert "не удалось" in app.update_status_label.cget("text").lower()
+    assert "сеть недоступна" in app.update_status_label.cget("text")
+
+
+def test_update_source_url_autosaves_and_survives_restart(gui, tmp_path, monkeypatch):
+    import llm_parser
+
+    config_path = tmp_path / "config.json"
+    local_path = tmp_path / "config.local.json"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_path)
+
+    first = gui.SurveyApp()
+    first.update_source_var.set("https://github.com/Berber86/CAD/tree/arena/53e1068f-cad")
+    first._persist_update_source()
+    first._on_close()
+
+    assert config_path.is_file()
+    second = gui.SurveyApp()
+    assert second.update_source_var.get() == "https://github.com/Berber86/CAD/tree/arena/53e1068f-cad"
+    second._on_close()

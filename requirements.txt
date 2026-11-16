@@ -1,12 +1,21 @@
-# Прототип 1: Legal Description -> AutoCAD (Windows)
-# Установка:  py -3.11 -m pip install -r requirements.txt
+# Prototype 1: Legal Description -> AutoCAD (Windows)
+# Install:  py -3.11 -m pip install -r requirements.txt
+#
+# ASCII only! pip on Windows reads this file in the system locale (cp1251 for a
+# Russian Windows), and a UTF-8 Cyrillic comment makes it fail with
+# UnicodeDecodeError. Comments in Russian live in README.md instead.
 
 openai>=1.50,<3          # Structured Outputs (client.beta.chat.completions.parse)
-pydantic>=2.7,<3         # строгая схема ответа LLM
+pydantic>=2.7,<3         # strict response schema for the LLM
 customtkinter>=5.2       # GUI
-pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (только Windows)
-pymupdf>=1.24            # извлечение текста и рендер страниц PDF
-Pillow>=10.0             # EXIF-поворот, улучшение фото старых чертежей (JPG/TIFF/PNG) и превью в GUI
-shapely>=2.0             # Шаг 2: геометрия объектов (участок, заборы, строения, габариты подписей)
+pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (Windows only)
+pymupdf>=1.24            # PDF text extraction and page rendering
+Pillow>=10.0             # EXIF rotation, scan enhancement (JPG/TIFF/PNG), GUI previews
+shapely>=2.0             # Step 2: geometry of features (lot, fences, buildings, label boxes)
+certifi>=2024.0          # app_updater.py: CA fallback when the OS trust store rejects GitHub's cert
+
+# Local OCR of scans (optional): pip install -r requirements-ocr.txt
+# Without it scans go to the paid AI/Vision; everything else works the same.
+
 # dev
 pytest>=8.0

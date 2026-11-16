@@ -70,6 +70,13 @@
       "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
       "pass3_provider": "routerai",
       "pass3_model": "openai/gpt-4.1"
+    },
+    "conflict_advisor": {
+      "enabled": true,
+      "auto": false,
+      "attempts": 3,
+      "max_tokens": null,
+      "max_images": 16
     }
   },
   "drawing": {
@@ -79,7 +86,10 @@
       10.0,
       16.0,
       20.0,
-      30.0
+      30.0,
+      40.0,
+      50.0,
+      60.0
     ],
     "text_offset_factor": 1.8,
     "street_offset_factor": 6.5,
@@ -119,8 +129,12 @@
     "property_line_layers": [
       "PROPERTY_LINE",
       "PL",
+      "M-PROPERTY",
       "M-TAX-LINE",
       "PROPERTY_LINES_APPROX"
+    ],
+    "property_closing_layers": [
+      "M-ROW-LINE"
     ],
     "point_label_layers": [
       "POINT_LABELS",
@@ -129,14 +143,19 @@
     ],
     "fence_layers": [
       "S-FENCE",
-      "ST-WALL",
+      "FENCE",
       "CODE_CREW",
-      "FENCE_*",
-      "GATE_*",
-      "LOW_EDGE_*"
+      "FENCE_*"
     ],
     "fence_layer_exclude": [
       "*_NOTE"
+    ],
+    "code_linework_layers": [
+      "CODE_CREW"
+    ],
+    "gate_layers": [
+      "GATE_*",
+      "*_GATE"
     ],
     "structure_layers": {
       "house": [
@@ -145,49 +164,319 @@
         "REF_VEC_BUILDING"
       ],
       "shed": [
-        "SUBJECT_SHED_OUTLINE",
-        "NEIGHBOUR_SHED_OUTLINE"
+        "*SHED*"
       ],
       "porch": [
-        "SIDE_PORCH",
-        "NEIGHBOUR_SIDE_PORCH",
-        "FRONT_LANDING",
-        "REAR_DECK_EDGE"
+        "*PORCH*",
+        "*LANDING*",
+        "*DECK*"
       ],
       "steps": [
-        "FRONT_STEPS",
-        "REAR_STEPS",
-        "ST-STEP",
-        "NEIGHBOUR_SIDE_STAIR"
+        "*_STEPS",
+        "*STAIR*",
+        "ST-STEP"
+      ],
+      "planter": [
+        "*PLANTER*"
+      ],
+      "pool": [
+        "POOL"
+      ],
+      "wall": [
+        "ST-WALL",
+        "WALL"
+      ],
+      "overhang": [
+        "ST-OHED"
       ],
       "surface": [
         "DRIVEWAY_EDGE",
         "SIDEWALK_EDGE",
         "WALK_EDGE",
-        "WALK_43_SKETCH",
-        "PLANTER_EDGE",
-        "SIDE_PLANTER_5",
-        "GRASS_STRIP_EDGE"
+        "WALK_*_SKETCH",
+        "GRASS_STRIP_EDGE",
+        "S-ROAD-DWY",
+        "S-ROAD-SW-LINE",
+        "S-DWY",
+        "S-CONC-MISC"
+      ],
+      "misc": [
+        "ST-MISC"
       ]
     },
+    "linear_structure_categories": [
+      "overhang"
+    ],
+    "ribbon_categories": [
+      "wall"
+    ],
+    "ribbon_cap_categories": [
+      "misc"
+    ],
+    "ribbon_cap_min_length_ft": 6.0,
+    "ribbon_max_width_ft": 1.6,
     "step_tread_layers": [
-      "*_STEP_TREADS"
+      "*TREADS*"
     ],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
+    "house_label_layer": "0",
+    "house_label_text_style": "RDS",
+    "house_label_style_definition": {
+      "font": "romand.shx",
+      "width_factor": 0.8,
+      "oblique_deg": 20.0
+    },
+    "standard_text_heights_ft": {
+      "label": 0.9,
+      "house_offset": 1.1,
+      "house": 1.5
+    },
+    "house_label_shrink_to_fit": true,
+    "house_label_height_step_ft": 0.1,
     "existing_label_layers": [
-      "D-TOPO-TEXT",
+      "D-TOPO-TEXT"
+    ],
+    "field_note_layers": [
       "FENCE_NOTE",
       "ENTRANCE_TEXT",
       "SURFACE_TEXT",
-      "CONTEXT_TEXT"
+      "CONTEXT_TEXT",
+      "CONTEXT_SURFACE_TEXT",
+      "LOW_EDGE_NOTE",
+      "*_NOTE",
+      "*_TEXT"
     ],
+    "field_note_rules": [
+      {
+        "match": "*HOUSE*",
+        "label": ""
+      },
+      {
+        "match": "*DWELLING*",
+        "label": ""
+      },
+      {
+        "match": "*TIMBER*EDGE*",
+        "label": ""
+      },
+      {
+        "match": "*POLE*",
+        "label": ""
+      },
+      {
+        "match": "*CHAIN*LINK*GATE*",
+        "label": "C.L.F.\nGATE",
+        "target": "gate"
+      },
+      {
+        "match": "*VINYL*GATE*",
+        "label": "V.FE.\nGATE",
+        "target": "gate"
+      },
+      {
+        "match": "*WOOD*GATE*",
+        "label": "W.FE.\nGATE",
+        "target": "gate"
+      },
+      {
+        "match": "*IRON*GATE*",
+        "label": "I.FE.\nGATE",
+        "target": "gate"
+      },
+      {
+        "match": "*GATE*",
+        "label": "GATE",
+        "target": "gate"
+      },
+      {
+        "match": "*CHAIN*LINK*",
+        "label": "CHAIN LINK FENCE",
+        "target": "fence"
+      },
+      {
+        "match": "*VINYL*FENCE*",
+        "label": "VINYL FENCE",
+        "target": "fence"
+      },
+      {
+        "match": "*STOCKADE*",
+        "label": "WOOD FENCE",
+        "target": "fence"
+      },
+      {
+        "match": "*WOOD*FENCE*",
+        "label": "WOOD FENCE",
+        "target": "fence"
+      },
+      {
+        "match": "*IRON*FENCE*",
+        "label": "IRON FENCE",
+        "target": "fence"
+      },
+      {
+        "match": "*WOOD*PORCH*STEP*",
+        "labels": {
+          "porch": "FRAME\nDECK",
+          "steps": "FRAME\nSTEPS"
+        }
+      },
+      {
+        "match": "*PORCH*TREAD*",
+        "labels": {
+          "porch": "O.P.",
+          "steps": "CONC.\nSTEPS"
+        }
+      },
+      {
+        "match": "*PORCH*STEP*",
+        "labels": {
+          "porch": "O.P.",
+          "steps": "CONC.\nSTEPS"
+        }
+      },
+      {
+        "match": "*WOOD*STEP*",
+        "label": "FRAME\nSTEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*WOOD*STAIR*",
+        "label": "FRAME\nSTEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*WOOD*TREAD*",
+        "label": "FRAME\nSTEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*BRICK*STEP*",
+        "label": "BRICK\nSTEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*CONC*STEP*",
+        "label": "CONC.\nSTEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*STEP*",
+        "label": "STEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*STAIR*",
+        "label": "STEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*TREAD*",
+        "label": "STEPS",
+        "target": "steps"
+      },
+      {
+        "match": "*WOOD*PORCH*",
+        "label": "FRAME\nDECK",
+        "target": "porch"
+      },
+      {
+        "match": "*DECK*",
+        "label": "FRAME\nDECK",
+        "target": "porch"
+      },
+      {
+        "match": "*PORCH*",
+        "label": "O.P.",
+        "target": "porch"
+      },
+      {
+        "match": "*SHED*",
+        "label": "SHED",
+        "target": "shed"
+      },
+      {
+        "match": "*PLANTER*",
+        "label": "PLANTER",
+        "target": "planter"
+      },
+      {
+        "match": "*PAVER*",
+        "label": "DECO. PAVERS",
+        "target": "ground"
+      },
+      {
+        "match": "*ASPHALT*",
+        "label": "ASPHALT",
+        "target": "ground"
+      },
+      {
+        "match": "*BLACKTOP*",
+        "label": "ASPHALT",
+        "target": "ground"
+      },
+      {
+        "match": "*GRAVEL*",
+        "label": "GRAVEL",
+        "target": "ground"
+      },
+      {
+        "match": "*CONC*WALK*",
+        "label": "CONC. WALK",
+        "target": "ground"
+      },
+      {
+        "match": "*CONC*",
+        "label": "CONC.",
+        "target": "ground"
+      },
+      {
+        "match": "*GRASS*",
+        "label": "GRASS",
+        "target": "ground"
+      },
+      {
+        "match": "*LAWN*",
+        "label": "GRASS",
+        "target": "ground"
+      },
+      {
+        "match": "*GROUND*",
+        "label": "EARTH",
+        "target": "ground"
+      },
+      {
+        "match": "*EARTH*",
+        "label": "EARTH",
+        "target": "ground"
+      },
+      {
+        "match": "*DIRT*",
+        "label": "EARTH",
+        "target": "ground"
+      },
+      {
+        "match": "*SOIL*",
+        "label": "EARTH",
+        "target": "ground"
+      },
+      {
+        "match": "*YARD*",
+        "label": "YARD",
+        "target": "ground"
+      },
+      {
+        "match": "*DRIVEWAY*",
+        "label": "DRIVEWAY",
+        "target": "ground"
+      }
+    ],
+    "field_note_bind_radius_ft": 5.0,
     "point_code_dictionary": {
       "FEC*": "CHAIN LINK FENCE",
       "FEV*": "VINYL FENCE",
       "FEW*": "WOOD FENCE",
       "FEI*": "IRON FENCE",
-      "TTP*": "UTILITY POLE",
       "LP*": "UTILITY POLE",
       "UP*": "UTILITY POLE",
       "CB*": "CATCH BASIN",
@@ -197,33 +486,307 @@
     "fence_point_codes": [
       "FE*"
     ],
+    "point_codes_without_label": [
+      "BLC*",
+      "DW*",
+      "OP*",
+      "PLAN*",
+      "SHED*",
+      "STEP*",
+      "SW*",
+      "LST*",
+      "FD*",
+      "XP*",
+      "TTP*",
+      "BL",
+      "BL?"
+    ],
     "point_to_fence_max_ft": 3.5,
-    "label_point_features": true,
+    "point_block_attribute_tags": {
+      "number": [
+        "PT#",
+        "PT*",
+        "PNT*",
+        "NUM*"
+      ],
+      "description": [
+        "DESC*"
+      ],
+      "elevation": [
+        "ELEV*"
+      ]
+    },
+    "point_descriptions": [
+      {
+        "match": [
+          "VINYL FENCE",
+          "V FENCE",
+          "PVC FENCE"
+        ],
+        "label": "VINYL FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "F E C",
+          "CHAIN LINK FENCE",
+          "C L F"
+        ],
+        "label": "CHAIN LINK FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "WOOD FENCE",
+          "W FENCE",
+          "STOCKADE FENCE"
+        ],
+        "label": "WOOD FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "IRON FENCE",
+          "I FENCE",
+          "I P F",
+          "IRON PICKET FENCE",
+          "F E I"
+        ],
+        "label": "IRON FENCE",
+        "category": "fence"
+      },
+      {
+        "match": [
+          "O PORCH",
+          "OPEN PORCH",
+          "PORCH"
+        ],
+        "label": "O.P.",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "WOOD DECK",
+          "FRAME DECK"
+        ],
+        "label": "FRAME\nDECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "METAL DECK",
+          "IRON DECK"
+        ],
+        "label": "METAL\nDECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "DECK"
+        ],
+        "label": "DECK",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "VESTIBULE",
+          "VEST"
+        ],
+        "label": "VEST.",
+        "category": "porch"
+      },
+      {
+        "match": [
+          "CELDOOR",
+          "CEL DOOR",
+          "CELLAR DOOR"
+        ],
+        "label": "C.D.",
+        "category": "cellar_door"
+      },
+      {
+        "match": [
+          "FIRESCAPE",
+          "FIRE ESCAPE",
+          "FIRE ESC"
+        ],
+        "label": "FIRE ESC.",
+        "category": "fire_escape"
+      },
+      {
+        "match": [
+          "AW OVERH",
+          "AWNING",
+          "AWN"
+        ],
+        "label": "AWNING",
+        "category": "awning"
+      },
+      {
+        "match": [
+          "STEPS",
+          "STEP",
+          "STAIRS"
+        ],
+        "label": "STEPS",
+        "label_narrow": "STEP",
+        "category": "steps"
+      },
+      {
+        "match": [
+          "SHED"
+        ],
+        "label": "SHED",
+        "category": "shed"
+      },
+      {
+        "match": [
+          "POOL"
+        ],
+        "label": "POOL\nAREA {area} Sq.Ft.",
+        "category": "pool"
+      },
+      {
+        "match": [
+          "PLANTER"
+        ],
+        "label": "PLANTER",
+        "label_narrow": "PLANT.",
+        "category": "planter"
+      },
+      {
+        "match": [
+          "BOT WALL",
+          "TOP WALL",
+          "WALL"
+        ],
+        "label": "WALL",
+        "category": "wall"
+      },
+      {
+        "match": [
+          "CANTILEVER",
+          "OVERHANG"
+        ],
+        "label": "CANTIL.",
+        "category": "overhang"
+      },
+      {
+        "match": [
+          "EDG DWY",
+          "EDGE DWY",
+          "DWY",
+          "DRIVEWAY"
+        ],
+        "label": "DRIVEWAY",
+        "category": "surface"
+      },
+      {
+        "match": [
+          "COLUMN",
+          "COL"
+        ],
+        "label": "",
+        "category": "column"
+      },
+      {
+        "match": [
+          "BLC*",
+          "BL",
+          "TTP*",
+          "SPOT GRADE*",
+          "CONC SW",
+          "SW",
+          "BBC*",
+          "BC*",
+          "TC*",
+          "EDG CONC",
+          "EDGE CONC",
+          "DW",
+          "W U P",
+          "WUP",
+          "U P"
+        ],
+        "label": ""
+      }
+    ],
+    "narrow_object_max_width_ft": 1.5,
+    "wall_with_columns_format": "{wall} W./COLUMNS",
+    "wall_columns_reach_ft": 1.5,
+    "wall_columns_min_count": 2,
+    "roofed_porch_labels": {
+      "O.P.": "ROOFED\nO.P."
+    },
+    "point_description_ignored_suffixes": [
+      "NE"
+    ],
+    "point_layer_suffixes": [
+      "-ELEV"
+    ],
+    "symbol_block_labels": {
+      "WUP": "UTILITY\nPOLE",
+      "UP": "UTILITY\nPOLE"
+    },
+    "symbol_label_scope": "lot",
+    "symbol_lot_tolerance_ft": 1.0,
+    "party_wall_layers": [
+      "0"
+    ],
+    "party_wall_label": "PARTY WALL",
+    "party_wall_max_width_ft": 1.6,
+    "party_wall_min_length_ft": 10.0,
+    "fence_atop_wall_format": "{fence} ATOP {wall}",
+    "fence_atop_plain_wall_names": [
+      "WALL"
+    ],
+    "fence_atop_wall_default": "CONC. WALL",
+    "fence_atop_wall_compact": {
+      "CONC. WALL": "C.WALL",
+      "CONCRETE WALL": "C.WALL"
+    },
+    "fence_atop_wall_reach_ft": 0.5,
+    "fence_atop_wall_min_ft": 4.0,
+    "fence_atop_wall_label_min_ft": 10.0,
+    "point_to_feature_max_ft": 2.0,
+    "label_point_features": false,
     "layer_label_mapping": {
       "FENCE_CHAIN*": "CHAIN LINK FENCE",
       "FENCE_VINYL*": "VINYL FENCE",
       "FENCE_WOOD*": "WOOD FENCE",
-      "LOW_EDGE*": "LOW TIMBER EDGE",
-      "SUBJECT_SHED_OUTLINE": "SHED",
-      "SIDE_PORCH": "PORCH",
-      "FRONT_LANDING": "PORCH",
-      "REAR_DECK_EDGE": "WOOD DECK",
-      "FRONT_STEPS": "STEPS",
-      "REAR_STEPS": "STEPS",
+      "FENCE_IRON*": "IRON FENCE",
+      "*SHED*": "SHED",
+      "*PORCH*": "O.P.",
+      "*LANDING*": "O.P.",
+      "*DECK*": "FRAME\nDECK",
+      "*_STEPS": "STEPS",
+      "*STAIR*": "STEPS",
       "ST-STEP": "STEPS",
+      "*PLANTER*": "PLANTER",
       "DRIVEWAY_EDGE": "DRIVEWAY",
-      "SIDEWALK_EDGE": "CONCRETE WALK",
-      "WALK_EDGE": "CONCRETE WALK",
-      "PLANTER_EDGE": "PLANTER",
-      "SIDE_PLANTER*": "PLANTER"
+      "SIDEWALK_EDGE": "CONC. WALK",
+      "WALK_EDGE": "CONC. WALK",
+      "WALK_*_SKETCH": "CONC. WALK",
+      "GRASS_STRIP_EDGE": "GRASS"
     },
+    "fence_abbreviations": {
+      "CHAIN LINK FENCE": "C.L.F.",
+      "VINYL FENCE": "V.FE.",
+      "WOOD FENCE": "W.FE.",
+      "IRON FENCE": "I.FE."
+    },
+    "gate_label_format": "{abbr}\nGATE",
+    "gate_label_plain": "GATE",
+    "gate_adjacent_tolerance_ft": 1.0,
+    "step_count_labels": false,
     "step_count_label_format": "{n} STEPS",
     "step_count_label_format_single": "{n} STEP",
     "search_buffer_ft": 50.0,
     "min_property_area_sqft": 200.0,
+    "property_mismatch_overlap": 0.85,
     "boundary_snap_tolerance_ft": 0.05,
     "boundary_gap_tolerance_ft": 2.0,
     "merge_tolerance_ft": 0.05,
+    "vertex_snap_tolerance_ft": 0.005,
     "min_feature_length_ft": 0.5,
     "min_area_width_ft": 0.75,
     "edge_pair_max_gap_ft": 12.0,
@@ -232,6 +795,9 @@
       "*"
     ],
     "obstacle_layer_exclude": [],
+    "text_obstacle_layers": [
+      "BOUNDARY_TEXT*"
+    ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,
     "duplicate_radius_ft": 6.0,
@@ -242,13 +808,22 @@
         "CHAIN LINK FNC."
       ],
       "VINYL FENCE": [
+        "V.FE.",
+        "VIN.FE.",
+        "VINYL FE.",
         "PVC FENCE"
       ],
+      "V.FE.": [
+        "VIN.FE.",
+        "VINYL FE."
+      ],
       "WOOD FENCE": [
+        "W.FE.",
         "WD. FENCE",
         "STOCKADE FENCE"
       ],
       "IRON FENCE": [
+        "I.FE.",
         "W.I. FENCE"
       ],
       "UTILITY POLE": [
@@ -265,38 +840,141 @@
       "HYDRANT": [
         "HYD."
       ],
-      "CONCRETE WALK": [
-        "CONC. WALK",
+      "CONC. WALK": [
+        "CONCRETE WALK",
         "CONCRETE SIDEWALK",
         "CONC. SIDEWALK"
       ],
       "DRIVEWAY": [
         "DRWY.",
-        "D/W"
+        "D/W",
+        "DRIVE"
       ],
-      "WOOD DECK": [
+      "DRIVE": [
+        "DRIVEWAY"
+      ],
+      "FRAME DECK": [
+        "WOOD DECK",
         "WD. DECK"
+      ],
+      "O.P.": [
+        "OPEN PORCH",
+        "PORCH"
+      ],
+      "PLANTER": [
+        "PLANT."
       ],
       "STEPS": [
         "STEP",
         "STAIRS"
+      ],
+      "STEP": [
+        "STEPS"
       ]
     },
     "text_height_ft": null,
     "text_height_factor": 1.0,
+    "vertical_text_reads": "auto",
+    "north_arrow_block_names": [
+      "NA",
+      "NORTH",
+      "NORTH?ARROW*",
+      "NORTHARROW*",
+      "N?ARROW*",
+      "NARROW*"
+    ],
+    "north_arrow_layers": [
+      "M-NTH-ARROW",
+      "*NTH?ARROW*",
+      "*NORTH?ARROW*",
+      "*NORTHARROW*"
+    ],
+    "north_arrow_block_north_deg": 90.0,
+    "north_arrow_side_sector_deg": 45.0,
+    "regen_after_labeling": true,
+    "hide_field_notes_after_labeling": true,
     "fence_min_extra_length_ft": 4.0,
-    "fence_text_offset_factor": 0.8,
+    "main_cell_categories": [
+      "porch"
+    ],
+    "main_cell_min_share": 0.5,
+    "arm_label_categories": [
+      "steps"
+    ],
+    "arm_label_min_length_ft": 8.0,
+    "arm_label_max_width_ft": 3.0,
+    "travel_direction_labels": {
+      "DRIVEWAY": "DRIVE"
+    },
+    "travel_axis_min_ratio": 1.25,
+    "along_line_gaps_ft": {
+      "fence": 0.7,
+      "house": 0.7,
+      "property": 0.8,
+      "other": 0.55
+    },
+    "fence_text_offset_factor": 1.1,
     "fence_end_margin_ft": 2.0,
+    "fence_text_end_gap_factor": 0.15,
+    "fence_label_every_run_min_ft": 25.0,
+    "fence_label_spacing_ft": 15.0,
+    "fence_min_label_length_ft": 3.0,
     "straight_angle_tolerance_deg": 2.0,
     "text_clearance_factor": 0.3,
-    "line_clearance_factor": 0.15,
+    "line_clearance_factor": 0.3,
     "inside_clearance_factor": 0.3,
     "mtext_line_spacing_factor": 1.67,
-    "leader_min_length_factor": 3.0,
-    "leader_max_length_factor": 16.0,
+    "char_width_factor": 0.92,
+    "space_width_factor": 1.0,
+    "narrow_char_width_factor": 0.48,
+    "text_bearing_factor": 0.26,
+    "narrow_chars": ".,'`:;!|",
+    "measure_text_in_autocad": true,
+    "label_short_fences_outside_lot": true,
+    "fence_full_label_ratio": 2.0,
+    "fence_on_line_tolerance_ft": 0.15,
+    "fence_abbreviation_spacing_ft": 4.0,
+    "fence_label_runs_beyond_lot": true,
+    "outward_label_categories": [
+      "planter",
+      "party_wall"
+    ],
+    "fence_near_lot_ft": 2.0,
+    "field_note_surface_radius_ft": 15.0,
+    "leader_style": "spline",
+    "leader_arc_bulge": 0.25,
+    "leader_min_length_factor": 2.8,
+    "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
-    "leader_text_gap_factor": 0.5,
+    "leader_text_gap_factor": 0.333,
     "leader_arrow_size_factor": 0.8,
-    "leader_attach_annotation": true
+    "leader_object_arrow_factor": 1.333,
+    "leader_attach_annotation": true,
+    "leader_stacked_penalty": 2.0,
+    "leader_min_length_arrows": 2.1,
+    "label_text_style": "ROMANS",
+    "front_yard_depth_ft": 15.0,
+    "label_text_kind": "text",
+    "linetype_scale_rules": {
+      "S-FENCE": {
+        "fixed": 5.0,
+        "divisor": 1.0
+      },
+      "S-FENCE-RAIL": {
+        "fixed": 0.62,
+        "divisor": 8.06
+      }
+    },
+    "linetype_scale_short_below_ft": 5.0,
+    "linetype_scale_halve_from_ft": 8.0,
+    "linetype_scale_halve_to_ft": 10.0
+  },
+  "ocr": {
+    "enabled": true,
+    "dpi": 400,
+    "comment": "локальное распознавание сканов (бесплатно, без ИИ): dpi — рендер страницы; на Шаге 0 можно менять поле OCR DPI (50–1200), настройка сохраняется; выше разрешения картинки в PDF не рендерим"
+  },
+  "deed_intake": {
+    "comment": "Шаг 0: в Windows Ctrl+S отправляется однократно только окну поддерживаемого браузера после загрузки PDF, не во время Cloudflare"
   }
 }

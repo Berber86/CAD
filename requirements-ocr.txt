@@ -1,0 +1,15 @@
+# Local OCR of scanned deeds (free, offline, no API keys).
+#
+# ASCII only! pip on Windows reads requirements files in the system locale
+# (cp1251 on a Russian Windows), so Cyrillic comments break the install.
+# The Russian explanation lives in README.md.
+#
+# Optional: without it deed scans can use the AI/Vision pass. The Step 0 portal
+# automation also needs it to locate page controls; without it enter BBL manually.
+# With it a scan is recognised on the machine (RapidOCR on
+# ONNX, CPU): about 5 seconds per page at 400 dpi, bearings and distances read
+# reliably, and a misread digit is caught by the closure check.
+#
+# Weight: ~16 MB package + ~78 MB onnxruntime + ~70 MB opencv.
+# Install:  .venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
+rapidocr-onnxruntime>=1.4

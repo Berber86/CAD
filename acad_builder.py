@@ -36,23 +36,37 @@ from llm_parser import LegalDescription, Segment, load_config
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
 # понятное сообщение об установке зависимостей.
 from feature_labeler import (
+    STEP2_VERSION,
     DrawingLine,
     DrawingSnapshot,
+    DrawingSymbol,
     DrawingText,
     Feature,
     FeatureLabelError,
+    FenceLinetypeItem,
+    FenceLinetypePlan,
     LayerClassifier,
     RecognitionResult,
+    SurveyPoint,
     feature_settings,
+    fence_linetype_plan,
+    fence_linetype_rule,
+    fence_linetype_scale,
     find_property_polygon,
+    is_north_arrow_block,
+    is_file_reference,
     labels_similar,
+    layer_matches,
     line_to_shapely,
+    lookup_pattern_label,
     plain_text,
     property_polygon_from_selection,
     recognize_features,
+    vertical_text_direction,
 )
 from shapely import affinity as shapely_affinity
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import polygonize, substring, unary_union
 from shapely.geometry import box as shapely_box
 from shapely.strtree import STRtree
 
@@ -110,6 +124,9 @@ AC_ATTACHMENT_MIDDLE_LEFT = 4
 AC_ATTACHMENT_MIDDLE_CENTER = 5
 AC_ATTACHMENT_MIDDLE_RIGHT = 6
 AC_LEADER_LINE_WITH_ARROW = 2
+AC_LEADER_SPLINE_WITH_ARROW = 3
+#: AcRegenType.acAllViewports — то же, что команда _REGENALL
+AC_REGEN_ALL_VIEWPORTS = 1
 
 #: линейные объекты DWG, из которых собираются участок, заборы и строения
 _FEATURE_LINE_KINDS = frozenset(
@@ -2770,7 +2787,9 @@ class AcadBuilder:
         is_hidden = layer.upper() in hidden
         if kind in {"AcDbText", "AcDbMText", "AcDbMLeader"}:
             is_point = classifier.is_point_label(layer)
-            is_label = classifier.is_existing_label(layer)
+            # Готовые подписи и заметки полевика читаются и из выключенных слоёв
+            # (после Шага 2 слои заметок выключаются, повторный запуск их видит).
+            is_label = classifier.is_existing_label(layer) or classifier.is_field_note(layer)
             if is_hidden and not (is_point or is_label):
                 snapshot.skipped_hidden += 1
                 return
@@ -2805,8 +2824,11 @@ class AcadBuilder:
                 )
             )
             return
+        if kind == "AcDbBlockReference":
+            self._read_survey_point(entity, layer, snapshot, classifier.fcfg)
+            return
         if kind == "AcDbLeader":
-            if not classifier.is_existing_label(layer):
+            if not (classifier.is_existing_label(layer) or classifier.is_field_note(layer)):
                 return
             flat = [float(value) for value in entity.Coordinates]
             path = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 2, 3)]
@@ -2815,14 +2837,16 @@ class AcadBuilder:
             return
         if kind not in _FEATURE_LINE_KINDS:
             return
+        is_note = classifier.is_field_note(layer)
         wanted = (
             classifier.is_feature_linework(layer)
             or classifier.is_obstacle(layer)
             or classifier.is_existing_label(layer)
+            or is_note
         )
         if not wanted:
             return
-        if is_hidden:
+        if is_hidden and not is_note:  # выноски заметок нужны и из выключенного слоя
             snapshot.skipped_hidden += 1
             return
         geometry = self._entity_polyline(entity, kind)
@@ -2833,6 +2857,80 @@ class AcadBuilder:
             snapshot.lines.append(
                 DrawingLine(layer=layer, points=tuple(points), closed=closed, kind=kind)
             )
+
+    @staticmethod
+    def _read_survey_point(
+        entity: Any, layer: str, snapshot: DrawingSnapshot, fcfg: dict[str, Any]
+    ) -> None:
+        """
+        Точка съёмки — блок с атрибутами «номер / отметка / описание»
+        (``srvpno3``: ``PT#``, ``ELEV2``, ``DESC2``).
+
+        Атрибуты читаются и тогда, когда их слои заморожены (на экране их не
+        видно): описание точки — исходные данные распознавания. Блоки без
+        атрибута-описания (стрелка севера, знаки) пропускаются.
+        """
+        try:
+            name = str(entity.EffectiveName)
+        except Exception:  # noqa: BLE001 - старые версии AutoCAD
+            name = str(getattr(entity, "Name", "") or "")
+        has_attributes = bool(getattr(entity, "HasAttributes", False))
+        is_north = is_north_arrow_block(name, layer, fcfg)
+        if is_north or not has_attributes:
+            # Условный знак (столб WUP) — блок без атрибутов с известным именем;
+            # стрелка севера — по имени блока или слою, нужен её поворот.
+            known = bool(name) and lookup_pattern_label(name, fcfg.get("symbol_block_labels")) is not None
+            if is_north or known:
+                insertion = entity.InsertionPoint
+
+                def number(attribute: str, default: float) -> float:
+                    try:
+                        return float(getattr(entity, attribute))
+                    except Exception:  # noqa: BLE001 - свойства может не быть
+                        return default
+
+                snapshot.symbols.append(
+                    DrawingSymbol(
+                        layer=layer, name=name,
+                        point=(float(insertion[0]), float(insertion[1])),
+                        rotation=number("Rotation", 0.0),
+                        x_scale=number("XScaleFactor", 1.0),
+                        y_scale=number("YScaleFactor", 1.0),
+                    )
+                )
+            return
+        tags = fcfg.get("point_block_attribute_tags") or {}
+        values = {"number": "", "description": "", "elevation": ""}
+        seen_tags: list[str] = []
+        for attribute in entity.GetAttributes() or ():
+            tag = str(attribute.TagString or "").strip()
+            seen_tags.append(tag)
+            for role in values:
+                if not values[role] and layer_matches(tag, tags.get(role)):
+                    values[role] = plain_text(attribute.TextString)
+                    break
+        if not values["description"]:
+            # Для отчёта: блоки с атрибутами есть, а описания точки в них нет
+            # (другие теги атрибутов либо пустое описание).
+            snapshot.blocks_without_description += 1
+            for tag in seen_tags:
+                snapshot.block_tags[tag] = snapshot.block_tags.get(tag, 0) + 1
+            return
+        insertion = entity.InsertionPoint
+        try:
+            block = str(entity.EffectiveName)
+        except Exception:  # noqa: BLE001 - старые версии AutoCAD
+            block = str(getattr(entity, "Name", "") or "")
+        snapshot.survey_points.append(
+            SurveyPoint(
+                layer=layer,
+                number=values["number"],
+                description=values["description"],
+                point=(float(insertion[0]), float(insertion[1])),
+                elevation=values["elevation"],
+                block=block,
+            )
+        )
 
     # -- указание границы участка в AutoCAD ----------------------------------
     def pick_boundary_lines(
@@ -2947,6 +3045,137 @@ class AcadBuilder:
             pass
         return name
 
+    def _hide_field_note_layers(
+        self, doc: Any, recognition: RecognitionResult | None = None
+    ) -> list[str]:
+        """
+        Выключает (LayerOn = False) слои заметок полевого чертёжника: их заменили
+        подписи в слое заказчика. Объекты не удаляются — слой можно включить обратно.
+
+        Выключаются только слои, в которых рядом с участком найдены заметки,
+        распознанные правилами ``field_note_rules`` (слой, попавший под шаблон
+        ``*_TEXT`` случайно, остаётся видимым).
+        """
+        classifier = LayerClassifier(feature_settings(self.cfg))
+        used: set[str] | None = None
+        if recognition is not None:
+            used = {
+                str(note.layer).upper() for note in recognition.field_notes
+                if note.status != "unknown"
+            }
+        hidden: list[str] = []
+        try:
+            layers = doc.Layers
+        except Exception:  # noqa: BLE001
+            return hidden
+        for layer in self._iter_com(layers):
+            try:
+                name = str(layer.Name)
+                if not classifier.is_field_note(name):
+                    continue
+                if used is not None and name.upper() not in used:
+                    continue
+                if bool(getattr(layer, "LayerOn", True)):
+                    layer.LayerOn = False
+                    hidden.append(name)
+            except Exception:  # noqa: BLE001 - слой заблокирован или недоступен
+                continue
+        return hidden
+
+    def _label_text_style(self, doc: Any) -> tuple[str, bool]:
+        """
+        Текстовый стиль подписей Шага 2: ``(имя, это стиль самого чертежа)``.
+
+        В чертежах заказчика подписи ``D-TOPO-TEXT`` набраны стилем ``ROMANS``
+        (``label_text_style``); если такой стиль в чертеже есть, он берётся как
+        есть, без изменений. Иначе — стиль программы (``drawing.text_style``).
+        """
+        wanted = str(feature_settings(self.cfg).get("label_text_style") or "").strip()
+        if wanted and self._text_style_exists(doc, wanted):
+            return wanted, True
+        return self._ensure_text_style(doc), False
+
+    @staticmethod
+    def _create_house_style(doc: Any, name: str, fcfg: dict[str, Any]) -> bool:
+        """
+        Создаёт стиль описания дома (``RDS``), как он задан в шаблоне заказчика
+        (``house_label_style_definition``): шрифт, сжатие, наклон. ``False`` —
+        стиль не задан в настройках либо AutoCAD его не создал.
+        """
+        definition = fcfg.get("house_label_style_definition")
+        if not isinstance(definition, dict) or not str(definition.get("font") or "").strip():
+            return False
+        try:
+            style_obj = _com_retry(doc.TextStyles.Add, name)
+        except Exception:  # noqa: BLE001
+            return False
+        font = str(definition.get("font")).strip()
+        try:
+            style_obj.fontFile = font
+        except Exception:  # noqa: BLE001
+            try:
+                style_obj.SetFont(font, False, False, 0, 0)
+            except Exception:  # noqa: BLE001
+                pass
+        for attribute, value in (
+            ("Height", 0.0),
+            ("Width", float(definition.get("width_factor") or 1.0)),
+            ("ObliqueAngle", math.radians(float(definition.get("oblique_deg") or 0.0))),
+        ):
+            try:
+                setattr(style_obj, attribute, value)
+            except Exception:  # noqa: BLE001 - параметр не критичен
+                pass
+        return True
+
+    @staticmethod
+    def _text_style_exists(doc: Any, name: str) -> bool:
+        """Есть ли в чертеже текстовый стиль ``name`` (стили шаблона заказчика)."""
+        try:
+            doc.TextStyles.Item(name)
+        except Exception:  # noqa: BLE001 - стиля нет либо коллекция недоступна
+            return False
+        return True
+
+    def _measure_text_width_scale(self, doc: Any, height: float) -> float:
+        """
+        Поправка ширины текста: пробная строка создаётся стилем подписей,
+        измеряется (``GetBoundingBox``) и сразу удаляется. ``1.0`` — измерить не
+        удалось либо шрифт совпадает с расчётным (romans.shx).
+        """
+        fcfg = feature_settings(self.cfg)
+        expected = feature_text_width(TEXT_WIDTH_PROBE, height, fcfg)
+        if expected <= 0.0:
+            return 1.0
+        entity = None
+        try:
+            style, _native = self._label_text_style(doc)
+            entity = _com_retry(
+                doc.ModelSpace.AddText, TEXT_WIDTH_PROBE, _variant_point((0.0, 0.0)), float(height)
+            )
+            try:
+                entity.StyleName = style
+            except Exception:  # noqa: BLE001
+                pass
+            bbox = self._entity_bbox(entity)
+        except Exception:  # noqa: BLE001 - измерение необязательно
+            bbox = None
+        finally:
+            if entity is not None:
+                try:
+                    entity.Delete()
+                except Exception:  # noqa: BLE001
+                    pass
+        if bbox is None:
+            return 1.0
+        # И расчёт, и GetBoundingBox — габарит видимого текста (без полей по краям).
+        measured = bbox[2] - bbox[0]
+        ratio = measured / expected
+        if not math.isfinite(ratio) or not (0.5 <= ratio <= 1.8):
+            return 1.0
+        # Совпадение в пределах 4 % — шрифт расчётный, поправка не нужна.
+        return 1.0 if abs(ratio - 1.0) <= 0.04 else float(ratio)
+
     def _add_mtext(
         self,
         model_space: Any,
@@ -2969,80 +3198,314 @@ class AcadBuilder:
         mtext.Layer = layer
         return mtext
 
+    def _feature_label_text_mode(
+        self, item: FeatureLabelItem, fcfg: dict[str, Any] | None = None
+    ) -> str:
+        """
+        Чем создавать подпись объекта: ``"text"`` — однострочным TEXT, ``"mtext"`` — MText.
+
+        Настройка ``feature_labeling.label_text_kind``:
+
+        * ``"text"`` (по умолчанию) — все подписи объектов однострочным TEXT; подпись
+          из двух строк создаётся двумя TEXT друг под другом с тем же шагом, что у
+          MText. Так надписи не «пляшут» в чужих CAD (Carlson Survey), где MText с
+          привязкой middle-center встаёт по левой линии. Описание дома (свой слой и
+          стиль RDS) остаётся MText, как в шаблоне заказчика;
+        * ``"mtext"`` — всё MText (как было до 3.7);
+        * ``"auto"`` — прежнее правило: вдоль линии — TEXT, остальное — MText.
+
+        Выноска всегда идёт с MText: аннотацией объекта ``Leader`` может быть
+        только MText (TEXT к выноске AutoCAD не привязывает).
+        """
+        fcfg = fcfg if fcfg is not None else feature_settings(self.cfg)
+        mode = str(fcfg.get("label_text_kind") or "text").strip().lower()
+        if item.kind == "leader":
+            return "mtext"
+        if item.layer or item.style:
+            return "mtext"  # описание дома — как в шаблоне заказчика
+        if mode == "mtext":
+            return "mtext"
+        if mode == "auto":
+            return "text" if item.kind == "text" else "mtext"
+        if mode == "old":
+            return "text" if item.kind == "text" else "mtext"
+        return "text"
+
+    def _add_feature_texts(
+        self,
+        model_space: Any,
+        item: FeatureLabelItem,
+        layer: str,
+        style: str,
+        fcfg: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Создаёт подпись объекта однострочными TEXT, выровненными по центру.
+
+        Каждая строка — отдельный ``AcDbText`` с ``Alignment = acAlignmentMiddleCenter``
+        и ``TextAlignmentPoint`` в её центре: так надпись стоит по центру, а не по
+        левой линии, в любом CAD. Строки двухстрочной подписи разнесены на
+        ``mtext_line_spacing_factor`` высот — габарит тот же, что программа отводит
+        при раскладке. Возвращает число созданных объектов.
+        """
+        fcfg = fcfg if fcfg is not None else feature_settings(self.cfg)
+        lines = [line for line in item.text.split("\n") if line.strip()] or [item.single_line]
+        spacing = float(fcfg.get("mtext_line_spacing_factor") or 1.67) * float(item.height)
+        # «Вверх» повёрнутого текста: rotation отсчитывается от +X против часовой.
+        up = (-math.sin(float(item.rotation)), math.cos(float(item.rotation)))
+        offset = spacing * (len(lines) - 1) / 2.0
+        for index, line in enumerate(lines):
+            shift = offset - index * spacing
+            point = (
+                float(item.point[0]) + up[0] * shift,
+                float(item.point[1]) + up[1] * shift,
+            )
+            self._add_text(
+                model_space,
+                TextItem(
+                    text=line, point=point, rotation=float(item.rotation),
+                    kind="feature", height=float(item.height),
+                ),
+                float(item.height), layer, style,
+            )
+        return len(lines)
+
     def _add_leader(
         self,
         model_space: Any,
         item: FeatureLabelItem,
         annotation: Any,
         layer: str,
-    ) -> tuple[Any, str]:
+    ) -> tuple[Any, str, bool]:
         """
-        Выноска со стрелкой. Возвращает ``(объект, предупреждение)``.
+        Выноска со стрелкой. Возвращает ``(объект, предупреждение, текст привязан)``.
 
-        Порядок попыток: ``AddLeader`` с привязанным MText -> ``AddLeader`` без
-        аннотации -> полилиния с клиновидной стрелкой (если AddLeader недоступен).
+        «Текст привязан» — выноска и MText связаны, как после команды QLEADER:
+        при переносе текста конец выноски идёт за ним.
+
+        ``leader_style = "spline"`` (по умолчанию) — объект Leader, как у
+        заказчика: сплайн со стрелкой по двум точкам, MText привязан к выноске
+        (QLEADER). ``"leader"`` — Leader из прямых отрезков с полкой. Порядок
+        попыток: ``AddLeader`` с привязанным MText -> ``AddLeader`` без
+        аннотации -> полилиния со стрелкой (если AddLeader недоступен).
+        ``"arc"`` — сразу дуга полилинией с клиновидной стрелкой.
         """
         fcfg = feature_settings(self.cfg)
+        style = str(fcfg.get("leader_style") or "spline").strip().lower()
+        use_leader = style in {"leader", "spline"}
+        leader_type = (
+            AC_LEADER_SPLINE_WITH_ARROW if style == "spline" else AC_LEADER_LINE_WITH_ARROW
+        )
         points3d = [(x, y, 0.0) for x, y in item.leader_points]
         coordinates = _variant_points(points3d)
         leader: Any = None
         warning = ""
+        attached = False
+        errors: list[str] = []
         attach = (
             bool(fcfg.get("leader_attach_annotation", True))
             and item.attach_annotation
             and annotation is not None
         )
-        if hasattr(model_space, "AddLeader"):
-            attempts: list[Any] = []
+        if use_leader and hasattr(model_space, "AddLeader"):
+            attempts: list[tuple[str, Any, bool]] = []
             if attach:
-                attempts.append(annotation)
-            attempts.append(_null_dispatch())
-            for candidate in attempts:
+                attempts.append(("AddLeader с текстом", annotation, True))
+            attempts.append(("AddLeader без текста", _null_dispatch(), False))
+            for name, candidate, with_text in attempts:
                 try:
                     leader = _com_retry(
-                        model_space.AddLeader, coordinates, candidate, AC_LEADER_LINE_WITH_ARROW,
+                        model_space.AddLeader, coordinates, candidate, leader_type,
                         attempts=2,
                     )
+                    attached = with_text
                     break
-                except Exception:  # noqa: BLE001 - пробуем следующий вариант
+                except Exception as exc:  # noqa: BLE001 - пробуем следующий вариант
+                    errors.append(f"{name}: {exc}")
                     leader = None
         if leader is not None:
-            arrow_factor = float(fcfg.get("leader_arrow_size_factor") or 0.0)
-            if arrow_factor > 0.0:
+            if attach and not attached:
+                # Leader создан без текста: привязка свойством Annotation.
+                try:
+                    leader.Annotation = annotation
+                    attached = True
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"Leader.Annotation: {exc}")
+            # Стрелка — из текущего размерного стиля чертежа (у заказчика
+            # CURB-DIM 1-16: 1.2 ft); своя — только если та несоразмерна тексту.
+            arrow_factor = float(fcfg.get("leader_object_arrow_factor") or 0.0)
+            try:
+                current = float(leader.ArrowheadSize) * float(leader.ScaleFactor)
+            except Exception:  # noqa: BLE001 - свойства недоступны
+                current = 0.0
+            fits = 0.6 * float(item.height) <= current <= 2.2 * float(item.height)
+            if arrow_factor > 0.0 and not fits:
                 try:
                     leader.ScaleFactor = 1.0
                     leader.ArrowheadSize = float(item.height) * arrow_factor
                 except Exception:  # noqa: BLE001 - остаётся размер из текущего размерного стиля
+                    pass
+            # AutoCAD не рисует стрелку, если выноска короче двух стрелок.
+            arrows = float(fcfg.get("leader_min_length_arrows") or 0.0)
+            first = math.hypot(
+                item.leader_points[1][0] - item.leader_points[0][0],
+                item.leader_points[1][1] - item.leader_points[0][1],
+            )
+            if arrows > 0.0:
+                try:
+                    scale = float(leader.ScaleFactor) or 1.0
+                    size = float(leader.ArrowheadSize) * scale
+                    if size > 1e-9 and first < arrows * size:
+                        leader.ArrowheadSize = first / arrows / scale
+                except Exception:  # noqa: BLE001 - свойства недоступны
                     pass
             leader.Layer = layer
             try:
                 leader.Update()
             except Exception:  # noqa: BLE001
                 pass
-            return leader, warning
+            if attach and not attached:
+                warning = (
+                    "AutoCAD создал объект Leader, но не привязал к нему текст — при переносе "
+                    "текста выноска останется на месте (" + "; ".join(errors) + ")"
+                )
+            return leader, warning, attached
 
-        # Запасной вариант: полилиния, первый короткий сегмент которой — стрелка.
+        # Полилиния, первый короткий сегмент которой — стрелка (ширина 0 -> w).
         tip, second = item.leader_points[0], item.leader_points[1]
         length = math.hypot(second[0] - tip[0], second[1] - tip[1])
-        arrow = min(float(item.height) * 0.9, length * 0.4)
+        arrow_factor = float(fcfg.get("leader_arrow_size_factor") or 0.9)
+        arrow = min(float(item.height) * arrow_factor, length * 0.4)
         path = list(item.leader_points)
+        bulges: list[float] = []
         if length > 1e-9 and arrow > 1e-9:
-            neck = (
-                tip[0] + (second[0] - tip[0]) * arrow / length,
-                tip[1] + (second[1] - tip[1]) * arrow / length,
-            )
+            bulge = float(item.leader_bulge) if len(path) == 2 else 0.0
+            if abs(bulge) > 1e-6:
+                # Дуга делится на «стрелку» и «хвост»: оба сегмента лежат на одной окружности.
+                theta = 4.0 * math.atan(bulge)
+                fraction = arrow / length
+                neck = _bulge_arc_points(tip, second, bulge, count=101)[
+                    max(1, min(99, int(round(fraction * 100))))
+                ]
+                bulges = [math.tan(theta * fraction / 4.0), math.tan(theta * (1.0 - fraction) / 4.0)]
+            else:
+                neck = (
+                    tip[0] + (second[0] - tip[0]) * arrow / length,
+                    tip[1] + (second[1] - tip[1]) * arrow / length,
+                )
             path.insert(1, neck)
         polyline = _com_retry(model_space.AddLightWeightPolyline, _variant_points(path))
         try:
             polyline.SetWidth(0, 0.0, arrow / 3.0)
+            for index, value in enumerate(bulges):
+                polyline.SetBulge(index, value)
         except Exception:  # noqa: BLE001
             pass
         polyline.Layer = layer
-        warning = "AddLeader недоступен — выноска начерчена полилинией со стрелкой"
-        return polyline, warning
+        if use_leader:
+            warning = (
+                "AutoCAD не создал объект Leader (AddLeader) — выноска начерчена "
+                "полилинией со стрелкой"
+            )
+            if errors:
+                warning += " (" + "; ".join(errors) + ")"
+        return polyline, warning, False
+
+    @staticmethod
+    def _entity_segment_lengths(entity: Any, kind: str) -> list[float]:
+        """Длины сегментов линейного объекта (у ``AcDbLine`` — одна)."""
+        geometry = AcadBuilder._entity_polyline(entity, kind)
+        if geometry is None:
+            return []
+        points, closed = geometry
+        if len(points) < 2:
+            return []
+        pairs = list(zip(points, points[1:])) + ([(points[-1], points[0])] if closed else [])
+        lengths = [
+            math.hypot(end[0] - start[0], end[1] - start[1]) for start, end in pairs
+        ]
+        return [length for length in lengths if length > 1e-6]
+
+    def apply_fence_linetype_scales(
+        self,
+        doc: Any,
+        *,
+        scale: float | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> FenceLinetypePlan:
+        """
+        Правит масштаб типа линий (``LinetypeScale``) у линий заборов.
+
+        Правило заказчика: на слое ``S-FENCE`` забор чертится с масштабом типа
+        линий 5; у отрезка короче 5 ft при этом не видно ни одного перекрестия,
+        а на 8–10 ft просятся два вместо одного. Поэтому короткому отрезку
+        масштаб ставится равным его длине, отрезку 8–10 ft — половине длины, а
+        остальным — масштаб слоя (``linetype_scale_rules``). У ``S-FENCE-RAIL``
+        узор мельче в 8.06 раза: там те же условия, но результат делится на
+        8.06, а по умолчанию стоит 0.62. Правила даны для 1"=16'; для другого
+        масштаба чертежа масштаб типа линий умножается на scale / 16.
+
+        Меняются только свойства объектов — геометрия, слои и подписи не
+        трогаются. У полилинии масштаб один на весь объект: он считается по
+        самому короткому сегменту, иначе на коротком участке крестик пропадёт.
+        """
+        fcfg = feature_settings(self.cfg)
+        base_scale = float(self.drawing_cfg.get("base_scale", 16.0) or 16.0)
+        plan = FenceLinetypePlan(scale=float(scale or base_scale), base_scale=base_scale)
+        if not fcfg.get("linetype_scale_rules"):
+            return plan
+        try:
+            model_space = doc.ModelSpace
+        except Exception as exc:  # noqa: BLE001
+            plan.failed.append(f"не удалось получить ModelSpace: {exc}")
+            return plan
+        for entity in self._iter_com(model_space):
+            if should_continue is not None and not should_continue():
+                raise AcadBuilderError("операция отменена: чертёж не изменён")
+            try:
+                layer = str(entity.Layer)
+            except Exception:  # noqa: BLE001 - прокси-объекты
+                continue
+            rule = fence_linetype_rule(layer, fcfg)
+            if rule is None:
+                continue
+            try:
+                kind = str(entity.ObjectName)
+                if kind not in _FEATURE_LINE_KINDS:
+                    continue  # блоки и тексты на слое забора — не линии
+                lengths = self._entity_segment_lengths(entity, kind)
+            except Exception:  # noqa: BLE001 - повреждённый примитив
+                lengths = []
+            if not lengths:
+                plan.skipped += 1
+                continue
+            length = min(lengths)
+            value, why = fence_linetype_scale(
+                length, rule, fcfg, scale=plan.scale, base_scale=base_scale
+            )
+            try:
+                current = float(getattr(entity, "LinetypeScale", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001 - свойства может не быть
+                current = 0.0
+            if abs(current - value) <= 1e-4:
+                plan.unchanged += 1
+                continue
+            try:
+                entity.LinetypeScale = value
+            except Exception as exc:  # noqa: BLE001 - слой заблокирован и т. п.
+                plan.failed.append(
+                    f"слой {layer}, отрезок {length:.2f} ft: не удалось задать "
+                    f"масштаб типа линий {value:g} — {exc}"
+                )
+                continue
+            plan.items.append(
+                FenceLinetypeItem(layer=layer, length_ft=length, value=value, why=why)
+            )
+        return plan
 
     def draw_feature_labels(
-        self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto"
+        self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto",
+        scale: float | None = None,
     ) -> FeatureLabelResult:
         """Создаёт запланированные подписи в целевом слое (одна отмена Undo на всё)."""
         fcfg = feature_settings(self.cfg)
@@ -3052,9 +3515,24 @@ class AcadBuilder:
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
         if not plan.items:
+            # Подписей нет — но масштаб типа линий заборов всё равно правится.
+            try:
+                doc.StartUndoMark()
+                undo = True
+            except Exception:  # noqa: BLE001 - группировка отмены не критична
+                undo = False
+            try:
+                result.linetype = self.apply_fence_linetype_scales(doc, scale=scale)
+            finally:
+                if undo:
+                    try:
+                        doc.EndUndoMark()
+                    except Exception:  # noqa: BLE001
+                        pass
             return result
 
-        style = self._ensure_text_style(doc)
+        style, result.text_style_native = self._label_text_style(doc)
+        result.text_style = style
         layer = self._ensure_feature_layer(
             doc, plan.output_layer, int(fcfg.get("label_output_layer_color") or 7)
         )
@@ -3071,27 +3549,64 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001 - группировка отмены не критична
             pass
         leader_warned = False
+        own_layers: dict[str, str] = {}
+        own_styles: dict[str, str] = {}
+        house_style = str(fcfg.get("house_label_text_style") or "").strip()
+
+        def item_layer(item: FeatureLabelItem) -> str:
+            """Слой подписи: общий либо собственный (описание дома — слой 0)."""
+            name = str(item.layer or "").strip()
+            if not name or name.upper() == str(layer).upper():
+                return layer
+            if name not in own_layers:
+                own_layers[name] = (
+                    name if name == "0"
+                    else self._ensure_feature_layer(
+                        doc, name, int(fcfg.get("label_output_layer_color") or 7)
+                    )
+                )
+            return own_layers[name]
+
+        def item_style(item: FeatureLabelItem) -> str:
+            """Стиль подписи: собственный, если он есть в чертеже, иначе общий."""
+            name = str(item.style or "").strip()
+            if not name:
+                return style
+            if name not in own_styles:
+                if self._text_style_exists(doc, name):
+                    own_styles[name] = name
+                elif name.upper() == house_style.upper() and self._create_house_style(doc, name, fcfg):
+                    own_styles[name] = name
+                    result.created_styles.append(name)
+                else:
+                    own_styles[name] = style
+            return own_styles[name]
+
         try:
             for item in plan.items:
                 title = item.single_line
+                layer_name, style_name = item_layer(item), item_style(item)
                 try:
-                    if item.kind == "text":
-                        self._add_text(
-                            model_space,
-                            TextItem(
-                                text=item.text, point=item.point, rotation=item.rotation,
-                                kind="feature", height=item.height,
-                            ),
-                            item.height, layer, style,
+                    # Выноска всегда MText + Leader: аннотацией AcDbLeader AutoCAD
+                    # принимает только MText, иначе теряется связь текста со стрелкой
+                    # (заказчик, 15.11.2026). Настройка label_text_kind на неё не влияет.
+                    if self._feature_label_text_mode(item, fcfg) == "text":
+                        result.created_texts += self._add_feature_texts(
+                            model_space, item, layer_name, style_name, fcfg
                         )
-                        result.created_texts += 1
                     else:
-                        mtext = self._add_mtext(model_space, item, layer, style)
+                        mtext = self._add_mtext(model_space, item, layer_name, style_name)
                         result.created_mtexts += 1
                         if item.kind == "leader" and len(item.leader_points) >= 2:
                             try:
-                                _leader, note = self._add_leader(model_space, item, mtext, layer)
+                                leader, note, attached = self._add_leader(
+                                    model_space, item, mtext, layer_name
+                                )
                                 result.created_leaders += 1
+                                if str(getattr(leader, "ObjectName", "")) == "AcDbLeader":
+                                    result.created_leader_objects += 1
+                                    if attached:
+                                        result.created_leader_attached += 1
                                 if note and not leader_warned:
                                     result.warnings.append(note)
                                     leader_warned = True
@@ -3102,6 +3617,8 @@ class AcadBuilder:
                     result.created_labels += 1
                 except Exception as exc:  # noqa: BLE001
                     result.failed.append(f"не удалось создать подпись «{title}»: {exc}")
+            # Масштаб типа линий заборов — в том же Undo, что и подписи.
+            result.linetype = self.apply_fence_linetype_scales(doc, scale=scale)
         finally:
             if undo_open:
                 try:
@@ -3112,7 +3629,45 @@ class AcadBuilder:
             app.Update()
         except Exception:  # noqa: BLE001 - обновление экрана не критично
             pass
+        if bool(fcfg.get("regen_after_labeling", True)):
+            # То же, что команда _REGENALL: типы линий (крестики забора) и новые
+            # подписи перерисовываются во всех видовых экранах.
+            try:
+                doc.Regen(AC_REGEN_ALL_VIEWPORTS)
+            except Exception:  # noqa: BLE001 - перерисовка не критична
+                pass
         return result
+
+    def _plan_text_mode(self, plan: FeatureLabelPlan) -> str:
+        """
+        Чем создаются подписи плана: ``"text"`` — однострочным TEXT, ``"mtext"`` — MText.
+
+        Решает настройка ``label_text_kind``, а не разбор готовых подписей: описание
+        дома и выноски остаются MText и при режиме ``"text"``.
+        """
+        if not plan.items:
+            return ""
+        if not any(self._feature_label_text_mode(item) == "text" for item in plan.items):
+            return "mtext"
+        mode = str(feature_settings(self.cfg).get("label_text_kind") or "text").lower()
+        return "mtext" if mode == "mtext" else "text"
+
+    @staticmethod
+    def _fence_segments(snapshot: DrawingSnapshot) -> list[tuple[str, float]]:
+        """Пары ``(слой, длина)`` по снимку — для пробного расчёта масштаба типа линий."""
+        segments: list[tuple[str, float]] = []
+        for line in snapshot.lines:
+            points = line.points or ()
+            if len(points) < 2:
+                continue
+            lengths = [
+                math.hypot(end[0] - start[0], end[1] - start[1])
+                for start, end in zip(points, points[1:])
+            ]
+            lengths = [length for length in lengths if length > 1e-6]
+            if lengths:
+                segments.append((str(line.layer), min(lengths)))
+        return segments
 
     def label_features(
         self,
@@ -3125,10 +3680,14 @@ class AcadBuilder:
         progress: Callable[[str], None] | None = None,
         should_continue: Callable[[], bool] | None = None,
         dry_run: bool = False,
+        hide_field_notes: bool | None = None,
     ) -> FeatureLabelResult:
         """
         Шаг 2 целиком: чтение активного чертежа, поиск участка, распознавание
         объектов и создание подписей в слое ``label_output_layer`` (D-TOPO-TEXT).
+
+        ``hide_field_notes`` — после подписания выключить слои заметок полевого
+        чертёжника (``None`` — по настройке ``hide_field_notes_after_labeling``).
 
         ``mode="auto"`` — автопоиск участка по слоям границы;
         ``mode="pick"`` — геодезист указывает границу в AutoCAD.
@@ -3175,18 +3734,41 @@ class AcadBuilder:
                 boundary = find_property_polygon(snapshot, self.cfg)
             recognition = recognize_features(snapshot, boundary, self.cfg, house_text)
             recognition.notes.extend(snapshot.notes)
+            if not snapshot.survey_points and snapshot.blocks_without_description:
+                wanted = ", ".join(
+                    (fcfg.get("point_block_attribute_tags") or {}).get("description") or []
+                )
+                found_tags = ", ".join(sorted(snapshot.block_tags)) or "атрибутов нет"
+                recognition.notes.append(
+                    f"блоков с атрибутами: {snapshot.blocks_without_description}, но описания "
+                    f"точки нет ни в одном (теги в блоках: {found_tags}; описание ищется в "
+                    f"тегах: {wanted}) — добавьте тег в point_block_attribute_tags"
+                )
+            width_scale = 1.0
+            if not dry_run and bool(fcfg.get("measure_text_in_autocad", True)):
+                width_scale = self._measure_text_width_scale(doc, height)
             plan = plan_feature_labels(
                 recognition, snapshot, self.cfg,
                 text_height=height, skip_existing=bool(skip_existing),
+                width_scale=width_scale,
             )
             check_continue()
             if dry_run:
                 result = FeatureLabelResult(
                     plan=plan, layer=plan.output_layer, mode=mode, dry_run=True
                 )
+                result.linetype = fence_linetype_plan(
+                    self._fence_segments(snapshot), self.cfg, scale=scale
+                )
+                result.text_mode = self._plan_text_mode(plan)
             else:
                 notify(f"Создаю подписи в слое {plan.output_layer}: {len(plan.items)} шт.…")
-                result = self.draw_feature_labels(app, doc, plan, mode=mode)
+                result = self.draw_feature_labels(app, doc, plan, mode=mode, scale=scale)
+                result.text_mode = result.text_mode or self._plan_text_mode(plan)
+                if hide_field_notes is None:
+                    hide_field_notes = bool(fcfg.get("hide_field_notes_after_labeling", False))
+                if hide_field_notes and recognition.by_notes > 0:
+                    result.hidden_layers = self._hide_field_note_layers(doc, recognition)
             if unit_warning:
                 result.warnings.append(unit_warning)
             return result
@@ -3655,6 +4237,15 @@ class NeighborVerificationReport:
         return "\n".join(lines)
 
 
+def _open_gap_length(plan: DrawPlan) -> float:
+    """Длина открытого гэпа контура (0.0, если контур сомкнут)."""
+    points = getattr(plan, "gap_points", None)
+    if not points:
+        return 0.0
+    (x1, y1), (x2, y2) = points
+    return math.hypot(x2 - x1, y2 - y1)
+
+
 def _neighbor_display_title(plan: DrawPlan, idx: int) -> str:
     d = plan.description
     parts: list[str] = []
@@ -4053,6 +4644,103 @@ def _detect_datum_rotation_arcsec(
     return None
 
 
+def _street_line_through_pob(plan: DrawPlan) -> tuple[tuple[float, float], float] | None:
+    """
+    Линия улицы, на которой стоит POB участка: ``(точка POB, азимут линии)``.
+
+    Берётся напечатанный фасад участка (сторона по улице); если фасада в данных
+    нет — румб привязки от перекрёстка.
+    """
+    desc = plan.description
+    index = desc.front_segment_index
+    if index is not None and 0 <= index < len(plan.boundary_lines):
+        line = plan.boundary_lines[index]
+        dx = line.end[0] - line.start[0]
+        dy = line.end[1] - line.start[1]
+        if math.hypot(dx, dy) > 1e-6:
+            return plan.pob, math.degrees(math.atan2(dx, dy)) % 360.0
+    tie = desc.corner_to_pob_bearing
+    if tie is not None and tie.has_bearing:
+        return plan.pob, tie.azimuth_deg
+    return None
+
+
+def _lateral_offset_ft(point: tuple[float, float], line: tuple[tuple[float, float], float]) -> float:
+    """Расстояние от точки до прямой (по нормали), в футах."""
+    (x0, y0), azimuth_deg = line
+    azimuth = math.radians(azimuth_deg)
+    ux, uy = math.sin(azimuth), math.cos(azimuth)
+    vx, vy = point[0] - x0, point[1] - y0
+    return abs(vx * uy - vy * ux)
+
+
+def _tie_along_street(plan: DrawPlan) -> bool | None:
+    """
+    Идёт ли привязка вдоль своей улицы: ``True`` — да (или румб «пустой»),
+    ``False`` — напечатанный румб уводит POB с линии улицы, ``None`` — не понять.
+    """
+    line = _street_line_through_pob(plan)
+    desc = plan.description
+    tie = desc.corner_to_pob_bearing
+    if line is None or tie is None or desc.distance_to_corner_ft <= 1e-6:
+        return None
+    if not tie.has_bearing:
+        return True
+    if int(tie.degrees) == 0 and int(tie.minutes) == 0 and round(float(tie.seconds), 2) == 0.0:
+        return True
+    return abs(_signed_axis_diff_arcsec(tie.azimuth_deg, line[1])) <= 1800.0
+
+
+def _tie_geometry_note(main_plan: DrawPlan, nb_plan: DrawPlan) -> str | None:
+    """
+    Стоят ли точки POB обоих участков на ОДНОЙ линии улицы.
+
+    Привязка отмеряется вдоль улицы, поэтому «пустой» румб (``N 0°00' E``,
+    который модель отдаёт вместо ``null``) уводит точку начала в сторону на
+    десятки футов: участки не встают стенка к стенке. Если румб привязки
+    напечатан и не идёт вдоль улицы (POB привязан курсом от дальнего
+    перекрёстка), сравнивать нечего — проверка пропускается.
+    """
+    along_m = _tie_along_street(main_plan)
+    along_n = _tie_along_street(nb_plan)
+    if along_m is False or along_n is False:
+        return None
+    line_m = _street_line_through_pob(main_plan)
+    line_n = _street_line_through_pob(nb_plan)
+    if line_m is None or line_n is None:
+        return None
+    if abs(_signed_axis_diff_arcsec(line_m[1], line_n[1])) > 15.0 * 3600.0:
+        # Фасады идут по разным улицам (угловое соседство) — сравнивать нечего.
+        return None
+    lateral_m = _lateral_offset_ft(nb_plan.pob, line_m)
+    lateral_n = _lateral_offset_ft(main_plan.pob, line_n)
+    if max(lateral_m, lateral_n) <= 0.25:
+        return None
+
+    street = main_plan.description.main_street or nb_plan.description.main_street or "улицы"
+    blame: list[str] = []
+    for role, plan in (("нашего участка", main_plan), ("соседа", nb_plan)):
+        desc = plan.description
+        tie = desc.corner_to_pob_bearing
+        if desc.distance_to_corner_ft <= 1e-6 or tie is None:
+            continue
+        # «Пустой» румб: его нет в документе либо модель вернула нули вместо null.
+        if tie.has_bearing and (int(tie.degrees) or int(tie.minutes) or round(float(tie.seconds), 2)):
+            continue
+        blame.append(
+            f"у {role} румб привязки не напечатан (в данных "
+            f"{format_bearing(tie, use_control_code=False)}) — POB отложен по номинальному "
+            "направлению"
+        )
+    msg = (
+        f"Точки POB стоят на разных линиях улицы «{street}»: линии разнесены на "
+        f"{max(lateral_m, lateral_n):.2f}' — стенка к стенке участки не встанут. "
+        + ("; ".join(blame) + ". " if blame else "")
+        + "Проверьте румб и расстояние привязки от перекрёстка."
+    )
+    return msg
+
+
 def _check_street_reference_and_frontage(
     main_plan: DrawPlan, nb_plan: DrawPlan
 ) -> tuple[str | None, str | None]:
@@ -4068,13 +4756,19 @@ def _check_street_reference_and_frontage(
     cs_n = _normalize_street_key(dn.cross_street)
 
     if ms_m and ms_n and ms_m == ms_n:
-        if cs_m and cs_n and cs_m != cs_n:
+        if cs_m and cs_n and cs_m != cs_n and not (cs_m.endswith(f" {cs_n}") or cs_n.endswith(f" {cs_m}")):
             warn = (
                 f"Оба участка выходят на «{dm.main_street}», но отсчитываются от РАЗНЫХ "
                 f"пересекаемых улиц («{dm.cross_street}» против «{dn.cross_street}») — "
                 "точка (0, 0) у них разная, прямое наложение координат некорректно!"
             )
             return warn, warn
+
+        # Главная проверка — геометрическая: обе точки POB должны стоять на одной
+        # линии улицы. Она же называет виновника (у кого румб привязки не на месте).
+        geometry_note = _tie_geometry_note(main_plan, nb_plan)
+        if geometry_note is not None:
+            return geometry_note, geometry_note
 
         # Проверяем румб линии привязки вдоль улицы (если у обоих > 0)
         tie_m = dm.corner_to_pob_bearing
@@ -4097,8 +4791,10 @@ def _check_street_reference_and_frontage(
             if tie_diff_sec > 2.0:
                 msg = (
                     f"Румб красной линии улицы «{dm.main_street}» отличается на "
-                    f"{_format_arcsec_dms(tie_diff_sec)} ({tie_m.bearing_label} против "
-                    f"{tie_n.bearing_label}) — точки POB расходятся уже на линии улицы!"
+                    f"{_format_arcsec_dms(tie_diff_sec)} "
+                    f"({format_bearing(tie_m, use_control_code=False)} против "
+                    f"{format_bearing(tie_n, use_control_code=False)}) — точки POB "
+                    "расходятся уже на линии улицы!"
                 )
                 return msg, msg
         return (
@@ -4436,11 +5132,28 @@ def verify_with_neighbors(
         # возникающие при секундном округлении на длинных 100-футовых стенах
         ref_span = max([c.overlap_span_ft for c in shared_checks] or [40.0])
         eff_overlap_width = overlap_sqft / max(ref_span, 10.0)
+        gap_note = ""
         if overlap_sqft <= 0.5 or eff_overlap_width <= 0.025:
+            overlap_sqft = 0.0
+            eff_overlap_width = 0.0
+        elif (
+            max(_open_gap_length(main_plan), _open_gap_length(nb_plan)) > 0.02
+            and eff_overlap_width <= 0.15
+        ):
+            # Открытый гэп контура отведён в угол: вдоль общей межи остаётся тонкая
+            # полоса «наложения» шириной с сам гэп. Это разрыв контура, а не заступ.
+            gap_note = (
+                f"Тонкая полоса вдоль общей межи ({overlap_sqft:,.1f} sq ft, ширина "
+                f"{eff_overlap_width * 12.0:.1f}″) — это отвод открытого гэпа "
+                f"{max(_open_gap_length(main_plan), _open_gap_length(nb_plan)):.3f} ft в угол, "
+                "а не наложение (заступа) участков: контуры стыкуются по меже."
+            )
             overlap_sqft = 0.0
             eff_overlap_width = 0.0
 
         findings: list[str] = []
+        if gap_note:
+            findings.append(gap_note)
         for bend_msg in continuation_bends:
             if bend_msg not in findings:
                 findings.append(bend_msg)
@@ -5249,8 +5962,8 @@ class FeatureLabelItem:
 
     feature: Feature
     text: str  # строки разделены "\n"
-    kind: str  # "text" (AddText) | "mtext" (AddMText) | "leader" (AddLeader + AddMText)
-    placement: str  # "along" | "inside" | "leader"
+    kind: str  # "text" (AddText) | "mtext" (AddMText) | "leader" (выноска + AddMText)
+    placement: str  # "along" | "inside" | "beside" | "gate" | "spot" | "leader"
     point: tuple[float, float]  # центр текста либо точка вставки MText выноски
     height: float
     rotation: float = 0.0
@@ -5259,6 +5972,11 @@ class FeatureLabelItem:
     box: Any = None  # shapely Polygon: габарит текста
     note: str = ""
     attach_annotation: bool = True  # False — выноска без привязки к MText (без «полки»)
+    leader_bulge: float = 0.0  # кривизна дуговой выноски (bulge полилинии), 0 — прямая
+    #: слой и текстовый стиль, если они отличаются от общих (описание дома
+    #: заказчик держит в слое 0 крупным шрифтом RDS); пусто — как у всех подписей
+    layer: str = ""
+    style: str = ""
 
     @property
     def single_line(self) -> str:
@@ -5278,6 +5996,9 @@ class FeatureLabelItem:
         return {
             "along": "вдоль линии",
             "inside": "внутри контура",
+            "beside": "рядом с контуром",
+            "gate": "поперёк калитки",
+            "spot": "в точке полевой заметки",
             "leader": "выноска",
         }.get(self.placement, self.placement)
 
@@ -5302,9 +6023,20 @@ class FeatureLabelPlan:
     skip_existing: bool = True
     items: list[FeatureLabelItem] = field(default_factory=list)
     duplicates: list[FeatureDuplicate] = field(default_factory=list)
+    skipped: list[tuple[Feature, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     line_count: int = 0
     text_count: int = 0
+    #: поправка ширины текста, измеренная в AutoCAD (1.0 — расчётный шрифт)
+    width_scale: float = 1.0
+    #: точек съёмки с описанием (блоки с атрибутами)
+    survey_point_count: int = 0
+    #: стыков линий, сведённых в общую точку, и допуск (``vertex_snap_tolerance_ft``)
+    junctions_snapped: int = 0
+    junction_tolerance: float = 0.0
+    #: как читается вертикальный текст ("up" / "down") и откуда это взято
+    vertical_reads: str = "up"
+    vertical_reads_note: str = ""
 
     def count_placement(self, placement: str) -> int:
         return sum(1 for item in self.items if item.placement == placement)
@@ -5320,14 +6052,33 @@ class FeatureLabelResult:
     created_texts: int = 0
     created_mtexts: int = 0
     created_leaders: int = 0
+    #: из них объектов Leader (остальные — полилинии со стрелкой)
+    created_leader_objects: int = 0
+    #: из них с привязанным текстом, как после команды QLEADER
+    created_leader_attached: int = 0
+    #: текстовый стиль подписей и взят ли он из самого чертежа
+    text_style: str = ""
+    text_style_native: bool = False
     failed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     mode: str = "auto"
     dry_run: bool = False
+    hidden_layers: list[str] = field(default_factory=list)  # выключенные слои заметок
+    #: текстовые стили, созданные программой (стиль описания дома RDS, если его не было)
+    created_styles: list[str] = field(default_factory=list)
+    #: масштаб типа линий заборов (LinetypeScale): что изменено или что будет
+    linetype: FenceLinetypePlan | None = None
+    #: чем созданы подписи объектов: "text" — однострочным TEXT, "mtext" — MText.
+    #: Для отладки и тестов; в отчёт не выводится (заказчик: сводной строки хватит).
+    text_mode: str = ""
 
     @property
     def recognition(self) -> RecognitionResult:
         return self.plan.recognition
+
+    @property
+    def found_by_notes(self) -> int:
+        return self.recognition.by_notes
 
     @property
     def found_by_point_codes(self) -> int:
@@ -5343,14 +6094,16 @@ class FeatureLabelResult:
 
     @property
     def has_issues(self) -> bool:
-        return bool(self.failed or self.warnings or self.plan.warnings)
+        linetype_errors = bool(self.linetype is not None and self.linetype.failed)
+        return bool(self.failed or self.warnings or self.plan.warnings or linetype_errors)
 
     def summary(self) -> str:
         rec = self.recognition
         verb = "Запланировано подписей" if self.dry_run else "Подписано объектов"
         parts = [
             f"Шаг 2: найдено объектов с подписью — {len(rec.labeled)} "
-            f"(по кодам точек: {rec.by_point_codes}, по слоям: {rec.by_layers}"
+            f"(по полевым заметкам: {rec.by_notes}, по кодам точек: {rec.by_point_codes}, "
+            f"по слоям: {rec.by_layers}"
             + (f", дом: {rec.by_user}" if rec.by_user else "")
             + ")",
             f"{verb}: {self.created_labels if not self.dry_run else len(self.plan.items)} "
@@ -5358,6 +6111,8 @@ class FeatureLabelResult:
         ]
         if self.plan.duplicates:
             parts.append(f"пропущено уже подписанных: {len(self.plan.duplicates)}")
+        if self.linetype is not None and self.linetype.has_work():
+            parts.append(self.linetype.summary())
         if self.failed:
             parts.append(f"ошибок AutoCAD: {len(self.failed)}")
         return ". ".join(parts) + "."
@@ -5373,12 +6128,36 @@ class FeatureLabelResult:
             + ("  [ПРОБНЫЙ РАСЧЁТ, чертёж не изменён]" if self.dry_run else ""),
             f"Граница участка: слой {boundary.layer} · вершин {boundary.vertex_count} · "
             f"площадь {boundary.area_sqft:,.0f} sq ft ({how})".replace(",", " "),
-            f"Зона поиска: участок + буфер; высота текста {plan.text_height:.3f} ft",
+            f"Зона поиска: участок + буфер; высота текста {plan.text_height:.3f} ft"
+            + (
+                f"; шрифт стиля измерен в AutoCAD — ширина текста ×{plan.width_scale:.2f} от расчётной"
+                if abs(plan.width_scale - 1.0) > 1e-9 else ""
+            ),
             f"Прочитано из чертежа: линий {plan.line_count}, текстов {plan.text_count}, "
-            f"кодов точек {len(rec.point_codes)} (из них по словарю: {rec.known_point_codes})",
+            f"кодов точек {len(rec.point_codes)} (из них по словарю: {rec.known_point_codes}), "
+            f"полевых заметок {len(rec.field_notes)}",
+            f"Точек съёмки с описанием в атрибутах блоков: {plan.survey_point_count}",
+            f"Версия Шага 2: {STEP2_VERSION}",
+        ]
+        if plan.junctions_snapped:
+            lines.insert(
+                -2,
+                f"Стыки линий: {plan.junctions_snapped} сведено в общие точки "
+                f"(концы расходились меньше чем на {plan.junction_tolerance:g} ft)",
+            )
+        if plan.vertical_reads_note:
+            lines.append("Направление текста: " + plan.vertical_reads_note)
+        if self.text_style:
+            lines.append(
+                f"Стиль текста подписей: {self.text_style} "
+                + ("(стиль чертежа)" if self.text_style_native
+                   else "(создан программой, шрифт romans.shx: стиля заказчика в чертеже нет)")
+            )
+        lines += [
             "",
             f"НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: {len(rec.labeled)}",
-            f"  • по кодам точек (POINT_LABELS): {rec.by_point_codes}",
+            f"  • по заметкам полевого чертёжника (перевод в формулировки заказчика): {rec.by_notes}",
+            f"  • по кодам и описаниям точек съёмки: {rec.by_point_codes}",
             f"  • по именам слоёв: {rec.by_layers}",
         ]
         if rec.by_user:
@@ -5388,13 +6167,49 @@ class FeatureLabelResult:
             f"{'К ПОДПИСАНИЮ' if self.dry_run else 'ПОДПИСАНО'}: {done} "
             f"(вдоль линии: {plan.count_placement('along')}, "
             f"внутри контура: {plan.count_placement('inside')}, "
+            f"у объекта: "
+            f"{sum(plan.count_placement(kind) for kind in ('beside', 'gate', 'spot'))}, "
             f"выноска: {plan.count_placement('leader')})"
         )
+        if done > len(rec.labeled):
+            lines.append(
+                "  подписей больше, чем объектов: забор подписывается на каждом длинном прямом участке"
+            )
         if not self.dry_run:
+            how_leaders = ""
+            if self.created_leaders:
+                objects = self.created_leader_objects
+                polylines = self.created_leaders - objects
+                parts = []
+                if objects:
+                    tied = self.created_leader_attached
+                    parts.append(
+                        f"объектов Leader: {objects}, из них с привязанным текстом (QLEADER): {tied}"
+                    )
+                if polylines:
+                    parts.append(f"полилиний со стрелкой: {polylines}")
+                how_leaders = f" ({', '.join(parts)})"
             lines.append(
                 f"  создано в AutoCAD: AddText — {self.created_texts}, AddMText — "
-                f"{self.created_mtexts}, AddLeader — {self.created_leaders}"
+                f"{self.created_mtexts}, выносок — {self.created_leaders}{how_leaders}"
             )
+        if rec.house_without_text:
+            lines.append(
+                "ДОМ НЕ ПОДПИСАН: поле «Текст для основного дома» пустое. Впишите описание "
+                "(например, 3 STY BRICK W/CELLAR No. 6910) и запустите Шаг 2 ещё раз — "
+                "добавится только подпись дома."
+            )
+        for item in plan.items:
+            if item.layer and item.layer.upper() != str(plan.output_layer).upper():
+                lines.append(
+                    f"  «{item.single_line}»: слой {item.layer}, высота {item.height:.2f} ft"
+                    + (f", стиль {item.style}" if item.style else "")
+                    + (
+                        " (создан программой: в чертеже его не было)"
+                        if item.style and item.style in self.created_styles else ""
+                    )
+                    + (f" — {item.note}" if item.note.startswith("высота уменьшена") else "")
+                )
         lines.append(
             f"ПРОПУЩЕНО КАК УЖЕ ПОДПИСАННЫЕ: {len(plan.duplicates)}"
             + ("" if plan.skip_existing else "  (проверка надписей чертежа выключена)")
@@ -5410,7 +6225,32 @@ class FeatureLabelResult:
             listing = ", ".join(
                 f"{code} ×{count}" for code, count in sorted(rec.unknown_codes.items())
             )
-            lines.append(f"Коды точек не из словаря: {listing}")
+            lines.append(
+                f"Коды и описания точек не из словаря (point_descriptions): {listing}"
+            )
+        unknown_notes = rec.unknown_notes
+        if unknown_notes:
+            listing = "; ".join(sorted({f"«{note.text}»" for note in unknown_notes}))
+            lines.append(
+                f"ПОЛЕВЫЕ ЗАМЕТКИ БЕЗ ПРАВИЛА ПЕРЕВОДА (не перенесены, добавьте правило в "
+                f"field_note_rules): {len(unknown_notes)} — {listing}"
+            )
+        unbound_notes = rec.unbound_notes
+        if unbound_notes:
+            listing = "; ".join(sorted({f"«{note.text}»" for note in unbound_notes}))
+            lines.append(
+                f"ПОЛЕВЫЕ ЗАМЕТКИ, ОБЪЕКТ КОТОРЫХ НЕ НАЙДЕН (не перенесены): "
+                f"{len(unbound_notes)} — {listing}"
+            )
+        ignored_notes = rec.ignored_notes
+        if ignored_notes:
+            listing = "; ".join(sorted({f"«{note.text}»" for note in ignored_notes}))
+            lines.append(f"Заметки, которые не переносятся по правилам: {listing}")
+        if self.hidden_layers:
+            lines.append(
+                "Слои полевых заметок выключены (их заменили подписи): "
+                + ", ".join(self.hidden_layers)
+            )
 
         if plan.items:
             lines += ["", "Подписи:"]
@@ -5420,12 +6260,16 @@ class FeatureLabelResult:
                     f"  + {item.single_line} — {item.feature.title} · "
                     f"{item.feature.source_text} · {item.placement_title}{note}"
                 )
+        if plan.skipped:
+            lines += ["", "Не подписаны намеренно:"]
+            for feature, reason in plan.skipped:
+                lines.append(f"  - {feature.flat_label} — {feature.title} · {reason}")
         if plan.duplicates:
             lines += ["", "Уже подписаны (дубликат не создан):"]
             for dup in plan.duplicates:
                 origin = "поставлена в этом запуске" if dup.own else f"слой {dup.existing_layer}"
                 lines.append(
-                    f"  = {dup.feature.label} — {dup.feature.title} · рядом «{dup.existing_text}» "
+                    f"  = {dup.feature.flat_label} — {dup.feature.title} · рядом «{dup.existing_text}» "
                     f"({origin})"
                 )
         notes = list(boundary.notes) + list(rec.notes)
@@ -5436,6 +6280,10 @@ class FeatureLabelResult:
         if problems:
             lines += ["", "Предупреждения:"]
             lines += [f"  ! {problem}" for problem in problems]
+        if self.linetype is not None:
+            section = self.linetype.lines(dry_run=self.dry_run)
+            if section:
+                lines += [""] + section
         return "\n".join(lines)
 
 
@@ -5480,6 +6328,92 @@ def _existing_text_box(text: DrawingText, fallback_height: float, drawing_cfg: d
     return rect
 
 
+#: Ширина символов romans.shx (Hershey Roman Simplex) в долях высоты текста:
+#: шаг символа / высота прописной буквы (21 единица).
+_ROMANS_ADVANCE: dict[str, float] = {
+    char: units / 21.0
+    for char, units in {
+        "A": 18, "B": 21, "C": 21, "D": 21, "E": 19, "F": 18, "G": 21, "H": 22, "I": 8,
+        "J": 16, "K": 21, "L": 17, "M": 24, "N": 22, "O": 22, "P": 21, "Q": 22, "R": 21,
+        "S": 20, "T": 16, "U": 22, "V": 18, "W": 24, "X": 20, "Y": 18, "Z": 20,
+        "0": 20, "1": 20, "2": 20, "3": 20, "4": 20, "5": 20, "6": 20, "7": 20, "8": 20,
+        "9": 20, "&": 26, "(": 14, ")": 14, "/": 22, "-": 26, "+": 26, "=": 26, "#": 21,
+        "*": 16, "\"": 16, "?": 18, "%": 24, "@": 27, "<": 24, ">": 24, "°": 14,
+    }.items()
+}
+
+
+def standard_text_heights(fcfg: dict[str, Any]) -> dict[str, float]:
+    """
+    Высоты текста заказчика при базовом масштабе 1"=16' (``standard_text_heights_ft``):
+    ``label`` 0.9 — подписи объектов, ``house_offset`` 1.1 — отступы до дома,
+    ``house`` 1.5 — описание дома.
+    """
+    result = {"label": 0.9, "house_offset": 1.1, "house": 1.5}
+    custom = fcfg.get("standard_text_heights_ft")
+    if isinstance(custom, dict):
+        for key in result:
+            try:
+                value = float(custom.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                result[key] = value
+    return result
+
+
+def house_label_height(text_height: float, fcfg: dict[str, Any]) -> float:
+    """Высота описания дома при высоте подписей ``text_height``: 1.5 ft при 0.9 ft."""
+    heights = standard_text_heights(fcfg)
+    return float(text_height) * heights["house"] / heights["label"]
+
+
+def house_offset_height(text_height: float, fcfg: dict[str, Any]) -> float:
+    """Высота отступов (offsets) до дома при высоте подписей ``text_height``: 1.1 ft при 0.9 ft."""
+    heights = standard_text_heights(fcfg)
+    return float(text_height) * heights["house_offset"] / heights["label"]
+
+
+def feature_text_width(
+    text: str, text_height: float, fcfg: dict[str, Any] | None = None, scale: float = 1.0
+) -> float:
+    """
+    Ширина строки подписи Шага 2 (стиль программы, шрифт romans.shx).
+
+    Буквы и цифры — по таблице шага символов шрифта, умноженной на
+    ``char_width_factor / 0.92``; пробел и узкие знаки (``. , ' :``) — по
+    ``space_width_factor`` и ``narrow_char_width_factor``. ``scale`` — поправка,
+    измеренная в AutoCAD пробным текстом (другой шрифт стиля).
+
+    Результат — ширина видимого текста (габарит в AutoCAD): из суммы шагов
+    символов вычитаются поля первого и последнего символа
+    (``text_bearing_factor`` высоты; подобрано по текстам итоговых чертежей).
+    """
+    fcfg = fcfg or {}
+    letter_scale = float(fcfg.get("char_width_factor") or 0.92) / 0.92
+    space = float(fcfg.get("space_width_factor") or 1.0)
+    narrow = float(fcfg.get("narrow_char_width_factor") or 0.48)
+    narrow_chars = str(fcfg.get("narrow_chars") or ".,'`:;!|")
+    display = re.sub(r"%%[dpc]", "°", str(text), flags=re.IGNORECASE)
+    width = 0.0
+    for char in display:
+        if char == " ":
+            width += space
+        elif char in narrow_chars:
+            width += narrow
+        else:
+            width += _ROMANS_ADVANCE.get(char.upper(), 20.0 / 21.0) * letter_scale
+    bearing = fcfg.get("text_bearing_factor")
+    bearing = 0.26 if bearing is None else max(0.0, float(bearing))
+    if len(display) >= 2:
+        width = max(width - bearing, 0.5 * width)
+    return width * float(text_height) * (float(scale) if scale and scale > 0 else 1.0)
+
+
+#: строка, по которой в AutoCAD измеряется фактическая ширина шрифта подписей
+TEXT_WIDTH_PROBE = "CHAIN LINK FENCE"
+
+
 def _two_line_variant(text: str) -> str | None:
     """«WOOD DECK» -> «WOOD\\nDECK»: перенос по пробелу, ближайшему к середине."""
     if "\n" in text or " " not in text.strip():
@@ -5495,10 +6429,90 @@ def _two_line_variant(text: str) -> str | None:
     return f"{left}\n{right}"
 
 
-class _LabelPlacer:
-    """Последовательно размещает подписи, не допуская наложений."""
+def label_rotation(line_angle_rad: float, reads: str = "up") -> float:
+    """
+    Угол поворота подписи Шага 2 вдоль линии с углом ``line_angle_rad``.
 
-    #: варианты выноски: (угол в градусах, текст по центру над/под концом выноски)
+    Горизонтальный текст читается слева направо. Вертикальный (и близкий к
+    нему, в пределах 30°): ``reads="up"`` — снизу вверх (поворот +90°, как в
+    итоговых чертежах заказчика), ``reads="down"`` — сверху вниз (−90°).
+    """
+    skew = math.radians(30.0)
+    center = skew if str(reads).strip().lower() == "up" else -skew
+    angle = (line_angle_rad - center + math.pi / 2.0) % math.pi - math.pi / 2.0 + center
+    return 0.0 if abs(angle) < 1e-9 else angle
+
+
+def _dominant_axis(geom: Any) -> tuple[float, float] | None:
+    """
+    Главное направление контура по модулю 90°: ``(угол в [0, pi/2), доля длины)``.
+
+    Для прямоугольных строений это направление стен, даже если у контура есть
+    срезанный угол или выступ.
+    """
+    if geom.geom_type == "Polygon":
+        coords = list(geom.exterior.coords)
+    elif geom.geom_type == "LineString":
+        coords = list(geom.coords)
+    else:
+        return None
+    segments: list[tuple[float, float]] = []
+    bins = [0.0] * 90
+    total = 0.0
+    for a, b in zip(coords, coords[1:]):
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        if length <= 1e-9:
+            continue
+        angle = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 90.0
+        bins[int(angle + 0.5) % 90] += length
+        segments.append((angle, length))
+        total += length
+    if total <= 0.0:
+        return None
+    best = max(range(90), key=lambda i: bins[i - 1] + bins[i] + bins[(i + 1) % 90])
+    shift = 0.0
+    weight = 0.0
+    for angle, length in segments:
+        diff = (angle - best + 45.0) % 90.0 - 45.0
+        if abs(diff) <= 1.5:
+            shift += diff * length
+            weight += length
+    if weight <= 0.0:
+        return None
+    return math.radians((best + shift / weight) % 90.0), weight / total
+
+
+def _bulge_arc_points(
+    start: tuple[float, float], end: tuple[float, float], bulge: float, count: int = 9
+) -> list[tuple[float, float]]:
+    """Точки дуги полилинии между ``start`` и ``end`` (``bulge`` = tan(угол/4))."""
+    chord = math.hypot(end[0] - start[0], end[1] - start[1])
+    if abs(bulge) < 1e-6 or chord <= 1e-9:
+        return [start, end]
+    theta = 4.0 * math.atan(bulge)
+    offset = chord * (1.0 - bulge * bulge) / (4.0 * bulge)
+    nx, ny = -(end[1] - start[1]) / chord, (end[0] - start[0]) / chord
+    cx = (start[0] + end[0]) / 2.0 + nx * offset
+    cy = (start[1] + end[1]) / 2.0 + ny * offset
+    radius = math.hypot(start[0] - cx, start[1] - cy)
+    phi = math.atan2(start[1] - cy, start[0] - cx)
+    points = [
+        (cx + radius * math.cos(phi + theta * i / (count - 1)),
+         cy + radius * math.sin(phi + theta * i / (count - 1)))
+        for i in range(count)
+    ]
+    points[0], points[-1] = start, end
+    return points
+
+
+class _LabelPlacer:
+    """
+    Раскладывает подписи «как у заказчика»: текст повёрнут по осям участка и
+    вдоль линий, стоит внутри контура или вплотную к линии; выноска — только
+    когда рядом с объектом нет места.
+    """
+
+    #: варианты выноски: (угол к горизонтальной оси участка, текст над/под концом)
     _LEADER_VARIANTS = (
         (45, False), (135, False), (-45, False), (-135, False),
         (25, False), (155, False), (-25, False), (-155, False),
@@ -5513,8 +6527,10 @@ class _LabelPlacer:
         cfg: dict[str, Any] | None,
         text_height: float,
         skip_existing: bool,
+        width_scale: float = 1.0,
     ) -> None:
         self.recognition = recognition
+        self.width_scale = float(width_scale) if width_scale and width_scale > 0 else 1.0
         self.fcfg = feature_settings(cfg)
         self.drawing_cfg = (cfg or {}).get("drawing", cfg or {}) if isinstance(cfg, dict) else {}
         self.h = float(text_height)
@@ -5527,6 +6543,12 @@ class _LabelPlacer:
         self.line_clear = float(self.fcfg.get("line_clearance_factor") or 0.0) * self.h
         self.inside_clear = float(self.fcfg.get("inside_clearance_factor") or 0.0) * self.h
         self.output_layer = str(self.fcfg.get("label_output_layer") or "D-TOPO-TEXT")
+        self.reads, self.reads_note = vertical_text_direction(snapshot, self.fcfg)
+        self.leader_style = str(self.fcfg.get("leader_style") or "spline").strip().lower()
+        # Описание основного дома: свой слой, стиль и высота (как у заказчика).
+        self.house_layer = str(self.fcfg.get("house_label_layer") or "").strip()
+        self.house_style = str(self.fcfg.get("house_label_text_style") or "").strip()
+        self.house_h = house_label_height(self.h, self.fcfg)
         classifier = LayerClassifier(self.fcfg)
         self.classifier = classifier
 
@@ -5534,17 +6556,33 @@ class _LabelPlacer:
         minx, miny, maxx, maxy = self.zone.bounds
         self._bounds = (minx - margin, miny - margin, maxx + margin, maxy + margin)
 
+        # Оси участка: вдоль них ставятся подписи, не привязанные к линии.
+        lot_axis = _dominant_axis(self.lot)
+        self.lot_axes = self._axes(lot_axis[0] if lot_axis else 0.0)
+
         # --- линии чертежа, которые нельзя закрывать текстом -----------------
+        # Заметки полевика и их выноски в итоговый чертёж не идут: не препятствие.
         self.lines: list[Any] = []
+        #: вид каждой линии для просвета до текста вдоль неё: fence / house / property / other
+        self.line_kinds: list[str] = []
+        self.line_layers: list[str] = []
         for line in snapshot.lines:
+            if classifier.is_field_note(line.layer):
+                continue
             if not (classifier.is_obstacle(line.layer) or classifier.is_feature_linework(line.layer)):
                 continue
             geom = line_to_shapely(line)
             if geom is not None and self._in_bounds(geom):
                 self.lines.append(geom)
+                self.line_kinds.append(self._line_kind(line.layer))
+                self.line_layers.append(str(line.layer))
         self.lines.append(LineString(list(self.lot.exterior.coords)))
+        self.line_kinds.append("property")
+        self.line_layers.append("")
         self.tree = STRtree(self.lines)
+        self.along_gaps = self._along_gaps()
         self.new_lines: list[Any] = []
+        self.front_strip = self._front_yard_strip(snapshot)
 
         # --- существующие тексты: препятствия и источник дубликатов ----------
         self.text_boxes: list[Any] = []
@@ -5553,23 +6591,102 @@ class _LabelPlacer:
         for text in snapshot.texts:
             if not str(text.text or "").strip():
                 continue
+            if classifier.is_field_note(text.layer) or is_file_reference(text.text):
+                continue
             rect = _existing_text_box(text, self.h, self.drawing_cfg)
             if not self._in_bounds(rect):
                 continue
             is_point = classifier.is_point_label(text.layer)
-            is_label = classifier.is_existing_label(text.layer)
-            if not text.hidden and (avoid_points or not is_point or is_label):
+            # Слой описания дома — тоже слой готовых подписей (повторный запуск).
+            on_house_layer = bool(self.house_layer) and (
+                str(text.layer).strip().upper() == self.house_layer.upper()
+            )
+            is_label = classifier.is_existing_label(text.layer) or on_house_layer
+            # Препятствие — только текст, который останется в итоговом чертеже.
+            keeps = (
+                classifier.is_text_obstacle(text.layer) or on_house_layer
+                or (avoid_points and is_point)
+            )
+            if not text.hidden and keeps:
                 self.text_boxes.append(rect)
             if is_label:
                 self.known.append(_KnownLabel(text=text.text, layer=text.layer, box=rect))
         self._link_existing_leaders(snapshot)
         self.area_features = [f for f in recognition.features if f.kind == "area"]
+        houses = [f for f in self.area_features if f.is_main_house] or [
+            f for f in self.area_features if f.category == "house"
+        ]
+        self.houses = houses
 
         self.items: list[FeatureLabelItem] = []
         self.duplicates: list[FeatureDuplicate] = []
+        self.skipped: list[tuple[Feature, str]] = []
         self.warnings: list[str] = []
 
     # -- вспомогательная геометрия -------------------------------------------
+    def _axes(self, angle: float) -> list[float]:
+        """Два направления текста (вдоль оси и поперёк), ближнее к горизонтали — первым."""
+        axes = [label_rotation(angle, self.reads), label_rotation(angle + math.pi / 2.0, self.reads)]
+        axes = [0.0 if abs(value) < math.radians(0.05) else value for value in axes]
+        axes.sort(key=abs)
+        return axes
+
+    def _front_yard_strip(self, snapshot: DrawingSnapshot) -> Any:
+        """
+        Полоса перед красной линией в створе участка (палисадник, приямок у
+        рядового дома) глубиной ``front_yard_depth_ft``; ``None`` — улицы нет.
+
+        Сторона участка «уличная», если идёт по линии слоя
+        ``property_closing_layers`` (``M-ROW-LINE``).
+        """
+        depth = float(self.fcfg.get("front_yard_depth_ft") or 0.0)
+        if depth <= 0.0:
+            return None
+        closing = self.fcfg.get("property_closing_layers")
+        street: list[Any] = []
+        for line in snapshot.lines:
+            if not layer_matches(line.layer, closing):
+                continue
+            geom = line_to_shapely(line)
+            if geom is not None and self._in_bounds(geom):
+                street.append(geom)
+        if not street:
+            return None
+        tolerance = max(float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0), 0.25)
+        try:
+            street_zone = unary_union(street).buffer(tolerance)
+            coords = [(float(x), float(y)) for x, y, *_rest in self.lot.exterior.coords]
+            strips: list[Any] = []
+            for a, b in zip(coords, coords[1:]):
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                if length < 1.0:
+                    continue
+                if LineString([a, b]).intersection(street_zone).length < 0.9 * length:
+                    continue
+                nx, ny = -(b[1] - a[1]) / length, (b[0] - a[0]) / length
+                mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+                if self.lot.contains(Point(mid[0] + nx * 0.1, mid[1] + ny * 0.1)):
+                    nx, ny = -nx, -ny
+                strips.append(Polygon([
+                    a, b, (b[0] + nx * depth, b[1] + ny * depth), (a[0] + nx * depth, a[1] + ny * depth),
+                ]))
+            if not strips:
+                return None
+            # Возвраты ограды идут по продолжению боковых границ: полоса чуть шире.
+            return unary_union(strips).buffer(max(tolerance, 0.5))
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            return None
+
+    def _front_yard_fence(self, geometry: Any) -> bool:
+        """Забор стоит перед красной линией в створе участка (своя ограда палисадника)."""
+        if self.front_strip is None:
+            return False
+        try:
+            inside = geometry.intersection(self.front_strip).length
+        except Exception:  # noqa: BLE001
+            return False
+        return inside >= 0.6 * geometry.length
+
     def _in_bounds(self, geom: Any) -> bool:
         minx, miny, maxx, maxy = geom.bounds
         b = self._bounds
@@ -5584,7 +6701,7 @@ class _LabelPlacer:
             return
         candidates: list[tuple[tuple[float, float], tuple[float, float]]] = []
         for leader in snapshot.leaders:
-            if len(leader.points) >= 2:
+            if len(leader.points) >= 2 and self.classifier.is_existing_label(leader.layer):
                 candidates.append((leader.points[0], leader.points[-1]))
         for line in snapshot.lines:
             if self.classifier.is_existing_label(line.layer) and len(line.points) >= 2 and not line.closed:
@@ -5604,10 +6721,24 @@ class _LabelPlacer:
 
     def _text_size(self, text: str) -> tuple[float, float]:
         lines = text.split("\n") or [text]
-        width = max(estimate_text_width(line, self.h, self.drawing_cfg) for line in lines)
+        width = max(
+            feature_text_width(line, self.h, self.fcfg, self.width_scale) for line in lines
+        )
         spacing = float(self.fcfg.get("mtext_line_spacing_factor") or 1.67)
         height = self.h * (1.0 + (len(lines) - 1) * spacing)
         return max(width, self.h * 0.5), height
+
+    @staticmethod
+    def _label_variants(text: str) -> list[str]:
+        """Подпись как задана, затем альтернатива: в одну строку либо в две."""
+        variants = [text]
+        if "\n" in text:
+            variants.append(" ".join(part for part in text.split("\n") if part))
+        else:
+            wrapped = _two_line_variant(text)
+            if wrapped:
+                variants.append(wrapped)
+        return variants
 
     def _hits_text(self, rect: Any) -> bool:
         padded = rect.buffer(self.text_clear) if self.text_clear > 0 else rect
@@ -5620,11 +6751,105 @@ class _LabelPlacer:
                 return True
         return False
 
-    def _line_hits(self, rect: Any) -> int:
+    def _line_kind(self, layer: str) -> str:
+        """Вид линии слоя для просвета до текста: забор, дом, граница участка, прочее."""
+        if self.classifier.is_property(layer):
+            return "property"
+        if self.classifier.is_fence(layer):
+            return "fence"
+        if self.classifier.structure_category(layer) == "house":
+            return "house"
+        return "other"
+
+    def _along_gaps(self) -> dict[str, float]:
+        """
+        Просветы ``along_line_gaps_ft`` в единицах чертежа: значения заданы для
+        текста 0.9 ft (масштаб 1"=16') и меняются вместе с высотой текста.
+        Пустой словарь — правило выключено.
+        """
+        raw = self.fcfg.get("along_line_gaps_ft")
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        base = standard_text_heights(self.fcfg)["label"]
+        gaps: dict[str, float] = {}
+        for kind in ("fence", "house", "property", "other"):
+            try:
+                value = float(raw.get(kind, raw.get("other", 0.0)))
+            except (TypeError, ValueError):
+                value = 0.0
+            gaps[kind] = max(0.0, value) * self.h / base
+        return gaps
+
+    def _feature_line_kind(self, feature: Feature) -> str:
+        if feature.kind == "fence":
+            return "fence"
+        return self._line_kind(feature.layer)
+
+    def _along_hits(
+        self,
+        center: tuple[float, float],
+        width: float,
+        height: float,
+        rotation: float,
+        end_gap: float,
+        ignore: Any = None,
+    ) -> int:
+        """
+        Сколько линий стоит ближе положенного к тексту вдоль линии: сбоку —
+        просвет по виду линии (``along_line_gaps_ft``), у концов текста —
+        обычный зазор до поперечных линий.
+        """
+        own = ignore.buffer(0.1) if ignore is not None else None
+        ends = width + 2.0 * (end_gap + self.line_clear)
+        reach = max(self.along_gaps.values())
+        outer = _rotated_box(center, ends, height + 2.0 * reach, rotation)
+        probes: dict[str, Any] = {}
+        hits = 0
+        for index in self.tree.query(outer, predicate="intersects"):
+            kind = self.line_kinds[int(index)]
+            probe = probes.get(kind)
+            if probe is None:
+                probe = probes[kind] = _rotated_box(
+                    center, ends, height + 2.0 * self.along_gaps[kind] - 1e-6, rotation
+                )
+            line = self.lines[int(index)]
+            if not probe.intersects(line):
+                continue
+            # Своя линия не мешает; граница участка, с которой она совпадает
+            # (забор по меже, общая стена), — мешает: до неё нужен свой просвет.
+            if own is not None and kind != "property" and own.contains(line.intersection(probe)):
+                continue
+            hits += 1
+        plain = _rotated_box(center, ends, height + 2.0 * self.line_clear, rotation)
+        hits += sum(1 for line in self.new_lines if plain.intersects(line))
+        return int(hits)
+
+    def _line_hits(self, rect: Any, ignore: Any = None) -> int:
+        """Сколько линий чертежа задевает габарит (``ignore`` — собственная линия объекта)."""
         padded = rect.buffer(self.line_clear) if self.line_clear > 0 else rect
-        hits = len(self.tree.query(padded, predicate="intersects"))
+        own = ignore.buffer(0.1) if ignore is not None else None
+        hits = 0
+        for index in self.tree.query(padded, predicate="intersects"):
+            if own is not None and own.contains(self.lines[int(index)].intersection(padded)):
+                continue
+            hits += 1
         hits += sum(1 for line in self.new_lines if padded.intersects(line))
         return int(hits)
+
+    def _crossing_path(self, path: Any, rect: Any) -> Any:
+        """Путь выноски для подсчёта пересечений: без начала у острия, с подходом к тексту."""
+        skip = min(0.3 * self.h, 0.2 * path.length)
+        try:
+            trimmed = substring(path, skip, path.length)
+            coords = list(trimmed.coords)
+            end = Point(coords[-1])
+            if rect.distance(end) > 1e-9:
+                boundary = rect.exterior
+                near = boundary.interpolate(boundary.project(end))
+                coords.append((near.x, near.y))
+            return LineString(coords) if len(coords) >= 2 else path
+        except Exception:  # noqa: BLE001 - вырожденный путь
+            return path
 
     def _path_crossings(self, path: Any) -> int:
         return int(len(self.tree.query(path, predicate="intersects"))) + sum(
@@ -5651,29 +6876,94 @@ class _LabelPlacer:
         return max(parts, key=lambda part: part.area)
 
     def _region_axes(self, region: Any) -> list[float]:
-        """Направления текста: вдоль сторон контура (ближе к горизонтали — первым), затем 0°."""
-        angles: list[float] = []
-        rect = region.minimum_rotated_rectangle
-        if rect.geom_type == "Polygon":
-            coords = list(rect.exterior.coords)
-            for a, b in ((coords[0], coords[1]), (coords[1], coords[2])):
-                if math.hypot(b[0] - a[0], b[1] - a[1]) <= 1e-9:
+        """Направления текста внутри контура: вдоль его стен, иначе по осям участка."""
+        dominant = _dominant_axis(region)
+        if dominant is not None and dominant[1] >= 0.5:
+            return self._axes(dominant[0])
+        return list(self.lot_axes)
+
+    def _main_cell(self, feature: Feature, region: Any) -> Any | None:
+        """
+        Сама площадка внутри контура «крыльцо + ступени».
+
+        Геодезист обводит открытое крыльцо вместе с его ступенями, а ступени
+        отделяет линиями в том же слое. Подпись ``O.P.`` заказчик ставит по
+        центру площадки, а не по центру общего контура. ``None`` — контур не
+        разделён либо главной части в нём нет (ни одна не больше половины).
+        """
+        if not layer_matches(feature.category, self.fcfg.get("main_cell_categories")):
+            return None
+        share = float(self.fcfg.get("main_cell_min_share") or 0.0)
+        if share <= 0.0 or region.geom_type != "Polygon":
+            return None
+        reach = 0.05
+        near = region.buffer(reach)
+        cuts: list[Any] = []
+        for index in self.tree.query(region, predicate="intersects"):
+            if self.line_layers[int(index)] != feature.layer:
+                continue
+            coords = [(float(x), float(y)) for x, y, *_rest in self.lines[int(index)].coords]
+            for a, b in zip(coords, coords[1:]):
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                if length < 0.5:
                     continue
-                angle = text_rotation(math.atan2(b[1] - a[1], b[0] - a[0]))
-                if abs(angle) < math.radians(0.5):
-                    angle = 0.0
-                angles.append(angle)
-            angles.sort(key=abs)
-        if all(abs(angle) > math.radians(3.0) for angle in angles):
-            angles.append(0.0)
-        unique: list[float] = []
-        for angle in angles:
-            if all(abs(angle - seen) > math.radians(1.0) for seen in unique):
-                unique.append(angle)
-        return unique or [0.0]
+                ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+                # Концы линии чуть продлены: она упирается в контур с точностью съёмки.
+                segment = LineString([
+                    (a[0] - ux * reach, a[1] - uy * reach), (b[0] + ux * reach, b[1] + uy * reach),
+                ])
+                inside = segment.intersection(near)
+                if inside.is_empty or inside.length < 0.5:
+                    continue
+                if region.exterior.buffer(reach).contains(inside):
+                    continue  # сторона самого контура
+                cuts.append(segment)
+        if not cuts:
+            return None
+        try:
+            cells = [
+                cell for cell in polygonize(unary_union([LineString(region.exterior.coords)] + cuts))
+                if near.contains(cell)
+            ]
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            return None
+        if len(cells) < 2:
+            return None
+        main = max(cells, key=lambda cell: cell.area)
+        if main.area < share * region.area or main.area > 0.97 * region.area:
+            return None
+        return main
+
+    def _travel_axis(self, text: str, region: Any, axes: list[float]) -> tuple[float, str] | None:
+        """
+        Направление движения для подписи заезда: ``(угол текста, короткая форма)``.
+
+        Заезд вытянут вдоль движения, поэтому берётся та из осей контура, вдоль
+        которой он длиннее. ``None`` — подпись не «дорожная» либо контур почти
+        квадратный и направление по нему не определить.
+        """
+        table = self.fcfg.get("travel_direction_labels")
+        if not isinstance(table, dict) or len(axes) < 2 or region.geom_type != "Polygon":
+            return None
+        key = " ".join(text.upper().split())
+        if key not in {str(name).upper() for name in table}:
+            return None
+        short = next((str(value or "") for name, value in table.items() if str(name).upper() == key), "")
+        coords = list(region.exterior.coords)
+        extents: list[float] = []
+        for angle in axes[:2]:
+            ux, uy = math.cos(angle), math.sin(angle)
+            values = [x * ux + y * uy for x, y in coords]
+            extents.append(max(values) - min(values))
+        ratio = max(1.0, float(self.fcfg.get("travel_axis_min_ratio") or 1.0))
+        if extents[0] >= extents[1] * ratio:
+            return axes[0], short
+        if extents[1] >= extents[0] * ratio:
+            return axes[1], short
+        return None
 
     def _region_centers(self, region: Any, angle: float, step: float) -> list[tuple[float, float]]:
-        """Кандидаты центра: центр масс, «полюс недоступности», затем сдвиги вдоль оси."""
+        """Кандидаты центра: центр масс, «полюс недоступности», затем сдвиги по осям."""
         points: list[tuple[float, float]] = []
 
         def add(x: float, y: float) -> None:
@@ -5691,6 +6981,25 @@ class _LabelPlacer:
             x, y = base[0] + ux * step * factor, base[1] + uy * step * factor
             if region.contains(Point(x, y)):
                 add(x, y)
+        across = max(self.h * 1.5, step * 0.5)
+        for factor in (1, -1, 2, -2):
+            x, y = base[0] - uy * across * factor, base[1] + ux * across * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
+        # Мелкие сдвиги вдоль текста: в длинной площадке, часть которой занята
+        # другим объектом (люк подвала под пожарной лестницей), подпись встаёт
+        # рядом с ним в одну строку, а не переносится на две.
+        for factor in (0.25, -0.25, 0.5, -0.5, 0.75, -0.75):
+            x, y = base[0] + ux * step * factor, base[1] + uy * step * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
+        # Мелкие сдвиги поперёк текста: в неглубокой площадке (крытое крыльцо
+        # между стеной дома и верхней ступенью) двухстрочная подпись встаёт,
+        # отодвинувшись от линии на полвысоты буквы.
+        for factor in (0.4, -0.4, 0.8, -0.8):
+            x, y = base[0] - uy * self.h * factor, base[1] + ux * self.h * factor
+            if region.contains(Point(x, y)):
+                add(x, y)
         return points
 
     # -- дедупликация ---------------------------------------------------------
@@ -5701,38 +7010,53 @@ class _LabelPlacer:
         for other in self.area_features:
             if other is feature:
                 continue
-            if other.geometry.contains(center):
+            # Надпись внутри чужого контура относится к нему, только если подходит ему
+            # по смыслу («STEPS» на дорожке рядом со ступенями — подпись ступеней).
+            if other.geometry.contains(center) and labels_similar(
+                known.text, other.flat_label, self.synonyms
+            ):
                 return True
         return False
 
     def find_duplicate(self, feature: Feature) -> _KnownLabel | None:
         """
-        Аналогичная надпись в радиусе ``duplicate_radius_ft`` от объекта.
+        Аналогичная подпись в радиусе ``duplicate_radius_ft`` от объекта.
 
-        Надписи чертежа учитываются при включённой галочке; подписи, созданные
-        в этом же запуске, — всегда (две кромки одной дорожки, повторные
-        пикеты одного колодца), но только для объектов того же слоя.
+        Готовые подписи чертежа (слои ``existing_label_layers``) учитываются при
+        включённой галочке; подписи этого же запуска — всегда, но только для
+        объектов того же слоя (две кромки одной дорожки). Заметки полевика
+        дубликатами не считаются: они — источник подписей.
         """
-        label = str(feature.label or "").replace("\n", " ")
+        label = feature.flat_label
         if not label:
             return None
+        variants = [label]
+        if feature.kind == "fence" and feature.category == "fence":
+            # На выноске забор пишется сокращением («C.L.F. ATOP WALL»).
+            short = self._fence_short_label(label)
+            if short:
+                variants.append(short)
         geom = feature.geometry
+        radius = self.radius
+        if feature.kind == "spot":
+            # Подпись покрытия могла быть сдвинута от точки заметки на свободное место.
+            radius += 2.0 * max(self.h, 0.5 * self._text_size(str(feature.label))[0])
         for known in self.known:
             if known.owner is None and not self.skip_existing:
                 continue
             if known.owner is not None:
                 if known.owner is feature:
                     return known
-                if known.owner.layer != feature.layer:
+                if feature.category == "gate" or known.owner.layer != feature.layer:
                     continue
                 if feature.kind == "area" and feature.closed:
                     continue
-            if not labels_similar(known.text, label, self.synonyms):
+            if not any(labels_similar(known.text, variant, self.synonyms) for variant in variants):
                 continue
             distance = geom.distance(known.box)
             for anchor in known.anchors:
                 distance = min(distance, geom.distance(anchor))
-            if distance > self.radius:
+            if distance > radius:
                 continue
             if (
                 known.owner is None
@@ -5741,6 +7065,32 @@ class _LabelPlacer:
             ):
                 continue
             return known
+        return None
+
+    def _same_label_near(self, text: str, center: tuple[float, float], spacing: float) -> _KnownLabel | None:
+        """Такая же подпись (готовая или этого запуска) ближе ``spacing`` от точки."""
+        point = Point(center)
+        for known in self.known:
+            if known.owner is None and not self.skip_existing:
+                continue
+            if known.box.distance(point) > spacing:
+                continue
+            if labels_similar(known.text, text, self.synonyms):
+                return known
+        return None
+
+    def _run_label(
+        self, text: str, start: tuple[float, float], end: tuple[float, float], reach: float
+    ) -> _KnownLabel | None:
+        """Такая же подпись, уже стоящая вдоль прямого участка линии (в полосе ``reach``)."""
+        corridor = LineString([start, end]).buffer(reach, cap_style=2)
+        for known in self.known:
+            if known.owner is None and not self.skip_existing:
+                continue
+            if not corridor.contains(known.box.centroid):
+                continue
+            if labels_similar(known.text, text, self.synonyms):
+                return known
         return None
 
     # -- фиксация результата --------------------------------------------------
@@ -5755,29 +7105,59 @@ class _LabelPlacer:
             )
         )
         if len(item.leader_points) >= 2:
-            self.new_lines.append(LineString(item.leader_points))
+            if item.leader_bulge and len(item.leader_points) == 2:
+                path = _bulge_arc_points(item.leader_points[0], item.leader_points[1], item.leader_bulge)
+            else:
+                path = list(item.leader_points)
+            self.new_lines.append(LineString(path))
 
     # -- текст внутри контура -------------------------------------------------
-    def place_inside(self, feature: Feature, *, force: bool = False) -> FeatureLabelItem | None:
-        """AddMText по центру контура, если габарит текста помещается внутри."""
+    def place_inside(
+        self, feature: Feature, *, force: bool = False, soft_only: bool = False,
+        _within_cell: Any = None,
+    ) -> FeatureLabelItem | None:
+        """
+        AddMText внутри контура: по осям контура, сначала ближе к горизонтали,
+        затем вдоль длинной стороны (узкие полосы подписываются вдоль).
+
+        ``soft_only`` — второй проход: в просторном контуре допускается место,
+        где текст задевает одну-две внутренние линии.
+        """
         text = str(feature.label or "")
         region = self._placement_region(feature)
         if region is None or region.is_empty:
             return None
-        variants = [text]
-        wrapped = _two_line_variant(text)
-        if wrapped:
-            variants.append(wrapped)
+        if not force and not soft_only and _within_cell is None:
+            # Крыльцо со ступенями в одном контуре: подпись — по центру площадки.
+            cell = self._main_cell(feature, region)
+            if cell is not None:
+                item = self.place_inside(feature, _within_cell=cell)
+                if item is not None:
+                    return item
+        if _within_cell is not None:
+            region = _within_cell
         axes = self._region_axes(region)
         fallback: tuple[float, FeatureLabelItem] | None = None
-        for variant in variants:
+        soft: tuple[int, FeatureLabelItem] | None = None
+        attempts: list[tuple[str, list[float]]] = []
+        travel = self._travel_axis(text, region, axes)
+        if travel is not None:
+            # DRIVEWAY — вдоль движения по заезду; не помещается — DRIVE, и только
+            # потом обычный перебор (поперёк, в две строки).
+            attempts.append((text, [travel[0]]))
+            if travel[1]:
+                attempts.append((travel[1], [travel[0]]))
+        attempts.extend((variant, axes) for variant in self._label_variants(text))
+        for variant, variant_axes in attempts:
             width, height = self._text_size(variant)
-            for angle in axes:
+            for angle in variant_axes:
                 for center in self._region_centers(region, angle, max(width * 0.75, self.h)):
                     rect = _rotated_box(center, width, height, angle)
                     padded = rect.buffer(self.inside_clear) if self.inside_clear > 0 else rect
                     fits = region.contains(padded)
-                    blocked = self._hits_text(rect) or self._line_hits(rect) > 0
+                    text_hit = self._hits_text(rect)
+                    hits = self._line_hits(rect) if fits and not text_hit else 0
+                    blocked = text_hit or hits > 0
                     item = FeatureLabelItem(
                         feature=feature, text=variant, kind="mtext", placement="inside",
                         point=center, height=self.h, rotation=angle,
@@ -5785,11 +7165,21 @@ class _LabelPlacer:
                     )
                     if fits and not blocked:
                         return item
+                    if (
+                        (soft_only or force)
+                        and fits and not text_hit and region.area >= 4.0 * rect.area
+                    ):
+                        if soft is None or hits < soft[0]:
+                            soft = (hits, item)
                     if force:
                         overflow = max(0.0, rect.area - rect.intersection(region).area)
-                        penalty = overflow + (rect.area if blocked else 0.0)
+                        penalty = overflow + (rect.area if blocked or not fits else 0.0)
                         if fallback is None or penalty < fallback[0] - 1e-9:
                             fallback = (penalty, item)
+        if soft is not None and (soft[0] <= 2 or force):
+            item = soft[1]
+            item.note = "пересекает линии внутри контура — проверьте положение"
+            return item
         if force and fallback is not None:
             item = fallback[1]
             item.note = "не помещается в контур или перекрывает объекты — проверьте положение"
@@ -5799,6 +7189,206 @@ class _LabelPlacer:
             )
             return item
         return None
+
+    # -- длинная ступень с изломом: подпись у каждого длинного участка --------
+    def _ribbon_arms(
+        self, region: Any
+    ) -> list[tuple[tuple[float, float], tuple[float, float], float, float]]:
+        """
+        Длинные прямые участки узкой ленты (ступень через весь двор с изломом):
+        ``(середина, единичное направление, длина, полуширина)``.
+
+        Участок — пара длинных параллельных сторон контура на расстоянии не
+        больше ``arm_label_max_width_ft``, перекрывающихся по длине не меньше
+        ``arm_label_min_length_ft``.
+        """
+        min_length = float(self.fcfg.get("arm_label_min_length_ft") or 0.0)
+        max_width = float(self.fcfg.get("arm_label_max_width_ft") or 0.0)
+        if min_length <= 0.0 or max_width <= 0.0 or region.geom_type != "Polygon":
+            return []
+        coords = [(float(x), float(y)) for x, y, *_rest in region.exterior.coords]
+        edges = []
+        for a, b in zip(coords, coords[1:]):
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            if length >= min_length:
+                edges.append((a, b, length))
+        arms: list[tuple[tuple[float, float], tuple[float, float], float, float]] = []
+        used: set[int] = set()
+        for i, (a, b, length) in enumerate(edges):
+            if i in used:
+                continue
+            ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+            for j in range(i + 1, len(edges)):
+                if j in used:
+                    continue
+                c, d, other = edges[j]
+                vx, vy = (d[0] - c[0]) / other, (d[1] - c[1]) / other
+                if abs(ux * vy - uy * vx) > math.sin(math.radians(5.0)):
+                    continue
+                # Положение второй стороны в осях первой.
+                s0 = (c[0] - a[0]) * ux + (c[1] - a[1]) * uy
+                s1 = (d[0] - a[0]) * ux + (d[1] - a[1]) * uy
+                n0 = -(c[0] - a[0]) * uy + (c[1] - a[1]) * ux
+                n1 = -(d[0] - a[0]) * uy + (d[1] - a[1]) * ux
+                across = (n0 + n1) / 2.0
+                if abs(across) > max_width or abs(across) < 1e-6:
+                    continue
+                low, high = max(0.0, min(s0, s1)), min(length, max(s0, s1))
+                if high - low < min_length:
+                    continue
+                along = (low + high) / 2.0
+                middle = (
+                    a[0] + ux * along - uy * across / 2.0,
+                    a[1] + uy * along + ux * across / 2.0,
+                )
+                if not region.buffer(1e-6).contains(Point(middle)):
+                    continue  # между сторонами не сама лента, а выемка
+                arms.append((middle, (ux, uy), high - low, abs(across) / 2.0))
+                used.update((i, j))
+                break
+        return arms
+
+    def place_arms(self, feature: Feature) -> list[FeatureLabelItem] | None:
+        """
+        Подписи длинной ступени с изломом: по одной у середины каждого длинного
+        участка, вдоль него, сначала со стороны дома. ``None`` — объект не такой
+        (обычная ступень, лестница, одна прямая лента) либо у какого-то из
+        участков нет свободного места: тогда действует обычное правило.
+        """
+        if not layer_matches(feature.category, self.fcfg.get("arm_label_categories")):
+            return None
+        region = self._placement_region(feature)
+        if region is None or region.is_empty:
+            return None
+        arms = self._ribbon_arms(region)
+        if len(arms) < 2:
+            return None
+        text = str(feature.label or "").replace("\n", " ")
+        width, height = self._text_size(text)
+        gap = self.along_gaps.get("other", 0.5 * self.h)
+        end_gap = max(0.0, float(self.fcfg.get("fence_text_end_gap_factor") or 0.0)) * self.h
+        toward = self.lot.centroid
+        if self.houses:
+            toward = min(self.houses, key=lambda house: house.geometry.distance(region)).geometry.centroid
+        items: list[FeatureLabelItem] = []
+        boxes_before = len(self.text_boxes)
+        try:
+            for middle, (ux, uy), length, half in arms:
+                rotation = label_rotation(math.atan2(uy, ux), self.reads)
+                nx, ny = -uy, ux
+                first = 1.0 if (toward.x - middle[0]) * nx + (toward.y - middle[1]) * ny >= 0.0 else -1.0
+                room = max(0.0, (length - width) / 2.0)
+                found: FeatureLabelItem | None = None
+                for side in (first, -first):
+                    for fraction in (0.0, -0.3, 0.3, -0.6, 0.6):
+                        if fraction and room <= 1e-6:
+                            break
+                        shift = fraction * room
+                        distance = (half + gap + height / 2.0) * side
+                        center = (
+                            middle[0] + ux * shift + nx * distance,
+                            middle[1] + uy * shift + ny * distance,
+                        )
+                        rect = _rotated_box(center, width, height, rotation)
+                        if self._hits_text(rect) or not self.zone.contains(rect):
+                            continue
+                        if self._structure_blocks(rect, feature):
+                            continue
+                        if self.along_gaps:
+                            hits = self._along_hits(
+                                center, width, height, rotation, end_gap, ignore=region
+                            )
+                        else:
+                            hits = self._line_hits(rect, ignore=region)
+                        if hits:
+                            continue
+                        found = FeatureLabelItem(
+                            feature=feature, text=text, kind="mtext", placement="beside",
+                            point=center, height=self.h, rotation=rotation,
+                            attachment=AC_ATTACHMENT_MIDDLE_CENTER, box=rect,
+                        )
+                        break
+                    if found is not None:
+                        break
+                if found is None:
+                    return None
+                items.append(found)
+                self.text_boxes.append(found.box)  # вторая подпись не ляжет на первую
+        finally:
+            del self.text_boxes[boxes_before:]
+        return items
+
+    # -- текст вплотную к маленькому контуру (ступени) ------------------------
+    def place_beside(self, feature: Feature) -> FeatureLabelItem | None:
+        """
+        Подпись рядом с контуром, в который она не помещается (ступени, узкая
+        клумба): без выноски, вплотную к стороне, обращённой от дома.
+        """
+        text = str(feature.label or "")
+        region = self._placement_region(feature)
+        if region is None or region.is_empty:
+            return None
+        # Ступени без своего контура лежат внутри контура крыльца: подпись
+        # ставится за этим контуром, как можно ближе к самим ступеням.
+        host = getattr(feature, "host", None)
+        outline = region
+        if host is not None and not host.is_empty and host.geom_type == "Polygon":
+            outline = host
+        angle = self._region_axes(outline)[0]
+        ux, uy = math.cos(angle), math.sin(angle)
+        coords = list(outline.exterior.coords)
+        us = [x * ux + y * uy for x, y in coords]
+        vs = [-x * uy + y * ux for x, y in coords]
+        u0, u1, v0, v1 = min(us), max(us), min(vs), max(vs)
+        gap = 0.5 * self.h
+        away = self.houses[0].geometry.centroid if self.houses else self.lot.centroid
+        if self.houses:
+            nearest = min(self.houses, key=lambda house: house.geometry.distance(region))
+            away = nearest.geometry.centroid
+        target = region.centroid
+        # Сдвиг вдоль стороны: в узком проходе между домом и границей участка
+        # текст встаёт по середине прохода, а не по середине контура.
+        slides = (0.0, 0.3, -0.3, 0.6, -0.6, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0)
+        candidates: list[tuple[tuple[float, float], FeatureLabelItem]] = []
+        for variant in self._label_variants(text):
+            width, height = self._text_size(variant)
+            for cu, cv, along_u in (
+                ((u0 + u1) / 2.0, v0 - gap - height / 2.0, True),
+                ((u0 + u1) / 2.0, v1 + gap + height / 2.0, True),
+                (u0 - gap - width / 2.0, (v0 + v1) / 2.0, False),
+                (u1 + gap + width / 2.0, (v0 + v1) / 2.0, False),
+            ):
+                for slide in slides:
+                    su = cu + (slide * self.h if along_u else 0.0)
+                    sv = cv + (0.0 if along_u else slide * self.h)
+                    center = (su * ux - sv * uy, su * uy + sv * ux)
+                    rect = _rotated_box(center, width, height, angle)
+                    if self._hits_text(rect) or self._line_hits(rect) > 0:
+                        continue
+                    if self._structure_blocks(rect, feature) or not self.zone.contains(rect):
+                        continue
+                    if rect.distance(region) > 2.0 * self.h:
+                        # Изогнутая лента (стенка клумбы углом): середина стороны её
+                        # габарита далеко от самой ленты — понятнее выноска.
+                        continue
+                    item = FeatureLabelItem(
+                        feature=feature, text=variant, kind="mtext", placement="beside",
+                        point=center, height=self.h, rotation=angle,
+                        attachment=AC_ATTACHMENT_MIDDLE_CENTER, box=rect,
+                    )
+                    if host is not None:
+                        rank = math.hypot(center[0] - target.x, center[1] - target.y)
+                    else:
+                        rank = -math.hypot(center[0] - away.x, center[1] - away.y)
+                    candidates.append(((abs(slide), rank), item))
+                    break  # наименьший сдвиг для этой стороны найден
+            if candidates:
+                break
+        if not candidates:
+            return None
+        if host is not None:
+            return min(candidates, key=lambda pair: pair[0][1])[1]
+        return min(candidates, key=lambda pair: (pair[0][0] > 0.0, pair[0][1]))[1]
 
     # -- текст вдоль забора ---------------------------------------------------
     def _straight_runs(self, line: Any) -> list[tuple[tuple[float, float], tuple[float, float], float]]:
@@ -5825,47 +7415,484 @@ class _LabelPlacer:
         runs.append((start, previous, math.hypot(previous[0] - start[0], previous[1] - start[1])))
         return [run for run in runs if run[2] > 1e-9]
 
-    def place_along(self, feature: Feature) -> FeatureLabelItem | None:
-        """
-        AddText параллельно линии забора посередине прямого участка.
-
-        Условие: прямой участок длиннее ``ширина текста + 4 ft`` и место вдоль
-        него свободно. Отступ от линии — ``0.8 * высота текста``; угол
-        ``90°..270°`` разворачивается на 180°, чтобы текст не был перевёрнут.
-        """
-        text = str(feature.label or "").replace("\n", " ")
+    def _along_run(
+        self,
+        feature: Feature,
+        text: str,
+        run: tuple[tuple[float, float], tuple[float, float], float],
+    ) -> tuple[int, FeatureLabelItem] | None:
+        """Лучшее место подписи вдоль прямого участка: ``(задето линий, подпись)``."""
+        start, end, length = run
         width, height = self._text_size(text)
-        need = width + float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
         offset = float(self.fcfg.get("fence_text_offset_factor") or 0.8) * self.h
+        typed = bool(self.along_gaps)
+        if typed:
+            # Просвет от своей линии до края текста — по её виду (забор 0.7 ft и т. д.).
+            offset = self.along_gaps[self._feature_line_kind(feature)] + height / 2.0
         margin = float(self.fcfg.get("fence_end_margin_ft") or 0.0)
+        end_gap = max(0.0, float(self.fcfg.get("fence_text_end_gap_factor") or 0.0)) * self.h
         centroid = self.lot.centroid
-        runs = sorted(self._straight_runs(feature.geometry), key=lambda run: -run[2])
-        for start, end, length in runs:
-            if length <= need:
-                break
-            ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
-            nx, ny = -uy, ux
-            rotation = text_rotation(math.atan2(uy, ux))
-            mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
-            # Первой проверяется сторона, обращённая внутрь участка.
-            toward = (centroid.x - mid[0]) * nx + (centroid.y - mid[1]) * ny
-            first_side = 1.0 if toward >= 0.0 else -1.0
-            max_shift = max(0.0, (length - width) / 2.0 - margin)
-            for fraction in (0.0, -0.3, 0.3, -0.6, 0.6, -0.9, 0.9):
-                shift = fraction * max_shift
-                if fraction and max_shift <= 1e-6:
-                    break
-                base = (mid[0] + ux * shift, mid[1] + uy * shift)
-                for side in (first_side, -first_side):
-                    center = (base[0] + nx * offset * side, base[1] + ny * offset * side)
-                    rect = _rotated_box(center, width, height, rotation)
-                    if self._hits_text(rect) or self._line_hits(rect) > 0:
+        ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
+        nx, ny = -uy, ux
+        rotation = label_rotation(math.atan2(uy, ux), self.reads)
+        mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+        # Первой проверяется сторона, обращённая внутрь участка.
+        toward = (centroid.x - mid[0]) * nx + (centroid.y - mid[1]) * ny
+        first_side = 1.0 if toward >= 0.0 else -1.0
+        outward = feature.kind == "edge" and layer_matches(
+            feature.category, self.fcfg.get("outward_label_categories")
+        )
+        if outward:
+            # Кромка клумбы: сама клумба — полоса между этой линией и забором у
+            # границы, подпись ставится в неё, а не во двор.
+            first_side = -first_side
+        elif feature.kind == "fence" and self._front_yard_fence(feature.geometry):
+            # Ограда палисадника: внутри тесно (люки, калитка) — подпись со стороны улицы.
+            first_side = -first_side
+        max_shift = max(0.0, (length - width) / 2.0 - margin)
+        fractions = (0.0, -0.3, 0.3, -0.6, 0.6, -0.9, 0.9)
+
+        def candidate(side: float, fraction: float, distance: float) -> tuple[Any, tuple[float, float]] | None:
+            shift = fraction * max_shift
+            base = (mid[0] + ux * shift, mid[1] + uy * shift)
+            center = (base[0] + nx * distance * side, base[1] + ny * distance * side)
+            rect = _rotated_box(center, width, height, rotation)
+            if self._hits_text(rect):
+                return None
+            return rect, center
+
+        def make(rect: Any, center: tuple[float, float]) -> FeatureLabelItem:
+            return FeatureLabelItem(
+                feature=feature, text=text, kind="text", placement="along",
+                point=center, height=self.h, rotation=rotation, box=rect,
+            )
+
+        if typed:
+            # Просветы заказчика: до своей линии и до соседних линий сбоку. Сначала
+            # сторона участка — посередине, чуть дальше от линии, если рядом идёт
+            # граница (забор в 0.1 ft от неё); затем другая сторона: подпись не
+            # «ютится» между забором и границей участка, а встаёт за забор.
+            sides = (first_side,) if outward else (first_side, -first_side)
+            for side in sides:
+                for fraction in fractions:
+                    if fraction and max_shift <= 1e-6:
+                        break
+                    for push in (0.0, 0.06, 0.12, 0.18, 0.24, 0.3, 0.36, 0.42, 0.48):
+                        found = candidate(side, fraction, offset + push * self.h)
+                        if found is None:
+                            continue
+                        if self._along_hits(
+                            found[1], width, height, rotation, end_gap, ignore=feature.geometry
+                        ) == 0:
+                            return 0, make(*found)
+            for step in (1.6, 2.4):
+                for side in sides:
+                    for fraction in fractions:
+                        if fraction and max_shift <= 1e-6:
+                            break
+                        found = candidate(side, fraction, offset + (step - 1.0) * self.h)
+                        if found is None:
+                            continue
+                        if self._along_hits(
+                            found[1], width, height, rotation, end_gap, ignore=feature.geometry
+                        ) == 0:
+                            return 0, make(*found)
+        best: tuple[int, FeatureLabelItem] | None = None
+        # Места с полными просветами нет — прежний малый зазор до линий.
+        # Рядом с забором часто идёт граница участка (FE. 0.3'): если вплотную
+        # места нет, подпись отодвигается дальше от линии.
+        # Сторона участка проверяется по всей длине участка забора и только
+        # потом — внешняя сторона.
+        for step in (1.0, 1.6, 2.4):
+            for side in (first_side, -first_side):
+                for fraction in fractions:
+                    if fraction and max_shift <= 1e-6:
+                        break
+                    found = candidate(side, fraction, offset + (step - 1.0) * self.h)
+                    if found is None:
                         continue
-                    return FeatureLabelItem(
-                        feature=feature, text=text, kind="text", placement="along",
-                        point=center, height=self.h, rotation=rotation, box=rect,
+                    rect, center = found
+                    # У концов текста — дополнительный зазор до поперечных линий.
+                    probe = _rotated_box(center, width + 2.0 * end_gap, height, rotation)
+                    hits = self._line_hits(probe, ignore=feature.geometry)
+                    if best is None or hits < best[0]:
+                        best = (hits, make(rect, center))
+                    if hits == 0:
+                        return best
+        return best
+
+    def place_along(self, feature: Feature) -> list[FeatureLabelItem] | None:
+        """
+        AddText параллельно линии забора (кромки): посередине прямого участка,
+        с отступом ``fence_text_offset_factor * высота текста``, сначала со
+        стороны участка.
+
+        Подпись ставится на самом длинном прямом участке и на каждом участке
+        длиннее ``fence_label_every_run_min_ft``; на коротком участке — в
+        сокращённом виде (``C.L.F.``). ``None`` — вдоль линии места нет
+        (нужна выноска), пустой список — подпись не нужна.
+        """
+        text = feature.flat_label
+        width, _height = self._text_size(text)
+        extra = float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
+        every = float(self.fcfg.get("fence_label_every_run_min_ft") or 0.0)
+        spacing = float(self.fcfg.get("fence_label_spacing_ft") or 0.0)
+        min_length = float(self.fcfg.get("fence_min_label_length_ft") or 0.0)
+        runs = sorted(self._straight_runs(feature.geometry), key=lambda run: -run[2])
+        if not runs or feature.geometry.length < min_length:
+            self.skipped.append((feature, "слишком короткий участок"))
+            return []
+        items: list[FeatureLabelItem] = []
+        duplicate: _KnownLabel | None = None
+        # Полоса вдоль линии, в которой может стоять подпись этого участка.
+        reach = (float(self.fcfg.get("fence_text_offset_factor") or 0.8) + 2.0) * self.h
+        short_text = self._fence_short_label(text) if feature.kind == "fence" else None
+        # Ограда палисадника перед красной линией — своя, хотя и стоит за участком.
+        front = feature.kind == "fence" and self._front_yard_fence(feature.geometry)
+        if short_text is not None and not front and self._neighbour_fence(feature.geometry):
+            # Забор за линией участка (соседский): заказчик пишет его сокращением
+            # на каждом прямом участке, включая отводы; полностью — только на
+            # длинном участке.
+            return self._place_neighbour(feature, text, short_text, runs, reach)
+        full_from = width + extra
+        if short_text is not None:
+            # Забор: полное название — только на длинном участке, иначе сокращение.
+            full_from = max(full_from, float(self.fcfg.get("fence_full_label_ratio") or 0.0) * width)
+        for index, run in enumerate(runs):
+            if run[2] <= full_from:
+                break
+            if index > 0 and (every <= 0.0 or run[2] < every):
+                break
+            already = self._run_label(text, run[0], run[1], reach)
+            if already is not None:
+                duplicate = duplicate or already
+                continue
+            found = self._along_run(feature, text, run)
+            if found is None or found[0] > 2:
+                continue
+            item = found[1]
+            near = self._same_label_near(text, item.point, spacing)
+            if near is not None:
+                duplicate = duplicate or near
+                continue
+            if found[0] > 0:
+                item.note = "рядом нет свободного места — текст задевает линии, проверьте"
+            self._commit(item)
+            items.append(item)
+        if items:
+            if short_text is not None and not front:
+                items += self._label_runs_beyond_lot(feature, short_text, runs, reach)
+            return items
+        if duplicate is not None:
+            self.duplicates.append(
+                FeatureDuplicate(
+                    feature=feature, existing_text=plain_text(duplicate.text),
+                    existing_layer=duplicate.layer, own=duplicate.owner is not None,
+                )
+            )
+            return []
+        # Короткий участок: сокращение материала вдоль линии.
+        if (
+            feature.kind == "fence"
+            and not bool(self.fcfg.get("label_short_fences_outside_lot", True))
+            and self._outside_lot(feature.geometry)
+        ):
+            # Возврат или продолжение соседского забора в стороне от участка.
+            self.skipped.append((feature, "короткий забор за пределами участка"))
+            return []
+        # Забор на стене: «C.L.F. ATOP CONC. WALL», а где не помещается — «C.L.F. ATOP C.WALL».
+        compact_text = self._fence_compact_label(short_text)
+        for attempt in (short_text, compact_text):
+            if attempt is None:
+                continue
+            short_width, _h = self._text_size(attempt)
+            if runs[0][2] >= short_width + 1.0:
+                already = self._run_label(attempt, runs[0][0], runs[0][1], reach)
+                if already is not None:
+                    self.duplicates.append(
+                        FeatureDuplicate(
+                            feature=feature, existing_text=plain_text(already.text),
+                            existing_layer=already.layer, own=already.owner is not None,
+                        )
                     )
+                    return []
+                found = self._along_run(feature, attempt, runs[0])
+                if found is not None and found[0] == 0:
+                    if self._same_label_near(attempt, found[1].point, spacing) is not None:
+                        return []
+                    self._commit(found[1])
+                    extra_items = (
+                        [] if front
+                        else self._label_runs_beyond_lot(feature, short_text, runs[1:], reach)
+                    )
+                    return [found[1]] + extra_items
         return None
+
+    def _label_runs_beyond_lot(
+        self,
+        feature: Feature,
+        short_text: str,
+        runs: list[tuple[tuple[float, float], tuple[float, float], float]],
+        reach: float,
+    ) -> list[FeatureLabelItem]:
+        """
+        Сокращение на прямых участках своего забора, уходящих за границу
+        участка (забор продолжается вдоль улицы или к соседу): заказчик
+        подписывает такой участок отдельно (``VIN.FE.`` за углом участка).
+        """
+        if not bool(self.fcfg.get("fence_label_runs_beyond_lot", True)):
+            return []
+        on_line = float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0)
+        spacing = float(self.fcfg.get("fence_abbreviation_spacing_ft") or 0.0)
+        short_width, _h = self._text_size(short_text)
+        try:
+            lot = self.lot.buffer(on_line)
+        except Exception:  # noqa: BLE001
+            return []
+        items: list[FeatureLabelItem] = []
+        for run in runs:
+            if run[2] < short_width + 1.0:
+                continue
+            segment = LineString([run[0], run[1]])
+            try:
+                inside = segment.intersection(lot).length
+            except Exception:  # noqa: BLE001
+                continue
+            if inside >= 0.5 * run[2]:
+                continue
+            if self._run_label(short_text, run[0], run[1], reach) is not None:
+                continue
+            found = self._along_run(feature, short_text, run)
+            if found is None or found[0] > 0:
+                continue
+            if self._same_label_near(short_text, found[1].point, spacing) is not None:
+                continue
+            self._commit(found[1])
+            items.append(found[1])
+        return items
+
+    def _fence_short_label(self, text: str) -> str | None:
+        """``CHAIN LINK FENCE`` -> ``C.L.F.``; ``… ATOP CONC. WALL`` сокращается так же."""
+        base, separator, tail = text.partition(" ATOP ")
+        short = lookup_pattern_label(base, self.fcfg.get("fence_abbreviations"))
+        if short is None:
+            return None
+        return f"{short[0]} ATOP {tail}" if separator else short[0]
+
+    def _fence_compact_label(self, short_text: str | None) -> str | None:
+        """
+        Самая короткая запись забора на стене: ``C.L.F. ATOP CONC. WALL`` ->
+        ``C.L.F. ATOP C.WALL`` (``fence_atop_wall_compact``). ``None`` — короче некуда.
+        """
+        if not short_text or " ATOP " not in short_text:
+            return None
+        base, _separator, tail = short_text.partition(" ATOP ")
+        compact = self.fcfg.get("fence_atop_wall_compact")
+        if not isinstance(compact, dict):
+            return None
+        wanted = " ".join(tail.upper().split())
+        for full, brief in compact.items():
+            if " ".join(str(full).upper().split()) == wanted and str(brief).strip():
+                return f"{base} ATOP {str(brief).strip()}"
+        return None
+
+    def _short_for_run(self, short_text: str, length: float) -> str:
+        """Сокращение, которое помещается на прямом участке длиной ``length``."""
+        compact = self._fence_compact_label(short_text)
+        if compact is None or length >= self._text_size(short_text)[0] + 1.0:
+            return short_text
+        return compact
+
+    def _neighbour_fence(self, geometry: Any) -> bool:
+        """Больше половины длины забора идёт за линией участка (забор соседа)."""
+        on_line = float(self.fcfg.get("fence_on_line_tolerance_ft") or 0.0)
+        try:
+            inside = geometry.intersection(self.lot.buffer(on_line)).length
+        except Exception:  # noqa: BLE001
+            return False
+        return inside < 0.5 * geometry.length
+
+    def _place_neighbour(
+        self,
+        feature: Feature,
+        text: str,
+        short_text: str,
+        runs: list[tuple[tuple[float, float], tuple[float, float], float]],
+        reach: float,
+    ) -> list[FeatureLabelItem] | None:
+        """Подписи соседского забора: сокращение на каждом прямом участке."""
+        spacing = float(self.fcfg.get("fence_abbreviation_spacing_ft") or 0.0)
+        full_spacing = float(self.fcfg.get("fence_label_spacing_ft") or 0.0)
+        width, _h = self._text_size(text)
+        # На коротком участке забор на стене пишется короче: «C.L.F. ATOP C.WALL».
+        short_width, _h = self._text_size(self._fence_compact_label(short_text) or short_text)
+        extra = float(self.fcfg.get("fence_min_extra_length_ft") or 0.0)
+        ratio = float(self.fcfg.get("fence_full_label_ratio") or 0.0)
+        full_from = max(width + extra, ratio * width)
+        if (
+            runs[0][2] <= full_from
+            and not bool(self.fcfg.get("label_short_fences_outside_lot", True))
+            and self._outside_lot(feature.geometry)
+        ):
+            # Возврат или продолжение соседского забора в стороне от участка.
+            self.skipped.append((feature, "короткий забор за пределами участка"))
+            return []
+        items: list[FeatureLabelItem] = []
+        duplicate: _KnownLabel | None = None
+        fitted = False
+        for run in runs:
+            if run[2] < short_width + 1.0:
+                break
+            fitted = True
+            full = run[2] > full_from
+            label = text if full else self._short_for_run(short_text, run[2])
+            already = self._run_label(label, run[0], run[1], reach)
+            if already is not None:
+                duplicate = duplicate or already
+                continue
+            found = self._along_run(feature, label, run)
+            if found is None or found[0] > 0:
+                continue
+            near = self._same_label_near(label, found[1].point, full_spacing if full else spacing)
+            if near is not None:
+                duplicate = duplicate or near
+                continue
+            self._commit(found[1])
+            items.append(found[1])
+        if items:
+            return items
+        if duplicate is not None:
+            self.duplicates.append(
+                FeatureDuplicate(
+                    feature=feature, existing_text=plain_text(duplicate.text),
+                    existing_layer=duplicate.layer, own=duplicate.owner is not None,
+                )
+            )
+            return []
+        if fitted:
+            # Сокращение помещается по длине, но рядом нет свободного места:
+            # выноска к соседскому забору чертёж только загромождает.
+            self.skipped.append((feature, "рядом с забором нет места для сокращения"))
+            return []
+        return None
+
+    def _outside_lot(self, geometry: Any) -> bool:
+        """Линия идёт в стороне от участка (меньше половины длины — у его границы)."""
+        reach = float(self.fcfg.get("fence_near_lot_ft") or 0.0)
+        try:
+            near = geometry.intersection(self.lot.buffer(reach)).length
+        except Exception:  # noqa: BLE001
+            return False
+        return near < 0.5 * geometry.length
+
+    # -- калитка --------------------------------------------------------------
+    def place_gate(self, feature: Feature) -> FeatureLabelItem | None:
+        """
+        Подпись калитки поперёк её линии: первая строка над линией, вторая —
+        под ней (``C.L.F.`` / ``GATE``); если так нельзя — обе строки с одной стороны.
+        """
+        text = str(feature.label or "")
+        geometry = feature.geometry
+        # Линия калитки, уходящая за границу участка (до стены соседнего дома):
+        # подписывается её часть на участке — проём между домом и забором.
+        try:
+            inside = geometry.intersection(self.lot)
+        except Exception:  # noqa: BLE001 - некорректная геометрия исходного чертежа
+            inside = None
+        if inside is not None and not inside.is_empty:
+            parts = [g for g in getattr(inside, "geoms", [inside]) if g.geom_type == "LineString"]
+            if parts:
+                longest = max(parts, key=lambda part: part.length)
+                if 2.0 <= longest.length < geometry.length - 1e-6:
+                    geometry = longest
+        runs = sorted(self._straight_runs(geometry), key=lambda run: -run[2])
+        if not runs:
+            return None
+        start, end, length = runs[0]
+        ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
+        nx, ny = -uy, ux
+        rotation = label_rotation(math.atan2(uy, ux), self.reads)
+        mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+        width, height = self._text_size(text)
+        side_offset = height / 2.0 + 0.5 * self.h
+        offsets = [side_offset, -side_offset]
+        if "\n" in text:
+            offsets.insert(0, 0.0)
+        best: tuple[float, FeatureLabelItem] | None = None
+        for order, distance in enumerate(offsets):
+            center = (mid[0] + nx * distance, mid[1] + ny * distance)
+            rect = _rotated_box(center, width, height, rotation)
+            if self._hits_text(rect):
+                continue
+            score = self._line_hits(rect, ignore=feature.geometry) * 10.0 + order
+            if best is None or score < best[0]:
+                best = (
+                    score,
+                    FeatureLabelItem(
+                        feature=feature, text=text, kind="mtext", placement="gate",
+                        point=center, height=self.h, rotation=rotation,
+                        attachment=AC_ATTACHMENT_MIDDLE_CENTER, box=rect,
+                    ),
+                )
+        return best[1] if best is not None else None
+
+    # -- подпись покрытия в точке полевой заметки -----------------------------
+    def place_spot(self, feature: Feature) -> FeatureLabelItem:
+        """
+        Подпись покрытия/грунта там, где её поставил полевик: по осям участка,
+        в узкой полосе — вдоль неё; при необходимости сдвигается на свободное место.
+        """
+        text = str(feature.label or "")
+        anchor = (float(feature.geometry.x), float(feature.geometry.y))
+        best: tuple[float, FeatureLabelItem] | None = None
+        forced: FeatureLabelItem | None = None
+        # Подпись остаётся с той же стороны границы участка, что и заметка:
+        # покрытие двора не «переезжает» к соседу, и наоборот.
+        anchor_in_lot = self.lot.contains(feature.geometry)
+        for variant in (text,):
+            width, height = self._text_size(variant)
+            for axis_index, angle in enumerate(self.lot_axes):
+                ux, uy = math.cos(angle), math.sin(angle)
+                step_u, step_v = max(self.h, width * 0.5), 1.5 * self.h
+                for du, dv in (
+                    (0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2),
+                    (1, 1), (-1, 1), (1, -1), (-1, -1), (2, 0), (-2, 0),
+                ):
+                    center = (
+                        anchor[0] + ux * step_u * du - uy * step_v * dv,
+                        anchor[1] + uy * step_u * du + ux * step_v * dv,
+                    )
+                    rect = _rotated_box(center, width, height, angle)
+                    item = FeatureLabelItem(
+                        feature=feature, text=variant, kind="mtext", placement="spot",
+                        point=center, height=self.h, rotation=angle,
+                        attachment=AC_ATTACHMENT_MIDDLE_CENTER, box=rect,
+                    )
+                    if forced is None:
+                        forced = item
+                    if self._hits_text(rect):
+                        continue
+                    hits = self._line_hits(rect)
+                    blocked = self._structure_blocks(rect, feature)
+                    wrong_side = self.lot.contains(Point(center)) != anchor_in_lot
+                    score = (
+                        hits * 10.0 + (25.0 if blocked else 0.0)
+                        + (40.0 if wrong_side else 0.0)
+                        + abs(du) + abs(dv) + 0.5 * axis_index
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, item)
+                    if score <= 0.0:
+                        return item
+        if best is not None:
+            item = best[1]
+            if best[0] >= 10.0:
+                item.note = "свободного места нет — текст задевает линии, проверьте положение"
+            return item
+        item = forced  # type: ignore[assignment]
+        item.note = "текст наложен на другие подписи — переместите вручную"
+        self.warnings.append(f"подпись «{item.single_line}» ({feature.title}): {item.note}")
+        return item
 
     # -- выноска --------------------------------------------------------------
     def _leader_tips(self, feature: Feature) -> list[tuple[float, float]]:
@@ -5887,33 +7914,55 @@ class _LabelPlacer:
         return tips
 
     def _leader_lengths(self) -> list[float]:
-        low = max(2.5, float(self.fcfg.get("leader_min_length_factor") or 3.0))
-        high = max(low, float(self.fcfg.get("leader_max_length_factor") or 16.0))
+        low = max(1.5, float(self.fcfg.get("leader_min_length_factor") or 2.5))
+        high = max(low, float(self.fcfg.get("leader_max_length_factor") or 12.0))
         lengths = [low]
-        while lengths[-1] * 1.45 < high:
-            lengths.append(lengths[-1] * 1.45)
+        while lengths[-1] * 1.3 < high:
+            lengths.append(lengths[-1] * 1.3)
         if high - lengths[-1] > 0.5:
             lengths.append(high)
         return [value * self.h for value in lengths]
 
     def _structure_blocks(self, rect: Any, feature: Feature) -> bool:
-        """Текст выноски не должен ложиться на контур строения (в т. ч. чужого)."""
+        """Текст не должен ложиться на контур строения (в т. ч. чужого)."""
         for other in self.area_features:
+            if other is feature:
+                continue
             if not other.closed and other.category == "surface":
                 continue  # дорожки/заезды — плоские покрытия, текст над ними допустим
             if other.geometry.intersects(rect):
                 return True
         return False
 
+    def _leader_text(self, feature: Feature) -> str:
+        """
+        Текст подписи на выноске. Забор, вдоль которого подпись не поместилась,
+        пишется сокращением: ``C.L.F.``, ``C.L.F. ATOP`` / ``WALL``.
+        """
+        text = str(feature.label or "")
+        if feature.kind == "fence" and feature.category == "fence":
+            short = self._fence_short_label(feature.flat_label)
+            if short:
+                return short.replace(" ATOP ", " ATOP\n", 1)
+        return text
+
     def place_leader(self, feature: Feature) -> FeatureLabelItem:
-        """Выноска со стрелкой (AddLeader) и горизонтальный MText на свободном месте."""
-        text = str(feature.label or "").replace("\n", " ")
+        """
+        Короткая выноска со стрелкой и текст на свободном месте рядом с объектом.
+        Текст повёрнут по горизонтальной оси участка, двухсловные подписи — в две строки.
+        """
+        text = self._leader_text(feature)
         width, height = self._text_size(text)
-        landing = float(self.fcfg.get("leader_landing_factor") or 0.0) * self.h
+        arc = self.leader_style != "leader"
+        landing = 0.0 if arc else float(self.fcfg.get("leader_landing_factor") or 0.0) * self.h
         gap = float(self.fcfg.get("leader_text_gap_factor") or 0.0) * self.h
+        bulge = abs(float(self.fcfg.get("leader_arc_bulge") or 0.0)) if arc else 0.0
+        axis = self.lot_axes[0]
+        ax, ay = math.cos(axis), math.sin(axis)
         best: tuple[float, FeatureLabelItem] | None = None
         best_clean: tuple[float, FeatureLabelItem] | None = None
         forced: FeatureLabelItem | None = None
+        stacked_penalty = float(self.fcfg.get("leader_stacked_penalty") or 0.0)
         # Объект участка подписывается на участке: вынос текста за границу
         # (на соседний участок или улицу) допустим, но хуже любого места внутри.
         try:
@@ -5925,46 +7974,58 @@ class _LabelPlacer:
                 if best_clean is not None and length / self.h >= best_clean[0]:
                     break  # более длинная выноска уже не станет лучше найденной
                 for angle_deg, stacked in self._LEADER_VARIANTS:
-                    angle = math.radians(angle_deg)
+                    angle = axis + math.radians(angle_deg)
                     elbow = (tip[0] + length * math.cos(angle), tip[1] + length * math.sin(angle))
+                    sign = 1.0 if (angle_deg % 180) < 90 else -1.0
                     if stacked:
                         # Текст по центру над (под) концом выноски — для узких мест,
-                        # где надпись не помещается сбоку от полки.
-                        up = 1.0 if math.sin(angle) >= 0.0 else -1.0
-                        center = (elbow[0], elbow[1] + up * (gap + height / 2.0))
-                        rect = _rotated_box(center, width, height, 0.0)
+                        # где надпись не помещается сбоку.
+                        up = 1.0 if angle_deg >= 0 else -1.0
+                        shift = up * (gap + height / 2.0)
+                        center = (elbow[0] - ay * shift, elbow[1] + ax * shift)
+                        rect = _rotated_box(center, width, height, axis)
                         item = FeatureLabelItem(
                             feature=feature, text=text, kind="leader", placement="leader",
-                            point=center, height=self.h, rotation=0.0,
+                            point=center, height=self.h, rotation=axis,
                             attachment=AC_ATTACHMENT_MIDDLE_CENTER,
-                            leader_points=[tip, elbow], box=rect, attach_annotation=False,
+                            leader_points=[tip, elbow], box=rect,
+                            leader_bulge=bulge * sign,
                         )
                     else:
-                        side = 1.0 if math.cos(angle) >= 0.0 else -1.0
-                        shelf = (elbow[0] + side * landing, elbow[1])
-                        anchor = (shelf[0] + side * gap, shelf[1])
-                        center = (anchor[0] + side * width / 2.0, anchor[1])
-                        rect = _rotated_box(center, width, height, 0.0)
+                        side = 1.0 if abs(angle_deg) < 90 else -1.0
+                        shelf = (elbow[0] + side * landing * ax, elbow[1] + side * landing * ay)
+                        anchor = (shelf[0] + side * gap * ax, shelf[1] + side * gap * ay)
+                        center = (
+                            anchor[0] + side * width / 2.0 * ax,
+                            anchor[1] + side * width / 2.0 * ay,
+                        )
+                        rect = _rotated_box(center, width, height, axis)
                         item = FeatureLabelItem(
                             feature=feature, text=text, kind="leader", placement="leader",
-                            point=anchor, height=self.h, rotation=0.0,
+                            point=anchor, height=self.h, rotation=axis,
                             attachment=(
                                 AC_ATTACHMENT_MIDDLE_LEFT if side > 0 else AC_ATTACHMENT_MIDDLE_RIGHT
                             ),
                             leader_points=[tip, elbow] + ([shelf] if landing > 1e-9 else []),
-                            box=rect,
+                            box=rect, leader_bulge=bulge * sign,
                         )
                     points = item.leader_points
                     if forced is None:
                         forced = item
-                    path = LineString(points)
+                    if item.leader_bulge and len(points) == 2:
+                        path = LineString(_bulge_arc_points(points[0], points[1], item.leader_bulge))
+                    else:
+                        path = LineString(points)
                     if self._hits_text(rect) or self._path_hits_text(path):
                         continue
                     line_hits = self._line_hits(rect)
                     on_structure = self._structure_blocks(rect, feature)
                     outside = not self.zone.contains(rect)
                     off_lot = prefer_lot and not self.lot.contains(rect)
-                    crossings = self._path_crossings(path)
+                    # Пересечения считаются без самого начала выноски (остриё стоит
+                    # на линии объекта, рядом — линия стены под забором) и вместе с
+                    # зазором до текста: иначе счёт зависит от тысячных долей фута.
+                    crossings = self._path_crossings(self._crossing_path(path, rect))
                     score = (
                         line_hits * 1000.0
                         + (200.0 if on_structure else 0.0)
@@ -5972,6 +8033,9 @@ class _LabelPlacer:
                         + (12.0 if off_lot else 0.0)
                         + crossings * 8.0
                         + length / self.h
+                        # У заказчика текст всегда сбоку от конца выноски; текст
+                        # над концом — только когда сбоку места нет и подальше.
+                        + (stacked_penalty if stacked else 0.0)
                     )
                     clean = line_hits == 0 and not on_structure and not outside
                     if best is None or score < best[0]:
@@ -6000,23 +8064,43 @@ class _LabelPlacer:
                 return (0, 0.0)
             if feature.kind == "area":
                 return (1, -feature.geometry.area)
-            if feature.kind == "fence":
+            if feature.category == "gate":
                 return (2, -feature.geometry.length)
-            if feature.kind == "edge":
+            if feature.kind == "fence":
                 return (3, -feature.geometry.length)
-            return (4, 0.0)
+            if feature.kind == "edge":
+                return (4, -feature.geometry.length)
+            if feature.kind == "spot":
+                return (5, 0.0)
+            return (6, 0.0)
 
         leader_queue: list[Feature] = []
         for feature in sorted(labeled, key=order_key):
-            if self._skip_duplicate(feature):
+            lines_feature = feature.kind in {"fence", "edge"} and feature.category != "gate"
+            if not lines_feature and self._skip_duplicate(feature):
                 continue
             item: FeatureLabelItem | None = None
             if feature.is_main_house:
-                item = self.place_inside(feature, force=True)
+                item = self._place_house(feature)
             elif feature.kind == "area":
-                item = self.place_inside(feature)
-            elif feature.kind == "fence":
-                item = self.place_along(feature)
+                arms = self.place_arms(feature)
+                if arms:
+                    for arm_item in arms:
+                        self._commit(arm_item)
+                    continue
+                item = (
+                    self.place_inside(feature)
+                    or self.place_beside(feature)
+                    or self.place_inside(feature, soft_only=True)
+                )
+            elif feature.category == "gate":
+                item = self.place_gate(feature)
+            elif lines_feature:
+                placed = self.place_along(feature)
+                if placed is not None:
+                    continue  # подписи уже зафиксированы (или не нужны)
+            elif feature.kind == "spot":
+                item = self.place_spot(feature)
             if item is None:
                 leader_queue.append(feature)
             else:
@@ -6025,6 +8109,59 @@ class _LabelPlacer:
             if self._skip_duplicate(feature):
                 continue
             self._commit(self.place_leader(feature))
+
+    def _house_heights(self) -> list[float]:
+        """Высоты описания дома от стандартной (1.5 ft при 1"=16') вниз до высоты обычной подписи."""
+        heights = [self.house_h]
+        if not bool(self.fcfg.get("house_label_shrink_to_fit", True)) or self.house_h <= self.h:
+            return heights
+        base = standard_text_heights(self.fcfg)
+        step = float(self.fcfg.get("house_label_height_step_ft") or 0.0) * self.h / base["label"]
+        if step <= 1e-9:
+            return heights
+        value = self.house_h - step
+        while value > self.h + 1e-9:
+            heights.append(value)
+            value -= step
+        heights.append(self.h)
+        return heights
+
+    def _place_house(self, feature: Feature) -> FeatureLabelItem | None:
+        """
+        Описание основного дома: по центру контура, в слое ``house_label_layer``
+        стилем ``house_label_text_style``, высотой 1.5 ft при масштабе 1"=16'
+        (``standard_text_heights_ft``). Если оно не помещается в контур, высота
+        уменьшается (заказчик это допускает) — но не мельче обычной подписи.
+        """
+        normal = self.h
+        heights = self._house_heights()
+        item: FeatureLabelItem | None = None
+        try:
+            # 1) чисто внутри контура; 2) задевая одну-две внутренние линии;
+            # 3) как получится — самой мелкой высотой, с предупреждением.
+            for soft in (False, True):
+                for height in heights:
+                    self.h = height
+                    item = self.place_inside(feature, soft_only=soft)
+                    if item is not None:
+                        break
+                if item is not None:
+                    break
+            if item is None:
+                self.h = heights[-1]
+                item = self.place_inside(feature, force=True)
+        finally:
+            self.h = normal
+        if item is not None:
+            item.layer = self.house_layer
+            item.style = self.house_style
+            if item.height < self.house_h - 1e-9:
+                reduced = (
+                    f"высота уменьшена с {self.house_h:.2f} до {item.height:.2f} ft: "
+                    "описание не помещается в контур дома"
+                )
+                item.note = f"{reduced}; {item.note}" if item.note else reduced
+        return item
 
     def _skip_duplicate(self, feature: Feature) -> bool:
         known = self.find_duplicate(feature)
@@ -6057,9 +8194,13 @@ def plan_feature_labels(
     *,
     text_height: float,
     skip_existing: bool = True,
+    width_scale: float = 1.0,
 ) -> FeatureLabelPlan:
     """
     Раскладывает подписи распознанных объектов (чистая геометрия, без AutoCAD).
+
+    ``width_scale`` — поправка ширины текста, измеренная в AutoCAD (1.0 — шрифт
+    romans.shx стиля программы).
 
     1. Дедупликация: объект пропускается, если в радиусе ``duplicate_radius_ft``
        (6 ft) уже стоит аналогичная надпись из слоёв ``existing_label_layers``.
@@ -6069,7 +8210,7 @@ def plan_feature_labels(
     4. Габариты текстов (``shapely.geometry.box``) не пересекают друг друга,
        существующие надписи и линии чертежа.
     """
-    placer = _LabelPlacer(recognition, snapshot, cfg, text_height, skip_existing)
+    placer = _LabelPlacer(recognition, snapshot, cfg, text_height, skip_existing, width_scale)
     placer.run()
     return FeatureLabelPlan(
         recognition=recognition,
@@ -6078,7 +8219,14 @@ def plan_feature_labels(
         skip_existing=bool(skip_existing),
         items=placer.items,
         duplicates=placer.duplicates,
+        skipped=placer.skipped,
         warnings=placer.warnings,
         line_count=len(snapshot.lines),
         text_count=len(snapshot.texts),
+        width_scale=placer.width_scale,
+        survey_point_count=len(snapshot.survey_points),
+        junctions_snapped=int(getattr(snapshot, "vertices_snapped", 0) or 0),
+        junction_tolerance=float(getattr(snapshot, "vertex_snap_ft", 0.0) or 0.0),
+        vertical_reads=placer.reads,
+        vertical_reads_note=placer.reads_note,
     )

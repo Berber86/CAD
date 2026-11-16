@@ -5263,6 +5263,12 @@ class SurveyApp(ctk.CTk):
                 f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
+            try:
+                was_topmost = bool(self.attributes("-topmost"))
+                if was_topmost:
+                    self.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                was_topmost = False
             if messagebox.askyesno(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"

@@ -467,11 +467,36 @@ def _drive_portal(
     block, lot, borough = _extract_portal_details(rows)
     # Retain a map-only image: neither the saved crop nor the Vision request includes
     # the address, Block/Lot pane, owner or building details on the page's left side.
+    _zoom_out_map_pane(window.handle)
     with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
         full_capture = Path(directory) / "portal_full.png"
         _save_window_capture(window.handle, full_capture)
         _crop_tax_map(full_capture, rows, map_path)
     return PortalCapture(block, lot, borough, map_path)
+
+
+def _zoom_out_map_pane(handle: int) -> None:
+    """Move cursor to the right half (map pane) and scroll down one tick to zoom out."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes  # noqa: PLC0415
+        from ctypes import wintypes  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(handle), ctypes.byref(rect)):
+            return
+        width = max(1, rect.right - rect.left)
+        height = max(1, rect.bottom - rect.top)
+        x = rect.left + (width * 3) // 4
+        y = rect.top + height // 2
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.1)
+        user32.mouse_event(0x0800, 0, 0, -120, 0)  # MOUSEEVENTF_WHEEL, -120 = 1 tick back
+        time.sleep(0.8)
+    except Exception:  # noqa: BLE001 - best-effort zoom out
+        pass
 
 
 def _integer_or_none(value: Any, name: str) -> str | None:
@@ -517,7 +542,7 @@ def lookup_parcel(
     if not clean_address:
         raise PortalLookupError("Введите адрес перед поиском.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    map_path = Path(screenshot_folder) / f"NYC_Portal_{stamp}_map.png"
+    map_path = Path(screenshot_folder) / f"TAX_MAP_{stamp}.jpg"
     capture = _drive_portal(clean_address, map_path, progress)
     if progress:
         borough_text = capture.borough or "район не распознан"

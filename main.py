@@ -471,6 +471,7 @@ class SurveyApp(ctk.CTk):
         self.step0_neighbours_var = ctk.StringVar(value="")
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
+        self.step0_fast_mode_var = ctk.BooleanVar(value=False)
         self.step0_ocr_dpi_var = ctk.StringVar(
             value=str((self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI))
         )
@@ -2830,6 +2831,15 @@ class SurveyApp(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
+        ctk.CTkCheckBox(
+            checks,
+            text="быстрая работа (меньше проверок экрана, паузы по 5 с)",
+            variable=self.step0_fast_mode_var,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+            checkbox_width=18,
+            checkbox_height=18,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -3179,6 +3189,7 @@ class SurveyApp(ctk.CTk):
             args=(
                 block, lot, neighbours, folder,
                 bool(self.step0_old_neighbour_var.get()), ocr_dpi,
+                bool(self.step0_fast_mode_var.get()),
             ),
             daemon=True,
         )
@@ -3192,6 +3203,7 @@ class SurveyApp(ctk.CTk):
         folder: Path,
         with_old: bool,
         ocr_dpi: int = ocr_pages.DEFAULT_DPI,
+        fast_mode: bool = False,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
@@ -3204,11 +3216,14 @@ class SurveyApp(ctk.CTk):
         if browser_save.available():
             auto_save = browser_save.auto_save_hook(
                 downloads,
+                ready_delay=5.0 if fast_mode else 4.0,
+                stable_for=0.0 if fast_mode else 1.0,
                 on_attempt=lambda title: progress(
                     f"PDF уже загружен в окне браузера «{title}» — нажимаю Ctrl+S один раз"
                 ),
             )
-            progress("браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю")
+            mode_note = " (быстрая работа: пауза 5 с)" if fast_mode else ""
+            progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
         else:
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
         progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
@@ -3390,7 +3405,12 @@ class SurveyApp(ctk.CTk):
                     )
 
         paths: list[Path] = []
+        our_new_paths: set[Path] = set()
         for item in items_meta:
+            role = str(item.get("role") or "").lower()
+            tag = str(item.get("tag") or "NEW").upper()
+            if role == "our" and tag == "OLD":
+                continue
             full_name = str(item.get("file") or "").strip()
             trimmed_name = str(item.get("trimmed") or "").strip()
             trimmed_path = folder / trimmed_name if trimmed_name else None
@@ -3409,6 +3429,8 @@ class SurveyApp(ctk.CTk):
                 continue
             if chosen not in paths:
                 paths.append(chosen)
+            if role == "our" and tag == "NEW":
+                our_new_paths.add(chosen)
 
         if not paths:
             self._step0_log("Передавать нечего: в папке описаний не найдено PDF")
@@ -3419,6 +3441,9 @@ class SurveyApp(ctk.CTk):
             + "; ".join(path.name for path in paths)
         )
         items, errors = self._make_pdf_set_items(paths)
+        if our_new_paths:
+            for item in items:
+                item.is_main = item.path in our_new_paths
         for error in errors:
             self._step0_log(f"Файл не открылся для Шага 1: {error}")
             self._log_line(f"! Шаг 0 → Шаг 1: {error}")

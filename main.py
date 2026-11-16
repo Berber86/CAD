@@ -7437,7 +7437,12 @@ class SurveyApp(ctk.CTk):
                         if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
                             post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
                             try:
-                                clean_llm_source = {k: v for k, v in job.source.items() if k != "ocr_path"}
+                                clean_llm_source = {
+                                    k: v for k, v in job.source.items()
+                                    if k not in ("ocr_path", "ocr_pages")
+                                }
+                                if "pdf_path" not in clean_llm_source:
+                                    clean_llm_source["pdf_path"] = job.path
                                 jllm = dataclasses.replace(job, source=clean_llm_source, use_llm=True)
                                 o3, pre3, iss3 = self._parse_pdf_set_job(
                                     jllm, cfg, provider_id, model_name, api_key, key_secret,

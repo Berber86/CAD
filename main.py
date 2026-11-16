@@ -7283,6 +7283,36 @@ class SurveyApp(ctk.CTk):
             )
         return outcome, False, []
 
+    @staticmethod
+    def _find_step0_cache_path(pdf_path: Path) -> Path | None:
+        base_stem = re.sub(r"_p\d+(?:[-,]\d+)*$", "", pdf_path.stem)
+        for candidate_stem in dict.fromkeys((pdf_path.stem, base_stem)):
+            candidate = pdf_path.with_name(f"{candidate_stem}_text.txt")
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def _shape_rank(plan: Any, issues: list[str]) -> tuple[int, int, float]:
+        if plan is None:
+            return (0, -999, -9999.0)
+        where, _ = ocr_closure_note(plan)
+        severe_count = len(issues) + (1 if where == "issue" else 0)
+        closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
+        return (1, -severe_count, -round(closure, 4))
+
+    @staticmethod
+    def _has_severe_shape_issues(plan: Any, issues: list[str]) -> bool:
+        if plan is None:
+            return True
+        if issues:
+            return True
+        where, _ = ocr_closure_note(plan)
+        if where == "issue":
+            return True
+        closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
+        return closure > 0.5
+
     def _pdf_set_worker(
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
@@ -7307,33 +7337,110 @@ class SurveyApp(ctk.CTk):
                     if job.source is None:
                         raise PDFError(job.source_error or "нет данных для разбора")
                     if job.ocr:
-                        # Скан без текстового слоя: сначала бесплатный локальный OCR.
-                        # Занимает секунды на страницу, поэтому только здесь, в фоне.
+                        # Трёхступенчатая эскалация для скана:
+                        # 1) кеш Шага 0 (*_text.txt) -> 2) OCR 400 dpi -> 3) LLM -> 4) ручной ввод.
+                        cache_path = self._find_step0_cache_path(job.path)
+                        cached_text = ""
+                        if cache_path is not None:
+                            try:
+                                cached_text = cache_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+                            except OSError:
+                                cached_text = ""
+
+                        best_outcome = None
+                        best_plan = None
+                        best_issues: list[str] = []
+                        best_text = ""
+                        best_rank = (0, -999, -9999.0)
+                        last_exc: Exception | None = None
+
+                        if cached_text:
+                            post("progress", f"[{idx}/{total}] {job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
+                            try:
+                                cache_job = dataclasses.replace(job, source={"text": cached_text}, use_llm=False)
+                                o1, _, iss1 = self._parse_pdf_set_job(
+                                    cache_job, cfg, provider_id, model_name, api_key, key_secret,
+                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
+                                )
+                                d1 = apply_changes(o1.data, fix_changes(job.fixes))
+                                p1 = builder.plan(d1, scale=scale, is_neighbor=not job.is_main)
+                                best_outcome, best_plan, best_issues, best_text = o1, p1, list(iss1), cached_text
+                                best_rank = self._shape_rank(p1, iss1)
+                            except Exception as exc:  # noqa: BLE001
+                                last_exc = exc
+
+                        if self._has_severe_shape_issues(best_plan, best_issues):
+                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально на 400 dpi…")
+                            pages = job.source.get("pdf_pages") or (1, 1)
+                            first_p, last_p = int(pages[0]), int(pages[1])
+                            try:
+                                text_400 = ocr_pages.ocr_pdf_pages(job.path, first_p, last_p, dpi=400).strip()
+                            except Exception:  # noqa: BLE001
+                                text_400 = ""
+                            if text_400 and text_400 != cached_text:
+                                try:
+                                    j400 = dataclasses.replace(job, source={"text": text_400}, use_llm=False)
+                                    o2, _, iss2 = self._parse_pdf_set_job(
+                                        j400, cfg, provider_id, model_name, api_key, key_secret,
+                                        do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
+                                    )
+                                    d2 = apply_changes(o2.data, fix_changes(job.fixes))
+                                    p2 = builder.plan(d2, scale=scale, is_neighbor=not job.is_main)
+                                    r2 = self._shape_rank(p2, iss2)
+                                    if r2 > best_rank:
+                                        best_outcome, best_plan, best_issues, best_text, best_rank = o2, p2, list(iss2), text_400, r2
+                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                        try:
+                                            target_cache.write_text(text_400, encoding="utf-8")
+                                        except OSError:
+                                            pass
+                                except Exception as exc:  # noqa: BLE001
+                                    last_exc = exc
+
+                        if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
+                            post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
+                            try:
+                                jllm = dataclasses.replace(job, use_llm=True)
+                                o3, pre3, iss3 = self._parse_pdf_set_job(
+                                    jllm, cfg, provider_id, model_name, api_key, key_secret,
+                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
+                                )
+                                post("valid_secret", key_secret)
+                                d3 = apply_changes(o3.data, fix_changes(job.fixes))
+                                p3 = builder.plan(d3, scale=scale, is_neighbor=not job.is_main)
+                                r3 = self._shape_rank(p3, iss3)
+                                if r3 > best_rank:
+                                    best_outcome, best_plan, best_issues, best_rank = o3, p3, list(iss3), r3
+                                    pre_counted = pre3
+                                    llm_raw = str(getattr(o3, "raw_text", "") or "").strip()
+                                    if llm_raw and llm_raw != best_text:
+                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                        try:
+                                            target_cache.write_text(llm_raw, encoding="utf-8")
+                                        except OSError:
+                                            pass
+                            except Exception as exc:  # noqa: BLE001
+                                last_exc = exc
+
+                        if best_outcome is None:
+                            raise last_exc or PDFError("не удалось распознать участок; введите текст вручную")
+                        if self._has_severe_shape_issues(best_plan, best_issues):
+                            best_issues.append("Требуется ручная проверка/ввод текста для этого лота")
+                        result.ocr = True
+                        outcome, pre_counted, issues = best_outcome, False, best_issues
+                    else:
                         post(
                             "progress",
-                            f"[{idx}/{total}] {job.path.name}: распознаю страницы локально (OCR)…",
+                            f"[{idx}/{total}] {job.role_label}: {job.path.name}, {job.pages_label} — {job.mode_label}…",
                         )
-                        recognized = resolve_ocr_source(
-                            job.source,
-                            progress=lambda msg, i=idx, name=job.path.name: post(
-                                "progress", f"[{i}/{total}] {name}: {msg}"
-                            ),
+                        outcome, pre_counted, issues = self._parse_pdf_set_job(
+                            job, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient,
+                            lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
                         )
-                        # Отметка «это OCR» — для отчёта, в парсер она не идёт.
-                        result.ocr = bool(recognized.pop("ocr", False))
-                        job = dataclasses.replace(job, source=recognized)
-                    post(
-                        "progress",
-                        f"[{idx}/{total}] {job.role_label}: {job.path.name}, {job.pages_label} — {job.mode_label}…",
-                    )
-                    outcome, pre_counted, issues = self._parse_pdf_set_job(
-                        job, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient,
-                        lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                    )
-                    if not self._worker_is_current():
-                        return
-                    if job.use_llm:
-                        post("valid_secret", key_secret)
+                        if not self._worker_is_current():
+                            return
+                        if job.use_llm:
+                            post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
                 description = apply_changes(result.outcome.data, fix_changes(job.fixes))

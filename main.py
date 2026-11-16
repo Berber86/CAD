@@ -1048,6 +1048,10 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_dim"],
         )
         self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+        self.update_progress_bar = ctk.CTkProgressBar(update_row, height=8)
+        self.update_progress_bar.set(0)
+        self.update_progress_bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        self.update_progress_bar.grid_remove()  # показываем только во время обновления
         ctk.CTkLabel(
             update_row,
             text=(
@@ -1061,7 +1065,7 @@ class SurveyApp(ctk.CTk):
             wraplength=394,
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
 
         # Откат на резервную копию предыдущей версии (на случай критического бага).
         self.rollback_status_label = ctk.CTkLabel(
@@ -1073,7 +1077,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
         )
-        self.rollback_status_label.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.rollback_status_label.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 4))
         self.rollback_button = ctk.CTkButton(
             update_row,
             text="↩ Откатиться на старую версию",
@@ -1084,7 +1088,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._start_rollback,
         )
-        self.rollback_button.grid(row=5, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
+        self.rollback_button.grid(row=6, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
         self._refresh_rollback_state()
 
         ctk.CTkLabel(
@@ -5254,19 +5258,36 @@ class SurveyApp(ctk.CTk):
             text=f"Скачиваю обновление из {source}…", text_color=THEME["text_dim"],
         )
         self._set_status(f"Обновление: скачиваю архив из {source}…")
+        self._show_update_stage("download", 0.0, "подключаюсь к GitHub…")
 
         def progress(message: str) -> None:
             self._post("update_progress", str(message))
 
+        def stage(name: str, fraction: float | None, detail: str) -> None:
+            self._post("update_stage", (name, fraction, detail))
+
         def worker() -> None:
             try:
-                result = app_updater.apply_update(source, app_dir, progress=progress)
+                result = app_updater.apply_update(source, app_dir, progress=progress, on_stage=stage)
             except Exception as exc:  # noqa: BLE001 - network/zip/filesystem failures
                 self._post("update_done", ("error", f"{type(exc).__name__}: {exc}"))
                 return
             self._post("update_done", ("ok", result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_stage(self, name: str, fraction: float | None, detail: str) -> None:
+        """Полоса и подпись: «Скачивание: 42% — 1.0 из 2.4 МБ», «Резервная копия…», «Установка…»."""
+        titles = {"download": "Скачивание", "backup": "Резервная копия", "install": "Установка"}
+        title = titles.get(name, name)
+        bar = self.update_progress_bar
+        bar.grid()
+        if fraction is None:
+            text = f"{title}: {detail}"
+        else:
+            bar.set(max(0.0, min(1.0, float(fraction))))
+            text = f"{title}: {round(max(0.0, min(1.0, float(fraction))) * 100)}% — {detail}"
+        self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
 
     def _confirm_update_version(self, source: str) -> bool:
         """Ask for confirmation before overwriting the running installation."""
@@ -5284,6 +5305,11 @@ class SurveyApp(ctk.CTk):
     def _finish_update_version(self, status: str, payload: Any) -> None:
         self._update_running = False
         self.update_version_button.configure(state="normal", text="🔄 Обновить версию")
+        if status == "ok":
+            self.update_progress_bar.set(1.0)
+        else:
+            self.update_progress_bar.set(0)
+            self.update_progress_bar.grid_remove()
         if status == "ok":
             result: app_updater.UpdateResult = payload
             kept_note = (
@@ -9050,6 +9076,9 @@ class SurveyApp(ctk.CTk):
             text = str(payload)
             self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
             self._set_status(f"Обновление: {text}")
+        elif kind == "update_stage":
+            name, fraction, detail = payload
+            self._show_update_stage(str(name), fraction, str(detail))
         elif kind == "update_done":
             status, update_payload = payload
             self._finish_update_version(status, update_payload)

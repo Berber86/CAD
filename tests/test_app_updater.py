@@ -462,3 +462,114 @@ def test_rollback_without_any_backup_says_so(tmp_path):
     app = _old_install(tmp_path)
     with pytest.raises(app_updater.UpdateError, match="резервной копии нет"):
         app_updater.rollback_latest(app)
+
+
+def test_http_get_reports_bytes_received_out_of_content_length(monkeypatch):
+    """Индикатор получает (получено, всего), читая тело кусками."""
+    import urllib.request
+
+    body = b"x" * (150 * 1024)
+
+    class _Response:
+        headers = {"Content-Length": str(len(body))}
+
+        def __init__(self):
+            self._buf = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(self._buf)
+            chunk, self._buf = self._buf[:size], self._buf[size:]
+            return chunk
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Response())
+    seen = []
+    data = app_updater._http_get("https://codeload.github.com/o/r/zip/refs/heads/main",
+                                 on_progress=lambda got, total: seen.append((got, total)))
+    assert data == body
+    assert seen[-1] == (len(body), len(body))
+    assert [got for got, _ in seen] == sorted(got for got, _ in seen)  # монотонно растёт
+    assert len(seen) == 3  # 64 КБ + 64 КБ + 22 КБ
+
+
+def test_http_get_without_content_length_reports_zero_total(monkeypatch):
+    import urllib.request
+
+    class _Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __init__(self):
+            self._chunks = [b"abc", b""]
+
+        def read(self, size=-1):  # noqa: ARG002
+            return self._chunks.pop(0)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Response())
+    seen = []
+    assert app_updater._http_get("https://codeload.github.com/o/r/zip/refs/heads/main",
+                                 on_progress=lambda got, total: seen.append((got, total))) == b"abc"
+    assert seen == [(3, 0)]
+
+
+def test_apply_update_emits_download_backup_and_install_stages(tmp_path, monkeypatch):
+    target = tmp_path / "app"
+    target.mkdir()
+    (target / "old.py").write_text("old", encoding="utf-8")
+    zip_bytes = _zip_bytes({"main.py": b"updated", "util.py": b"u"})
+
+    def fake_http_get(url, timeout=30.0, on_progress=None):  # noqa: ARG001
+        half = len(zip_bytes) // 2
+        on_progress(half, len(zip_bytes))
+        on_progress(len(zip_bytes), len(zip_bytes))
+        return zip_bytes
+
+    monkeypatch.setattr(app_updater, "_http_get", fake_http_get)
+    stages = []
+    app_updater.apply_update(
+        "https://github.com/Berber86/CAD/archive/refs/heads/main.zip",
+        target,
+        on_stage=lambda name, fraction, detail: stages.append((name, fraction)),
+    )
+
+    names = [name for name, _ in stages]
+    assert names.index("download") < names.index("backup") < names.index("install")
+    download = [f for n, f in stages if n == "download"]
+    assert download[0] == 0.0 and download[-1] == 1.0
+    assert ("backup", 1.0) in stages  # все архивные файлы учтены, даже новые (их копировать не нужно)
+    assert stages[-1] == ("install", 1.0)
+
+
+def test_apply_update_without_on_stage_still_works(tmp_path, monkeypatch):
+    """Без индикатора поведение прежнее: никаких лишних аргументов в вызовах."""
+    target = tmp_path / "app"
+    target.mkdir()
+    monkeypatch.setattr(app_updater, "_http_get", lambda url, timeout=30.0: _zip_bytes({"main.py": b"x"}))
+    result = app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", target)
+    assert result.files_written == 1
+
+
+def test_download_zip_passes_progress_only_when_asked(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_http_get(url, timeout=30.0, **kwargs):  # noqa: ARG001
+        calls.append(kwargs)
+        return b"zip-bytes"
+
+    monkeypatch.setattr(app_updater, "_http_get", fake_http_get)
+    app_updater.download_zip("https://codeload.github.com/o/r/zip/refs/heads/main", tmp_path / "a.zip")
+    app_updater.download_zip("https://codeload.github.com/o/r/zip/refs/heads/main", tmp_path / "b.zip",
+                             on_progress=lambda got, total: None)
+    assert calls[0] == {}
+    assert "on_progress" in calls[1]

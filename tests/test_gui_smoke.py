@@ -3971,6 +3971,46 @@ def test_update_version_requires_a_source_url_before_running(gui):
     assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
 
 
+def test_update_version_shows_download_percent_backup_and_install_stages(gui, monkeypatch):
+    """Полоса и подпись проходят все этапы: скачивание в процентах, резерв, установка, готово."""
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    shown = []
+    real_show = app._show_update_stage
+
+    def spy(name, fraction, detail):
+        shown.append((name, fraction))
+        real_show(name, fraction, detail)
+
+    monkeypatch.setattr(app, "_show_update_stage", spy)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+        on_stage("download", 0.42, "1.0 из 2.4 МБ")
+        on_stage("backup", 1.0, "файлов: 3 из 3")
+        on_stage("install", 0.5, "файлов: 4 из 8")
+        return gui.app_updater.UpdateResult(zip_url="z", files_written=8, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    names = [name for name, _ in shown]
+    assert names[0] == "download"
+    assert "backup" in names and "install" in names
+    assert names.index("backup") < names.index("install")
+    assert ("download", 0.42) in shown
+    assert app.update_progress_bar.get() == 1.0  # по итогам успешного обновления полоса полная
+
+
 def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypatch):
     from tkinter import messagebox
 
@@ -3978,7 +4018,7 @@ def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypa
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         assert source == "https://github.com/Berber86/CAD/tree/main"
         if progress:
             progress("скачиваю архив обновления: https://codeload.github.com/...")
@@ -4007,7 +4047,7 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         return gui.app_updater.UpdateResult(
             zip_url="https://codeload...",
             files_written=42,
@@ -4036,7 +4076,7 @@ def _finish_update(app, gui, monkeypatch, files=7):
     """Запускает обновление с подменённым архивом и дожидается его конца."""
     import time
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=files, app_dir=str(app_dir))
 
     monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
@@ -4143,7 +4183,7 @@ def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def boom(source, app_dir, *, progress=None, timeout=60.0):
+    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         raise gui.app_updater.UpdateError("сеть недоступна")
 
     monkeypatch.setattr(gui.app_updater, "apply_update", boom)

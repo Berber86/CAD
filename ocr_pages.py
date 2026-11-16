@@ -129,10 +129,15 @@ def _read_cache(key: str) -> str | None:
         return None
 
 
-def is_cached(path: str | Path, first: int, last: int, *, dpi: int = DEFAULT_DPI, tile: int = 1) -> bool:
-    """Есть ли уже распознанный текст для этих страниц и разрешения (для честного отчёта)."""
-    pdf = Path(path)
-    return _read_cache(_cache_key(pdf, int(first), int(last), int(dpi), int(tile))) is not None
+def effective_dpi(path: str | Path, page_no: int, dpi: int = DEFAULT_DPI) -> int:
+    """Реальное разрешение рендера страницы (с учётом потолка по нативному dpi скана)."""
+    import pymupdf  # noqa: PLC0415
+
+    doc = pymupdf.open(str(path))
+    try:
+        return page_render_dpi(doc.load_page(int(page_no) - 1), int(dpi))
+    finally:
+        doc.close()
 
 
 def _write_cache(key: str, text: str) -> None:

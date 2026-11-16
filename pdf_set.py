@@ -346,18 +346,21 @@ class OcrEscalation:
     text: str = ""
     error: str = ""
     seconds: float = 0.0
-    cached: bool = False
     tiled: bool = False
     pages: tuple[int, int] = (1, 1)
     dpi: int = ESCALATION_DPI
+    render_dpi: int = ESCALATION_DPI
 
     def summary(self) -> str:
         if self.error:
             return f"ошибка за {self.seconds:.1f} с: {self.error}"
-        how = "из кеша OCR" if self.cached else "распознано заново"
+        how = "распознано заново, без кеша"
         if self.tiled:
             how += ", кусками 2×2"
-        return f"{self.seconds:.1f} с, {how}, {format_pages(*self.pages)}, {self.dpi} dpi"
+        dpi_note = f"{self.render_dpi} dpi" if self.render_dpi == self.dpi else (
+            f"{self.render_dpi} dpi (запрошено {self.dpi}: выше нативного разрешения скана не рендерим)"
+        )
+        return f"{self.seconds:.1f} с, {how}, {format_pages(*self.pages)}, {dpi_note}"
 
 
 def escalate_ocr(
@@ -365,13 +368,13 @@ def escalate_ocr(
     dpi: int = ESCALATION_DPI, progress: Callable[[str], None] | None = None,
 ) -> OcrEscalation:
     """
-    Ступень 2 для скана в фоновом разборе: реальное локальное распознавание.
+    Ступень 2 для скана в фоновом разборе: настоящее локальное распознавание.
 
-    * страницы — выбранные пользователем (``ocr_pages`` из источника, а не «1–2»);
-    * сначала страница целиком на ``dpi``; если обхода нет — тот же диапазон кусками 2×2
-      (это и есть «мельче» при плотном шрифте, см. ``resolve_ocr_source``);
-    * ошибки не глотаются: они возвращаются в ``error`` и попадают в отчёт;
-    * готовый текст из кеша OCR отдаётся сразу, но помечается как «из кеша».
+    * Кеш не читается и не пишется ни в каком виде: эскалация нужна именно затем,
+      чтобы не доверять прошлому результату. Каждый запуск распознаёт страницы заново.
+    * Страницы — выбранные пользователем (``ocr_pages`` из источника).
+    * Сначала страница целиком; если обхода нет — тот же диапазон кусками 2×2.
+    * Ошибки не глотаются: они возвращаются в ``error`` и попадают в отчёт.
     """
     src = dict(source or {})
     pdf = Path(path)
@@ -381,30 +384,31 @@ def escalate_ocr(
     except PDFError as exc:
         return OcrEscalation(error=str(exc), seconds=0.0, dpi=dpi)
     pages = (first, last)
-    cached = ocr_pages.is_cached(pdf, first, last, dpi=dpi)
     try:
-        text = ocr_pages.ocr_pdf_pages(pdf, first, last, dpi=dpi, progress=progress)
+        text = ocr_pages.ocr_pdf_pages(pdf, first, last, dpi=dpi, progress=progress, use_cache=False)
     except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
         return OcrEscalation(
-            error=describe_exc(exc), seconds=time.monotonic() - started,
-            cached=cached, pages=pages, dpi=dpi,
+            error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages, dpi=dpi,
         )
     tiled = False
     if not has_legal_courses(text):
         if progress:
             progress("целиком обход не прочитан — пробую по кускам 2×2 (OCR, локально)…")
-        tiled_cached = ocr_pages.is_cached(pdf, first, last, dpi=dpi, tile=2)
         try:
             tiled_text = ocr_pages.ocr_pdf_pages(
-                pdf, first, last, dpi=dpi, progress=progress, tile=2,
+                pdf, first, last, dpi=dpi, progress=progress, tile=2, use_cache=False,
             )
         except Exception:  # noqa: BLE001 - целиком текст уже есть, его и оставляем
             tiled_text = ""
         if has_legal_courses(tiled_text):
-            text, tiled, cached = tiled_text, True, tiled_cached
+            text, tiled = tiled_text, True
+    try:
+        render = ocr_pages.effective_dpi(pdf, first, dpi)
+    except Exception:  # noqa: BLE001 - это только отчёт
+        render = dpi
     return OcrEscalation(
         text=text.strip(), seconds=time.monotonic() - started,
-        cached=cached, tiled=tiled, pages=pages, dpi=dpi,
+        tiled=tiled, pages=pages, dpi=dpi, render_dpi=render,
     )
 
 

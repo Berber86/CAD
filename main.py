@@ -143,6 +143,7 @@ from pdf_set import (
     format_pages,
     make_item,
     make_job,
+    pages_from_spec,
     read_page_boxes,
     resolve_ocr_source,
     set_signature,
@@ -7445,8 +7446,8 @@ class SurveyApp(ctk.CTk):
                         if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
                             post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
                             try:
-                                pages_llm = job.source.get("ocr_pages") or job.source.get("pdf_pages") or (1, 1)
-                                lp1, lp2 = int(pages_llm[0]), int(pages_llm[1])
+                                # Страницы приходят строкой «2» / «3-4»: разбираем их, а не индексируем.
+                                lp1, lp2 = pages_from_spec(job.source.get("ocr_pages") or job.source.get("pdf_pages") or "1")
                                 try:
                                     total_p = int(inspect_pdf(job.path).get("pages") or 0)
                                     if 1 <= total_p <= 2:

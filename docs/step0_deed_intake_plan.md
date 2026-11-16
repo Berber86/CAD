@@ -21,11 +21,11 @@
 ```
 <папка проекта>/
   01_описания/
-    LOT 32_p4-6.pdf            # наш участок (is_main)
-    LOT 32_p4-6.txt / .json    # текст описания + паспорт документа
-    LOT 30_p2-3.pdf            # сосед слева
-    LOT 28_p9-10.pdf           # сосед справа
-    LOT 34 — описания нет.txt  # чего не хватило и что делать
+    OUR 32 NEW.pdf             # наш участок, самый свежий документ (схема Коли)
+    OUR 32 OLD.pdf             # наш участок, самый старый документ
+    LOT 30 NEW.pdf             # сосед — только свежий
+    OUR 32 NEW_p4-6.pdf        # если нашли страницы описания — суффикс страниц
+    OUR 32 NEW.json            # паспорт: откуда взят, что за документ, страницы
     _manifest.json             # состав набора: роли, страницы, BBL, итоги проверок
 ```
 
@@ -66,28 +66,43 @@ DWG — не источник координат, но источник **под
 4. BBL — единственный «якорь» всего Шага 0: по нему берутся документы ACRIS и геометрия
    лотов города.
 
-## 5. Документы: ACRIS через открытые данные
+## 5. Документы: Richmond County Clerk (и ACRIS для других районов)
 
-Поиск и отбор — по выгрузкам NYC Open Data (Socrata, JSON, без ключа); на сайт ACRIS
-идём **только за картинками** нужного `document_id`.
+Схема Коли (15.11.2026, по его видео) — **Staten Island берётся не в ACRIS**:
+
+1. По block/lot открывается список документов участка:
+
+   ```
+   https://www.richmondcountyclerk.com/Search/ShowResultsBlocks/0?Block=6323&Lot=32&SelectedDocumentIdentifier=0
+   ```
+
+2. В списке берутся строки **Deed**; если Deed нет — **Mortgage**.
+3. Строка открывает карточку `/Search/ViewDocumentInfo/<номер>`, а из неё —
+   сам PDF: `/ViewVscmsDocument/ViewContent?p_endorsementId=<номер>`.
+4. Для **нашего** лота качаются **самый свежий и самый старый** документ;
+   для **соседей** — только свежий (старый оставлен функцией на случай проблем
+   с межой соседа — `with_old_for_neighbour`).
+5. Имя файла: `OUR 32 NEW.pdf` / `OUR 32 OLD.pdf`; сосед — `LOT 30 NEW.pdf`.
+
+**Cloudflare.** За ссылкой на PDF стоит проверка на бота: она крутится минуты
+три и, ничего не спрашивая, отдаёт файл. Значит честный путь — браузер: программа
+открывает ссылку, Коля ждёт, PDF падает в «Загрузки», а программа подхватывает
+файл, называет по схеме, пишет паспорт и добавляет в `_manifest.json`. Прямое
+скачивание тоже реализовано (`rcclerk.download_pdf`), но при проверке оно честно
+падает `CloudflareBlocked` и говорит, какую ссылку открыть.
+
+**Другие районы.** Для Manhattan / Bronx / Brooklyn / Queens документы лежат в
+ACRIS, и там работает прежняя схема с открытыми данными:
 
 | Набор | ID | Что даёт |
 |---|---|---|
-| ACRIS Real Property Legals | `8h5j-fqxa` | `document_id` по borough + block + lot (+ `partial_lot`, `easement`, адрес) |
-| ACRIS Real Property Master | `bnx9-e6tj` | тип (`DEED`, `MTGE`…), CRFN, даты, сумма, reel/page для старых записей |
+| ACRIS Real Property Legals | `8h5j-fqxa` | `document_id` по borough + block + lot |
+| ACRIS Real Property Master | `bnx9-e6tj` | тип (`DEED`, `MTGE`…), CRFN, даты |
 | ACRIS Real Property Parties | `636b-3b5g` | продавец/покупатель |
-| ACRIS Real Property References | `pwkr-dpni` | ссылки документа на другие документы |
-| ACRIS Document Control Codes | `7isb-wh4c` | расшифровка типов |
+| ACRIS Real Property References | `pwkr-dpni` | цепочка «being the same premises…» |
 
-Правила отбора:
-
-- берём **DEED** (и `DEED, OTHER`, `ADDTL DEED`), не берём `MTGE`, `AGMT`, `LIEN`;
-- если новый deed метесы не содержит («being the same premises conveyed by deed recorded
-  … CRFN …»), идём по `References` назад до документа, где «BEGINNING AT A POINT» есть;
-- `partial_lot = P` или несколько BBL в одном документе — повод для пометки: deed может
-  описывать несколько лотов, тогда один файл закрывает и нашего, и соседа;
-- документы до 1966 г. идут с legacy-номерами (`FT_`, `BK_`, reel/page) — их тоже
-  показываем, если новее ничего нет.
+Это следующий шаг: сейчас сделан Richmond (там работает заказчик), ACRIS —
+по той же логике выбора документов (`choose_documents`) и того же хранения.
 
 ## 6. Соседи — из городской геометрии, а не из нашего чертежа
 
@@ -198,20 +213,20 @@ Ghostscript; на Windows работает так же). Вес: 16 МБ сам 
   "created": "2026-11-16T10:12:00",
   "items": [
     {
-      "file": "LOT 32_p4-6.pdf",
-      "text": "LOT 32_p4-6.txt",
+      "file": "OUR 32 NEW_p4-6.pdf",
+      "text": "OUR 32 NEW.txt",
       "lot": "32",
       "role": "main",
       "side": null,
       "bbl": "5-1234-32",
-      "document_id": "2019061400123001",
+      "endorsement_id": "2640218",
       "crfn": "2019000123456",
       "doc_type": "DEED",
       "doc_date": "2019-05-14",
       "recorded": "2019-06-14",
       "parties": ["SMITH JOHN", "JONES MARY"],
       "pages": "4-6",
-      "source_url": "https://a836-acris.nyc.gov/DS/DocumentSearch/DocumentImageView?doc_id=2019061400123001",
+      "source_url": "https://www.richmondcountyclerk.com/ViewVscmsDocument/ViewContent?p_endorsementId=2640218",
       "downloaded": "2026-11-16T10:10:41",
       "checks": {"closure_ft": 0.006, "area_sqft": 4000, "city_area_sqft": 4000,
                  "shared_line": null, "street": "ALVINE AVENUE"},
@@ -230,7 +245,8 @@ Ghostscript; на Windows работает так же). Вес: 16 МБ сам 
 
 | Модуль | Что делает | Зависимости |
 |---|---|---|
-| `deed_store.py` | имена `LOT <n>_p<a>-<b>.pdf`, `.txt`, `.json`, `_manifest.json`, дедуп по `document_id` | — |
+| `rcclerk.py` | адреса списка/карточки/PDF, разбор строк (Deed/Mortgage, даты), правило «свежий + старый», имена файлов, скачивание с честной ошибкой Cloudflare | — |
+| `deed_store.py` | папка `01_описания`: имена `OUR 32 NEW.pdf` (+`_p4-6`), паспорт `.json` рядом, `_manifest.json`, поиск дублей по номеру клерка | — |
 | `deed_pages.py` | поиск страниц с описанием (миниатюры → Vision), обрезка, склейка | PyMuPDF, `llm_parser` |
 | `deed_verify.py` | пять проверок §7 → «принят / проверить», третий голос с DWG | существующий парсер |
 | `acris.py` | BBL → документы (Legals + Master + References), отбор DEED, скачивание страниц с кэшем и троттлингом | `urllib`, `pyproj` не нужен |
@@ -266,13 +282,13 @@ Ghostscript; на Windows работает так же). Вес: 16 МБ сам 
 6. Нужны соседи только по меже или ещё «через улицу»/«сзади по кварталу»?
 7. Скачивает он страницы по одной или документ целиком, и режет ли обложки?
 
-## 14. Проба на реальном заказе (первый день)
+## 14. Проба на реальном заказе (следующий шаг)
 
-- «24 Alvine Avenue»: адрес → BBL; сколько записей в Legals, какие типы, сколько страниц
-  у deed, есть ли текстовый слой.
-- Отдаёт ли `DocumentImageView` страницы без браузера (сессия/cookies): если только
-  интерактивно — скачивание оставляем человеку, а обрезку, имена и проверку берём на себя.
-- Как выглядит EXHIBIT A в deed 1990-х: качество скана и шрифт — тянет ли Vision или
-  нужен локальный OCR.
-- Проверить на живом BBL: наши ли соседи определяются по геометрии города и находится ли
-  у соседа «обратная» линия общей межи.
+- Открыть в браузере `ShowResultsBlocks/0?Block=6323&Lot=32`, сохранить страницу
+  и прогнать её через `rcclerk.parse_document_rows` — увидеть, все ли строки
+  нашлись с типами и датами (разбор терпимый, но настоящий HTML мы ещё не видели).
+- Скачать `OUR 32 NEW.pdf` и `OUR 32 OLD.pdf` (руками, через браузер) и прогнать
+  через локальный OCR: есть ли описание, на каких страницах, замыкается ли контур.
+- Проверить, что `_manifest.json` поднимает набор в Шаге 1 одним нажатием.
+- По соседям: взять 2–3 лота по меже, убедиться, что «свежий» документ есть и что
+  общая межа с нашим описанием совпадает (обратный румб той же длины).

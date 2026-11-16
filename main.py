@@ -375,6 +375,14 @@ def ocr_closure_note(plan: Any, limit: float = CLOSURE_LIMIT_FT) -> tuple[str, s
     )
 
 
+_NO_DISTANCE_WARNING = "расстояние от угла до точки начала не найдено"
+
+
+def _lacks_corner_distance(warnings: Any) -> bool:
+    """Парсер не нашёл расстояние до угла: участок построен от угла улицы (ошибка, не шум)."""
+    return any(_NO_DISTANCE_WARNING in str(item) for item in (warnings or ()))
+
+
 class SurveyApp(ctk.CTk):
     """Главное окно приложения (Dark CAD Studio UI)."""
 
@@ -7484,13 +7492,35 @@ class SurveyApp(ctk.CTk):
         return None
 
     @staticmethod
-    def _shape_rank(plan: Any, issues: list[str]) -> tuple[int, int, float]:
+    def _shape_rank(plan: Any, issues: list[str], warnings: Any = ()) -> tuple[int, int, float]:
         if plan is None:
             return (0, -999, -9999.0)
         where, _ = ocr_closure_note(plan)
-        severe_count = len(issues) + (1 if where == "issue" else 0)
+        suspicion = getattr(plan, "suspicion", None)
+        suspicious = bool(suspicion is not None and suspicion.is_suspicious)
+        no_distance = _lacks_corner_distance(list(warnings or ()) + list(getattr(plan, "warnings", None) or ()))
+        severe_count = (
+            len(issues) + (1 if where == "issue" else 0)
+            + (1 if suspicious else 0) + (1 if no_distance else 0)
+        )
         closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
         return (1, -severe_count, -round(closure, 4))
+
+    def _needs_local_recheck(self, outcome: Any, plan: Any, issues: list[str]) -> bool:
+        """
+        Повод перераспознать локально (бесплатно): кеш или OCR дал сомнительный участок.
+
+        Сюда входят предупреждения, которых раньше не было в проверке: нет расстояния
+        до угла и подозрительная форма (почти прямоугольник, неравные параллельные).
+        В платный ИИ они не ведут: см. _has_severe_shape_issues.
+        """
+        suspicion = getattr(plan, "suspicion", None)
+        warnings = list(getattr(outcome, "warnings", None) or ()) + list(getattr(plan, "warnings", None) or ())
+        return (
+            self._has_severe_shape_issues(plan, issues)
+            or _lacks_corner_distance(warnings)
+            or bool(suspicion is not None and suspicion.is_suspicious)
+        )
 
     @staticmethod
     def _has_severe_shape_issues(plan: Any, issues: list[str]) -> bool:
@@ -7524,6 +7554,7 @@ class SurveyApp(ctk.CTk):
                     result.issues = list(job.cached_issues)
                     result.pre_counted = True
                     result.cached = True
+                    result.llm_used = bool(job.use_llm)
                 else:
                     if job.source is None:
                         raise PDFError(job.source_error or "нет данных для разбора")
@@ -7556,11 +7587,11 @@ class SurveyApp(ctk.CTk):
                                 d1 = apply_changes(o1.data, fix_changes(job.fixes))
                                 p1 = builder.plan(d1, scale=scale, is_neighbor=not job.is_main)
                                 best_outcome, best_plan, best_issues, best_text = o1, p1, list(iss1), cached_text
-                                best_rank = self._shape_rank(p1, iss1)
+                                best_rank = self._shape_rank(p1, iss1, o1.warnings)
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
 
-                        if self._has_severe_shape_issues(best_plan, best_issues):
+                        if self._needs_local_recheck(best_outcome, best_plan, best_issues):
                             post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально без кеша (до {max(ESCALATION_DPIS)} dpi)…")
                             # Реальная ступень 2: выбранные страницы, OCR, при пустом обходе — кусками 2×2.
                             # Ошибка не глотается: она попадает в отчёт и в причину отказа.
@@ -7582,14 +7613,9 @@ class SurveyApp(ctk.CTk):
                                     )
                                     d2 = apply_changes(o2.data, fix_changes(job.fixes))
                                     p2 = builder.plan(d2, scale=scale, is_neighbor=not job.is_main)
-                                    r2 = self._shape_rank(p2, iss2)
+                                    r2 = self._shape_rank(p2, iss2, o2.warnings)
                                     if r2 > best_rank:
                                         best_outcome, best_plan, best_issues, best_text, best_rank = o2, p2, list(iss2), text_400, r2
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(text_400, encoding="utf-8")
-                                        except OSError:
-                                            pass
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
 
@@ -7606,6 +7632,7 @@ class SurveyApp(ctk.CTk):
                                     pass
                                 clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
                                 jllm = dataclasses.replace(job, source=clean_llm_source, use_llm=True)
+                                result.llm_used = True  # ступень 3 запущена: токены могут быть потрачены
                                 o3, pre3, iss3 = self._parse_pdf_set_job(
                                     jllm, cfg, provider_id, model_name, api_key, key_secret,
                                     do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
@@ -7613,7 +7640,7 @@ class SurveyApp(ctk.CTk):
                                 post("valid_secret", key_secret)
                                 d3 = apply_changes(o3.data, fix_changes(job.fixes))
                                 p3 = builder.plan(d3, scale=scale, is_neighbor=not job.is_main)
-                                r3 = self._shape_rank(p3, iss3)
+                                r3 = self._shape_rank(p3, iss3, o3.warnings)
                                 if r3 > best_rank:
                                     best_outcome, best_plan, best_issues, best_rank = o3, p3, list(iss3), r3
                                     pre_counted = pre3
@@ -7646,6 +7673,7 @@ class SurveyApp(ctk.CTk):
                         )
                         if not self._worker_is_current():
                             return
+                        result.llm_used = bool(job.use_llm or getattr(outcome, "source", "") == "llm")
                         if job.use_llm:
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
@@ -7705,7 +7733,7 @@ class SurveyApp(ctk.CTk):
                     description=outcome.data, fixes=tuple(job.fixes),
                     source_text=str(getattr(outcome, "prepared_text", "") or ""),
                     images=tuple(getattr(outcome, "prepared_images", None) or ()),
-                    used_ai=bool(job.use_llm),
+                    used_ai=bool(res.llm_used),
                 ))
             advisor_cfg = cfg.get("api", {}).get("conflict_advisor") or {}
             advisor = None
@@ -7854,6 +7882,7 @@ class SurveyApp(ctk.CTk):
             item.error = res.error
             item.issues = list(res.issues)
             item.ocr_used = bool(res.ocr) and not res.error
+            item.llm_used = bool(res.llm_used) and not res.error
             if res.error or res.plan is None or res.outcome is None:
                 item.outcome = None
                 item.parsed_key = None
@@ -7953,7 +7982,7 @@ class SurveyApp(ctk.CTk):
             else:
                 mark = "⚠" if self._pdf_set_issue_lines(item) else "✓"
             role = "наш" if item.is_main else "сосед"
-            if item.use_llm:
+            if item.llm_used or (item.use_llm and item.outcome is None):
                 mode = "ИИ"
             elif item.ocr_used:
                 mode = "локально, OCR"
@@ -7980,6 +8009,8 @@ class SurveyApp(ctk.CTk):
             f"Файлов: {len(items)} · построено: {len(built)} · с замечаниями: {len(flagged)} "
             f"· не разобрано: {len(failed)}",
         ]
+        llm_count = sum(1 for item in items if item.llm_used)
+        lines.append(f"ИИ (по факту): файлов {llm_count} · локально: {len(items) - llm_count}")
         by_ocr = [item for item in items if item.ocr_used]
         if by_ocr:
             lines.append(
@@ -8001,7 +8032,7 @@ class SurveyApp(ctk.CTk):
             lines.append("")
             lines.append(f"▸ {role} — {item.path.name}")
             lines.append(f"   {item.pages_label()} · {item.mode_label()}")
-            if item.ocr_used:
+            if item.ocr_used and not item.llm_used:
                 lines.append(
                     "   🔍 текст страниц получен локальным OCR — платный запрос ИИ не делался"
                 )

@@ -83,6 +83,8 @@ class PdfSetItem:
     ocr_ok: bool = False
     #: Этот файл уже распознавался локальным OCR (для отчёта).
     ocr_used: bool = False
+    #: ИИ реально вызывался для этого файла (см. PdfSetResult.llm_used).
+    llm_used: bool = False
     #: Способ ещё не выбирали вручную — он следует за страницами.
     auto_mode: bool = True
     #: Страницы, прочитанные из имени файла (None — в имени их нет).
@@ -233,6 +235,8 @@ class PdfSetResult:
     cached: bool = False
     #: Текст страниц получен локальным OCR (бесплатно), ИИ не вызывался.
     ocr: bool = False
+    #: ИИ реально вызывался для этого файла (в том числе ступенью 3 после OCR).
+    llm_used: bool = False
     issues: list[str] = field(default_factory=list)
     error: str = ""
 
@@ -446,6 +450,10 @@ def escalate_ocr(
             if has_legal_courses(tiled_text):
                 text, tiled = tiled_text, True
         quality = text_quality(text.strip())
+        if best is not None and quality <= best[0]:
+            # Смена dpi не улучшила текст: при том же результате следующий dpi даст то же самое.
+            tried.append(f"{dpi} dpi — без улучшения, дальше не ищем")
+            break
         tried.append(f"{dpi} dpi — сторон {quality[0]}" + ("" if quality[1] else ", без расстояния"))
         if best is None or quality > best[0]:
             best = (quality, text.strip(), dpi, tiled)

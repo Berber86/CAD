@@ -167,17 +167,57 @@ def test_escalation_keeps_best_pass_when_none_is_clean(fake_pdf, monkeypatch):
         " to the point or place of BEGINNING.",
     )
     texts = {400: NO_TIE, 600: three_sides_with_tie, 300: "COVER PAGE\nno courses here"}
+    calls: list[int] = []
 
     def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
                use_cache=True, tile=1, exact_dpi=False):
+        if tile == 1:
+            calls.append(dpi)
         return texts.get(dpi, "")
 
     monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
     result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    # 400 dpi даёт 4 стороны (без расстояния), 600 — 3 стороны с расстоянием: полнота важнее.
+    # 400 dpi даёт 4 стороны (без расстояния), 600 — 3 стороны: хуже, поэтому дальше не ищем.
     assert result.dpi == 400
     assert result.text == NO_TIE
-    assert len(result.tried) == 3
+    assert calls == [400, 600]
+    assert "без улучшения" in result.tried[-1]
+
+
+def test_escalation_stops_when_dpi_change_gives_the_same_parse(fake_pdf, monkeypatch):
+    """
+    Текст без расстояния (как LOT 72: «hundred feet» без цифр) не лечится dpi:
+    600 и 300 dpi дают тот же результат, поэтому проход останавливается на 600.
+    """
+    calls: list[int] = []
+
+    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+               use_cache=True, tile=1, exact_dpi=False):
+        if tile == 1:
+            calls.append(dpi)
+        return NO_TIE
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "2"})
+    assert calls == [400, 600]
+    assert result.dpi == 400
+    assert result.text == NO_TIE
+
+
+def test_escalation_keeps_trying_while_dpi_improves(fake_pdf, monkeypatch):
+    """Порядок 400 → 600 → 300 сохраняется: 600 улучшил результат, и это чистый разбор."""
+    calls: list[int] = []
+
+    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+               use_cache=True, tile=1, exact_dpi=False):
+        if tile == 1:
+            calls.append(dpi)
+        return {400: NO_TIE, 600: CLEAN, 300: NO_TIE}.get(dpi, "")
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
+    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    assert calls == [400, 600]
+    assert result.dpi == 600
 
 
 def test_escalation_reports_error_when_every_pass_fails(fake_pdf, monkeypatch):
@@ -220,6 +260,9 @@ def _worker_stub(gui_module, post, *, severe: bool, parse_job):
         _shape_rank=gui_module.SurveyApp._shape_rank,
         _analyse_pdf_set_conflicts=lambda *a, **k: None,
         _parse_pdf_set_job=parse_job,
+    )
+    stub._needs_local_recheck = lambda outcome, plan, issues: gui_module.SurveyApp._needs_local_recheck(
+        stub, outcome, plan, issues,
     )
     return stub
 
@@ -350,3 +393,59 @@ def test_text_quality_counts_courses_when_the_parser_cannot_read_the_text():
     assert sides == 4
     assert has_tie == 1
     assert pdf_set.text_quality("COVER PAGE\nno courses here") == (0, 0, 0)
+
+
+def test_cache_without_corner_distance_is_rechecked_locally_and_not_written(gui, tmp_path, monkeypatch):
+    """
+    Кеш Шага 0 без расстояния до угла («построен на удалении») не принимается как есть:
+    ступень 2 перераспознаёт страницы, а её текст в кеш не пишется.
+    """
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    cache = tmp_path / "LOT 68 NEW_text.txt"
+    cache.write_text(NO_TIE, encoding="utf-8")
+    progress: list[str] = []
+    done: dict = {}
+    ocr_calls: list[int] = []
+
+    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+               use_cache=True, tile=1, exact_dpi=False):
+        assert use_cache is False
+        if tile == 1:
+            ocr_calls.append(dpi)
+        return CLEAN if dpi == 400 else NO_TIE
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
+
+    def post(kind, payload):
+        if kind == "progress":
+            progress.append(payload)
+        elif kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
+    results, _ = done["payload"]
+    assert ocr_calls and ocr_calls[0] == 400, progress
+    assert results[0].error == ""
+    assert not any("расстояние от угла" in w for w in results[0].outcome.warnings)
+    assert results[0].llm_used is False
+    assert cache.read_text(encoding="utf-8") == NO_TIE
+
+
+def test_suspicious_shape_triggers_local_recheck_but_not_paid_ai(gui):
+    """Подозрительная форма (почти прямоугольник) — повод для бесплатного OCR, не для ИИ."""
+    suspicion = types.SimpleNamespace(is_suspicious=True)
+    plan = types.SimpleNamespace(suspicion=suspicion, warnings=[], closure=None, description=None)
+    outcome = types.SimpleNamespace(warnings=[])
+    stub = types.SimpleNamespace(_has_severe_shape_issues=gui.SurveyApp._has_severe_shape_issues)
+    assert gui.SurveyApp._needs_local_recheck(stub, outcome, plan, []) is True
+    assert gui.SurveyApp._has_severe_shape_issues(plan, []) is False
+    clean_plan = types.SimpleNamespace(suspicion=types.SimpleNamespace(is_suspicious=False), warnings=[],
+                                       closure=None, description=None)
+    assert gui.SurveyApp._needs_local_recheck(stub, outcome, clean_plan, []) is False

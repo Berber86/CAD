@@ -10984,7 +10984,7 @@ class PdfSetDialog:
 
     def _edit_lot_text(self, index: int) -> None:
         item = self.items[index]
-        cache_path = self.owner._find_step0_cache_path(item.path)
+        cache_path = self.app._find_step0_cache_path(item.path)
         target_path = cache_path or item.path.with_name(f"{item.path.stem}_text.txt")
         initial_text = ""
         if target_path.is_file():

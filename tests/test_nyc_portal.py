@@ -117,6 +117,9 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
         nyc_portal, "_type_into_address", lambda _handle, address, _rows: clicks.append((42, address)),
     )
     ocr_calls = iter([
+        # The first entry is consumed by the quick top-left-quarter portal check
+        # that now runs before any Select hover/click.
+        [nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
         [nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
         [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
                                (20, 160, 550, 180))],
@@ -161,7 +164,12 @@ def test_portal_driver_stops_on_challenge_without_keypress(tmp_path, monkeypatch
     monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
-    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _handle, path: Path(path))
+
+    def save_screen(_handle, path):
+        _write_portal_screen(Path(path))
+        return Path(path)
+
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", save_screen)
     monkeypatch.setattr(
         nyc_portal, "_screen_ocr",
         lambda _path: [nyc_portal.ScreenText("Verify you are human", (1, 1, 100, 20))],
@@ -274,6 +282,11 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
     monkeypatch.setattr(nyc_portal, "_key", lambda _handle, vk: keys.append(vk))
     monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_args: None)
     screens = iter([
+        # The first entry is consumed by the quick top-left-quarter portal check
+        # that now runs before any Select hover/click.
+        [nyc_portal.ScreenText("Select", (10, 10, 90, 30)),
+         nyc_portal.ScreenText("Borough/Block", (10, 40, 200, 60)),
+         nyc_portal.ScreenText("Address", (10, 70, 100, 90))],
         [nyc_portal.ScreenText("Select", (10, 10, 90, 30)),
          nyc_portal.ScreenText("Borough/Block", (10, 40, 200, 60)),
          nyc_portal.ScreenText("Address", (10, 70, 100, 90))],
@@ -324,3 +337,20 @@ def test_tax_map_crop_excludes_all_left_property_details_and_header(tmp_path):
     assert crop.size == (598, 448)
     assert crop.getpixel((0, 0)) == (0, 0, 255)
     assert crop.getpixel((crop.width - 1, crop.height - 1)) == (0, 0, 255)
+
+
+def test_initial_portal_check_ocr_uses_only_top_left_quarter(tmp_path, monkeypatch):
+    from PIL import Image
+
+    source = tmp_path / "browser.png"
+    Image.new("RGB", (1000, 800), "white").save(source)
+    seen = {}
+
+    def ocr(path):
+        seen["size"] = Image.open(path).size
+        return [nyc_portal.ScreenText("Select", (10, 10, 50, 30))]
+
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    rows = nyc_portal._screen_ocr_top_left_quarter(source)
+    assert seen["size"] == (500, 400)
+    assert nyc_portal._contains(rows, "Select")

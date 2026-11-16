@@ -260,3 +260,31 @@ def test_maximize_only_targets_a_verified_browser_window(monkeypatch):
     ])
     assert not browser_save.maximize_browser_window(10)
     assert shown == [(10, 3)]
+
+
+def test_partial_sendinput_never_falls_back_to_a_second_select_click(monkeypatch):
+    calls = []
+
+    class SendInput:
+        argtypes = None
+        restype = None
+
+        def __call__(self, count, _inputs, _size):
+            calls.append(("send-input", count))
+            return 1  # Windows inserted only half of the click pair.
+
+    class User32:
+        def SetCursorPos(self, x, y):
+            calls.append(("cursor", x, y))
+            return True
+
+        def mouse_event(self, *args):
+            calls.append(("fallback-mouse", *args))
+
+    User32.SendInput = SendInput()
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _handle: (0, 0, 800, 600))
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 10)
+    assert not browser_save.click_browser_window(10, 100, 200)
+    assert ("send-input", 2) in calls
+    assert not any(call[0] == "fallback-mouse" for call in calls)

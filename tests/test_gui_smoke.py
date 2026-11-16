@@ -245,6 +245,28 @@ class _Widget:
         self._clipboard = str(getattr(self, "_clipboard", "") or "") + str(text)
 
 
+class _FakeMenu:
+    """Заглушка tkinter.Menu для проверки контекстного меню Копировать/Вставить."""
+
+    instances: list["_FakeMenu"] = []
+
+    def __init__(self, master=None, tearoff=0, **kwargs):
+        self.master = master
+        self.items: list[dict] = []
+        self.popups: list[tuple[int, int]] = []
+        self.released = False
+        _FakeMenu.instances.append(self)
+
+    def add_command(self, label="", command=None, state="normal", **kwargs):
+        self.items.append({"label": label, "command": command, "state": state})
+
+    def tk_popup(self, x_root, y_root):
+        self.popups.append((x_root, y_root))
+
+    def grab_release(self):
+        self.released = True
+
+
 class _FakeCanvas(_Widget):
     """Заглушка tkinter.Canvas для тестирования живого CAD-предпросмотра."""
 
@@ -307,6 +329,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
     tkinter = types.ModuleType("tkinter")
     tkinter.Canvas = _FakeCanvas
+    tkinter.Menu = _FakeMenu
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
     filedialog.askopenfilenames = lambda **kwargs: ()
@@ -3813,6 +3836,95 @@ def test_clipboard_shortcuts_paste_into_inputs_and_copy_selected_output(gui):
     assert entry.value == "вставка на русской раскладке"
     assert ("Entry", "<Control-KeyPress>") in app._class_bindings
     assert ("Text", "<Control-c>") in app._class_bindings
+
+
+def test_right_click_shows_copy_cut_paste_menu_on_editable_entry(gui):
+    app = gui.SurveyApp()
+    gui.tk.Menu.instances.clear()
+
+    class EntryWidget:
+        value = "old"
+        clipboard = "clipboard text"
+        focused = False
+
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "normal"
+
+        def clipboard_get(self):
+            return self.clipboard
+
+        def selection_present(self):
+            return True
+
+        def selection_get(self):
+            return "selected text"
+
+        def delete(self, _first, _last):
+            self.value = ""
+
+        def insert(self, _where, text):
+            self.value += text
+
+        def clipboard_clear(self):
+            self.clipboard = ""
+
+        def clipboard_append(self, text):
+            self.clipboard += text
+
+        def focus_set(self):
+            self.focused = True
+
+    entry = EntryWidget()
+    event = type("Event", (), {"widget": entry, "x_root": 120, "y_root": 80})()
+    assert ("Entry", "<Button-3>") in app._class_bindings
+    handler = app._class_bindings[("Entry", "<Button-3>")]
+    assert handler(event) == "break"
+    assert entry.focused is True
+
+    created_menu = gui.tk.Menu.instances[-1]
+    assert created_menu.popups == [(120, 80)]
+    assert created_menu.released is True
+    labels = {item["label"]: item for item in created_menu.items}
+    assert labels["Копировать"]["state"] == "normal"
+    assert labels["Вырезать"]["state"] == "normal"
+    assert "Вставить" in labels
+
+    labels["Копировать"]["command"]()
+    assert entry.clipboard == "selected text"
+    entry.clipboard = "new clipboard text"
+    labels["Вставить"]["command"]()
+    assert entry.value == "new clipboard text"  # selection_present() replaces the selection
+
+
+def test_right_click_disables_paste_and_cut_on_readonly_entry_without_selection(gui):
+    app = gui.SurveyApp()
+    gui.tk.Menu.instances.clear()
+
+    class ReadonlyEntry:
+        def winfo_class(self):
+            return "Entry"
+
+        def cget(self, name):
+            return "readonly"
+
+        def selection_present(self):
+            return False
+
+        def focus_set(self):
+            return None
+
+    entry = ReadonlyEntry()
+    event = type("Event", (), {"widget": entry, "x_root": 10, "y_root": 20})()
+    handler = app._class_bindings[("Entry", "<Button-3>")]
+    assert handler(event) == "break"
+    created_menu = gui.tk.Menu.instances[-1]
+    labels = {item["label"]: item for item in created_menu.items}
+    assert labels["Копировать"]["state"] == "disabled"
+    assert "Вырезать" not in labels
+    assert "Вставить" not in labels
 
 
 def test_provider_and_model_preferences_autosave_and_survive_restart(gui, tmp_path, monkeypatch):

@@ -354,9 +354,13 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
     if user32 is None:
         return False
     try:
-        user32.SetCursorPos(int(x), int(y))
+        moved = user32.SetCursorPos(int(x), int(y))
+        if moved is False:
+            return False
         # SendInput is more reliable than the legacy mouse_event API for modern
-        # Chromium windows. Fall back only when SendInput is unavailable/rejected.
+        # Chromium windows. Do not fall back after a partial SendInput: that could
+        # turn one intended click into a down/up pair that toggles a Select twice.
+        sendinput_available = False
         try:
             import ctypes
             from ctypes import wintypes
@@ -375,20 +379,24 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
                 _anonymous_ = ("union",)
                 _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
 
-            user32.SendInput.argtypes = (
-                wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int,
-            )
-            user32.SendInput.restype = wintypes.UINT
+            send_input = user32.SendInput
+            send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+            send_input.restype = wintypes.UINT
             inputs = (INPUT * 2)(
                 INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTDOWN)),
                 INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTUP)),
             )
-            sent = int(user32.SendInput(2, inputs, ctypes.sizeof(INPUT)))
+            sendinput_available = True
+            sent = int(send_input(2, inputs, ctypes.sizeof(INPUT)))
         except Exception:  # noqa: BLE001 - legacy fallback below
+            sendinput_available = False
             sent = 0
-        if sent != 2:
-            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        if sent == 2:
+            return active_window_handle() == int(handle)
+        if sendinput_available and sent != 0:
+            return False  # partial click; never issue a second click as fallback
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         return active_window_handle() == int(handle)
     except Exception:  # noqa: BLE001
         return False

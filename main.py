@@ -630,6 +630,7 @@ class SurveyApp(ctk.CTk):
 
         self._build_ui()
         self._bind_text_clipboard_shortcuts()
+        self._bind_text_context_menu()
         self._bind_model_preference_autosave()
         self._bind_studio_shortcuts()
         self._refresh_height_label()
@@ -4848,6 +4849,39 @@ class SurveyApp(ctk.CTk):
             return "break"
 
     @staticmethod
+    def _cut_text_event(event: Any) -> str | None:
+        """Cut selected text (copy then delete) from editable Tk Entry/Text widgets."""
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return None
+        widget_class = str(widget.winfo_class())
+        try:
+            state = str(widget.cget("state"))
+            if state in {"disabled", "readonly"}:
+                return "break"
+        except Exception:  # noqa: BLE001 - widgets without a "state" option
+            pass
+        try:
+            if widget_class == "Entry":
+                if not widget.selection_present():
+                    return None
+                text = widget.selection_get()
+                widget.delete("sel.first", "sel.last")
+            elif widget_class == "Text":
+                selection = widget.tag_ranges("sel")
+                if not selection:
+                    return None
+                text = widget.get(selection[0], selection[1])
+                widget.delete(selection[0], selection[1])
+            else:
+                return None
+            widget.clipboard_clear()
+            widget.clipboard_append(str(text))
+            return "break"
+        except Exception:  # noqa: BLE001 - no selection or clipboard unavailable
+            return None
+
+    @staticmethod
     def _copy_text_event(event: Any) -> str | None:
         """Copy selected text from editable or read-only Tk Entry/Text widgets."""
         widget = getattr(event, "widget", None)
@@ -4885,6 +4919,67 @@ class SurveyApp(ctk.CTk):
             for sequence in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
                 bind_class(class_name, sequence, SurveyApp._copy_text_event)
             bind_class(class_name, "<Control-KeyPress>", SurveyApp._clipboard_control_event)
+
+    def _show_text_context_menu(self, event: Any) -> str | None:
+        """Right-click menu with Copy/Paste (and Cut where editable) for Entry/Text."""
+        widget = getattr(event, "widget", None)
+        if widget is None or tk is None:
+            return None
+        widget_class = str(widget.winfo_class())
+        if widget_class not in {"Entry", "Text"}:
+            return None
+        try:
+            state = str(widget.cget("state"))
+        except Exception:  # noqa: BLE001 - widgets without a "state" option
+            state = "normal"
+        editable = state not in {"disabled", "readonly"}
+        try:
+            if widget_class == "Entry":
+                has_selection = bool(widget.selection_present())
+            else:
+                has_selection = bool(widget.tag_ranges("sel"))
+        except Exception:  # noqa: BLE001
+            has_selection = False
+        try:
+            widget.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(
+            label="Копировать",
+            command=lambda: SurveyApp._copy_text_event(event),
+            state="normal" if has_selection else "disabled",
+        )
+        if editable:
+            menu.add_command(
+                label="Вырезать",
+                command=lambda: SurveyApp._cut_text_event(event),
+                state="normal" if has_selection else "disabled",
+            )
+            menu.add_command(
+                label="Вставить",
+                command=lambda: SurveyApp._paste_text_event(event),
+            )
+        try:
+            x_root = int(getattr(event, "x_root", 0) or 0)
+            y_root = int(getattr(event, "y_root", 0) or 0)
+            menu.tk_popup(x_root, y_root)
+        finally:
+            release = getattr(menu, "grab_release", None)
+            if callable(release):
+                release()
+        return "break"
+
+    def _bind_text_context_menu(self) -> None:
+        """Enable a right-click Copy/Paste context menu on all Entry and Text controls."""
+        if tk is None:
+            return
+        bind_class = getattr(self, "bind_class", None)
+        if not callable(bind_class):
+            return
+        for class_name in ("Entry", "Text"):
+            for sequence in ("<Button-3>", "<Control-Button-1>"):
+                bind_class(class_name, sequence, self._show_text_context_menu)
 
     def _bind_model_preference_autosave(self) -> None:
         """Persist editable model names when a combobox loses focus or Enter is pressed."""

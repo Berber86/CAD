@@ -102,6 +102,28 @@ def _screen_ocr(image_path: str | Path) -> list[ScreenText]:
     return rows
 
 
+def _screen_ocr_top_left_quarter(image_path: str | Path) -> list[ScreenText]:
+    """OCR only the upper-left screen quadrant for the initial portal/page check."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        width, height = image.size
+        if width < 2 or height < 2:
+            raise PortalLookupError("Снимок браузера слишком мал для проверки страницы.")
+        crop = image.crop((0, 0, width // 2, height // 2))
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_quadrant_") as directory:
+            crop_path = Path(directory) / "top_left_quarter.png"
+            crop.save(crop_path, format="PNG")
+            # The crop starts at (0, 0), so OCR boxes remain window-relative.
+            return _screen_ocr(crop_path)
+    except PortalLookupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - screenshot/crop/OCR preparation
+        raise PortalLookupError(f"Не удалось проверить верхнюю левую часть браузера: {exc}") from exc
+
+
 def _portal_window() -> browser_save.BrowserWindow:
     windows = [
         window for window in browser_save.list_windows()
@@ -356,11 +378,27 @@ def _drive_portal(
         with tempfile.TemporaryDirectory(prefix="tsai_pip_start_") as directory:
             path = Path(directory) / "screen.png"
             _save_window_capture(window.handle, path)
+            # Before hovering/clicking the Select control, cheaply confirm we are
+            # already on the portal (and not a CAPTCHA) by OCR-ing only the upper
+            # left quarter of the screen; this avoids the cost of a full-page OCR
+            # for the common failure cases (challenge page, wrong tab/page).
+            quick_rows = _screen_ocr_top_left_quarter(path)
+            if _challenge_visible(quick_rows) or browser_save.looks_like_cloudflare_page(window.title):
+                raise PortalLookupError(
+                    "На портале отображается проверка человека/CAPTCHA. "
+                    "Остановился, не нажимал и не отправлял снимок в ИИ."
+                )
+            if not any(
+                _contains(quick_rows, marker)
+                for marker in ("Select", "Find Another Property", "Enter an Address")
+            ):
+                raise PortalLookupError(
+                    "По верхней левой четверти экрана не удалось подтвердить страницу NYC Portal; "
+                    "ничего не нажимал. Разверните страницу портала и повторите."
+                )
+            # Confirmed we are on the portal: OCR the full page to get accurate
+            # coordinates for the Select control and any other on-screen text.
             rows = _screen_ocr(path)
-        if _challenge_visible(rows):
-            raise PortalLookupError(
-                "На портале отображается проверка человека/CAPTCHA. Остановился и не отправлял снимок в ИИ."
-            )
 
     if _contains(rows, "Find Another Property"):
         _click_text(window.handle, rows, "Find Another Property")

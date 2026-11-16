@@ -4802,6 +4802,25 @@ class SurveyApp(ctk.CTk):
         return txt
 
     @staticmethod
+    def _clipboard_control_event(event: Any) -> str | None:
+        """Recognize physical Ctrl+C/Ctrl+V keys regardless of keyboard layout."""
+        state = int(getattr(event, "state", 0) or 0)
+        if not state & 0x4:  # Tk ControlMask
+            return None
+        keysym = str(getattr(event, "keysym", "") or "").casefold()
+        keycode = int(getattr(event, "keycode", 0) or 0)
+        char = str(getattr(event, "char", "") or "")
+        # On Windows keycodes are virtual-key codes, independent of the active layout.
+        # Tk may also report Ctrl+C/V as control characters or Cyrillic keysyms.
+        physical_copy = sys.platform == "win32" and keycode == 67
+        physical_paste = sys.platform == "win32" and keycode == 86
+        if physical_copy or char == "\x03" or keysym in {"c", "cyrillic_es", "с"}:
+            return SurveyApp._copy_text_event(event)
+        if physical_paste or char == "\x16" or keysym in {"v", "cyrillic_em", "м"}:
+            return SurveyApp._paste_text_event(event)
+        return None
+
+    @staticmethod
     def _paste_text_event(event: Any) -> str | None:
         """Paste clipboard text into focused Tk Entry/Text widgets, replacing selection."""
         widget = getattr(event, "widget", None)
@@ -4859,10 +4878,13 @@ class SurveyApp(ctk.CTk):
         if not callable(bind_class):
             return
         for class_name in ("Entry", "Text"):
+            # Exact Latin-key bindings cover the usual layout; the generic physical
+            # Ctrl+KeyPress handler below also recognizes Cyrillic layout keysyms.
             for sequence in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
                 bind_class(class_name, sequence, SurveyApp._paste_text_event)
-            for sequence in ("<Control-c>", "<Control-C>"):
+            for sequence in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
                 bind_class(class_name, sequence, SurveyApp._copy_text_event)
+            bind_class(class_name, "<Control-KeyPress>", SurveyApp._clipboard_control_event)
 
     def _bind_model_preference_autosave(self) -> None:
         """Persist editable model names when a combobox loses focus or Enter is pressed."""

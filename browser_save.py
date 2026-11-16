@@ -229,6 +229,13 @@ def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     user32 = _user32()
     if user32 is None:
         return False
+    # If this browser is already foreground, preserve focus inside its web page.
+    # Reapplying SetFocus to the top-level Chrome HWND steals focus from HTML controls.
+    try:
+        if int(user32.GetForegroundWindow() or 0) == int(handle):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     attached_threads: list[int] = []
     try:
         import ctypes
@@ -272,8 +279,6 @@ def foreground(handle: int, *, timeout: float = 1.5) -> bool:
         while True:
             user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
-            user32.SetActiveWindow(handle)
-            user32.SetFocus(handle)
             if int(user32.GetForegroundWindow() or 0) == int(handle):
                 return True
             if time.monotonic() >= deadline:

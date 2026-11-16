@@ -3796,7 +3796,22 @@ def test_clipboard_shortcuts_paste_into_inputs_and_copy_selected_output(gui):
     assert entry.value == "new address"
     assert gui.SurveyApp._copy_text_event(event) == "break"
     assert entry.clipboard == "selected address"
-    assert ("Entry", "<Control-v>") in app._class_bindings
+
+    # Russian layout maps the physical C/V positions to Cyrillic keysyms; Ctrl
+    # shortcuts must still copy/paste from the same controls.
+    russian_copy = type("Event", (), {
+        "widget": entry, "state": 0x4, "keycode": 67,
+        "keysym": "Cyrillic_es", "char": "\x03",
+    })()
+    assert gui.SurveyApp._clipboard_control_event(russian_copy) == "break"
+    entry.clipboard = "вставка на русской раскладке"
+    russian_paste = type("Event", (), {
+        "widget": entry, "state": 0x4, "keycode": 86,
+        "keysym": "Cyrillic_em", "char": "\x16",
+    })()
+    assert gui.SurveyApp._clipboard_control_event(russian_paste) == "break"
+    assert entry.value == "вставка на русской раскладке"
+    assert ("Entry", "<Control-KeyPress>") in app._class_bindings
     assert ("Text", "<Control-c>") in app._class_bindings
 
 

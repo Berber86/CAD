@@ -218,6 +218,23 @@ def test_foreground_retries_with_attached_input_queues_for_verified_browser(monk
     assert ("attach", 5, 40, True) in calls
     assert ("attach", 5, 40, False) in calls
     assert ("attach", 5, 30, False) in calls
+    assert not any(item[0] in {"active", "focus"} for item in calls)
+
+
+def test_foreground_keeps_existing_focus_inside_the_browser_page(monkeypatch):
+    import browser_save
+
+    calls = []
+
+    class User32:
+        def GetForegroundWindow(self):
+            calls.append("query")
+            return 10
+
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [_yandex()])
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    assert browser_save.foreground(10)
+    assert calls == ["query"]  # no SetFocus on the top-level HWND; keep the page control focused
 
 
 def test_maximize_only_targets_a_verified_browser_window(monkeypatch):

@@ -4756,7 +4756,7 @@ def _check_street_reference_and_frontage(
     cs_n = _normalize_street_key(dn.cross_street)
 
     if ms_m and ms_n and ms_m == ms_n:
-        if cs_m and cs_n and cs_m != cs_n:
+        if cs_m and cs_n and cs_m != cs_n and not (cs_m.endswith(f" {cs_n}") or cs_n.endswith(f" {cs_m}")):
             warn = (
                 f"Оба участка выходят на «{dm.main_street}», но отсчитываются от РАЗНЫХ "
                 f"пересекаемых улиц («{dm.cross_street}» против «{dn.cross_street}») — "

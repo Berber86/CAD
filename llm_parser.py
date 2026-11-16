@@ -2943,7 +2943,7 @@ _DMS_BEARING_RE = re.compile(
     r"(?P<deg>\d{1,3})\s*(?:°|º|deg(?:rees?)?\.?)\s*"
     r"(?P<min>\d{1,2})\s*(?:'|′|’|min(?:utes?)?\.?)\s*"
     r"(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|″|”|''|sec(?:onds?)?\.?)\s*"
-    rf"(?P<ew>(?:{_EW})|(?:W(?:est)?\.?))(?![A-Za-z])",
+    rf"(?P<ew>East\.?|West\.?|(?:E|W)\.?(?![A-Za-z]))",
     re.IGNORECASE,
 )
 

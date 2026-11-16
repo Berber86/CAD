@@ -63,6 +63,7 @@ try:
 except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
+import app_updater
 from acad_builder import (
     AcadBuilder,
     AcadBuilderError,
@@ -492,6 +493,11 @@ class SurveyApp(ctk.CTk):
             )
         )
         self.feature_label_result: FeatureLabelResult | None = None
+
+        self.update_source_var = ctk.StringVar(
+            value=str((self.config_data.get("update") or {}).get("source_url") or "")
+        )
+        self._update_running = False
         self._step2_report_text = ""
         self._events: queue.Queue[tuple[int, str, Any]] = queue.Queue()
 
@@ -632,6 +638,7 @@ class SurveyApp(ctk.CTk):
         self._bind_text_clipboard_shortcuts()
         self._bind_text_context_menu()
         self._bind_model_preference_autosave()
+        self._bind_update_source_autosave()
         self._bind_studio_shortcuts()
         self._refresh_height_label()
         self._refresh_provider_highlights()
@@ -1073,6 +1080,70 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        update_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
+        update_row.grid(row=4, column=0, sticky="ew", pady=(10, 4))
+        update_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            update_row,
+            text="ОБНОВЛЕНИЕ ПРОГРАММЫ",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        ctk.CTkLabel(
+            update_row,
+            text="Ссылка GitHub (репозиторий, ветка или .zip), куда падают актуальные пуши",
+            anchor="w",
+            justify="left",
+            wraplength=410,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.update_source_entry = ctk.CTkEntry(
+            update_row,
+            textvariable=self.update_source_var,
+            height=30,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            placeholder_text="https://github.com/owner/repo/tree/main",
+        )
+        self.update_source_entry.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self.update_version_button = ctk.CTkButton(
+            update_row,
+            text="🔄 Обновить версию",
+            width=150,
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12),
+            command=self._start_update_version,
+        )
+        self.update_version_button.grid(row=2, column=1, padx=(6, 0), pady=(0, 6), sticky="e")
+        self.update_status_label = ctk.CTkLabel(
+            update_row,
+            text=f"Текущая версия: {APP_VERSION} ({APP_DATE})",
+            anchor="w",
+            justify="left",
+            wraplength=410,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        )
+        self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ctk.CTkLabel(
+            update_row,
+            text=(
+                "Архив скачивается и принудительно разворачивается в папку программы "
+                "(совпадающие файлы заменяются); config.local.json и .env не трогаются, "
+                "если их нет в архиве. После обновления перезапустите программу."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=410,
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         drawer_foot = ctk.CTkFrame(self.keys_drawer, fg_color=THEME["bg_header"])
         drawer_foot.grid(row=2, column=0, sticky="ew")
@@ -5065,6 +5136,96 @@ class SurveyApp(ctk.CTk):
             (self.pass2_model_var if slot == 2 else self.pass3_model_var).set(value)
             self._persist_ai_preferences()
 
+    def _bind_update_source_autosave(self) -> None:
+        """Persist the GitHub update source as soon as the field loses focus or Enter is hit."""
+        entry = getattr(self, "update_source_entry", None)
+        binder = getattr(entry, "bind", None)
+        if not callable(binder):
+            return
+        binder("<FocusOut>", self._persist_update_source, add="+")
+        binder("<Return>", self._persist_update_source, add="+")
+
+    def _persist_update_source(self, event: Any = None) -> None:
+        try:
+            cfg = copy.deepcopy(self.config_data)
+            cfg.setdefault("update", {})["source_url"] = str(self.update_source_var.get() or "").strip()
+            save_config(cfg)
+            self.config_data = cfg
+        except Exception as exc:  # noqa: BLE001 - retain UI operation if disk is read-only
+            self._set_status(f"Не удалось сохранить ссылку обновления: {exc}", warn=True)
+
+    def _start_update_version(self) -> None:
+        """Download the configured GitHub archive and forcibly unpack it over this install."""
+        if self._update_running:
+            self._set_status("Обновление уже выполняется, дождитесь завершения.", warn=True)
+            return
+        source = str(self.update_source_var.get() or "").strip()
+        if not source:
+            self._set_status(
+                "Укажите ссылку на GitHub (репозиторий, ветку или .zip) в настройках перед обновлением.",
+                error=True,
+            )
+            return
+        self._persist_update_source()
+        confirm = getattr(self, "_confirm_update_version", None)
+        if callable(confirm) and not confirm(source):
+            return
+        app_dir = Path(__file__).resolve().parent
+        self._update_running = True
+        self.update_version_button.configure(state="disabled", text="⏳ Обновляю…")
+        self.update_status_label.configure(
+            text=f"Скачиваю обновление из {source}…", text_color=THEME["text_dim"],
+        )
+        self._set_status(f"Обновление: скачиваю архив из {source}…")
+
+        def progress(message: str) -> None:
+            self._post("update_progress", str(message))
+
+        def worker() -> None:
+            try:
+                result = app_updater.apply_update(source, app_dir, progress=progress)
+            except Exception as exc:  # noqa: BLE001 - network/zip/filesystem failures
+                self._post("update_done", ("error", f"{type(exc).__name__}: {exc}"))
+                return
+            self._post("update_done", ("ok", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _confirm_update_version(self, source: str) -> bool:
+        """Ask for confirmation before overwriting the running installation."""
+        from tkinter import messagebox
+
+        return bool(
+            messagebox.askyesno(
+                "Обновить версию",
+                "Программа скачает архив по указанной ссылке GitHub и принудительно "
+                f"заменит файлы в текущей папке программы:\n{source}\n\n"
+                "Продолжить?",
+            )
+        )
+
+    def _finish_update_version(self, status: str, payload: Any) -> None:
+        self._update_running = False
+        self.update_version_button.configure(state="normal", text="🔄 Обновить версию")
+        if status == "ok":
+            result: app_updater.UpdateResult = payload
+            self.update_status_label.configure(
+                text=(
+                    f"Обновлено файлов: {result.files_written}. "
+                    "Перезапустите программу, чтобы применить изменения."
+                ),
+                text_color=THEME["ok"],
+            )
+            self._set_status(
+                f"Обновление завершено: заменено файлов — {result.files_written}. "
+                "Перезапустите программу.",
+            )
+        else:
+            self.update_status_label.configure(
+                text=f"Обновление не удалось: {payload}", text_color=THEME["err"],
+            )
+            self._set_status(f"Обновление не удалось: {payload}", error=True)
+
     def _bind_studio_shortcuts(self) -> None:
         """Привязывает студийные горячие клавиши для быстрой повседневной работы."""
         bind_fn = getattr(self, "bind_all", None) or getattr(self, "bind", None)
@@ -8356,6 +8517,13 @@ class SurveyApp(ctk.CTk):
             elif kind == "step0_portal_done":
                 status, portal_result = payload
                 self._finish_step0_portal_lookup(status, portal_result)
+            elif kind == "update_progress":
+                text = str(payload)
+                self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
+                self._set_status(f"Обновление: {text}")
+            elif kind == "update_done":
+                status, update_payload = payload
+                self._finish_update_version(status, update_payload)
             elif kind == "step0_done":
                 status, payload_done = payload
                 self._finish_step0(status, payload_done)

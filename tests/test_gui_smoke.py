@@ -3945,3 +3945,97 @@ def test_provider_and_model_preferences_autosave_and_survive_restart(gui, tmp_pa
     assert second.current_provider_id() == "openrouter"
     assert second.current_model() == "stepfun/step-3.5-flash:free"
     second._on_close()
+
+
+def test_update_version_requires_a_source_url_before_running(gui):
+    app = gui.SurveyApp()
+    app.update_source_var.set("")
+    app._start_update_version()
+    assert not app._update_running
+    assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
+
+
+def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+        assert source == "https://github.com/Berber86/CAD/tree/main"
+        if progress:
+            progress("скачиваю архив обновления: https://codeload.github.com/...")
+            progress("обновление завершено: заменено файлов — 7")
+        return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=7, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    assert "7" in app.update_status_label.cget("text")
+    assert "перезапустите" in app.update_status_label.cget("text").lower()
+
+
+def test_update_version_declined_confirmation_does_not_run(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: False)
+    calls = []
+    monkeypatch.setattr(gui.app_updater, "apply_update", lambda *a, **kw: calls.append(True))
+    app._start_update_version()
+    assert not calls
+    assert not app._update_running
+
+
+def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def boom(source, app_dir, *, progress=None, timeout=60.0):
+        raise gui.app_updater.UpdateError("сеть недоступна")
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", boom)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    assert "не удалось" in app.update_status_label.cget("text").lower()
+    assert "сеть недоступна" in app.update_status_label.cget("text")
+
+
+def test_update_source_url_autosaves_and_survives_restart(gui, tmp_path, monkeypatch):
+    import llm_parser
+
+    config_path = tmp_path / "config.json"
+    local_path = tmp_path / "config.local.json"
+    monkeypatch.setattr(llm_parser, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(llm_parser, "LOCAL_CONFIG_PATH", local_path)
+
+    first = gui.SurveyApp()
+    first.update_source_var.set("https://github.com/Berber86/CAD/tree/arena/53e1068f-cad")
+    first._persist_update_source()
+    first._on_close()
+
+    assert config_path.is_file()
+    second = gui.SurveyApp()
+    assert second.update_source_var.get() == "https://github.com/Berber86/CAD/tree/arena/53e1068f-cad"
+    second._on_close()

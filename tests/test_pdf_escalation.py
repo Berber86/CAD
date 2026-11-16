@@ -395,10 +395,10 @@ def test_text_quality_counts_courses_when_the_parser_cannot_read_the_text():
     assert pdf_set.text_quality("COVER PAGE\nno courses here") == (0, 0, 0)
 
 
-def test_cache_without_corner_distance_is_rechecked_locally_and_not_written(gui, tmp_path, monkeypatch):
+def test_cache_without_corner_distance_is_rechecked_locally_and_updated_when_better(gui, tmp_path, monkeypatch):
     """
     Кеш Шага 0 без расстояния до угла («построен на удалении») не принимается как есть:
-    ступень 2 перераспознаёт страницы, а её текст в кеш не пишется.
+    ступень 2 перераспознаёт страницы, и если результат лучше — кеш обновляется на него.
     """
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
@@ -435,6 +435,29 @@ def test_cache_without_corner_distance_is_rechecked_locally_and_not_written(gui,
     assert results[0].error == ""
     assert not any("расстояние от угла" in w for w in results[0].outcome.warnings)
     assert results[0].llm_used is False
+    assert cache.read_text(encoding="utf-8") == CLEAN
+
+
+def test_cache_is_kept_when_local_ocr_is_not_better(gui, tmp_path, monkeypatch):
+    """OCR дал тот же текст без расстояния → лучше не стало, кеш не трогаем."""
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    cache = tmp_path / "LOT 68 NEW_text.txt"
+    cache.write_text(NO_TIE, encoding="utf-8")
+    done: dict = {}
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
     assert cache.read_text(encoding="utf-8") == NO_TIE
 
 

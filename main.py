@@ -7616,6 +7616,12 @@ class SurveyApp(ctk.CTk):
                                     r2 = self._shape_rank(p2, iss2, o2.warnings)
                                     if r2 > best_rank:
                                         best_outcome, best_plan, best_issues, best_text, best_rank = o2, p2, list(iss2), text_400, r2
+                                        # Лучше предыдущего уровня (кеша или прошлого dpi) — кеш обновляем на него.
+                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                        try:
+                                            target_cache.write_text(text_400, encoding="utf-8")
+                                        except OSError:
+                                            pass
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
 

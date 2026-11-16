@@ -3626,9 +3626,10 @@ def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(g
     _fill_step0(app, folder=folder, neighbours="30")
     app._step0_to_step1()
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
-    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf", "OUR 32 OLD.pdf"]
+    # Старый документ нашего участка хранится в папке, но в набор Шага 1 не передаётся (решение пользователя).
+    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
     assert any("В manifest не было LOT 30 NEW.pdf" in line for line in app._step0_lines)
-    assert any("Отправляю в Шаг 1 (3 PDF)" in line for line in app._step0_lines)
+    assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in app._step0_lines)
 
 
 def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gui, tmp_path):

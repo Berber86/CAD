@@ -149,8 +149,9 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert clicks == [(42, "Select"), (42, "87 Stafford Ave")]
-    assert waits == [0.2, 0.2, 3.0, 0.2]
+    assert waits == [0.2, 0.2, 0.2, 3.0, 0.2]
     assert keys == [
+        nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_RETURN,
@@ -236,7 +237,7 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert typed == [nyc_portal.PORTAL_URL]
-    assert waits == [0.2, 0.2, 3.0, 0.2]
+    assert waits == [0.2, 0.2, 0.2, 3.0, 0.2]
     assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
     assert key_events[-2:] == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
 
@@ -317,8 +318,9 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
     assert result.block == "5712" and result.lot == "70"
     assert result.map_image.is_file()
     assert clicks == []
-    assert waits == [0.2, 0.2, 3.0, 0.2]
-    assert keys[:3] == [
+    assert waits == [0.2, 0.2, 0.2, 3.0, 0.2]
+    assert keys[:4] == [
+        nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_RETURN,

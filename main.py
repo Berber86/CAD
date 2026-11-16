@@ -1075,7 +1075,7 @@ class SurveyApp(ctk.CTk):
         self.rollback_status_label.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 4))
         self.rollback_button = ctk.CTkButton(
             update_row,
-            text="↩ Откатиться на предыдущую версию",
+            text="↩ Откатиться на старую версию",
             width=230,
             height=30,
             fg_color=THEME["btn_secondary"],

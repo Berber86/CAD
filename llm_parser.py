@@ -2967,6 +2967,77 @@ _DISTANCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Числа прописью перед «feet»/«foot» («one hundred forty-one feet», «hundred feet»).
+# Сами по себе не разбираются _DISTANCE_RE, поэтому переводятся в цифры до разбора.
+_WORD_UNITS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+               "eight": 8, "nine": 9}
+_WORD_TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+               "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_WORD_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+              "seventy": 70, "eighty": 80, "ninety": 90}
+_WORD_TWO_DIGIT = (
+    r"(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-]+(?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen"
+    r"|one|two|three|four|five|six|seven|eight|nine)"
+)
+_WORD_NUMBER_FEET_RE = re.compile(
+    r"\b(?P<number>(?:(?:(?:one|two|three|four|five|six|seven|eight|nine|on)\s+)?hundred"
+    r"(?:\s+(?:and\s+)?" + _WORD_TWO_DIGIT + r")?)|" + _WORD_TWO_DIGIT + r")"
+    r"\s+(?P<unit>feet|foot)\b",
+    re.IGNORECASE,
+)
+
+
+def _spelled_number_value(phrase: str) -> int | None:
+    """«one hundred forty-one» → 141; «hundred» → 100 (OCR часто теряет «one»)."""
+    tokens = [t for t in re.split(r"[\s-]+", phrase.lower()) if t and t != "and"]
+    if not tokens:
+        return None
+
+    def tail_value(words: list[str]) -> int | None:
+        total = 0
+        for word in words:
+            if word in _WORD_UNITS:
+                total += _WORD_UNITS[word]
+            elif word in _WORD_TEENS:
+                total += _WORD_TEENS[word]
+            elif word in _WORD_TENS:
+                total += _WORD_TENS[word]
+            else:
+                return None
+        return total
+
+    if "hundred" in tokens:
+        idx = tokens.index("hundred")
+        head = tokens[:idx]
+        if head and head[0] not in _WORD_UNITS and head[0] != "on":
+            return None
+        multiplier = _WORD_UNITS.get(head[0], 1) if head else 1
+        rest = tail_value(tokens[idx + 1:]) if tokens[idx + 1:] else 0
+        if rest is None:
+            return None
+        return multiplier * 100 + rest
+    return tail_value(tokens)
+
+
+def _spell_numbers_before_feet(text: str) -> tuple[str, list[str]]:
+    """Переводит числа прописью перед «feet» в цифры; каждая замена — замечание для проверки."""
+    notes: list[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        phrase = match.group("number")
+        value = _spelled_number_value(phrase)
+        if value is None:
+            return match.group(0)
+        notes.append(
+            f"число прописью «{' '.join(phrase.split())} {match.group('unit')}» прочитано как "
+            f"{value} ft — сверьте с документом"
+        )
+        return f"{value} {match.group('unit')}"
+
+    return _WORD_NUMBER_FEET_RE.sub(repl, text), notes
+
+
 _STREET_SUFFIX = (
     r"(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Boulevard|Blvd|Lane|Ln|Way|Court|Ct|"
     r"Place|Pl|Parkway|Pkwy|Highway|Hwy|Circle|Cir|Trail|Trl|Terrace|Ter|Loop|Pike|"
@@ -3856,8 +3927,12 @@ def parse_with_regex(
         «interior angle of 93°33'29.5"») без компасных румбов.
     """
     normalized = _normalize_legal_text(text)
+    normalized, spelled_notes = _spell_numbers_before_feet(normalized)
+    # OCR пишет составные румбы через пробел («north westerly»): иначе не находится угол улицы.
+    normalized = re.sub(r"\b(north|south)\s+(east|west)erly\b", r"\1\2erly", normalized, flags=re.IGNORECASE)
     preamble, lot_body = _split_preamble_and_body(normalized)
     raw_segments, warnings = _segments_from_regex(lot_body)
+    warnings.extend(spelled_notes)
     if not raw_segments:
         raise LegalDescriptionError(
             "локальный парсер не нашёл сторон участка: "

@@ -47,13 +47,13 @@ echo Перед отправкой отчёта удалите из него API
 if not exist "backups\*" goto :launch_pause
 echo.
 echo Есть резервная копия прежней версии (сохранена перед последним обновлением).
-choice /c YN /n /m "Откатиться на неё и запустить снова? [Y/N] "
+choice /c YN /n /m "Откатиться на неё? [Y/N] "
 if errorlevel 2 goto :launch_pause
 ".venv\Scripts\python.exe" rollback_update.py
 if errorlevel 1 goto :launch_pause
-echo Запускаю прежнюю версию ...
-call "%~f0"
-exit /b
+echo Откат выполнен. Закройте это окно и запустите run.bat снова.
+pause
+exit /b 0
 
 :launch_pause
 pause

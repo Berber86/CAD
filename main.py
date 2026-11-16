@@ -134,9 +134,12 @@ import ocr_pages
 import rcclerk
 from pdf_set import (
     CLOSURE_LIMIT_FT,
+    ESCALATION_DPI,
     PdfSetItem,
     PdfSetJob,
     PdfSetResult,
+    describe_exc,
+    escalate_ocr,
     format_pages,
     make_item,
     make_job,
@@ -7407,19 +7410,18 @@ class SurveyApp(ctk.CTk):
                                 last_exc = exc
 
                         if self._has_severe_shape_issues(best_plan, best_issues):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально на 400 dpi…")
-                            pages = job.source.get("pdf_pages") or (1, 1)
-                            first_p, last_p = int(pages[0]), int(pages[1])
-                            try:
-                                total_p = int(inspect_pdf(job.path).get("pages") or 0)
-                                if 1 <= total_p <= 2:
-                                    first_p, last_p = 1, total_p
-                            except Exception:  # noqa: BLE001
-                                pass
-                            try:
-                                text_400 = ocr_pages.ocr_pdf_pages(job.path, first_p, last_p, dpi=400).strip()
-                            except Exception:  # noqa: BLE001
-                                text_400 = ""
+                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально на {ESCALATION_DPI} dpi…")
+                            # Реальная ступень 2: выбранные страницы, OCR, при пустом обходе — кусками 2×2.
+                            # Ошибка не глотается: она попадает в отчёт и в причину отказа.
+                            esc = escalate_ocr(
+                                job.path, job.source, dpi=ESCALATION_DPI,
+                                progress=lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"),
+                            )
+                            post("progress", f"[{idx}/{total}] {job.path.name}: OCR {ESCALATION_DPI} dpi — {esc.summary()}")
+                            if esc.error:
+                                last_exc = PDFError(f"ступень 2 (локальный OCR {ESCALATION_DPI} dpi): {esc.error}")
+                                best_issues.append(f"Локальный OCR {ESCALATION_DPI} dpi не выполнен: {esc.error}")
+                            text_400 = esc.text
                             if text_400 and text_400 != cached_text:
                                 try:
                                     j400 = dataclasses.replace(job, source={"text": text_400}, use_llm=False)
@@ -7475,6 +7477,8 @@ class SurveyApp(ctk.CTk):
                                 last_exc = exc
 
                         if best_outcome is None:
+                            if last_exc is not None and not isinstance(last_exc, PDFError):
+                                raise PDFError(f"разбор скана не удался: {describe_exc(last_exc)}") from last_exc
                             raise last_exc or PDFError("не удалось распознать участок; введите текст вручную")
                         if self._has_severe_shape_issues(best_plan, best_issues):
                             best_issues.append("Требуется ручная проверка/ввод текста для этого лота")

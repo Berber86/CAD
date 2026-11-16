@@ -129,6 +129,12 @@ def _read_cache(key: str) -> str | None:
         return None
 
 
+def is_cached(path: str | Path, first: int, last: int, *, dpi: int = DEFAULT_DPI, tile: int = 1) -> bool:
+    """Есть ли уже распознанный текст для этих страниц и разрешения (для честного отчёта)."""
+    pdf = Path(path)
+    return _read_cache(_cache_key(pdf, int(first), int(last), int(dpi), int(tile))) is not None
+
+
 def _write_cache(key: str, text: str) -> None:
     try:
         folder = cache_dir()

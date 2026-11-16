@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -321,6 +323,89 @@ def resolve_ocr_source(
             "Переключите файл на ИИ или укажите другие страницы."
         )
     return {"text": text, "ocr": True}
+
+
+#: Ступень 2 фонового разбора скана: локальный OCR на повышенном разрешении.
+ESCALATION_DPI = int(ocr_pages.DEFAULT_DPI)
+
+
+def describe_exc(exc: BaseException) -> str:
+    """«IndexError: string index out of range (llm_parser.py:123)» — тип, текст и место."""
+    text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ is not None else []
+    if frames:
+        last = frames[-1]
+        text += f" ({Path(last.filename).name}:{last.lineno})"
+    return text
+
+
+@dataclass(frozen=True)
+class OcrEscalation:
+    """Итог ступени 2: текст (если получен), ошибка (если нет) и что реально выполнено."""
+
+    text: str = ""
+    error: str = ""
+    seconds: float = 0.0
+    cached: bool = False
+    tiled: bool = False
+    pages: tuple[int, int] = (1, 1)
+    dpi: int = ESCALATION_DPI
+
+    def summary(self) -> str:
+        if self.error:
+            return f"ошибка за {self.seconds:.1f} с: {self.error}"
+        how = "из кеша OCR" if self.cached else "распознано заново"
+        if self.tiled:
+            how += ", кусками 2×2"
+        return f"{self.seconds:.1f} с, {how}, {format_pages(*self.pages)}, {self.dpi} dpi"
+
+
+def escalate_ocr(
+    path: str | Path, source: dict[str, Any] | None, *,
+    dpi: int = ESCALATION_DPI, progress: Callable[[str], None] | None = None,
+) -> OcrEscalation:
+    """
+    Ступень 2 для скана в фоновом разборе: реальное локальное распознавание.
+
+    * страницы — выбранные пользователем (``ocr_pages`` из источника, а не «1–2»);
+    * сначала страница целиком на ``dpi``; если обхода нет — тот же диапазон кусками 2×2
+      (это и есть «мельче» при плотном шрифте, см. ``resolve_ocr_source``);
+    * ошибки не глотаются: они возвращаются в ``error`` и попадают в отчёт;
+    * готовый текст из кеша OCR отдаётся сразу, но помечается как «из кеша».
+    """
+    src = dict(source or {})
+    pdf = Path(path)
+    started = time.monotonic()
+    try:
+        first, last = pages_from_spec(src.get("ocr_pages") or src.get("pdf_pages") or "1")
+    except PDFError as exc:
+        return OcrEscalation(error=str(exc), seconds=0.0, dpi=dpi)
+    pages = (first, last)
+    cached = ocr_pages.is_cached(pdf, first, last, dpi=dpi)
+    try:
+        text = ocr_pages.ocr_pdf_pages(pdf, first, last, dpi=dpi, progress=progress)
+    except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
+        return OcrEscalation(
+            error=describe_exc(exc), seconds=time.monotonic() - started,
+            cached=cached, pages=pages, dpi=dpi,
+        )
+    tiled = False
+    if not has_legal_courses(text):
+        if progress:
+            progress("целиком обход не прочитан — пробую по кускам 2×2 (OCR, локально)…")
+        tiled_cached = ocr_pages.is_cached(pdf, first, last, dpi=dpi, tile=2)
+        try:
+            tiled_text = ocr_pages.ocr_pdf_pages(
+                pdf, first, last, dpi=dpi, progress=progress, tile=2,
+            )
+        except Exception:  # noqa: BLE001 - целиком текст уже есть, его и оставляем
+            tiled_text = ""
+        if has_legal_courses(tiled_text):
+            text, tiled, cached = tiled_text, True, tiled_cached
+    return OcrEscalation(
+        text=text.strip(), seconds=time.monotonic() - started,
+        cached=cached, tiled=tiled, pages=pages, dpi=dpi,
+    )
 
 
 def make_item(

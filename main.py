@@ -25,6 +25,7 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 import json
 import math
 import os
@@ -2857,6 +2858,15 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _step0_timestamp(message: str) -> str:
+        """Метка местного времени для каждого события в журнале Шага 0."""
+        return f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+
+    def _step0_log(self, message: str) -> None:
+        self._step0_lines.append(self._step0_timestamp(message))
+        self._render_step0_log()
+
     def _render_step0_log(self) -> None:
         self._set_step0_report("\n".join(self._step0_lines) or STEP0_EMPTY_REPORT)
 
@@ -2903,11 +2913,11 @@ class SurveyApp(ctk.CTk):
         self.step0_to_step1_button.configure(state="disabled")
         self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
         self.step0_stop_button.configure(state="normal")
-        self._step0_lines = [
-            f"Блок {block}, лот {lot}"
+        self._step0_lines = [self._step0_timestamp(
+            f"Начинаю сбор: блок {block}, лот {lot}"
             + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
-            + f"; папка: {folder}",
-        ]
+            + f"; папка: {folder}"
+        )]
         self._render_step0_log()
         self._set_status("Шаг 0: собираю описания участка…")
         worker = threading.Thread(
@@ -2932,7 +2942,7 @@ class SurveyApp(ctk.CTk):
         self._worker_context.generation = self._generation
 
         def progress(line: str) -> None:
-            self._post("step0_progress", line)
+            self._post("step0_progress", self._step0_timestamp(line))
 
         downloads = rcclerk.default_downloads_dir()
         auto_save = None
@@ -2971,6 +2981,7 @@ class SurveyApp(ctk.CTk):
         if not self._step0_running:
             return
         self._step0_stop.set()
+        self._step0_log("Запрошена остановка; завершу текущий документ и сохраню собранное.")
         self._set_status("Шаг 0: останавливаю после текущего документа…")
 
     def _finish_step0(self, status: str, payload: Any) -> None:
@@ -2978,19 +2989,17 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
         self.step0_stop_button.configure(state="disabled")
         if status == "cancelled":
-            self._step0_lines.append("Сбор остановлен — собранное осталось в папке.")
-            self._render_step0_log()
+            self._step0_log("Сбор остановлен — собранное осталось в папке.")
             self._set_status("Шаг 0: сбор остановлен.", warn=True)
             return
         if status == "error":
-            self._step0_lines.append(f"Ошибка: {payload}")
-            self._render_step0_log()
+            self._step0_log(f"Ошибка: {payload}")
             self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
             return
         outcome = payload
         self._step0_outcome = outcome
-        self._step0_lines.append("")
-        self._step0_lines.append(outcome.report())
+        self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}")
+        self._step0_lines.append(outcome.report(include_notes=False))
         self._render_step0_log()
         if outcome.ok:
             self.step0_to_step1_button.configure(state="normal")
@@ -3029,6 +3038,7 @@ class SurveyApp(ctk.CTk):
 
     def _adopt_step0_download(self) -> None:
         """Забирает свежий PDF из «Загрузок» под нужным именем (ступень 3 лестницы)."""
+        self._step0_log("Забираю вручную скачанный PDF из «Загрузок»…")
         role = self._step0_manual_role()
         text = str(self.step0_manual_lot_var.get() or "").strip()
         if not text:
@@ -3053,28 +3063,106 @@ class SurveyApp(ctk.CTk):
                 warn=True,
             )
             return
-        self._step0_lines.append(f"Из «Загрузок» принят файл: {record.file}")
-        self._render_step0_log()
+        self._step0_log(f"Из «Загрузок» принят файл: {record.file}")
         self._set_status(f"Шаг 0: файл «{record.file}» добавлен в папку описаний.")
 
     def _step0_to_step1(self) -> None:
         """Открывает собранные описания в Шаге 1: наш участок и соседи одним набором."""
+        self._step0_log("Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…")
         folder = self._step0_folder()
-        manifest = deed_store.read_manifest(folder)
-        items_meta = manifest.get("items") or []
+        try:
+            manifest = deed_store.read_manifest(folder)
+        except deed_store.DeedStoreError as exc:
+            self._step0_log(f"Manifest не читается ({exc}); проверяю паспорта .json рядом с PDF")
+            manifest = {}
+        raw_items = manifest.get("items") or []
+        items_meta = [dict(item) for item in raw_items if isinstance(item, dict)]
+
+        # Если общий список неполон/устарел, восстановим ожидаемые документы по
+        # паспортам. Так сосед не потеряется лишь из-за отсутствующей записи manifest.
+        expected: set[tuple[str, str, str]] = set()
+        try:
+            our_lot = str(int(str(self.step0_lot_var.get() or "").strip()))
+            expected.update({("our", our_lot, "NEW"), ("our", our_lot, "OLD")})
+            neighbour_lots = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
+            neighbour_tags = ["NEW"] + (["OLD"] if self.step0_old_neighbour_var.get() else [])
+            expected.update(
+                ("neighbour", str(lot), tag)
+                for lot in neighbour_lots for tag in neighbour_tags
+            )
+        except (TypeError, ValueError):
+            neighbour_lots = []
+
+        def item_key(item: dict[str, Any]) -> tuple[str, str, str]:
+            return (
+                str(item.get("role") or "").lower(),
+                str(item.get("lot") or ""),
+                str(item.get("tag") or "NEW").upper(),
+            )
+
+        try:
+            sidecars = deed_store.read_records(folder)
+        except Exception as exc:  # noqa: BLE001 - повреждённый паспорт не мешает остальным
+            sidecars = []
+            self._step0_log(f"Не удалось прочитать паспорта файлов: {exc}")
+        by_key = {item_key(item): item for item in items_meta}
+        for record in sidecars:
+            record_data = dataclasses.asdict(record)
+            key = item_key(record_data)
+            if key not in expected:
+                continue
+            existing = by_key.get(key)
+            if existing is None:
+                items_meta.append(record_data)
+                by_key[key] = record_data
+                self._step0_log(
+                    f"В manifest не было {record.file}; восстановил запись по паспорту документа"
+                )
+                continue
+            # Manifest and sidecar are written together; if one reference went stale,
+            # use an existing file from the passport rather than silently dropping it.
+            for field_name in ("file", "trimmed"):
+                recovered = str(record_data.get(field_name) or "").strip()
+                current = str(existing.get(field_name) or "").strip()
+                if (recovered and (not current or not (folder / current).is_file())
+                        and (folder / recovered).is_file()):
+                    existing[field_name] = recovered
+                    self._step0_log(
+                        f"Обновил путь {field_name} для {record.file} по паспорту документа"
+                    )
+
         paths: list[Path] = []
         for item in items_meta:
-            preferred = str(item.get("trimmed") or "") or str(item.get("file") or "")
-            if not preferred:
+            full_name = str(item.get("file") or "").strip()
+            trimmed_name = str(item.get("trimmed") or "").strip()
+            trimmed_path = folder / trimmed_name if trimmed_name else None
+            full_path = folder / full_name if full_name else None
+            if trimmed_path is not None and trimmed_path.is_file():
+                chosen = trimmed_path
+            elif full_path is not None and full_path.is_file():
+                chosen = full_path
+                if trimmed_name:
+                    self._step0_log(
+                        f"{trimmed_name} отсутствует; передаю полный документ {full_name}"
+                    )
+            else:
+                expected_name = trimmed_name or full_name or "(имя в manifest не указано)"
+                self._step0_log(f"Файл из manifest не найден и пропущен: {expected_name}")
                 continue
-            path = folder / preferred
-            if path.is_file():
-                paths.append(path)
+            if chosen not in paths:
+                paths.append(chosen)
+
         if not paths:
+            self._step0_log("Передавать нечего: в папке описаний не найдено PDF")
             self._set_status("Шаг 0: в папке описаний нет файлов для Шага 1.", error=True)
             return
+        self._step0_log(
+            f"Отправляю в Шаг 1 ({len(paths)} PDF): "
+            + "; ".join(path.name for path in paths)
+        )
         items, errors = self._make_pdf_set_items(paths)
         for error in errors:
+            self._step0_log(f"Файл не открылся для Шага 1: {error}")
             self._log_line(f"! Шаг 0 → Шаг 1: {error}")
         if not items:
             self._set_status(
@@ -7818,7 +7906,10 @@ class SurveyApp(ctk.CTk):
                         error=True,
                     )
             elif kind == "step0_progress":
-                self._step0_lines.append(str(payload))
+                text = str(payload)
+                if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
+                    text = self._step0_timestamp(text)
+                self._step0_lines.append(text)
                 self._render_step0_log()
             elif kind == "step0_done":
                 status, payload_done = payload

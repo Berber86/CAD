@@ -89,8 +89,12 @@ class IntakeOutcome:
     def our_records(self) -> list[deed_store.StoredDeed]:
         return [record for record in self.records if record.role == "our"]
 
-    def report(self) -> str:
-        """Короткий отчёт для экрана Шага 0 (и для журнала)."""
+    def report(self, *, include_notes: bool = True) -> str:
+        """Короткий отчёт для экрана Шага 0 (и для журнала).
+
+        ``include_notes=False`` удобно для GUI, где события уже выведены отдельными
+        строками с точным временем и не должны дублироваться без временных меток.
+        """
         lines: list[str] = [f"Папка описаний: {self.folder}"]
         if self.records:
             lines.append("")
@@ -106,7 +110,7 @@ class IntakeOutcome:
             lines.append("")
             lines.append("Чего не хватает:")
             lines.extend(f"  • {item}" for item in self.missing)
-        if self.notes:
+        if include_notes and self.notes:
             lines.append("")
             lines.append("Как шло:")
             lines.extend(f"  • {item}" for item in self.notes)

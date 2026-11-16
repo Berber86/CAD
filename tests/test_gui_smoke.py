@@ -3555,3 +3555,81 @@ def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, mo
     assert seen["auto_save"] is hook
     assert callable(seen["attempt_notice"])
     assert any("Ctrl+S" in line for line in app._step0_lines)
+
+
+def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(gui, tmp_path):
+    import json
+
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our-new.pdf"),
+        role="our", lot=32, tag="NEW", block=6323, pages="2",
+        trimmed_source=_step0_pdf(tmp_path / "our-new-trim.pdf"),
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our-old.pdf"),
+        role="our", lot=32, tag="OLD", block=6323,
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "neighbour.pdf"),
+        role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+
+    manifest_path = folder / gui.deed_store.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["items"] = [item for item in manifest["items"] if item["role"] != "neighbour"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fill_step0(app, folder=folder, neighbours="30")
+    app._step0_to_step1()
+    names = sorted(item.path.name for item in app._pdf_set_dialog.items)
+    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf", "OUR 32 OLD.pdf"]
+    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in app._step0_lines)
+    assert any("Отправляю в Шаг 1 (3 PDF)" in line for line in app._step0_lines)
+
+
+def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gui, tmp_path):
+    import json
+
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "our.pdf"),
+        role="our", lot=32, tag="NEW", block=6323,
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "neighbour.pdf"),
+        role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+    manifest_path = folder / gui.deed_store.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    neighbour = next(item for item in manifest["items"] if item["role"] == "neighbour")
+    neighbour["trimmed"] = "LOT 30 NEW_p1.pdf"  # повреждённая ссылка, полный PDF существует
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fill_step0(app, folder=folder, neighbours="30")
+    app._step0_to_step1()
+    names = sorted(item.path.name for item in app._pdf_set_dialog.items)
+    assert "LOT 30 NEW.pdf" in names
+    assert any("отсутствует; передаю полный документ LOT 30 NEW.pdf" in line
+               for line in app._step0_lines)
+
+
+def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
+    import re
+
+    app = gui.SurveyApp()
+    monkeypatch.setattr(gui.browser_save, "available", lambda: False)
+
+    def fake_collect(**kwargs):
+        kwargs["progress"]("читаю список документов")
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
+    _fill_step0(app, folder=tmp_path)
+    app._start_step0_intake()
+    _wait_step0(app)
+    lines = [line for line in app._step0_lines if "список документов" in line]
+    assert lines and re.match(r"^\[\d{2}:\d{2}:\d{2}\]", lines[0])
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", app._step0_lines[0])

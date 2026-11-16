@@ -973,5 +973,9 @@
     "enabled": true,
     "dpi": 400,
     "comment": "локальное распознавание сканов (бесплатно, без ИИ): rapidocr-onnxruntime; dpi — рендер страницы (выше разрешения картинки в PDF не поднимаемся)"
+  },
+  "deed_intake": {
+    "auto_ctrl_s": true,
+    "comment": "Шаг 0: сохранять PDF из браузера самому (эмуляция Ctrl+S, только Windows); false — человек нажимает Ctrl+S"
   }
 }

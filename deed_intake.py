@@ -121,6 +121,25 @@ def _default_downloader(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, 
     return rcclerk.download_with_fallback(row.endorsement_id, destination)
 
 
+def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, base_url: str = rcclerk.BASE_URL):
+    """
+    Загрузчик по лестнице; при ``auto_save`` сам просит браузер сохранить PDF (Ctrl+S).
+
+    Отдельной функцией — чтобы экран Шага 0 мог включить автоматическое сохранение
+    одной галочкой, а тесты — подставить своё.
+    """
+
+    def download(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, str]:
+        options: dict = {"base": base_url}
+        if downloads_dir is not None:
+            options["downloads_dir"] = downloads_dir
+        if auto_save is not None:
+            options["auto_save"] = auto_save
+        return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
+
+    return download
+
+
 def _default_page_finder(pdf: Path) -> deed_pages.DescriptionPages:
     return deed_pages.find_description_pages(pdf)
 
@@ -143,6 +162,8 @@ def collect_deeds(
     with_old_for_neighbour: bool = False,
     fetch_list: ListFetcher | None = None,
     downloader: Downloader | None = None,
+    auto_save=None,
+    downloads_dir: str | Path | None = None,
     page_finder: PageFinder | None = None,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
@@ -154,6 +175,10 @@ def collect_deeds(
     Авария одного документа не отменяет остальные: проход идёт дальше, а причина
     попадает в ``missing``/``notes`` — так человек видит и то, что собралось, и
     что именно надо доделать руками.
+
+    ``auto_save`` — хук ``(endorsement_id) -> путь | None`` для автоматического
+    Ctrl+S в браузере (см. ``browser_save``); ``downloads_dir`` — папка, в которой
+    браузер сохраняет файлы.
     """
     block_no = int(block)
     lot_no = int(lot)
@@ -162,7 +187,9 @@ def collect_deeds(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     fetch = fetch_list or _default_fetch_list
-    download = downloader or _default_downloader
+    download = downloader or make_downloader(
+        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url
+    )
     find_pages = page_finder or _default_page_finder
     outcome = IntakeOutcome(folder=target_dir)
 

@@ -485,6 +485,11 @@ def _default_downloads_dir() -> Path:
     return Path.home() / "Downloads"
 
 
+def default_downloads_dir() -> Path:
+    """Папка «Загрузки» текущего пользователя (куда браузер сохраняет файлы)."""
+    return _default_downloads_dir()
+
+
 def _open_in_browser(url: str) -> None:
     import webbrowser
 
@@ -524,6 +529,18 @@ def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[
     return best
 
 
+def _drop_our_pending(path: Path, downloads_dir: Path) -> None:
+    """Удаляет наш собственный временный файл из «Загрузок» (чужие не трогаем)."""
+    try:
+        if path.parent.resolve() != Path(downloads_dir).resolve():
+            return
+        if not path.name.startswith("tsai_step0_"):
+            return
+        path.unlink()
+    except OSError:
+        return
+
+
 def download_with_fallback(
     endorsement_id: int | str,
     destination: str | Path,
@@ -534,6 +551,8 @@ def download_with_fallback(
     downloads_dir: str | Path | None = None,
     watch_timeout: float = 300.0,
     poll: float = 1.0,
+    auto_save=None,
+    auto_save_pause: float = 2.0,
     on_step=None,
 ) -> tuple[Path, str]:
     """
@@ -545,6 +564,10 @@ def download_with_fallback(
        подхватывается и копируется в нужное место — человеку ничего делать не надо.
     3. **Ручной шаг**: если браузер не открылся или файл не появился, ``ManualStepNeeded``
        с готовой ссылкой: открыть, дождаться и положить файл в папку описаний.
+
+    ``auto_save`` — необязательный хук ``(endorsement_id) -> путь | None``: он просит
+    браузер сохранить открытый PDF сам (``browser_save``, эмуляция Ctrl+S в окне
+    просмотрщика). Без него человек нажимает Ctrl+S руками — как раньше.
 
     Возвращает ``(путь, ступень)``, где ступень — ``"direct"`` или ``"browser"``.
     """
@@ -580,12 +603,26 @@ def download_with_fallback(
     step(f"2/3 ждём файл в «{folder}» — проверка на сайте идёт сама, до {int(watch_timeout)} с")
 
     deadline = time.monotonic() + max(0.0, float(watch_timeout))
+    last_auto = 0.0
     while True:
         found = find_new_pdf(folder, since=since)
         if found is not None:
             shutil.copyfile(found, target)
+            _drop_our_pending(found, folder)
             step(f"файл взят из загрузок: {found.name}")
             return target, "browser"
+        if auto_save is not None and time.monotonic() - last_auto >= auto_save_pause:
+            last_auto = time.monotonic()
+            saved = None
+            try:
+                saved = auto_save(endorsement_id)
+            except Exception:  # noqa: BLE001 - надстройка не должна ломать лестницу
+                saved = None
+            if saved is not None and Path(saved).is_file():
+                shutil.copyfile(saved, target)
+                _drop_our_pending(Path(saved), folder)
+                step("PDF сохранён из браузера автоматически (Ctrl+S)")
+                return target, "browser"
         if time.monotonic() >= deadline:
             break
         time.sleep(max(0.05, float(poll)))

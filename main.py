@@ -123,6 +123,7 @@ from llm_parser import (
     save_config,
     save_protected_env,
 )
+import browser_save
 import deed_intake
 import deed_store
 import ocr_pages
@@ -462,6 +463,10 @@ class SurveyApp(ctk.CTk):
         self.step0_neighbours_var = ctk.StringVar(value="")
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
+        # Автоматическое Ctrl+S в браузере (Windows): человек только ждёт файл.
+        self.step0_auto_save_var = ctk.BooleanVar(
+            value=bool(self.config_data.get("deed_intake", {}).get("auto_ctrl_s", True))
+        )
         self.step0_manual_role_var = ctk.StringVar(value=STEP0_MANUAL_ROLES[0])
         self.step0_manual_lot_var = ctk.StringVar(value="")
         self._step0_lines: list[str] = []
@@ -2704,15 +2709,27 @@ class SurveyApp(ctk.CTk):
 
         field(2, "Соседи — номера лотов через запятую (они получат роль «сосед»)",
               self.step0_neighbours_var, "30, 28")
+        checks = ctk.CTkFrame(panel, fg_color="transparent")
+        checks.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 4))
         ctk.CTkCheckBox(
-            panel,
+            checks,
             text="докачать старый документ соседей (если межа соседа спорная)",
             variable=self.step0_old_neighbour_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             checkbox_width=18,
             checkbox_height=18,
-        ).grid(row=3, column=0, sticky="w", padx=16, pady=(10, 4))
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkCheckBox(
+            checks,
+            text="сохранять PDF из браузера самому (Ctrl+S вместо вас)",
+            variable=self.step0_auto_save_var,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+            checkbox_width=18,
+            checkbox_height=18,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.step0_auto_save_check = checks
 
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
@@ -2909,19 +2926,41 @@ class SurveyApp(ctk.CTk):
         self._set_status("Шаг 0: собираю описания участка…")
         worker = threading.Thread(
             target=self._step0_worker,
-            args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get())),
+            args=(
+                block, lot, neighbours, folder,
+                bool(self.step0_old_neighbour_var.get()),
+                bool(self.step0_auto_save_var.get()),
+            ),
             daemon=True,
         )
         worker.start()
 
     def _step0_worker(
-        self, block: int, lot: int, neighbours: list[int], folder: Path, with_old: bool,
+        self,
+        block: int,
+        lot: int,
+        neighbours: list[int],
+        folder: Path,
+        with_old: bool,
+        auto_save_enabled: bool = True,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
 
         def progress(line: str) -> None:
             self._post("step0_progress", line)
+
+        downloads = rcclerk.default_downloads_dir()
+        auto_save = None
+        if auto_save_enabled:
+            if browser_save.available():
+                auto_save = browser_save.auto_save_hook(downloads)
+                progress("браузер: PDF буду сохранять сам (Ctrl+S), ждать в «Загрузках»")
+            else:
+                progress(
+                    "браузер: автоматическое Ctrl+S доступно только в Windows — "
+                    "если PDF откроется в просмотрщике, нажмите Ctrl+S сами"
+                )
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -2932,6 +2971,8 @@ class SurveyApp(ctk.CTk):
                 with_old_for_neighbour=with_old,
                 progress=progress,
                 should_stop=self._step0_stop.is_set,
+                auto_save=auto_save,
+                downloads_dir=downloads,
             )
         except deed_intake.IntakeCancelled:
             self._post("step0_done", ("cancelled", None))

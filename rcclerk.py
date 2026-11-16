@@ -101,6 +101,18 @@ class CloudflareBlocked(RcclerkError):
     """Сайт показал проверку на бота вместо PDF."""
 
 
+class DocumentServerError(RcclerkError):
+    """Сайт округа сам не смог отдать документ (его страница ошибки). Это не Cloudflare."""
+
+
+#: Фразы страницы ошибки сайта округа (HTML/JSON), которую нельзя принимать за проверку бота.
+_SERVER_ERROR_MARKERS = (
+    "could not load the requested document",
+    "unexpected error",
+    "error reading jobject",
+)
+
+
 class ManualStepNeeded(RcclerkError):
     """Автоматические ступени не сработали: нужен ручной шаг человека."""
 
@@ -462,6 +474,12 @@ def download_pdf(
     if data[:5] == b"%PDF-" or "application/pdf" in content_type:
         target.write_bytes(data)
         return target
+    head = data[:4096].decode("utf-8", errors="replace").lower()
+    if any(marker in head for marker in _SERVER_ERROR_MARKERS):
+        raise DocumentServerError(
+            f"сайт округа не отдал документ {endorsement_id}: ошибка на стороне сайта. "
+            "Попробуйте позже; если повторяется — клерк округа Richmond, 718-675-7700."
+        )
     if b"<html" in data[:2048].lower() or "text/html" in content_type:
         raise CloudflareBlocked(
             "вместо PDF пришла HTML-страница — это проверка Cloudflare. "
@@ -541,6 +559,11 @@ def _drop_our_pending(path: Path, downloads_dir: Path) -> None:
         return
 
 
+#: Сколько раз повторить прямое скачивание, если сайт округа ответил ошибкой, и пауза между попытками.
+SERVER_ERROR_RETRIES = 2
+SERVER_ERROR_RETRY_PAUSE_SEC = 5.0
+
+
 class DownloadStopped(Exception):
     """Пользователь нажал «Стоп» во время ожидания загрузки — это не ошибка документа."""
 
@@ -589,10 +612,24 @@ def download_with_fallback(
 
     check_stop()
     step("1/3 пробую скачать напрямую…")
-    try:
-        return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
-    except CloudflareBlocked:
-        step("прямое скачивание закрыто проверкой Cloudflare — открываю браузер")
+    server_attempts = 0
+    while True:
+        try:
+            return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
+        except DocumentServerError:
+            # Ошибка сайта округа: браузер тут не поможет. Повторяем пару раз и сдаёмся.
+            server_attempts += 1
+            if server_attempts > SERVER_ERROR_RETRIES:
+                raise
+            step(f"сайт округа вернул ошибку — повтор {server_attempts} из {SERVER_ERROR_RETRIES} через "
+                 f"{int(SERVER_ERROR_RETRY_PAUSE_SEC)} с")
+            deadline = time.monotonic() + SERVER_ERROR_RETRY_PAUSE_SEC
+            while time.monotonic() < deadline:
+                check_stop()
+                time.sleep(0.2)
+        except CloudflareBlocked:
+            step("прямое скачивание закрыто проверкой Cloudflare — открываю браузер")
+            break
 
     folder = Path(downloads_dir) if downloads_dir is not None else _default_downloads_dir()
     open_it = open_browser or _open_in_browser

@@ -684,3 +684,73 @@ def _row_for_test():
     import datetime as _dt
 
     return rcclerk.DeedRow(endorsement_id=NEWEST_ID, doc_type="DEED", doc_date=_dt.date(2023, 9, 5))
+
+
+_CLERK_ERROR_PAGE = (
+    b"<html><body>WE COULD NOT LOAD THE REQUESTED DOCUMENT IMAGE DUE TO AN UNEXPECTED ERROR: "
+    b"ERROR READING JOBJECT FROM JSONREADER. PATH '', LINE 0, POSITION 0.. PLEASE TRY AGAIN.</body></html>"
+)
+
+
+def test_clerk_error_page_is_a_server_error_not_cloudflare(tmp_path):
+    with pytest.raises(rcclerk.DocumentServerError) as caught:
+        rcclerk.download_pdf(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(_CLERK_ERROR_PAGE, "text/html"),
+        )
+    assert not isinstance(caught.value, rcclerk.CloudflareBlocked)
+    assert "718-675-7700" in str(caught.value)
+
+
+def test_clerk_error_retries_directly_and_never_opens_the_browser(tmp_path, monkeypatch):
+    monkeypatch.setattr(rcclerk, "SERVER_ERROR_RETRY_PAUSE_SEC", 0.0)
+    attempts = {"n": 0}
+    opened = []
+
+    def opener(request, timeout=0):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return _Response(_CLERK_ERROR_PAGE, "text/html")
+        return _Response(b"%PDF-1.7 deed", "application/pdf")
+
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf", opener=opener,
+        open_browser=lambda url: opened.append(url), downloads_dir=tmp_path / "downloads",
+    )
+    assert rung == "direct" and path.read_bytes().startswith(b"%PDF-")
+    assert attempts["n"] == 3 and opened == []
+
+
+def test_persistent_clerk_error_ends_fast_without_browser_wait(tmp_path, monkeypatch):
+    import time
+
+    monkeypatch.setattr(rcclerk, "SERVER_ERROR_RETRY_PAUSE_SEC", 0.0)
+    opened = []
+    started = time.monotonic()
+    with pytest.raises(rcclerk.DocumentServerError):
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(_CLERK_ERROR_PAGE, "text/html"),
+            open_browser=lambda url: opened.append(url),
+            downloads_dir=tmp_path / "downloads", watch_timeout=300.0,
+        )
+    assert opened == []
+    assert time.monotonic() - started < 5.0
+
+
+def test_collect_skips_a_document_the_clerk_could_not_serve(tmp_path):
+    import deed_intake
+
+    missing: list[str] = []
+
+    def failing_downloader(row, destination):
+        raise rcclerk.DocumentServerError("сайт округа не отдал документ: ошибка на стороне сайта")
+
+    result = deed_intake._collect_one(
+        block_no=5711, lot_value=34, role="our", row=_row_for_test(), tag="",
+        target_dir=tmp_path, base_url=rcclerk.BASE_URL,
+        download=failing_downloader, find_pages=lambda pdf: None, ocr_dpi=200,
+        say=lambda message: None, missing=missing,
+    )
+    assert result is None
+    assert any("ошибка на стороне сайта" in item for item in missing)

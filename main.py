@@ -5263,6 +5263,22 @@ class SurveyApp(ctk.CTk):
                 f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
+            if messagebox.askyesno(
+                "Обновление завершено",
+                f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
+                "Перезапустить программу сейчас?",
+                parent=self,
+            ):
+                run_bat = app_dir() / "run.bat"
+                if run_bat.is_file():
+                    if sys.platform == "win32":
+                        subprocess.Popen(
+                            ["cmd", "/c", "start", "", str(run_bat)],
+                            cwd=str(run_bat.parent),
+                        )
+                    else:
+                        subprocess.Popen([str(run_bat)], cwd=str(run_bat.parent))
+                self.destroy()
         else:
             self.update_status_label.configure(
                 text=f"Обновление не удалось: {payload}", text_color=THEME["err"],

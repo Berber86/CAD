@@ -551,23 +551,17 @@ def download_with_fallback(
     downloads_dir: str | Path | None = None,
     watch_timeout: float = 300.0,
     poll: float = 1.0,
-    auto_save=None,
-    auto_save_pause: float = 2.0,
     on_step=None,
 ) -> tuple[Path, str]:
     """
     Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
 
     1. **Прямое скачивание** (`download_pdf`). Работает, если Cloudflare не мешает.
-    2. **Браузер**: открываем ссылку в браузере по умолчанию и ждём, пока в «Загрузках»
-       появится новый PDF (проверка на бота проходит сама, минуты за три). Файл
-       подхватывается и копируется в нужное место — человеку ничего делать не надо.
-    3. **Ручной шаг**: если браузер не открылся или файл не появился, ``ManualStepNeeded``
-       с готовой ссылкой: открыть, дождаться и положить файл в папку описаний.
-
-    ``auto_save`` — необязательный хук ``(endorsement_id) -> путь | None``: он просит
-    браузер сохранить открытый PDF сам (``browser_save``, эмуляция Ctrl+S в окне
-    просмотрщика). Без него человек нажимает Ctrl+S руками — как раньше.
+    2. **Браузер**: открываем ссылку в браузере по умолчанию. Если открылся
+       встроенный PDF-просмотрщик, человек нажимает штатную кнопку скачивания;
+       программа ждёт PDF в «Загрузках» и копирует его в нужное место.
+    3. **Ручной шаг**: если браузер не открылся или файл так и не появился,
+       ``ManualStepNeeded`` подсказывает ссылку, кнопку скачивания и папку.
 
     Возвращает ``(путь, ступень)``, где ступень — ``"direct"`` или ``"browser"``.
     """
@@ -600,10 +594,13 @@ def download_with_fallback(
             "файл скачается, положите его в папку описаний",
             url, folder=folder,
         ) from exc
-    step(f"2/3 ждём файл в «{folder}» — проверка на сайте идёт сама, до {int(watch_timeout)} с")
+    step(
+        f"2/3 браузер открыл PDF. Нажмите в его панели значок скачивания "
+        f"(стрелка вниз); программа сама заберёт файл из «{folder}». "
+        f"Жду до {int(watch_timeout)} с"
+    )
 
     deadline = time.monotonic() + max(0.0, float(watch_timeout))
-    last_auto = 0.0
     while True:
         found = find_new_pdf(folder, since=since)
         if found is not None:
@@ -611,23 +608,12 @@ def download_with_fallback(
             _drop_our_pending(found, folder)
             step(f"файл взят из загрузок: {found.name}")
             return target, "browser"
-        if auto_save is not None and time.monotonic() - last_auto >= auto_save_pause:
-            last_auto = time.monotonic()
-            saved = None
-            try:
-                saved = auto_save(endorsement_id)
-            except Exception:  # noqa: BLE001 - надстройка не должна ломать лестницу
-                saved = None
-            if saved is not None and Path(saved).is_file():
-                shutil.copyfile(saved, target)
-                _drop_our_pending(Path(saved), folder)
-                step("PDF сохранён из браузера автоматически (Ctrl+S)")
-                return target, "browser"
         if time.monotonic() >= deadline:
             break
         time.sleep(max(0.05, float(poll)))
     raise ManualStepNeeded(
         f"файл не появился в «{folder}» за {int(watch_timeout)} с. Откройте ссылку вручную: "
-        f"{url} — дождитесь скачивания и положите PDF в папку описаний",
+        f"{url} — нажмите значок скачивания PDF (стрелка вниз) и повторите сбор; "
+        "либо сохраните файл в папку описаний вручную",
         url, folder=folder,
     )

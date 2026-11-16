@@ -326,83 +326,53 @@ class _Response:
         return None
 
 
-def test_ladder_asks_the_browser_to_save_the_pdf_by_itself(tmp_path):
-    """Ступень 2 без Ctrl+S от человека: хук сохраняет файл, лестница его забирает."""
+def test_browser_download_button_is_watched_without_stealing_focus(tmp_path):
+    """PDF stays in the browser until the user clicks its own download icon."""
     steps: list[str] = []
-    saved_elsewhere = tmp_path / "browser did it.pdf"
-    calls: list[int | str] = []
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
 
-    def auto_save(endorsement_id):
-        calls.append(endorsement_id)
-        saved_elsewhere.write_bytes(b"%PDF-1.7 deed")
-        return saved_elsewhere
+    def open_browser(url):
+        # Mimics the browser's built-in PDF download button writing to Downloads.
+        assert url.endswith(f"p_endorsementId={OUR_NEW}")
+        (downloads / "document.pdf").write_bytes(b"%PDF-1.7 deed")
 
     path, rung = rcclerk.download_with_fallback(
         OUR_NEW, tmp_path / "raw.pdf",
         opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
-        open_browser=lambda url: None,
-        downloads_dir=tmp_path / "downloads", watch_timeout=3.0, poll=0.05,
-        auto_save=auto_save, auto_save_pause=0.0, on_step=steps.append,
+        open_browser=open_browser, downloads_dir=downloads, watch_timeout=1.0, poll=0.01,
+        on_step=steps.append,
     )
     assert rung == "browser" and path.read_bytes().startswith(b"%PDF-")
-    assert calls and str(OUR_NEW) in str(calls[0])
-    assert any("Ctrl+S" in step for step in steps)
+    assert any("значок скачивания" in step and "стрелка вниз" in step for step in steps)
+    assert (downloads / "document.pdf").is_file()  # чужие загрузки никогда не удаляем
 
 
-def test_our_pending_file_is_cleaned_up_but_a_users_pdf_is_not(tmp_path):
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-
-    def auto_save(endorsement_id):
-        pending = downloads / f"tsai_step0_{endorsement_id}.pdf"
-        pending.write_bytes(b"%PDF-1.7 deed")
-        return pending
-
-    user_file = downloads / "мой документ.pdf"
-    user_file.write_bytes(b"%PDF-1.7 user")
-    path, rung = rcclerk.download_with_fallback(
-        OUR_NEW, tmp_path / "raw.pdf",
-        opener=lambda request, timeout=0: _Response(b"<html></html>", "text/html"),
-        open_browser=lambda url: None,
-        downloads_dir=downloads, watch_timeout=3.0, poll=0.05,
-        auto_save=auto_save, auto_save_pause=0.0,
-    )
-    assert rung == "browser" and path.is_file()
-    assert not (downloads / f"tsai_step0_{OUR_NEW}.pdf").exists()   # наш убран
-    assert user_file.is_file()                                      # чужой цел
-
-
-def test_a_broken_auto_save_does_not_break_the_ladder(tmp_path):
-    def auto_save(endorsement_id):
-        raise RuntimeError("окно не нашлось")
-
-    with pytest.raises(rcclerk.ManualStepNeeded):
+def test_manual_step_explains_the_browser_download_button(tmp_path):
+    with pytest.raises(rcclerk.ManualStepNeeded) as exc:
         rcclerk.download_with_fallback(
             OUR_NEW, tmp_path / "raw.pdf",
             opener=lambda request, timeout=0: _Response(b"<html></html>", "text/html"),
-            open_browser=lambda url: None,
-            downloads_dir=tmp_path / "downloads", watch_timeout=0.2, poll=0.05,
-            auto_save=auto_save, auto_save_pause=0.0,
+            open_browser=lambda url: None, downloads_dir=tmp_path / "downloads",
+            watch_timeout=0.0, poll=0.01,
         )
+    assert "стрелка вниз" in str(exc.value)
 
 
-def test_collect_passes_the_auto_save_hook_to_the_ladder(tmp_path, monkeypatch):
-    """Галочка Шага 0 доходит до лестницы: хук вызывается, файл берётся без Ctrl+S."""
-    calls: list[str] = []
+def test_collect_default_downloader_uses_downloads_without_keyboard_hook(tmp_path, monkeypatch):
+    """Никаких Ctrl+S/эмуляции клавиш: экран передаёт только папку загрузок."""
+    calls: list[dict] = []
 
     def fake_ladder(endorsement_id, destination, **kwargs):
-        calls.append("auto_save" if kwargs.get("auto_save") else "manual")
+        calls.append(kwargs)
         Path(destination).write_bytes(b"%PDF-1.7 deed")
         return Path(destination), "browser"
 
     monkeypatch.setattr(rcclerk, "download_with_fallback", fake_ladder)
-    outcome = _collect(
-        tmp_path,
-        downloader=None,          # загрузчик по умолчанию — тот, что в лестнице
-        auto_save=lambda endorsement_id: None,
-        downloads_dir=tmp_path / "dl",
-    )
-    assert outcome.records and set(calls) == {"auto_save"}
+    outcome = _collect(tmp_path, downloader=None, downloads_dir=tmp_path / "downloads")
+    assert outcome.records
+    assert calls and calls[0]["downloads_dir"] == tmp_path / "downloads"
+    assert "auto_save" not in calls[0]
 
 
 def test_list_page_is_read_with_the_site_encoding(monkeypatch):

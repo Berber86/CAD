@@ -3534,27 +3534,7 @@ def test_step0_never_calls_the_paid_model(gui):
         assert forbidden not in body
 
 
-def test_step0_ctrl_s_checkbox_is_on_by_default_and_reaches_the_run(gui, tmp_path, monkeypatch):
-    app = gui.SurveyApp()
-    assert app.step0_auto_save_var.get() is True
-
-    seen: dict[str, object] = {}
-
-    def fake_collect(**kwargs):
-        seen.update(kwargs)
-        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
-
-    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
-    monkeypatch.setattr(gui.browser_save, "auto_save_hook", lambda folder: f"hook:{folder}")
-    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
-    _fill_step0(app, folder=tmp_path)
-    app._start_step0_intake()
-    _wait_step0(app)
-    assert seen["auto_save"] == f"hook:{gui.rcclerk.default_downloads_dir()}"
-    assert any("Ctrl+S" in line for line in app._step0_lines)
-
-
-def test_step0_without_windows_says_ctrl_s_is_manual(gui, tmp_path, monkeypatch):
+def test_step0_worker_never_sends_keyboard_input_to_a_window(gui, tmp_path, monkeypatch):
     app = gui.SurveyApp()
     seen: dict[str, object] = {}
 
@@ -3562,27 +3542,9 @@ def test_step0_without_windows_says_ctrl_s_is_manual(gui, tmp_path, monkeypatch)
         seen.update(kwargs)
         return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
 
-    monkeypatch.setattr(gui.browser_save, "available", lambda: False)
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
-    _fill_step0(app, folder=tmp_path)
-    app._start_step0_intake()
+    app._step0_worker(6323, 32, [], tmp_path, False)
     _wait_step0(app)
-    assert seen["auto_save"] is None
-    assert any("нажмите Ctrl+S сами" in line for line in app._step0_lines)
-
-
-def test_step0_unticking_the_box_leaves_the_manual_route(gui, tmp_path, monkeypatch):
-    app = gui.SurveyApp()
-    seen: dict[str, object] = {}
-
-    def fake_collect(**kwargs):
-        seen.update(kwargs)
-        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
-
-    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
-    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
-    app.step0_auto_save_var.set(False)
-    _fill_step0(app, folder=tmp_path)
-    app._start_step0_intake()
-    _wait_step0(app)
-    assert seen["auto_save"] is None
+    assert seen["downloads_dir"] == gui.rcclerk.default_downloads_dir()
+    assert "auto_save" not in seen
+    assert not hasattr(gui, "browser_save")

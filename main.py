@@ -6232,16 +6232,19 @@ class SurveyApp(ctk.CTk):
             )
             return
 
-        # Собираем все точки сцены для автоцентрирования и масштабирования
-        world_pts: list[tuple[float, float]] = [(0.0, 0.0)]
+        # Собираем точки участков для автоцентрирования (длинные линии улиц не ужимают масштаб)
+        world_pts: list[tuple[float, float]] = []
         for pl in plans:
             world_pts.append(pl.pob)
             for bl in pl.boundary_lines:
                 world_pts.append(bl.start)
                 world_pts.append(bl.end)
-            for rl in pl.lines:
-                world_pts.append(rl.start)
-                world_pts.append(rl.end)
+        if not world_pts:
+            world_pts.append((0.0, 0.0))
+            for pl in plans:
+                for rl in pl.lines:
+                    world_pts.append(rl.start)
+                    world_pts.append(rl.end)
 
         xs = [p[0] for p in world_pts]
         ys = [p[1] for p in world_pts]

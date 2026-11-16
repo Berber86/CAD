@@ -107,6 +107,14 @@ def _user32():  # noqa: ANN202 - ctypes object
         user32.BringWindowToTop.restype = wintypes.BOOL
         user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
         user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetActiveWindow.argtypes = (wintypes.HWND,)
+        user32.SetActiveWindow.restype = wintypes.HWND
+        user32.SetFocus.argtypes = (wintypes.HWND,)
+        user32.SetFocus.restype = wintypes.HWND
+        user32.AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.AllowSetForegroundWindow.argtypes = (wintypes.DWORD,)
+        user32.AllowSetForegroundWindow.restype = wintypes.BOOL
         user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
         user32.GetWindowRect.restype = wintypes.BOOL
         user32.IsWindowVisible.argtypes = (wintypes.HWND,)
@@ -221,23 +229,64 @@ def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     user32 = _user32()
     if user32 is None:
         return False
+    attached_threads: list[int] = []
     try:
+        import ctypes
+        from ctypes import wintypes
+
         # Do not restore a maximized browser to its small remembered window size on
-        # every keystroke. Restore only when minimized, then retry activation briefly:
-        # Windows can defer SetForegroundWindow while the caller is a worker thread.
+        # every keystroke. Restore only when minimized.
         if user32.IsIconic(handle):
             user32.ShowWindow(handle, 9)  # SW_RESTORE
+
+        foreground_handle = int(user32.GetForegroundWindow() or 0)
+        foreground_pid = wintypes.DWORD()
+        foreground_thread = (
+            int(user32.GetWindowThreadProcessId(foreground_handle, ctypes.byref(foreground_pid)))
+            if foreground_handle else 0
+        )
+        target_pid = wintypes.DWORD()
+        target_thread = int(user32.GetWindowThreadProcessId(handle, ctypes.byref(target_pid)))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        try:
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        except AttributeError:  # simple callable doubles in non-Windows tests
+            pass
+        current_thread = int(kernel32.GetCurrentThreadId())
+
+        # The portal runs from a worker thread. Temporarily attach its input queue to
+        # the UI/foreground and browser queues so Windows permits a deliberate,
+        # verified foreground switch; always detach before returning.
+        for thread_id in dict.fromkeys((foreground_thread, target_thread)):
+            if thread_id and thread_id != current_thread and user32.AttachThreadInput(
+                current_thread, thread_id, True,
+            ):
+                attached_threads.append(thread_id)
+
+        # Let the target browser process become foreground when the current app owns
+        # the active window; this does not send keys or activate any other process.
+        if foreground_handle:
+            user32.AllowSetForegroundWindow(int(target_pid.value))
+
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
-            if int(user32.GetForegroundWindow()) == int(handle):
+            user32.SetActiveWindow(handle)
+            user32.SetFocus(handle)
+            if int(user32.GetForegroundWindow() or 0) == int(handle):
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.05)
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        for thread_id in reversed(attached_threads):
+            try:
+                user32.AttachThreadInput(current_thread, thread_id, False)
+            except Exception:  # noqa: BLE001 - best-effort input queue cleanup
+                pass
 
 
 def maximize_browser_window(handle: int) -> bool:

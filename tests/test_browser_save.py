@@ -160,16 +160,35 @@ def test_portal_click_requires_the_selected_browser_to_be_foreground(monkeypatch
     assert calls == []
 
 
-def test_foreground_retries_until_windows_switches_to_verified_browser(monkeypatch):
+def test_foreground_retries_with_attached_input_queues_for_verified_browser(monkeypatch):
+    import ctypes
     import browser_save
 
     calls = []
-    active = iter((99, 10))
+    active = iter((99, 99, 10))
 
     class User32:
         def IsIconic(self, handle):
             assert handle == 10
             return False
+
+        def GetWindowForegroundWindow(self):
+            return next(active)
+
+        def GetForegroundWindow(self):
+            return next(active)
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            process_id._obj.value = 1234 if handle == 10 else 5678
+            return 40 if handle == 10 else 30
+
+        def AttachThreadInput(self, source, target, attach):
+            calls.append(("attach", source, target, attach))
+            return True
+
+        def AllowSetForegroundWindow(self, process_id):
+            calls.append(("allow", process_id))
+            return True
 
         def BringWindowToTop(self, handle):
             calls.append(("top", handle))
@@ -179,14 +198,26 @@ def test_foreground_retries_until_windows_switches_to_verified_browser(monkeypat
             calls.append(("activate", handle))
             return True
 
-        def GetForegroundWindow(self):
-            return next(active)
+        def SetActiveWindow(self, handle):
+            calls.append(("active", handle))
+
+        def SetFocus(self, handle):
+            calls.append(("focus", handle))
+
+    class Kernel32:
+        def GetCurrentThreadId(self):
+            return 5
 
     monkeypatch.setattr(browser_save, "list_windows", lambda: [_yandex()])
     monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32(), raising=False)
     monkeypatch.setattr(browser_save.time, "sleep", lambda _delay: None)
     assert browser_save.foreground(10, timeout=0.1)
-    assert calls == [("top", 10), ("activate", 10), ("top", 10), ("activate", 10)]
+    assert ("activate", 10) in calls
+    assert ("attach", 5, 30, True) in calls
+    assert ("attach", 5, 40, True) in calls
+    assert ("attach", 5, 40, False) in calls
+    assert ("attach", 5, 30, False) in calls
 
 
 def test_maximize_only_targets_a_verified_browser_window(monkeypatch):

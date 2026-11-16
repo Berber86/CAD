@@ -59,6 +59,108 @@ def test_resolve_zip_url_rejects_repo_only_path_without_owner():
         app_updater.resolve_zip_url("https://github.com/Berber86")
 
 
+def test_http_get_returns_body_when_the_default_ssl_context_works(monkeypatch):
+    """The common path: no certificate trouble, no retry, no certifi involved."""
+    import ssl
+    import urllib.request
+
+    calls = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return b"zip-bytes"
+
+    def fake_urlopen(request, timeout=30.0, context=None):  # noqa: ARG001
+        calls.append(context)
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert app_updater._http_get("https://codeload.github.com/owner/repo/zip/refs/heads/main") == b"zip-bytes"
+    assert calls == [None]  # never touched certifi: the default context already worked
+
+
+def test_http_get_retries_with_certifi_when_the_os_trust_store_rejects_the_cert(monkeypatch):
+    """
+    Reproduces a real failure reported from a Windows machine: every request to
+    codeload.github.com failed with ``CERTIFICATE_VERIFY_FAILED: unable to get
+    issuer certificate`` even though the link opened fine in a browser. The
+    fix retries once against the bundled certifi CA file instead of giving up
+    on the very first certificate-verification failure.
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    contexts_tried = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return b"zip-bytes"
+
+    def fake_urlopen(request, timeout=30.0, context=None):  # noqa: ARG001
+        contexts_tried.append(context)
+        if context is None:
+            reason = ssl.SSLCertVerificationError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get issuer certificate (_ssl.c:1000)"
+            )
+            raise urllib.error.URLError(reason)
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = app_updater._http_get("https://codeload.github.com/owner/repo/zip/refs/heads/main")
+    assert result == b"zip-bytes"
+    assert len(contexts_tried) == 2
+    assert contexts_tried[0] is None
+    assert contexts_tried[1] is not None  # the certifi-backed context
+
+
+def test_http_get_reports_a_clear_error_when_both_trust_stores_reject_the_cert(monkeypatch):
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, timeout=30.0, context=None):  # noqa: ARG001
+        reason = ssl.SSLCertVerificationError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "unable to get issuer certificate (_ssl.c:1000)"
+        )
+        raise urllib.error.URLError(reason)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(app_updater.UpdateError, match="системное|системног"):
+        app_updater._http_get("https://codeload.github.com/owner/repo/zip/refs/heads/main")
+
+
+def test_http_get_does_not_retry_on_unrelated_network_errors(monkeypatch):
+    """A retry is only warranted for certificate trouble, not e.g. DNS failures."""
+    import urllib.error
+    import urllib.request
+
+    calls = []
+
+    def fake_urlopen(request, timeout=30.0, context=None):  # noqa: ARG001
+        calls.append(context)
+        raise urllib.error.URLError("Name or service not known")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(app_updater.UpdateError, match="Name or service not known"):
+        app_updater._http_get("https://codeload.github.com/owner/repo/zip/refs/heads/main")
+    assert calls == [None]  # no pointless retry
+
+
 def test_download_zip_writes_bytes_from_http_get(tmp_path, monkeypatch):
     monkeypatch.setattr(app_updater, "_http_get", lambda url, timeout=30.0: b"zip-bytes")
     destination = tmp_path / "nested" / "update.zip"

@@ -12,6 +12,7 @@ pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (Windows on
 pymupdf>=1.24            # PDF text extraction and page rendering
 Pillow>=10.0             # EXIF rotation, scan enhancement (JPG/TIFF/PNG), GUI previews
 shapely>=2.0             # Step 2: geometry of features (lot, fences, buildings, label boxes)
+certifi>=2024.0          # app_updater.py: CA fallback when the OS trust store rejects GitHub's cert
 
 # Local OCR of scans (optional): pip install -r requirements-ocr.txt
 # Without it scans go to the paid AI/Vision; everything else works the same.

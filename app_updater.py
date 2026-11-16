@@ -24,6 +24,12 @@ skip a small set of root-level settings/secrets files — see
 Network access, ZIP parsing and the local file replacement are split into
 small functions so tests can monkeypatch the HTTP call without touching the
 network.
+
+``_http_get`` also works around a real failure seen on a Windows machine
+where the OS certificate store rejected GitHub's TLS certificate
+(``CERTIFICATE_VERIFY_FAILED: unable to get issuer certificate``) even though
+the same link opened fine in a browser: on that specific failure it retries
+once against the bundled ``certifi`` CA file before giving up.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import ssl
 import tempfile
 import urllib.error
 import urllib.request
@@ -38,6 +45,11 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
+
+try:  # pragma: no cover - certifi is an existing transitive dependency (openai/httpx)
+    import certifi
+except ImportError:  # pragma: no cover - degrade gracefully if it's ever absent
+    certifi = None  # type: ignore[assignment]
 
 USER_AGENT = "TitleSurveyAI-Updater/1.0"
 _ALLOWED_HOSTS = ("github.com", "codeload.github.com", "githubusercontent.com", "api.github.com")
@@ -65,8 +77,35 @@ class UpdateResult:
     protected_skipped: tuple[str, ...] = ()
 
 
+def _is_certificate_verify_failure(reason: object) -> bool:
+    """True when ``reason`` (``URLError.reason``) is an SSL verification failure."""
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    return isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason)
+
+
+def _certifi_ssl_context() -> ssl.SSLContext | None:
+    """A TLS context pinned to the bundled certifi CA file, if it's installed."""
+    if certifi is None:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
-    """Fetch raw bytes from ``url``. The only network primitive in this module."""
+    """
+    Fetch raw bytes from ``url``. The only network primitive in this module.
+
+    Tries the OS trust store first (``urlopen``'s own default context — on
+    Windows this is the system certificate store). Some Windows machines fail
+    every HTTPS request from Python with ``CERTIFICATE_VERIFY_FAILED: unable
+    to get issuer certificate`` even though the same link opens fine in a
+    browser — typically a stale system clock, antivirus HTTPS scanning, or a
+    corporate proxy leaving the system store without the issuing certificate
+    GitHub's CDN uses. When that happens, retry once against the bundled
+    ``certifi`` CA file, which ships its own independently maintained root
+    store. Only a certificate-verification failure triggers the retry; any
+    other network error is reported immediately.
+    """
     request = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
     )
@@ -76,7 +115,28 @@ def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
     except urllib.error.HTTPError as exc:
         raise UpdateError(f"GitHub ответил ошибкой {exc.code} для {url}") from exc
     except urllib.error.URLError as exc:
-        raise UpdateError(f"Не удалось обратиться к {url}: {exc.reason}") from exc
+        if not _is_certificate_verify_failure(exc.reason):
+            raise UpdateError(f"Не удалось обратиться к {url}: {exc.reason}") from exc
+        context = _certifi_ssl_context()
+        if context is None:
+            raise UpdateError(
+                f"Не удалось проверить SSL-сертификат при обращении к {url}: {exc.reason}. "
+                "Возможные причины: неверные дата/время на компьютере, антивирус с проверкой "
+                "HTTPS-трафика или корпоративный прокси. Проверьте системные часы и, если "
+                "используется антивирус с SSL-сканированием, на время обновления отключите его."
+            ) from exc
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:  # noqa: S310
+                return response.read()
+        except urllib.error.HTTPError as retry_exc:
+            raise UpdateError(f"GitHub ответил ошибкой {retry_exc.code} для {url}") from retry_exc
+        except urllib.error.URLError as retry_exc:
+            raise UpdateError(
+                f"Не удалось проверить SSL-сертификат при обращении к {url} ни через системное "
+                f"хранилище, ни через встроенный список корневых сертификатов: {retry_exc.reason}. "
+                "Проверьте дату/время на компьютере и отключите на время обновления HTTPS-сканирование "
+                "антивируса/прокси, затем повторите."
+            ) from retry_exc
 
 
 def _default_branch(owner: str, repo: str, *, timeout: float = 30.0) -> str:

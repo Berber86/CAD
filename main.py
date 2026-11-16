@@ -8020,13 +8020,32 @@ class SurveyApp(ctk.CTk):
         self.pdf_path = chosen
         self._pdf_total_pages = int(info.get("pages") or 1)
         has_legal_text = bool(info.get("has_legal_text", info["has_text"]))
-        if has_legal_text:
-            text = str(info["text"])
+        step0_text_path: Path | None = None
+        step0_text = ""
+        if not has_legal_text:
+            base_stem = re.sub(r"_p\d+(?:[-,]\d+)*$", "", chosen.stem)
+            for candidate_stem in dict.fromkeys((chosen.stem, base_stem)):
+                candidate = chosen.with_name(f"{candidate_stem}_text.txt")
+                if candidate.is_file():
+                    try:
+                        content = candidate.read_text(encoding="utf-8-sig", errors="replace").strip()
+                    except OSError:
+                        content = ""
+                    if content:
+                        step0_text_path = candidate
+                        step0_text = content
+                        break
+        if has_legal_text or step0_text:
+            text = str(info["text"]) if has_legal_text else step0_text
             self._pdf_needs_vision = False
             self.text_box.delete("1.0", "end")
             self.text_box.insert("1.0", text)
             self._loaded_pdf_text = str(self.text_box.get("1.0", "end") or "").strip()
-            self._text_source_label = f"текст из PDF: {chosen.name}"
+            self._text_source_label = (
+                f"текст из PDF: {chosen.name}"
+                if has_legal_text
+                else f"текст Шага 0: {step0_text_path.name}"
+            )
             self._text_source_snapshot = self._loaded_pdf_text
             self._refresh_text_counter()
             # Если извлечён распознаваемый текст обхода, не отправляем его в ИИ по умолчанию.
@@ -8043,10 +8062,16 @@ class SurveyApp(ctk.CTk):
                 text=f"PDF: {self.pdf_path.name} ({len(text):,} симв.)",
                 text_color=THEME["ok"],
             )
-            self._set_status(
-                f"PDF загружен: {self.pdf_path.name}. Найден текст обхода — выбран бесплатный "
-                "локальный разбор; результат нужно сверить с документом."
-            )
+            if has_legal_text:
+                self._set_status(
+                    f"PDF загружен: {self.pdf_path.name}. Найден текст обхода — выбран бесплатный "
+                    "локальный разбор; результат нужно сверить с документом."
+                )
+            else:
+                self._set_status(
+                    f"PDF загружен: {self.pdf_path.name}. Подхвачен текст с Шага 0 ({step0_text_path.name}) — "
+                    "выбран бесплатный локальный разбор; при ошибке можно перераспознать на 400 dpi или через ИИ."
+                )
         else:
             self.text_box.delete("1.0", "end")
             self._pdf_needs_vision = True

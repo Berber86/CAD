@@ -57,9 +57,11 @@ def pages_spec(pages: Iterable[int]) -> str:
 
 
 _DESCRIPTION_START_RE = re.compile(r"\bBEGINNING\s+(?:AT|ON)\b", re.IGNORECASE)
+_OCR_SEP = r"[\s.,:;\-]+"
 _DESCRIPTION_END_RE = re.compile(
-    r"\bTO\s+(?:THE\s+)?(?:TRUE\s+)?"
-    r"(?:POINT(?:\s+OR\s+PLACE)?|PLACE)\s+OF\s+BEGINNING\b",
+    rf"\bT[O0]{_OCR_SEP}(?:TH[EA]{_OCR_SEP})?(?:TRUE{_OCR_SEP})?"
+    rf"(?:P[O0][I1L]NT(?:{_OCR_SEP}(?:[O0]R|AND){_OCR_SEP}P[L1I]ACE)?|P[L1I]ACE)"
+    rf"{_OCR_SEP}[O0]F{_OCR_SEP}BEG[I1L]NN[I1L]NG\b",
     re.IGNORECASE,
 )
 
@@ -151,23 +153,18 @@ def find_description_pages(
                 pages=pages, text="\n".join(pieces), scanned=len(scanned_pages),
                 from_text_layer=used_text_layer and not scanned_pages,
             )
-        # Описание перешло на следующую страницу: дополняем до стандартной точки закрытия.
-        for continuation in range(start_index + 1, limit):
-            text = page_text(continuation, 2 if continuation >= mid and limit >= 4 else 1)
-            pages.append(continuation + 1)
+        # Если фраза завершения не найдена на той же странице — берём с запасом
+        # только следующую страницу и дальше не ищем.
+        next_index = start_index + 1
+        if next_index < limit:
+            text = page_text(next_index, 2 if next_index >= mid and limit >= 4 else 1)
+            pages.append(next_index + 1)
             pieces.append(text)
-            joined = "\n".join(pieces)
-            if has_description_end(joined, after=marker_end):
-                break
-            # Без OCR нечем проверять скан-продолжение; хотя бы захватим следующую
-            # страницу, как просил заказчик, но не будем копировать оставшийся PDF.
-            if not ocr_available and not text.strip():
-                break
-        if progress and not has_description_end("\n".join(pieces), after=marker_end):
-            progress(
-                f"описание началось на стр. {start_index + 1}, но фраза завершения "
-                f"не найдена до стр. {pages[-1]}"
-            )
+            if progress and not has_description_end("\n".join(pieces), after=marker_end):
+                progress(
+                    f"фраза завершения на стр. {start_index + 1} не найдена — "
+                    f"беру с запасом стр. {start_index + 1}–{pages[-1]}"
+                )
         return DescriptionPages(
             pages=pages, text="\n".join(pieces), scanned=len(scanned_pages),
             from_text_layer=used_text_layer and not scanned_pages,

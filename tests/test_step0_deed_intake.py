@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -452,3 +453,128 @@ def test_summary_says_what_is_missing(tmp_path):
     text = deed_store.summary(folder)
     assert "нашего участка в папке нет" in text
     assert "⚠ не проверен" in text
+
+
+# ---------------------------------------------- настоящая страница от заказчика
+
+#: Сохранённая страница списка (Block 6323, Lot 32) — та, что прислал заказчик.
+#: Её сохранил браузер с переводом на русский: «Поступок» = Deed, «Ипотека» =
+#: Mortgage, «Погашение ипотеки»/«САТ»/«A/MTG» = записи о погашении и переуступке.
+REAL_PAGE = Path(__file__).resolve().parents[1] / "docs" / "Клерк округа Ричмонд, штат Нью-Йорк.html"
+
+
+def _real_page_rows():
+    if not REAL_PAGE.is_file():
+        pytest.skip("страница списка документов не приложена к репозиторию")
+    return rcclerk.parse_document_rows(
+        REAL_PAGE.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def test_real_page_gives_every_row_with_type_date_and_clerk_number():
+    rows = _real_page_rows()
+    assert len(rows) == 12
+    first = rows[0]
+    assert first.endorsement_id == "2642470"
+    assert first.doc_type == "Погашение ипотеки"
+    assert first.kind == rcclerk.KIND_SATISFACTION
+    assert first.doc_date == date(2022, 4, 18)     # точки — день.месяц
+    assert first.instrument == "882324"
+
+
+def test_real_page_deed_rows_are_found_through_the_russian_translation():
+    rows = {row.endorsement_id: row for row in _real_page_rows()}
+    assert rows["2640217"].doc_type == "Поступок"
+    assert rows["2640217"].kind == rcclerk.KIND_DEED
+    assert rows["351707"].doc_type == "ПОСТУПОК"
+    assert rows["351707"].kind == rcclerk.KIND_DEED
+    assert rows["351707"].doc_date == date(1985, 7, 10)
+    assert rows["351707"].clerk_number == "№ 17623, кн. 45, стр. 3683"
+    assert rows["2640218"].kind == rcclerk.KIND_MORTGAGE
+
+
+def test_real_page_satisfactions_are_not_taken_for_mortgages():
+    """«Погашение ипотеки» и «A/MTG» содержат слово «ипотека», но описания в них нет."""
+    rows = {row.endorsement_id: row for row in _real_page_rows()}
+    for endorsement_id in ("2642470", "1775233", "1732196", "1694529", "1818080", "1497415"):
+        assert rows[endorsement_id].kind == rcclerk.KIND_SATISFACTION, endorsement_id
+        assert not rows[endorsement_id].is_mortgage
+
+
+def test_real_page_gives_our_lot_the_oldest_and_newest_deed():
+    rows = _real_page_rows()
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("2640217", "NEW"),   # Deed 2022, а не свежая ипотека 2640218
+        ("351707", "OLD"),    # Deed 1985
+    ]
+    assert chosen[0][0].doc_date >= chosen[1][0].doc_date
+
+
+def test_real_page_gives_a_neighbour_only_the_newest_deed():
+    chosen = rcclerk.choose_documents(_real_page_rows(), role="neighbour")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [("2640217", "NEW")]
+
+
+def test_real_page_is_recognised_as_a_list_and_not_a_cloudflare_page():
+    text = REAL_PAGE.read_text(encoding="utf-8", errors="replace")
+    assert "ShowResultsBlocks/0?Block=6323" in text   # сохранена именно эта страница
+    assert not any(
+        mark in text[:4000].lower() and "ViewDocumentInfo" not in text
+        for mark in rcclerk.CLOUDFLARE_MARKS
+    )
+
+
+def test_mortgage_is_taken_only_when_there_is_no_deed_on_the_real_page():
+    rows = [row for row in _real_page_rows() if not row.is_deed]
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("2640218", "NEW"),   # Ипотека 2022 (свежайшая из ипотек)
+        ("940351", "OLD"),    # Ипотека 1985
+    ]
+
+
+# ------------------------------------------- типы и даты: разбор без страницы
+
+
+@pytest.mark.parametrize(
+    "doc_type, kind",
+    [
+        ("DEED", rcclerk.KIND_DEED),
+        ("WAR DEED", rcclerk.KIND_DEED),
+        ("Поступок", rcclerk.KIND_DEED),
+        ("ПОСТУПОК", rcclerk.KIND_DEED),
+        ("Акт купли-продажи", rcclerk.KIND_DEED),
+        ("MORTGAGE", rcclerk.KIND_MORTGAGE),
+        ("Ипотека", rcclerk.KIND_MORTGAGE),
+        ("ИПОТЕКА", rcclerk.KIND_MORTGAGE),
+        ("Погашение ипотеки", rcclerk.KIND_SATISFACTION),
+        ("САТ", rcclerk.KIND_SATISFACTION),
+        ("SAT", rcclerk.KIND_SATISFACTION),
+        ("A/MTG", rcclerk.KIND_SATISFACTION),
+        ("Assignment of mortgage", rcclerk.KIND_SATISFACTION),
+        ("", rcclerk.KIND_OTHER),
+        ("Справка", rcclerk.KIND_OTHER),
+    ],
+)
+def test_document_kind_is_understood_in_english_and_russian(doc_type, kind):
+    assert rcclerk.classify_document(doc_type) == kind
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("18.04.2022", date(2022, 4, 18)),   # день.месяц (переведённая страница)
+        ("9/3/2022", date(2022, 9, 3)),      # сайт: месяц/день — 3 сентября
+        ("03.09.2022", date(2022, 9, 3)),    # перевод: день.месяц — та же дата
+        ("7/10/1985", date(1985, 7, 10)),
+        ("31.02.2020", None),                # такого дня нет — не выдумываем дату
+        ("без даты", None),
+    ],
+)
+def test_registration_date_is_read_in_both_conventions(text, expected):
+    row = rcclerk.parse_document_rows(
+        f'<tr><td data-label="Type">DEED</td><td data-label="Recorded">{text}</td>'
+        '<td data-label="Number"><a href="/Search/ViewDocumentInfo/42">42</a></td></tr>'
+    )
+    assert row[0].doc_date == expected

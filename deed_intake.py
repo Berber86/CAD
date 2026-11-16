@@ -286,6 +286,10 @@ def _collect_one(
         else:
             say(f"  {name}: страницы описания не найдены — файл кладу целиком")
         notes = [f"ступень загрузки: {rung}"] if rung != "direct" else []
+        if row.clerk_number:
+            notes.append(f"клерк: {row.clerk_number}")
+        if row.doc_type and row.doc_type != row.kind:
+            notes.append(f"тип на сайте: {row.doc_type} ({row.kind})")
         record = deed_store.store_pdf(
             target_dir, saved,
             role=role, lot=lot_value, tag=tag, block=block_no,

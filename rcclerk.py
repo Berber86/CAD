@@ -39,6 +39,53 @@ DEED_KINDS = ("DEED", "WAR DEED", "BARGAIN AND SALE DEED", "ADMINISTRATRIX DEED"
               "EXECUTOR DEED", "REFEREE DEED", "QUITCLAIM DEED", "CORRECTIVE DEED")
 MORTGAGE_KINDS = ("MORTGAGE", "MTGE", "CONSOLIDATION", "AGREEMENT")
 
+#: Классификация строки: что это за документ по существу.
+KIND_DEED = "DEED"
+KIND_MORTGAGE = "MORTGAGE"
+KIND_SATISFACTION = "SATISFACTION"
+KIND_OTHER = "OTHER"
+
+#: Русские названия: страницу часто сохраняют с переводом браузера (см. §5 плана).
+DEED_WORDS = ("ПОСТУПОК", "КУПЧ", "АКТ КУПЛИ", "ДАРСТВЕНН", "ЗАВЕЩАНИ", "DEED")
+MORTGAGE_WORDS = ("ИПОТЕК", "ЗАКЛАДН", "MORTGAGE", "MTGE")
+#: Погашение ипотеки и переуступка — **не** описание участка, хотя в них есть слово «ипотека».
+SATISFACTION_WORDS = (
+    "ПОГАШЕН", "ПРЕКРАЩЕН", "РАСПИСК", "SATISFACTION", "DISCHARGE", "RELEASE",
+    "ASSIGNMENT", "ПЕРЕУСТУП", "A/MTG", "A/MTGE",
+)
+
+
+def _has_word(text: str, word: str) -> bool:
+    """Короткие сокращения (``SAT``, ``САТ``) ищем целым словом, длинные — подстрокой."""
+    if len(word) <= 4 and word.isalpha():
+        return re.search(rf"(?<![A-ZА-Я]){re.escape(word)}(?![A-ZА-Я])", text) is not None
+    return word in text
+
+
+def classify_document(doc_type: str) -> str:
+    """
+    DEED / MORTGAGE / SATISFACTION / OTHER — по названию строки, на любом языке.
+
+    Порядок проверок важен: «Погашение ипотеки» содержит «ипотек», но это не ипотека
+    заёмщика, а запись о её погашении — брать такой документ за описание участка
+    нельзя. Переуступка (``A/MTG``, ``ASSIGNMENT``) — тоже не ипотека.
+    """
+    upper = str(doc_type or "").upper().replace("Ё", "Е").strip()
+    if not upper:
+        return KIND_OTHER
+    for word in SATISFACTION_WORDS:
+        if _has_word(upper, word):
+            return KIND_SATISFACTION
+    if _has_word(upper, "САТ") or _has_word(upper, "SAT"):
+        return KIND_SATISFACTION
+    for word in DEED_WORDS:
+        if _has_word(upper, word):
+            return KIND_DEED
+    for word in MORTGAGE_WORDS:
+        if _has_word(upper, word):
+            return KIND_MORTGAGE
+    return KIND_OTHER
+
 #: Как называются файлы (§5 схемы Коли).
 OUR_PREFIX = "OUR"
 NEIGHBOUR_PREFIX = "LOT"
@@ -72,15 +119,36 @@ class DeedRow:
     doc_date: Optional[date] = None
     party: str = ""
     raw: str = ""
+    #: Номер инструмента у клерка (колонка Number), книга и страница — для паспорта.
+    instrument: str = ""
+    book: str = ""
+    page: str = ""
+    #: Место строки в списке: сайт отдаёт документы сверху вниз, от свежих к старым.
+    index: int = 0
+
+    @property
+    def kind(self) -> str:
+        return classify_document(self.doc_type)
 
     @property
     def is_deed(self) -> bool:
-        return self.doc_type.upper() in DEED_KINDS or "DEED" in self.doc_type.upper()
+        return self.kind == KIND_DEED
 
     @property
     def is_mortgage(self) -> bool:
-        text = self.doc_type.upper()
-        return text in MORTGAGE_KINDS or "MORTGAGE" in text or "MTGE" in text
+        return self.kind == KIND_MORTGAGE
+
+    @property
+    def clerk_number(self) -> str:
+        """«№ 876753, кн. 45, стр. 3683» — то, что человек увидит в паспорте."""
+        parts = []
+        if self.instrument:
+            parts.append(f"№ {self.instrument}")
+        if self.book:
+            parts.append(f"кн. {self.book}")
+        if self.page:
+            parts.append(f"стр. {self.page}")
+        return ", ".join(parts)
 
 
 def results_url(block: int | str, lot: int | str, *, base: str = BASE_URL) -> str:
@@ -174,7 +242,10 @@ def document_pdf_url(endorsement_id: int | str, *, base: str = BASE_URL) -> str:
 _ROW_LINK_RE = re.compile(r"ViewDocumentInfo/(\d+)", re.IGNORECASE)
 _ROW_SPLIT_RE = re.compile(r"<tr\b.*?</tr>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
-_DATE_RE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b")
+_DATE_RE = re.compile(r"\b(\d{1,2})\s*([./-])\s*(\d{1,2})\s*[./-]\s*(\d{4})\b", re.UNICODE)
+#: Ячейки с устойчивыми английскими именами колонок: их не трогает даже перевод страницы.
+_CELL_RE = re.compile(r'<td\b[^>]*\bdata-label\s*=\s*"([^"]*)"[^>]*>(.*?)</td>',
+                      re.IGNORECASE | re.DOTALL)
 
 
 def _text_of(html: str) -> str:
@@ -183,16 +254,29 @@ def _text_of(html: str) -> str:
 
 
 def _row_date(text: str) -> Optional[date]:
-    for month, day, year in _DATE_RE.findall(text):
-        try:
-            return date(int(year), int(month), int(day))
-        except ValueError:
-            continue
+    """
+    Дата регистрации из текста строки.
+
+    Формат разный, и это не прихоть: сайт пишет по-американски (``9/3/2022`` —
+    месяц/день), а страница с переводом браузера приходит с точками и европейским
+    порядком (``03.09.2022`` — день.месяц). Поэтому точки читаем как день.месяц,
+    слэш и дефис — как месяц/день; если так не получается, пробуем обратный порядок.
+    """
+    for first, sep, second, year in _DATE_RE.findall(text):
+        # Точки — день.месяц (переведённая страница), слэш и дефис — месяц/день (сайт).
+        pairs = ((first, second), (second, first)) if sep == "." else (
+            (second, first), (first, second)
+        )
+        for day, month in pairs:
+            try:
+                return date(int(year), int(month), int(day))
+            except ValueError:
+                continue
     return None
 
 
 def _row_type(text: str) -> str:
-    """Тип документа из текста строки: «DEED», «MORTGAGE», …"""
+    """Тип документа из текста строки: «DEED», «MORTGAGE», «Поступок», …"""
     upper = text.upper()
     # Составные названия важнее: «WAR DEED» не должно стать просто «DEED».
     for kind in sorted(set(DEED_KINDS) | set(MORTGAGE_KINDS), key=len, reverse=True):
@@ -205,22 +289,43 @@ def _row_type(text: str) -> str:
     return ""
 
 
+def _row_cells(block: str) -> dict[str, str]:
+    """Ячейки строки по ``data-label``: ``{"type": "ПОСТУПОК", "recorded": "03.09.2022", …}."""
+    cells: dict[str, str] = {}
+    for label, inner in _CELL_RE.findall(block):
+        key = " ".join(str(label).split()).lower()
+        if not key or key in cells:
+            continue
+        cells[key] = _text_of(inner)
+    return cells
+
+
+def _cell(cells: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = cells.get(name, "")
+        if value:
+            return value
+    return ""
+
+
 def parse_document_rows(html: str) -> list[DeedRow]:
     """
-    Строки списка документов: номер, тип, дата.
+    Строки списка документов: номер, тип, дата, книга и страница.
 
-    Разбор нарочно терпимый: страницу сайта мы пока видели только глазами, поэтому
-    ищем ссылки ``ViewDocumentInfo/<id>`` и вокруг них — тип документа и дату.
-    Если сайт отдаёт строки не в ``<tr>``, разбор всё равно найдёт номера и типы
-    (тогда дата может не определиться). Настоящий HTML надо один раз прогнать
-    через ``docs/step0_deed_intake_plan.md`` §15 и, если нужно, уточнить правила.
+    Разбор опирается на ``data-label`` у ячеек (``Block``, ``Lot``, ``Book``, ``Page``,
+    ``Recorded``, ``Type``, ``Number``): эти имена не меняются, даже когда браузер
+    переводит страницу на русский — а настоящую страницу заказчик присылает именно
+    переведённой (``Поступок`` = Deed, ``Ипотека`` = Mortgage, ``Погашение ипотеки`` =
+    Satisfaction). Если ``data-label`` нет (страница другой вёрстки), работает старый
+    терпимый разбор по тексту строки: номер из ссылки ``ViewDocumentInfo/<id>``, тип и
+    дата — из текста.
     """
     rows: list[DeedRow] = []
     blocks = _ROW_SPLIT_RE.findall(html or "")
     if not blocks:
         blocks = [html or ""]
     seen: set[str] = set()
-    for block in blocks:
+    for position, block in enumerate(blocks):
         match = _ROW_LINK_RE.search(block)
         if match is None:
             continue
@@ -229,12 +334,25 @@ def parse_document_rows(html: str) -> list[DeedRow]:
             continue
         seen.add(endorsement_id)
         text = _text_of(block)
+        cells = _row_cells(block)
+        doc_type = _cell(cells, "type", "document type", "тип")
+        date_text = _cell(cells, "recorded", "recorded date", "дата регистрации")
+        instrument = _cell(cells, "number", "instrument", "номер")
+        book = _cell(cells, "book", "книга")
+        page = _cell(cells, "page", "страница")
+        if not doc_type:
+            doc_type = _row_type(text)
+        number = re.search(r"\d+", instrument)
         rows.append(DeedRow(
             endorsement_id=endorsement_id,
-            doc_type=_row_type(text),
-            doc_date=_row_date(text),
+            doc_type=doc_type,
+            doc_date=_row_date(date_text or text),
             party="",
             raw=text[:400],
+            instrument=number.group(0) if number else "",
+            book=book,
+            page=page,
+            index=position,
         ))
     return rows
 
@@ -245,10 +363,15 @@ def parse_document_rows(html: str) -> list[DeedRow]:
 
 
 def _sorted_by_date(rows: Iterable[DeedRow]) -> list[DeedRow]:
-    """Старые сверху; строки без даты — в конец (не выбрасываем: могут быть единственными)."""
+    """
+    Старые сверху; строки без даты — в конец (не выбрасываем: могут быть единственными).
+
+    При одинаковой дате порядок берём со страницы: сайт показывает документы сверху
+    вниз, от свежих к старым, поэтому верхняя строка считается более новой.
+    """
     dated = [row for row in rows if row.doc_date is not None]
     undated = [row for row in rows if row.doc_date is None]
-    return sorted(dated, key=lambda row: row.doc_date) + undated
+    return sorted(dated, key=lambda row: (row.doc_date, -row.index)) + undated
 
 
 def choose_documents(

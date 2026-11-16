@@ -92,6 +92,7 @@ from feature_labeler import feature_settings
 from version import APP_DATE, APP_VERSION
 from llm_parser import (
     ASPENWALL_SAMPLES,
+    legal_to_step0_text,
     CONFIG_PATH,
     ENV_PATH,
     IMAGE_EXTENSIONS,
@@ -7494,7 +7495,7 @@ class SurveyApp(ctk.CTk):
     @staticmethod
     def _shape_rank(plan: Any, issues: list[str], warnings: Any = ()) -> tuple[int, int, float]:
         if plan is None:
-            return (0, -999, -9999.0)
+            return (0, -999, -9999.0, 0)
         where, _ = ocr_closure_note(plan)
         suspicion = getattr(plan, "suspicion", None)
         suspicious = bool(suspicion is not None and suspicion.is_suspicious)
@@ -7504,7 +7505,63 @@ class SurveyApp(ctk.CTk):
             + (1 if suspicious else 0) + (1 if no_distance else 0)
         )
         closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
-        return (1, -severe_count, -round(closure, 4))
+        # При равной фигуре больше данных о расстояниях (угол, длины сторон) — лучше.
+        desc = getattr(plan, "description", None)
+        info = 0
+        if desc is not None:
+            info += 1 if float(getattr(desc, "distance_to_corner_ft", 0.0) or 0.0) > 0 else 0
+            info += sum(
+                1 for seg in (getattr(desc, "segments", None) or ())
+                if float(getattr(seg, "distance_ft", 0.0) or 0.0) > 0 and getattr(seg, "has_bearing", True)
+            )
+        return (1, -severe_count, -round(closure, 4), info)
+
+    def _local_text_rank(
+        self, job: PdfSetJob, text: str, builder: AcadBuilder, scale: float, cfg: dict[str, Any],
+        provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+        do_auto_orient: bool, post: Any,
+    ) -> tuple[int, int, float, int] | None:
+        """Ранг текста, как его прочитает локальный разбор (без ИИ). None — текст не читается."""
+        try:
+            probe = dataclasses.replace(job, source={"text": text}, use_llm=False, ocr=True)
+            outcome, _, issues = self._parse_pdf_set_job(
+                probe, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient,
+                lambda msg: None, post,
+            )
+            plan = builder.plan(outcome.data, scale=scale, is_neighbor=not job.is_main)
+        except Exception:  # noqa: BLE001 - нечитаемый текст просто не даёт ранга
+            return None
+        return self._shape_rank(plan, list(issues), outcome.warnings)
+
+    def _write_ai_to_step0_cache(
+        self, job: PdfSetJob, data: Any, *, prev_rank: tuple[int, int, float, int] | None,
+        cache_path: Path | None, builder: AcadBuilder, scale: float, cfg: dict[str, Any],
+        provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+        do_auto_orient: bool, post: Any,
+    ) -> str:
+        """
+        Пишет ответ ИИ в кеш Шага 0, если пересобранный текст лучше прежнего уровня.
+
+        Лучше — строго выше ранга (фигура, затем данные о расстояниях). При равенстве кеш
+        не меняется. Возвращает строку для журнала.
+        """
+        rendered = legal_to_step0_text(data)
+        if rendered is None:
+            return "ответ ИИ нельзя записать текстом (сторона без румба) — кеш не изменён"
+        new_rank = self._local_text_rank(
+            job, rendered, builder, scale, cfg, provider_id, model_name, api_key, key_secret,
+            do_auto_orient, post,
+        )
+        if new_rank is None:
+            return "ответ ИИ не читается локально — кеш не изменён"
+        if prev_rank is not None and not new_rank > prev_rank:
+            return "ответ ИИ не лучше кеша — кеш не изменён"
+        target = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+        try:
+            target.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            return f"кеш не записан: {exc}"
+        return f"кеш Шага 0 обновлён ответом ИИ ({target.name})"
 
     def _needs_local_recheck(self, outcome: Any, plan: Any, issues: list[str]) -> bool:
         """
@@ -7572,8 +7629,7 @@ class SurveyApp(ctk.CTk):
                         best_outcome = None
                         best_plan = None
                         best_issues: list[str] = []
-                        best_text = ""
-                        best_rank = (0, -999, -9999.0)
+                        best_rank = (0, -999, -9999.0, 0)
                         last_exc: Exception | None = None
 
                         if cached_text:
@@ -7586,7 +7642,7 @@ class SurveyApp(ctk.CTk):
                                 )
                                 d1 = apply_changes(o1.data, fix_changes(job.fixes))
                                 p1 = builder.plan(d1, scale=scale, is_neighbor=not job.is_main)
-                                best_outcome, best_plan, best_issues, best_text = o1, p1, list(iss1), cached_text
+                                best_outcome, best_plan, best_issues = o1, p1, list(iss1)
                                 best_rank = self._shape_rank(p1, iss1, o1.warnings)
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
@@ -7615,7 +7671,7 @@ class SurveyApp(ctk.CTk):
                                     p2 = builder.plan(d2, scale=scale, is_neighbor=not job.is_main)
                                     r2 = self._shape_rank(p2, iss2, o2.warnings)
                                     if r2 > best_rank:
-                                        best_outcome, best_plan, best_issues, best_text, best_rank = o2, p2, list(iss2), text_400, r2
+                                        best_outcome, best_plan, best_issues, best_rank = o2, p2, list(iss2), r2
                                         # Лучше предыдущего уровня (кеша или прошлого dpi) — кеш обновляем на него.
                                         target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
                                         try:
@@ -7647,16 +7703,18 @@ class SurveyApp(ctk.CTk):
                                 d3 = apply_changes(o3.data, fix_changes(job.fixes))
                                 p3 = builder.plan(d3, scale=scale, is_neighbor=not job.is_main)
                                 r3 = self._shape_rank(p3, iss3, o3.warnings)
+                                prev_rank = best_rank
                                 if r3 > best_rank:
                                     best_outcome, best_plan, best_issues, best_rank = o3, p3, list(iss3), r3
                                     pre_counted = pre3
-                                    llm_raw = str(getattr(o3, "raw_text", "") or "").strip()
-                                    if llm_raw and llm_raw != best_text:
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(llm_raw, encoding="utf-8")
-                                        except OSError:
-                                            pass
+                                # Ответ ИИ — в кеш, если он лучше предыдущего уровня (кеш или OCR).
+                                ai_note = self._write_ai_to_step0_cache(
+                                    job, o3.data, prev_rank=prev_rank, cache_path=cache_path,
+                                    builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
+                                    model_name=model_name, api_key=api_key, key_secret=key_secret,
+                                    do_auto_orient=do_auto_orient, post=post,
+                                )
+                                post("progress", f"[{idx}/{total}] {job.path.name}: {ai_note}")
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
 
@@ -7680,6 +7738,27 @@ class SurveyApp(ctk.CTk):
                         if not self._worker_is_current():
                             return
                         result.llm_used = bool(job.use_llm or getattr(outcome, "source", "") == "llm")
+                        if job.use_llm and job.scan and not job.ocr:
+                            # Скан разобран ИИ сразу: его текст — в кеш, если лучше имеющегося.
+                            cache_path = self._find_step0_cache_path(job.path)
+                            prev_rank = None
+                            if cache_path is not None:
+                                try:
+                                    cache_text = cache_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+                                except OSError:
+                                    cache_text = ""
+                                if cache_text:
+                                    prev_rank = self._local_text_rank(
+                                        job, cache_text, builder, scale, cfg, provider_id, model_name,
+                                        api_key, key_secret, do_auto_orient, post,
+                                    )
+                            ai_note = self._write_ai_to_step0_cache(
+                                job, outcome.data, prev_rank=prev_rank, cache_path=cache_path,
+                                builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
+                                model_name=model_name, api_key=api_key, key_secret=key_secret,
+                                do_auto_orient=do_auto_orient, post=post,
+                            )
+                            post("progress", f"[{idx}/{total}] {job.path.name}: {ai_note}")
                         if job.use_llm:
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)

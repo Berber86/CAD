@@ -3038,6 +3038,56 @@ def _spell_numbers_before_feet(text: str) -> tuple[str, list[str]]:
     return _WORD_NUMBER_FEET_RE.sub(repl, text), notes
 
 
+_STEP0_NS = {"N": "North", "S": "South"}
+_STEP0_EW = {"E": "East", "W": "West"}
+_STEP0_SIDE = {
+    "N": "northerly", "S": "southerly", "E": "easterly", "W": "westerly",
+    "NE": "northeasterly", "NW": "northwesterly", "SE": "southeasterly", "SW": "southwesterly",
+}
+
+
+def legal_to_step0_text(data: "LegalDescription") -> str | None:
+    """
+    Пересобирает структурированный результат (в т.ч. ответ ИИ) в текст описания для кеша Шага 0.
+
+    Текст пишется в стиле документа, чтобы локальный разбор читал его так же, как OCR.
+    Если какая-то сторона без компасного румба, пересборка не даст того же контура,
+    поэтому возвращаем ``None``: в кеш такой ответ не пишем.
+    """
+    segments = list(getattr(data, "segments", None) or ())
+    main = (getattr(data, "main_street", "") or "").strip()
+    if not segments or not main:
+        return None
+    if any(not seg.has_bearing for seg in segments):
+        return None
+
+    def bearing(seg: Any) -> str:
+        sec = float(seg.seconds)
+        sec_text = str(int(sec)) if sec.is_integer() else f"{sec:.2f}"
+        return (
+            f"{_STEP0_NS[seg.ns]} {seg.degrees} degrees {seg.minutes} minutes "
+            f"{sec_text} seconds {_STEP0_EW[seg.ew]}"
+        )
+
+    front = _STEP0_SIDE.get(str(getattr(data, "front_side", "") or ""), "")
+    side_part = f"the {front} side of {main}" if front else main
+    head = f"ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on {side_part}"
+    tie = float(getattr(data, "distance_to_corner_ft", 0.0) or 0.0)
+    cross = (getattr(data, "cross_street", "") or "").strip()
+    if tie > 0 and cross:
+        head += (
+            f", distant {tie:.2f} feet from the corner formed by the intersection of "
+            f"{main} and {cross}"
+        )
+    parts = [head + ";"]
+    last = len(segments) - 1
+    for index, seg in enumerate(segments):
+        lead = "RUNNING THENCE" if index == 0 else "THENCE"
+        ending = " to the point or place of BEGINNING." if index == last else " to a point;"
+        parts.append(f"{lead} {bearing(seg)} {float(seg.distance_ft):.2f} feet{ending}")
+    return " ".join(parts)
+
+
 _STREET_SUFFIX = (
     r"(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Boulevard|Blvd|Lane|Ln|Way|Court|Ct|"
     r"Place|Pl|Parkway|Pkwy|Highway|Hwy|Circle|Cir|Trail|Trl|Terrace|Ter|Loop|Pike|"

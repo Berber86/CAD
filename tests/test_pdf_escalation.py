@@ -264,6 +264,8 @@ def _worker_stub(gui_module, post, *, severe: bool, parse_job):
     stub._needs_local_recheck = lambda outcome, plan, issues: gui_module.SurveyApp._needs_local_recheck(
         stub, outcome, plan, issues,
     )
+    stub._local_text_rank = lambda *a, **k: gui_module.SurveyApp._local_text_rank(stub, *a, **k)
+    stub._write_ai_to_step0_cache = lambda *a, **k: gui_module.SurveyApp._write_ai_to_step0_cache(stub, *a, **k)
     return stub
 
 
@@ -472,3 +474,109 @@ def test_suspicious_shape_triggers_local_recheck_but_not_paid_ai(gui):
     clean_plan = types.SimpleNamespace(suspicion=types.SimpleNamespace(is_suspicious=False), warnings=[],
                                        closure=None, description=None)
     assert gui.SurveyApp._needs_local_recheck(stub, outcome, clean_plan, []) is False
+
+
+def test_equal_figure_with_more_distance_data_ranks_higher(gui):
+    """При одинаковой фигуре больше данных о расстояниях (угол, длины сторон) — выше."""
+    seg = types.SimpleNamespace(distance_ft=100.0, has_bearing=True)
+    with_tie = types.SimpleNamespace(distance_to_corner_ft=161.0, segments=[seg] * 4)
+    without_tie = types.SimpleNamespace(distance_to_corner_ft=0.0, segments=[seg] * 4)
+    plan_a = types.SimpleNamespace(suspicion=None, warnings=[], closure=None, closure_error_ft=0.0,
+                                   description=without_tie)
+    plan_b = types.SimpleNamespace(suspicion=None, warnings=[], closure=None, closure_error_ft=0.0,
+                                   description=with_tie)
+    rank_a = gui.SurveyApp._shape_rank(plan_a, [], ())
+    rank_b = gui.SurveyApp._shape_rank(plan_b, [], ())
+    assert rank_b > rank_a
+
+
+def _ai_write_stub(gui, post):
+    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    return stub
+
+
+def test_ai_result_better_than_cache_replaces_it(gui, tmp_path):
+    """Ответ ИИ с расстоянием до угла лучше кеша без него → кеш пишется текстом ИИ."""
+    from acad_builder import AcadBuilder
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    cache = tmp_path / "LOT 68 NEW_text.txt"
+    cache.write_text(NO_TIE, encoding="utf-8")
+    job = PdfSetJob(path=pdf, is_main=True, use_llm=True, pages_label="стр. 3–4", mode_label="ИИ",
+                    parse_key=("x",), source={"pdf_path": pdf}, scan=True)
+    cfg = load_config()
+    builder = AcadBuilder(cfg)
+    stub = _ai_write_stub(gui, lambda *a: None)
+    prev = stub._local_text_rank(job, NO_TIE, builder, 16.0, cfg, "p", "m", None, "", False, lambda *a: None)
+    ai_data, _ = smoke_parse(CLEAN)
+    note = stub._write_ai_to_step0_cache(
+        job, ai_data, prev_rank=prev, cache_path=cache, builder=builder, scale=16.0, cfg=cfg,
+        provider_id="p", model_name="m", api_key=None, key_secret="", do_auto_orient=False,
+        post=lambda *a: None,
+    )
+    assert "обновлён" in note, note
+    assert "distant 161.00 feet" in cache.read_text(encoding="utf-8")
+
+
+def test_worse_ai_result_leaves_cache_alone(gui, tmp_path):
+    """Ответ ИИ не лучше кеша → кеш не меняется."""
+    from acad_builder import AcadBuilder
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    cache = tmp_path / "LOT 68 NEW_text.txt"
+    cache.write_text(CLEAN, encoding="utf-8")
+    job = PdfSetJob(path=pdf, is_main=True, use_llm=True, pages_label="стр. 3–4", mode_label="ИИ",
+                    parse_key=("x",), source={"pdf_path": pdf}, scan=True)
+    cfg = load_config()
+    builder = AcadBuilder(cfg)
+    stub = _ai_write_stub(gui, lambda *a: None)
+    prev = stub._local_text_rank(job, CLEAN, builder, 16.0, cfg, "p", "m", None, "", False, lambda *a: None)
+    ai_data, _ = smoke_parse(NO_TIE)
+    note = stub._write_ai_to_step0_cache(
+        job, ai_data, prev_rank=prev, cache_path=cache, builder=builder, scale=16.0, cfg=cfg,
+        provider_id="p", model_name="m", api_key=None, key_secret="", do_auto_orient=False,
+        post=lambda *a: None,
+    )
+    assert "не лучше" in note, note
+    assert cache.read_text(encoding="utf-8") == CLEAN
+
+
+def smoke_parse(text):
+    import llm_parser as L
+    return L.parse_with_regex(text)
+
+
+def test_scan_parsed_by_ai_from_the_start_updates_weaker_cache(gui, tmp_path, monkeypatch):
+    """Скан с режимом ИИ сразу: ответ ИИ лучше кеша без расстояния → кеш обновляется."""
+    import llm_parser as L
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    cache = tmp_path / "LOT 68 NEW_text.txt"
+    cache.write_text(NO_TIE, encoding="utf-8")
+    done: dict = {}
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    ai_model, _ = L.parse_with_regex(CLEAN)
+
+    def parse_job(job, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient, progress, post_):
+        if job.use_llm:
+            outcome = types.SimpleNamespace(data=ai_model, warnings=[], source="llm", prepared_text="",
+                                            prepared_images=[], usage=None, raw_text="")
+            return outcome, False, []
+        return gui.SurveyApp._parse_pdf_set_job(stub, job, cfg, provider_id, model_name, api_key, key_secret,
+                                                do_auto_orient, progress, post_)
+
+    stub._parse_pdf_set_job = parse_job
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=True, pages_label="стр. 3–4", mode_label="ИИ",
+        parse_key=("x",), source={"pdf_path": pdf, "pdf_pages": (3, 4)}, ocr=False, scan=True,
+    )
+    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", "key", "", 1.0, False, {}, False)
+    results, _ = done["payload"]
+    assert results[0].error == "", results[0].error
+    assert "distant 161.00 feet" in cache.read_text(encoding="utf-8")

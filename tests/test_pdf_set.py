@@ -363,9 +363,13 @@ def test_each_file_has_its_own_parser_and_scans_send_only_their_pages(gui, tmp_p
     dialog.submit()
     _wait(app)
 
-    by_llm = {call["use_llm"]: call for call in calls}
-    assert len(calls) == 2
-    assert "text" in by_llm[False] and "pdf_path" not in by_llm[False]
+    # Один вызов ИИ по скану; остальные — локальные разборы текста (в том числе проверка
+    # ответа ИИ перед записью в кеш Шага 0).
+    llm_calls = [call for call in calls if call["use_llm"]]
+    local_calls = [call for call in calls if not call["use_llm"]]
+    assert len(llm_calls) == 1
+    assert local_calls and all("text" in call and "pdf_path" not in call for call in local_calls)
+    by_llm = {True: llm_calls[0]}
     assert by_llm[True]["pdf_path"] == scan and by_llm[True]["pdf_pages"] == "2-3"
     assert not by_llm[True].get("text")
     assert app._preview_main_plan is not None and set(app._neighbor_plan_sources) == {scan}

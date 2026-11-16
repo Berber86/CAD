@@ -64,3 +64,22 @@ def test_lot72_ocr_text_gives_four_sides_and_the_corner_distance():
     # «north westerly» через пробел склеивается: без этого угол улицы не находился бы.
     assert model.cross_street == "Carlton Boulevard"
 
+
+
+def test_ai_answer_renders_to_cache_text_that_reads_back_the_same():
+    """Ответ ИИ, пересобранный в текст, читается локально так же: стороны и угол совпадают."""
+    model, _ = L.parse_with_regex(LOT72_OCR)
+    rendered = L.legal_to_step0_text(model)
+    assert rendered is not None
+    back, _ = L.parse_with_regex(rendered)
+    assert [(s.ns, s.degrees, s.minutes, s.seconds, s.ew, s.distance_ft) for s in back.segments] == [
+        (s.ns, s.degrees, s.minutes, s.seconds, s.ew, s.distance_ft) for s in model.segments
+    ]
+    assert back.distance_to_corner_ft == model.distance_to_corner_ft == 241.0
+    assert back.main_street == model.main_street and back.cross_street == model.cross_street
+
+
+def test_side_without_bearing_is_not_rendered():
+    model, _ = L.parse_with_regex(LOT72_OCR)
+    model.segments[1].has_bearing = False
+    assert L.legal_to_step0_text(model) is None

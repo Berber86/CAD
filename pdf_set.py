@@ -216,6 +216,8 @@ class PdfSetJob:
     fixes: tuple[Any, ...] = ()
     #: Файл — скан: текст появится из локального OCR (бесплатно), уже в фоне.
     ocr: bool = False
+    #: Файл — скан без текстового слоя: ответ ИИ по нему пишется в кеш Шага 0.
+    scan: bool = False
 
     @property
     def role_label(self) -> str:
@@ -264,6 +266,7 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         cached_issues=tuple(item.issues) if reuse else (),
         fixes=tuple(item.fixes) if reuse else (),
         ocr=bool(source is not None and "ocr_path" in source),
+        scan=not item.has_legal_text(),
     )
 
 

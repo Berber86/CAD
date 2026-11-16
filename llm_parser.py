@@ -3016,6 +3016,7 @@ def _distance_after(chunk: str) -> float | None:
     Читает длину стороны: сначала проверяет связку «13 feet 8 inches» / «25'-6 1/2"»,
     затем явную пометку ``(DEED)``, затем обычное число в футах.
     """
+    chunk = re.sub(r"(?<=\d)[Oo](?=[\d.])|(?<=[\d.])[Oo]", "0", chunk)
     fi = _FEET_INCHES_STR_RE.search(chunk)
     deed_match = re.search(
         r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:'|′|ft\b\.?|feet\b|foot\b)\s*\(\s*DEED\s*\)",

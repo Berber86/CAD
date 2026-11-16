@@ -7405,6 +7405,12 @@ class SurveyApp(ctk.CTk):
                             pages = job.source.get("pdf_pages") or (1, 1)
                             first_p, last_p = int(pages[0]), int(pages[1])
                             try:
+                                total_p = int(inspect_pdf(job.path).get("pages") or 0)
+                                if 1 <= total_p <= 2:
+                                    first_p, last_p = 1, total_p
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
                                 text_400 = ocr_pages.ocr_pdf_pages(job.path, first_p, last_p, dpi=400).strip()
                             except Exception:  # noqa: BLE001
                                 text_400 = ""
@@ -7431,7 +7437,8 @@ class SurveyApp(ctk.CTk):
                         if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
                             post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
                             try:
-                                jllm = dataclasses.replace(job, use_llm=True)
+                                clean_llm_source = {k: v for k, v in job.source.items() if k != "ocr_path"}
+                                jllm = dataclasses.replace(job, source=clean_llm_source, use_llm=True)
                                 o3, pre3, iss3 = self._parse_pdf_set_job(
                                     jllm, cfg, provider_id, model_name, api_key, key_secret,
                                     do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,

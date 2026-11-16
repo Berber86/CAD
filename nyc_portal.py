@@ -414,8 +414,20 @@ def _drive_portal(
         # If the user left the Select menu open, do not toggle it closed. Address is option 3.
         if not _has_exact_text(rows, "Address"):
             _click_text(window.handle, rows, "Select")
+            # The click opens the dropdown asynchronously (render/animation, listener
+            # attachment). Sending arrow keys before it is actually open is exactly
+            # how the menu was observed opening and instantly doing nothing: the
+            # Down/Down/Enter presses landed before anything was listening for them.
+            # Confirm the option list is visible (its "Address" row appears) before
+            # driving it with the keyboard, instead of guessing with a fixed delay.
+            rows = _wait_screen(
+                window.handle, lambda screen: _has_exact_text(screen, "Address"),
+                timeout=5, description="открывшийся список Select",
+            )
         _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(0.2)
         _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(0.2)
         _key(window.handle, browser_save.VK_RETURN)
         rows = _wait_screen(
             window.handle, lambda screen: _contains(screen, "Enter an Address"),
@@ -427,6 +439,7 @@ def _drive_portal(
     _type_into_address(window.handle, address, rows)
     _wait_after_address_input(window.handle)
     _key(window.handle, browser_save.VK_DOWN)
+    time.sleep(0.2)
     _key(window.handle, browser_save.VK_RETURN)
     rows = _wait_screen(
         window.handle,

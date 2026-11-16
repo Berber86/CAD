@@ -5269,12 +5269,14 @@ class SurveyApp(ctk.CTk):
                     self.attributes("-topmost", False)
             except Exception:  # noqa: BLE001
                 was_topmost = False
+            from tkinter import messagebox
+
             if messagebox.askyesno(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
                 "Перезапустить программу сейчас?",
             ):
-                run_bat = app_dir() / "run.bat"
+                run_bat = Path(__file__).resolve().parent / "run.bat"
                 if run_bat.is_file():
                     if sys.platform == "win32":
                         subprocess.Popen(
@@ -7417,7 +7419,14 @@ class SurveyApp(ctk.CTk):
                             except Exception:  # noqa: BLE001
                                 pass
                             try:
-                                text_400 = ocr_pages.ocr_pdf_pages(job.path, first_p, last_p, dpi=400).strip()
+                                text_400 = ocr_pages.ocr_pdf_pages(
+                                    job.path,
+                                    first_p,
+                                    last_p,
+                                    dpi=400,
+                                    use_cache=False,
+                                    progress=lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"),
+                                ).strip()
                             except Exception:  # noqa: BLE001
                                 text_400 = ""
                             if text_400 and text_400 != cached_text:

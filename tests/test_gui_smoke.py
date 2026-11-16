@@ -4031,6 +4031,97 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     assert "сохранены" in status_text.lower()
 
 
+def _finish_update(app, gui, monkeypatch, files=7):
+    """Запускает обновление с подменённым архивом и дожидается его конца."""
+    import time
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+        return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=files, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+
+def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
+    """Регресс: после обновления показывается вопрос о перезапуске и запускается run.bat."""
+    import subprocess
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (asked.append((title, text)) or True))
+    launched: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+
+    _finish_update(app, gui, monkeypatch)
+
+    restart_questions = [text for title, text in asked if title == "Обновление завершено"]
+    assert restart_questions, "вопрос о перезапуске не показан"
+    assert "Перезапустить" in restart_questions[0]
+    assert launched, "run.bat не запущен"
+    assert launched[0][:3] == ["cmd", "/c", "start"]
+    assert launched[0][-1].endswith("run.bat")
+    # run.bat ищется рядом с main.py, а не в текущей папке запуска.
+    from pathlib import Path as _Path
+
+    assert _Path(launched[0][-1]) == _Path(gui.__file__).resolve().parent / "run.bat"
+    assert destroyed, "окно должно закрыться после успешного запуска нового экземпляра"
+
+
+def test_failed_restart_keeps_window_and_says_how_to_restart(gui, monkeypatch):
+    import subprocess
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def refuse(args, **kw):
+        raise PermissionError("доступ запрещён")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+
+    _finish_update(app, gui, monkeypatch)
+
+    assert not destroyed, "нельзя закрывать программу, если новый экземпляр не запущен"
+    text = app.update_status_label.cget("text")
+    assert "7" in text, "итог обновления не должен пропасть"
+    assert "вручную" in text and "run.bat" in text
+    assert "доступ запрещён" in text
+
+
+def test_one_failing_event_does_not_stop_the_queue(gui, monkeypatch):
+    """Регресс: исключение в обработчике не должно остановить разбор следующих событий."""
+    app = gui.SurveyApp()
+
+    def boom():
+        raise RuntimeError("тестовый сбой")
+
+    monkeypatch.setattr(app, "_finish_busy", boom)
+    app._events.put((app._generation, "done", None))
+    app._events.put((app._generation, "update_progress", "шаг после сбоя"))
+    app._drain_events()
+    # Событие после сбоя обработано: очередь не остановилась.
+    assert app.update_status_label.cget("text") == "шаг после сбоя"
+
+    # Сам сбой виден в строке статуса, если он был последним событием.
+    app._events.put((app._generation, "done", None))
+    app._drain_events()
+    assert "тестовый сбой" in app.status_var.get()
+
+
 def test_update_version_declined_confirmation_does_not_run(gui, monkeypatch):
     from tkinter import messagebox
 

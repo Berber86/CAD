@@ -5267,32 +5267,66 @@ class SurveyApp(ctk.CTk):
                 f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
+            from tkinter import messagebox
+
             try:
                 was_topmost = bool(self.attributes("-topmost"))
                 if was_topmost:
                     self.attributes("-topmost", False)
             except Exception:  # noqa: BLE001
                 was_topmost = False
-            if messagebox.askyesno(
+            asked = messagebox.askyesno(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
                 "Перезапустить программу сейчас?",
-            ):
-                run_bat = app_dir() / "run.bat"
-                if run_bat.is_file():
-                    if sys.platform == "win32":
-                        subprocess.Popen(
-                            ["cmd", "/c", "start", "", str(run_bat)],
-                            cwd=str(run_bat.parent),
-                        )
-                    else:
-                        subprocess.Popen([str(run_bat)], cwd=str(run_bat.parent))
-                self.destroy()
+            )
+            if asked:
+                problem = self._relaunch_after_update()
+                if problem:
+                    # Окно остаётся открытым: без нового экземпляра закрывать программу нельзя.
+                    base = str(self.update_status_label.cget("text"))
+                    text = (
+                        f"{base} Не удалось перезапустить автоматически ({problem}): "
+                        "закройте программу и запустите run.bat из её папки вручную."
+                    )
+                    self.update_status_label.configure(text=text, text_color=THEME["err"])
+                    self._set_status(text, error=True)
+                else:
+                    self.destroy()
+                    return
+            if was_topmost:
+                try:
+                    self.attributes("-topmost", True)
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             self.update_status_label.configure(
                 text=f"Обновление не удалось: {payload}", text_color=THEME["err"],
             )
             self._set_status(f"Обновление не удалось: {payload}", error=True)
+
+    def _relaunch_after_update(self) -> str:
+        """
+        Запускает run.bat из папки программы, чтобы поднять обновлённую версию.
+
+        Папка берётся из пути main.py (run.bat лежит рядом с ним), а не из текущей
+        директории. Возвращает текст причины, если запуск не удался, иначе пустую строку.
+        """
+        import subprocess
+
+        run_bat = Path(__file__).resolve().parent / "run.bat"
+        if not run_bat.is_file():
+            return f"не найден {run_bat.name} в папке программы"
+        if sys.platform != "win32":
+            return "автоматический перезапуск работает в Windows"
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", str(run_bat)],
+                cwd=str(run_bat.parent),
+            )
+        except OSError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return ""
 
     def _bind_studio_shortcuts(self) -> None:
         """Привязывает студийные горячие клавиши для быстрой повседневной работы."""
@@ -8569,217 +8603,236 @@ class SurveyApp(ctk.CTk):
         """Tkinter-поток: забирает сообщения из рабочего потока."""
         if getattr(self, "_closing", False):
             return
-        while not self._events.empty():
-            try:
-                generation, kind, payload = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if generation != self._generation:
-                continue
-            if kind == "valid_secret":
-                self._last_valid_secret = str(payload)
-            elif kind == "round_usages":
-                self._record_round_usages(payload)
-                if self._session_llm_calls:
-                    total = self._session_prompt_tokens + self._session_completion_tokens
-                    self.tokens_var.set(
-                        f"Сессия ({self._session_llm_calls} выз.): "
-                        f"↑ {self._session_prompt_tokens:,} / ↓ {self._session_completion_tokens:,} "
-                        f"(всего {total:,})"
-                    )
-            elif kind == "consensus_label":
-                self._last_consensus_label = payload
-            elif kind == "progress":
-                self._set_status(str(payload))
-            elif kind == "error":
-                self._finish_busy()
-                self._set_status(str(payload), error=True)
-                self._update_closure_badge("Closure Error: —", None)
-            elif kind == "parsed":
-                self._dismiss_conflict_ui()
-                parsed_plan = None
-                if len(payload) == 5:
-                    outcome, draw, pre_counted, round_usages, parsed_plan = payload
-                    if round_usages:
-                        self._record_round_usages(round_usages)
-                elif len(payload) == 4:
-                    outcome, draw, pre_counted, round_usages = payload
-                    if round_usages:
-                        self._record_round_usages(round_usages)
-                elif len(payload) == 3:
-                    outcome, draw, pre_counted = payload
-                else:
-                    outcome, draw = payload
-                    pre_counted = False
-                if draw:
-                    self._handle_draw_result(outcome, draw, already_counted=pre_counted)
-                else:
-                    self._finish_busy()
-                    self._apply_parsed(outcome, already_counted=pre_counted)
-                    self._set_status(self._parsed_summary(outcome))
-                    try:
-                        plan = parsed_plan or AcadBuilder(self.config_data).plan(
-                            outcome.data,
-                            scale=self._current_scale(),
-                            is_neighbor=self.is_neighbor_mode(),
-                        )
-                        self._record_plan_for_preview(
-                            plan, warnings=outcome.warnings, source=self._running_source_path,
-                            source_label=self._running_source_label, outcome=outcome,
-                        )
-                        self._mark_running_source_ready(plan)
-                        self._append_suspicion_to_status(plan)
-                        self._append_neighbor_verification_to_status()
-                        self._update_closure_badge(
-                            plan.closure.short_report(), plan.closure.distance
-                        )
-                    except Exception:  # noqa: BLE001
-                        self._update_closure_badge(self._closure_text(outcome), None)
-            elif kind == "scene_drawn":
-                completed, error = payload
-                self._finish_busy()
-                draw_warnings = []
-                if completed:
-                    self.draw_result = completed[-1][1]
-                    for name, result in completed:
-                        self._log_line(f"{name}: {result.summary()}")
-                        draw_warnings.extend(f"{name}: {warning}" for warning in result.warnings)
-                if error:
-                    self._set_status(
-                        f"Отрисовка остановлена: {error}. Уже начерчено участков: {len(completed)}. "
-                        "В текущем участке могли остаться отдельные объекты; повторное нажатие может создать дубликаты.",
-                        error=True,
-                    )
-                elif draw_warnings:
-                    self._set_status(
-                        f"Начерчено участков: {len(completed)}, предупреждений AutoCAD: {len(draw_warnings)}. "
-                        f"{draw_warnings[0]} (подробности в журнале). Использованы готовые планы без запроса к ИИ.",
-                        warn=True,
-                    )
-                else:
-                    self._set_status(f"Начерчено участков: {len(completed)}. Использованы готовые планы, без запроса к ИИ.")
-                self._refresh_stepper()
-            elif kind == "conflict":
-                self._finish_busy()
-                self._present_conflict(payload)
-            elif kind == "doubt":
-                self._finish_busy()
-                self._present_doubt(payload)
-            elif kind == "batch_neighbors":
-                items_done, batch_errors, pdf_pages_spec = payload
-                self._finish_busy()
-                self.batch_neighbor_results = items_done
-                for source, out, res, pre_counted in items_done:
-                    self._apply_parsed(out, already_counted=pre_counted)
-                    self.draw_result = res
-                    self._record_plan_for_preview(res.plan, warnings=out.warnings, source=source, outcome=out)
-                    self._pending_neighbor_pdfs.discard(source)
-                    self._pending_neighbor_files.discard(source)
-                    self._neighbor_parsed_pages[source] = pdf_pages_spec
-                msg_parts = [
-                    f"Пакет соседей: обработано {len(items_done)} уч. в слое NEIGHBOR_LOT"
-                ]
-                if batch_errors:
-                    msg_parts.append(f"ошибок: {len(batch_errors)} (см. лог)")
-                    for err_line in batch_errors:
-                        self._log_line(f"! {err_line}")
-                self._set_status(
-                    "  |  ".join(msg_parts),
-                    error=bool(batch_errors and not items_done),
-                    warn=bool(batch_errors and items_done),
+        try:
+            while not self._events.empty():
+                try:
+                    generation, kind, payload = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                if generation != self._generation:
+                    continue
+                try:
+                    self._handle_event(kind, payload)
+                except Exception as exc:  # noqa: BLE001 - одно событие не останавливает очередь
+                    self._report_event_error(kind, exc)
+        finally:
+            # Опрос событий перезапускается всегда, даже если обработчик упал.
+            self.after(120, self._drain_events)
+
+    def _report_event_error(self, kind: str, exc: BaseException) -> None:
+        """Сообщает об ошибке обработчика события, не останавливая программу."""
+        traceback.print_exc()
+        text = f"Внутренняя ошибка ({kind}): {type(exc).__name__}: {exc}. Подробности — в консоли."
+        try:
+            self._set_status(text, error=True)
+        except Exception:  # noqa: BLE001 - окно могло уже закрываться
+            pass
+
+    def _handle_event(self, kind: str, payload: Any) -> None:
+        """Обработка одного сообщения из рабочего потока (тело прежнего цикла)."""
+        if kind == "valid_secret":
+            self._last_valid_secret = str(payload)
+        elif kind == "round_usages":
+            self._record_round_usages(payload)
+            if self._session_llm_calls:
+                total = self._session_prompt_tokens + self._session_completion_tokens
+                self.tokens_var.set(
+                    f"Сессия ({self._session_llm_calls} выз.): "
+                    f"↑ {self._session_prompt_tokens:,} / ↓ {self._session_completion_tokens:,} "
+                    f"(всего {total:,})"
                 )
-                for _source, _out, res, _counted in items_done:
-                    self._append_suspicion_to_status(res.plan)
-                self._append_neighbor_verification_to_status()
-                if items_done:
-                    _source, _last_out, last_res, _counted = items_done[-1]
+        elif kind == "consensus_label":
+            self._last_consensus_label = payload
+        elif kind == "progress":
+            self._set_status(str(payload))
+        elif kind == "error":
+            self._finish_busy()
+            self._set_status(str(payload), error=True)
+            self._update_closure_badge("Closure Error: —", None)
+        elif kind == "parsed":
+            self._dismiss_conflict_ui()
+            parsed_plan = None
+            if len(payload) == 5:
+                outcome, draw, pre_counted, round_usages, parsed_plan = payload
+                if round_usages:
+                    self._record_round_usages(round_usages)
+            elif len(payload) == 4:
+                outcome, draw, pre_counted, round_usages = payload
+                if round_usages:
+                    self._record_round_usages(round_usages)
+            elif len(payload) == 3:
+                outcome, draw, pre_counted = payload
+            else:
+                outcome, draw = payload
+                pre_counted = False
+            if draw:
+                self._handle_draw_result(outcome, draw, already_counted=pre_counted)
+            else:
+                self._finish_busy()
+                self._apply_parsed(outcome, already_counted=pre_counted)
+                self._set_status(self._parsed_summary(outcome))
+                try:
+                    plan = parsed_plan or AcadBuilder(self.config_data).plan(
+                        outcome.data,
+                        scale=self._current_scale(),
+                        is_neighbor=self.is_neighbor_mode(),
+                    )
+                    self._record_plan_for_preview(
+                        plan, warnings=outcome.warnings, source=self._running_source_path,
+                        source_label=self._running_source_label, outcome=outcome,
+                    )
+                    self._mark_running_source_ready(plan)
+                    self._append_suspicion_to_status(plan)
+                    self._append_neighbor_verification_to_status()
                     self._update_closure_badge(
-                        last_res.closure.short_report(), last_res.closure.distance
+                        plan.closure.short_report(), plan.closure.distance
                     )
-            elif kind == "verify_neighbors_done":
-                plans_done, verify_errors, open_popup, pdf_pages_spec = payload
-                self._finish_busy()
-                for source, out, nb_plan, pre_counted in plans_done:
-                    self._apply_parsed(out, already_counted=pre_counted)
-                    self._record_plan_for_preview(nb_plan, warnings=out.warnings, source=source, outcome=out)
-                    self._pending_neighbor_pdfs.discard(source)
-                    self._pending_neighbor_files.discard(source)
-                    self._neighbor_parsed_pages[source] = pdf_pages_spec
-                if (self._running_batch_attached and self.neighbor_pdf_paths and not self._pending_neighbor_pdfs
-                    and all(path in self._neighbor_plan_sources
-                            and self._neighbor_parsed_pages.get(path) == pdf_pages_spec
-                            for path in self.neighbor_pdf_paths)):
-                    self._ready_source_signature = self._running_source_signature
-                    self._input_incomplete = False
-                for err_line in verify_errors:
-                    self._log_line(f"! {err_line}")
-                error_note = (
-                    f" Ошибок: {len(verify_errors)} (см. журнал; {verify_errors[0]})."
-                    " Повторите разбор проблемных файлов или очистите соседей перед отрисовкой."
-                    if verify_errors else ""
+                except Exception:  # noqa: BLE001
+                    self._update_closure_badge(self._closure_text(outcome), None)
+        elif kind == "scene_drawn":
+            completed, error = payload
+            self._finish_busy()
+            draw_warnings = []
+            if completed:
+                self.draw_result = completed[-1][1]
+                for name, result in completed:
+                    self._log_line(f"{name}: {result.summary()}")
+                    draw_warnings.extend(f"{name}: {warning}" for warning in result.warnings)
+            if error:
+                self._set_status(
+                    f"Отрисовка остановлена: {error}. Уже начерчено участков: {len(completed)}. "
+                    "В текущем участке могли остаться отдельные объекты; повторное нажатие может создать дубликаты.",
+                    error=True,
                 )
-                unopened = self._pending_neighbor_pdfs.difference(self.neighbor_pdf_paths)
-                if self._running_batch_attached and unopened:
-                    names = ", ".join(path.name for path in sorted(unopened))
-                    error_note += f" Не удалось открыть PDF: {names}. Исправьте выбор файлов."
-                if plans_done:
-                    last_plan = plans_done[-1][2]
-                    self._update_closure_badge(last_plan.closure.short_report(), last_plan.closure.distance)
-                if plans_done and self._neighbor_report is not None and self._neighbor_report.pair_reports:
-                    rep = self._neighbor_report
-                    self._set_status(
-                        f"Разобрано соседей: {len(plans_done)}. {rep.headline()}{error_note}",
-                        error=(rep.overall_status == "error"),
-                        warn=(bool(error_note) or rep.overall_status == "warn"),
+            elif draw_warnings:
+                self._set_status(
+                    f"Начерчено участков: {len(completed)}, предупреждений AutoCAD: {len(draw_warnings)}. "
+                    f"{draw_warnings[0]} (подробности в журнале). Использованы готовые планы без запроса к ИИ.",
+                    warn=True,
+                )
+            else:
+                self._set_status(f"Начерчено участков: {len(completed)}. Использованы готовые планы, без запроса к ИИ.")
+            self._refresh_stepper()
+        elif kind == "conflict":
+            self._finish_busy()
+            self._present_conflict(payload)
+        elif kind == "doubt":
+            self._finish_busy()
+            self._present_doubt(payload)
+        elif kind == "batch_neighbors":
+            items_done, batch_errors, pdf_pages_spec = payload
+            self._finish_busy()
+            self.batch_neighbor_results = items_done
+            for source, out, res, pre_counted in items_done:
+                self._apply_parsed(out, already_counted=pre_counted)
+                self.draw_result = res
+                self._record_plan_for_preview(res.plan, warnings=out.warnings, source=source, outcome=out)
+                self._pending_neighbor_pdfs.discard(source)
+                self._pending_neighbor_files.discard(source)
+                self._neighbor_parsed_pages[source] = pdf_pages_spec
+            msg_parts = [
+                f"Пакет соседей: обработано {len(items_done)} уч. в слое NEIGHBOR_LOT"
+            ]
+            if batch_errors:
+                msg_parts.append(f"ошибок: {len(batch_errors)} (см. лог)")
+                for err_line in batch_errors:
+                    self._log_line(f"! {err_line}")
+            self._set_status(
+                "  |  ".join(msg_parts),
+                error=bool(batch_errors and not items_done),
+                warn=bool(batch_errors and items_done),
+            )
+            for _source, _out, res, _counted in items_done:
+                self._append_suspicion_to_status(res.plan)
+            self._append_neighbor_verification_to_status()
+            if items_done:
+                _source, _last_out, last_res, _counted = items_done[-1]
+                self._update_closure_badge(
+                    last_res.closure.short_report(), last_res.closure.distance
+                )
+        elif kind == "verify_neighbors_done":
+            plans_done, verify_errors, open_popup, pdf_pages_spec = payload
+            self._finish_busy()
+            for source, out, nb_plan, pre_counted in plans_done:
+                self._apply_parsed(out, already_counted=pre_counted)
+                self._record_plan_for_preview(nb_plan, warnings=out.warnings, source=source, outcome=out)
+                self._pending_neighbor_pdfs.discard(source)
+                self._pending_neighbor_files.discard(source)
+                self._neighbor_parsed_pages[source] = pdf_pages_spec
+            if (self._running_batch_attached and self.neighbor_pdf_paths and not self._pending_neighbor_pdfs
+                and all(path in self._neighbor_plan_sources
+                        and self._neighbor_parsed_pages.get(path) == pdf_pages_spec
+                        for path in self.neighbor_pdf_paths)):
+                self._ready_source_signature = self._running_source_signature
+                self._input_incomplete = False
+            for err_line in verify_errors:
+                self._log_line(f"! {err_line}")
+            error_note = (
+                f" Ошибок: {len(verify_errors)} (см. журнал; {verify_errors[0]})."
+                " Повторите разбор проблемных файлов или очистите соседей перед отрисовкой."
+                if verify_errors else ""
+            )
+            unopened = self._pending_neighbor_pdfs.difference(self.neighbor_pdf_paths)
+            if self._running_batch_attached and unopened:
+                names = ", ".join(path.name for path in sorted(unopened))
+                error_note += f" Не удалось открыть PDF: {names}. Исправьте выбор файлов."
+            if plans_done:
+                last_plan = plans_done[-1][2]
+                self._update_closure_badge(last_plan.closure.short_report(), last_plan.closure.distance)
+            if plans_done and self._neighbor_report is not None and self._neighbor_report.pair_reports:
+                rep = self._neighbor_report
+                self._set_status(
+                    f"Разобрано соседей: {len(plans_done)}. {rep.headline()}{error_note}",
+                    error=(rep.overall_status == "error"),
+                    warn=(bool(error_note) or rep.overall_status == "warn"),
+                )
+                if rep.has_issues:
+                    self._append_neighbor_verification_to_status()
+                if self._preview_main_plan is not None:
+                    self._set_inspector_text(
+                        self._build_inspector_report(self._preview_main_plan)
                     )
-                    if rep.has_issues:
-                        self._append_neighbor_verification_to_status()
-                    if self._preview_main_plan is not None:
-                        self._set_inspector_text(
-                            self._build_inspector_report(self._preview_main_plan)
-                        )
-                    if open_popup:
-                        self._open_neighbor_report_window()
-                elif plans_done:
-                    self._set_status(
-                        f"Разобрано соседей: {len(plans_done)}. "
-                        f"Для сверки разберите основной участок.{error_note}",
-                        warn=bool(error_note),
-                    )
-                elif verify_errors:
-                    self._set_status(
-                        f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
-                        error=True,
-                    )
-            elif kind == "step0_progress":
-                text = str(payload)
-                if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
-                    text = self._step0_timestamp(text)
-                self._step0_lines.append(text)
-                self._render_step0_log()
-            elif kind == "step0_portal_done":
-                status, portal_result = payload
-                self._finish_step0_portal_lookup(status, portal_result)
-            elif kind == "update_progress":
-                text = str(payload)
-                self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
-                self._set_status(f"Обновление: {text}")
-            elif kind == "update_done":
-                status, update_payload = payload
-                self._finish_update_version(status, update_payload)
-            elif kind == "step0_done":
-                status, payload_done = payload
-                self._finish_step0(status, payload_done)
-            elif kind == "pdf_set_done":
-                self._finish_busy()
-                self._handle_pdf_set_done(payload)
-            elif kind == "feature_labeled":
-                label_result, label_error, label_mode = payload
-                self._finish_busy()
-                self._handle_feature_label_result(label_result, label_error, label_mode)
-            elif kind == "done":
-                self._finish_busy()
-        self.after(120, self._drain_events)
+                if open_popup:
+                    self._open_neighbor_report_window()
+            elif plans_done:
+                self._set_status(
+                    f"Разобрано соседей: {len(plans_done)}. "
+                    f"Для сверки разберите основной участок.{error_note}",
+                    warn=bool(error_note),
+                )
+            elif verify_errors:
+                self._set_status(
+                    f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
+                    error=True,
+                )
+        elif kind == "step0_progress":
+            text = str(payload)
+            if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
+                text = self._step0_timestamp(text)
+            self._step0_lines.append(text)
+            self._render_step0_log()
+        elif kind == "step0_portal_done":
+            status, portal_result = payload
+            self._finish_step0_portal_lookup(status, portal_result)
+        elif kind == "update_progress":
+            text = str(payload)
+            self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
+            self._set_status(f"Обновление: {text}")
+        elif kind == "update_done":
+            status, update_payload = payload
+            self._finish_update_version(status, update_payload)
+        elif kind == "step0_done":
+            status, payload_done = payload
+            self._finish_step0(status, payload_done)
+        elif kind == "pdf_set_done":
+            self._finish_busy()
+            self._handle_pdf_set_done(payload)
+        elif kind == "feature_labeled":
+            label_result, label_error, label_mode = payload
+            self._finish_busy()
+            self._handle_feature_label_result(label_result, label_error, label_mode)
+        elif kind == "done":
+            self._finish_busy()
 
     def _set_controls_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"

@@ -10923,16 +10923,21 @@ class PdfSetDialog:
             command=lambda value, i=index: self._mode_clicked(i, value),
         )
         mode.grid(row=0, column=7, padx=(0, 8), pady=(10, 2))
+        edit_text_btn = ctk.CTkButton(
+            frame, text="✏ Текст", width=72, height=28, fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"], command=lambda i=index: self._edit_lot_text(i),
+        )
+        edit_text_btn.grid(row=0, column=8, padx=(0, 6), pady=(10, 2))
         remove = ctk.CTkButton(
             frame, text="✕", width=30, height=28, fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"], command=lambda i=index: self.remove(i),
         )
-        remove.grid(row=0, column=8, padx=(0, 10), pady=(10, 2))
+        remove.grid(row=0, column=9, padx=(0, 10), pady=(10, 2))
         note = ctk.CTkLabel(
             frame, text="", font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
             anchor="w", justify="left", wraplength=840,
         )
-        note.grid(row=1, column=0, columnspan=9, sticky="ew", padx=12, pady=(0, 9))
+        note.grid(row=1, column=0, columnspan=10, sticky="ew", padx=12, pady=(0, 9))
         for entry in (first_entry, last_entry):
             for event in ("<KeyRelease>", "<FocusOut>"):
                 entry.bind(event, lambda _event, i=index: self.pages_edited(i))
@@ -10976,6 +10981,62 @@ class PdfSetDialog:
         self.rows[index]["mode_var"].set(value)
         self.rows[index]["mode"].set(value)
         self._mode_clicked(index, value)
+
+    def _edit_lot_text(self, index: int) -> None:
+        item = self.items[index]
+        cache_path = self.owner._find_step0_cache_path(item.path)
+        target_path = cache_path or item.path.with_name(f"{item.path.stem}_text.txt")
+        initial_text = ""
+        if target_path.is_file():
+            try:
+                initial_text = target_path.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                initial_text = ""
+
+        editor = ctk.CTkToplevel(self.win)
+        editor.title(f"Текст описания — {item.path.name}")
+        editor.geometry("760x520")
+        editor.transient(self.win)
+        editor.grid_columnconfigure(0, weight=1)
+        editor.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            editor,
+            text=f"Файл кеша: {target_path.name} (после сохранения нажмите «Отправить на разбор»)",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_muted"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+
+        textbox = ctk.CTkTextbox(editor, font=ctk.CTkFont(family="Consolas", size=12))
+        textbox.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
+        if initial_text:
+            textbox.insert("1.0", initial_text)
+
+        btn_row = ctk.CTkFrame(editor, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="e", padx=14, pady=(0, 12))
+
+        def save_and_close() -> None:
+            content = str(textbox.get("1.0", "end") or "").strip()
+            if content:
+                target_path.write_text(content, encoding="utf-8")
+                item.set_mode(False)
+                self.rows[index]["mode_var"].set(self.MODE_LOCAL)
+                self._refresh_notes()
+                self._refresh_submit_text()
+            editor.destroy()
+
+        ctk.CTkButton(
+            btn_row, text="Отмена", width=100, height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=editor.destroy,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text="Сохранить в кеш", width=150, height=32,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            command=save_and_close,
+        ).pack(side="left")
+        editor.grab_set()
 
     def remove(self, index: int) -> None:
         if not 0 <= index < len(self.items):

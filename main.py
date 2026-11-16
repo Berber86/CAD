@@ -5267,7 +5267,6 @@ class SurveyApp(ctk.CTk):
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
                 "Перезапустить программу сейчас?",
-                parent=self,
             ):
                 run_bat = app_dir() / "run.bat"
                 if run_bat.is_file():

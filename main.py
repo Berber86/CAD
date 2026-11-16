@@ -6320,14 +6320,27 @@ class SurveyApp(ctk.CTk):
             gy_val += grid_step
             grid_guard += 1
 
-        # 1. Пунктирные линии красных линий улиц (STREET_ROW_AI)
+        # 1. Пунктирные линии красных линий улиц (STREET_ROW_AI) + подписи улиц
+        labeled_streets: set[str] = set()
         for pl in plans:
-            for rl in pl.lines:
+            for idx_rl, rl in enumerate(pl.lines):
                 x1, y1 = to_screen(rl.start)
                 x2, y2 = to_screen(rl.end)
                 canvas.create_line(
-                    x1, y1, x2, y2, fill=THEME["cad_street"], width=1, dash=(4, 3)
+                    x1, y1, x2, y2, fill=THEME["cad_street"], width=1.6, dash=(6, 4)
                 )
+                street_label = ""
+                if idx_rl == 0 and getattr(pl.description, "main_street", ""):
+                    street_label = str(pl.description.main_street).strip()
+                elif idx_rl == 1 and getattr(pl.description, "cross_street", ""):
+                    street_label = str(pl.description.cross_street).strip()
+                if street_label and street_label.lower() not in labeled_streets:
+                    labeled_streets.add(street_label.lower())
+                    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                    canvas.create_text(
+                        mx, my - 8, text=street_label,
+                        fill=THEME["cad_street"], font=("Segoe UI", 9, "bold"),
+                    )
 
         # 2. Перекрёсток улиц (0.0, 0.0): кольцо + перекрестие + подпись
         ox, oy = to_screen((0.0, 0.0))

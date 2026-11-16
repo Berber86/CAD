@@ -166,7 +166,7 @@ def test_manifest_puts_our_lot_first_and_remembers_the_missing_items(tmp_path):
 def test_deed_wins_over_a_newer_mortgage(tmp_path):
     outcome = _collect(tmp_path)
     newest = deed_store.read_records(outcome.folder)[0]
-    assert newest.doc_type in ("DEED", "WAR DEED")
+    assert newest.doc_type == "DEED"   # вид, а не слово сайта («WAR DEED» → DEED)
     assert newest.endorsement_id != "111333"  # ипотека 2019 не стала NEW
 
 

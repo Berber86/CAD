@@ -126,9 +126,11 @@ def _default_page_finder(pdf: Path) -> deed_pages.DescriptionPages:
 
 
 def _row_label(row: rcclerk.DeedRow) -> str:
-    kind = row.doc_type or "документ"
+    """«DEED (Поступок) №2640217 от 2022-09-03» — вид, слово сайта, номер и дата."""
+    kind = row.kind if row.kind != rcclerk.KIND_OTHER else "документ"
+    site_word = f" ({row.doc_type})" if row.doc_type and row.doc_type.upper() != kind else ""
     when = row.doc_date.isoformat() if row.doc_date else "без даты"
-    return f"{kind} №{row.endorsement_id} от {when}"
+    return f"{kind}{site_word} №{row.endorsement_id} от {when}"
 
 
 def collect_deeds(
@@ -288,12 +290,12 @@ def _collect_one(
         notes = [f"ступень загрузки: {rung}"] if rung != "direct" else []
         if row.clerk_number:
             notes.append(f"клерк: {row.clerk_number}")
-        if row.doc_type and row.doc_type != row.kind:
-            notes.append(f"тип на сайте: {row.doc_type} ({row.kind})")
+        if row.doc_type and row.doc_type.upper() != row.kind:
+            notes.append(f"тип на сайте: {row.doc_type}")
         record = deed_store.store_pdf(
             target_dir, saved,
             role=role, lot=lot_value, tag=tag, block=block_no,
-            doc_type=row.doc_type, doc_date=row.doc_date,
+            doc_type=row.kind, doc_date=row.doc_date,
             endorsement_id=row.endorsement_id,
             source_url=rcclerk.document_pdf_url(row.endorsement_id, base=base_url),
             pages=pages, trimmed_source=trimmed_path, text=found.text, notes=notes,

@@ -7288,7 +7288,7 @@ class SurveyApp(ctk.CTk):
                 key_secret=key_secret, allow_regex_fallback=False, progress=progress,
             )
         except Exception as local_exc:  # noqa: BLE001
-            if job.use_llm or not (api_key or key_secret):
+            if job.use_llm or not (api_key or key_secret) or job.ocr:
                 raise
             if progress is not None:
                 progress(f"локальный парсер не справился ({local_exc}) — отправляю в ИИ…")

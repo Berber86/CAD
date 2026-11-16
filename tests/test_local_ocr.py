@@ -200,8 +200,8 @@ def test_recognised_pages_are_cached_and_not_read_twice(tmp_path, ocr_ready):
     assert (tmp_path / "ocr_cache").is_dir()
 
 
-def test_render_dpi_never_goes_above_the_embedded_image(tmp_path, ocr_ready):
-    """Скан — это картинка: рендерить выше её собственного разрешения бессмысленно."""
+def test_render_dpi_honours_low_request_and_keeps_200_floor_for_normal_scan_ocr(tmp_path, ocr_ready):
+    """Явный low-DPI запрос соблюдается; обычный OCR сохраняет floor 200 для мелкого скана."""
     pymupdf = pytest.importorskip("pymupdf")
 
     assert ocr_pages.DEFAULT_DPI == 400
@@ -209,8 +209,10 @@ def test_render_dpi_never_goes_above_the_embedded_image(tmp_path, ocr_ready):
     high = _scan_pdf(tmp_path / "high.pdf", DESCRIPTION, dpi=350)  # ≈350 dpi картинки
     doc = pymupdf.open(str(low))
     try:
-        assert ocr_pages.page_render_dpi(doc[0], 400) == ocr_pages.MIN_DPI
-        assert ocr_pages.page_render_dpi(doc[0], 600) == ocr_pages.MIN_DPI
+        assert ocr_pages.page_render_dpi(doc[0], 400) == 200
+        assert ocr_pages.page_render_dpi(doc[0], 600) == 200
+        assert ocr_pages.page_render_dpi(doc[0], 120) == 120
+        assert ocr_pages.page_render_dpi(doc[0], 80) == 80
     finally:
         doc.close()
     doc = pymupdf.open(str(high))
@@ -227,6 +229,9 @@ def test_render_dpi_never_goes_above_the_embedded_image(tmp_path, ocr_ready):
     try:
         assert ocr_pages.native_dpi(doc[0]) == 0.0
         assert ocr_pages.page_render_dpi(doc[0], 400) == 400
+        assert ocr_pages.page_render_dpi(doc[0], 80) == 80
+        assert ocr_pages.page_render_dpi(doc[0], 10) == ocr_pages.MIN_DPI
+        assert ocr_pages.page_render_dpi(doc[0], 5000) == ocr_pages.MAX_DPI
     finally:
         doc.close()
 

@@ -24,15 +24,16 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-#: Разрешение рендера страницы. 400 dpi: замеры показали, что это бесплатно —
-#: время на странице не растёт (движок всё равно приводит строки к своей высоте),
-#: а мелкий и бледный шрифт читается чуть надёжнее. 600 dpi не даёт ничего и
-#: иногда вредит (см. docs/ocr_probe.py), поэтому выше 400 не поднимаемся.
+#: Разрешение по умолчанию. На Шаге 0 пользователь может выбрать 50–1200 dpi;
+#: OCR cache key включает DPI, поэтому экспериментальные запуски не перепутаются.
 DEFAULT_DPI = 400
 
-#: Ниже этого разрешения страницу рендерить смысла нет: узнаватель строк
-#: приводит кроп к 48 пикселям по высоте, слишком мелкая картинка теряет цифры.
-MIN_DPI = 200
+#: На Шаге 0 доступны низкие значения для проверки скорости/читаемости.
+MIN_DPI = 50
+MAX_DPI = 1200
+#: Для обычных/высоких запросов сохраняем прежний OCR floor: очень низкое native DPI
+#: скана можно слегка увеличить до 200 для лучшей детекции. Явный запрос <200 не повышаем.
+UPSAMPLE_FLOOR_DPI = 200
 
 #: Пояснение для окна и отчёта: чем распознаём.
 ENGINE_LABEL = "RapidOCR (локально, бесплатно)"
@@ -178,12 +179,19 @@ def native_dpi(page: Any) -> float:
 
 
 def page_render_dpi(page: Any, requested: int = DEFAULT_DPI) -> int:
-    """Сколько dpi имеет смысл рендерить: не выше встроенной картинки и не ниже MIN_DPI."""
+    """Разрешает малый DPI, но не уменьшает традиционный рендер по умолчанию ниже 200."""
+    wanted = max(MIN_DPI, min(MAX_DPI, int(requested)))
     native = native_dpi(page)
-    wanted = max(MIN_DPI, int(requested))
     if native <= 0:
         return wanted
-    return int(max(MIN_DPI, min(wanted, round(native))))
+    native = max(MIN_DPI, round(native))
+    if wanted < UPSAMPLE_FLOOR_DPI:
+        # Пользовательский low-DPI эксперимент соблюдается; при этом не растягиваем
+        # embedded scan выше его native resolution без причины.
+        return min(wanted, native)
+    # For normal/high settings, preserve the former 200-DPI OCR floor. Mild upsampling
+    # from e.g. 150 to 200 improves small text detection; larger scans stay native-capped.
+    return min(wanted, max(UPSAMPLE_FLOOR_DPI, native))
 
 
 def _lines_to_text(result: Any) -> str:

@@ -28,6 +28,7 @@ from typing import Callable, Iterable, Sequence
 
 import deed_pages
 import deed_store
+import ocr_pages
 import rcclerk
 
 #: Папка описаний внутри папки проекта (как в схеме шага).
@@ -142,8 +143,10 @@ def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, 
     return download
 
 
-def _default_page_finder(pdf: Path) -> deed_pages.DescriptionPages:
-    return deed_pages.find_description_pages(pdf)
+def _default_page_finder(
+    pdf: Path, *, dpi: int = ocr_pages.DEFAULT_DPI, progress: Progress | None = None,
+) -> deed_pages.DescriptionPages:
+    return deed_pages.find_description_pages(pdf, dpi=dpi, progress=progress)
 
 
 def _row_label(row: rcclerk.DeedRow) -> str:
@@ -165,6 +168,7 @@ def collect_deeds(
     fetch_list: ListFetcher | None = None,
     downloader: Downloader | None = None,
     auto_save=None,
+    ocr_dpi: int = ocr_pages.DEFAULT_DPI,
     downloads_dir: str | Path | None = None,
     page_finder: PageFinder | None = None,
     progress: Progress | None = None,
@@ -191,7 +195,9 @@ def collect_deeds(
     download = downloader or make_downloader(
         auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url
     )
-    find_pages = page_finder or _default_page_finder
+    find_pages = page_finder or (
+        lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
+    )
     outcome = IntakeOutcome(folder=target_dir)
 
     def say(message: str) -> None:
@@ -242,7 +248,8 @@ def collect_deeds(
             outcome_item = _collect_one(
                 block_no=block_no, lot_value=lot_value, role=role, row=row, tag=tag,
                 target_dir=target_dir, base_url=base_url,
-                download=download, find_pages=find_pages, say=say, missing=outcome.missing,
+                download=download, find_pages=find_pages, ocr_dpi=ocr_dpi,
+                say=say, missing=outcome.missing,
             )
             if outcome_item is not None:
                 outcome.records.append(outcome_item)
@@ -270,6 +277,7 @@ def _collect_one(
     base_url: str,
     download: Downloader,
     find_pages: PageFinder,
+    ocr_dpi: int,
     say: Progress,
     missing: list[str],
 ) -> deed_store.StoredDeed | None:
@@ -298,6 +306,7 @@ def _collect_one(
             say(f"  {name}: скачано ступенью «{rung}»")
         pages = ""
         trimmed_path: Path | None = None
+        say(f"  {name}: ищу начало и конец описания (локальный OCR, {int(ocr_dpi)} dpi)…")
         try:
             found = find_pages(saved)
         except Exception as exc:  # noqa: BLE001 - страницы не обязательны для файла

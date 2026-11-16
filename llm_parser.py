@@ -2785,6 +2785,7 @@ def ask_llm_json(
     task_label: str = "вопрос",
     attempts: int = JSON_ATTEMPTS,
     max_tokens: int | None = None,
+    single_request: bool = False,
     on_usage: Callable[[TokenUsage], None] | None = None,
 ) -> tuple[dict[str, Any], TokenUsage]:
     """
@@ -2829,7 +2830,7 @@ def ask_llm_json(
         tag = f", изображений: {len(images)}" if images else ""
         progress(f"{task_label}: запрос к {provider_label}: {model_name}{tag} …")
 
-    rounds = max(1, min(int(attempts or 1), 5))
+    rounds = 1 if single_request else max(1, min(int(attempts or 1), 5))
     prompt_acc = completion_acc = total_acc = 0
     saw_usage = False
     errors: list[str] = []
@@ -2849,6 +2850,10 @@ def ask_llm_json(
             variants[0]["max_tokens"] = limit
             variants.append({"max_tokens": limit})
         variants.append({})
+        if single_request:
+            # Explicitly consented one-shot calls must not fan out to fallback variants.
+            # The prompt already requires JSON, so omit provider-specific response_format.
+            variants = [{}]
         cut = False
         for extra in variants:
             try:

@@ -424,3 +424,21 @@ def test_sidecar_of_a_stored_document_is_readable_back(tmp_path):
     assert raw["endorsement_id"] == str(OUR_NEW)
     assert raw["trimmed"] == "OUR 32 NEW_p2.pdf"
     assert raw["text_file"] == "OUR 32 NEW_text.txt"
+
+
+def test_collect_passes_selected_dpi_to_default_page_search(tmp_path, monkeypatch):
+    import deed_pages
+
+    seen = []
+
+    def fake_find(pdf, *, dpi, progress):
+        seen.append((Path(pdf).name, dpi, callable(progress)))
+        return deed_pages.DescriptionPages()
+
+    monkeypatch.setattr(deed_pages, "find_description_pages", fake_find)
+    outcome = _collect(
+        tmp_path, page_finder=None, ocr_dpi=72, progress=lambda _line: None,
+    )
+    assert outcome.records
+    assert len(seen) == 2
+    assert all(dpi == 72 and has_progress for _name, dpi, has_progress in seen)

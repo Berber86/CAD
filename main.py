@@ -127,6 +127,7 @@ from llm_parser import (
 import browser_save
 import deed_intake
 import deed_store
+import nyc_portal
 import ocr_pages
 import rcclerk
 from pdf_set import (
@@ -163,9 +164,12 @@ STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS)
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
 STEP0_EMPTY_REPORT = (
     "Отчёт появится после сбора.\n\n"
-    "1. Впишите block и lot участка (их присылает геодезист вместе с DWG).\n"
-    "2. Соседей впишите руками через запятую — они получат роль «сосед» и имена "
-    "вида LOT 30 NEW.pdf; автоматического поиска соседей на этом шаге нет.\n"
+    "1. Введите адрес и нажмите «Найти по адресу + анализ только карты»: портал откроется "
+    "в текущем окне Chrome/Edge; локальный OCR прочитает Borough, Block и Lot, а Vision получит "
+    "только обрезку tax map для поиска соседей.\n"
+    "2. Проверьте Block, Lot и соседей слева/справа; поля можно исправить вручную. "
+    "Каждый сосед получает роль «сосед» и файл, например LOT 30 NEW.pdf. "
+    "Если портал/ИИ недоступен, значения можно ввести самостоятельно.\n"
     "3. Нажмите «Собрать описания»: программа откроет список документов Richmond "
     "County Clerk, возьмёт Deed (а без него Mortgage), скачает свежий и старый "
     "документ нашего участка, найдёт страницы описания и положит всё в папку "
@@ -459,14 +463,20 @@ class SurveyApp(ctk.CTk):
         self.step_tab_var = ctk.StringVar(value=STEP_TAB_BOUNDARY)
         # Шаг 0: документы участка. Соседи вводятся руками и получают роль «сосед».
         self.step0_address_var = ctk.StringVar(value="")
+        self.step0_borough_var = ctk.StringVar(value="")
         self.step0_block_var = ctk.StringVar(value="")
         self.step0_lot_var = ctk.StringVar(value="")
         self.step0_neighbours_var = ctk.StringVar(value="")
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
+        self.step0_ocr_dpi_var = ctk.StringVar(
+            value=str((self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI))
+        )
         self.step0_manual_role_var = ctk.StringVar(value=STEP0_MANUAL_ROLES[0])
         self.step0_manual_lot_var = ctk.StringVar(value="")
         self._step0_lines: list[str] = []
+        self._step0_portal_running = False
+        self._step0_portal_restore_topmost: bool | None = None
         self._step0_running = False
         self._step0_outcome: deed_intake.IntakeOutcome | None = None
         self._step0_stop = threading.Event()
@@ -2652,7 +2662,9 @@ class SurveyApp(ctk.CTk):
             text=(
                 "Staten Island — Richmond County: список документов участка, Deed, а без него "
                 "Mortgage. Наш участок — самый свежий и самый старый документ, сосед — только "
-                "свежий. Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf."
+                "свежий. Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf. "
+                "Block/Lot и Borough читает локальный OCR; выбранной Vision-модели отправляется "
+                "только обрезка карты для поиска двух соседних лотов."
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
@@ -2685,27 +2697,40 @@ class SurveyApp(ctk.CTk):
             entry.grid(row=row * 2 + 1, column=0, sticky="ew", pady=(2, 0))
             return entry
 
-        field(0, "Адрес (для папки проекта)", self.step0_address_var,
-              "24 Alvine Avenue, Staten Island")
+        field(0, "Адрес объекта (как на Property Information Portal)", self.step0_address_var,
+              "87 Stafford Ave")
+        field(1, "Borough (район Нью-Йорка)", self.step0_borough_var, "Staten Island")
+        self.step0_portal_button = ctk.CTkButton(
+            fields, text="🌐 Найти по адресу + анализ только карты", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._start_step0_portal_lookup,
+        )
+        self.step0_portal_button.grid(row=4, column=0, sticky="ew", pady=(7, 2))
         numbers = ctk.CTkFrame(fields, fg_color="transparent")
-        numbers.grid(row=3, column=0, sticky="ew")
+        numbers.grid(row=5, column=0, sticky="ew")
         numbers.grid_columnconfigure(0, weight=1)
         numbers.grid_columnconfigure(1, weight=1)
-        for column, (label, var) in enumerate(
-            (("Block", self.step0_block_var), ("Lot", self.step0_lot_var))
+        numbers.grid_columnconfigure(2, weight=1)
+        for column, (label, var, placeholder) in enumerate(
+            (
+                ("Block", self.step0_block_var, "6323"),
+                ("Lot", self.step0_lot_var, "32"),
+                ("OCR dpi (50–1200)", self.step0_ocr_dpi_var, "400"),
+            )
         ):
             ctk.CTkLabel(
                 numbers, text=label, font=ctk.CTkFont(size=11),
                 text_color=THEME["text_muted"], anchor="w",
             ).grid(row=0, column=column, sticky="ew", padx=(0, 8) if column == 0 else 0)
             ctk.CTkEntry(
-                numbers, textvariable=var, placeholder_text="6323" if column == 0 else "32",
+                numbers, textvariable=var, placeholder_text=placeholder,
                 height=32, width=120, fg_color=THEME["bg_field"],
                 border_color=THEME["border_card"], font=ctk.CTkFont(size=12),
             ).grid(row=1, column=column, sticky="ew", padx=(0, 8) if column == 0 else 0, pady=(2, 0))
 
-        field(2, "Соседи — номера лотов через запятую (они получат роль «сосед»)",
-              self.step0_neighbours_var, "30, 28")
+        field(3, "Соседи слева и справа на карте (проверьте значения)",
+              self.step0_neighbours_var, "например: 68, 72")
         checks = ctk.CTkFrame(panel, fg_color="transparent")
         checks.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 4))
         ctk.CTkCheckBox(
@@ -2717,7 +2742,6 @@ class SurveyApp(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
-
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -2883,8 +2907,128 @@ class SurveyApp(ctk.CTk):
         if chosen:
             self.step0_folder_var.set(str(chosen))
 
+    def _start_step0_portal_lookup(self) -> None:
+        """Address → NYC Portal → one user-initiated Vision extraction call."""
+        if self._step0_portal_running or self._step0_running:
+            self._set_status("Шаг 0 уже выполняет поиск или сбор; дождитесь завершения.", warn=True)
+            return
+        if self._busy:
+            self._set_status("Дождитесь окончания текущего разбора перед поиском участка.", warn=True)
+            return
+        address = str(self.step0_address_var.get() or "").strip()
+        if not address:
+            self._set_status("Шаг 0: сначала введите адрес (номер дома и улицу).", error=True)
+            return
+        try:
+            cfg, provider, model, api_key, key_secret = self._build_runtime_config()
+            target = resolve_api_target(
+                cfg, provider=provider, model=model, api_key=api_key, key_secret=key_secret,
+            )
+            if not target.get("api_key"):
+                raise LLMParseError(
+                    "Для чтения снимка нужен API-ключ выбранного Vision-провайдера. "
+                    "Откройте «Настройки», задайте ключ и повторите."
+                )
+        except Exception as exc:  # noqa: BLE001 - protected/missing provider key or bad settings
+            self._set_status(f"Шаг 0: не удалось подготовить Vision: {exc}", error=True)
+            return
+
+        folder = self._step0_folder()
+        self.step0_folder_var.set(str(folder))
+        self._step0_portal_restore_topmost = bool(self.topmost_var.get())
+        if self._step0_portal_restore_topmost:
+            # The CAD window must not cover the browser while we capture its screen.
+            self.attributes("-topmost", False)
+        self._step0_portal_running = True
+        self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
+        self.step0_run_button.configure(state="disabled")
+        self._step0_lines = [self._step0_timestamp(
+            f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; один Vision-запрос получит только карту."
+        )]
+        self._render_step0_log()
+        self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
+        worker = threading.Thread(
+            target=self._step0_portal_worker,
+            args=(address, folder, cfg, provider, model, target["api_key"], key_secret),
+            daemon=True,
+        )
+        worker.start()
+
+    def _step0_portal_worker(
+        self,
+        address: str,
+        folder: Path,
+        cfg: dict[str, Any],
+        provider: str,
+        model: str,
+        api_key: str,
+        key_secret: str,
+    ) -> None:
+        """Browser UI, screenshot and Vision run off the Tk thread."""
+        self._worker_context.generation = self._generation
+
+        def progress(line: str) -> None:
+            self._post("step0_progress", self._step0_timestamp(line))
+
+        try:
+            result = nyc_portal.lookup_parcel(
+                address,
+                folder,
+                cfg=cfg,
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                key_secret=key_secret,
+                progress=progress,
+            )
+        except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
+            self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
+            return
+        self._post("step0_portal_done", ("ok", result))
+
+    def _finish_step0_portal_lookup(self, status: str, payload: Any) -> None:
+        self._step0_portal_running = False
+        if self._step0_portal_restore_topmost is not None:
+            self.attributes("-topmost", self._step0_portal_restore_topmost)
+            self._step0_portal_restore_topmost = None
+        self.step0_portal_button.configure(
+            state="normal", text="🌐 Найти по адресу + анализ только карты",
+        )
+        self.step0_run_button.configure(state="normal")
+        try:
+            self.lift()
+        except Exception:  # noqa: BLE001 - a closing window needs no focus restoration
+            pass
+        if status != "ok":
+            self._step0_log(f"Поиск участка не завершён: {payload}")
+            self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
+            return
+        result = payload
+        self.step0_borough_var.set(result.borough or "")
+        self.step0_block_var.set(result.block)
+        self.step0_lot_var.set(result.lot)
+        self.step0_neighbours_var.set(", ".join(result.neighbours))
+        self._record_round_usages([result.usage])
+        self._step0_log(
+            f"Локальный OCR: Borough {result.borough or 'не распознан'}, "
+            f"Block {result.block}, Lot {result.lot}. Vision только по карте: "
+            f"соседи слева/справа {result.left_neighbour or '—'} / "
+            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}."
+        )
+        if result.notes:
+            self._step0_log(f"Примечание Vision: {result.notes}")
+        self._step0_log(f"Vision получал только карту: {result.map_image}")
+        self._set_status(
+            f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
+            "проверьте соседей и затем нажмите «Собрать описания».",
+            warn=result.confidence.lower() in {"low", "низкая"},
+        )
+
     def _start_step0_intake(self) -> None:
         """Собирает описания в фоне: окно не замирает на Cloudflare и OCR."""
+        if self._step0_portal_running:
+            self._set_status("Сначала дождитесь завершения поиска адреса на портале.", warn=True)
+            return
         if self._step0_running:
             self._set_status("Шаг 0: сбор уже идёт — дождитесь конца или нажмите «Стоп».")
             return
@@ -2902,29 +3046,51 @@ class SurveyApp(ctk.CTk):
                 error=True,
             )
             return
+        try:
+            ocr_dpi = int(str(self.step0_ocr_dpi_var.get() or "").strip())
+        except (TypeError, ValueError):
+            self._set_status("Шаг 0: DPI OCR задаётся целым числом от 50 до 1200.", error=True)
+            return
+        if not ocr_pages.MIN_DPI <= ocr_dpi <= ocr_pages.MAX_DPI:
+            self._set_status(
+                f"Шаг 0: DPI OCR должен быть от {ocr_pages.MIN_DPI} до {ocr_pages.MAX_DPI}.",
+                error=True,
+            )
+            return
         if lot in neighbours:
             neighbours = [value for value in neighbours if value != lot]
             self._set_status("Шаг 0: наш лот убран из списка соседей — он собирается как наш участок.", warn=True)
         folder = self._step0_folder()
         self.step0_folder_var.set(str(folder))
+        previous_dpi = (self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI)
+        self.config_data.setdefault("ocr", {})["dpi"] = ocr_dpi
+        dpi_save_error = ""
+        if str(previous_dpi).strip() != str(ocr_dpi):
+            try:
+                save_config(self.config_data)
+            except OSError as exc:
+                dpi_save_error = f"не удалось сохранить DPI в config.json: {exc}"
         self._step0_stop.clear()
         self._step0_running = True
         self._step0_outcome = None
+        self.step0_portal_button.configure(state="disabled")
         self.step0_to_step1_button.configure(state="disabled")
         self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
         self.step0_stop_button.configure(state="normal")
         self._step0_lines = [self._step0_timestamp(
             f"Начинаю сбор: блок {block}, лот {lot}"
             + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
-            + f"; папка: {folder}"
+            + f"; OCR: {ocr_dpi} dpi; папка: {folder}"
         )]
+        if dpi_save_error:
+            self._step0_lines.append(self._step0_timestamp(dpi_save_error))
         self._render_step0_log()
         self._set_status("Шаг 0: собираю описания участка…")
         worker = threading.Thread(
             target=self._step0_worker,
             args=(
                 block, lot, neighbours, folder,
-                bool(self.step0_old_neighbour_var.get()),
+                bool(self.step0_old_neighbour_var.get()), ocr_dpi,
             ),
             daemon=True,
         )
@@ -2937,6 +3103,7 @@ class SurveyApp(ctk.CTk):
         neighbours: list[int],
         folder: Path,
         with_old: bool,
+        ocr_dpi: int = ocr_pages.DEFAULT_DPI,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
@@ -2956,6 +3123,7 @@ class SurveyApp(ctk.CTk):
             progress("браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю")
         else:
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
+        progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -2967,6 +3135,7 @@ class SurveyApp(ctk.CTk):
                 progress=progress,
                 should_stop=self._step0_stop.is_set,
                 auto_save=auto_save,
+                ocr_dpi=ocr_dpi,
                 downloads_dir=downloads,
             )
         except deed_intake.IntakeCancelled:
@@ -2986,6 +3155,7 @@ class SurveyApp(ctk.CTk):
 
     def _finish_step0(self, status: str, payload: Any) -> None:
         self._step0_running = False
+        self.step0_portal_button.configure(state="normal")
         self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
         self.step0_stop_button.configure(state="disabled")
         if status == "cancelled":
@@ -7911,6 +8081,9 @@ class SurveyApp(ctk.CTk):
                     text = self._step0_timestamp(text)
                 self._step0_lines.append(text)
                 self._render_step0_log()
+            elif kind == "step0_portal_done":
+                status, portal_result = payload
+                self._finish_step0_portal_lookup(status, portal_result)
             elif kind == "step0_done":
                 status, payload_done = payload
                 self._finish_step0(status, payload_done)

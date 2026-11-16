@@ -3524,12 +3524,14 @@ def test_step0_handover_without_files_explains_itself(gui, tmp_path):
     assert "нет файлов для Шага 1" in app.status_var.get()
 
 
-def test_step0_never_calls_the_paid_model(gui):
-    """Шаг 0 — сеть, локальный OCR и файлы: платного ИИ здесь нет вовсе."""
+def test_step0_deed_collection_does_not_call_the_paid_model(gui):
+    """The address-preflight Vision call is separate from document collection/OCR."""
     import pathlib
 
     text = pathlib.Path(gui.__file__).read_text(encoding="utf-8")
-    body = text[text.index("    def _start_step0_intake"):text.index("    def _build_step2_page")]
+    start = text.index("    def _step0_worker(")
+    end = text.index("    def _stop_step0_intake(")
+    body = text[start:end]
     for forbidden in ("ask_llm_json", "run_multipass_consensus", "parse_legal_description_full"):
         assert forbidden not in body
 
@@ -3633,3 +3635,105 @@ def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
     lines = [line for line in app._step0_lines if "список документов" in line]
     assert lines and re.match(r"^\[\d{2}:\d{2}:\d{2}\]", lines[0])
     assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", app._step0_lines[0])
+
+
+def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    captured: dict[str, object] = {}
+    saved_configs = []
+
+    def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    monkeypatch.setattr(gui.browser_save, "available", lambda: False)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
+    monkeypatch.setattr(
+        gui, "save_config", lambda config: saved_configs.append(config.copy()) or tmp_path / "config.json",
+    )
+    app.step0_ocr_dpi_var.set("88")
+    _fill_step0(app, folder=tmp_path)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert captured["ocr_dpi"] == 88
+    assert saved_configs and saved_configs[-1]["ocr"]["dpi"] == 88
+    assert any("OCR: 88 dpi" in line for line in app._step0_lines)
+
+
+def test_step0_rejects_invalid_ocr_dpi(gui):
+    app = gui.SurveyApp()
+    app.step0_ocr_dpi_var.set("20")
+    _fill_step0(app)
+    app._start_step0_intake()
+    assert "от 50 до 1200" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_portal_lookup_requires_address_and_configured_vision_key(gui, monkeypatch):
+    app = gui.SurveyApp()
+    app._start_step0_portal_lookup()
+    assert "введите адрес" in app.status_var.get().lower()
+
+    app.step0_address_var.set("87 Stafford Ave")
+    monkeypatch.setattr(
+        app, "_build_runtime_config",
+        lambda: ({"api": {}}, "hydra", "vision-model", None, ""),
+    )
+    monkeypatch.setattr(
+        gui, "resolve_api_target",
+        lambda *args, **kwargs: {"api_key": ""},
+    )
+    called = []
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lambda *a, **k: called.append(True))
+    app._start_step0_portal_lookup()
+    assert "api-ключ" in app.status_var.get().lower()
+    assert not called
+    assert app._step0_portal_running is False
+
+
+def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_path, monkeypatch):
+    import time
+
+    app = gui.SurveyApp()
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_folder_var.set(str(tmp_path))
+    usage = gui.TokenUsage(
+        prompt_tokens=20, completion_tokens=8, total_tokens=28,
+        provider="hydra", provider_label="Hydra AI", model="vision", available=True,
+    )
+    result = gui.nyc_portal.ParcelLookup(
+        block="5712", lot="70", borough="Staten Island",
+        left_neighbour="68", right_neighbour="72",
+        confidence="high", notes="Visible on the map.",
+        map_image=tmp_path / "NYC_Portal_map.png", usage=usage,
+    )
+    monkeypatch.setattr(
+        app, "_build_runtime_config",
+        lambda: ({"api": {}}, "hydra", "vision-model", "key", "pin"),
+    )
+    monkeypatch.setattr(
+        gui, "resolve_api_target", lambda *args, **kwargs: {"api_key": "key"},
+    )
+    captured = {}
+
+    def lookup(address, folder, **kwargs):
+        captured.update(address=address, folder=folder, **kwargs)
+        return result
+
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lookup)
+    app._start_step0_portal_lookup()
+    for _ in range(300):
+        app._drain_events()
+        if not app._step0_portal_running:
+            break
+        time.sleep(0.01)
+    assert not app._step0_portal_running
+    assert captured["address"] == "87 Stafford Ave"
+    assert captured["provider"] == "hydra" and captured["model"] == "vision-model"
+    assert app.step0_borough_var.get() == "Staten Island"
+    assert app.step0_block_var.get() == "5712"
+    assert app.step0_lot_var.get() == "70"
+    assert app.step0_neighbours_var.get() == "68, 72"
+    assert app._session_llm_calls == 1
+    assert any("соседи слева/справа 68 / 72" in line for line in app._step0_lines)
+    assert app.step0_run_button.cget("state") == "normal"

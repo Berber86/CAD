@@ -578,3 +578,60 @@ def test_registration_date_is_read_in_both_conventions(text, expected):
         '<td data-label="Number"><a href="/Search/ViewDocumentInfo/42">42</a></td></tr>'
     )
     assert row[0].doc_date == expected
+
+
+def test_description_search_stops_after_beginning_and_completion_page(tmp_path, monkeypatch):
+    import deed_pages
+    import ocr_pages
+
+    pages = ["", "", "", "", "", ""]
+    start = (
+        "BEGINNING AT A POINT on the easterly line; THENCE N 10 E 50 feet; "
+        "THENCE N 20 W 30 feet."
+    )
+    end = "THENCE S 10 W 50 feet to the point or place of BEGINNING."
+    monkeypatch.setattr(deed_pages, "read_pdf_page_texts", lambda _pdf: pages)
+    monkeypatch.setattr(ocr_pages, "available", lambda: True)
+    calls = []
+
+    def fake_ocr(_pdf, first, last, *, dpi, **_kwargs):
+        calls.append((first, last, dpi))
+        return {2: start, 3: end}.get(first, "")
+
+    monkeypatch.setattr(ocr_pages, "ocr_pdf_pages", fake_ocr)
+    progress = []
+    found = deed_pages.find_description_pages(
+        tmp_path / "deed.pdf", dpi=96, progress=progress.append,
+    )
+    assert found.pages == [2, 3]
+    assert "BEGINNING AT A POINT" in found.text
+    assert "point or place of BEGINNING" in found.text
+    assert found.scanned == 3
+    assert calls == [(1, 1, 96), (2, 2, 96), (3, 3, 96)]
+    assert any("части 1/2" in line and "стр. 1–3" in line for line in progress)
+
+
+def test_description_search_uses_second_half_only_when_first_has_no_match(tmp_path, monkeypatch):
+    import deed_pages
+    import ocr_pages
+
+    pages = [""] * 5  # floor(5/2) = 2 pages in the first part
+    start = "BEGINNING AT A POINT; THENCE N 10 E 20 feet."
+    end = "THENCE S 10 W 20 feet to the point of BEGINNING."
+    monkeypatch.setattr(deed_pages, "read_pdf_page_texts", lambda _pdf: pages)
+    monkeypatch.setattr(ocr_pages, "available", lambda: True)
+    calls = []
+
+    def fake_ocr(_pdf, first, last, *, dpi, **_kwargs):
+        calls.append(first)
+        return {4: start, 5: end}.get(first, "")
+
+    monkeypatch.setattr(ocr_pages, "ocr_pdf_pages", fake_ocr)
+    progress = []
+    found = deed_pages.find_description_pages(
+        tmp_path / "deed.pdf", dpi=80, progress=progress.append,
+    )
+    assert found.pages == [4, 5]
+    assert calls == [1, 2, 3, 4, 5]
+    assert any("части 1/2" in line and "стр. 1–2" in line for line in progress)
+    assert any("части 2/2" in line and "стр. 3–5" in line for line in progress)

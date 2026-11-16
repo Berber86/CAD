@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Callable, Iterable
 
 import ocr_pages
@@ -55,6 +56,29 @@ def pages_spec(pages: Iterable[int]) -> str:
     return ",".join(chunks)
 
 
+_DESCRIPTION_START_RE = re.compile(r"\bBEGINNING\s+(?:AT|ON)\b", re.IGNORECASE)
+_DESCRIPTION_END_RE = re.compile(
+    r"\bTO\s+(?:THE\s+)?(?:TRUE\s+)?"
+    r"(?:POINT(?:\s+OR\s+PLACE)?|PLACE)\s+OF\s+BEGINNING\b",
+    re.IGNORECASE,
+)
+
+
+def has_description_start(text: str | None) -> bool:
+    """Страница содержит характерное начало юридического описания участка."""
+    return _DESCRIPTION_START_RE.search(str(text or "")) is not None
+
+
+def has_description_end(text: str | None, *, after: int = 0) -> bool:
+    """Стандартная заключительная фраза: «to the point [or place] of beginning»."""
+    return _DESCRIPTION_END_RE.search(str(text or ""), max(0, int(after))) is not None
+
+
+def _description_start_end(text: str) -> int:
+    match = _DESCRIPTION_START_RE.search(text)
+    return match.end() if match else 0
+
+
 def find_description_pages(
     pdf: str | Path,
     *,
@@ -63,11 +87,14 @@ def find_description_pages(
     max_pages: int | None = None,
 ) -> DescriptionPages:
     """
-    Ищет страницы с обходом границ: сначала текстовый слой, потом локальный OCR.
+    Ищет описание с приоритетом на фразы его начала и завершения.
 
-    Дешёвый порядок важен: у документа с текстовым слоем OCR не запускается вовсе.
-    У скана распознаётся каждая страница по очереди, поэтому вызов стоит делать
-    в фоне (5 с на страницу) и показывать прогресс.
+    Для документов от 4 страниц сначала идёт по первой половине (``floor(n/2)``),
+    затем — только если там нет ни начала, ни достаточных курсов — по второй.
+    Как только найдено начало или устойчивая последовательность курсов, поиск
+    прекращается; если фраза конца ещё не встретилась, добавляются следующие
+    страницы до неё. Текстовый слой проверяется мгновенно, OCR вызывается только
+    для страниц без текста и только по мере продвижения к найденному описанию.
     """
     path = Path(pdf)
     try:
@@ -76,37 +103,93 @@ def find_description_pages(
         texts = []
     total = len(texts)
     limit = total if max_pages is None else min(total, max(1, int(max_pages)))
-    found: list[int] = []
-    pieces: list[str] = []
-    scanned = 0
-    used_layer = False
-    for index in range(limit):
-        page_no = index + 1
-        page_text = texts[index] if index < len(texts) else ""
-        if has_legal_courses(page_text):
-            found.append(page_no)
-            pieces.append(page_text)
-            used_layer = True
-            continue
-        if not ocr_pages.available():
-            continue
-        if progress:
-            progress(f"ищу описание: страница {page_no} из {limit} (локальный OCR)…")
-        try:
-            recognized = ocr_pages.ocr_pdf_pages(path, page_no, page_no, dpi=dpi)
-        except ocr_pages.OcrError:
-            continue
-        scanned += 1
-        if has_legal_courses(recognized):
-            found.append(page_no)
-            pieces.append(recognized)
-    return DescriptionPages(
-        pages=found,
-        text="\n".join(pieces),
-        scanned=scanned,
-        from_text_layer=used_layer and not scanned,
-    )
+    if limit <= 0:
+        return DescriptionPages()
 
+    mid = max(1, limit // 2) if limit >= 4 else limit
+    ranges = [(0, mid, 1)]
+    if mid < limit:
+        ranges.append((mid, limit, 2))
+
+    cache: dict[int, str] = {}
+    scanned_pages: set[int] = set()
+    used_text_layer = False
+    ocr_available = ocr_pages.available()
+
+    def page_text(index: int, half_no: int) -> str:
+        nonlocal used_text_layer
+        if index in cache:
+            return cache[index]
+        text = texts[index] if index < len(texts) else ""
+        if text.strip():
+            used_text_layer = True
+            cache[index] = text
+            return text
+        if not ocr_available:
+            cache[index] = ""
+            return ""
+        page_no = index + 1
+        if progress:
+            progress(
+                f"ищу ключевые фразы: часть {half_no}/2, страница {page_no}/{limit}, "
+                f"локальный OCR {int(dpi)} dpi…"
+            )
+        scanned_pages.add(page_no)
+        try:
+            text = ocr_pages.ocr_pdf_pages(path, page_no, page_no, dpi=int(dpi))
+        except ocr_pages.OcrError:
+            text = ""
+        cache[index] = text
+        return text
+
+    def collect_from(start_index: int, start_text: str) -> DescriptionPages:
+        pages = [start_index + 1]
+        pieces = [start_text]
+        marker_end = _description_start_end(start_text)
+        if has_description_end(start_text, after=marker_end):
+            return DescriptionPages(
+                pages=pages, text="\n".join(pieces), scanned=len(scanned_pages),
+                from_text_layer=used_text_layer and not scanned_pages,
+            )
+        # Описание перешло на следующую страницу: дополняем до стандартной точки закрытия.
+        for continuation in range(start_index + 1, limit):
+            text = page_text(continuation, 2 if continuation >= mid and limit >= 4 else 1)
+            pages.append(continuation + 1)
+            pieces.append(text)
+            joined = "\n".join(pieces)
+            if has_description_end(joined, after=marker_end):
+                break
+            # Без OCR нечем проверять скан-продолжение; хотя бы захватим следующую
+            # страницу, как просил заказчик, но не будем копировать оставшийся PDF.
+            if not ocr_available and not text.strip():
+                break
+        if progress and not has_description_end("\n".join(pieces), after=marker_end):
+            progress(
+                f"описание началось на стр. {start_index + 1}, но фраза завершения "
+                f"не найдена до стр. {pages[-1]}"
+            )
+        return DescriptionPages(
+            pages=pages, text="\n".join(pieces), scanned=len(scanned_pages),
+            from_text_layer=used_text_layer and not scanned_pages,
+        )
+
+    for first, stop, half_no in ranges:
+        if progress and len(ranges) > 1:
+            progress(f"ищу начало описания в части {half_no}/2 (стр. {first + 1}–{stop})…")
+        for index in range(first, stop):
+            text = page_text(index, half_no)
+            if not text.strip():
+                continue
+            if has_description_start(text):
+                if progress:
+                    progress(f"начало описания найдено на стр. {index + 1}; проверяю фразу завершения…")
+                return collect_from(index, text)
+            if has_legal_courses(text) and not re.search(r"\bCOMMENCING\b", text, re.IGNORECASE):
+                if progress:
+                    progress(f"курсы обхода найдены на стр. {index + 1}; беру как начало описания")
+                return collect_from(index, text)
+
+    return DescriptionPages(scanned=len(scanned_pages))
 
 def trim_pdf(source: str | Path, pages: Iterable[int], destination: str | Path) -> Path:
     """Копия документа только с указанными страницами (порядок сохраняется)."""

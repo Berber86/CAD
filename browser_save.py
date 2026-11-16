@@ -1,9 +1,8 @@
-"""Безопасное Ctrl+S во встроенном PDF-просмотрщике браузера (только Windows).
+"""Безопасное взаимодействие с окнами браузера (только Windows).
 
-Клавиши никогда не отправляются в окно, выбранное только по заголовку: сначала
-проверяются имя процесса браузера и признаки уже загруженного PDF. Cloudflare,
-Foxit/FinReader и прочие PDF-программы поэтому не подходят. На один документ —
-не более одной попытки Ctrl+S.
+Portal automation uses only a verified supported-browser window; Ctrl+S remains
+stricter and additionally requires a loaded PDF title. Foxit/FinReader and other
+PDF programs are never activated, and a download gets at most one Ctrl+S attempt.
 """
 from __future__ import annotations
 
@@ -17,7 +16,13 @@ PENDING_PREFIX = "tsai_step0_"
 VK_CONTROL = 0x11
 VK_S = 0x53
 VK_RETURN = 0x0D
+VK_TAB = 0x09
+VK_DOWN = 0x28
+VK_A = 0x41
+VK_L = 0x4C
 KEYEVENTF_KEYUP = 0x0002
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
 KEYEVENTF_UNICODE = 0x0004
 
 # Только реальные браузеры. Yandex использует browser.exe; узнаём его по пути.
@@ -88,7 +93,33 @@ def _user32():  # noqa: ANN202 - ctypes object
         return None
     try:
         import ctypes
-        return ctypes.WinDLL("user32", use_last_error=True)
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # Declare pointer-sized HWND signatures explicitly: ctypes otherwise assumes
+        # a 32-bit int return/argument on 64-bit Windows and can truncate window handles.
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user32.GetWindowRect.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.mouse_event.argtypes = (
+            wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t,
+        )
+        user32.keybd_event.argtypes = (wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t)
+        return user32
     except Exception:  # noqa: BLE001
         return None
 
@@ -134,6 +165,8 @@ def list_windows() -> list[BrowserWindow]:
 
     result: list[BrowserWindow] = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
 
     def collect(handle, _param):  # noqa: ANN001 - EnumWindows callback
         if not user32.IsWindowVisible(handle):
@@ -196,6 +229,46 @@ def active_window_handle() -> int:
         return 0
 
 
+def window_bounds(handle: int) -> tuple[int, int, int, int] | None:
+    """Bounds of the exact supported-browser window, in desktop coordinates."""
+    if not any(
+        window.handle == int(handle)
+        and is_supported_browser(window.executable, window.image_path)
+        for window in list_windows()
+    ):
+        return None
+    user32 = _user32()
+    if user32 is None:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(int(handle), ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:  # noqa: BLE001 - fail closed if window geometry is unavailable
+        return None
+
+
+def click_browser_window(handle: int, x: int, y: int) -> bool:
+    """Click only inside the currently foreground supported browser window."""
+    if active_window_handle() != int(handle) or window_bounds(handle) is None:
+        return False
+    user32 = _user32()
+    if user32 is None:
+        return False
+    try:
+        user32.SetCursorPos(int(x), int(y))
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return active_window_handle() == int(handle)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _key(vk: int, *, up: bool) -> None:
     user32 = _user32()
     if user32 is not None:
@@ -223,6 +296,46 @@ def press_enter() -> bool:
     try:
         _key(VK_RETURN, up=False)
         _key(VK_RETURN, up=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def press_key(vk: int) -> bool:
+    """Send one key to the foreground window; callers must validate its process first."""
+    if _user32() is None:
+        return False
+    try:
+        _key(int(vk), up=False)
+        _key(int(vk), up=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def press_ctrl_l() -> bool:
+    """Focus the address bar in the foreground browser tab."""
+    if _user32() is None:
+        return False
+    try:
+        _key(VK_CONTROL, up=False)
+        _key(VK_L, up=False)
+        _key(VK_L, up=True)
+        _key(VK_CONTROL, up=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def press_ctrl_a() -> bool:
+    """Select the focused browser field contents."""
+    if _user32() is None:
+        return False
+    try:
+        _key(VK_CONTROL, up=False)
+        _key(VK_A, up=False)
+        _key(VK_A, up=True)
+        _key(VK_CONTROL, up=True)
         return True
     except Exception:  # noqa: BLE001
         return False

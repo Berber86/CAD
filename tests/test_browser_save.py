@@ -135,3 +135,26 @@ def test_hook_does_nothing_without_windows_keyboard_api(tmp_path, monkeypatch):
     monkeypatch.setattr(browser_save, "available", lambda: False)
     hook = browser_save.auto_save_hook(tmp_path)
     assert hook("42") is None
+
+
+def test_portal_click_requires_the_selected_browser_to_be_foreground(monkeypatch):
+    calls = []
+
+    class FakeUser32:
+        def SetCursorPos(self, x, y):
+            calls.append(("cursor", x, y))
+            return True
+
+        def mouse_event(self, *args):
+            calls.append(("mouse", *args))
+
+    monkeypatch.setattr(browser_save, "window_bounds", lambda handle: (0, 0, 800, 600))
+    monkeypatch.setattr(browser_save, "_user32", lambda: FakeUser32())
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 10)
+    assert browser_save.click_browser_window(10, 100, 200)
+    assert calls[0] == ("cursor", 100, 200)
+
+    calls.clear()
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 99)
+    assert not browser_save.click_browser_window(10, 100, 200)
+    assert calls == []

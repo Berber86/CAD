@@ -3588,7 +3588,7 @@ def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, mo
     monkeypatch.setattr(gui.browser_save, "available", lambda: True)
     monkeypatch.setattr(
         gui.browser_save, "auto_save_hook",
-        lambda folder, on_attempt: seen.setdefault("attempt_notice", on_attempt) and hook,
+        lambda folder, on_attempt, **kwargs: seen.setdefault("attempt_notice", on_attempt) and hook,
     )
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
     app._step0_worker(6323, 32, [], tmp_path, False)

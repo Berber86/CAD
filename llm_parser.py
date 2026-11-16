@@ -2963,7 +2963,7 @@ _SPACED_BEARING_RE = re.compile(
 )
 
 _DISTANCE_RE = re.compile(
-    r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:'|′|ft\b\.?|feet\b|foot\b|foot|f\.)",
+    r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:'|′|ft\.?|feet|foot|f\.)",
     re.IGNORECASE,
 )
 

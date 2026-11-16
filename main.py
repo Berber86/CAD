@@ -7240,11 +7240,22 @@ class SurveyApp(ctk.CTk):
                 provider_label=f"Расхождение {count} проходов",
             )
             return outcome, True, [issue]
-        outcome = parse_legal_description_full(
-            **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
-            use_llm=job.use_llm, provider=provider_id, model=model_name, api_key=api_key,
-            key_secret=key_secret, allow_regex_fallback=False, progress=progress,
-        )
+        try:
+            outcome = parse_legal_description_full(
+                **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
+                use_llm=job.use_llm, provider=provider_id, model=model_name, api_key=api_key,
+                key_secret=key_secret, allow_regex_fallback=False, progress=progress,
+            )
+        except Exception as local_exc:  # noqa: BLE001
+            if job.use_llm or not (api_key or key_secret):
+                raise
+            if progress is not None:
+                progress(f"локальный парсер не справился ({local_exc}) — отправляю в ИИ…")
+            outcome = parse_legal_description_full(
+                **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
+                use_llm=True, provider=provider_id, model=model_name, api_key=api_key,
+                key_secret=key_secret, allow_regex_fallback=False, progress=progress,
+            )
         return outcome, False, []
 
     def _pdf_set_worker(

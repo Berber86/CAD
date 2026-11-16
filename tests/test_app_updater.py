@@ -86,9 +86,10 @@ def test_extract_update_overwrites_existing_files_and_adds_new_ones(tmp_path):
         "sub/dir/module.py": b"print('hi')",
     }))
 
-    written = app_updater.extract_update(archive_path, target)
+    written, skipped = app_updater.extract_update(archive_path, target)
 
     assert sorted(written) == ["main.py", "sub/dir/module.py", "version.py"]
+    assert skipped == []
     assert (target / "main.py").read_text(encoding="utf-8") == "new main"
     assert (target / "version.py").read_text(encoding="utf-8") == "APP_VERSION = '9.9'"
     assert (target / "sub" / "dir" / "module.py").read_text(encoding="utf-8") == "print('hi')"
@@ -102,10 +103,71 @@ def test_extract_update_works_without_a_common_root_folder(tmp_path):
     archive_path = tmp_path / "update.zip"
     archive_path.write_bytes(_zip_bytes({"main.py": b"flat main"}, root=None))
 
-    written = app_updater.extract_update(archive_path, target)
+    written, skipped = app_updater.extract_update(archive_path, target)
 
     assert written == ["main.py"]
+    assert skipped == []
     assert (target / "main.py").read_text(encoding="utf-8") == "flat main"
+
+
+def test_extract_update_never_overwrites_config_json_even_though_the_repo_tracks_it(tmp_path):
+    """config.json ships repo defaults but also stores the user's live provider/model
+    choices and this very update source URL; the update must leave it alone."""
+    target = tmp_path / "app"
+    target.mkdir()
+    (target / "config.json").write_text('{"api": {"provider": "openrouter"}}', encoding="utf-8")
+
+    archive_path = tmp_path / "update.zip"
+    archive_path.write_bytes(_zip_bytes({
+        "main.py": b"new main",
+        "config.json": b'{"api": {"provider": "hydra"}}',
+    }))
+
+    written, skipped = app_updater.extract_update(archive_path, target)
+
+    assert written == ["main.py"]
+    assert skipped == ["config.json"]
+    assert (target / "config.json").read_text(encoding="utf-8") == '{"api": {"provider": "openrouter"}}'
+
+
+def test_extract_update_never_overwrites_local_config_or_env_secrets(tmp_path):
+    target = tmp_path / "app"
+    target.mkdir()
+    (target / "config.local.json").write_text('{"secret": "keep-me"}', encoding="utf-8")
+    (target / ".env").write_text("TSAI1_HYDRA_KEY=keep-me", encoding="utf-8")
+
+    archive_path = tmp_path / "update.zip"
+    archive_path.write_bytes(_zip_bytes({
+        "main.py": b"new main",
+        "config.local.json": b'{"secret": "overwritten"}',
+        ".env": b"TSAI1_HYDRA_KEY=overwritten",
+        "other.local.json": b"{}",
+    }))
+
+    written, skipped = app_updater.extract_update(archive_path, target)
+
+    assert written == ["main.py"]
+    assert sorted(skipped) == [".env", "config.local.json", "other.local.json"]
+    assert (target / "config.local.json").read_text(encoding="utf-8") == '{"secret": "keep-me"}'
+    assert (target / ".env").read_text(encoding="utf-8") == "TSAI1_HYDRA_KEY=keep-me"
+    assert not (target / "other.local.json").exists()
+
+
+def test_extract_update_only_protects_settings_files_at_the_archive_root(tmp_path):
+    """A nested file that happens to share a protected name is not special;
+    only the root-level config.json/.env/*.local.json matter here."""
+    target = tmp_path / "app"
+    target.mkdir()
+
+    archive_path = tmp_path / "update.zip"
+    archive_path.write_bytes(_zip_bytes({
+        "docs/config.json": b"not the real config",
+    }))
+
+    written, skipped = app_updater.extract_update(archive_path, target)
+
+    assert written == ["docs/config.json"]
+    assert skipped == []
 
 
 def test_extract_update_rejects_zip_slip_paths(tmp_path):
@@ -160,6 +222,30 @@ def test_apply_update_downloads_and_extracts_reporting_progress(tmp_path, monkey
     assert result.app_dir == str(target)
     assert any("скачиваю" in message for message in messages)
     assert any("завершено" in message for message in messages)
+
+
+def test_apply_update_protects_config_json_and_reports_it(tmp_path, monkeypatch):
+    target = tmp_path / "app"
+    target.mkdir()
+    (target / "config.json").write_text('{"api": {"provider": "openrouter"}}', encoding="utf-8")
+    zip_bytes = _zip_bytes({
+        "main.py": b"updated",
+        "config.json": b'{"api": {"provider": "hydra"}}',
+    })
+    monkeypatch.setattr(app_updater, "_http_get", lambda url, timeout=30.0: zip_bytes)
+
+    messages = []
+    result = app_updater.apply_update(
+        "https://github.com/Berber86/CAD/archive/refs/heads/main.zip",
+        target,
+        progress=messages.append,
+    )
+
+    assert (target / "main.py").read_text(encoding="utf-8") == "updated"
+    assert (target / "config.json").read_text(encoding="utf-8") == '{"api": {"provider": "openrouter"}}'
+    assert result.files_written == 1
+    assert result.protected_skipped == ("config.json",)
+    assert any("config.json" in message and "сохранены" in message for message in messages)
 
 
 def test_apply_update_surfaces_download_errors_without_touching_disk(tmp_path, monkeypatch):

@@ -1135,8 +1135,9 @@ class SurveyApp(ctk.CTk):
             update_row,
             text=(
                 "Архив скачивается и принудительно разворачивается в папку программы "
-                "(совпадающие файлы заменяются); config.local.json и .env не трогаются, "
-                "если их нет в архиве. После обновления перезапустите программу."
+                "(совпадающие файлы заменяются); config.json, config.local.json и .env "
+                "не трогаются — ваш выбор провайдера/моделей и ключи сохранятся. "
+                "После обновления перезапустите программу."
             ),
             anchor="w",
             justify="left",
@@ -5209,15 +5210,20 @@ class SurveyApp(ctk.CTk):
         self.update_version_button.configure(state="normal", text="🔄 Обновить версию")
         if status == "ok":
             result: app_updater.UpdateResult = payload
+            kept_note = (
+                f" Локальные настройки сохранены: {', '.join(result.protected_skipped)}."
+                if result.protected_skipped
+                else ""
+            )
             self.update_status_label.configure(
                 text=(
-                    f"Обновлено файлов: {result.files_written}. "
+                    f"Обновлено файлов: {result.files_written}.{kept_note} "
                     "Перезапустите программу, чтобы применить изменения."
                 ),
                 text_color=THEME["ok"],
             )
             self._set_status(
-                f"Обновление завершено: заменено файлов — {result.files_written}. "
+                f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
         else:

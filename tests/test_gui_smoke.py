@@ -3984,6 +3984,38 @@ def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypa
     assert "перезапустите" in app.update_status_label.cget("text").lower()
 
 
+def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch):
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+        return gui.app_updater.UpdateResult(
+            zip_url="https://codeload...",
+            files_written=42,
+            app_dir=str(app_dir),
+            protected_skipped=("config.json",),
+        )
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    assert not app._update_running
+    status_text = app.update_status_label.cget("text")
+    assert "42" in status_text
+    assert "config.json" in status_text
+    assert "сохранены" in status_text.lower()
+
+
 def test_update_version_declined_confirmation_does_not_run(gui, monkeypatch):
     from tkinter import messagebox
 

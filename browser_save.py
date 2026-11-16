@@ -218,6 +218,39 @@ def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None) -> Op
     return None
 
 
+def _same_owning_process(user32, handle_a: int, handle_b: int) -> bool:
+    """True when both window handles belong to the same OS process."""
+    import ctypes
+    from ctypes import wintypes
+
+    pid_a = wintypes.DWORD()
+    pid_b = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(handle_a, ctypes.byref(pid_a))
+    user32.GetWindowThreadProcessId(handle_b, ctypes.byref(pid_b))
+    return bool(pid_a.value) and pid_a.value == pid_b.value
+
+
+def foreground_is_acceptable(handle: int) -> bool:
+    """
+    True when ``handle`` is foreground, or the current foreground window belongs
+    to the same process (an open ``<select>`` dropdown, autocomplete list or
+    similar transient popup renders as its own top-level window owned by the
+    same browser process). Callers that only need to know whether it is safe to
+    keep sending input should use this instead of an exact handle comparison,
+    which would otherwise treat a just-opened popup as "not focused".
+    """
+    user32 = _user32()
+    if user32 is None:
+        return False
+    try:
+        current = int(user32.GetForegroundWindow() or 0)
+    except Exception:  # noqa: BLE001
+        return False
+    if current == int(handle):
+        return True
+    return bool(current) and _same_owning_process(user32, current, int(handle))
+
+
 def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     """Activate the exact supported browser and wait for Windows to grant focus."""
     if not any(
@@ -229,10 +262,12 @@ def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     user32 = _user32()
     if user32 is None:
         return False
-    # If this browser is already foreground, preserve focus inside its web page.
-    # Reapplying SetFocus to the top-level Chrome HWND steals focus from HTML controls.
+    # If this browser (or one of its own transient popups, e.g. an open <select>
+    # dropdown) is already foreground, preserve focus inside its web page.
+    # Reapplying SetFocus/SetForegroundWindow to the top-level Chrome HWND here
+    # would steal activation from that popup and close it immediately.
     try:
-        if int(user32.GetForegroundWindow() or 0) == int(handle):
+        if foreground_is_acceptable(handle):
             return True
     except Exception:  # noqa: BLE001
         pass

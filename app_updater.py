@@ -13,6 +13,14 @@ Files that only exist locally and are *not* part of the archive (typically
 untouched: the extractor only ever writes files present in the ZIP, it never
 deletes anything.
 
+``config.json`` is different: it ships with repository defaults *and* is where
+the running program persists the user's live choices (selected AI provider and
+models, consensus settings, this very update source URL, …). If the archive
+were allowed to overwrite it, every update would silently reset those choices
+back to the repo defaults. ``extract_update``/``apply_update`` therefore always
+skip a small set of root-level settings/secrets files — see
+``DEFAULT_PROTECTED_FILES`` — even though the archive contains them.
+
 Network access, ZIP parsing and the local file replacement are split into
 small functions so tests can monkeypatch the HTTP call without touching the
 network.
@@ -34,6 +42,16 @@ from urllib.parse import urlparse
 USER_AGENT = "TitleSurveyAI-Updater/1.0"
 _ALLOWED_HOSTS = ("github.com", "codeload.github.com", "githubusercontent.com", "api.github.com")
 
+# Root-level settings/secrets that an update must never overwrite, even when the
+# archive also contains a same-named file. ``config.json`` is tracked in the
+# repository (it ships defaults), but on disk it also holds the user's live
+# provider/model selections, consensus settings and this update source URL —
+# replacing it would reset all of that on every update. ``config.local.json``
+# and ``.env`` hold the user's own API keys and are git-ignored, so they would
+# not normally be in the archive at all, but are listed here for safety in case
+# someone's fork ever tracks them.
+DEFAULT_PROTECTED_FILES = frozenset({"config.json", "config.local.json", ".env"})
+
 
 class UpdateError(Exception):
     """Could not resolve, download or apply an update from the given source."""
@@ -44,6 +62,7 @@ class UpdateResult:
     zip_url: str
     files_written: int
     app_dir: str
+    protected_skipped: tuple[str, ...] = ()
 
 
 def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
@@ -137,15 +156,45 @@ def _common_root(names: list[str]) -> str:
     return ""
 
 
-def extract_update(zip_path: Path, target_dir: Path) -> list[str]:
+def _is_protected_file(relative: str, protected: frozenset[str]) -> bool:
+    """
+    True for root-level settings/secrets an update must leave alone.
+
+    Only applies at the root of the installation: ``config.json``,
+    ``config.local.json`` and ``.env`` are all resolved next to ``main.py`` via
+    ``Path(__file__).with_name(...)``, never inside a subfolder, so a file with
+    one of these names deeper in the archive (if that ever happened) is not
+    protected by this check.
+    """
+    if "/" in relative:
+        return False
+    if relative in protected:
+        return True
+    # Mirrors the project's own "<name>.local.json" convention for machine-local
+    # overrides that must never come from a shared update archive.
+    return relative.endswith(".local.json")
+
+
+def extract_update(
+    zip_path: Path,
+    target_dir: Path,
+    *,
+    protected: frozenset[str] = DEFAULT_PROTECTED_FILES,
+) -> tuple[list[str], list[str]]:
     """
     Forcibly overwrite files under ``target_dir`` with the archive's contents.
 
     Only files present in the archive are written; anything else already on
-    disk (local config, user data, caches) is left alone. Returns the list of
-    paths (relative to ``target_dir``) that were written.
+    disk (local config, user data, caches) is left alone. Files matching
+    ``protected`` (see ``DEFAULT_PROTECTED_FILES``) are skipped even when the
+    archive contains them, so the user's live settings/secrets on disk survive
+    an update untouched.
+
+    Returns ``(written, skipped)``: paths (relative to ``target_dir``) that
+    were written, and protected paths the archive contained but left alone.
     """
     written: list[str] = []
+    skipped: list[str] = []
     target_dir = Path(target_dir).resolve()
     try:
         with zipfile.ZipFile(zip_path) as archive:
@@ -161,6 +210,9 @@ def extract_update(zip_path: Path, target_dir: Path) -> list[str]:
                     relative = name
                 if not relative or relative.endswith("/"):
                     continue
+                if _is_protected_file(relative, protected):
+                    skipped.append(relative)
+                    continue
                 dest_path = (target_dir / relative).resolve()
                 if not dest_path.is_relative_to(target_dir):
                     raise UpdateError(f"Архив содержит недопустимый путь: {name}")
@@ -172,7 +224,7 @@ def extract_update(zip_path: Path, target_dir: Path) -> list[str]:
         raise UpdateError(f"Скачанный файл не является ZIP-архивом: {exc}") from exc
     if not written:
         raise UpdateError("В архиве не найдено ни одного файла для обновления.")
-    return written
+    return written, skipped
 
 
 def apply_update(
@@ -181,6 +233,7 @@ def apply_update(
     *,
     progress: Callable[[str], None] | None = None,
     timeout: float = 60.0,
+    protected: frozenset[str] = DEFAULT_PROTECTED_FILES,
 ) -> UpdateResult:
     """Resolve ``source``, download its ZIP and forcibly unpack it into ``app_dir``."""
 
@@ -198,6 +251,16 @@ def apply_update(
         zip_path = Path(tmp_name) / "update.zip"
         download_zip(zip_url, zip_path, timeout=timeout)
         report("распаковываю архив и принудительно заменяю файлы…")
-        written = extract_update(zip_path, app_dir)
+        written, skipped = extract_update(zip_path, app_dir, protected=protected)
+    if skipped:
+        report(
+            "локальные настройки сохранены без изменений: "
+            + ", ".join(sorted(skipped))
+        )
     report(f"обновление завершено: заменено файлов — {len(written)}")
-    return UpdateResult(zip_url=zip_url, files_written=len(written), app_dir=str(app_dir))
+    return UpdateResult(
+        zip_url=zip_url,
+        files_written=len(written),
+        app_dir=str(app_dir),
+        protected_skipped=tuple(skipped),
+    )

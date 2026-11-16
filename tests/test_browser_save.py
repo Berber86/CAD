@@ -237,6 +237,82 @@ def test_foreground_keeps_existing_focus_inside_the_browser_page(monkeypatch):
     assert calls == ["query"]  # no SetFocus on the top-level HWND; keep the page control focused
 
 
+def test_foreground_keeps_an_open_dropdown_popup_from_the_same_process(monkeypatch):
+    """An open <select>/autocomplete popup is its own HWND owned by the same browser
+    process. foreground() must not force SetForegroundWindow back onto the parent
+    tab in that case: doing so closes the popup (opens-then-shuts-instantly bug)."""
+    import browser_save
+
+    calls = []
+
+    class User32:
+        def GetForegroundWindow(self):
+            calls.append("query")
+            return 777  # the dropdown popup's own top-level window
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            # Popup (777) and parent tab (10) are both owned by the same browser process.
+            process_id._obj.value = 4321
+            return 50
+
+        def BringWindowToTop(self, handle):
+            calls.append(("top", handle))
+            return True
+
+        def SetForegroundWindow(self, handle):
+            calls.append(("activate", handle))
+            return True
+
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [_yandex()])
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    assert browser_save.foreground(10)
+    assert "query" in calls
+    assert not any(isinstance(item, tuple) for item in calls)  # never re-activated the parent
+
+
+def test_foreground_is_acceptable_matches_exact_handle_or_same_process(monkeypatch):
+    import browser_save
+
+    class User32:
+        def __init__(self, current):
+            self.current = current
+
+        def GetForegroundWindow(self):
+            return self.current
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            process_id._obj.value = 111 if handle == 10 else 222
+            return 1
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32(10))
+    assert browser_save.foreground_is_acceptable(10)
+
+    # Different HWND, same owning process as the target (a popup) -> acceptable.
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32(10))
+
+    class User32DifferentHandleSameProcess:
+        def GetForegroundWindow(self):
+            return 777
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            process_id._obj.value = 999  # same pid regardless of which hwnd is asked
+            return 1
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32DifferentHandleSameProcess())
+    assert browser_save.foreground_is_acceptable(10)
+
+    class User32DifferentProcess:
+        def GetForegroundWindow(self):
+            return 888
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            process_id._obj.value = 111 if handle == 888 else 222
+            return 1
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32DifferentProcess())
+    assert not browser_save.foreground_is_acceptable(10)
+
+
 def test_maximize_only_targets_a_verified_browser_window(monkeypatch):
     import browser_save
 

@@ -182,7 +182,10 @@ def _focus(handle: int) -> None:
         raise PortalLookupError(
             "Фокус больше не на выбранном поддерживаемом браузере; клавиатуру не трогаю."
         )
-    if not browser_save.foreground(handle) or browser_save.active_window_handle() != handle:
+    # foreground_is_acceptable() also allows an open <select> dropdown/autocomplete
+    # popup owned by the same browser process to stay focused: forcing the parent
+    # tab back to the foreground here would close that popup immediately.
+    if not browser_save.foreground(handle) or not browser_save.foreground_is_acceptable(handle):
         raise PortalLookupError("Не удалось безопасно активировать окно NYC Portal.")
 
 

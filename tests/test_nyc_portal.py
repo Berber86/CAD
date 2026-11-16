@@ -354,3 +354,55 @@ def test_initial_portal_check_ocr_uses_only_top_left_quarter(tmp_path, monkeypat
     rows = nyc_portal._screen_ocr_top_left_quarter(source)
     assert seen["size"] == (500, 400)
     assert nyc_portal._contains(rows, "Select")
+
+
+def test_focus_does_not_fight_an_open_select_dropdown_popup(monkeypatch):
+    """Keeping keyboard input flowing to a just-opened <select> dropdown matters:
+    treating its own popup HWND as "not focused" and forcing the parent tab back
+    to the foreground would close the dropdown within a blink of opening it."""
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=42, title="Property Information Portal - Chrome",
+        executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground", lambda _handle: True)
+    # The dropdown popup (a different HWND, same browser process) is foreground.
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground_is_acceptable", lambda _handle: True)
+    nyc_portal._focus(42)  # must not raise
+
+
+def test_focus_raises_when_a_different_application_is_actually_focused(monkeypatch):
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=42, title="Property Information Portal - Chrome",
+        executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground_is_acceptable", lambda _handle: False)
+    with pytest.raises(nyc_portal.PortalLookupError, match="активировать"):
+        nyc_portal._focus(42)
+
+
+def test_select_dropdown_popup_stealing_foreground_does_not_abort_the_down_arrow_keys(monkeypatch):
+    """Regression test for the Select menu opening and instantly closing: once the
+    click opens the dropdown, Windows reports its own popup HWND as foreground, and
+    _key() (via _focus) must keep sending Down/Down/Enter instead of forcing the
+    parent tab back and killing the popup."""
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=42, title="Property Information Portal - Chrome",
+        executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground", lambda _handle: True)
+    # Simulate: foreground is the dropdown's own popup window once it is open.
+    monkeypatch.setattr(nyc_portal.browser_save, "foreground_is_acceptable", lambda _handle: True)
+    sent = []
+    monkeypatch.setattr(nyc_portal.browser_save, "press_key", lambda vk: sent.append(vk) or True)
+    nyc_portal._key(42, nyc_portal.browser_save.VK_DOWN)
+    nyc_portal._key(42, nyc_portal.browser_save.VK_DOWN)
+    nyc_portal._key(42, nyc_portal.browser_save.VK_RETURN)
+    assert sent == [
+        nyc_portal.browser_save.VK_DOWN,
+        nyc_portal.browser_save.VK_DOWN,
+        nyc_portal.browser_save.VK_RETURN,
+    ]

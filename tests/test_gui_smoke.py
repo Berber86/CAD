@@ -3947,6 +3947,21 @@ def test_provider_and_model_preferences_autosave_and_survive_restart(gui, tmp_pa
     second._on_close()
 
 
+def test_update_section_is_the_first_scrollable_settings_entry_not_buried_at_the_bottom(gui):
+    """Regression: the update controls used to sit after the API-keys/PIN vault
+    sections with no scrolling, so they were unreachable on a short window and
+    the user could not find them. The settings body must scroll, and the update
+    card must be the very first thing inside it."""
+    app = gui.SurveyApp()
+
+    update_row = app.update_source_entry.master
+    drawer_body = update_row.master
+    assert isinstance(drawer_body, gui.ctk.CTkScrollableFrame)
+    assert drawer_body.winfo_children()[0] is update_row
+    assert app.update_source_entry in update_row.winfo_children()
+    assert app.update_version_button in update_row.winfo_children()
+
+
 def test_update_version_requires_a_source_url_before_running(gui):
     app = gui.SurveyApp()
     app.update_source_var.set("")

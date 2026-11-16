@@ -968,9 +968,85 @@ class SurveyApp(ctk.CTk):
             command=self.toggle_keys_drawer,
         ).grid(row=0, column=1, rowspan=2, sticky="ne")
 
-        drawer_body = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
+        # Прокручиваемый контейнер: без него нижние разделы (PIN-сейф,
+        # «Обновить версию») были недостижимы при невысоком окне — пользователь
+        # долго искал «Обновить версию» и не находил её ниже границы экрана.
+        drawer_body = ctk.CTkScrollableFrame(self.keys_drawer, fg_color="transparent")
         drawer_body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
         drawer_body.grid_columnconfigure(0, weight=1)
+
+        # Карточка обновления — самый первый пункт настроек (а не внизу под всем
+        # остальным), с явной рамкой, чтобы её невозможно было не заметить/не найти.
+        update_row = ctk.CTkFrame(
+            drawer_body,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["sky"],
+        )
+        update_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        update_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            update_row,
+            text="🔄 ОБНОВЛЕНИЕ ПРОГРАММЫ",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["sky"],
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
+        ctk.CTkLabel(
+            update_row,
+            text="Ссылка GitHub (репозиторий, ветка или .zip), куда падают актуальные пуши",
+            anchor="w",
+            justify="left",
+            wraplength=394,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+        self.update_source_entry = ctk.CTkEntry(
+            update_row,
+            textvariable=self.update_source_var,
+            height=30,
+            fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"],
+            placeholder_text="https://github.com/owner/repo/tree/main",
+        )
+        self.update_source_entry.grid(row=2, column=0, sticky="ew", padx=(10, 4), pady=(0, 6))
+        self.update_version_button = ctk.CTkButton(
+            update_row,
+            text="🔄 Обновить версию",
+            width=150,
+            height=30,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._start_update_version,
+        )
+        self.update_version_button.grid(row=2, column=1, padx=(0, 10), pady=(0, 6), sticky="e")
+        self.update_status_label = ctk.CTkLabel(
+            update_row,
+            text=f"Текущая версия: {APP_VERSION} ({APP_DATE})",
+            anchor="w",
+            justify="left",
+            wraplength=394,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        )
+        self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(
+            update_row,
+            text=(
+                "Архив скачивается и принудительно разворачивается в папку программы "
+                "(совпадающие файлы заменяются); config.json, config.local.json и .env "
+                "не трогаются — ваш выбор провайдера/моделей и ключи сохранятся. "
+                "После обновления перезапустите программу."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=394,
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
 
         ctk.CTkLabel(
             drawer_body,
@@ -978,10 +1054,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=THEME["text_dim"],
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 4))
+        ).grid(row=2, column=0, sticky="w", pady=(4, 4))
 
         keys_frame = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        keys_frame.grid(row=2, column=0, sticky="ew", pady=(2, 6))
+        keys_frame.grid(row=3, column=0, sticky="ew", pady=(2, 6))
         keys_frame.grid_columnconfigure(0, weight=1)
         for col, pid in enumerate(self.provider_ids):
             card = ctk.CTkFrame(
@@ -1042,7 +1118,7 @@ class SurveyApp(ctk.CTk):
             self.provider_key_buttons[pid] = btn
 
         vault_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        vault_row.grid(row=3, column=0, sticky="ew", pady=(10, 4))
+        vault_row.grid(row=4, column=0, sticky="ew", pady=(10, 4))
         vault_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -1081,70 +1157,6 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_dim"],
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        update_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        update_row.grid(row=4, column=0, sticky="ew", pady=(10, 4))
-        update_row.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            update_row,
-            text="ОБНОВЛЕНИЕ ПРОГРАММЫ",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=THEME["text_dim"],
-            anchor="w",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(4, 4))
-        ctk.CTkLabel(
-            update_row,
-            text="Ссылка GitHub (репозиторий, ветка или .zip), куда падают актуальные пуши",
-            anchor="w",
-            justify="left",
-            wraplength=410,
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_muted"],
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        self.update_source_entry = ctk.CTkEntry(
-            update_row,
-            textvariable=self.update_source_var,
-            height=30,
-            fg_color=THEME["bg_editor"],
-            border_color=THEME["border_card"],
-            placeholder_text="https://github.com/owner/repo/tree/main",
-        )
-        self.update_source_entry.grid(row=2, column=0, sticky="ew", pady=(0, 6))
-        self.update_version_button = ctk.CTkButton(
-            update_row,
-            text="🔄 Обновить версию",
-            width=150,
-            height=30,
-            fg_color=THEME["btn_secondary"],
-            hover_color=THEME["btn_secondary_hover"],
-            font=ctk.CTkFont(size=12),
-            command=self._start_update_version,
-        )
-        self.update_version_button.grid(row=2, column=1, padx=(6, 0), pady=(0, 6), sticky="e")
-        self.update_status_label = ctk.CTkLabel(
-            update_row,
-            text=f"Текущая версия: {APP_VERSION} ({APP_DATE})",
-            anchor="w",
-            justify="left",
-            wraplength=410,
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_dim"],
-        )
-        self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 0))
-        ctk.CTkLabel(
-            update_row,
-            text=(
-                "Архив скачивается и принудительно разворачивается в папку программы "
-                "(совпадающие файлы заменяются); config.json, config.local.json и .env "
-                "не трогаются — ваш выбор провайдера/моделей и ключи сохранятся. "
-                "После обновления перезапустите программу."
-            ),
-            anchor="w",
-            justify="left",
-            wraplength=410,
-            font=ctk.CTkFont(size=10),
-            text_color=THEME["text_dim"],
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         drawer_foot = ctk.CTkFrame(self.keys_drawer, fg_color=THEME["bg_header"])
         drawer_foot.grid(row=2, column=0, sticky="ew")
@@ -1176,7 +1188,7 @@ class SurveyApp(ctk.CTk):
 
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        ai_card.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ai_card.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         ai_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(

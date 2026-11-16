@@ -437,6 +437,15 @@ def _drive_portal(
             window.handle, lambda screen: _contains(screen, "Enter an Address"),
             timeout=8, description="поля Address",
         )
+        # Confirming "Address" with the keyboard (not a mouse click) leaves DOM
+        # focus sitting on the <select> itself even though the page has already
+        # swapped to the address-entry view (just confirmed above by OCR). A
+        # click computed from the OCR'd label position was landing outside the
+        # input — the swap can still be settling at that instant — so advance
+        # focus the same way a user tabbing through the form would: Tab moves
+        # off the Select and onto the address input field right next to it.
+        _key(window.handle, browser_save.VK_TAB)
+        time.sleep(0.2)
 
     if progress:
         progress("ввожу адрес в NYC Portal и жду совпадающую подсказку")

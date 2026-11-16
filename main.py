@@ -3089,7 +3089,10 @@ class SurveyApp(ctk.CTk):
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
         worker = threading.Thread(
             target=self._step0_portal_worker,
-            args=(address, folder, cfg, provider, model, target["api_key"], key_secret),
+            args=(
+                address, folder, cfg, provider, model, target["api_key"], key_secret,
+                bool(self.step0_fast_mode_var.get()),
+            ),
             daemon=True,
         )
         worker.start()
@@ -3103,6 +3106,7 @@ class SurveyApp(ctk.CTk):
         model: str,
         api_key: str,
         key_secret: str,
+        fast_mode: bool = False,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
         self._worker_context.generation = self._generation
@@ -3120,6 +3124,7 @@ class SurveyApp(ctk.CTk):
                 api_key=api_key,
                 key_secret=key_secret,
                 progress=progress,
+                fast_mode=fast_mode,
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
             self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
@@ -5276,6 +5281,17 @@ class SurveyApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _attach_child_window(self, win: Any) -> None:
+        """
+        Окно-отчёт (сверка с соседями, итог набора, журнал и т. п.) принадлежит главному окну:
+        transient держит его поверх основного окна, lift поднимает при открытии.
+        """
+        try:
+            win.transient(self)
+        except Exception:  # noqa: BLE001 - платформа не поддерживает transient — окно всё равно откроется
+            pass
+        win.lift()
+
     def _show_update_stage(self, name: str, fraction: float | None, detail: str) -> None:
         """Полоса и подпись: «Скачивание: 42% — 1.0 из 2.4 МБ», «Резервная копия…», «Установка…»."""
         titles = {"download": "Скачивание", "backup": "Резервная копия", "install": "Установка"}
@@ -5522,6 +5538,7 @@ class SurveyApp(ctk.CTk):
         win.configure(fg_color=THEME["bg_root"])
         try:
             win.attributes("-topmost", bool(self.topmost_var.get()))
+            self._attach_child_window(win)
         except Exception:  # noqa: BLE001
             pass
         win.grid_columnconfigure(0, weight=1)
@@ -6012,6 +6029,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("860x560")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
@@ -7161,6 +7179,7 @@ class SurveyApp(ctk.CTk):
         win.configure(fg_color=THEME["bg_root"])
         win.transient(self)
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkLabel(
             win, text=f"Какой участок содержится в {source_label}?",
@@ -8312,6 +8331,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("1000x760" if analysis is not None and (analysis.proposals or analysis.applied) else "1000x640")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
@@ -8736,6 +8756,7 @@ class SurveyApp(ctk.CTk):
         window.geometry("820x560")
         window.configure(fg_color=THEME["bg_root"])
         window.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(window)
         text = ctk.CTkTextbox(
             window,
             wrap="word",
@@ -9141,6 +9162,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("880x620")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
@@ -10276,6 +10298,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("880x560")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         self.doubt_window = win
 
         top_banner = ctk.CTkFrame(
@@ -10648,6 +10671,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("900x610")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         self.conflict_window = win
 
         top_banner = ctk.CTkFrame(

@@ -4282,3 +4282,39 @@ def test_rollback_is_refused_while_an_update_is_running(gui, tmp_path, monkeypat
 
     assert (app_dir / "main.py").read_text(encoding="utf-8") == "new main"
     assert "Дождитесь" in app.status_var.get()
+
+
+def test_child_report_windows_are_attached_to_the_main_window(gui):
+    """Окна-отчёты привязаны к главному окну (transient) и поднимаются при открытии."""
+
+    class _Win:
+        def __init__(self):
+            self.calls = []
+
+        def transient(self, master):
+            self.calls.append(("transient", master))
+
+        def lift(self):
+            self.calls.append(("lift",))
+
+    app = gui.SurveyApp()
+    win = _Win()
+    app._attach_child_window(win)
+    assert win.calls == [("transient", app), ("lift",)]
+
+
+def test_step0_portal_worker_receives_fast_mode_flag(gui, monkeypatch, tmp_path):
+    """Галочка «быстрая работа» доходит до поиска по адресу, а не только до сбора документов."""
+    import nyc_portal as portal_module
+
+    app = gui.SurveyApp()
+    received = {}
+
+    def fake_lookup(address, folder, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("стоп")
+
+    monkeypatch.setattr(portal_module, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", True)
+    assert received.get("fast_mode") is True
+

@@ -49,7 +49,7 @@ def test_lookup_uses_local_bbl_and_sends_only_map_to_one_vision_request(tmp_path
         provider="hydra", provider_label="Hydra AI", model="vision", available=True,
     )
 
-    def drive(address, path, progress=None):
+    def drive(address, path, progress=None, **_kwargs):
         calls["address"] = address
         calls["map_path"] = path
         return nyc_portal.PortalCapture("5712", "70", "Staten Island", map_image)
@@ -417,3 +417,110 @@ def test_select_dropdown_popup_stealing_foreground_does_not_abort_the_down_arrow
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_RETURN,
     ]
+
+
+class _FakeClock:
+    """Подмена time: monotonic() идёт вперёд только от sleep()."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _wait_setup(monkeypatch, screens):
+    clock = _FakeClock()
+    seen = []
+    monkeypatch.setattr(nyc_portal, "time", clock)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, path: Path(path).write_bytes(b"x"))
+
+    def ocr(_path):
+        seen.append(True)
+        return screens[min(len(seen), len(screens)) - 1]
+
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    return clock, seen
+
+
+def test_fast_mode_waits_five_seconds_between_screen_checks(monkeypatch):
+    select = [nyc_portal.ScreenText("Select", (20, 100, 80, 130))]
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty, empty, select])
+
+    rows = nyc_portal._wait_screen(
+        1, lambda screen: any(r.text == "Select" for r in screen),
+        timeout=60, description="страницу", pause=nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
+    )
+    assert rows == select
+    assert len(seen) == 3
+    assert clock.sleeps == [5.0, 5.0]
+
+
+def test_default_wait_keeps_the_fast_short_polling(monkeypatch):
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty])
+    with pytest.raises(nyc_portal.PortalLookupError, match="Не дождался"):
+        nyc_portal._wait_screen(1, lambda _s: False, timeout=1.5, description="страницу")
+    # Проверки при t=0, 0.6, 1.2 и у дедлайна t=1.5: последняя пауза укорочена до остатка.
+    assert len(seen) == 4
+    assert clock.sleeps == [0.6, 0.6, pytest.approx(0.3)]
+
+
+def test_wait_screen_makes_a_final_check_exactly_at_the_deadline(monkeypatch):
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty])
+    with pytest.raises(nyc_portal.PortalLookupError):
+        nyc_portal._wait_screen(1, lambda _s: False, timeout=5, description="окно", pause=5.0)
+    assert len(seen) == 2  # при t=0 и при t=5, а не только при t=0
+    assert clock.sleeps == [5.0]
+
+
+def test_map_is_captured_only_after_the_redraw_wait_following_the_wheel(monkeypatch):
+    import ctypes
+
+    clock = _FakeClock()
+    monkeypatch.setattr(nyc_portal, "time", clock)
+    monkeypatch.setattr(nyc_portal, "sys", type("S", (), {"platform": "win32"}))
+    wheel = []
+
+    class _User32:
+        def GetWindowRect(self, _hwnd, rect_ref):
+            rect = rect_ref._obj
+            rect.left, rect.top, rect.right, rect.bottom = 0, 0, 1000, 800
+            return 1
+
+        def SetCursorPos(self, x, y):
+            wheel.append(("cursor", x, y))
+
+        def mouse_event(self, flags, dx, dy, data, extra):
+            wheel.append(("wheel", data))
+
+    fake_windll = type("W", (), {"user32": _User32()})()
+    monkeypatch.setattr(ctypes, "windll", fake_windll, raising=False)
+    nyc_portal._zoom_out_map_pane(1)
+    assert wheel == [("cursor", 750, 400), ("wheel", -120)]
+    assert clock.sleeps == [0.1, nyc_portal.MAP_REDRAW_WAIT_SEC]
+    assert nyc_portal.MAP_REDRAW_WAIT_SEC == pytest.approx(3.8)
+
+
+def test_lookup_parcel_passes_fast_mode_to_the_portal_driver(monkeypatch, tmp_path):
+    received = {}
+
+    def drive(address, map_path, progress=None, *, fast_mode=False):
+        received["fast_mode"] = fast_mode
+        raise nyc_portal.PortalLookupError("стоп после проверки аргумента")
+
+    monkeypatch.setattr(nyc_portal, "_drive_portal", drive)
+    with pytest.raises(nyc_portal.PortalLookupError, match="стоп"):
+        nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="vision",
+            fast_mode=True,
+        )
+    assert received == {"fast_mode": True}

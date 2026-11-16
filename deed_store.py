@@ -74,6 +74,7 @@ def store_pdf(
     source_url: str = "",
     pages: str = "",
     trimmed_source: str | Path | None = None,
+    text: str = "",
     notes: Iterable[str] = (),
 ) -> StoredDeed:
     """
@@ -116,9 +117,12 @@ def store_pdf(
         source_url=source_url,
         pages=pages,
         trimmed=trimmed_name,
+        text_file=f"{Path(final_name).stem}_text.txt" if text.strip() else "",
         downloaded=datetime.now().isoformat(timespec="seconds"),
         notes=list(notes),
     )
+    if record.text_file:
+        (target_dir / record.text_file).write_text(text, encoding="utf-8")
     (target_dir / record.sidecar_name()).write_text(
         json.dumps(asdict(record), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

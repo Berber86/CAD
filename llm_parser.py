@@ -2015,7 +2015,9 @@ def render_image_files_base64(
 # Соглашение с заказчиком об именах PDF: в конце имени «_p» и страница
 # («deed_p17.pdf») либо диапазон через ещё одно подчёркивание
 # («bruklin250_p2_5.pdf» — страницы со 2-й по 5-ю).
-_PDF_NAME_PAGES_RE = re.compile(r"_p(\d{1,4})(?:_(\d{1,4}))?$", re.IGNORECASE)
+#: Страницы в конце имени файла: ``…_p17``, ``…_p2_5`` и ``…_p4-6`` (Шаг 0 пишет
+#: диапазон через дефис, Шаг 1 исторически — через подчёркивание; читаем оба).
+_PDF_NAME_PAGES_RE = re.compile(r"_p(\d{1,4})(?:[-_](\d{1,4}))?$", re.IGNORECASE)
 
 
 def pages_from_pdf_name(name: str | Path) -> tuple[int, int] | None:

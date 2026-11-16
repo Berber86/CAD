@@ -123,7 +123,10 @@ from llm_parser import (
     save_config,
     save_protected_env,
 )
+import deed_intake
+import deed_store
 import ocr_pages
+import rcclerk
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
@@ -149,9 +152,26 @@ CENTER_PANEL_MIN_WIDTH = 260
 RESULT_SPLITTER_WIDTH = 12
 
 # Глобальные вкладки окна: шаги технологической цепочки Title Survey.
+# Шаг 0 стоит перед Шагом 1: сначала документы участка, потом посадка границы.
+STEP_TAB_DEEDS = "Шаг 0. Документы участка"
 STEP_TAB_BOUNDARY = "Шаг 1. Граница участка (Legal Description)"
 STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
-STEP_TABS = (STEP_TAB_BOUNDARY, STEP_TAB_LABELS)
+STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS)
+#: Роль файла, который человек докачал сам: наш участок или сосед.
+STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
+STEP0_EMPTY_REPORT = (
+    "Отчёт появится после сбора.\n\n"
+    "1. Впишите block и lot участка (их присылает геодезист вместе с DWG).\n"
+    "2. Соседей впишите руками через запятую — они получат роль «сосед» и имена "
+    "вида LOT 30 NEW.pdf; автоматического поиска соседей на этом шаге нет.\n"
+    "3. Нажмите «Собрать описания»: программа откроет список документов Richmond "
+    "County Clerk, возьмёт Deed (а без него Mortgage), скачает свежий и старый "
+    "документ нашего участка, найдёт страницы описания и положит всё в папку "
+    "01_описания вместе с паспортами и _manifest.json.\n\n"
+    "Если сайт закрыт проверкой Cloudflare, программа открывает ссылку в браузере "
+    "и ждёт скачанный файл; последняя ступень — положить PDF самому и нажать "
+    "«Забрать свежий PDF из «Загрузок»»."
+)
 STEP2_EMPTY_REPORT = (
     "Отчёт появится после запуска.\n\n"
     "1. Откройте в AutoCAD чертёж, в котором уже посажена граница участка (Шаг 1).\n"
@@ -435,6 +455,19 @@ class SurveyApp(ctk.CTk):
         self._draw_lock = threading.Lock()
         # Шаг 2: автоподписание объектов (вторая глобальная вкладка)
         self.step_tab_var = ctk.StringVar(value=STEP_TAB_BOUNDARY)
+        # Шаг 0: документы участка. Соседи вводятся руками и получают роль «сосед».
+        self.step0_address_var = ctk.StringVar(value="")
+        self.step0_block_var = ctk.StringVar(value="")
+        self.step0_lot_var = ctk.StringVar(value="")
+        self.step0_neighbours_var = ctk.StringVar(value="")
+        self.step0_folder_var = ctk.StringVar(value="")
+        self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
+        self.step0_manual_role_var = ctk.StringVar(value=STEP0_MANUAL_ROLES[0])
+        self.step0_manual_lot_var = ctk.StringVar(value="")
+        self._step0_lines: list[str] = []
+        self._step0_running = False
+        self._step0_outcome: deed_intake.IntakeOutcome | None = None
+        self._step0_stop = threading.Event()
         self.house_text_var = ctk.StringVar(value="")
         self.feature_text_height_var = ctk.StringVar(value="")
         self.skip_existing_labels_var = ctk.BooleanVar(
@@ -2543,7 +2576,8 @@ class SurveyApp(ctk.CTk):
         )
         self.draw_button.grid(row=0, column=3, padx=(6, 16), pady=11, sticky="e")
 
-        # 5. Страница второй глобальной вкладки (Шаг 2) — поверх той же строки сетки
+        # 5. Страницы остальных глобальных вкладок (Шаг 0 и Шаг 2) — поверх той же строки
+        self._build_step0_page()
         self._build_step2_page()
         self._switch_step_tab()
 
@@ -2552,7 +2586,7 @@ class SurveyApp(ctk.CTk):
         """Полоса глобальных вкладок: Шаг 1 (граница участка) | Шаг 2 (подписи объектов)."""
         bar = ctk.CTkFrame(self, corner_radius=0, fg_color=THEME["bg_root"], border_width=0)
         bar.grid(row=1, column=0, sticky="ew")
-        bar.grid_columnconfigure(2, weight=1)
+        bar.grid_columnconfigure(len(STEP_TABS), weight=1)
         self.step_tab_bar = bar
         self.step_tab_buttons: dict[str, Any] = {}
         for column, label in enumerate(STEP_TABS):
@@ -2573,11 +2607,456 @@ class SurveyApp(ctk.CTk):
             self.step_tab_buttons[label] = button
         ctk.CTkLabel(
             bar,
-            text="Порядок работы: 1 — посадка границы участка → 2 — подписи объектов → оффсеты",
+            text=(
+                "Порядок работы: 0 — документы участка → 1 — посадка границы → "
+                "2 — подписи объектов → оффсеты"
+            ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="e",
-        ).grid(row=0, column=2, sticky="e", padx=(8, 16))
+        ).grid(row=0, column=len(STEP_TABS), sticky="e", padx=(8, 16))
+
+    # ----------------------------------------------- Шаг 0: документы участка ---
+    def _build_step0_page(self) -> None:
+        """Страница «Шаг 0. Документы участка»: block/lot → папка описаний."""
+        page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
+        page.grid(row=2, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=0)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        self.step0_page = page
+
+        panel = ctk.CTkFrame(
+            page,
+            width=470,
+            fg_color=THEME["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            panel,
+            text=STEP_TAB_DEEDS,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            panel,
+            text=(
+                "Staten Island — Richmond County: список документов участка, Deed, а без него "
+                "Mortgage. Наш участок — самый свежий и самый старый документ, сосед — только "
+                "свежий. Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=430,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        fields = ctk.CTkFrame(panel, fg_color="transparent")
+        fields.grid(row=2, column=0, sticky="ew", padx=16)
+        fields.grid_columnconfigure(0, weight=1)
+
+        def field(row: int, label: str, var: Any, placeholder: str = "", width: int = 0) -> Any:
+            ctk.CTkLabel(
+                fields,
+                text=label,
+                font=ctk.CTkFont(size=11),
+                text_color=THEME["text_muted"],
+                anchor="w",
+            ).grid(row=row * 2, column=0, sticky="ew", pady=(6, 0))
+            entry = ctk.CTkEntry(
+                fields,
+                textvariable=var,
+                placeholder_text=placeholder,
+                height=32,
+                fg_color=THEME["bg_field"],
+                border_color=THEME["border_card"],
+                font=ctk.CTkFont(size=12),
+            )
+            entry.grid(row=row * 2 + 1, column=0, sticky="ew", pady=(2, 0))
+            return entry
+
+        field(0, "Адрес (для папки проекта)", self.step0_address_var,
+              "24 Alvine Avenue, Staten Island")
+        numbers = ctk.CTkFrame(fields, fg_color="transparent")
+        numbers.grid(row=3, column=0, sticky="ew")
+        numbers.grid_columnconfigure(0, weight=1)
+        numbers.grid_columnconfigure(1, weight=1)
+        for column, (label, var) in enumerate(
+            (("Block", self.step0_block_var), ("Lot", self.step0_lot_var))
+        ):
+            ctk.CTkLabel(
+                numbers, text=label, font=ctk.CTkFont(size=11),
+                text_color=THEME["text_muted"], anchor="w",
+            ).grid(row=0, column=column, sticky="ew", padx=(0, 8) if column == 0 else 0)
+            ctk.CTkEntry(
+                numbers, textvariable=var, placeholder_text="6323" if column == 0 else "32",
+                height=32, width=120, fg_color=THEME["bg_field"],
+                border_color=THEME["border_card"], font=ctk.CTkFont(size=12),
+            ).grid(row=1, column=column, sticky="ew", padx=(0, 8) if column == 0 else 0, pady=(2, 0))
+
+        field(2, "Соседи — номера лотов через запятую (они получат роль «сосед»)",
+              self.step0_neighbours_var, "30, 28")
+        ctk.CTkCheckBox(
+            panel,
+            text="докачать старый документ соседей (если межа соседа спорная)",
+            variable=self.step0_old_neighbour_var,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+            checkbox_width=18,
+            checkbox_height=18,
+        ).grid(row=3, column=0, sticky="w", padx=16, pady=(10, 4))
+
+        folder_row = ctk.CTkFrame(panel, fg_color="transparent")
+        folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
+        folder_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            folder_row, text="Папка описаний", font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"], anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkEntry(
+            folder_row, textvariable=self.step0_folder_var, height=30,
+            placeholder_text="пусто — рядом с программой",
+            fg_color=THEME["bg_field"], border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ctk.CTkButton(
+            folder_row, text="…", width=36, height=30, fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"], command=self._pick_step0_folder,
+        ).grid(row=1, column=1, padx=(6, 0), pady=(2, 0))
+
+        self.step0_run_button = ctk.CTkButton(
+            panel,
+            text="📥 Собрать описания",
+            height=38,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_step0_intake,
+        )
+        self.step0_run_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(12, 4))
+
+        run_row = ctk.CTkFrame(panel, fg_color="transparent")
+        run_row.grid(row=6, column=0, sticky="ew", padx=16)
+        run_row.grid_columnconfigure(0, weight=1)
+        run_row.grid_columnconfigure(1, weight=1)
+        self.step0_stop_button = ctk.CTkButton(
+            run_row, text="⏹ Стоп", height=30, fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"], state="disabled",
+            command=self._stop_step0_intake,
+        )
+        self.step0_stop_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.step0_open_button = ctk.CTkButton(
+            run_row, text="📂 Открыть папку", height=30, fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"], command=self._open_step0_folder,
+        )
+        self.step0_open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        # Ручная докачка: файл уже скачан в браузере — остаётся сказать, чей он.
+        manual = ctk.CTkFrame(
+            panel, fg_color=THEME["bg_field"], corner_radius=8,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        manual.grid(row=7, column=0, sticky="ew", padx=16, pady=(12, 14))
+        manual.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            manual, text="Файл скачан вручную", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"], anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
+        ctk.CTkLabel(
+            manual,
+            text="PDF уже лежит в «Загрузках» — программа назовёт его по схеме и добавит в папку.",
+            font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
+            anchor="w", justify="left", wraplength=400,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        manual_row = ctk.CTkFrame(manual, fg_color="transparent")
+        manual_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        manual_row.grid_columnconfigure(2, weight=1)
+        self.step0_manual_role_menu = ctk.CTkOptionMenu(
+            manual_row, values=list(STEP0_MANUAL_ROLES),
+            variable=self.step0_manual_role_var, width=130, height=28,
+            fg_color=THEME["bg_editor"], button_color=THEME["seg_sel"],
+            font=ctk.CTkFont(size=11),
+        )
+        self.step0_manual_role_menu.grid(row=0, column=0, padx=(0, 6))
+        ctk.CTkLabel(
+            manual_row, text="лот", font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkEntry(
+            manual_row, textvariable=self.step0_manual_lot_var, width=70, height=28,
+            placeholder_text="30", fg_color=THEME["bg_editor"],
+            border_color=THEME["border_card"], font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=2, sticky="w")
+        ctk.CTkButton(
+            manual, text="📂 Забрать свежий PDF из «Загрузок»", height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=self._adopt_step0_download,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+
+        # Правая колонка: отчёт сбора
+        report_wrap = ctk.CTkFrame(
+            page, fg_color=THEME["bg_card"], corner_radius=10,
+            border_width=1, border_color=THEME["border_card"],
+        )
+        report_wrap.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
+        report_wrap.grid_columnconfigure(0, weight=1)
+        report_wrap.grid_rowconfigure(1, weight=1)
+        head = ctk.CTkFrame(report_wrap, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            head, text="Ход сбора и результат", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=THEME["text_main"], anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.step0_to_step1_button = ctk.CTkButton(
+            head, text="→ Передать в Шаг 1", height=28, width=170,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11), state="disabled",
+            command=self._step0_to_step1,
+        )
+        self.step0_to_step1_button.grid(row=0, column=1, sticky="e")
+        self.step0_report_box = ctk.CTkTextbox(
+            report_wrap,
+            fg_color=THEME["bg_editor"],
+            border_width=0,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="word",
+        )
+        self.step0_report_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self._set_step0_report(STEP0_EMPTY_REPORT)
+
+    # --- Шаг 0: работа с полями и запуск -------------------------------------
+    def _is_step0_tab(self) -> bool:
+        var = getattr(self, "step_tab_var", None)
+        return var is not None and str(var.get()) == STEP_TAB_DEEDS
+
+    def _set_step0_report(self, content: str) -> None:
+        box = getattr(self, "step0_report_box", None)
+        if box is None:
+            return
+        target = getattr(box, "_textbox", box)
+        try:
+            target.configure(state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        box.delete("1.0", "end")
+        box.insert("1.0", content)
+        try:
+            target.configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _render_step0_log(self) -> None:
+        self._set_step0_report("\n".join(self._step0_lines) or STEP0_EMPTY_REPORT)
+
+    def _step0_folder(self) -> Path:
+        text = str(self.step0_folder_var.get() or "").strip()
+        if text:
+            return Path(text)
+        return deed_intake.build_folder_for(str(self.step0_address_var.get() or ""))
+
+    def _pick_step0_folder(self) -> None:
+        from tkinter import filedialog
+
+        chosen = filedialog.askdirectory(title="Папка описаний")
+        if chosen:
+            self.step0_folder_var.set(str(chosen))
+
+    def _start_step0_intake(self) -> None:
+        """Собирает описания в фоне: окно не замирает на Cloudflare и OCR."""
+        if self._step0_running:
+            self._set_status("Шаг 0: сбор уже идёт — дождитесь конца или нажмите «Стоп».")
+            return
+        try:
+            block = int(str(self.step0_block_var.get() or "").strip())
+            lot = int(str(self.step0_lot_var.get() or "").strip())
+        except (TypeError, ValueError):
+            self._set_status("Шаг 0: впишите block и lot цифрами (например, 6323 и 32).", error=True)
+            return
+        try:
+            neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
+        except ValueError as exc:
+            self._set_status(
+                f"Шаг 0: соседи — {exc}. Впишите номера лотов через запятую, например «30, 28».",
+                error=True,
+            )
+            return
+        if lot in neighbours:
+            neighbours = [value for value in neighbours if value != lot]
+            self._set_status("Шаг 0: наш лот убран из списка соседей — он собирается как наш участок.", warn=True)
+        folder = self._step0_folder()
+        self.step0_folder_var.set(str(folder))
+        self._step0_stop.clear()
+        self._step0_running = True
+        self._step0_outcome = None
+        self.step0_to_step1_button.configure(state="disabled")
+        self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
+        self.step0_stop_button.configure(state="normal")
+        self._step0_lines = [
+            f"Блок {block}, лот {lot}"
+            + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
+            + f"; папка: {folder}",
+        ]
+        self._render_step0_log()
+        self._set_status("Шаг 0: собираю описания участка…")
+        worker = threading.Thread(
+            target=self._step0_worker,
+            args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get())),
+            daemon=True,
+        )
+        worker.start()
+
+    def _step0_worker(
+        self, block: int, lot: int, neighbours: list[int], folder: Path, with_old: bool,
+    ) -> None:
+        """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
+        self._worker_context.generation = self._generation
+
+        def progress(line: str) -> None:
+            self._post("step0_progress", line)
+
+        try:
+            outcome = deed_intake.collect_deeds(
+                block=block,
+                lot=lot,
+                neighbours=neighbours,
+                folder=folder,
+                with_old_for_neighbour=with_old,
+                progress=progress,
+                should_stop=self._step0_stop.is_set,
+            )
+        except deed_intake.IntakeCancelled:
+            self._post("step0_done", ("cancelled", None))
+            return
+        except Exception as exc:  # noqa: BLE001 - сеть, файлы, PDF — всё возможно
+            self._post("step0_done", ("error", f"{type(exc).__name__}: {exc}"))
+            return
+        self._post("step0_done", ("ok", outcome))
+
+    def _stop_step0_intake(self) -> None:
+        if not self._step0_running:
+            return
+        self._step0_stop.set()
+        self._set_status("Шаг 0: останавливаю после текущего документа…")
+
+    def _finish_step0(self, status: str, payload: Any) -> None:
+        self._step0_running = False
+        self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
+        self.step0_stop_button.configure(state="disabled")
+        if status == "cancelled":
+            self._step0_lines.append("Сбор остановлен — собранное осталось в папке.")
+            self._render_step0_log()
+            self._set_status("Шаг 0: сбор остановлен.", warn=True)
+            return
+        if status == "error":
+            self._step0_lines.append(f"Ошибка: {payload}")
+            self._render_step0_log()
+            self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
+            return
+        outcome = payload
+        self._step0_outcome = outcome
+        self._step0_lines.append("")
+        self._step0_lines.append(outcome.report())
+        self._render_step0_log()
+        if outcome.ok:
+            self.step0_to_step1_button.configure(state="normal")
+            self._set_status(
+                f"Шаг 0: собрано документов — {len(outcome.records)}. Папка: {outcome.folder}"
+            )
+        else:
+            self._set_status(
+                "Шаг 0: наш участок не собран — смотрите отчёт и «Чего не хватает».",
+                error=True,
+            )
+
+    def _open_step0_folder(self) -> None:
+        folder = self._step0_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Шаг 0: папку не создать — {exc}", error=True)
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(
+                    ["xdg-open", str(folder)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        except Exception as exc:  # noqa: BLE001 - проводник может быть недоступен
+            self._set_status(f"Шаг 0: не удалось открыть папку {folder} — {exc}", error=True)
+
+    def _step0_manual_role(self) -> str:
+        value = str(self.step0_manual_role_var.get() or "")
+        return "our" if value == STEP0_MANUAL_ROLES[0] else "neighbour"
+
+    def _adopt_step0_download(self) -> None:
+        """Забирает свежий PDF из «Загрузок» под нужным именем (ступень 3 лестницы)."""
+        role = self._step0_manual_role()
+        text = str(self.step0_manual_lot_var.get() or "").strip()
+        if not text:
+            text = str(self.step0_lot_var.get() or "").strip()
+        try:
+            lot = int(text)
+        except (TypeError, ValueError):
+            self._set_status("Шаг 0: впишите номер лота для скачанного файла.", error=True)
+            return
+        folder = self._step0_folder()
+        try:
+            record = deed_intake.adopt_downloads(
+                folder, role=role, lot=lot, tag=rcclerk.NEW_TAG,
+                block=str(self.step0_block_var.get() or "").strip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Шаг 0: файл не принят — {exc}", error=True)
+            return
+        if record is None:
+            self._set_status(
+                "Шаг 0: в «Загрузках» нет нового PDF. Скачайте документ в браузере и повторите.",
+                warn=True,
+            )
+            return
+        self._step0_lines.append(f"Из «Загрузок» принят файл: {record.file}")
+        self._render_step0_log()
+        self._set_status(f"Шаг 0: файл «{record.file}» добавлен в папку описаний.")
+
+    def _step0_to_step1(self) -> None:
+        """Открывает собранные описания в Шаге 1: наш участок и соседи одним набором."""
+        folder = self._step0_folder()
+        manifest = deed_store.read_manifest(folder)
+        items_meta = manifest.get("items") or []
+        paths: list[Path] = []
+        for item in items_meta:
+            preferred = str(item.get("trimmed") or "") or str(item.get("file") or "")
+            if not preferred:
+                continue
+            path = folder / preferred
+            if path.is_file():
+                paths.append(path)
+        if not paths:
+            self._set_status("Шаг 0: в папке описаний нет файлов для Шага 1.", error=True)
+            return
+        items, errors = self._make_pdf_set_items(paths)
+        for error in errors:
+            self._log_line(f"! Шаг 0 → Шаг 1: {error}")
+        if not items:
+            self._set_status(
+                f"Шаг 0: файлы не открылись — {errors[0] if errors else 'нечего открывать'}",
+                error=True,
+            )
+            return
+        self._open_pdf_set_dialog(items, fresh=True, notes=errors)
 
     def _build_step2_page(self) -> None:
         """Страница «Шаг 2. Автоподписание объектов (D-TOPO-TEXT)»."""
@@ -2949,21 +3428,31 @@ class SurveyApp(ctk.CTk):
         self._switch_step_tab()
 
     def _switch_step_tab(self) -> None:
-        """Переключает глобальные вкладки: рабочая зона Шага 1 <-> страница Шага 2."""
+        """
+        Переключает глобальные вкладки: Шаг 0 (документы) | рабочая зона Шага 1 |
+        страница Шага 2.
+        """
         tab = str(self.step_tab_var.get() or STEP_TAB_BOUNDARY)
         on_step2 = tab == STEP_TAB_LABELS
-        if on_step2:
+        on_step0 = tab == STEP_TAB_DEEDS
+        if on_step2 or on_step0:
             self.main_wrap.grid_remove()
-            self.step2_page.grid(row=2, column=0, sticky="nsew")
             # Кнопки отрисовки границы относятся только к Шагу 1.
             self.add_neighbor_button.grid_remove()
             self.draw_button.grid_remove()
-            self._refresh_step2_height_label()
         else:
-            self.step2_page.grid_remove()
             self.main_wrap.grid(row=2, column=0, sticky="nsew")
             self.add_neighbor_button.grid(row=0, column=2, padx=(8, 6))
             self.draw_button.grid(row=0, column=3, padx=(6, 16), pady=11, sticky="e")
+        if on_step2:
+            self.step2_page.grid(row=2, column=0, sticky="nsew")
+            self._refresh_step2_height_label()
+        else:
+            self.step2_page.grid_remove()
+        if on_step0:
+            self.step0_page.grid(row=2, column=0, sticky="nsew")
+        else:
+            self.step0_page.grid_remove()
         for label, button in getattr(self, "step_tab_buttons", {}).items():
             active = label == tab
             button.configure(
@@ -4031,8 +4520,9 @@ class SurveyApp(ctk.CTk):
             def _handler(_event: Any = None) -> str | None:
                 if getattr(self, "_busy", False) or getattr(self, "_source_role_dialog", None) is not None:
                     return None
-                # Клавиши разбора и отрисовки границы не срабатывают на вкладке Шага 2.
-                if step1_only and self._is_step2_tab():
+                # Клавиши разбора и отрисовки границы не срабатывают на вкладках
+                # Шага 2 и Шага 0: там другой работой занят экран.
+                if step1_only and (self._is_step2_tab() or self._is_step0_tab()):
                     return None
                 action()
                 return "break"
@@ -7301,6 +7791,12 @@ class SurveyApp(ctk.CTk):
                         f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
                         error=True,
                     )
+            elif kind == "step0_progress":
+                self._step0_lines.append(str(payload))
+                self._render_step0_log()
+            elif kind == "step0_done":
+                status, payload_done = payload
+                self._finish_step0(status, payload_done)
             elif kind == "pdf_set_done":
                 self._finish_busy()
                 self._handle_pdf_set_done(payload)

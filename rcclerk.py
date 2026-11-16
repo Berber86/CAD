@@ -91,6 +91,72 @@ def results_url(block: int | str, lot: int | str, *, base: str = BASE_URL) -> st
     )
 
 
+CLOUDFLARE_MARKS = ("just a moment", "cf-challenge", "checking your browser", "attention required")
+
+
+def fetch_list_html(
+    block: int | str,
+    lot: int | str,
+    *,
+    base: str = BASE_URL,
+    timeout: float = 45.0,
+    opener=None,
+) -> str:
+    """
+    Страница списка документов участка (HTML).
+
+    Если сайт показал проверку на бота — ``CloudflareBlocked``: список тогда
+    открывают в браузере, а разбор работает по сохранённой странице.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = results_url(block, lot, base=base)
+    request = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{base}/Search",
+    })
+    open_it = opener or urllib.request.urlopen
+    try:
+        with open_it(request, timeout=timeout) as response:
+            charset = ""
+            try:
+                charset = str(response.headers.get_content_charset() or "")
+            except Exception:  # noqa: BLE001 - заголовков может не быть
+                charset = ""
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise CloudflareBlocked(
+            f"сайт ответил {exc.code} вместо списка документов — откройте в браузере: {url}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RcclerkError(f"не удалось открыть список документов {block}/{lot}: {exc}") from exc
+    html = _decode_html(payload, charset)
+    lowered = html[:4000].lower()
+    if any(mark in lowered for mark in CLOUDFLARE_MARKS) and "ViewDocumentInfo" not in html:
+        raise CloudflareBlocked(
+            f"вместо списка пришла страница проверки Cloudflare — откройте в браузере: {url}"
+        )
+    return html
+
+
+def _decode_html(payload: bytes, charset: str = "") -> str:
+    """Текст страницы: заявленная кодировка, потом utf-8, потом cp1252."""
+    for encoding in (charset, "utf-8", "cp1252"):
+        if not encoding:
+            continue
+        try:
+            return payload.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
 def document_info_url(endorsement_id: int | str, *, base: str = BASE_URL) -> str:
     """Карточка документа."""
     return f"{base}/Search/ViewDocumentInfo/{int(endorsement_id)}"

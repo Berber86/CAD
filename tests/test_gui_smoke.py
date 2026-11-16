@@ -3086,7 +3086,9 @@ def _wait_idle(app):
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
+    # Шаг 0 стоит перед Шагом 1: документы участка собираются до посадки границы.
     assert gui.STEP_TABS == (
+        "Шаг 0. Документы участка",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
     )
@@ -3293,3 +3295,240 @@ def test_step2_requires_windows_autocad(gui, monkeypatch):
     _wait_idle(app)
     assert "только в Windows" in app.step2_report_box.get("1.0", "end")
     assert "Шаг 2 не выполнен" in app.status_var.get()
+
+
+# --------------------------------------------------- Шаг 0: документы участка
+
+
+def _step0_pdf(path):
+    """PDF на две страницы: обложка и описание (текстовый слой, без OCR)."""
+    import pymupdf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    doc.new_page().insert_textbox(pymupdf.Rect(36, 36, 560, 760), "COVER", fontsize=10)
+    doc.new_page().insert_textbox(
+        pymupdf.Rect(36, 36, 560, 760),
+        "BEGINNING AT A POINT on the easterly side of Alvine Avenue; RUNNING THENCE "
+        "N 67 33 48 E, 174.89 feet; THENCE N 50 25 10 W, 45.30 feet; THENCE "
+        "S 67 33 48 W, 153.64 feet; THENCE S 22 26 12 E, 40.00 feet to the point "
+        "of BEGINNING.",
+        fontsize=9,
+    )
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def _fill_step0(app, *, block="6323", lot="32", neighbours="30", folder=""):
+    app.step0_block_var.set(block)
+    app.step0_lot_var.set(lot)
+    app.step0_neighbours_var.set(neighbours)
+    if folder:
+        app.step0_folder_var.set(str(folder))
+    return app
+
+
+def _wait_step0(app):
+    """Сбор идёт в фоновом потоке: ждём его, прокачивая очередь событий."""
+    import time
+
+    for _ in range(300):
+        app._drain_events()
+        if not app._step0_running:
+            return
+        time.sleep(0.01)
+    raise AssertionError("сбор Шага 0 не завершился")
+
+
+def test_step0_tab_is_first_and_hides_step1_workspace(gui):
+    app = gui.SurveyApp()
+    assert app.step0_page._gridded is False
+    app._select_step_tab(gui.STEP_TAB_DEEDS)
+    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы участка"
+    assert app.step0_page._gridded is True
+    assert app.main_wrap._gridded is False
+    assert app.step2_page._gridded is False
+    assert app.draw_button._gridded is False
+    assert app.add_neighbor_button._gridded is False
+    assert app.step_tab_buttons[gui.STEP_TAB_DEEDS].cget("fg_color") == gui.THEME["btn_primary"]
+    # Клавиши Шага 1 на вкладке Шага 0 не запускают разбор границы.
+    started = []
+    app._start = lambda **kwargs: started.append(kwargs)
+    app._global_bindings["<F5>"]()
+    assert started == []
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.main_wrap._gridded is True and app.step0_page._gridded is False
+
+
+def test_step0_screen_shows_the_customer_scheme(gui):
+    app = gui.SurveyApp()
+    assert "Собрать описания" in app.step0_run_button.cget("text")
+    assert app.step0_manual_role_menu.cget("values") == list(gui.STEP0_MANUAL_ROLES)
+    assert list(gui.STEP0_MANUAL_ROLES) == ["Наш участок", "Сосед"]
+    assert app.step0_manual_role_var.get() == "Наш участок"
+    report = app.step0_report_box.get("1.0", "end")
+    assert "LOT 30 NEW.pdf" in report and "сосед" in report
+    assert "Cloudflare" in report
+
+
+def test_step0_rejects_non_numeric_block_or_lot(gui):
+    app = gui.SurveyApp()
+    _fill_step0(app, block="шесть", lot="32")
+    app._start_step0_intake()
+    assert "block и lot" in app.status_var.get()
+    _fill_step0(app, block="6323", lot="тридцать два")
+    app._start_step0_intake()
+    assert "block и lot" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_rejects_junk_in_the_neighbours_field(gui):
+    app = gui.SurveyApp()
+    _fill_step0(app, neighbours="30, сосед")
+    app._start_step0_intake()
+    assert "соседи" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
+    app = gui.SurveyApp()
+    collected = {}
+
+    def fake_collect(**kwargs):
+        collected.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = fake_collect
+    try:
+        _fill_step0(app, neighbours="32, 30", folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert collected["neighbours"] == [30]
+    assert "соседи: 30" in app._step0_lines[0]
+    assert "32" not in app._step0_lines[0].split("соседи:")[1]
+
+
+def test_step0_success_enables_handover_to_step1(gui, tmp_path):
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=folder,
+        records=[
+            gui.deed_store.StoredDeed(file="OUR 32 NEW.pdf", role="our", lot="32", pages="2"),
+        ],
+    )
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = lambda **kwargs: outcome
+    try:
+        _fill_step0(app, folder=folder)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert app.step0_to_step1_button.cget("state") == "normal"
+    assert "OUR 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
+    assert "собрано документов — 1" in app.status_var.get()
+
+
+def test_step0_failure_keeps_the_button_for_another_try(gui, tmp_path):
+    app = gui.SurveyApp()
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=tmp_path, missing=["наш участок (лот 32): список не открылся — таймаут"],
+    )
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = lambda **kwargs: outcome
+    try:
+        _fill_step0(app, folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert app.step0_to_step1_button.cget("state") == "disabled"
+    assert app.step0_run_button.cget("state") == "normal"
+    assert "наш участок не собран" in app.status_var.get()
+
+
+def test_step0_stop_leaves_the_window_usable(gui):
+    app = gui.SurveyApp()
+    app._step0_running = True
+    app.step0_run_button.configure(state="disabled")
+    app._stop_step0_intake()
+    app._finish_step0("cancelled", None)
+    assert app._step0_running is False
+    assert app.step0_run_button.cget("state") == "normal"
+    assert "сбор остановлен" in app.status_var.get()
+
+
+def test_step0_crash_is_reported_not_swallowed(gui, tmp_path):
+    app = gui.SurveyApp()
+
+    def boom(**kwargs):
+        raise RuntimeError("нет сети")
+
+    saved = gui.deed_intake.collect_deeds
+    gui.deed_intake.collect_deeds = boom
+    try:
+        _fill_step0(app, folder=tmp_path)
+        app._start_step0_intake()
+        _wait_step0(app)
+    finally:
+        gui.deed_intake.collect_deeds = saved
+    assert "нет сети" in app.status_var.get()
+    assert app._step0_running is False
+
+
+def test_step0_takes_a_hand_downloaded_pdf_and_names_it_as_a_neighbour(
+    gui, tmp_path, monkeypatch
+):
+    app = gui.SurveyApp()
+    downloads = tmp_path / "Downloads"
+    _step0_pdf(downloads / "ViewContent.pdf")
+    monkeypatch.setattr(gui.rcclerk, "_default_downloads_dir", lambda: downloads)
+    _fill_step0(app, neighbours="30", folder=tmp_path / "01_описания")
+    app.step0_manual_role_var.set("Сосед")
+    app.step0_manual_lot_var.set("30")
+    app._adopt_step0_download()
+    assert (tmp_path / "01_описания" / "LOT 30 NEW.pdf").is_file()
+    assert "LOT 30 NEW.pdf" in app.status_var.get()
+    assert "Из «Загрузок» принят файл" in app.step0_report_box.get("1.0", "end")
+
+
+def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
+    app = gui.SurveyApp()
+    folder = tmp_path / "01_описания"
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "full.pdf"),
+        role="our", lot=32, tag="NEW", block=6323, pages="2",
+        trimmed_source=_step0_pdf(tmp_path / "trim.pdf"),
+    )
+    gui.deed_store.store_pdf(
+        folder, _step0_pdf(tmp_path / "nb.pdf"), role="neighbour", lot=30, tag="NEW", block=6323,
+    )
+    _fill_step0(app, folder=folder)
+    app._step0_to_step1()
+    assert app._pdf_set_dialog is not None
+    items = app._pdf_set_dialog.items
+    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
+    trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
+    assert trimmed.name_pages == (2, 2)
+
+
+def test_step0_handover_without_files_explains_itself(gui, tmp_path):
+    app = gui.SurveyApp()
+    _fill_step0(app, folder=tmp_path / "пустая")
+    app._step0_to_step1()
+    assert "нет файлов для Шага 1" in app.status_var.get()
+
+
+def test_step0_never_calls_the_paid_model(gui):
+    """Шаг 0 — сеть, локальный OCR и файлы: платного ИИ здесь нет вовсе."""
+    import pathlib
+
+    text = pathlib.Path(gui.__file__).read_text(encoding="utf-8")
+    body = text[text.index("    def _start_step0_intake"):text.index("    def _build_step2_page")]
+    for forbidden in ("ask_llm_json", "run_multipass_consensus", "parse_legal_description_full"):
+        assert forbidden not in body

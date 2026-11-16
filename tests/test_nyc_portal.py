@@ -188,7 +188,7 @@ def test_portal_driver_stops_on_challenge_without_keypress(tmp_path, monkeypatch
     assert key_calls == []
 
 
-def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
+def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypatch):
     window = nyc_portal.browser_save.BrowserWindow(
         handle=77, title="New Tab - Google Chrome",
         executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
@@ -203,6 +203,9 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     key_events = []
     waits = []
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda seconds: waits.append(seconds))
+    new_tabs = []
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: new_tabs.append(1) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "New Tab - Google Chrome")
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
@@ -238,7 +241,8 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert typed == [nyc_portal.PORTAL_URL]
-    assert waits == [0.2, 0.2, 0.2, 0.2, 3.0, 0.2]
+    assert new_tabs == [1]  # портал открыт в новой вкладке
+    assert waits == [0.6, 0.2, 0.2, 0.2, 0.2, 3.0, 0.2]  # 0.6 — ждём переключения на новую вкладку
     assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
     assert key_events[-2:] == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
 
@@ -524,3 +528,26 @@ def test_lookup_parcel_passes_fast_mode_to_the_portal_driver(monkeypatch, tmp_pa
             fast_mode=True,
         )
     assert received == {"fast_mode": True}
+
+
+def test_address_is_not_typed_when_ctrl_t_did_not_lead_to_a_new_tab(tmp_path, monkeypatch):
+    """Если после Ctrl+T активна не новая вкладка (например, переписка), текст не печатается."""
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=77, title="Arena - Chrome", executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    typed = []
+    omnibox = []
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "Arena - Chrome")
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: omnibox.append("ctrl_l") or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
+    with pytest.raises(nyc_portal.PortalLookupError, match="не новая вкладка"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "parcel.png")
+    assert typed == [] and omnibox == []

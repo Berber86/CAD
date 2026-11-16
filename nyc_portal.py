@@ -21,6 +21,9 @@ import ocr_pages
 from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
+#: Заголовок пустой новой вкладки в разных браузерах (русский и английский интерфейс).
+NEW_TAB_TITLE_MARKS = ("new tab", "new private tab", "новая вкладка", "about:blank")
+
 PORTAL_URL_MARKS = (
     "propertyinformationportal", "property information portal", "nyc department of finance",
 )
@@ -387,15 +390,26 @@ def _drive_portal(
     _focus(window.handle)
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
-            progress("открываю NYC Property Information Portal в текущей вкладке браузера")
-        # Ctrl+L selects the current URL; Ctrl+A also clears any stale omnibox text
-        # if the browser retained a partially typed value from an earlier attempt.
+            progress("открываю NYC Property Information Portal в НОВОЙ вкладке; текущие вкладки не трогаю")
+        # Ctrl+T открывает новую вкладку; текущие вкладки (например, переписка) не меняются.
+        if not browser_save.press_ctrl_t():
+            raise PortalLookupError("Не удалось открыть новую вкладку в браузере.")
+        time.sleep(0.6)  # даём браузеру переключиться на новую вкладку
+        # Печатать можно только в пустую новую вкладку. Если заголовок активной вкладки
+        # не похож на пустую вкладку — ничего не печатаем, иначе текст уйдёт в чужую страницу.
+        active_title = (browser_save.active_window_title() or "").lower()
+        if not any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
+            raise PortalLookupError(
+                "После Ctrl+T активна не новая вкладка; адрес ничего не печатал. "
+                "Откройте NYC Portal вручную во вкладке и повторите поиск."
+            )
+        # Ctrl+L выделяет адресную строку новой вкладки; Ctrl+A очищает возможный остаток.
         if (
             not browser_save.press_ctrl_l()
             or not browser_save.press_ctrl_a()
             or not browser_save.type_text(PORTAL_URL)
         ):
-            raise PortalLookupError("Не удалось заменить адрес в текущей вкладке браузера.")
+            raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
         _key(window.handle, browser_save.VK_RETURN)
         rows = wait(
             window.handle,

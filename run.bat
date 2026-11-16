@@ -44,6 +44,18 @@ echo.
 echo Ошибка запуска. Скопируйте текст ошибки выше.
 echo Если создан журнал, он находится здесь: "%USERPROFILE%\tsai_crash.log"
 echo Перед отправкой отчёта удалите из него API-ключи, если они там есть.
+if not exist "backups\*" goto :launch_pause
+echo.
+echo Есть резервная копия прежней версии (сохранена перед последним обновлением).
+choice /c YN /n /m "Откатиться на неё и запустить снова? [Y/N] "
+if errorlevel 2 goto :launch_pause
+".venv\Scripts\python.exe" rollback_update.py
+if errorlevel 1 goto :launch_pause
+echo Запускаю прежнюю версию ...
+call "%~f0"
+exit /b
+
+:launch_pause
 pause
 exit /b 1
 

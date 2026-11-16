@@ -4177,3 +4177,67 @@ def test_update_source_url_autosaves_and_survives_restart(gui, tmp_path, monkeyp
     second = gui.SurveyApp()
     assert second.update_source_var.get() == "https://github.com/Berber86/CAD/tree/arena/53e1068f-cad"
     second._on_close()
+
+
+def _write_backup_fixture(app_dir):
+    """Старая версия в резерве, новая установлена поверх: как после обновления."""
+    from app_updater import create_backup
+
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "main.py").write_text("old main", encoding="utf-8")
+    (app_dir / "version.py").write_text("APP_VERSION = '3.42'\n", encoding="utf-8")
+    create_backup(app_dir, ["main.py", "version.py", "fresh.py"])
+    (app_dir / "main.py").write_text("new main", encoding="utf-8")
+    (app_dir / "fresh.py").write_text("new file", encoding="utf-8")
+
+
+def test_rollback_button_is_off_without_backups(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: tmp_path)
+    app._refresh_rollback_state()
+    assert app.rollback_button.cget("state") == "disabled"
+    assert "Резервных копий нет" in app.rollback_status_label.cget("text")
+
+
+def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path, monkeypatch):
+    import subprocess
+    from tkinter import messagebox
+
+    app_dir = tmp_path / "app"
+    _write_backup_fixture(app_dir)
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: app_dir)
+    app._refresh_rollback_state()
+    assert app.rollback_button.cget("state") == "normal"
+    assert "3.42" in app.rollback_status_label.cget("text")
+
+    questions: list[tuple[str, str]] = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (questions.append((title, text)) or True))
+    launched: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+
+    app._start_rollback()
+
+    assert (app_dir / "main.py").read_text(encoding="utf-8") == "old main"
+    assert not (app_dir / "fresh.py").exists()
+    assert any(title == "Откат версии" for title, _ in questions)
+    assert any(title == "Откат выполнен" for title, _ in questions)
+    assert launched and launched[0][-1].endswith("run.bat")
+    assert destroyed
+    assert app.rollback_button.cget("state") == "disabled"
+
+
+def test_rollback_is_refused_while_an_update_is_running(gui, tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    _write_backup_fixture(app_dir)
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: app_dir)
+    app._update_running = True
+
+    app._start_rollback()
+
+    assert (app_dir / "main.py").read_text(encoding="utf-8") == "new main"
+    assert "Дождитесь" in app.status_var.get()

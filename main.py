@@ -25,6 +25,7 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import dataclasses
 from datetime import datetime
 import json
@@ -1052,6 +1053,30 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
         ).grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+
+        # Откат на резервную копию предыдущей версии (на случай критического бага).
+        self.rollback_status_label = ctk.CTkLabel(
+            update_row,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=394,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        )
+        self.rollback_status_label.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.rollback_button = ctk.CTkButton(
+            update_row,
+            text="↩ Откатиться на предыдущую версию",
+            width=230,
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._start_rollback,
+        )
+        self.rollback_button.grid(row=5, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
+        self._refresh_rollback_state()
 
         ctk.CTkLabel(
             drawer_body,
@@ -5212,9 +5237,10 @@ class SurveyApp(ctk.CTk):
         confirm = getattr(self, "_confirm_update_version", None)
         if callable(confirm) and not confirm(source):
             return
-        app_dir = Path(__file__).resolve().parent
+        app_dir = self._update_dir()
         self._update_running = True
         self.update_version_button.configure(state="disabled", text="⏳ Обновляю…")
+        self._set_rollback_enabled(False)
         self.update_status_label.configure(
             text=f"Скачиваю обновление из {source}…", text_color=THEME["text_dim"],
         )
@@ -5267,43 +5293,133 @@ class SurveyApp(ctk.CTk):
                 f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
-            from tkinter import messagebox
-
-            try:
-                was_topmost = bool(self.attributes("-topmost"))
-                if was_topmost:
-                    self.attributes("-topmost", False)
-            except Exception:  # noqa: BLE001
-                was_topmost = False
-            asked = messagebox.askyesno(
+            self._refresh_rollback_state()
+            self._offer_restart(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
                 "Перезапустить программу сейчас?",
+                base_text=str(self.update_status_label.cget("text")),
             )
-            if asked:
-                problem = self._relaunch_after_update()
-                if problem:
-                    # Окно остаётся открытым: без нового экземпляра закрывать программу нельзя.
-                    base = str(self.update_status_label.cget("text"))
-                    text = (
-                        f"{base} Не удалось перезапустить автоматически ({problem}): "
-                        "закройте программу и запустите run.bat из её папки вручную."
-                    )
-                    self.update_status_label.configure(text=text, text_color=THEME["err"])
-                    self._set_status(text, error=True)
-                else:
-                    self.destroy()
-                    return
-            if was_topmost:
-                try:
-                    self.attributes("-topmost", True)
-                except Exception:  # noqa: BLE001
-                    pass
         else:
+            self._refresh_rollback_state()
             self.update_status_label.configure(
                 text=f"Обновление не удалось: {payload}", text_color=THEME["err"],
             )
             self._set_status(f"Обновление не удалось: {payload}", error=True)
+
+    def _update_dir(self) -> Path:
+        """Папка программы: обновление и откат работают только с ней."""
+        return Path(__file__).resolve().parent
+
+    def _offer_restart(self, title: str, question: str, *, base_text: str) -> None:
+        """
+        Спрашивает о перезапуске и, если пользователь согласен, запускает run.bat.
+
+        Окно закрывается только после успешного запуска нового экземпляра. Иначе
+        оно остаётся открытым, а причина и инструкция пишутся рядом с итогом.
+        """
+        from tkinter import messagebox
+
+        try:
+            was_topmost = bool(self.attributes("-topmost"))
+            if was_topmost:
+                self.attributes("-topmost", False)
+        except Exception:  # noqa: BLE001
+            was_topmost = False
+        asked = messagebox.askyesno(title, question)
+        if asked:
+            problem = self._relaunch_after_update()
+            if problem:
+                text = (
+                    f"{base_text} Не удалось перезапустить автоматически ({problem}): "
+                    "закройте программу и запустите run.bat из её папки вручную."
+                )
+                self.update_status_label.configure(text=text, text_color=THEME["err"])
+                self._set_status(text, error=True)
+            else:
+                self.destroy()
+                return
+        if was_topmost:
+            try:
+                self.attributes("-topmost", True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _set_rollback_enabled(self, enabled: bool) -> None:
+        button = getattr(self, "rollback_button", None)
+        if button is not None:
+            button.configure(state="normal" if enabled else "disabled")
+
+    def _refresh_rollback_state(self) -> None:
+        """Показывает, на какую версию откатимся, или что резервных копий нет."""
+        label = getattr(self, "rollback_status_label", None)
+        if label is None:
+            return
+        try:
+            backups = app_updater.list_backups(self._update_dir())
+        except OSError:
+            backups = []
+        if not backups:
+            label.configure(
+                text="Резервных копий нет: откат станет доступен после первого обновления.",
+                text_color=THEME["text_dim"],
+            )
+            self._set_rollback_enabled(False)
+            return
+        latest = backups[0]
+        when = latest.created
+        try:
+            when = _dt.datetime.fromisoformat(latest.created).strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            pass
+        label.configure(
+            text=(
+                f"Резерв: версия {latest.version or 'неизвестна'} (сохранена {when}). "
+                "Откат вернёт её файлы; настройки и ключи не меняются."
+            ),
+            text_color=THEME["text_dim"],
+        )
+        self._set_rollback_enabled(not self._update_running)
+
+    def _start_rollback(self) -> None:
+        """Возвращает файлы прежней версии из самой свежей резервной копии."""
+        if self._update_running:
+            self._set_status("Дождитесь окончания обновления, затем откатывайте версию.", warn=True)
+            return
+        from tkinter import messagebox
+
+        latest = app_updater.list_backups(self._update_dir())
+        if not latest:
+            self._refresh_rollback_state()
+            return
+        version = latest[0].version or "неизвестна"
+        if not messagebox.askyesno(
+            "Откат версии",
+            f"Вернуть файлы версии {version} из резервной копии?\n\n"
+            "Текущие файлы программы будут заменены. config.json, .env и локальные "
+            "файлы не меняются.\n\nПродолжить?",
+        ):
+            return
+        try:
+            result = app_updater.rollback_latest(self._update_dir())
+        except (app_updater.UpdateError, OSError) as exc:
+            self._refresh_rollback_state()
+            self._set_status(f"Откат не выполнен: {exc}", error=True)
+            self.update_status_label.configure(text=f"Откат не выполнен: {exc}", text_color=THEME["err"])
+            return
+        text = (
+            f"Откат выполнен: возвращена версия {result.version or 'неизвестна'} "
+            f"(файлов восстановлено — {result.files_restored}, новых удалено — {result.files_removed})."
+        )
+        self.update_status_label.configure(text=text, text_color=THEME["ok"])
+        self._set_status(text)
+        self._refresh_rollback_state()
+        self._offer_restart(
+            "Откат выполнен",
+            f"После перезапуска программа продолжит работу на версии "
+            f"{result.version or 'неизвестна'}.\n\nПерезапустить программу сейчас?",
+            base_text=text,
+        )
 
     def _relaunch_after_update(self) -> str:
         """

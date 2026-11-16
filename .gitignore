@@ -8,6 +8,8 @@ venv/
 
 # локальные артефакты
 logs/
+# резервные копии перед обновлением (app_updater.py)
+/backups/
 *.log
 .env
 config.local.json

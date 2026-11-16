@@ -54,6 +54,15 @@ class CloudflareBlocked(RcclerkError):
     """Сайт показал проверку на бота вместо PDF."""
 
 
+class ManualStepNeeded(RcclerkError):
+    """Автоматические ступени не сработали: нужен ручной шаг человека."""
+
+    def __init__(self, message: str, url: str = "", *, folder: str | Path | None = None):
+        super().__init__(message)
+        self.url = url
+        self.folder = Path(folder) if folder is not None else None
+
+
 @dataclass(frozen=True)
 class DeedRow:
     """Строка списка документов: чем открывается и что это за документ."""
@@ -272,4 +281,127 @@ def download_pdf(
     raise RcclerkError(
         f"документ {endorsement_id} пришёл неизвестного вида ({content_type or 'без типа'}, "
         f"{len(data)} байт)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Лестница скачивания: от самого автоматического к ручному
+# ---------------------------------------------------------------------------
+
+#: Недокачанные файлы браузера — их нельзя принимать за документ.
+PARTIAL_SUFFIXES = (".crdownload", ".part", ".tmp", ".download")
+
+
+def _default_downloads_dir() -> Path:
+    return Path.home() / "Downloads"
+
+
+def _open_in_browser(url: str) -> None:
+    import webbrowser
+
+    webbrowser.open(url)
+
+
+def _is_pdf_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[Path]:
+    """
+    Самый свежий готовый PDF в папке, появившийся после ``since`` (время в секундах).
+
+    Недокачанные файлы (``.crdownload`` и подобные) и файлы без сигнатуры ``%PDF-``
+    пропускаются: принять недокачанный документ за документ хуже, чем подождать.
+    """
+    best: Optional[Path] = None
+    best_time = -1.0
+    for path in sorted(Path(folder).glob("*.pdf")):
+        if path.suffix.lower() in PARTIAL_SUFFIXES:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if since is not None and mtime < since:
+            continue
+        if not _is_pdf_file(path):
+            continue
+        if mtime > best_time:
+            best, best_time = path, mtime
+    return best
+
+
+def download_with_fallback(
+    endorsement_id: int | str,
+    destination: str | Path,
+    *,
+    base: str = BASE_URL,
+    opener=None,
+    open_browser=None,
+    downloads_dir: str | Path | None = None,
+    watch_timeout: float = 300.0,
+    poll: float = 1.0,
+    on_step=None,
+) -> tuple[Path, str]:
+    """
+    Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
+
+    1. **Прямое скачивание** (`download_pdf`). Работает, если Cloudflare не мешает.
+    2. **Браузер**: открываем ссылку в браузере по умолчанию и ждём, пока в «Загрузках»
+       появится новый PDF (проверка на бота проходит сама, минуты за три). Файл
+       подхватывается и копируется в нужное место — человеку ничего делать не надо.
+    3. **Ручной шаг**: если браузер не открылся или файл не появился, ``ManualStepNeeded``
+       с готовой ссылкой: открыть, дождаться и положить файл в папку описаний.
+
+    Возвращает ``(путь, ступень)``, где ступень — ``"direct"`` или ``"browser"``.
+    """
+    import shutil
+    import time
+
+    url = document_pdf_url(endorsement_id, base=base)
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def step(message: str) -> None:
+        if on_step is not None:
+            on_step(message)
+
+    step("1/3 пробую скачать напрямую…")
+    try:
+        return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
+    except CloudflareBlocked:
+        step("прямое скачивание закрыто проверкой Cloudflare — открываю браузер")
+
+    folder = Path(downloads_dir) if downloads_dir is not None else _default_downloads_dir()
+    open_it = open_browser or _open_in_browser
+    # Небольшой запас: время файла может оказаться чуть раньше времени открытия.
+    since = time.time() - 1.0
+    try:
+        open_it(url)
+    except Exception as exc:  # noqa: BLE001 - браузера может не быть вовсе
+        raise ManualStepNeeded(
+            f"не удалось открыть браузер ({exc}). Откройте ссылку вручную: {url} — "
+            "файл скачается, положите его в папку описаний",
+            url, folder=folder,
+        ) from exc
+    step(f"2/3 ждём файл в «{folder}» — проверка на сайте идёт сама, до {int(watch_timeout)} с")
+
+    deadline = time.monotonic() + max(0.0, float(watch_timeout))
+    while True:
+        found = find_new_pdf(folder, since=since)
+        if found is not None:
+            shutil.copyfile(found, target)
+            step(f"файл взят из загрузок: {found.name}")
+            return target, "browser"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.05, float(poll)))
+    raise ManualStepNeeded(
+        f"файл не появился в «{folder}» за {int(watch_timeout)} с. Откройте ссылку вручную: "
+        f"{url} — дождитесь скачивания и положите PDF в папку описаний",
+        url, folder=folder,
     )

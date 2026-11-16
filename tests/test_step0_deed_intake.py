@@ -217,6 +217,163 @@ def test_http_error_is_reported_as_a_cloudflare_problem(tmp_path):
         rcclerk.download_pdf(NEWEST_ID, tmp_path / "raw.pdf", opener=refusing)
 
 
+# ------------------------------------------------- лестница скачивания
+
+
+def _browser_that_saves(downloads: Path, *, name="deed.pdf", data=b"%PDF-1.7 deed"):
+    """Браузер, который «скачал» файл: кладём PDF в папку загрузок."""
+
+    def open_it(url: str) -> None:
+        (downloads / name).write_bytes(data)
+
+    return open_it
+
+
+def test_first_rung_direct_download_needs_no_browser(tmp_path):
+    opened = []
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf",
+        opener=lambda request, timeout=0: _Response(b"%PDF-1.7 deed", "application/pdf"),
+        open_browser=lambda url: opened.append(url),
+        downloads_dir=tmp_path / "downloads",
+    )
+    assert rung == "direct" and path.read_bytes().startswith(b"%PDF-")
+    assert opened == []  # браузер не понадобился
+
+
+def test_second_rung_opens_the_browser_and_picks_up_the_file(tmp_path):
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    steps: list[str] = []
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf",
+        opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+        open_browser=_browser_that_saves(downloads),
+        downloads_dir=downloads, watch_timeout=2.0, poll=0.05,
+        on_step=steps.append,
+    )
+    assert rung == "browser" and path.read_bytes().startswith(b"%PDF-")
+    assert any("открываю браузер" in step for step in steps)
+    assert any("взят из загрузок" in step for step in steps)
+
+
+def test_third_rung_is_the_manual_step_with_a_ready_link(tmp_path):
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    with pytest.raises(rcclerk.ManualStepNeeded) as manual:
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda url: None,  # браузер открылся, но файла нет
+            downloads_dir=downloads, watch_timeout=0.2, poll=0.05,
+        )
+    assert rcclerk.document_pdf_url(NEWEST_ID) in str(manual.value)
+    assert manual.value.folder == downloads
+
+
+def test_a_browser_that_cannot_open_also_ends_in_the_manual_step(tmp_path):
+    def broken(url):
+        raise OSError("нет браузера по умолчанию")
+
+    with pytest.raises(rcclerk.ManualStepNeeded, match="не удалось открыть браузер"):
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html></html>", "text/html"),
+            open_browser=broken, downloads_dir=tmp_path, watch_timeout=0.1,
+        )
+
+
+def test_partial_and_fake_pdfs_are_not_taken_from_downloads(tmp_path):
+    import os
+    import time
+
+    since = time.time() - 1
+    (tmp_path / "half.pdf.crdownload").write_bytes(b"%PDF-1.7 half")
+    (tmp_path / "broken.pdf").write_bytes(b"<html>error</html>")
+    assert rcclerk.find_new_pdf(tmp_path, since=since) is None
+    good = tmp_path / "deed.pdf"
+    good.write_bytes(b"%PDF-1.7 deed")
+    os.utime(good, (since + 0.5, since + 0.5))
+    assert rcclerk.find_new_pdf(tmp_path, since=since) == good
+    # Старый файл (до открытия браузера) не подхватывается.
+    assert rcclerk.find_new_pdf(tmp_path, since=since + 5) is None
+
+
+# ------------------------------------------- страницы описания и обрезка
+
+
+def _text_pdf(path, pages: list[str]):
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    for content in pages:
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(36, 36, 560, 760), content, fontsize=9)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+DESCRIPTION_TEXT = (
+    "BEGINNING AT A POINT on the easterly side of Alvine Avenue, distant 200.00 feet "
+    "northerly from the corner formed by the intersection of the easterly side of "
+    'Alvine Avenue with the northerly side of Amboy Road; RUNNING THENCE N 67°33\'48" E, '
+    '174.89 feet; THENCE N 50°25\'10" W, 45.30 feet; THENCE S 67°33\'48" W, 153.64 feet; '
+    "THENCE S 22°26'12\" E, 40.00 feet to the point or place of BEGINNING."
+)
+
+
+def test_description_pages_are_found_in_a_text_pdf(tmp_path):
+    import deed_pages
+
+    pdf = _text_pdf(tmp_path / "deed.pdf", ["COVER PAGE", DESCRIPTION_TEXT, "RP-5217"])
+    found = deed_pages.find_description_pages(pdf)
+    assert found.pages == [2] and found.from_text_layer is True and found.scanned == 0
+    assert "174.89" in found.text
+    assert found.pages_spec == "2"
+
+
+def test_description_pages_are_found_in_a_scan_without_spending_ai(tmp_path, monkeypatch):
+    import deed_pages
+    import ocr_pages
+    from test_local_ocr import FakeEngine, _scan_pdf
+
+    # Скан: описания в текстовом слое нет, ищем локальным OCR по страницам.
+    pdf = _scan_pdf(tmp_path / "deed.pdf", DESCRIPTION_TEXT)
+    monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(ocr_pages, "_available", True)
+    monkeypatch.setattr(ocr_pages, "_engine", FakeEngine(DESCRIPTION_TEXT))
+    found = deed_pages.find_description_pages(pdf)
+    assert found.pages == [1] and found.scanned >= 1
+    assert "BEGINNING AT A POINT" in found.text.upper()
+
+
+def test_trimmed_copy_keeps_only_the_description_pages(tmp_path):
+    import deed_pages
+
+    pdf = _text_pdf(tmp_path / "deed.pdf", ["COVER PAGE", DESCRIPTION_TEXT, "RP-5217"])
+    out = deed_pages.trim_pdf(pdf, [2], tmp_path / "OUR 32 NEW_p2.pdf")
+    import pymupdf
+
+    doc = pymupdf.open(str(out))
+    try:
+        assert len(doc) == 1
+        assert "174.89" in doc[0].get_text()
+        assert "COVER PAGE" not in doc[0].get_text()
+    finally:
+        doc.close()
+    with pytest.raises(Exception):
+        deed_pages.trim_pdf(pdf, [9], tmp_path / "bad.pdf")
+
+
+def test_pages_spec_is_written_the_way_step_one_reads_it():
+    import deed_pages
+
+    assert deed_pages.pages_spec([]) == ""
+    assert deed_pages.pages_spec([4]) == "4"
+    assert deed_pages.pages_spec([4, 5, 6]) == "4-6"
+    assert deed_pages.pages_spec([7, 4, 5, 8]) == "4-5,7-8"
+
+
 # ------------------------------------------------------------ папка описаний
 
 
@@ -228,20 +385,27 @@ def _pdf(tmp_path: Path, name: str = "raw.pdf") -> Path:
 
 def test_store_files_the_document_with_sidecar_and_manifest(tmp_path):
     folder = tmp_path / "01_deeds"
+    trimmed = _pdf(tmp_path, "trimmed.pdf")
     record = deed_store.store_pdf(
         folder, _pdf(tmp_path),
         role="our", lot=LOT, tag="NEW", block=BLOCK,
         doc_type="DEED", doc_date="2019-05-14", endorsement_id=NEWEST_ID,
         source_url=rcclerk.document_pdf_url(NEWEST_ID), pages="4-6",
+        trimmed_source=trimmed,
     )
-    assert record.file == "OUR 32 NEW_p4-6.pdf"          # суффикс страниц понимает Шаг 1
+    # Документ целиком и рядом — только страницы описания (схема «оба»).
+    assert record.file == "OUR 32 NEW.pdf"
+    assert record.trimmed == "OUR 32 NEW_p4-6.pdf"
+    assert (folder / "OUR 32 NEW.pdf").is_file()
     assert (folder / "OUR 32 NEW_p4-6.pdf").is_file()
-    sidecar = json.loads((folder / "OUR 32 NEW_p4-6.json").read_text(encoding="utf-8"))
+    sidecar = json.loads((folder / "OUR 32 NEW.json").read_text(encoding="utf-8"))
     assert sidecar["endorsement_id"] == str(NEWEST_ID)
+    assert sidecar["trimmed"] == "OUR 32 NEW_p4-6.pdf"
     assert sidecar["source_url"].endswith(f"p_endorsementId={NEWEST_ID}")
     manifest = deed_store.read_manifest(folder)
     assert manifest["version"] == deed_store.MANIFEST_VERSION
-    assert [item["file"] for item in manifest["items"]] == ["OUR 32 NEW_p4-6.pdf"]
+    assert [item["file"] for item in manifest["items"]] == ["OUR 32 NEW.pdf"]
+    assert manifest["items"][0]["trimmed"] == "OUR 32 NEW_p4-6.pdf"
 
 
 def test_manifest_lists_our_lot_first_and_neighbours_after(tmp_path):
@@ -272,9 +436,11 @@ def test_the_same_document_is_not_stored_twice(tmp_path):
     deed_store.store_pdf(
         folder, _pdf(tmp_path), role="our", lot=LOT, tag="NEW",
         doc_type="DEED", endorsement_id=NEWEST_ID, pages="2",
+        trimmed_source=_pdf(tmp_path, "trim2.pdf"),
     )
-    assert len(list(folder.glob("*.pdf"))) == 2  # NEW.pdf и NEW_p2.pdf — разные имена
+    assert len(list(folder.glob("*.pdf"))) == 2  # весь документ и копия со стр. 2
     assert first.endorsement_id == str(NEWEST_ID)
+    assert len(deed_store.read_records(folder)) == 1  # запись одна: документ один
 
 
 def test_summary_says_what_is_missing(tmp_path):

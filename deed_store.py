@@ -43,6 +43,7 @@ class StoredDeed:
     endorsement_id: str = ""       # номер документа на сайте клерка
     source_url: str = ""
     pages: str = ""                # "4-6" — страницы с описанием
+    trimmed: str = ""              # обрезанная копия только с описанием
     downloaded: str = ""
     text_file: str = ""            # распознанный текст описания
     checks: dict[str, Any] = field(default_factory=dict)
@@ -72,10 +73,16 @@ def store_pdf(
     endorsement_id: int | str = "",
     source_url: str = "",
     pages: str = "",
+    trimmed_source: str | Path | None = None,
     notes: Iterable[str] = (),
 ) -> StoredDeed:
     """
     Кладёт скачанный PDF в папку под именем по схеме и пишет паспорт.
+
+    Документ хранится **целиком** (``OUR 32 NEW.pdf``): обложка и RP-5217 иногда
+    нужны, а места они почти не занимают. Если известны страницы описания и дана
+    обрезанная копия, рядом появляется ``OUR 32 NEW_p4-6.pdf`` — её и открывать,
+    её и читать Шагу 1.
 
     Если такой документ уже лежит (то же имя), файл не дублируется: обновляется
     только паспорт. Возвращает запись для ``_manifest.json``.
@@ -84,16 +91,19 @@ def store_pdf(
     target_dir.mkdir(parents=True, exist_ok=True)
     from rcclerk import document_file_name  # локальный импорт: модуль без сети
 
-    name = document_file_name(role, lot, tag)
-    stem = Path(name).stem
-    suffix = f"_p{pages}" if pages else ""
-    final_name = f"{stem}{suffix}.pdf"
-    destination = target_dir / final_name
+    destination = target_dir / document_file_name(role, lot, tag)
+    final_name = destination.name
     source = Path(source_pdf)
+    if source.suffix.lower() != ".pdf":
+        raise DeedStoreError(f"ожидался PDF, получено: {source.name}")
     if source.resolve() != destination.resolve():
-        if source.suffix.lower() != ".pdf":
-            raise DeedStoreError(f"ожидался PDF, получено: {source.name}")
         shutil.copyfile(source, destination)
+    trimmed_name = ""
+    if pages and trimmed_source is not None:
+        trimmed_name = f"{destination.stem}_p{pages}.pdf"
+        trimmed_source_path = Path(trimmed_source)
+        if trimmed_source_path.resolve() != (target_dir / trimmed_name).resolve():
+            shutil.copyfile(trimmed_source_path, target_dir / trimmed_name)
     record = StoredDeed(
         file=final_name,
         role=role,
@@ -105,6 +115,7 @@ def store_pdf(
         endorsement_id=str(endorsement_id),
         source_url=source_url,
         pages=pages,
+        trimmed=trimmed_name,
         downloaded=datetime.now().isoformat(timespec="seconds"),
         notes=list(notes),
     )
@@ -200,6 +211,8 @@ def summary(folder: str | Path) -> str:
         line = f"  • {record.file} — {who}, {kind} {year}, лот {record.lot}"
         if record.pages:
             line += f", описание на стр. {record.pages}"
+            if record.trimmed:
+                line += f" (обрезанная копия: {record.trimmed})"
         else:
             line += ", страницы описания не найдены"
         if not record.accepted:

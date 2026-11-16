@@ -337,8 +337,14 @@ def _drive_portal(
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
             progress("открываю NYC Property Information Portal в текущей вкладке браузера")
-        if not browser_save.press_ctrl_l() or not browser_save.type_text(PORTAL_URL):
-            raise PortalLookupError("Не удалось открыть адресную строку в текущем браузере.")
+        # Ctrl+L selects the current URL; Ctrl+A also clears any stale omnibox text
+        # if the browser retained a partially typed value from an earlier attempt.
+        if (
+            not browser_save.press_ctrl_l()
+            or not browser_save.press_ctrl_a()
+            or not browser_save.type_text(PORTAL_URL)
+        ):
+            raise PortalLookupError("Не удалось заменить адрес в текущей вкладке браузера.")
         _key(window.handle, browser_save.VK_RETURN)
         rows = _wait_screen(
             window.handle,

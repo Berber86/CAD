@@ -350,8 +350,40 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
         return False
     try:
         user32.SetCursorPos(int(x), int(y))
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        # SendInput is more reliable than the legacy mouse_event API for modern
+        # Chromium windows. Fall back only when SendInput is unavailable/rejected.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            class INPUTUNION(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT)]
+
+            class INPUT(ctypes.Structure):
+                _anonymous_ = ("union",)
+                _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
+
+            user32.SendInput.argtypes = (
+                wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int,
+            )
+            user32.SendInput.restype = wintypes.UINT
+            inputs = (INPUT * 2)(
+                INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTDOWN)),
+                INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTUP)),
+            )
+            sent = int(user32.SendInput(2, inputs, ctypes.sizeof(INPUT)))
+        except Exception:  # noqa: BLE001 - legacy fallback below
+            sent = 0
+        if sent != 2:
+            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         return active_window_handle() == int(handle)
     except Exception:  # noqa: BLE001
         return False

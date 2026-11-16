@@ -189,6 +189,7 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     waits = []
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda seconds: waits.append(seconds))
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
     monkeypatch.setattr(nyc_portal, "_key", lambda _handle, vk: key_events.append(vk))
     monkeypatch.setattr(

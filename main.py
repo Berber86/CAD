@@ -123,6 +123,7 @@ from llm_parser import (
     save_config,
     save_protected_env,
 )
+import browser_save
 import deed_intake
 import deed_store
 import ocr_pages
@@ -2934,6 +2935,17 @@ class SurveyApp(ctk.CTk):
             self._post("step0_progress", line)
 
         downloads = rcclerk.default_downloads_dir()
+        auto_save = None
+        if browser_save.available():
+            auto_save = browser_save.auto_save_hook(
+                downloads,
+                on_attempt=lambda title: progress(
+                    f"PDF уже загружен в окне браузера «{title}» — нажимаю Ctrl+S один раз"
+                ),
+            )
+            progress("браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю")
+        else:
+            progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -2944,6 +2956,7 @@ class SurveyApp(ctk.CTk):
                 with_old_for_neighbour=with_old,
                 progress=progress,
                 should_stop=self._step0_stop.is_set,
+                auto_save=auto_save,
                 downloads_dir=downloads,
             )
         except deed_intake.IntakeCancelled:

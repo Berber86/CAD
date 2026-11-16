@@ -121,16 +121,18 @@ def _default_downloader(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, 
     return rcclerk.download_with_fallback(row.endorsement_id, destination)
 
 
-def make_downloader(*, downloads_dir: str | Path | None = None, base_url: str = rcclerk.BASE_URL):
+def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, base_url: str = rcclerk.BASE_URL):
     """
-    Загрузчик по лестнице. При Cloudflare открывает PDF в обычном браузере;
-    человек нажимает штатную кнопку скачивания PDF, программа подхватывает файл.
+    Загрузчик по лестнице; при поддержке Windows безопасно нажимает Ctrl+S в
+    браузере только после того, как просмотрщик PDF уже загружен.
     """
 
     def download(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, str]:
         options: dict = {"base": base_url}
         if downloads_dir is not None:
             options["downloads_dir"] = downloads_dir
+        if auto_save is not None:
+            options["auto_save"] = auto_save
         return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
 
     return download
@@ -158,6 +160,7 @@ def collect_deeds(
     with_old_for_neighbour: bool = False,
     fetch_list: ListFetcher | None = None,
     downloader: Downloader | None = None,
+    auto_save=None,
     downloads_dir: str | Path | None = None,
     page_finder: PageFinder | None = None,
     progress: Progress | None = None,
@@ -171,8 +174,8 @@ def collect_deeds(
     попадает в ``missing``/``notes`` — так человек видит и то, что собралось, и
     что именно надо доделать руками.
 
-    ``downloads_dir`` — папка «Загрузки», откуда программа подхватывает PDF,
-    сохранённый штатной кнопкой браузера.
+    ``auto_save`` — безопасный хук, который ждёт загруженный PDF в браузере и
+    отправляет Ctrl+S однократно; ``downloads_dir`` — папка «Загрузки».
     """
     block_no = int(block)
     lot_no = int(lot)
@@ -182,7 +185,7 @@ def collect_deeds(
 
     fetch = fetch_list or _default_fetch_list
     download = downloader or make_downloader(
-        downloads_dir=downloads_dir, base_url=base_url
+        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url
     )
     find_pages = page_finder or _default_page_finder
     outcome = IntakeOutcome(folder=target_dir)

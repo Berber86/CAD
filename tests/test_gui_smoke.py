@@ -3534,17 +3534,24 @@ def test_step0_never_calls_the_paid_model(gui):
         assert forbidden not in body
 
 
-def test_step0_worker_never_sends_keyboard_input_to_a_window(gui, tmp_path, monkeypatch):
+def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, monkeypatch):
     app = gui.SurveyApp()
     seen: dict[str, object] = {}
+    hook = lambda endorsement_id: None
 
     def fake_collect(**kwargs):
         seen.update(kwargs)
         return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
 
+    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
+    monkeypatch.setattr(
+        gui.browser_save, "auto_save_hook",
+        lambda folder, on_attempt: seen.setdefault("attempt_notice", on_attempt) and hook,
+    )
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
     app._step0_worker(6323, 32, [], tmp_path, False)
     _wait_step0(app)
     assert seen["downloads_dir"] == gui.rcclerk.default_downloads_dir()
-    assert "auto_save" not in seen
-    assert not hasattr(gui, "browser_save")
+    assert seen["auto_save"] is hook
+    assert callable(seen["attempt_notice"])
+    assert any("Ctrl+S" in line for line in app._step0_lines)

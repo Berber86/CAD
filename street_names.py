@@ -72,18 +72,22 @@ def split_former_name(text: str | None) -> tuple[str, str | None]:
 
 
 def find_former_name(full_text: str, street: str | None, window: int = 160) -> str | None:
-    """Старое название, которое стоит рядом с упоминанием улицы в полном тексте описания."""
+    """
+    Старое название рядом с упоминанием улицы в полном тексте описания.
+
+    Перебираются все упоминания: первое часто стоит в адресе владельца («52 Doty Avenue»),
+    где старого названия нет.
+    """
     if not street or not full_text:
         return None
-    pos = re.search(re.escape(street), full_text, re.IGNORECASE)
-    if not pos:
-        return None
-    chunk = full_text[pos.end(): pos.end() + window]
-    match = FORMER_NAME_RE.search(chunk)
-    if not match:
-        return None
-    former = " ".join(match.group("name").split()).strip(" ,;")
-    return former or None
+    for pos in re.finditer(re.escape(street), full_text, re.IGNORECASE):
+        chunk = full_text[pos.end(): pos.end() + window]
+        match = FORMER_NAME_RE.search(chunk)
+        if match:
+            former = " ".join(match.group("name").split()).strip(" ,;")
+            if former:
+                return former
+    return None
 
 
 def _flat(text: str | None) -> str:

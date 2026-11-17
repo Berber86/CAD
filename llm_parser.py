@@ -2974,7 +2974,8 @@ _EW = r"E(?:ast)?\.?"
 
 _DMS_BEARING_RE = re.compile(
     rf"(?P<ns>(?:{_NS})|(?:S(?:outh)?\.?))\s*,?\s*"
-    r"(?P<deg>\d{1,3})\s*(?:°|º|deg(?:rees?)?\.?)\s*"
+    # «degrecs» и подобные искажения слова degrees (частые ошибки OCR)
+    r"(?P<deg>\d{1,3})\s*(?:°|º|deg(?:rees?|recs?|rces?|reos?)?\.?)\s*"
     r"(?P<min>\d{1,2})\s*(?:'|′|’|min(?:utes?)?\.?)\s*"
     r"(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|″|”|''|sec(?:onds?)?\.?)\s*"
     rf"(?P<ew>East\.?|West\.?|(?:E|W)\.?(?![A-Za-z]))",
@@ -3131,7 +3132,7 @@ _STREET_SUFFIX = (
 )
 
 _STREET_RE = re.compile(
-    rf"(?P<name>(?:[A-Za-z0-9][\w.'’-]*\s+){{0,3}}{_STREET_SUFFIX})(?![A-Za-z])",
+    rf"(?P<name>(?:[A-Za-z0-9][\w.'’-]*\s+){{0,3}}(?<![A-Za-z]){_STREET_SUFFIX})(?![A-Za-z])",
     re.IGNORECASE,
 )
 
@@ -3145,10 +3146,64 @@ _STOP_WORDS = {
 }
 
 
+# OCR путает цифры с буквами внутри числа: «1l5.15», «lio.68», «1O0 feet».
+# Исправляется только токен, в котором есть цифра и который стоит перед «.dd» или «feet».
+_OCR_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z])([0-9Il|iOo]{2,8})(?=\.\d{2}\b|\s*(?:feet|foot|ft\b|'))"
+)
+_OCR_DIGIT_TABLE = str.maketrans({"l": "1", "I": "1", "|": "1", "i": "1", "O": "0", "o": "0"})
+
+
+# Частые искажения слов юридического текста при локальном OCR (только целые слова).
+_OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(rf"\b{pattern}\b", re.IGNORECASE), repl)
+    for pattern, repl in (
+        (r"eide", "side"),
+        (r"laat", "last"),
+        (r"Iand", "land"),
+        (r"degrecs", "degrees"),
+        (r"degrces", "degrees"),
+        (r"degreos", "degrees"),
+        (r"nortlensterly", "northeasterly"),
+        (r"northweaterly", "northwesterly"),
+        (r"thcreof", "thereof"),
+        (r"Descrlbed", "Described"),
+    )
+)
+
+
+def _fix_ocr_words(text: str) -> str:
+    for pattern, repl in _OCR_WORD_FIXES:
+        text = pattern.sub(repl, text)
+    return text
+
+
+# Номера строк и помехи на полях скана: отдельные строки «7331», «0», «o».
+_MARGIN_NOISE_LINE_RE = re.compile(r"(?m)^[ \t]*(?:[0-9|]{1,4}|[oO])[ \t]*(?:\n|\Z)")
+
+
+def _drop_margin_noise(text: str) -> str:
+    return _MARGIN_NOISE_LINE_RE.sub("", text)
+
+
+def _fix_ocr_number_tokens(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        # «lio.68» — цифры после точки уже есть; «1l5 feet» — нужна хотя бы одна цифра
+        if not (re.search(r"\d", token) or match.string[match.end(1): match.end(1) + 1] == "."):
+            return token
+        return token.translate(_OCR_DIGIT_TABLE)
+
+    return _OCR_NUMBER_RE.sub(repl, text)
+
+
 def _normalize_legal_text(text: str) -> str:
     """Приводит типографику к единому виду (градусы, минуты, секунды, дроби дюймов)."""
     text = _replace_vulgar_fractions(text)
+    text = _drop_margin_noise(text)
+    text = _fix_ocr_words(_fix_ocr_number_tokens(text))
     replacements = {
+        "\uff08": "(", "\uff09": ")", "\uff0c": ",", "\uff1a": ":", "\uff1b": ";",
         "\u00ba": "°", "\u02da": "°", "\u00b0": "°",
         "\u2032": "'", "\u2019": "'", "\u2018": "'", "\u02b9": "'",
         "\u2033": '"', "\u201d": '"', "\u201c": '"', "\u02ba": '"',
@@ -3636,7 +3691,7 @@ _FRONT_RE = re.compile(
     r"(?:side|line|lines|right[- ]of[- ]way)?\s*"
     r"(?:of|on|to)?\s*"
     r"(?P<block>[^.;:]{0,80}?(?:%s|%s)[^.;:]{0,20})"
-    % (_STREET_SUFFIX, r"\b\d{1,4}\b"),
+    % (r"(?<![A-Za-z])" + _STREET_SUFFIX, r"\b\d{1,4}\b"),
     re.IGNORECASE,
 )
 
@@ -3899,7 +3954,10 @@ def _extract_streets(
         distance_match = re.search(
             r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
             r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
-            r"(?:\([^)]*\)\s*)?"
+            # «U.S. Standard (75.00 feet Deed)» между числом и направлением
+            r"(?:\s*U\.?\s*S\.?\s*(?:Standard|Survey)\.?)?"
+            r"(?:\s*\([^()]{0,40}\))?"
+            r"(?:\s*(?:feet|ft|')\s*(?:Deed\)?)?)?\s*"
             + _DIR_WORDS
             + r"?\s*(?:of|from)\s+the\s+",
             text,
@@ -4071,8 +4129,10 @@ def parse_with_regex(
     width_text = street_names.find_width_text(normalized, main_street, stop=cross_street)
     if width_text and not street_names.has_width(note_now):
         meta["main_street_note"] = f"{width_text} {note_now}" if note_now else width_text
-    former_name = meta.get("main_street_former") or street_names.find_former_name(
-        normalized, main_street
+    former_name = (
+        meta.get("main_street_former")
+        or street_names.find_former_name(normalized, main_street)
+        or street_names.split_former_name(meta.get("main_street_note") or "")[1]
     )
 
     try:

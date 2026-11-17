@@ -301,6 +301,12 @@ class _FakeCanvas(_Widget):
         return len(self.items)
 
 
+
+def _step0_texts(app):
+    """Тексты записей журнала Шага 0 (записи хранятся как (уровень, текст))."""
+    return [item[1] if isinstance(item, tuple) else item for item in app._step0_lines]
+
+
 def _fake_modules() -> dict[str, types.ModuleType]:
     ctk = types.ModuleType("customtkinter")
     for name in (
@@ -3236,14 +3242,24 @@ def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
     assert app.step2_stat_vars["layers"].get() == "14"
     assert app.step2_stat_vars["labeled"].get() == "15"
     assert app.step2_stat_vars["skipped"].get() == "3"
+    # По умолчанию журнал упрощённый: в окне отчёта итоги есть, подробные строки скрыты.
+    report = app.step2_report_box.get("1.0", "end")
+    assert "ПОДПИСАНО: 15" in report
+    assert "НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: 18" in report
+    assert "по кодам и описаниям точек съёмки: 2" not in report
+    # Переключатель «Подробный журнал» перерисовывает отчёт полностью.
+    app.log_mode_var.set(True)
+    app._apply_log_mode()
     report = app.step2_report_box.get("1.0", "end")
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 1" in report
     assert "по кодам и описаниям точек съёмки: 2" in report
     assert "по именам слоёв: 14" in report
     assert "ПОДПИСАНО: 15" in report
     assert "полевая заметка «WOOD PORCH»" in report
+    app.log_mode_var.set(False)
+    app._apply_log_mode()
     # Тот же отчёт — в журнале операций (лог-панель).
-    log = "\n".join(app._log)
+    log = app.log_text()
     assert "Шаг 2 · • по кодам и описаниям точек съёмки: 2" in log
     assert "Шаг 2 · • по именам слоёв: 14" in log
     assert "Шаг 2 · ПОДПИСАНО: 15" in log
@@ -3448,8 +3464,8 @@ def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
     finally:
         gui.deed_intake.collect_deeds = saved
     assert collected["neighbours"] == [30]
-    assert "соседи: 30" in app._step0_lines[0]
-    assert "32" not in app._step0_lines[0].split("соседи:")[1]
+    assert "соседи: 30" in _step0_texts(app)[0]
+    assert "32" not in _step0_texts(app)[0].split("соседи:")[1]
 
 
 def test_step0_success_enables_handover_to_step1(gui, tmp_path):
@@ -3596,7 +3612,7 @@ def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, mo
     assert seen["downloads_dir"] == gui.rcclerk.default_downloads_dir()
     assert seen["auto_save"] is hook
     assert callable(seen["attempt_notice"])
-    assert any("Ctrl+S" in line for line in app._step0_lines)
+    assert any("Ctrl+S" in line for line in _step0_texts(app))
 
 
 def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(gui, tmp_path):
@@ -3628,8 +3644,8 @@ def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(g
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
     # Старый документ нашего участка хранится в папке, но в набор Шага 1 не передаётся (решение пользователя).
     assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
-    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in app._step0_lines)
-    assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in app._step0_lines)
+    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in _step0_texts(app))
+    assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in _step0_texts(app))
 
 
 def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gui, tmp_path):
@@ -3656,7 +3672,7 @@ def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gu
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
     assert "LOT 30 NEW.pdf" in names
     assert any("отсутствует; передаю полный документ LOT 30 NEW.pdf" in line
-               for line in app._step0_lines)
+               for line in _step0_texts(app))
 
 
 def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
@@ -3673,9 +3689,9 @@ def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
     _fill_step0(app, folder=tmp_path)
     app._start_step0_intake()
     _wait_step0(app)
-    lines = [line for line in app._step0_lines if "список документов" in line]
+    lines = [line for line in _step0_texts(app) if "список документов" in line]
     assert lines and re.match(r"^\[\d{2}:\d{2}:\d{2}\]", lines[0])
-    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", app._step0_lines[0])
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", _step0_texts(app)[0])
 
 
 def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, monkeypatch):
@@ -3698,7 +3714,7 @@ def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, 
     _wait_step0(app)
     assert captured["ocr_dpi"] == 88
     assert saved_configs and saved_configs[-1]["ocr"]["dpi"] == 88
-    assert any("OCR: 88 dpi" in line for line in app._step0_lines)
+    assert any("OCR: 88 dpi" in line for line in _step0_texts(app))
 
 
 def test_step0_rejects_invalid_ocr_dpi(gui):
@@ -3776,7 +3792,7 @@ def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_pa
     assert app.step0_lot_var.get() == "70"
     assert app.step0_neighbours_var.get() == "68, 72"
     assert app._session_llm_calls == 1
-    assert any("соседи слева/справа 68 / 72" in line for line in app._step0_lines)
+    assert any("соседи слева/справа 68 / 72" in line for line in _step0_texts(app))
     assert app.step0_run_button.cget("state") == "normal"
 
 
@@ -4318,3 +4334,23 @@ def test_step0_portal_worker_receives_fast_mode_flag(gui, monkeypatch, tmp_path)
     app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", True)
     assert received.get("fast_mode") is True
 
+
+
+def test_log_mode_switch_saves_to_config_and_keeps_other_keys(gui):
+    import json  # noqa: PLC0415
+
+    before = json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))
+    app = gui.SurveyApp()
+    assert app._log_mode() == gui.log_mode.SIMPLE  # по умолчанию упрощённый
+
+    app.log_mode_var.set(True)  # то же, что щелчок по переключателю
+    app._apply_log_mode()
+    after = json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert after["ui"]["log_mode"] == "full"
+    expected = json.loads(json.dumps(before))
+    expected.setdefault("ui", {})["log_mode"] = "full"
+    assert after == expected
+
+    app.log_mode_var.set(False)
+    app._apply_log_mode()
+    assert json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))["ui"]["log_mode"] == "simple"

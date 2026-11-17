@@ -90,6 +90,7 @@ from conflict_resolver import (
 )
 from feature_labeler import feature_settings
 from version import APP_DATE, APP_VERSION
+import log_mode
 from llm_parser import (
     ASPENWALL_SAMPLES,
     legal_to_step0_text,
@@ -491,7 +492,7 @@ class SurveyApp(ctk.CTk):
         )
         self.step0_manual_role_var = ctk.StringVar(value=STEP0_MANUAL_ROLES[0])
         self.step0_manual_lot_var = ctk.StringVar(value="")
-        self._step0_lines: list[str] = []
+        self._step0_lines: list[tuple[str, str]] = []
         self._step0_portal_running = False
         self._step0_portal_restore_topmost: bool | None = None
         self._step0_running = False
@@ -849,6 +850,17 @@ class SurveyApp(ctk.CTk):
             width=36,
             command=self._apply_topmost,
         ).grid(row=0, column=3, sticky="e")
+        self.log_mode_var = ctk.BooleanVar(
+            value=log_mode.mode_from_config(self.config_data) == log_mode.FULL,
+        )
+        ctk.CTkSwitch(
+            header_tools,
+            text="Подробный журнал",
+            variable=self.log_mode_var,
+            font=ctk.CTkFont(size=11),
+            width=36,
+            command=self._apply_log_mode,
+        ).grid(row=0, column=4, sticky="e", padx=(12, 0))
 
         # 1. Глобальные вкладки шагов: «Шаг 1. Граница участка» | «Шаг 2. Автоподписание»
         self._build_step_tab_bar()
@@ -3027,12 +3039,13 @@ class SurveyApp(ctk.CTk):
         """Метка местного времени для каждого события в журнале Шага 0."""
         return f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
 
-    def _step0_log(self, message: str) -> None:
-        self._step0_lines.append(self._step0_timestamp(message))
+    def _step0_log(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
+        self._step0_lines.append((level, self._step0_timestamp(message)))
         self._render_step0_log()
 
     def _render_step0_log(self) -> None:
-        self._set_step0_report("\n".join(self._step0_lines) or STEP0_EMPTY_REPORT)
+        visible = log_mode.filter_entries(self._step0_lines, self._log_mode())
+        self._set_step0_report("\n".join(visible) or STEP0_EMPTY_REPORT)
 
     def _step0_folder(self) -> Path:
         text = str(self.step0_folder_var.get() or "").strip()
@@ -3082,9 +3095,9 @@ class SurveyApp(ctk.CTk):
         self._step0_portal_running = True
         self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
         self.step0_run_button.configure(state="disabled")
-        self._step0_lines = [self._step0_timestamp(
+        self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
             f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; один Vision-запрос получит только карту."
-        )]
+        ))]
         self._render_step0_log()
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
         worker = threading.Thread(
@@ -3145,7 +3158,7 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001 - a closing window needs no focus restoration
             pass
         if status != "ok":
-            self._step0_log(f"Поиск участка не завершён: {payload}")
+            self._step0_log(f"Поиск участка не завершён: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
         result = payload
@@ -3167,6 +3180,7 @@ class SurveyApp(ctk.CTk):
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
             "проверьте соседей и затем нажмите «Собрать описания».",
             warn=result.confidence.lower() in {"low", "низкая"},
+            key=True,
         )
 
     def _start_step0_intake(self) -> None:
@@ -3222,13 +3236,13 @@ class SurveyApp(ctk.CTk):
         self.step0_to_step1_button.configure(state="disabled")
         self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
         self.step0_stop_button.configure(state="normal")
-        self._step0_lines = [self._step0_timestamp(
+        self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
             f"Начинаю сбор: блок {block}, лот {lot}"
             + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
             + f"; OCR: {ocr_dpi} dpi; папка: {folder}"
-        )]
+        ))]
         if dpi_save_error:
-            self._step0_lines.append(self._step0_timestamp(dpi_save_error))
+            self._step0_lines.append((log_mode.LEVEL_ERROR, self._step0_timestamp(dpi_save_error)))
         self._render_step0_log()
         self._set_status("Шаг 0: собираю описания участка…")
         worker = threading.Thread(
@@ -3300,7 +3314,7 @@ class SurveyApp(ctk.CTk):
         if not self._step0_running:
             return
         self._step0_stop.set()
-        self._step0_log("Запрошена остановка; завершу текущий документ и сохраню собранное.")
+        self._step0_log("Запрошена остановка; завершу текущий документ и сохраню собранное.", level=log_mode.LEVEL_KEY)
         self._set_status("Шаг 0: останавливаю после текущего документа…")
 
     def _finish_step0(self, status: str, payload: Any) -> None:
@@ -3309,22 +3323,26 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
         self.step0_stop_button.configure(state="disabled")
         if status == "cancelled":
-            self._step0_log("Сбор остановлен — собранное осталось в папке.")
+            self._step0_log("Сбор остановлен — собранное осталось в папке.", level=log_mode.LEVEL_KEY)
             self._set_status("Шаг 0: сбор остановлен.", warn=True)
             return
         if status == "error":
-            self._step0_log(f"Ошибка: {payload}")
+            self._step0_log(f"Ошибка: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
             return
         outcome = payload
         self._step0_outcome = outcome
-        self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}")
-        self._step0_lines.append(outcome.report(include_notes=False))
+        self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}", level=log_mode.LEVEL_KEY)
+        self._step0_lines.append((
+            log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY,
+            outcome.report(include_notes=False),
+        ))
         self._render_step0_log()
         if outcome.ok:
             self.step0_to_step1_button.configure(state="normal")
             self._set_status(
-                f"Шаг 0: собрано документов — {len(outcome.records)}. Папка: {outcome.folder}"
+                f"Шаг 0: собрано документов — {len(outcome.records)}. Папка: {outcome.folder}",
+                key=True,
             )
         else:
             self._set_status(
@@ -3383,12 +3401,12 @@ class SurveyApp(ctk.CTk):
                 warn=True,
             )
             return
-        self._step0_log(f"Из «Загрузок» принят файл: {record.file}")
+        self._step0_log(f"Из «Загрузок» принят файл: {record.file}", level=log_mode.LEVEL_KEY)
         self._set_status(f"Шаг 0: файл «{record.file}» добавлен в папку описаний.")
 
     def _step0_to_step1(self) -> None:
         """Открывает собранные описания в Шаге 1: наш участок и соседи одним набором."""
-        self._step0_log("Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…")
+        self._step0_log("Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…", level=log_mode.LEVEL_KEY)
         folder = self._step0_folder()
         try:
             manifest = deed_store.read_manifest(folder)
@@ -3424,7 +3442,7 @@ class SurveyApp(ctk.CTk):
             sidecars = deed_store.read_records(folder)
         except Exception as exc:  # noqa: BLE001 - повреждённый паспорт не мешает остальным
             sidecars = []
-            self._step0_log(f"Не удалось прочитать паспорта файлов: {exc}")
+            self._step0_log(f"Не удалось прочитать паспорта файлов: {exc}", level=log_mode.LEVEL_ERROR)
         by_key = {item_key(item): item for item in items_meta}
         for record in sidecars:
             record_data = dataclasses.asdict(record)
@@ -3472,7 +3490,7 @@ class SurveyApp(ctk.CTk):
                     )
             else:
                 expected_name = trimmed_name or full_name or "(имя в manifest не указано)"
-                self._step0_log(f"Файл из manifest не найден и пропущен: {expected_name}")
+                self._step0_log(f"Файл из manifest не найден и пропущен: {expected_name}", level=log_mode.LEVEL_ERROR)
                 continue
             if chosen not in paths:
                 paths.append(chosen)
@@ -3480,19 +3498,20 @@ class SurveyApp(ctk.CTk):
                 our_new_paths.add(chosen)
 
         if not paths:
-            self._step0_log("Передавать нечего: в папке описаний не найдено PDF")
+            self._step0_log("Передавать нечего: в папке описаний не найдено PDF", level=log_mode.LEVEL_ERROR)
             self._set_status("Шаг 0: в папке описаний нет файлов для Шага 1.", error=True)
             return
         self._step0_log(
             f"Отправляю в Шаг 1 ({len(paths)} PDF): "
-            + "; ".join(path.name for path in paths)
+            + "; ".join(path.name for path in paths),
+            level=log_mode.LEVEL_KEY,
         )
         items, errors = self._make_pdf_set_items(paths)
         if our_new_paths:
             for item in items:
                 item.is_main = item.path in our_new_paths
         for error in errors:
-            self._step0_log(f"Файл не открылся для Шага 1: {error}")
+            self._step0_log(f"Файл не открылся для Шага 1: {error}", level=log_mode.LEVEL_ERROR)
             self._log_line(f"! Шаг 0 → Шаг 1: {error}")
         if not items:
             self._set_status(
@@ -3921,11 +3940,17 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
         box.delete("1.0", "end")
-        box.insert("1.0", content)
+        box.insert("1.0", self._step2_report_view(content))
         try:
             target.configure(state="disabled")
         except Exception:  # noqa: BLE001
             pass
+
+    def _step2_report_view(self, content: str) -> str:
+        """Отчёт Шага 2 для показа в выбранном режиме; копирование берёт полный текст."""
+        if content == STEP2_EMPTY_REPORT:
+            return content
+        return "\n".join(log_mode.filter_step2_lines(content.splitlines(), self._log_mode()))
 
     def _clear_step2_report(self) -> None:
         self.feature_label_result = None
@@ -4055,11 +4080,12 @@ class SurveyApp(ctk.CTk):
         self._set_step2_report(report)
         for line in report.splitlines():
             if line.strip():
-                self._log_line(f"Шаг 2 · {line.strip()}")
+                self._log_line(f"Шаг 2 · {line.strip()}", level=log_mode.step2_line_level(line))
         self._set_status(
             result.summary(),
             error=bool(result.failed) and result.created_labels == 0,
             warn=result.has_issues,
+            key=True,
         )
 
     # --------------------------------------------------- ящик ключей и ИИ ---
@@ -4396,7 +4422,7 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
         box.delete("1.0", "end")
-        lines = list(getattr(self, "_log", []))[-300:]
+        lines = log_mode.filter_entries(list(getattr(self, "_log", []))[-300:], self._log_mode())
         content = "\n".join(reversed(lines)) if lines else "Журнал пуст"
         box.insert("1.0", content)
         try:
@@ -8095,7 +8121,7 @@ class SurveyApp(ctk.CTk):
         self._pdf_set_report_ready = True
         report = self._pdf_set_report_text()
         for line in report.splitlines():
-            self._log_line(line)
+            self._log_line(line, level=log_mode.report_line_level(line))
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
         self._open_pdf_set_report_window()
@@ -8304,7 +8330,9 @@ class SurveyApp(ctk.CTk):
             if previous in self._session_windows:
                 self._session_windows.remove(previous)
             self._pdf_set_report_window = None
-        full_text = self._pdf_set_report_text()
+        full_text = "\n".join(
+            log_mode.filter_report_lines(self._pdf_set_report_text().splitlines(), self._log_mode()),
+        )
         built = [item for item in self.pdf_set if item.on_scene]
         failed = [item for item in self.pdf_set if not item.on_scene]
         flagged = [item for item in built if self._pdf_set_issue_lines(item)]
@@ -8765,24 +8793,52 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(family="Consolas", size=12),
         )
         text.pack(fill="both", expand=True, padx=12, pady=12)
-        text.insert("1.0", self.log_text() or "Лог пуст.")
+        text.insert("1.0", self._log_view_text() or "Лог пуст.")
         text.insert("end", "\n\n--- Исходное описание ---\n" + self.text_box.get("1.0", "end"))
         target = getattr(text, "_textbox", text)
         target.configure(state="disabled")
 
     def log_text(self) -> str:
-        return "\n".join(getattr(self, "_log", []))
+        """Полный журнал операций (для сохранения); на экране — ``_log_view_text``."""
+        return "\n".join(text for _level, text in getattr(self, "_log", []))
 
-    def _log_line(self, message: str) -> None:
+    def _log_mode(self) -> str:
+        var = getattr(self, "log_mode_var", None)
+        if var is None:
+            return log_mode.DEFAULT_MODE
+        return log_mode.FULL if bool(var.get()) else log_mode.SIMPLE
+
+    def _log_view_text(self) -> str:
+        """Журнал операций в текущем режиме (без служебных уровней)."""
+        return "\n".join(log_mode.filter_entries(getattr(self, "_log", []), self._log_mode()))
+
+    def _apply_log_mode(self) -> None:
+        """Переключатель «Подробный журнал»: сохраняет режим и перерисовывает все журналы."""
+        mode = self._log_mode()
+        try:
+            log_mode.save_mode_to_file(CONFIG_PATH, mode)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Режим журнала не сохранён в config.json: {exc}", warn=True)
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("ui", {})["log_mode"] = mode
+        self._render_step0_log()
+        self._refresh_log_view()
+        content = str(getattr(self, "_step2_report_text", "") or "")
+        if content:
+            self._set_step2_report(content)
+
+    def _log_line(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         if not hasattr(self, "_log"):
             self._log = []
         stamp = __import__("datetime").datetime.now().strftime("%H:%M:%S")
-        self._log.append(f"{stamp}  {message}")
+        self._log.append((level, f"{stamp}  {message}"))
         del self._log[:-400]
         if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
             self._refresh_log_view()
 
-    def _set_status(self, message: str, error: bool = False, *, warn: bool = False) -> None:
+    def _set_status(
+        self, message: str, error: bool = False, *, warn: bool = False, key: bool = False,
+    ) -> None:
         self.status_var.set(message)
         if error:
             color = THEME["err"]
@@ -8796,7 +8852,13 @@ class SurveyApp(ctk.CTk):
             dot.configure(
                 text_color=THEME["err"] if error else (THEME["warn"] if warn else THEME["ok"])
             )
-        self._log_line(message)
+        level = (
+            log_mode.LEVEL_ERROR if error else
+            log_mode.LEVEL_WARN if warn else
+            log_mode.LEVEL_KEY if key else
+            log_mode.LEVEL_INFO
+        )
+        self._log_line(message, level=level)
         self._refresh_stepper()
 
     def _refresh_center_badges(self, plan: DrawPlan | None, closure_ft: float | None) -> None:
@@ -9088,7 +9150,7 @@ class SurveyApp(ctk.CTk):
             text = str(payload)
             if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
                 text = self._step0_timestamp(text)
-            self._step0_lines.append(text)
+            self._step0_lines.append((log_mode.LEVEL_INFO, text))
             self._render_step0_log()
         elif kind == "step0_portal_done":
             status, portal_result = payload

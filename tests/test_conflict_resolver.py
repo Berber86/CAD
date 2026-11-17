@@ -607,6 +607,7 @@ def test_set_report_offers_the_neighbour_bearing_and_changes_the_lot_only_on_req
 
     ours, neighbour = _alvine_set(tmp_path)
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # этот тест проверяет подробный текст отчёта
     monkeypatch.setattr(gui, "ask_llm_json", lambda *a, **k: pytest.fail("платный запрос без ИИ в наборе"))
     parses = []
     real = gui.parse_legal_description_full
@@ -710,6 +711,7 @@ def test_advisor_is_asked_only_after_the_button_is_confirmed(gui, tmp_path, monk
     _write_test_pdf(neighbour, [NEIGHBOUR_TEXT])
     our_desc, _ = parse_with_regex(OUR_TEXT)
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     app.select_passes(1)
     real = gui.parse_legal_description_full
 
@@ -792,6 +794,7 @@ def test_advisor_asks_nothing_without_a_key_or_when_switched_off(gui, tmp_path, 
     _write_test_pdf(neighbour, [NEIGHBOUR_TEXT])
     our_desc, _ = parse_with_regex(OUR_TEXT)
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     app.select_passes(1)
     real = gui.parse_legal_description_full
     monkeypatch.setattr(

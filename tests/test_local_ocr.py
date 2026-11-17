@@ -306,6 +306,7 @@ def test_scan_in_the_set_is_read_locally_and_built(gui, tmp_path, monkeypatch):
         lambda **kwargs: calls.append(kwargs) or real(**kwargs),
     )
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # этот тест проверяет подробный текст отчёта
     from tkinter import filedialog
 
     monkeypatch.setattr(

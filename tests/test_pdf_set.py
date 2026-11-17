@@ -185,6 +185,7 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
 
     main, left, right = _three_lots(tmp_path)
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     monkeypatch.setattr(app, "_ask_source_role", lambda *_: pytest.fail("роль не спрашивается до выбора PDF"))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("платный запрос без выбора ИИ"))
     assert "наш участок и соседи" in app.load_pdf_button.cget("text")
@@ -260,6 +261,7 @@ def test_only_the_chosen_pages_are_parsed_and_edits_reparse_one_file(gui, tmp_pa
     _write_test_pdf(both, [samples[RIGHT], samples[MAIN]])
     _write_test_pdf(left, [samples[LEFT]])
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     real = gui.parse_legal_description_full
     calls = []
 
@@ -333,6 +335,7 @@ def test_each_file_has_its_own_parser_and_scans_send_only_their_pages(gui, tmp_p
     _write_test_pdf(text_pdf, [samples[MAIN]])
     _write_test_pdf(scan, [None, None, None, None])
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     app.select_passes(1)
     real = gui.parse_legal_description_full
     left_desc, _ = parse_with_regex(samples[LEFT])
@@ -392,6 +395,7 @@ def test_disagreeing_ai_passes_keep_the_lot_and_flag_it(gui, tmp_path, monkeypat
     bad = good.model_copy(deep=True)
     bad.segments[0].distance_ft += 7.0  # один проход прочитал длину иначе — контур не замыкается
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # этот тест проверяет подробный текст отчёта
     app.select_passes(2)
     seen = []
 
@@ -433,6 +437,7 @@ def test_failed_file_is_reported_and_blocks_drawing_until_fixed_or_removed(gui, 
     scan = tmp_path / "scan.pdf"
     _write_test_pdf(scan, [None])
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     real = gui.parse_legal_description_full
     calls = []
     monkeypatch.setattr(gui, "parse_legal_description_full", lambda **kw: calls.append(kw) or real(**kw))
@@ -478,6 +483,7 @@ def test_failed_file_is_reported_and_blocks_drawing_until_fixed_or_removed(gui, 
 def test_new_set_asks_about_the_existing_scene_and_may_have_no_main(gui, tmp_path, monkeypatch):
     main, left, right = _three_lots(tmp_path)
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     app._on_sample_selected(MAIN)  # на схеме уже есть наш участок из текста
     old_main = app._preview_main_plan
     assert old_main is not None

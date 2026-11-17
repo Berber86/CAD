@@ -4348,8 +4348,32 @@ def test_step0_portal_worker_receives_fast_mode_flag(gui, monkeypatch, tmp_path)
         raise RuntimeError("стоп")
 
     monkeypatch.setattr(portal_module, "lookup_parcel", fake_lookup)
-    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", True)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", True, 3.5)
     assert received.get("fast_mode") is True
+    assert received.get("fast_pause_sec") == 3.5
+
+
+def test_fast_pause_field_sits_next_to_the_checkbox_and_defaults_to_five(gui):
+    app = gui.SurveyApp()
+    assert app.step0_fast_pause_var.get() == "5"
+    assert app._step0_fast_pause_value() == 5.0  # без галочки значение не важно
+    app.step0_fast_mode_var.set(True)
+    app.step0_fast_pause_var.set("3,5")
+    assert app._step0_fast_pause_value() == 3.5
+
+
+def test_wrong_fast_pause_stops_the_portal_lookup_before_it_starts(gui, monkeypatch):
+    import nyc_portal as portal_module
+
+    app = gui.SurveyApp()
+    started = []
+    monkeypatch.setattr(portal_module, "lookup_parcel", lambda *a, **k: started.append(True))
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_fast_mode_var.set(True)
+    app.step0_fast_pause_var.set("7")
+    app._start_step0_portal_lookup()
+    assert not started
+    assert "от 1 до 5" in app.status_var.get()
 
 
 

@@ -557,6 +557,8 @@ class SurveyApp(ctk.CTk):
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
         self.step0_fast_mode_var = ctk.BooleanVar(value=False)
+        #: Пауза «быстрой работы» в секундах, от 1 до 5 (поле рядом с галочкой).
+        self.step0_fast_pause_var = ctk.StringVar(value=str(int(nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC)))
         self.step0_ocr_dpi_var = ctk.StringVar(
             value=str((self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI))
         )
@@ -3012,15 +3014,30 @@ class SurveyApp(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
+        fast_row = ctk.CTkFrame(checks, fg_color="transparent")
+        fast_row.grid(row=1, column=0, sticky="w", pady=(4, 0))
         ctk.CTkCheckBox(
-            checks,
-            text="быстрая работа (меньше проверок экрана, паузы по 5 с)",
+            fast_row,
+            text="быстрая работа (меньше проверок экрана), пауза",
             variable=self.step0_fast_mode_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             checkbox_width=18,
             checkbox_height=18,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkEntry(
+            fast_row,
+            textvariable=self.step0_fast_pause_var,
+            width=48,
+            justify="center",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=1, sticky="w", padx=(6, 4))
+        ctk.CTkLabel(
+            fast_row,
+            text=f"с (от {nyc_portal.FAST_PAUSE_MIN_SEC:g} до {nyc_portal.FAST_PAUSE_MAX_SEC:g})",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=2, sticky="w")
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -3187,6 +3204,22 @@ class SurveyApp(ctk.CTk):
         if chosen:
             self.step0_folder_var.set(str(chosen))
 
+    def _step0_fast_pause_value(self) -> float | None:
+        """
+        Пауза «быстрой работы» из поля. Без галочки значение не используется — возвращаем 5 с.
+        Если галочка стоит, а число неверное, выводит сообщение и возвращает None: запуск не начинаем.
+        """
+        if not self.step0_fast_mode_var.get():
+            return nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC
+        value = nyc_portal.parse_fast_pause(self.step0_fast_pause_var.get())
+        if value is None:
+            self._set_status(
+                f"Шаг 0: пауза «быстрой работы» — число от {nyc_portal.FAST_PAUSE_MIN_SEC:g} "
+                f"до {nyc_portal.FAST_PAUSE_MAX_SEC:g} секунд.",
+                error=True,
+            )
+        return value
+
     def _start_step0_portal_lookup(self) -> None:
         """Address → NYC Portal → one user-initiated Vision extraction call."""
         if self._step0_portal_running or self._step0_running:
@@ -3198,6 +3231,9 @@ class SurveyApp(ctk.CTk):
         address = str(self.step0_address_var.get() or "").strip()
         if not address:
             self._set_status("Шаг 0: сначала введите адрес (номер дома и улицу).", error=True)
+            return
+        fast_pause = self._step0_fast_pause_value()
+        if fast_pause is None:
             return
         try:
             cfg, provider, model, api_key, key_secret = self._build_runtime_config()
@@ -3231,7 +3267,7 @@ class SurveyApp(ctk.CTk):
             target=self._step0_portal_worker,
             args=(
                 address, folder, cfg, provider, model, target["api_key"], key_secret,
-                bool(self.step0_fast_mode_var.get()),
+                bool(self.step0_fast_mode_var.get()), fast_pause,
             ),
             daemon=True,
         )
@@ -3247,6 +3283,7 @@ class SurveyApp(ctk.CTk):
         api_key: str,
         key_secret: str,
         fast_mode: bool = False,
+        fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
         self._worker_context.generation = self._generation
@@ -3265,6 +3302,7 @@ class SurveyApp(ctk.CTk):
                 key_secret=key_secret,
                 progress=progress,
                 fast_mode=fast_mode,
+                fast_pause_sec=fast_pause,
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
             self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
@@ -3344,6 +3382,9 @@ class SurveyApp(ctk.CTk):
                 error=True,
             )
             return
+        fast_pause = self._step0_fast_pause_value()
+        if fast_pause is None:
+            return
         if lot in neighbours:
             neighbours = [value for value in neighbours if value != lot]
             self._set_status("Шаг 0: наш лот убран из списка соседей — он собирается как наш участок.", warn=True)
@@ -3378,7 +3419,7 @@ class SurveyApp(ctk.CTk):
             args=(
                 block, lot, neighbours, folder,
                 bool(self.step0_old_neighbour_var.get()), ocr_dpi,
-                bool(self.step0_fast_mode_var.get()),
+                bool(self.step0_fast_mode_var.get()), fast_pause,
             ),
             daemon=True,
         )
@@ -3393,6 +3434,7 @@ class SurveyApp(ctk.CTk):
         with_old: bool,
         ocr_dpi: int = ocr_pages.DEFAULT_DPI,
         fast_mode: bool = False,
+        fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
@@ -3405,13 +3447,13 @@ class SurveyApp(ctk.CTk):
         if browser_save.available():
             auto_save = browser_save.auto_save_hook(
                 downloads,
-                ready_delay=5.0 if fast_mode else 4.0,
+                ready_delay=fast_pause if fast_mode else 4.0,
                 stable_for=0.0 if fast_mode else 1.0,
                 on_attempt=lambda title: progress(
                     f"PDF уже загружен в окне браузера «{title}» — нажимаю Ctrl+S один раз"
                 ),
             )
-            mode_note = " (быстрая работа: пауза 5 с)" if fast_mode else ""
+            mode_note = f" (быстрая работа: пауза {fast_pause:g} с)" if fast_mode else ""
             progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
         else:
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")

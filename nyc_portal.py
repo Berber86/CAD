@@ -89,6 +89,25 @@ def _normalise(text: str) -> str:
 # Пауза между проверками экрана (OCR всего окна). В «быстрой работе» проверок меньше.
 SCREEN_CHECK_PAUSE_SEC = 0.6
 FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
+#: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
+FAST_PAUSE_MIN_SEC = 1.0
+FAST_PAUSE_MAX_SEC = 5.0
+
+
+def parse_fast_pause(text: object) -> float | None:
+    """
+    Разбирает паузу «быстрой работы» из поля: число от 1 до 5 (дробные, с точкой или запятой).
+
+    Возвращает ``None``, если это не число или оно вне пределов — такой запуск не начинаем.
+    """
+    raw = str(text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not FAST_PAUSE_MIN_SEC <= value <= FAST_PAUSE_MAX_SEC:
+        return None
+    return value
 # После прокрутки колёсиком карта перерисовывается не сразу: снимок делаем через 0.8 с + 3 с.
 MAP_REDRAW_WAIT_SEC = 0.8 + 3.0
 
@@ -360,14 +379,16 @@ def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: s
 
 def _drive_portal(
     address: str, map_path: Path, progress: Progress | None = None, *, fast_mode: bool = False,
+    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
 ) -> PortalCapture:
     """
     Use the current browser window to select an address and retain a map-only crop.
 
-    ``fast_mode`` — «быстрая работа»: между проверками экрана пауза 5 с вместо 0.6 с,
-    то есть OCR всего окна запускается заметно реже.
+    ``fast_mode`` — «быстрая работа»: между проверками экрана пауза ``fast_pause_sec``
+    (по умолчанию 5 с, пользователь выбирает от 1 до 5) вместо 0.6 с, то есть OCR всего окна
+    запускается заметно реже.
     """
-    pause = FAST_SCREEN_CHECK_PAUSE_SEC if fast_mode else SCREEN_CHECK_PAUSE_SEC
+    pause = fast_pause_sec if fast_mode else SCREEN_CHECK_PAUSE_SEC
 
     def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
              timeout: float, description: str) -> list[ScreenText]:
@@ -577,6 +598,7 @@ def lookup_parcel(
     key_secret: str = "",
     progress: Progress | None = None,
     fast_mode: bool = False,
+    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
 ) -> ParcelLookup:
     """Navigate the portal, read BBL locally, then ask Vision only about map neighbours."""
     clean_address = str(address or "").strip()
@@ -584,7 +606,9 @@ def lookup_parcel(
         raise PortalLookupError("Введите адрес перед поиском.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     map_path = Path(screenshot_folder) / f"TAX_MAP_{stamp}.jpg"
-    capture = _drive_portal(clean_address, map_path, progress, fast_mode=fast_mode)
+    capture = _drive_portal(
+        clean_address, map_path, progress, fast_mode=fast_mode, fast_pause_sec=fast_pause_sec,
+    )
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(

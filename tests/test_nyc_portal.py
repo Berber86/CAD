@@ -517,17 +517,31 @@ def test_map_is_captured_only_after_the_redraw_wait_following_the_wheel(monkeypa
 def test_lookup_parcel_passes_fast_mode_to_the_portal_driver(monkeypatch, tmp_path):
     received = {}
 
-    def drive(address, map_path, progress=None, *, fast_mode=False):
+    def drive(address, map_path, progress=None, *, fast_mode=False, fast_pause_sec=None):
         received["fast_mode"] = fast_mode
+        received["fast_pause_sec"] = fast_pause_sec
         raise nyc_portal.PortalLookupError("стоп после проверки аргумента")
 
     monkeypatch.setattr(nyc_portal, "_drive_portal", drive)
     with pytest.raises(nyc_portal.PortalLookupError, match="стоп"):
         nyc_portal.lookup_parcel(
             "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="vision",
-            fast_mode=True,
+            fast_mode=True, fast_pause_sec=2.5,
         )
-    assert received == {"fast_mode": True}
+    assert received == {"fast_mode": True, "fast_pause_sec": 2.5}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("5", 5.0), ("1", 1.0), ("3,5", 3.5), (" 2.25 ", 2.25), ("4.9", 4.9)],
+)
+def test_fast_pause_accepts_any_number_from_one_to_five(text, expected):
+    assert nyc_portal.parse_fast_pause(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "0.9", "5.1", "6", "-1", "abc", "nan", "inf", None])
+def test_fast_pause_rejects_numbers_outside_the_range_and_garbage(text):
+    assert nyc_portal.parse_fast_pause(text) is None
 
 
 def test_address_is_not_typed_when_ctrl_t_did_not_lead_to_a_new_tab(tmp_path, monkeypatch):

@@ -1,9 +1,11 @@
 """
-Шаг 1, набор PDF: эскалация для скана.
+Шаг 1, набор PDF: локальный OCR для скана — один проход.
 
-* Ступень 2 (локальный OCR) распознаёт выбранные страницы заново и НИКОГДА не читает
-  кеш: эскалация нужна, чтобы не доверять прошлому результату.
-* Ступень 3 (ИИ) получает страницы из строки «2» / «3-4», а не индексирует её.
+* Один проход OCR на максимуме, который даёт документ (SCAN_OCR_DPI, не выше нативного
+  разрешения скана). Перебора 400/600/300 dpi и кусков 2×2 больше нет.
+* Проход НИКОГДА не читает кеш: результат прошлого прохода не доверяем.
+* Страницы — выбранные пользователем; строка «2» / «3-4» разбирается, а не индексируется.
+* ИИ вызывается только если проверка описания не пройдена (статус не ok).
 * Ошибки OCR не глотаются: они попадают в отчёт с типом и местом.
 
 Движок OCR подменяется, кроме одного теста, который запускает настоящий rapidocr
@@ -42,9 +44,12 @@ CLEAN = (
     "33 degrees 23 minutes 48 seconds East 40.00 feet to the point or place of BEGINNING."
 )
 # Те же стороны, но без расстояния до угла.
-NO_TIE = CLEAN.replace("distant 161.00 feet southwesterly from the corner formed by the "
-                       "intersection of the northwesterly side of Stafford Avenue and the "
-                       "southwesterly side of Carlton Boulevard", "at a point")
+NO_TIE = CLEAN.replace(
+    "distant 161.00 feet southwesterly from the corner formed by the "
+    "intersection of the northwesterly side of Stafford Avenue and the "
+    "southwesterly side of Carlton Boulevard",
+    "at a point",
+)
 
 
 @pytest.fixture()
@@ -56,10 +61,10 @@ def fake_pdf(tmp_path):
 
 @pytest.fixture()
 def ocr_calls(monkeypatch, tmp_path):
-    """Подменяет OCR и записывает, с каким флагом кеша его вызвали."""
+    """Подменяет OCR и записывает каждый вызов (страницы, dpi, кеш, нарезку)."""
     monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
     calls: list[dict] = []
-    state = {"plain": LEGAL, "tiled": LEGAL, "raise": None}
+    state = {"text": LEGAL, "raise": None}
 
     def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
                  use_cache=True, tile=1, exact_dpi=False):
@@ -67,32 +72,50 @@ def ocr_calls(monkeypatch, tmp_path):
                       "use_cache": use_cache, "exact": exact_dpi})
         if state["raise"] is not None:
             raise state["raise"]
-        return state["tiled"] if tile > 1 else state["plain"]
+        return state["text"]
 
     monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", fake_ocr)
     return calls, state
 
 
-def test_escalation_never_reads_or_writes_cache(fake_pdf, ocr_calls):
-    calls, state = ocr_calls
-    state["plain"] = "COVER PAGE\nno courses"
-    pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert calls, "OCR должен был вызваться"
-    assert all(call["use_cache"] is False for call in calls)
-
-
-def test_escalation_uses_selected_pages(fake_pdf, ocr_calls):
+def test_single_pass_uses_scan_dpi_and_never_tiles(fake_pdf, ocr_calls):
     calls, _ = ocr_calls
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
+    assert len(calls) == 1, "проход один, без повтора"
+    assert calls[0]["dpi"] == pdf_set.SCAN_OCR_DPI == ocr_pages.SCAN_MAX_DPI
+    assert calls[0]["tile"] == 1
+    assert calls[0]["exact"] is True, "рендер ровно на запрошенном dpi, не по нативному разрешению"
+    assert result.dpi == pdf_set.SCAN_OCR_DPI
+    assert result.text == LEGAL
+
+
+def test_single_pass_does_not_retry_when_no_courses(fake_pdf, ocr_calls):
+    """Раньше здесь был второй заход 2×2 и смена dpi. Теперь текст берётся как есть."""
+    calls, state = ocr_calls
+    state["text"] = "COVER PAGE\nno courses here"
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
+    assert len(calls) == 1 and calls[0]["tile"] == 1
+    assert result.text == "COVER PAGE\nno courses here"
+
+
+def test_single_pass_never_reads_or_writes_cache(fake_pdf, ocr_calls):
+    calls, _ = ocr_calls
+    pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
+    assert calls and all(call["use_cache"] is False for call in calls)
+
+
+def test_single_pass_uses_selected_pages(fake_pdf, ocr_calls):
+    calls, _ = ocr_calls
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
     assert result.error == ""
-    assert calls[0]["first"] == 3 and calls[0]["last"] == 4
+    assert (calls[0]["first"], calls[0]["last"]) == (3, 4)
     assert result.pages == (3, 4)
     assert has_legal_courses(result.text)
 
 
-def test_escalation_single_page_spec(fake_pdf, ocr_calls):
+def test_single_page_spec(fake_pdf, ocr_calls):
     calls, _ = ocr_calls
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "2"})
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "2"})
     assert result.error == ""
     assert (calls[0]["first"], calls[0]["last"]) == (2, 2)
 
@@ -100,7 +123,7 @@ def test_escalation_single_page_spec(fake_pdf, ocr_calls):
 def test_ocr_error_is_reported_not_swallowed(fake_pdf, ocr_calls):
     _, state = ocr_calls
     state["raise"] = IndexError("string index out of range")
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
     assert result.text == ""
     assert "IndexError" in result.error
     assert "string index out of range" in result.error
@@ -108,136 +131,16 @@ def test_ocr_error_is_reported_not_swallowed(fake_pdf, ocr_calls):
     assert "ошибка" in result.summary()
 
 
-def test_tiled_pass_runs_when_whole_page_has_no_courses(fake_pdf, ocr_calls):
-    calls, state = ocr_calls
-    state["plain"] = "COVER PAGE\nno courses here"
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"}, dpis=(400,))
-    assert [c["tile"] for c in calls] == [1, 2]
-    assert all(c["use_cache"] is False for c in calls)
-    assert result.tiled is True
-    assert has_legal_courses(result.text)
-    assert "2×2" in result.summary()
-
-
-def test_escalation_renders_the_requested_dpi_not_the_native_cap(fake_pdf, ocr_calls):
-    """Регресс: OUR 70 нативно 219 dpi; «400» не должно рендериться на 219."""
-    calls, _ = ocr_calls
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"}, dpis=(400,))
-    assert all(call["exact"] is True for call in calls)
-    assert result.dpi == 400
-    assert "рендер 400 dpi" in result.summary()
-
-
-def test_escalation_default_tries_400_first_and_stops_on_clean_parse(fake_pdf, ocr_calls, monkeypatch):
-    """Основной проход — 400 dpi (как требует задача); чистый разбор → остальные не запускаются."""
-    calls, _ = ocr_calls
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages",
-                        lambda *a, **k: (calls.append({"dpi": k.get("dpi"), "tile": k.get("tile", 1)}),
-                                         CLEAN)[1])
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert pdf_set.ESCALATION_DPIS[0] == 400
-    assert [c["dpi"] for c in calls] == [400]
-    assert result.dpi == 400
-    assert result.tried == ("400 dpi — сторон 4",)
-
-
-def test_escalation_falls_back_to_600_when_400_is_not_clean(fake_pdf, monkeypatch):
-    """400 dpi без расстояния до угла → пробуем 600 dpi, он чистый → берём его."""
-    calls: list[tuple[int, int]] = []
-    texts = {400: NO_TIE, 600: CLEAN}
-
-    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
-               use_cache=True, tile=1, exact_dpi=False):
-        calls.append((dpi, tile))
-        assert use_cache is False and exact_dpi is True
-        return texts.get(dpi, "")
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert [d for d, t in calls if t == 1] == [400, 600]
-    assert result.dpi == 600
-    assert result.text == CLEAN
-    assert len(result.tried) == 2
-
-
-def test_escalation_keeps_best_pass_when_none_is_clean(fake_pdf, monkeypatch):
-    """Ни один проход не чистый → берём лучший: сначала полнота сторон, затем расстояние."""
-    three_sides_with_tie = CLEAN.replace(
-        " THENCE North 33 degrees 23 minutes 48 seconds East 40.00 feet to the point or place of BEGINNING.",
-        " to the point or place of BEGINNING.",
-    )
-    texts = {400: NO_TIE, 600: three_sides_with_tie, 300: "COVER PAGE\nno courses here"}
-    calls: list[int] = []
-
-    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
-               use_cache=True, tile=1, exact_dpi=False):
-        if tile == 1:
-            calls.append(dpi)
-        return texts.get(dpi, "")
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    # 400 dpi даёт 4 стороны (без расстояния), 600 — 3 стороны: хуже, поэтому дальше не ищем.
-    assert result.dpi == 400
-    assert result.text == NO_TIE
-    assert calls == [400, 600]
-    assert "без улучшения" in result.tried[-1]
-
-
-def test_escalation_stops_when_dpi_change_gives_the_same_parse(fake_pdf, monkeypatch):
-    """
-    Текст без расстояния (как LOT 72: «hundred feet» без цифр) не лечится dpi:
-    600 и 300 dpi дают тот же результат, поэтому проход останавливается на 600.
-    """
-    calls: list[int] = []
-
-    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
-               use_cache=True, tile=1, exact_dpi=False):
-        if tile == 1:
-            calls.append(dpi)
-        return NO_TIE
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "2"})
-    assert calls == [400, 600]
-    assert result.dpi == 400
-    assert result.text == NO_TIE
-
-
-def test_escalation_keeps_trying_while_dpi_improves(fake_pdf, monkeypatch):
-    """Порядок 400 → 600 → 300 сохраняется: 600 улучшил результат, и это чистый разбор."""
-    calls: list[int] = []
-
-    def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
-               use_cache=True, tile=1, exact_dpi=False):
-        if tile == 1:
-            calls.append(dpi)
-        return {400: NO_TIE, 600: CLEAN, 300: NO_TIE}.get(dpi, "")
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert calls == [400, 600]
-    assert result.dpi == 600
-
-
-def test_escalation_reports_error_when_every_pass_fails(fake_pdf, monkeypatch):
-    def broken(*args, **kwargs):
-        raise IndexError("string index out of range")
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", broken)
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert result.text == ""
-    assert "IndexError" in result.error
-    assert len(result.tried) == len(pdf_set.ESCALATION_DPIS)
-
-
-def test_summary_says_fresh_recognition(fake_pdf, ocr_calls):
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "3-4"})
-    assert "без кеша" in result.summary()
+def test_summary_says_fresh_recognition_at_one_dpi(fake_pdf, ocr_calls):
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "3-4"})
+    summary = result.summary()
+    assert "без кеша" in summary
+    assert f"рендер {pdf_set.SCAN_OCR_DPI} dpi" in summary
+    assert "кусками" not in summary
 
 
 def test_bad_page_spec_is_reported(fake_pdf, ocr_calls):
-    result = pdf_set.escalate_ocr(fake_pdf, {"ocr_pages": "abc"})
+    result = pdf_set.ocr_scan_once(fake_pdf, {"ocr_pages": "abc"})
     assert result.error
     assert result.text == ""
 
@@ -251,115 +154,8 @@ def test_describe_exc_keeps_type_message_and_place():
     assert "test_pdf_escalation.py:" in text
 
 
-def _worker_stub(gui_module, post, *, severe: bool, parse_job):
-    stub = types.SimpleNamespace(
-        _worker_poster=lambda: post,
-        _worker_is_current=lambda: True,
-        _find_step0_cache_path=gui_module.SurveyApp._find_step0_cache_path,
-        _has_severe_shape_issues=lambda plan, issues: severe,
-        _shape_rank=gui_module.SurveyApp._shape_rank,
-        _analyse_pdf_set_conflicts=lambda *a, **k: None,
-        _parse_pdf_set_job=parse_job,
-    )
-    stub._needs_local_recheck = lambda outcome, plan, issues: gui_module.SurveyApp._needs_local_recheck(
-        stub, outcome, plan, issues,
-    )
-    stub._local_text_rank = lambda *a, **k: gui_module.SurveyApp._local_text_rank(stub, *a, **k)
-    stub._write_ai_to_step0_cache = lambda *a, **k: gui_module.SurveyApp._write_ai_to_step0_cache(stub, *a, **k)
-    return stub
-
-
-def test_stage_three_gets_pages_from_the_spec_not_by_indexing(gui, tmp_path, monkeypatch):
-    """Регресс: «2» падал с IndexError (string index out of range) в ступени 3."""
-    pdf = tmp_path / "LOT 72 NEW_p2.pdf"
-    pdf.write_bytes(b"%PDF-1.4 fake")
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: LEGAL)
-    monkeypatch.setattr(gui, "inspect_pdf", lambda *a, **k: {"pages": 0})
-    seen: list = []
-    done: dict = {}
-
-    def parse_job(job, *args, **kwargs):
-        seen.append(job.source)
-        if job.use_llm:
-            raise gui.PDFError("ИИ-заглушка")
-        return gui.SurveyApp._parse_pdf_set_job(stub, job, *args, **kwargs)
-
-    def post(kind, payload):
-        if kind == "pdf_set_done":
-            done["payload"] = payload
-
-    stub = _worker_stub(gui, post, severe=True, parse_job=parse_job)
-    job = PdfSetJob(
-        path=pdf, is_main=False, use_llm=False, pages_label="стр. 2", mode_label="локально",
-        parse_key=("y",), source={"ocr_path": pdf, "ocr_pages": "2", "ocr_dpi": 400}, ocr=True,
-    )
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", "key", "", 1.0, False, {}, False)
-    results, _ = done["payload"]
-    llm_sources = [src for src in seen if src and "pdf_path" in src]
-    assert llm_sources, "ступень 3 должна была вызваться"
-    assert llm_sources[0]["pdf_pages"] == (2, 2)
-    assert "IndexError" not in (results[0].error or "")
-
-
-def test_background_worker_runs_stage_two_and_reports_it(gui, tmp_path, monkeypatch):
-    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
-    pdf.write_bytes(b"%PDF-1.4 fake")
-    progress: list[str] = []
-    done: dict = {}
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: LEGAL)
-
-    def post(kind, payload):
-        if kind == "progress":
-            progress.append(payload)
-        elif kind == "pdf_set_done":
-            done["payload"] = payload
-
-    stub = _worker_stub(gui, post, severe=True, parse_job=None)
-    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
-    job = PdfSetJob(
-        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
-        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
-    )
-    # без ключа ступень 3 не запускается — проверяем только ступень 2
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
-    results, _ = done["payload"]
-    assert results[0].error == ""
-    assert results[0].plan is not None
-    assert any("OCR —" in line and "без кеша" in line for line in progress), progress
-
-
-def test_background_worker_reports_stage_two_error(gui, tmp_path, monkeypatch):
-    pdf = tmp_path / "LOT 72 NEW_p2.pdf"
-    pdf.write_bytes(b"%PDF-1.4 fake")
-    progress: list[str] = []
-    done: dict = {}
-
-    def broken_ocr(*args, **kwargs):
-        raise IndexError("string index out of range")
-
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", broken_ocr)
-
-    def post(kind, payload):
-        if kind == "progress":
-            progress.append(payload)
-        elif kind == "pdf_set_done":
-            done["payload"] = payload
-
-    stub = _worker_stub(gui, post, severe=True, parse_job=None)
-    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
-    job = PdfSetJob(
-        path=pdf, is_main=False, use_llm=False, pages_label="стр. 2", mode_label="локально",
-        parse_key=("y",), source={"ocr_path": pdf, "ocr_pages": "2", "ocr_dpi": 400}, ocr=True,
-    )
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
-    results, _ = done["payload"]
-    assert results[0].outcome is None
-    assert "IndexError" in results[0].error
-    assert any("OCR —" in line and "ошибка" in line for line in progress), progress
-
-
 def test_real_ocr_ignores_a_poisoned_cache(tmp_path, monkeypatch):
-    """Настоящий OCR: в кеш положен неверный текст, эскалация его не читает."""
+    """Настоящий OCR: в кеш положен неверный текст, проход его не читает."""
     pytest.importorskip("rapidocr_onnxruntime")
     pymupdf = pytest.importorskip("pymupdf")
     monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
@@ -377,14 +173,15 @@ def test_real_ocr_ignores_a_poisoned_cache(tmp_path, monkeypatch):
     scan.close()
     src.close()
 
-    # Отравляем кеш ровно под тот ключ, который использовал бы обычный OCR.
-    key = ocr_pages._cache_key(image_pdf, 1, 1, 400, 1)
-    ocr_pages._write_cache(key, GARBAGE_CACHE)
+    # Отравляем кеш под ключ, который использовал бы обычный OCR (в том числе на SCAN_OCR_DPI).
+    for dpi in (400, pdf_set.SCAN_OCR_DPI):
+        ocr_pages._write_cache(ocr_pages._cache_key(image_pdf, 1, 1, dpi, 1), GARBAGE_CACHE)
 
-    result = pdf_set.escalate_ocr(image_pdf, {"ocr_pages": "1"}, dpis=(400,))
+    result = pdf_set.ocr_scan_once(image_pdf, {"ocr_pages": "1"})
     assert result.error == ""
+    # Кеш не прочитан: текст получен настоящим распознаванием, а не подставлен из кеша.
     assert result.text != GARBAGE_CACHE
-    assert has_legal_courses(result.text)
+    assert "BEGINNING" in result.text.upper()
     assert result.seconds > 0.5, "настоящее распознавание занимает время, а не 0.0 с"
 
 
@@ -397,10 +194,179 @@ def test_text_quality_counts_courses_when_the_parser_cannot_read_the_text():
     assert pdf_set.text_quality("COVER PAGE\nno courses here") == (0, 0, 0)
 
 
+def _worker_stub(gui_module, post, *, parse_job):
+    stub = types.SimpleNamespace(
+        _worker_poster=lambda: post,
+        _worker_is_current=lambda: True,
+        _find_step0_cache_path=gui_module.SurveyApp._find_step0_cache_path,
+        _shape_rank=gui_module.SurveyApp._shape_rank,
+        _analyse_pdf_set_conflicts=lambda *a, **k: None,
+        _parse_pdf_set_job=parse_job,
+    )
+    stub._local_text_rank = lambda *a, **k: gui_module.SurveyApp._local_text_rank(stub, *a, **k)
+    stub._write_ai_to_step0_cache = lambda *a, **k: gui_module.SurveyApp._write_ai_to_step0_cache(stub, *a, **k)
+    return stub
+
+
+def _run_worker(gui, stub, job, *, api_key=None):
+    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", api_key, "", 1.0, False, {}, False)
+
+
+def test_stage_three_gets_pages_from_the_spec_not_by_indexing(gui, tmp_path, monkeypatch):
+    """Регресс: «2» падал с IndexError (string index out of range) при вызове ИИ."""
+    pdf = tmp_path / "LOT 72 NEW_p2.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    monkeypatch.setattr(gui, "inspect_pdf", lambda *a, **k: {"pages": 0})
+    seen: list = []
+    done: dict = {}
+
+    def parse_job(job, *args, **kwargs):
+        seen.append(job.source)
+        if job.use_llm:
+            raise gui.PDFError("ИИ-заглушка")
+        return gui.SurveyApp._parse_pdf_set_job(stub, job, *args, **kwargs)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=parse_job)
+    job = PdfSetJob(
+        path=pdf, is_main=False, use_llm=False, pages_label="стр. 2", mode_label="локально",
+        parse_key=("y",), source={"ocr_path": pdf, "ocr_pages": "2", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job, api_key="key")
+    results, _ = done["payload"]
+    llm_sources = [src for src in seen if src and "pdf_path" in src]
+    assert llm_sources, "ИИ должен был вызваться: проверка не пройдена"
+    assert llm_sources[0]["pdf_pages"] == (2, 2)
+    assert "IndexError" not in (results[0].error or "")
+
+
+def test_clean_ocr_text_skips_the_ai_even_with_a_key(gui, tmp_path, monkeypatch):
+    """Чистый OCR (статус ok): ИИ не вызывается, даже если ключ задан."""
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: CLEAN)
+    used_llm: list[bool] = []
+    done: dict = {}
+
+    def parse_job(job, *args, **kwargs):
+        used_llm.append(bool(job.use_llm))
+        return gui.SurveyApp._parse_pdf_set_job(stub, job, *args, **kwargs)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=parse_job)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job, api_key="key")
+    results, _ = done["payload"]
+    assert results[0].error == ""
+    assert not any(used_llm), "ИИ не должен вызываться при статусе ok"
+    assert results[0].llm_used is False
+
+
+def test_no_key_leaves_a_visible_reason_in_the_log(gui, tmp_path, monkeypatch):
+    """Проверка не пройдена, ключа нет: ИИ не вызван, и это написано в журнале и в замечаниях."""
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    progress: list[str] = []
+    done: dict = {}
+
+    def post(kind, payload):
+        if kind == "progress":
+            progress.append(payload)
+        elif kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job, api_key=None)
+    results, _ = done["payload"]
+    assert results[0].error == ""
+    assert any("ИИ не вызван" in line for line in progress), progress
+    assert any("ИИ не вызван" in issue for issue in results[0].issues), results[0].issues
+
+
+def test_background_worker_runs_one_pass_and_reports_it(gui, tmp_path, monkeypatch):
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    progress: list[str] = []
+    done: dict = {}
+    calls: list[int] = []
+
+    def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+                 use_cache=True, tile=1, exact_dpi=False):
+        calls.append(tile)
+        return LEGAL
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", fake_ocr)
+
+    def post(kind, payload):
+        if kind == "progress":
+            progress.append(payload)
+        elif kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job)
+    results, _ = done["payload"]
+    assert results[0].error == ""
+    assert results[0].plan is not None
+    assert calls == [1], "один проход, без кусков 2×2"
+    assert any("OCR —" in line and "без кеша" in line for line in progress), progress
+
+
+def test_background_worker_reports_ocr_error(gui, tmp_path, monkeypatch):
+    pdf = tmp_path / "LOT 72 NEW_p2.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    progress: list[str] = []
+    done: dict = {}
+
+    def broken_ocr(*args, **kwargs):
+        raise IndexError("string index out of range")
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", broken_ocr)
+
+    def post(kind, payload):
+        if kind == "progress":
+            progress.append(payload)
+        elif kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=False, use_llm=False, pages_label="стр. 2", mode_label="локально",
+        parse_key=("y",), source={"ocr_path": pdf, "ocr_pages": "2", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job)
+    results, _ = done["payload"]
+    assert results[0].outcome is None
+    assert "IndexError" in results[0].error
+    assert any("OCR —" in line and "ошибка" in line for line in progress), progress
+
+
 def test_cache_without_corner_distance_is_rechecked_locally_and_updated_when_better(gui, tmp_path, monkeypatch):
     """
-    Кеш Шага 0 без расстояния до угла («построен на удалении») не принимается как есть:
-    ступень 2 перераспознаёт страницы, и если результат лучше — кеш обновляется на него.
+    Кеш Шага 0 без расстояния до угла не принимается как есть: проход OCR перераспознаёт
+    страницы, и если результат лучше — кеш обновляется на него.
     """
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
@@ -413,9 +379,8 @@ def test_cache_without_corner_distance_is_rechecked_locally_and_updated_when_bet
     def by_dpi(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
                use_cache=True, tile=1, exact_dpi=False):
         assert use_cache is False
-        if tile == 1:
-            ocr_calls.append(dpi)
-        return CLEAN if dpi == 400 else NO_TIE
+        ocr_calls.append(dpi)
+        return CLEAN
 
     monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", by_dpi)
 
@@ -425,15 +390,15 @@ def test_cache_without_corner_distance_is_rechecked_locally_and_updated_when_bet
         elif kind == "pdf_set_done":
             done["payload"] = payload
 
-    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub = _worker_stub(gui, post, parse_job=None)
     stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
     job = PdfSetJob(
         path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
         parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
     )
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
+    _run_worker(gui, stub, job)
     results, _ = done["payload"]
-    assert ocr_calls and ocr_calls[0] == 400, progress
+    assert ocr_calls == [pdf_set.SCAN_OCR_DPI], progress
     assert results[0].error == ""
     assert not any("расстояние от угла" in w for w in results[0].outcome.warnings)
     assert results[0].llm_used is False
@@ -453,27 +418,14 @@ def test_cache_is_kept_when_local_ocr_is_not_better(gui, tmp_path, monkeypatch):
         if kind == "pdf_set_done":
             done["payload"] = payload
 
-    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub = _worker_stub(gui, post, parse_job=None)
     stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
     job = PdfSetJob(
         path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
         parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
     )
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", None, "", 1.0, False, {}, False)
+    _run_worker(gui, stub, job)
     assert cache.read_text(encoding="utf-8") == NO_TIE
-
-
-def test_suspicious_shape_triggers_local_recheck_but_not_paid_ai(gui):
-    """Подозрительная форма (почти прямоугольник) — повод для бесплатного OCR, не для ИИ."""
-    suspicion = types.SimpleNamespace(is_suspicious=True)
-    plan = types.SimpleNamespace(suspicion=suspicion, warnings=[], closure=None, description=None)
-    outcome = types.SimpleNamespace(warnings=[])
-    stub = types.SimpleNamespace(_has_severe_shape_issues=gui.SurveyApp._has_severe_shape_issues)
-    assert gui.SurveyApp._needs_local_recheck(stub, outcome, plan, []) is True
-    assert gui.SurveyApp._has_severe_shape_issues(plan, []) is False
-    clean_plan = types.SimpleNamespace(suspicion=types.SimpleNamespace(is_suspicious=False), warnings=[],
-                                       closure=None, description=None)
-    assert gui.SurveyApp._needs_local_recheck(stub, outcome, clean_plan, []) is False
 
 
 def test_equal_figure_with_more_distance_data_ranks_higher(gui):
@@ -491,7 +443,7 @@ def test_equal_figure_with_more_distance_data_ranks_higher(gui):
 
 
 def _ai_write_stub(gui, post):
-    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub = _worker_stub(gui, post, parse_job=None)
     stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
     return stub
 
@@ -560,7 +512,7 @@ def test_scan_parsed_by_ai_from_the_start_updates_weaker_cache(gui, tmp_path, mo
         if kind == "pdf_set_done":
             done["payload"] = payload
 
-    stub = _worker_stub(gui, post, severe=False, parse_job=None)
+    stub = _worker_stub(gui, post, parse_job=None)
     ai_model, _ = L.parse_with_regex(CLEAN)
 
     def parse_job(job, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient, progress, post_):
@@ -576,7 +528,7 @@ def test_scan_parsed_by_ai_from_the_start_updates_weaker_cache(gui, tmp_path, mo
         path=pdf, is_main=True, use_llm=True, pages_label="стр. 3–4", mode_label="ИИ",
         parse_key=("x",), source={"pdf_path": pdf, "pdf_pages": (3, 4)}, ocr=False, scan=True,
     )
-    gui.SurveyApp._pdf_set_worker(stub, [job], load_config(), "p", "m", "key", "", 1.0, False, {}, False)
+    _run_worker(gui, stub, job, api_key="key")
     results, _ = done["payload"]
     assert results[0].error == "", results[0].error
     assert "distant 161.00 feet" in cache.read_text(encoding="utf-8")

@@ -135,20 +135,20 @@ import deed_store
 import nyc_portal
 import ocr_pages
 import rcclerk
+from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING
 from pdf_set import (
     CLOSURE_LIMIT_FT,
-    ESCALATION_DPIS,
     PdfSetItem,
     PdfSetJob,
     PdfSetResult,
     describe_exc,
-    escalate_ocr,
     format_pages,
     make_item,
     make_job,
     pages_from_spec,
     read_page_boxes,
-    resolve_ocr_source,
+    ocr_scan_once,
+    SCAN_OCR_DPI,
     set_signature,
 )
 
@@ -383,6 +383,40 @@ _NO_DISTANCE_WARNING = "расстояние от угла до точки на�
 def _lacks_corner_distance(warnings: Any) -> bool:
     """Парсер не нашёл расстояние до угла: участок построен от угла улицы (ошибка, не шум)."""
     return any(_NO_DISTANCE_WARNING in str(item) for item in (warnings or ()))
+
+
+#: Ранг статуса проверки описания: больше — лучше. Сначала сравнивается статус, потом фигура.
+_STATUS_RANKS = {STATUS_OK: 2, STATUS_WARNING: 1, STATUS_FAILED: 0}
+_STATUS_OK_RANK = _STATUS_RANKS[STATUS_OK]
+
+
+def _check_status_rank(outcome: Any, plan: Any = None) -> int:
+    """
+    Ранг итога проверки. Описание без расстояния до угла — не ``ok``, даже если стороны сошлись:
+    такой кеш или текст перераспознаётся (правило из c4df930).
+    """
+    check = getattr(outcome, "check", None)
+    rank = _STATUS_RANKS.get(getattr(check, "status", STATUS_FAILED), 0)
+    warnings = list(getattr(outcome, "warnings", None) or ()) + list(getattr(plan, "warnings", None) or ())
+    if _lacks_corner_distance(warnings):
+        rank = min(rank, _STATUS_RANKS[STATUS_WARNING])
+    return rank
+
+
+@dataclasses.dataclass
+class _ScanCandidate:
+    """Один вариант текста скана (кеш, OCR или ответ ИИ) с итогом проверки."""
+
+    outcome: Any
+    plan: Any
+    issues: list[str]
+    pre_counted: bool
+    shape_rank: tuple
+    status_rank: int
+
+    @property
+    def rank(self) -> tuple:
+        return (self.status_rank,) + tuple(self.shape_rank)
 
 
 class SurveyApp(ctk.CTk):
@@ -7635,34 +7669,6 @@ class SurveyApp(ctk.CTk):
             return f"кеш не записан: {exc}"
         return f"кеш Шага 0 обновлён ответом ИИ ({target.name})"
 
-    def _needs_local_recheck(self, outcome: Any, plan: Any, issues: list[str]) -> bool:
-        """
-        Повод перераспознать локально (бесплатно): кеш или OCR дал сомнительный участок.
-
-        Сюда входят предупреждения, которых раньше не было в проверке: нет расстояния
-        до угла и подозрительная форма (почти прямоугольник, неравные параллельные).
-        В платный ИИ они не ведут: см. _has_severe_shape_issues.
-        """
-        suspicion = getattr(plan, "suspicion", None)
-        warnings = list(getattr(outcome, "warnings", None) or ()) + list(getattr(plan, "warnings", None) or ())
-        return (
-            self._has_severe_shape_issues(plan, issues)
-            or _lacks_corner_distance(warnings)
-            or bool(suspicion is not None and suspicion.is_suspicious)
-        )
-
-    @staticmethod
-    def _has_severe_shape_issues(plan: Any, issues: list[str]) -> bool:
-        if plan is None:
-            return True
-        if issues:
-            return True
-        where, _ = ocr_closure_note(plan)
-        if where == "issue":
-            return True
-        closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
-        return closure > 0.5
-
     def _pdf_set_worker(
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
@@ -7688,8 +7694,8 @@ class SurveyApp(ctk.CTk):
                     if job.source is None:
                         raise PDFError(job.source_error or "нет данных для разбора")
                     if job.ocr:
-                        # Трёхступенчатая эскалация для скана:
-                        # 1) кеш Шага 0 (*_text.txt) -> 2) OCR 400 dpi -> 3) LLM -> 4) ручной ввод.
+                        # Скан: кеш Шага 0 -> один проход локального OCR -> ИИ, только если проверка
+                        # описания не пройдена (статус ok/warning/failed из description_check).
                         cache_path = self._find_step0_cache_path(job.path)
                         cached_text = ""
                         if cache_path is not None:
@@ -7698,106 +7704,100 @@ class SurveyApp(ctk.CTk):
                             except OSError:
                                 cached_text = ""
 
-                        best_outcome = None
-                        best_plan = None
-                        best_issues: list[str] = []
-                        best_rank = (0, -999, -9999.0, 0)
+                        def progress_of(msg: str, i: int = idx) -> None:
+                            post("progress", f"[{i}/{total}] {msg}")
+
+                        def judge(source: dict[str, Any], use_llm: bool) -> _ScanCandidate:
+                            """Разбирает источник, строит план и ранжирует: сначала статус проверки, затем фигура."""
+                            judged_job = dataclasses.replace(job, source=source, use_llm=use_llm)
+                            o, pre, iss = self._parse_pdf_set_job(
+                                judged_job, cfg, provider_id, model_name, api_key, key_secret,
+                                do_auto_orient, progress_of, post,
+                            )
+                            d = apply_changes(o.data, fix_changes(job.fixes))
+                            p = builder.plan(d, scale=scale, is_neighbor=not job.is_main)
+                            shape = self._shape_rank(p, iss, o.warnings)
+                            return _ScanCandidate(
+                                outcome=o, plan=p, issues=list(iss), pre_counted=bool(pre),
+                                shape_rank=tuple(shape), status_rank=_check_status_rank(o, p),
+                            )
+
+                        best: _ScanCandidate | None = None
+                        cache_candidate: _ScanCandidate | None = None
                         last_exc: Exception | None = None
 
                         if cached_text:
-                            post("progress", f"[{idx}/{total}] {job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
+                            progress_of(f"{job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
                             try:
-                                cache_job = dataclasses.replace(job, source={"text": cached_text}, use_llm=False)
-                                o1, _, iss1 = self._parse_pdf_set_job(
-                                    cache_job, cfg, provider_id, model_name, api_key, key_secret,
-                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                )
-                                d1 = apply_changes(o1.data, fix_changes(job.fixes))
-                                p1 = builder.plan(d1, scale=scale, is_neighbor=not job.is_main)
-                                best_outcome, best_plan, best_issues = o1, p1, list(iss1)
-                                best_rank = self._shape_rank(p1, iss1, o1.warnings)
+                                cache_candidate = judge({"text": cached_text}, False)
+                                best = cache_candidate
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
 
-                        if self._needs_local_recheck(best_outcome, best_plan, best_issues):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально без кеша (до {max(ESCALATION_DPIS)} dpi)…")
-                            # Реальная ступень 2: выбранные страницы, OCR, при пустом обходе — кусками 2×2.
-                            # Ошибка не глотается: она попадает в отчёт и в причину отказа.
-                            esc = escalate_ocr(
-                                job.path, job.source,
-                                progress=lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"),
-                            )
-                            post("progress", f"[{idx}/{total}] {job.path.name}: OCR — {esc.summary()}")
-                            if esc.error:
-                                last_exc = PDFError(f"ступень 2 (локальный OCR): {esc.error}")
-                                best_issues.append(f"Локальный OCR не выполнен: {esc.error}")
-                            text_400 = esc.text
-                            if text_400 and text_400 != cached_text:
+                        if best is None or best.status_rank < _STATUS_OK_RANK:
+                            progress_of(f"{job.path.name}: распознаю локально, один проход (до {SCAN_OCR_DPI} dpi)…")
+                            ocr = ocr_scan_once(job.path, job.source, progress=progress_of)
+                            progress_of(f"{job.path.name}: OCR — {ocr.summary()}")
+                            if ocr.error:
+                                last_exc = PDFError(f"локальный OCR: {ocr.error}")
+                            elif ocr.text:
                                 try:
-                                    j400 = dataclasses.replace(job, source={"text": text_400}, use_llm=False)
-                                    o2, _, iss2 = self._parse_pdf_set_job(
-                                        j400, cfg, provider_id, model_name, api_key, key_secret,
-                                        do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                    )
-                                    d2 = apply_changes(o2.data, fix_changes(job.fixes))
-                                    p2 = builder.plan(d2, scale=scale, is_neighbor=not job.is_main)
-                                    r2 = self._shape_rank(p2, iss2, o2.warnings)
-                                    if r2 > best_rank:
-                                        best_outcome, best_plan, best_issues, best_rank = o2, p2, list(iss2), r2
-                                        # Лучше предыдущего уровня (кеша или прошлого dpi) — кеш обновляем на него.
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(text_400, encoding="utf-8")
-                                        except OSError:
-                                            pass
+                                    ocr_candidate = judge({"text": ocr.text}, False)
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
+                                else:
+                                    if best is None or ocr_candidate.rank > best.rank:
+                                        best = ocr_candidate
+                                        # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
+                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                        try:
+                                            target_cache.write_text(ocr.text, encoding="utf-8")
+                                        except OSError:
+                                            pass
 
-                        if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
-                            try:
-                                # Страницы приходят строкой «2» / «3-4»: разбираем их, а не индексируем.
-                                lp1, lp2 = pages_from_spec(job.source.get("ocr_pages") or job.source.get("pdf_pages") or "1")
+                        if best is not None and best.status_rank < _STATUS_OK_RANK:
+                            if api_key or key_secret:
+                                progress_of(f"{job.path.name}: проверка не пройдена — отправляю в ИИ…")
                                 try:
-                                    total_p = int(inspect_pdf(job.path).get("pages") or 0)
-                                    if 1 <= total_p <= 2:
-                                        lp1, lp2 = 1, total_p
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
-                                jllm = dataclasses.replace(job, source=clean_llm_source, use_llm=True)
-                                result.llm_used = True  # ступень 3 запущена: токены могут быть потрачены
-                                o3, pre3, iss3 = self._parse_pdf_set_job(
-                                    jllm, cfg, provider_id, model_name, api_key, key_secret,
-                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                )
-                                post("valid_secret", key_secret)
-                                d3 = apply_changes(o3.data, fix_changes(job.fixes))
-                                p3 = builder.plan(d3, scale=scale, is_neighbor=not job.is_main)
-                                r3 = self._shape_rank(p3, iss3, o3.warnings)
-                                prev_rank = best_rank
-                                if r3 > best_rank:
-                                    best_outcome, best_plan, best_issues, best_rank = o3, p3, list(iss3), r3
-                                    pre_counted = pre3
-                                # Ответ ИИ — в кеш, если он лучше предыдущего уровня (кеш или OCR).
-                                ai_note = self._write_ai_to_step0_cache(
-                                    job, o3.data, prev_rank=prev_rank, cache_path=cache_path,
-                                    builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
-                                    model_name=model_name, api_key=api_key, key_secret=key_secret,
-                                    do_auto_orient=do_auto_orient, post=post,
-                                )
-                                post("progress", f"[{idx}/{total}] {job.path.name}: {ai_note}")
-                            except Exception as exc:  # noqa: BLE001
-                                last_exc = exc
+                                    # Страницы приходят строкой «2» / «3-4»: разбираем их, а не индексируем.
+                                    lp1, lp2 = pages_from_spec(job.source.get("ocr_pages") or job.source.get("pdf_pages") or "1")
+                                    try:
+                                        total_p = int(inspect_pdf(job.path).get("pages") or 0)
+                                        if 1 <= total_p <= 2:
+                                            lp1, lp2 = 1, total_p
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
+                                    result.llm_used = True  # ИИ запущен: токены могут быть потрачены
+                                    ai = judge(clean_llm_source, True)
+                                    post("valid_secret", key_secret)
+                                    prev_shape = best.shape_rank
+                                    # ИИ авторитетен при равных статусах и фигуре (решение 3.53).
+                                    if ai.rank >= best.rank:
+                                        best = ai
+                                    ai_note = self._write_ai_to_step0_cache(
+                                        job, ai.outcome.data, prev_rank=prev_shape, cache_path=cache_path,
+                                        builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
+                                        model_name=model_name, api_key=api_key, key_secret=key_secret,
+                                        do_auto_orient=do_auto_orient, post=post,
+                                    )
+                                    progress_of(f"{job.path.name}: {ai_note}")
+                                except Exception as exc:  # noqa: BLE001
+                                    last_exc = exc
+                                    best.issues.append(f"ИИ не отработал: {describe_exc(exc)}")
+                            else:
+                                reason = "ИИ не вызван: не задан ключ API (поле ключа в окне программы)"
+                                best.issues.append(reason)
+                                progress_of(f"{job.path.name}: {reason}")
 
-                        if best_outcome is None:
+                        if best is None:
                             if last_exc is not None and not isinstance(last_exc, PDFError):
                                 raise PDFError(f"разбор скана не удался: {describe_exc(last_exc)}") from last_exc
                             raise last_exc or PDFError("не удалось распознать участок; введите текст вручную")
-                        if self._has_severe_shape_issues(best_plan, best_issues):
-                            best_issues.append("Требуется ручная проверка/ввод текста для этого лота")
+                        if best.status_rank < _STATUS_OK_RANK:
+                            best.issues.append("Требуется ручная проверка/ввод текста для этого лота")
                         result.ocr = True
-                        outcome, pre_counted, issues = best_outcome, False, best_issues
+                        outcome, pre_counted, issues = best.outcome, best.pre_counted, best.issues
                     else:
                         post(
                             "progress",

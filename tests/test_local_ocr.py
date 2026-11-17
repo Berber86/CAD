@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 import ocr_pages
+import pdf_set
 from llm_parser import PDFError, has_legal_courses
 
 DESCRIPTION = (
@@ -129,7 +130,7 @@ def test_scan_becomes_a_free_source_when_ocr_is_available(tmp_path, ocr_ready):
     assert item.use_llm is False and item.ocr_ok is True and item.uses_ocr() is True
     assert item.mode_label() == "локальный OCR, бесплатно"
     assert item.parse_source() == {
-        "ocr_path": scan, "ocr_pages": "1", "ocr_dpi": ocr_pages.DEFAULT_DPI,
+        "ocr_path": scan, "ocr_pages": "1", "ocr_dpi": pdf_set.SCAN_OCR_DPI,
     }
 
 

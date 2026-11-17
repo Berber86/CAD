@@ -186,7 +186,7 @@ class PdfSetItem:
                     return {
                         "ocr_path": self.path,
                         "ocr_pages": self.pages_spec(),
-                        "ocr_dpi": int(ocr_pages.DEFAULT_DPI),
+                        "ocr_dpi": int(SCAN_OCR_DPI),
                     }
                 raise PDFError(
                     f"на {self.pages_label()} нет текстового слоя (скан или чертёж). "
@@ -300,14 +300,13 @@ def resolve_ocr_source(
         return source
     path = Path(str(source["ocr_path"]))
     first, last = pages_from_spec(source.get("ocr_pages"))
-    dpi = int(source.get("ocr_dpi") or ocr_pages.DEFAULT_DPI)
+    dpi = int(source.get("ocr_dpi") or SCAN_OCR_DPI)
     try:
         text = ocr_pages.ocr_pdf_pages(
             path, first, last, dpi=dpi, progress=progress
         )
         if not has_legal_courses(text):
-            # Второй заход «мельче»: страница режется на 2×2 и распознаётся по кускам.
-            # Это дешевле платного Vision и спасает плотный мелкий шрифт.
+            # Обычный разбор (не ступень 2): второй заход по кускам 2×2, если целиком не прочитано.
             if progress:
                 progress("целиком не разобрать — пробую по кускам 2×2")
             tiled = ocr_pages.ocr_pdf_pages(
@@ -333,12 +332,8 @@ def resolve_ocr_source(
     return {"text": text, "ocr": True}
 
 
-#: Ступень 2 фонового разбора скана: разрешения рендера по порядку. Основное — 400 dpi.
-#: Одного разрешения мало: на реальных сканах то выпадает сторона, то строка с расстоянием
-#: (LOT 68 на 400 dpi — 3 стороны; на 600 — полный контур). Следующие проходы берутся,
-#: только если разбор не чистый (4 стороны, есть расстояние до угла, без замечаний).
-ESCALATION_DPIS: tuple[int, ...] = (400, 600, 300)
-ESCALATION_DPI = ESCALATION_DPIS[0]
+#: Разрешение скана: один проход, не выше того, что даёт сам документ.
+SCAN_OCR_DPI: int = ocr_pages.SCAN_MAX_DPI
 
 
 def describe_exc(exc: BaseException) -> str:
@@ -352,28 +347,21 @@ def describe_exc(exc: BaseException) -> str:
 
 
 @dataclass(frozen=True)
-class OcrEscalation:
-    """Итог ступени 2: текст (если получен), ошибка (если нет) и что реально выполнено."""
+class OcrPass:
+    """Итог единственного прохода локального OCR: текст или ошибка и что реально выполнено."""
 
     text: str = ""
     error: str = ""
     seconds: float = 0.0
-    tiled: bool = False
     pages: tuple[int, int] = (1, 1)
-    dpi: int = ESCALATION_DPI
-    #: Какие разрешения пробовали и какой разбор получился (для журнала).
-    tried: tuple[str, ...] = ()
+    dpi: int = SCAN_OCR_DPI
 
     def summary(self) -> str:
         if self.error:
             return f"ошибка за {self.seconds:.1f} с: {self.error}"
-        how = "распознано заново, без кеша"
-        if self.tiled:
-            how += ", кусками 2×2"
-        tried = f"; пробовали: {', '.join(self.tried)}" if len(self.tried) > 1 else ""
         return (
-            f"{self.seconds:.1f} с, {how}, {format_pages(*self.pages)}, "
-            f"рендер {self.dpi} dpi{tried}"
+            f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, "
+            f"рендер {self.dpi} dpi"
         )
 
 
@@ -403,20 +391,16 @@ def text_quality(text: str) -> tuple[int, int, int]:
     return (len(model.segments), has_tie, -len(warnings))
 
 
-def escalate_ocr(
-    path: str | Path, source: dict[str, Any] | None, *,
-    dpis: tuple[int, ...] = ESCALATION_DPIS, progress: Callable[[str], None] | None = None,
-) -> OcrEscalation:
+def ocr_scan_once(
+    path: str | Path, source: dict[str, Any] | None, *, progress: Callable[[str], None] | None = None,
+) -> OcrPass:
     """
-    Ступень 2 для скана в фоновом разборе: настоящее локальное распознавание.
+    Единственный проход локального OCR для скана в фоновом разборе.
 
-    * Кеш не читается и не пишется: эскалация нужна, чтобы не доверять прошлому результату.
-    * Страницы — выбранные пользователем (``ocr_pages`` из источника).
-    * Рендер — запрошенное dpi, без потолка по нативному разрешению скана.
-    * Проходы по ``dpis`` по порядку; проход останавливается, когда разбор чистый
-      (4 стороны, найдено расстояние до угла, без замечаний). Иначе берётся лучший.
-    * На странице без обхода — тот же проход кусками 2×2.
-    * Ошибки не глотаются: при неудаче всех проходов они возвращаются в ``error``.
+    Кеш не читается и не пишется: результат прошлого прохода не доверяем.
+    Рендер — ровно SCAN_OCR_DPI (не режется по нативному разрешению: на сканах 400–600 dpi
+    давали одинаковый чистый результат, 300 — нет). Страницы — выбранные пользователем. Ошибка не глотается:
+    она возвращается в ``error`` и попадает в отчёт.
     """
     src = dict(source or {})
     pdf = Path(path)
@@ -424,54 +408,18 @@ def escalate_ocr(
     try:
         first, last = pages_from_spec(src.get("ocr_pages") or src.get("pdf_pages") or "1")
     except PDFError as exc:
-        return OcrEscalation(error=str(exc), seconds=0.0, dpi=dpis[0])
+        return OcrPass(error=str(exc), seconds=0.0, dpi=SCAN_OCR_DPI)
     pages = (first, last)
-
-    best: tuple[tuple[int, int, int], str, int, bool] | None = None
-    tried: list[str] = []
-    last_error = ""
-    for dpi in dpis:
-        try:
-            text = ocr_pages.ocr_pdf_pages(
-                pdf, first, last, dpi=dpi, progress=progress, use_cache=False, exact_dpi=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
-            last_error = describe_exc(exc)
-            tried.append(f"{dpi} dpi — ошибка")
-            continue
-        tiled = False
-        if not has_legal_courses(text):
-            if progress:
-                progress(f"{dpi} dpi: обход не прочитан целиком — пробую кусками 2×2…")
-            try:
-                tiled_text = ocr_pages.ocr_pdf_pages(
-                    pdf, first, last, dpi=dpi, progress=progress, tile=2, use_cache=False,
-                    exact_dpi=True,
-                )
-            except Exception:  # noqa: BLE001 - целиком текст уже есть, его и оставляем
-                tiled_text = ""
-            if has_legal_courses(tiled_text):
-                text, tiled = tiled_text, True
-        quality = text_quality(text.strip())
-        if best is not None and quality <= best[0]:
-            # Смена dpi не улучшила текст: при том же результате следующий dpi даст то же самое.
-            tried.append(f"{dpi} dpi — без улучшения, дальше не ищем")
-            break
-        tried.append(f"{dpi} dpi — сторон {quality[0]}" + ("" if quality[1] else ", без расстояния"))
-        if best is None or quality > best[0]:
-            best = (quality, text.strip(), dpi, tiled)
-        if quality[0] >= 4 and quality[1] and quality[2] == 0:
-            break  # чистый разбор — дальше не ищем
-
-    elapsed = time.monotonic() - started
-    if best is None or not best[1]:
-        return OcrEscalation(
-            error=last_error or "на этих страницах ничего не распознано",
-            seconds=elapsed, pages=pages, dpi=dpis[0], tried=tuple(tried),
+    try:
+        text = ocr_pages.ocr_pdf_pages(
+            pdf, first, last, dpi=SCAN_OCR_DPI, progress=progress, use_cache=False, exact_dpi=True,
         )
-    _quality, text, dpi, tiled = best
-    return OcrEscalation(
-        text=text, seconds=elapsed, tiled=tiled, pages=pages, dpi=dpi, tried=tuple(tried),
+    except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
+        return OcrPass(
+            error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI,
+        )
+    return OcrPass(
+        text=text.strip(), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI,
     )
 
 

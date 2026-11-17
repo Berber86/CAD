@@ -390,13 +390,12 @@ def adopt_downloads(
     """
     Забрать из «Загрузок» самый свежий PDF и положить его по схеме.
 
-    Это ступень 2 лестницы, вызванная вручную: браузер уже скачал файл, программа
-    больше не ждёт, а забирает готовое.
+    Ручной вход: браузер уже скачал файл, программа больше не ждёт, а забирает готовое.
     """
     target = Path(folder)
     target.mkdir(parents=True, exist_ok=True)
     source = rcclerk.find_new_pdf(downloads) if downloads is not None else rcclerk.find_new_pdf(
-        rcclerk._default_downloads_dir()  # noqa: SLF001 - та же папка, что у лестницы
+        rcclerk._default_downloads_dir()  # noqa: SLF001 - та же папка, что у загрузки документа
     )
     if source is None:
         return None

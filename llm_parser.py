@@ -47,6 +47,7 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+import ocr_numbers
 import street_names
 from description_check import CLOSURE_OK_FT, accepted_without_ai
 
@@ -3163,14 +3164,6 @@ _STOP_WORDS = {
 }
 
 
-# OCR путает цифры с буквами внутри числа: «1l5.15», «lio.68», «1O0 feet».
-# Исправляется только токен, в котором есть цифра и который стоит перед «.dd» или «feet».
-_OCR_NUMBER_RE = re.compile(
-    r"(?<![A-Za-z])([0-9Il|iOo]{2,8})(?=\.\d{2}\b|\s*(?:feet|foot|ft\b|'|\s+degr\w*|\s+ainut\w*|\s+minut\w*|\s+secon\w*|\s+scconds))"
-)
-_OCR_DIGIT_TABLE = str.maketrans({"l": "1", "I": "1", "|": "1", "i": "1", "O": "0", "o": "0"})
-
-
 # Частые искажения слов юридического текста при локальном OCR (только целые слова).
 _OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(rf"\b{pattern}\b", re.IGNORECASE), repl)
@@ -3270,14 +3263,8 @@ def _drop_margin_noise(text: str) -> str:
 
 
 def _fix_ocr_number_tokens(text: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        token = match.group(1)
-        # «lio.68» — цифры после точки уже есть; «1l5 feet» — нужна хотя бы одна цифра
-        if not (re.search(r"\d", token) or match.string[match.end(1): match.end(1) + 1] == "."):
-            return token
-        return token.translate(_OCR_DIGIT_TABLE)
-
-    return _OCR_NUMBER_RE.sub(repl, text)
+    """Буквы вместо цифр внутри чисел (1l5.15, 3l degrees, 2l4.0O feet) — см. ocr_numbers."""
+    return ocr_numbers.fix_text(text)
 
 
 def _normalize_legal_text(text: str) -> str:

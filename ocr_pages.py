@@ -25,6 +25,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
+from ocr_numbers import number_key
+
 #: Разрешение по умолчанию. На Шаге 0 пользователь может выбрать 50–1200 dpi;
 #: OCR cache key включает DPI, поэтому экспериментальные запуски не перепутаются.
 DEFAULT_DPI = 400
@@ -320,7 +322,6 @@ def _line_key(line: str) -> str:
 
 
 # Похожие по написанию символы, которыми OCR путает цифры (в числовом контексте).
-_DIGIT_LOOKALIKES = {"l": "1", "I": "1", "i": "1", "|": "1", "o": "0", "O": "0"}
 # Слова описания участка: вариант слова из этого списка выигрывает у «испорченного» варианта.
 _DESCRIPTION_WORDS = frozenset(
     """avenue street boulevard road place thence beginning running feet degrees minutes seconds
@@ -332,10 +333,7 @@ _DESCRIPTION_WORDS = frozenset(
 
 
 def _is_numeric_token(token: str) -> bool:
-    core = token.strip(".,;:()\"'")
-    return bool(core) and any(c.isdigit() for c in core) and all(
-        c.isdigit() or c in _DIGIT_LOOKALIKES or c in ".," for c in core
-    )
+    return number_key(token) is not None
 
 
 def vote_tokens(first: str, second: str) -> str:
@@ -343,10 +341,9 @@ def vote_tokens(first: str, second: str) -> str:
     if first == second:
         return first
     if _is_numeric_token(first) and _is_numeric_token(second):
-        norm_first = "".join(_DIGIT_LOOKALIKES.get(c, c) for c in first)
-        norm_second = "".join(_DIGIT_LOOKALIKES.get(c, c) for c in second)
-        if norm_first == norm_second:
-            return norm_first  # l/i/o внутри числа — это 1 и 0
+        key_first, key_second = number_key(first), number_key(second)
+        if key_first == key_second:
+            return key_first  # «llo.68» и «110.68» — одно число
         return first if sum(c.isdigit() for c in first) >= sum(c.isdigit() for c in second) else second
     word_first = re.sub(r"[^a-z]", "", first.lower())
     word_second = re.sub(r"[^a-z]", "", second.lower())

@@ -6823,7 +6823,7 @@ class SurveyApp(ctk.CTk):
         )
 
         # 3. Соседние участки (NEIGHBOR_LOT, голубой контур)
-        for nb_plan in self._preview_neighbor_plans:
+        for nb_index, nb_plan in enumerate(self._preview_neighbor_plans, 1):
             for bl in nb_plan.boundary_lines:
                 x1, y1 = to_screen(bl.start)
                 x2, y2 = to_screen(bl.end)
@@ -6832,7 +6832,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 ncx,
                 ncy,
-                text="СОСЕД",
+                text=f"СОСЕД #{nb_index}" if self.pdf_set else "СОСЕД",
                 fill=THEME["cad_neighbor"],
                 font=("Segoe UI", 8, "bold"),
             )
@@ -6992,6 +6992,27 @@ class SurveyApp(ctk.CTk):
                             fill=hl_color,
                             font=("Consolas", 8, "bold"),
                         )
+
+        # Те же вершины, что названы в инструкции. Не засоряем вид метками без совета.
+        analysis = self._pdf_set_analysis
+        if analysis:
+            marked = set()
+            for fix in (*analysis.proposals, *analysis.applied):
+                snap = fix.stitch
+                if snap is None:
+                    continue
+                for key, v in ((fix.lot_key, snap.moving.vertex), (snap.anchor_key, snap.fixed.vertex)):
+                    item = self._pdf_set_item_by_key(key)
+                    plan = self._pdf_set_plan_for(item) if item else None
+                    if plan is None or (key, v) in marked or not 1 <= v <= len(plan.vertices):
+                        continue
+                    marked.add((key, v))
+                    x, y = to_screen(plan.vertices[v - 1])
+                    color = THEME["cad_neighbor"] if plan.is_neighbor else THEME["cad_tie"]
+                    canvas.create_oval(x - 5, y - 5, x + 5, y + 5, outline=color, width=2)
+                    canvas.create_text(x + 7, y + (7 if plan.is_neighbor else -7), text=f"V{v}",
+                                       anchor="nw" if plan.is_neighbor else "sw", fill=color,
+                                       font=("Consolas", 9, "bold"))
 
         # 6. Динамическая масштабная линейка в футах (левый нижний угол, засечки вверх)
         ruler_ft = self._pick_nice_feet_step(110.0 / max(scale, 1e-6))
@@ -7657,7 +7678,9 @@ class SurveyApp(ctk.CTk):
         )
         self._start_pdf_set()
 
-    def _start_pdf_set(self, *, force: bool = False, ask_advisor: bool = False) -> None:
+    def _start_pdf_set(
+        self, *, force: bool = False, ask_advisor: bool = False, reference_map: Path | None = None,
+    ) -> None:
         """
         Разбирает все участки набора одним заданием; AutoCAD запускается отдельно.
 
@@ -7723,7 +7746,7 @@ class SurveyApp(ctk.CTk):
             self._pdf_set_worker,
             args=(
                 jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient,
-                dict(self._pdf_set_advice), ask_advisor,
+                dict(self._pdf_set_advice), ask_advisor, reference_map,
             ),
         )
 
@@ -7874,6 +7897,7 @@ class SurveyApp(ctk.CTk):
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
         advice: dict[str, AdvisorReply] | None = None, ask_advisor: bool = False,
+        reference_map: Path | None = None,
     ) -> None:
         """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
         post = self._worker_poster()
@@ -8104,6 +8128,8 @@ class SurveyApp(ctk.CTk):
                     if issue not in plan.warnings:
                         plan.warnings.append(issue)
                 for fix in job.fixes:
+                    if fix.stitch:  # размещение проверяется по всему набору ниже
+                        continue
                     plan.notes.append(f"Принята правка по данным соседей: {fix.title} (откуда: {fix.source})")
                 result.plan = plan
             except Exception as exc:  # noqa: BLE001 - ошибка относится только к этому файлу
@@ -8115,10 +8141,20 @@ class SurveyApp(ctk.CTk):
             return
         analysis = self._analyse_pdf_set_conflicts(
             jobs, results, builder, cfg, provider_id, model_name, api_key, key_secret, scale,
-            advice or {}, ask_advisor, post,
+            advice or {}, ask_advisor, post, reference_map,
         )
         if not self._worker_is_current():
             return
+        if analysis is not None:
+            # Только подтверждённые пользователем и повторно проверенные переносы.
+            # В preview, акт и AutoCAD пойдёт один и тот же план; ParseOutcome не меняем.
+            by_key = {str(result.path): result for result in results}
+            for fix in analysis.applied:
+                if fix.stitch:
+                    result = by_key[fix.lot_key]
+                    result.plan = fix.stitch.place(result.plan)
+                    result.plan.notes.append(f"Принято размещение: {fix.title}; {fix.stitch.vector_label()}. "
+                                             f"Исходная привязка в deed сохранена. Источник: {fix.source}")
         post("pdf_set_done", (results, analysis))
         post("done", None)
 
@@ -8126,6 +8162,7 @@ class SurveyApp(ctk.CTk):
         self, jobs: list[PdfSetJob], results: list[PdfSetResult], builder: AcadBuilder,
         cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None,
         key_secret: str, scale: float, advice: dict[str, AdvisorReply], ask_advisor: bool, post: Any,
+        reference_map: Path | None = None,
     ) -> ConflictAnalysis:
         """
         Сверяет описания участков набора между собой (в фоне).
@@ -8146,6 +8183,7 @@ class SurveyApp(ctk.CTk):
                     source_text=str(getattr(outcome, "prepared_text", "") or ""),
                     images=tuple(getattr(outcome, "prepared_images", None) or ()),
                     used_ai=bool(res.llm_used),
+                    scan_pages=(job.path, *job.scan_pages) if job.scan_pages else None,
                 ))
             advisor_cfg = cfg.get("api", {}).get("conflict_advisor") or {}
             advisor = None
@@ -8193,7 +8231,8 @@ class SurveyApp(ctk.CTk):
                     advisor = ask_model
             return analyse_conflicts(
                 builder, lots, scale=scale, advisor=advisor, advisor_note=note, advisor_cache=advice,
-                force_advisor=ask_advisor, max_images=int(advisor_cfg.get("max_images") or 16),
+                force_advisor=ask_advisor, max_images=int(advisor_cfg.get("max_images", 16)),
+                reference_map=reference_map if ask_advisor else None,
                 progress=lambda message: post("progress", message),
             )
         except Exception as exc:  # noqa: BLE001 - сбой анализа не срывает разбор набора
@@ -8286,6 +8325,9 @@ class SurveyApp(ctk.CTk):
             # Ответ советника хранится для этого разбора: правки его заново не запрашивают.
             self._pdf_set_advice[analysis.advisor_key] = analysis.advisor_reply
         by_path = {item.path: item for item in self.pdf_set}
+        active_stitches = {p.id for p in analysis.applied if p.stitch} if analysis is not None else set()
+        for item in self.pdf_set:
+            item.fixes = [p for p in item.fixes if not p.stitch or p.id in active_stitches]
         # Прежние участки этого набора снимаются: на схеме остаётся только текущий результат.
         for path in list(self._pdf_set_scene_neighbors):
             self._drop_neighbor_plan(path)
@@ -8340,6 +8382,8 @@ class SurveyApp(ctk.CTk):
             active_plan = res.plan
 
         self._sync_pdf_set_readiness()
+        if analysis and any(p.stitch for p in (*analysis.proposals, *analysis.applied)):
+            self._redraw_preview_canvas()  # все ключи файлов и номера соседей теперь на месте
         if active_plan is None:
             # Ни один участок набора не построен: обновляем схему без него.
             self._recompute_neighbor_verification()
@@ -8398,7 +8442,8 @@ class SurveyApp(ctk.CTk):
             item for item in built
             if any(severity == "error" for severity, _ in self._pdf_set_issue_lines(item))
         ]
-        needs_attention = bool(hard or failed or error_items or verify_bad or (analysis is not None and analysis.proposals))
+        needs_attention = bool(hard or failed or error_items or verify_bad
+                               or (analysis and (analysis.proposals or analysis.notes)))
         if needs_attention:
             self._open_pdf_set_report_window()
         else:
@@ -8557,6 +8602,8 @@ class SurveyApp(ctk.CTk):
             if item is None or not item.has_fresh_result():
                 continue
             taken = {change.slot for fix in item.fixes for change in fix.changes}
+            if proposal.stitch and any(fix.stitch for fix in item.fixes):
+                continue  # альтернативные привязки одного соседа не складываются
             if any(fix.id == proposal.id for fix in item.fixes) or any(c.slot in taken for c in proposal.changes):
                 # Та же сторона уже исправлена другой находкой.
                 continue
@@ -8583,20 +8630,30 @@ class SurveyApp(ctk.CTk):
         self._log_line(f"↩ Правка снята — «{item.path.name}»: {dropped.title}")
         self._start_pdf_set()
 
-    def _ask_pdf_set_advisor(self) -> None:
+    def _ask_pdf_set_advisor(self, *, with_map: bool = False) -> None:
         """Платный вопрос ИИ-советнику о расхождениях набора (по кнопке — всегда заново)."""
         if self._busy or not self.pdf_set:
             return
-        from tkinter import messagebox
+        from tkinter import filedialog, messagebox
 
+        reference_map = None
+        if with_map:
+            path = filedialog.askopenfilename(
+                title="Карта этого набора для советника (tax map)", initialdir=str(self.pdf_set[0].path.parent),
+                filetypes=[("Карта", "*.jpg *.jpeg *.png")],
+            )
+            if not path:
+                return
+            reference_map = Path(path)
+        map_note = f" и карту «{reference_map.name}»" if reference_map else ""
         if not messagebox.askyesno(
             "ИИ-советник",
-            "Отправить нейросети данные участков набора, их тексты или страницы и акт сверки?\n\n"
-            "Это платный запрос. Советник объяснит расхождения и предложит правки; каждая "
-            "проверяется геометрией и применяется только после вашего подтверждения.",
+            f"Отправить нейросети данные участков, их тексты или выбранные страницы, акт сверки{map_note}?\n\n"
+            "Это платный запрос. Советник может указать, какой угол соседа совместить с нашим. "
+            "Сдвиг проверяется на копии; схема изменится только по кнопке «Применить».",
         ):
             return
-        self._start_pdf_set(ask_advisor=True)
+        self._start_pdf_set(ask_advisor=True, reference_map=reference_map)
 
     def _close_pdf_set_report_window(self) -> None:
         """Итог всегда один: прежнее окно закрывается (и при новом разборе без вопросов тоже)."""
@@ -8720,6 +8777,11 @@ class SurveyApp(ctk.CTk):
             command=self._ask_pdf_set_advisor,
         )
         win._advisor_button.grid(row=0, column=0, padx=(0, 8))
+        win._advisor_map_button = ctk.CTkButton(
+            left, text="Спросить с картой…", width=158, height=28,
+            command=lambda: self._ask_pdf_set_advisor(with_map=True),
+        )
+        win._advisor_map_button.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
         verified = [p for p in analysis.proposals if p.verified] if analysis is not None else []
         win._apply_all_button = None
         if len(verified) > 1:

@@ -1008,6 +1008,8 @@ class DrawPlan:
     suspicion: LotSuspicionReport | None = None
     #: Черновик для печати (правила — docs/customer_rules.md, раздел «Черновик для печати»).
     print_draft: bool = False
+    #: Условное размещение в наборе, отдельно от документальной привязки POB.
+    placement_note: str = ""
 
     @property
     def area_sqft(self) -> float:
@@ -4366,7 +4368,7 @@ class NeighborVerificationReport:
                 lines.append(
                     f"   [{e_icon}] Общая межа: наша сторона #{ec.main_seg_index} "
                     f"({ec.main_bearing}, {format_distance(ec.main_length_ft)})  ↔  "
-                    f"сосед #{ec.neighbor_seg_index} "
+                    f"сторона соседа #{ec.neighbor_seg_index} "
                     f"({ec.neighbor_bearing}, {format_distance(ec.neighbor_length_ft)})"
                 )
                 if ec.status == "ok" and compact:
@@ -5301,6 +5303,11 @@ def verify_with_neighbors(
 
             # Итоговая оценка серьёзности для данной общей стены
             lateral_from_ang = min(len_m, len_n) * math.sin(math.radians(ang_deg))
+            # При частичном примыкании дальний конец короткой стены лежит ВНУТРИ
+            # длинной: расстояние до дальнего угла — не смещение общей линии.
+            partial_span = ("STEPPED_BOUNDARY_DEPTH" in issue_codes
+                            and meta["overlap_1d"] >= min(len_m, len_n) - 0.025
+                            and max(meta["p0"], meta["p1"]) <= 0.025)
             if (
                 ang_arcsec <= 1.0
                 and abs_len_diff <= 0.015
@@ -5313,7 +5320,7 @@ def verify_with_neighbors(
                 ang_arcsec > 120.0
                 or lateral_from_ang > 0.08
                 or (abs_len_diff > 0.10 and "STEPPED_BOUNDARY_DEPTH" not in issue_codes)
-                or max_end > 0.12
+                or (max_end > 0.12 and not partial_span)
                 or "QUADRANT_LETTER_TYPO" in issue_codes
                 or "DEGREES_TYPO" in issue_codes
                 or "SAME_DIRECTION_VECTOR" in issue_codes
@@ -5410,6 +5417,9 @@ def verify_with_neighbors(
             pair_err += 1
         elif overlap_sqft > 0.5:
             pair_warn += 1
+        if nb_plan.placement_note:
+            findings.append(nb_plan.placement_note)
+            pair_warn += 1  # совпадение после сдвига не является проверкой привязки deed
         if continuation_bends:
             pair_warn += len(continuation_bends)
         if not shared_checks and overlap_sqft <= 0.5:

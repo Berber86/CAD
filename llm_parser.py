@@ -4150,7 +4150,7 @@ def _extract_streets(
 
     # 7. Расстояние до угла: обычное («150.00 feet East of ...») или последнее звено привязки COMMENCING.
     if distance_to_corner is None:
-        distance_match = re.search(
+        tie_distance_re = re.compile(
             r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
             r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
             # «U.S. Standard (75.00 feet Deed)» между числом и направлением
@@ -4159,11 +4159,16 @@ def _extract_streets(
             r"(?:\s*(?:feet|ft|')\s*(?:Deed\)?)?)?\s*"
             + _DIR_WORDS
             + r"?\s*(?:of|from)\s+the\s+",
-            text,
             re.IGNORECASE,
         )
-        if distance_match is None:
-            distance_match = _DISTANT_OF_STREET_RE.search(text)
+        # «the easterly 88 feet of the northerly part of Acre Plot ...» в преамбуле
+        # описывает надел, а не POB. Сначала ищем привязку в самом BEGINNING.
+        beginning = re.search(r"\bBEGINNING\s+at\b", body, re.IGNORECASE)
+        scope = text
+        if beginning:
+            scope = re.split(r"\b(?:RUNNING|THENCE)\b", body[beginning.end():],
+                             maxsplit=1, flags=re.IGNORECASE)[0]
+        distance_match = tie_distance_re.search(scope) or _DISTANT_OF_STREET_RE.search(scope)
         if distance_match:
             feet_val = float(distance_match.group("num").replace(",", ""))
             inch_raw = distance_match.groupdict().get("inch")

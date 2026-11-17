@@ -39,6 +39,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from acad_builder import (
@@ -50,9 +51,10 @@ from acad_builder import (
     street_name_canon as acad_builder_street_canon,
     verify_with_neighbors,
 )
-from llm_parser import LegalDescription, Segment, bearing_label
+from llm_parser import LegalDescription, Segment, bearing_label, render_image_files_base64, render_pdf_pages_base64
 from street_names import share_street_aliases, with_shared_aliases
 from pdf_set import CLOSURE_LIMIT_FT
+from parcel_stitch import Joint, Stitch, try_stitch
 
 #: Слово «southerly» допускает такой отход настоящего румба от стороны света.
 WORD_DIRECTION_TOLERANCE_DEG = 50.0
@@ -136,7 +138,7 @@ class Proposal:
     id: str
     lot_key: str
     lot_name: str
-    kind: str  # "street_bearing" | "closing_course" | "neighbor_value" | "advisor" | "street_name"
+    kind: str  # см. правила, "advisor" (правка данных) или "stitch" (только размещение)
     origin: str  # "rule" — правило Python, "ai" — ИИ-советник
     title: str
     changes: tuple[Change, ...]
@@ -147,16 +149,22 @@ class Proposal:
     verdict: str  # "verified" | "partial"
     #: Находки, вместе с которыми эта проверялась (применяются заодно).
     requires: tuple[str, ...] = ()
+    #: Отдельная операция размещения: НИКОГДА не входит в apply_changes / LegalDescription.
+    stitch: Stitch | None = None
 
     @property
     def verified(self) -> bool:
         return self.verdict == "verified"
 
     def verdict_label(self) -> str:
+        if self.stitch:
+            return "вариант размещения, не исправление deed"
         return "подтверждено геометрией" if self.verified else "подтверждено частично"
 
     def metrics_line(self) -> str:
         parts = [f"невязка {self.before.closure_ft:.3f} → {self.after.closure_ft:.3f} ft"]
+        if self.stitch:
+            parts[:0] = [self.stitch.vector_label(), self.stitch.contact]
         if max(self.before.overlap_sqft, self.after.overlap_sqft) > 0.5:
             parts.append(
                 f"наложение на соседние участки {self.before.overlap_sqft:,.1f} → "
@@ -180,6 +188,8 @@ class LotInput:
     source_text: str = ""
     images: tuple[str, ...] = ()
     used_ai: bool = False
+    #: Исходный PDF и выбранный диапазон в нём (на случай разбора только по OCR/кешу).
+    scan_pages: tuple[Path, int, int] | None = None
 
     @property
     def title(self) -> str:
@@ -195,6 +205,9 @@ class AdvisorReply:
     proposals: list[dict[str, Any]] = field(default_factory=list)
     model: str = ""
     usage: Any = None
+    #: Что действительно было отправлено (не поля JSON от модели).
+    map_name: str = ""
+    pictured_lots: tuple[str, ...] = ()
 
 
 @dataclass
@@ -234,7 +247,7 @@ class ConflictAnalysis:
     def has_content(self) -> bool:
         return bool(
             self.proposals or self.applied or self.remaining or self.advisor_reply
-            or self.advisor_rejected or self.error
+            or self.advisor_rejected or self.notes or self.error
             or (self.advisor_status in {"skipped", "error"} and self.advisor_note)
         )
 
@@ -266,10 +279,12 @@ class ConflictAnalysis:
                 lines.append("")
                 lines.append(f"[{self.number(proposal)}] {mark} {proposal.title}")
                 lines.append(f"    Участок: «{proposal.lot_name}» · {who} · {proposal.verdict_label()}")
-                lines.append(f"    Откуда значение: {proposal.source}")
+                basis_label = "Основание склейки" if proposal.stitch else "Откуда значение"
+                lines.append(f"    {basis_label}: {proposal.source}")
                 for change in proposal.changes:
                     lines.append(f"    Правка: {change.describe()}")
-                lines.append(f"    Проверка: {proposal.metrics_line()}")
+                check_label = "Размещение" if proposal.stitch else "Проверка"
+                lines.append(f"    {check_label}: {proposal.metrics_line()}")
                 for reason in proposal.reasons:
                     lines.append(f"    • {reason}")
                 if proposal.requires:
@@ -286,6 +301,8 @@ class ConflictAnalysis:
             for fix in self.applied:
                 lines.append(f"  ✎ «{fix.lot_name}»: {fix.title}")
                 lines.append(f"      откуда: {fix.source}")
+                if fix.stitch:
+                    lines.append(f"      Размещение: {fix.stitch.vector_label()}; {fix.stitch.contact}. Deed не изменён.")
         if self.remaining:
             if lines:
                 lines.append("")
@@ -302,6 +319,8 @@ class ConflictAnalysis:
             tag = f" ({reply.model})" if reply.model else ""
             when = "" if self.advisor_status == "ok" else " — получено ранее для этого же разбора"
             lines.append(f"ИИ-СОВЕТНИК{tag}{when}:")
+            if reply.map_name:
+                lines.append(f"  Приложенная карта: «{reply.map_name}»")
             if reply.analysis:
                 lines.append(f"  {reply.analysis}")
             for conflict, cause in reply.explanations:
@@ -309,7 +328,8 @@ class ConflictAnalysis:
             for text in self.advisor_rejected:
                 lines.append(f"  ✗ {text}")
             if not (reply.analysis or reply.explanations or self.advisor_rejected):
-                lines.append("  Советник не нашёл, что добавить.")
+                lines.append("  Советы проверены — см. находки выше." if reply.proposals
+                             else "  Советник не нашёл, что добавить.")
         elif self.advisor_status in {"skipped", "error"} and self.advisor_note:
             lines.append("")
             lines.append(f"ИИ-советник: {self.advisor_note}")
@@ -498,6 +518,9 @@ class _Scene:
         self._plans: dict[tuple[str, tuple[Change, ...]], DrawPlan | None] = {}
         #: Подтверждённые находки, принятые «в уме» (после них считается остаток).
         self.virtual: dict[str, tuple[Change, ...]] = {}
+        self.placed: dict[str, Proposal] = {}
+        self.placement_notes: list[str] = []
+        self._restore_stitches()
 
     def description(self, lot: LotInput, extra: Sequence[Change] = ()) -> LegalDescription | None:
         key = (lot.key, tuple(extra))
@@ -518,9 +541,50 @@ class _Scene:
                     None if desc is None
                     else self.builder.plan(desc, scale=self.scale, is_neighbor=not lot.is_main)
                 )
+                fix = self.placed.get(lot.key)
+                if fix and fix.stitch and self._plans[key] is not None:
+                    self._plans[key] = fix.stitch.place(self._plans[key])
             except Exception:  # noqa: BLE001 - участок с такой правкой не строится
                 self._plans[key] = None
         return self._plans[key]
+
+    def trial_stitch(
+        self, lot: LotInput, anchor: LotInput, moving: Joint, fixed: Joint,
+        state: dict[str, tuple[Change, ...]],
+    ) -> tuple[Stitch, DrawPlan, DrawPlan]:
+        plan = self.plan(lot, state.get(lot.key, ()))
+        ref = self.plan(anchor, state.get(anchor.key, ()))
+        if plan is None or ref is None:
+            raise ValueError("нет обеих фигур на схеме")
+        others = [(other.name, p) for other, p in self._others(lot, state) if other is not anchor]
+        return try_stitch(plan, ref, moving, fixed, anchor_key=anchor.key, others=others), plan, ref
+
+    def _restore_stitches(self) -> None:
+        """Перестроение/смена ролей: старый сдвиг не переносится вслепую на новую схему."""
+        by_key = {lot.key: lot for lot in self.lots}
+        pending = [(lot, fix) for lot in self.lots for fix in lot.fixes if fix.stitch]
+        # Порядок строк набора не обязан совпасть с порядком нажатий «Применить».
+        # Например, B сначала освободил место для A, но файл A в списке первый.
+        while pending:
+            blocked = []
+            for lot, fix in pending:
+                snap = fix.stitch
+                try:
+                    anchor = by_key.get(snap.anchor_key)
+                    if anchor is None or lot.key in self.placed:
+                        raise ValueError("опорный участок убран или сосед уже сдвинут")
+                    checked, _, _ = self.trial_stitch(lot, anchor, snap.moving, snap.fixed, {})
+                    if checked != snap:
+                        raise ValueError("изменились исходные данные или положение углов")
+                except ValueError as exc:
+                    blocked.append((lot, fix, str(exc)))
+                    continue
+                self.placed[lot.key] = fix
+                self._plans.pop((lot.key, ()), None)  # дальше plan() вернёт сдвинутую копию
+            if len(blocked) == len(pending):
+                self.placement_notes.extend(f"✎ Склейка «{lot.name}» снята: {reason}" for lot, _, reason in blocked)
+                break
+            pending = [(lot, fix) for lot, fix, _ in blocked]
 
     def _others(self, lot: LotInput, state: dict[str, tuple[Change, ...]]) -> list[tuple[LotInput, DrawPlan]]:
         found = []
@@ -553,14 +617,15 @@ class _Scene:
         if plan is None:
             return None
         others = [p for _, p in self._others(lot, state or {})]
-        overlap, errors, warnings = 0.0, 0, 0
-        gap = 0.0
-        if others:
-            report = verify_with_neighbors(plan, others)
-            overlap = sum(pair.overlap_area_sqft for pair in report.pair_reports)
-            errors, warnings = report.error_count, report.warning_count
-            gap = _nearest_gap_ft(plan, others)
-        return Metrics(plan.closure.distance, overlap, errors, warnings, gap)
+        return _plan_metrics(plan, others)
+
+
+def _plan_metrics(plan: DrawPlan, others: Sequence[DrawPlan]) -> Metrics:
+    if not others:
+        return Metrics(plan.closure.distance, 0.0, 0, 0)
+    report = verify_with_neighbors(plan, others)
+    return Metrics(plan.closure.distance, sum(pair.overlap_area_sqft for pair in report.pair_reports),
+                   report.error_count, report.warning_count, _nearest_gap_ft(plan, others))
 
 
 def _nearest_gap_ft(plan: DrawPlan, others: Sequence[DrawPlan]) -> float:
@@ -1236,17 +1301,17 @@ def _conflicts(
 # ИИ-советник
 # ---------------------------------------------------------------------------
 
-ADVISOR_SYSTEM_PROMPT = """You are a senior land surveyor's assistant. You review metes-and-bounds legal descriptions of ADJACENT lots (normally the same tax block, often New York City deeds and title reports).
+ADVISOR_SYSTEM_PROMPT = """You are a senior land surveyor's assistant. You review metes-and-bounds legal descriptions of POTENTIALLY adjacent lots (normally the same tax block, often New York City deeds and title reports).
 
 A Python geometry engine has already parsed every description, built each lot polygon and cross-checked the lots against each other. It also applied its own verified findings (listed in the input). Your job is to REASON about the conflicts Python could not explain and to tell Python what to try next. Python will test every suggestion numerically (closure of the lot, overlap with neighbours, fit of shared boundaries) and discards whatever does not improve the geometry. A human surveyor confirms every change, so be precise and honest about uncertainty.
 
-COORDINATES: feet; origin (0, 0) is the street corner the lots are tied to; +Y is north, +X is east. Bearings are quadrant bearings in the traverse direction of the side. A side marked NO BEARING PRINTED has only a word direction in the document ("southerly along ..."), so its bearing in the data is a nominal compass direction, not a real value.
+COORDINATES: feet; each deed has its OWN reference corner at (0, 0); different corners are NOT the same physical origin; +Y is north, +X is east. Bearings are quadrant bearings in the traverse direction of the side. A side marked NO BEARING PRINTED has only a word direction in the document ("southerly along ..."), so its bearing in the data is a nominal compass direction, not a real value.
 
 INPUT: for every lot (L1, L2, ...) its role, streets, tie to the corner, sides in traverse order, closure error, polygon vertices and the document text and/or page images. Then Python's findings, and the conflicts that REMAIN after them.
 
 WORK THROUGH THIS CHECKLIST FOR EVERY REMAINING CONFLICT:
 1. Data missing in one document but printed in another: a course along a street given only by a word, a tie without a bearing, a street width, a skipped course.
-2. Misread characters (the sources are often scans): N/S or E/W letter, 6-9, 3-8, 5-6, 1-7, 0-8, a dropped digit, feet-and-inches read as decimal feet. A boundary shared by two lots must have the same bearing (reversed) in both documents, and the same length unless one lot is deeper than the other.
+2. Misread characters (the sources are often scans): N/S or E/W letter, 6-9, 3-8, 5-6, 1-7, 0-8, a dropped digit, feet-and-inches read as decimal feet. Shared lines must be collinear; their bearings may be the same or reciprocal depending on traverse order. Only part of a longer side may be shared.
 3. Tie problems: a different reference corner, a distance measured along the other side of the street, lots on opposite sides of a street, a distance to the corner that contradicts the neighbours' frontages (for example 160 + 40 = 200).
 4. A different bearing basis: all bearings of one document rotated by the same angle against the other.
 5. Alternate lengths printed side by side: "(deed)" and "(tax map)", "(U.S. Standard)", "(actual)", "(record)" and "(measured)". These are NOT errors. Do NOT invent a system that is not printed. Python itself offers the switch when the neighbour's side of a shared boundary is printed as the alternate value in our document and the contour stays closed (it is listed among Python's findings, applied by the surveyor with one button); say which system each lot was built with, and which printed alternate would match the neighbour when Python did not already offer it. Never switch a lot to an alternate value that Python's geometry check rejected.
@@ -1258,7 +1323,7 @@ HARD RULES:
 - Never change a value only to make a polygon close.
 - Do not repeat Python's findings.
 - When page images are attached, read the relevant course yourself and say so if the parsed value differs from what is printed.
-- If nothing should be changed, return an empty "proposals" list. An explanation alone is a valid and useful answer.
+- If neither a deed correction nor an evidence-based relative placement is justified, return an empty "proposals" list. An explanation alone is a valid and useful answer when a contact is not supported.
 - Write "analysis", "conflict", "cause", "title" and "reason" in RUSSIAN, in plain words for a surveyor. Be brief: "analysis" is 2 to 6 sentences.
 
 OUTPUT: exactly one JSON object and nothing else:
@@ -1288,7 +1353,13 @@ Two more operations change NAMES, not geometry. Python accepts them only when th
   - {"target": "cross_street", "name": "Seaside Boulevard"}: the street that this lot's corner is tied to (the cross street), exactly as printed in this lot's document. Use it when the lot is attached to a different intersection only because its cross street is named differently or wrongly.
   - {"target": "street_alias", "current": "Father Capodanno Blvd", "old": "Seaside Boulevard"}: a printed renaming ("X (now Y)", "Y (formerly X)", "f/k/a", "a/k/a", "also known as"). Both names must be printed in this lot's text, together with that marker.
 If a street name in a lot is misread (for example a neighbouring corner street spelled differently from the other documents), the fix MUST be a proposal with a cross_street or street_alias change, not only an explanation. Put a naming fix in its own proposal, with "changes" holding only these items, and quote the printed words in "source_quote".
-"source_lot" and "source_quote" may be null when the value is computed."""
+For computed deed values "source_lot" and "source_quote" may be null.
+
+LAYOUT / STITCHING (not a deed correction):
+- First compare the footprint actually built with ALL parcels in each deed. If a second parcel, strip, intervening lot or street accounts for a gap, DO NOT pull the neighbour across it. Identify the missing parcel/calls and which contour must be built or checked first.
+- Read the actual BEGINNING tie, not a depth, width or a distance in the Acre Plot recital. Different reference intersections neither prove non-adjacency nor justify equating their origins. Look for an independent common corner on a named street. If an extra TAX MAP image is identified, use it to establish topology (lot numbers, which street end touches); check that it shows these lots/block; never measure deed coordinates from pixels. Without that image do not claim to have seen a map. A nearest vertex, parallel bearings or the disappearance of overlap alone do not establish adjacency.
+- If the source supports a particular common corner, give a testable snap proposal, not just an explanation. Identify the MOVING neighbour and the FIXED OUR LOT, the sides and their incident vertices. Vi starts side #i; V1 is POB; the last side ends at V1. Walk both sides away from the anchor: do the other ends coincide, or does the shorter line end part way along the longer one? Give the concrete instruction and evidence in Russian. If the anchor cannot be distinguished, say what evidence is missing and do not guess a pair.
+- In its OWN proposal use e.g. "lot":"L3", "changes":[{"target":"snap", "vertex":1, "side":1, "to_lot":"L1", "to_vertex":2, "to_side":2}]. These are examples of indices, not defaults. For a documented point contact ONLY omit both side fields. Give a nonempty "reason" and "source_lot" + "source_quote" (exact words of the deed; for a supplied map use "MAP" and describe the visible lots, street and contact). Python derives the translation of the WHOLE neighbour; no supplied coordinates, rotation, stretching, changed tie or side lengths. Never change a street name or tie distance just to achieve this layout. A fit is a placement hypothesis for human review, NOT proof of a legal boundary."""
 
 
 def _lot_block(
@@ -1324,17 +1395,23 @@ def _lot_block(
             f"bearing {tie.bearing_label}{mark}"
         )
     else:
-        lines.append("  tie: the point of beginning is the street corner itself")
+        lines.append("  tie: built at (0,0); corner lot or tie not read — check deed")
     if plan is not None:
         lines.append(
             f"  point of beginning (x, y) = ({plan.pob[0]:.2f}, {plan.pob[1]:.2f}); "
             f"closure error {plan.closure.distance:.3f} ft; area {plan.area_sqft:,.0f} sq ft"
         )
-        lines.append("  vertices: " + " ".join(f"({x:.2f}, {y:.2f})" for x, y in plan.vertices))
+        if lot.key in scene.placed:
+            lines.append(f"  approved relative placement on scene (not deed): {scene.placed[lot.key].title}")
+        lines.append("  vertices (V1 = POB): " + " ".join(
+            f"V{i}=({x:.3f}, {y:.3f})" for i, (x, y) in enumerate(plan.vertices, 1)
+        ))
     lines.append("  sides in traverse order:")
     for index, seg in enumerate(desc.segments):
         old = raw.segments[index] if index < len(raw.segments) else seg
         marks = []
+        if seg.bearing_solved:
+            marks.append("bearing inferred by closure; check original")
         if not seg.has_bearing:
             marks.append("NO BEARING PRINTED — nominal direction only")
         elif not old.has_bearing:
@@ -1343,12 +1420,17 @@ def _lot_block(
             marks.append(f"was {old.bearing_label}; changed by a verified finding")
         if abs(old.distance_ft - seg.distance_ft) > 1e-6:
             marks.append(f"was {old.distance_ft:.2f} ft; changed by a verified finding")
+        if index == desc.front_segment_index:
+            marks.append(f"frontage: {desc.main_street}")
+        if index == desc.cross_street_side_index:
+            marks.append(f"cross-street frontage: {desc.cross_street}")
         if seg.course_note:
             marks.append(f'note: "{seg.course_note}"')
         if seg.interior_angle:
             marks.append(f"interior angle {seg.interior_angle}")
         lines.append(
-            f"    #{index + 1}  {seg.bearing_label}  {seg.distance_ft:.2f} ft"
+            f"    #{index + 1} V{index + 1}->V{(index + 1) % len(desc.segments) + 1}  "
+            f"{seg.bearing_label}  {seg.distance_ft:.2f} ft"
             + (f"  [{'; '.join(marks)}]" if marks else "")
         )
     if desc.anomaly_note:
@@ -1371,20 +1453,47 @@ def _lot_block(
 def build_advisor_request(
     scene: _Scene, chosen: Sequence[Proposal], remaining: Sequence[str],
     report: NeighborVerificationReport | None, *, max_images: int = 16, text_limit: int = 6000,
+    reference_map: Path | None = None, pictured_lots: list[str] | None = None,
 ) -> tuple[str, list[str], dict[str, LotInput]]:
-    """Собирает запрос советнику: (текст, изображения страниц, обозначения участков)."""
+    """Текст, изображения, обозначения; в pictured_lots отмечаем реально приложенные сканы."""
     ordered = sorted(scene.lots, key=lambda lot: not lot.is_main)
     labels = {f"L{i}": lot for i, lot in enumerate(ordered, 1)}
     by_key = {lot.key: label for label, lot in labels.items()}
     images: list[str] = []
     blocks: list[str] = []
+    budget = max(0, int(max_images)) - int(reference_map is not None)
+    if budget < 0:
+        raise ValueError("лимит изображений не позволяет приложить выбранную карту")
     for label, lot in labels.items():
         image_range = None
-        if lot.images and len(images) + len(lot.images) <= max(0, int(max_images)):
-            image_range = (len(images) + 1, len(images) + len(lot.images))
-            images.extend(lot.images)
+        pages = lot.images
+        page_note = ""
+        if not pages and lot.scan_pages:
+            # Число в кеше OCR может быть прочитано уверенно, но неверно. Советник
+            # получает оригинал выбранных страниц, а не только пересказ парсера.
+            path, first, last = lot.scan_pages
+            if last - first + 1 <= budget - len(images):
+                try:
+                    pages = tuple(render_pdf_pages_base64(path, pages=f"{first}-{last}",
+                                                          max_pages=last - first + 1, output_format="auto"))
+                except (OSError, RuntimeError, ValueError):
+                    page_note = "  original scan could not be read; do not claim a visual check"
+        if pages and len(images) + len(pages) <= budget:
+            image_range = len(images) + 1, len(images) + len(pages)
+            images.extend(pages)
+            if pictured_lots is not None:
+                pictured_lots.append(label)
         blocks.append(_lot_block(scene, lot, label, scene.virtual, image_range, text_limit))
+        if page_note:
+            blocks.append(page_note)
     parts = ["LOTS (the data already includes Python's verified findings):", "\n\n".join(blocks)]
+    if reference_map is not None:
+        urls, _ = render_image_files_base64([reference_map], max_side_px=1800, enhance_scan=False)
+        images.append(urls[0])
+        parts.append(f'Image {len(images)}: TAX MAP "{reference_map.name}", supplied by the user. '
+                     'This is NOT a deed page. Use only for relative adjacency, not measurements.')
+    else:
+        parts.append("No reference tax map image was supplied.")
     if chosen:
         parts.append("PYTHON'S VERIFIED FINDINGS (already included above, do not repeat them):")
         parts.append("\n".join(
@@ -1400,7 +1509,8 @@ def build_advisor_request(
     if report is not None and report.pair_reports:
         parts.append("PYTHON'S CHECK OF OUR LOT AGAINST THE NEIGHBOURS (full report, in Russian):")
         parts.append(report.format_report(compact=True))
-    parts.append("Explain every remaining conflict and propose only fixes you can justify from the documents.")
+    parts.append("Explain the remaining conflicts. Justify deed corrections from the documents. For a supported "
+                 "relative placement give a snap with the exact incident vertices and sides; otherwise abstain.")
     return "\n\n".join(parts), images, labels
 
 
@@ -1579,6 +1689,58 @@ def _value_origin(scene: _Scene, lot: LotInput, change: Change) -> str | None:
     return None
 
 
+def _advisor_stitch(
+    scene: _Scene, lot: LotInput, item: dict[str, Any], labels: dict[str, LotInput],
+    reply: AdvisorReply, requires: tuple[str, ...],
+) -> Proposal:
+    """Команда модели адресует узлы, но не задаёт координаты или вектор переноса."""
+    if len(item["changes"]) != 1:
+        raise ValueError("размещение должно быть отдельным советом, без правок описания")
+    raw = item["changes"][0]
+    if raw.keys() - {"target", "vertex", "to_vertex", "side", "to_side", "to_lot"}:
+        raise ValueError("для склейки укажите только номера углов, сторон и опорный участок")
+    anchor = labels.get(str(raw.get("to_lot") or "").strip().upper())
+    if anchor is None or not anchor.is_main or lot.is_main:
+        raise ValueError("укажите перемещаемого соседа и наш участок в качестве опоры")
+    moving, fixed = Joint(raw.get("vertex"), raw.get("side")), Joint(raw.get("to_vertex"), raw.get("to_side"))
+    if (moving.side is None) != (fixed.side is None):
+        raise ValueError("для общей межи укажите обе стороны и их углы")
+
+    reason = " ".join(str(item.get("reason") or "").split())
+    quote = " ".join(str(item.get("source_quote") or "").split())
+    source_id = str(item.get("source_lot") or "").strip().upper()
+    if not (reason and quote):
+        raise ValueError("нет обоснования и источника общего угла")
+    if source_id == "MAP":
+        if not reply.map_name:
+            raise ValueError("совет ссылается на карту, но карта не была приложена")
+        source = f"tax map «{reply.map_name}» (по мнению советника): {quote}"
+    else:
+        donor = labels.get(source_id)
+        if donor is None:
+            raise ValueError("не указан документ — источник общего угла")
+        in_text = quote.casefold() in " ".join(donor.source_text.split()).casefold()
+        if source_id not in reply.pictured_lots and not in_text:
+            raise ValueError(f"цитата не найдена в тексте «{donor.name}»")
+        source = f"«{donor.name}», цитата для сверки: «{quote}»"
+
+    snap, plan, ref = scene.trial_stitch(lot, anchor, moving, fixed, scene.virtual)
+    # Измеряем именно выбранную пару, а не
+    # расстояние до ближайшего из всех соседей (оно могло быть нулевым и раньше).
+    before = _plan_metrics(plan, [ref])
+    after = _plan_metrics(snap.place(plan), [ref])
+    title = (f"Склейка на схеме: V{moving.vertex} «{lot.name}» → V{fixed.vertex} «{anchor.name}»"
+             + (f" (стороны #{moving.side} → #{fixed.side})" if moving.side is not None else ""))
+    ident = json.dumps([lot.key, anchor.key, moving.vertex, fixed.vertex, moving.side, fixed.side, snap.basis])
+    return Proposal(
+        id=hashlib.sha1(ident.encode()).hexdigest()[:10], lot_key=lot.key, lot_name=lot.name,
+        kind="stitch", origin="ai", title=title, changes=(), source=source,
+        reasons=(reason, "Двигается весь сосед, без поворота. Привязка в deed, длины и румбы не меняются. "
+                 "Совпадение на схеме не доказывает общую границу на местности."),
+        before=before, after=after, verdict="partial", requires=requires, stitch=snap,
+    )
+
+
 def _advisor_proposals(
     scene: _Scene, reply: AdvisorReply, labels: dict[str, LotInput], chosen: Sequence[Proposal],
 ) -> tuple[list[Proposal], list[str]]:
@@ -1591,6 +1753,13 @@ def _advisor_proposals(
         title = " ".join(str(item.get("title") or "совет без названия").split())
         if lot is None:
             rejected.append(f"{title} — не указан участок")
+            continue
+        if any(isinstance(c, dict) and str(c.get("target")).strip().lower() == "snap" for c in item["changes"]):
+            if lot.key not in scene.placed:
+                try:
+                    accepted.append(_advisor_stitch(scene, lot, item, labels, reply, requires))
+                except ValueError as exc:
+                    rejected.append(f"«{lot.name}»: {title} — склейка отклонена: {exc}")
             continue
         base = scene.virtual.get(lot.key, ())
         desc = scene.description(lot, base)
@@ -1643,7 +1812,10 @@ def _advisor_proposals(
                     continue
                 changes.append(Change(target="street", index=-1, field="alias", new_label=label))
                 continue
-            target = "tie" if kind == "tie" else "side"
+            if kind not in {"side", "tie"}:
+                problem = f"неизвестная операция «{kind}»"
+                break
+            target = kind
             if target == "tie" and raw.get("distance_ft") not in (None, "", "null"):
                 # Советник задаёт расстояние от угла улицы до POB (и, если знает, румб привязки).
                 try:
@@ -1775,8 +1947,11 @@ def _advisor_proposals(
 def advisor_cache_key(lots: Sequence[LotInput]) -> str:
     """Ключ разбора набора: пока файлы разобраны так же, советник заново не запрашивается."""
     payload = [
-        [lot.key, lot.is_main, lot.description.model_dump(mode="json")]
-        for lot in sorted(lots, key=lambda lot: lot.key)
+        [lot.key, lot.is_main, lot.description.model_dump(mode="json"),
+         lot.scan_pages[1:] if lot.scan_pages else None, lot.source_text]
+        # L2, L3 и т. д. означают соседей в порядке набора. Не переигрывать ответ
+        # на переставленных файлах под чужими номерами.
+        for lot in sorted(lots, key=lambda lot: not lot.is_main)
     ]
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -1818,6 +1993,7 @@ def analyse_conflicts(
     advisor_cache: dict[str, AdvisorReply] | None = None,
     force_advisor: bool = False,
     max_images: int = 16,
+    reference_map: Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> ConflictAnalysis:
     """
@@ -1831,10 +2007,12 @@ def analyse_conflicts(
     """
     analysis = ConflictAnalysis()
     lots = list(lots)
-    analysis.applied = [fix for lot in lots for fix in lot.fixes]
     if not lots:
         return analysis
     scene = _Scene(builder, lots, scale)
+    analysis.applied = [fix for lot in lots for fix in lot.fixes
+                        if not fix.stitch or scene.placed.get(lot.key) is fix]
+    analysis.notes.extend(scene.placement_notes)
 
     proposals: list[Proposal] = []
     for lot in sorted(lots, key=lambda lot: not lot.is_main):
@@ -1871,13 +2049,17 @@ def analyse_conflicts(
             analysis.advisor_note = advisor_note or "не запрошен"
         else:
             try:
+                pictured: list[str] = []
                 user_text, images, labels = build_advisor_request(
                     scene, chosen, analysis.remaining, report, max_images=max_images,
+                    reference_map=reference_map, pictured_lots=pictured,
                 )
                 if progress:
                     progress("ИИ-советник разбирает оставшиеся расхождения между участками…")
                 data, usage = advisor(ADVISOR_SYSTEM_PROMPT, user_text, images)
                 reply = read_advisor_reply(data)
+                reply.pictured_lots = tuple(pictured)
+                reply.map_name = reference_map.name if reference_map is not None else ""
                 reply.usage = usage
                 reply.model = str(getattr(usage, "model", "") or "")
                 analysis.advisor_status = "ok"
@@ -1896,6 +2078,9 @@ def analyse_conflicts(
         analysis.advisor_reply = reply
         accepted, analysis.advisor_rejected = _advisor_proposals(scene, reply, labels, chosen)
         known = {p.id for p in proposals}
-        proposals.extend(p for p in accepted if p.id not in known)
+        for p in accepted:
+            if p.id not in known:
+                proposals.append(p)
+                known.add(p.id)
     analysis.proposals = proposals
     return analysis

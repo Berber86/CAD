@@ -228,6 +228,8 @@ class PdfSetJob:
     scan: bool = False
     #: Режим «Эконом»: локальный разбор, а при проблемах — ИИ (только для текстовых файлов).
     economy: bool = False
+    #: Диапазон именно в этом PDF (включая обрезанные копии), даже при чтении из кеша.
+    scan_pages: tuple[int, int] | None = None
 
     @property
     def role_label(self) -> str:
@@ -266,6 +268,7 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
             source = item.parse_source()
         except Exception as exc:  # noqa: BLE001 - ошибка относится только к этому файлу
             source_error = str(exc)
+    scan = not item.has_legal_text()
     return PdfSetJob(
         path=item.path,
         is_main=item.is_main,
@@ -279,7 +282,8 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         cached_issues=tuple(item.issues) if reuse else (),
         fixes=tuple(item.fixes) if reuse else (),
         ocr=bool(source is not None and "ocr_path" in source),
-        scan=not item.has_legal_text(),
+        scan=scan,
+        scan_pages=(item.first_page, item.last_page) if scan else None,
         economy=bool(item.economy and not item.use_llm),
     )
 

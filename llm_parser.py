@@ -5058,6 +5058,122 @@ def _scan_single_typo_candidate(
     return None
 
 
+def _scan_clear_lookalike_typo(
+    segments: Sequence[Segment],
+    *,
+    unanimous_llm_passes: int = 0,
+) -> TypoSuspicion | None:
+    """
+    Однозначная опечатка похожих цифр, которую программа исправляет сама, без решения человека.
+
+    Условия (все обязательны):
+      * контур до правки не замкнут (невязка > CLOSURE_OK_FT);
+      * ровно одна одиночная замена цифры в румбе (градусы/минуты/целые секунды) или в длине стороны
+        даёт замкнутый контур (невязка ≤ CLOSURE_OK_FT) и при этом не ухудшает валидность;
+      * эта замена — похожих цифр (3↔8, 6↔9 и т.п.; ``is_lookalike=True``);
+      * нет единогласного чтения ИИ (unanimous_llm_passes < 2).
+    Не зависит от настройки «Спрашивать при сомнении».
+    """
+    segs = list(segments)
+    n = len(segs)
+    if not (3 <= n <= 10) or unanimous_llm_passes >= 2:
+        return None
+    err0, _ = _trace_closure_and_validity(segs)
+    if err0 <= CLOSURE_OK_FT:
+        return None
+
+    def _digit_variants(text: str) -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
+        for pos, ch in enumerate(text):
+            if not ch.isdigit():
+                continue
+            for d in "0123456789":
+                if d != ch:
+                    out.append((text[:pos] + d + text[pos + 1 :], ch, d))
+        return out
+
+    # (idx, мутированная сторона, вид, старый текст, новый текст, пара цифр, невязка после)
+    hits: list[tuple[int, Segment, str, str, str, tuple[str, str], float]] = []
+
+    def _consider(idx: int, mutated: Segment, kind: str, old_s: str, new_s: str) -> None:
+        trial = list(segs)
+        trial[idx] = mutated
+        err, valid = _trace_closure_and_validity(trial)
+        if not valid or err > CLOSURE_OK_FT or err >= err0:
+            return
+        pair = _single_digit_diff(old_s, new_s)
+        if pair is None:
+            return
+        hits.append((idx, mutated, kind, old_s, new_s, pair, err))
+
+    for idx, seg in enumerate(segs):
+        if seg.has_bearing:
+            sec_is_int = abs(seg.seconds - round(seg.seconds)) < 1e-4
+            base: list[int | None] = [
+                seg.degrees,
+                seg.minutes,
+                int(round(seg.seconds)) if sec_is_int else None,
+            ]
+            for which in (0, 1, 2):
+                cur = base[which]
+                if cur is None:
+                    continue
+                old_text = f"{cur:02d}"
+                for new_text, _od, _nd in _digit_variants(old_text):
+                    vals = list(base)
+                    vals[which] = int(new_text)
+                    mutated = _mutate_segment_bearing(
+                        seg,
+                        degrees=vals[0],
+                        minutes=vals[1],
+                        seconds=float(vals[2]) if vals[2] is not None else None,
+                    )
+                    if mutated is None:
+                        continue
+                    _consider(idx, mutated, "angle_digit", old_text, new_text)
+        if abs(seg.distance_ft - round(seg.distance_ft, 2)) < 1e-6:
+            len_text = f"{seg.distance_ft:.2f}"
+            for new_text, _od, _nd in _digit_variants(len_text):
+                new_len = float(new_text)
+                if new_len <= 0.0:
+                    continue
+                _consider(idx, seg.model_copy(update={"distance_ft": new_len}), "length_digit", len_text, new_text)
+
+    if len(hits) != 1:
+        return None
+    idx, mutated, kind, old_s, new_s, (d_old, d_new), err_after = hits[0]
+    if not _is_lookalike_digit_pair(d_old, d_new):
+        return None
+
+    repaired = list(segs)
+    repaired[idx] = mutated
+    if kind == "angle_digit":
+        original_value = segs[idx].bearing_label
+        suggested_value = mutated.bearing_label
+        what = "в румбе"
+    else:
+        original_value = f"{old_s}'"
+        suggested_value = f"{new_s}'"
+        what = "в длине"
+    return TypoSuspicion(
+        segment_index=idx + 1,
+        kind=kind,
+        original_value=original_value,
+        suggested_value=suggested_value,
+        digit_pair=f"{d_old}→{d_new}",
+        is_lookalike=True,
+        closure_before_ft=err0,
+        closure_after_ft=err_after,
+        reason_ru=(
+            f"Исправлена очевидная опечатка цифры {what} стороны №{idx + 1} "
+            f"(цифра {d_old}→{d_new}): {original_value} → {suggested_value} "
+            f"(невязка {err0:.2f} ft → {err_after:.2f} ft)"
+        ),
+        repaired_segments=repaired,
+        unanimous_llm_passes=unanimous_llm_passes,
+    )
+
+
 def _detect_and_repair_obvious_typos(
     segments: Sequence[Segment],
     *,
@@ -5096,6 +5212,10 @@ def _detect_and_repair_obvious_typos(
     if cand is not None and cand.can_auto_apply(ask_on_doubt=not auto_apply):
         assert cand.repaired_segments is not None
         return cand.repaired_segments, old_to_new, [*align_notes, cand.reason_ru]
+    clear = _scan_clear_lookalike_typo(segs, unanimous_llm_passes=unanimous_llm_passes)
+    if clear is not None and clear.can_auto_apply(ask_on_doubt=False):
+        assert clear.repaired_segments is not None
+        return clear.repaired_segments, old_to_new, [*align_notes, clear.reason_ru]
     return segs, old_to_new, align_notes
 
 

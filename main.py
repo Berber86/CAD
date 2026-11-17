@@ -8105,6 +8105,17 @@ class SurveyApp(ctk.CTk):
         if plan is None:
             return []
         lines: list[tuple[str, str]] = []
+        # Проверка описания — тот же источник, что и статус в журнале: если она нашла проблему
+        # или чего-то не хватает, файл не может быть «без замечаний».
+        check = getattr(item.outcome, "check", None)
+        if check is not None and check.status != STATUS_OK:
+            check_severity = "error" if check.status == STATUS_FAILED else "warn"
+            for issue in check.issues:
+                lines.append((check_severity, " ".join(str(issue.text).split())))
+            for missing in (check.score.missing if check.score is not None else []):
+                if missing.startswith("контур не замыкается"):
+                    continue  # уже показано строкой невязки ниже
+                lines.append((check_severity, f"не найдено: {missing}"))
         if plan.closure.distance > CLOSURE_LIMIT_FT:
             lines.append(("error", f"невязка {plan.closure.distance:.3f} ft — контур не замыкается"))
         for diag in self._plan_diagnostic_items(plan):
@@ -8303,11 +8314,15 @@ class SurveyApp(ctk.CTk):
         lines.append(f"ИИ (по факту): файлов {llm_count} · локально: {len(items) - llm_count}")
         by_ocr = [item for item in items if item.ocr_used]
         if by_ocr:
-            lines.append(
-                f"Сканов распознано локально (OCR, бесплатно): {len(by_ocr)} — "
-                f"это {', '.join(item.path.name for item in by_ocr[:4])}"
-                + ("…" if len(by_ocr) > 4 else "")
-            )
+            # Скан всегда читается OCR, но ИИ подключается, если проверка не пройдена:
+            # «бесплатно» пишем только про тех, кто обошёлся без ИИ.
+            ocr_ai = [item for item in by_ocr if item.llm_used]
+            ocr_free = [item for item in by_ocr if not item.llm_used]
+            line = f"Сканов через OCR: {len(by_ocr)} · без ИИ: {len(ocr_free)}"
+            if ocr_ai:
+                line += f" · с ИИ: {', '.join(item.path.name for item in ocr_ai[:4])}"
+                line += "…" if len(ocr_ai) > 4 else ""
+            lines.append(line)
         for item in items:
             plan = self._pdf_set_plan_for(item)
             if item.is_main:

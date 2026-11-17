@@ -331,7 +331,7 @@ def test_scan_in_the_set_is_read_locally_and_built(gui, tmp_path, monkeypatch):
     assert len(calls) == 2
     assert all("pdf_path" not in kwargs for kwargs in calls)
     report = app._pdf_set_report_window._report_text
-    assert "Сканов распознано локально (OCR, бесплатно): 1" in report
+    assert "Сканов через OCR: 1 · без ИИ: 1" in report
     assert "текст страниц получен локальным OCR — платный запрос ИИ не делался" in report
     assert "локально, OCR" in app.neighbor_pdf_summary.cget("text")
 

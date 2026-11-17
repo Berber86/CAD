@@ -1043,6 +1043,13 @@ def translate_plan(plan: DrawPlan, dx: float, dy: float) -> DrawPlan:
     )
 
 
+def translate_plan_in_place(plan: DrawPlan, dx: float, dy: float) -> None:
+    """Тот же сдвиг, но на месте: объект остаётся тем же (на него ссылаются списки предпросмотра)."""
+    moved = translate_plan(plan, dx, dy)
+    if moved is not plan:
+        plan.__dict__.update(moved.__dict__)
+
+
 def make_print_draft(plan: DrawPlan, print_cfg: dict[str, Any]) -> DrawPlan:
     """План черновика для печати: только наш участок, его улицы и подпись пересекающей улицы.
 

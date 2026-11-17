@@ -66,6 +66,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
 import app_updater
+from neighbour_slide import slide_off_overlap
 from acad_builder import (
     AcadBuilder,
     AcadBuilderError,
@@ -81,6 +82,7 @@ from acad_builder import (
     format_distance,
     house_label_height,
     verify_with_neighbors,
+    translate_plan_in_place,
 )
 from conflict_resolver import (
     AdvisorReply,
@@ -2266,6 +2268,33 @@ class SurveyApp(ctk.CTk):
             command=self._clear_preview_scene,
         )
         self.reset_scene_button.grid(row=0, column=1, padx=(0, 8), sticky="e")
+
+        slide_tools = ctk.CTkFrame(center_head, fg_color="transparent")
+        slide_tools.grid(row=0, column=2, sticky="e", padx=(0, 12))
+        self.slide_overlaps_button = ctk.CTkButton(
+            slide_tools,
+            text="⇲ Развести наложения",
+            width=168,
+            height=26,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._slide_overlapping_neighbours,
+        )
+        self.slide_overlaps_button.grid(row=0, column=0, padx=(0, 6), sticky="e")
+        self.slide_undo_button = ctk.CTkButton(
+            slide_tools,
+            text="↶ Вернуть",
+            width=84,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=11),
+            command=self._undo_slide_neighbours,
+        )
+        self.slide_undo_button.grid(row=0, column=1, sticky="e")
 
         # Панели конфликта проходов и сомнительных мест (между шапкой и холстом)
         self.alerts_wrap = ctk.CTkFrame(self.center_col, fg_color="transparent")
@@ -6003,6 +6032,63 @@ class SurveyApp(ctk.CTk):
         self._set_inspector_text(hint)
         self._redraw_preview_canvas()
 
+    def _slide_overlapping_neighbours(self) -> None:
+        """
+        Развод наложений в предпросмотре: сосед, лежащий поверх нашего участка, съезжает наружу
+        до появления общей межи (алгоритм — neighbour_slide.py). Зазоры не трогаем.
+        Сосед переносится жёстко: форма, длины и румбы не меняются, меняется только положение на
+        схеме; описание (legal description) не меняется.
+        """
+        main = self._preview_main_plan
+        neighbours = list(self._preview_neighbor_plans)
+        if main is None or not neighbours:
+            self._set_status("Развод: на схеме нет нашего участка или соседей", warn=True)
+            return
+        streets = [
+            (ln.start, ln.end)
+            for ln in main.lines
+            if str(ln.kind).startswith(("main-street-row", "cross-street-row"))
+        ]
+        moves: list[tuple[DrawPlan, float, float]] = []
+        moved_count = 0
+        for idx, plan in enumerate(neighbours, 1):
+            others = [other.vertices for other in neighbours if other is not plan]
+            res = slide_off_overlap(
+                main.vertices, plan.vertices, street_lines=streets, others=others,
+            )
+            if res.status == "moved":
+                translate_plan_in_place(plan, res.dx, res.dy)
+                moves.append((plan, res.dx, res.dy))
+                moved_count += 1
+                self._log_line(
+                    f"Развод: СОСЕД #{idx} сдвинут на {res.distance_ft:.2f} ft "
+                    f"(направление {res.direction_deg:.1f}°), общая межа {res.shared_ft:.2f} ft; "
+                    f"было наложение {res.overlap_before_sqft:,.1f} кв. ft",
+                )
+            elif res.status == "no_overlap":
+                self._log_line(f"Развод: СОСЕД #{idx} — наложения нет, не трогаем (зазор не сдвигаем)")
+            else:
+                self._log_line(f"Развод: СОСЕД #{idx} не сдвинут — {res.note}", level=log_mode.LEVEL_WARN)
+        self._slide_undo = moves
+        self._redraw_preview_canvas()
+        if moved_count:
+            self._set_status(f"Развод наложений: сдвинуто соседей — {moved_count}")
+        else:
+            self._set_status("Развод наложений: сдвигать нечего (см. журнал)", warn=True)
+
+    def _undo_slide_neighbours(self) -> None:
+        """Возвращает соседей на места, с которых их сдвинул последний «Развести наложения»."""
+        moves = list(getattr(self, "_slide_undo", []) or [])
+        if not moves:
+            self._set_status("Отменять нечего: последний развод не сдвигал соседей", warn=True)
+            return
+        for plan, dx, dy in reversed(moves):
+            translate_plan_in_place(plan, -dx, -dy)
+        self._slide_undo = []
+        self._redraw_preview_canvas()
+        self._log_line(f"Развод отменён: соседей возвращено на места — {len(moves)}")
+        self._set_status("Развод отменён")
+
     def _on_preview_mode_changed(self, _mode_label: str = "") -> None:
         self._reset_viewport_state()
         self._redraw_preview_canvas()
@@ -6370,6 +6456,7 @@ class SurveyApp(ctk.CTk):
 
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
+        self._slide_undo = []
         self._pdf_set_main_plan = None
         self._pdf_set_scene_neighbors.clear()
         self._pdf_set_main_pending = False

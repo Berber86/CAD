@@ -3171,7 +3171,8 @@ class SurveyApp(ctk.CTk):
             f"Локальный OCR: Borough {result.borough or 'не распознан'}, "
             f"Block {result.block}, Lot {result.lot}. Vision только по карте: "
             f"соседи слева/справа {result.left_neighbour or '—'} / "
-            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}."
+            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}.",
+            level=log_mode.LEVEL_KEY,
         )
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
@@ -3406,7 +3407,7 @@ class SurveyApp(ctk.CTk):
 
     def _step0_to_step1(self) -> None:
         """Открывает собранные описания в Шаге 1: наш участок и соседи одним набором."""
-        self._step0_log("Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…", level=log_mode.LEVEL_KEY)
+        self._step0_log("Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…")
         folder = self._step0_folder()
         try:
             manifest = deed_store.read_manifest(folder)

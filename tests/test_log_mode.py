@@ -25,7 +25,6 @@ def test_simple_mode_keeps_errors_and_key_items_and_drops_the_rest():
         (log_mode.LEVEL_ERROR, "Ошибка: сайт не ответил " + "x" * 200),
     ]
     assert log_mode.filter_entries(entries, log_mode.SIMPLE) == [
-        "12:00:01  качаю страницу 3",
         "Сбор завершён",
         "Ошибка: сайт не ответил " + "x" * 200,
     ]
@@ -191,3 +190,40 @@ def test_simple_journal_drops_service_lines_from_a_real_run():
     assert len(log_mode.filter_entries(entries, log_mode.FULL)) == len(run)
     # Ошибка не скрывается, даже если похожа на служебную строку.
     assert log_mode.level_visible(log_mode.LEVEL_ERROR, log_mode.SIMPLE, "[3/3] стр. 1 из 1 ошибка")
+
+
+def test_simple_journal_for_step0_and_step2_keeps_results_only():
+    step0 = [
+        (log_mode.LEVEL_INFO, "[10:00:01] Шаг 0: собираю описания участка…"),
+        (log_mode.LEVEL_INFO, "[10:00:02] браузер: Ctrl+S сработает только после загрузки PDF"),
+        (log_mode.LEVEL_INFO, "[10:00:03]   OUR: качаю DEED 2019 · файл"),
+        (log_mode.LEVEL_INFO, "[10:00:04]   OUR: ищу начало и конец описания (локальный OCR, 400 dpi)…"),
+        (log_mode.LEVEL_INFO, "[10:00:05]   OUR: описание на стр. 3-4 (копия x.pdf)"),
+        (log_mode.LEVEL_INFO, "[10:00:06]   LOT 70: страницы описания не найдены — файл кладу целиком"),
+        (log_mode.LEVEL_INFO, "[10:00:07] Передаю документы в Шаг 1: проверяю manifest и паспорта файлов…"),
+        (log_mode.LEVEL_KEY, "[10:00:08] Отправляю в Шаг 1 (2 PDF): OUR 70.pdf; LOT 68.pdf"),
+        (log_mode.LEVEL_KEY, "[10:00:09] Сбор завершён: документов в результате — 3"),
+    ]
+    assert log_mode.filter_entries(step0, log_mode.SIMPLE) == [
+        "[10:00:05]   OUR: описание на стр. 3-4 (копия x.pdf)",
+        "[10:00:06]   LOT 70: страницы описания не найдены — файл кладу целиком",
+        "[10:00:08] Отправляю в Шаг 1 (2 PDF): OUR 70.pdf; LOT 68.pdf",
+        "[10:00:09] Сбор завершён: документов в результате — 3",
+    ]
+
+    step2 = [
+        (log_mode.LEVEL_KEY, "Шаг 2 · ШАГ 2 · АВТОПОДПИСАНИЕ ОБЪЕКТОВ → слой D-TOPO-TEXT"),
+        (log_mode.LEVEL_INFO, "Шаг 2 · Версия Шага 2: 2.1"),
+        (log_mode.LEVEL_INFO, "Шаг 2 · Зона поиска: участок + буфер; высота текста 0.250 ft"),
+        (log_mode.LEVEL_INFO, "Шаг 2 · Чтение чертежа AutoCAD: 3 из 20 объектов…"),
+        (log_mode.LEVEL_KEY, "Шаг 2 · НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: 18"),
+        (log_mode.LEVEL_INFO, "Шаг 2 · • по именам слоёв: 14"),
+        (log_mode.LEVEL_KEY, "Шаг 2 · ПОДПИСАНО: 15 (вдоль линии: 4)"),
+        (log_mode.LEVEL_ERROR, "Шаг 2 · ДОМ НЕ ПОДПИСАН: поле «Текст для основного дома» пустое."),
+    ]
+    assert log_mode.filter_entries(step2, log_mode.SIMPLE) == [
+        "Шаг 2 · ШАГ 2 · АВТОПОДПИСАНИЕ ОБЪЕКТОВ → слой D-TOPO-TEXT",
+        "Шаг 2 · НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: 18",
+        "Шаг 2 · ПОДПИСАНО: 15 (вдоль линии: 4)",
+        "Шаг 2 · ДОМ НЕ ПОДПИСАН: поле «Текст для основного дома» пустое.",
+    ]

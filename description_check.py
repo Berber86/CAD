@@ -46,6 +46,24 @@ _THENCE_RE = re.compile(r"\bTHENCE\b", re.IGNORECASE)
 _AT_CORNER_START_RE = re.compile(
     r"BEGINNING\s+at\s+(?:[A-Za-z]+\s+){0,5}?(?:corner|intersection)\b", re.IGNORECASE,
 )
+# «COMMENCING at the intersection of … ; running thence … to the point or place of beginning»:
+# точка начала — это и есть угол (контур возвращается в неё). Действует только если в описании
+# нет отдельного «BEGINNING at …»: тогда BEGINNING — настоящая точка начала и нужно её расстояние.
+_COMMENCE_AT_CORNER_RE = re.compile(
+    r"COMMENCING\s+at\s+(?:[A-Za-z]+\s+){0,5}?(?:corner|intersection)\b", re.IGNORECASE,
+)
+_BEGINNING_AT_RE = re.compile(r"\bBEGINNING\s+at\b", re.IGNORECASE)
+
+
+def _starts_at_corner(text: str) -> bool:
+    """Описание начинается на углу улицы (расстояние до угла не нужно)."""
+    if not text:
+        return False
+    if _AT_CORNER_START_RE.search(text):
+        return True
+    if _BEGINNING_AT_RE.search(text):
+        return False  # есть своя точка начала с расстоянием — COMMENCING тут не главный
+    return bool(_COMMENCE_AT_CORNER_RE.search(text))
 
 
 @dataclass(frozen=True)
@@ -180,7 +198,7 @@ def figure_score(model: Any, source_text: str = "", closure_ft: float | None = N
     required_sides = max(3, n, thence)
     bearing_found = sum(1 for seg in segments if getattr(seg, "has_bearing", True))
     length_found = sum(1 for seg in segments if float(getattr(seg, "distance_ft", 0.0) or 0.0) > 0)
-    at_corner = bool(text) and bool(_AT_CORNER_START_RE.search(text))
+    at_corner = _starts_at_corner(text)
     corner_required = 0 if at_corner else 1
     distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
     corner_found = 1 if distance > 1e-6 else 0
@@ -329,7 +347,7 @@ def _check_description_core(model: Any, source_text: str = "") -> DescriptionChe
         distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
         if _DISTANT_RE.search(text) and distance <= 1e-6:
             check.add(STATUS_FAILED, "в тексте есть «distant … feet», но расстояние до угла не найдено")
-        elif distance <= 1e-6 and not _AT_CORNER_START_RE.search(text):
+        elif distance <= 1e-6 and not _starts_at_corner(text):
             # Строка с расстоянием могла потеряться при OCR целиком: без точки начала контур
             # построен от угла улицы. Это сомнение, а не «ok».
             check.add(

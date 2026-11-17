@@ -141,8 +141,26 @@ def _repair_token(token: str, after: str) -> str | None:
     return mapped
 
 
+# «108,06 feet» — запятая вместо точки. Группа ровно из двух цифр после запятой не бывает
+# тысячной («1,108» и «234,400.00» не трогаем), поэтому такая запятая — десятичная точка,
+# если сразу за числом стоит «feet» (или ft / ').
+_COMMA_DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9.])(?<!\d,)([0-9lIi|!oO]{1,5}),(\d{2})(?![\d.,])")
+
+
+def fix_comma_decimals(text: str) -> str:
+    """Запятая вместо точки перед двумя цифрами: «108,06 feet» → «108.06 feet»."""
+
+    def repl(match: re.Match[str]) -> str:
+        if _unit_after(text[match.end(): match.end() + 40]) != "ft":
+            return match.group(0)
+        return f"{match.group(1)}.{match.group(2)}"
+
+    return _COMMA_DECIMAL_RE.sub(repl, text)
+
+
 def fix_text(text: str) -> str:
-    """Исправляет числа с буквами-двойниками в тексте описания."""
+    """Исправляет числа с буквами-двойниками в тексте описания (и запятую вместо точки)."""
+    text = fix_comma_decimals(text)
 
     def repl(match: re.Match[str]) -> str:
         token = match.group(1)

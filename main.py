@@ -2088,15 +2088,14 @@ class SurveyApp(ctk.CTk):
         )
         self.parse_button.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
 
-        self.economy_check = ctk.CTkCheckBox(
+        self.run_mode_seg = ctk.CTkSegmentedButton(
             run_box,
-            text="Эконом: локально, ИИ только при проблемах",
-            variable=self.economy_var,
-            command=self._on_economy_toggled,
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_main"],
+            values=self.RUN_MODE_LABELS,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_run_mode_clicked,
         )
-        self.economy_check.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 2))
+        self.run_mode_seg.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
 
         self.regex_link_button = ctk.CTkButton(
             run_box,
@@ -4203,8 +4202,22 @@ class SurveyApp(ctk.CTk):
         self._refresh_consensus_rows()
         self._refresh_engine_card()
 
-    def _on_economy_toggled(self) -> None:
-        self._refresh_parse_actions()
+    RUN_MODE_LABELS = ["Локально", "Эконом", "ИИ"]
+
+    def _on_run_mode_clicked(self, label: str) -> None:
+        """Три режима: Локально (бесплатно), Эконом (локально, ИИ при проблемах), ИИ."""
+        if label == "ИИ":
+            self.economy_var.set(False)
+            self.use_llm_var.set(True)
+        else:
+            self.economy_var.set(label == "Эконом")
+            self.use_llm_var.set(False)
+        self._on_use_llm_toggled()
+
+    def _run_mode_label(self) -> str:
+        if self.use_llm_var.get():
+            return "ИИ"
+        return "Эконом" if self.economy_var.get() else "Локально"
 
     # -------------------------------------------------- Spectrum UX helpers --
     def _result_logical_pixels(self, value: float) -> float:
@@ -4308,14 +4321,17 @@ class SurveyApp(ctk.CTk):
         """Основная кнопка показывает выбранный режим, вторая запускает альтернативу."""
         if not hasattr(self, "parse_button"):
             return
+        if hasattr(self, "run_mode_seg"):
+            self.run_mode_seg.set(self._run_mode_label())
         use_llm = bool(self.use_llm_var.get())
         if self.pdf_set and self._current_source_mode() == "📄 PDF":
             # В наборе способ разбора выбран у каждого файла отдельно.
             paid = sum(1 for item in self.pdf_set if item.use_llm)
+            economy_files = sum(1 for item in self.pdf_set if item.economy and not item.use_llm)
             if paid:
                 cost = f"ИИ: {paid} файл., платно"
-            elif self.economy_var.get():
-                cost = "экономно: ИИ только при проблемах"
+            elif economy_files:
+                cost = f"эконом: {economy_files} файл., ИИ только при проблемах"
             else:
                 cost = "бесплатно"
             self.parse_button.configure(
@@ -4331,8 +4347,6 @@ class SurveyApp(ctk.CTk):
             return
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
         economy_on = bool(self.economy_var.get())
-        if hasattr(self, "economy_check"):
-            self.economy_check.configure(state="disabled" if use_llm else "normal")
         if use_llm:
             primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
             alternative = "⚡ Локальный разбор без ИИ · бесплатно"
@@ -7549,8 +7563,7 @@ class SurveyApp(ctk.CTk):
                 self._pending_neighbor_files.discard(item.path)
             else:
                 self._pending_neighbor_files.add(item.path)
-        economy = bool(self.economy_var.get())
-        jobs = [make_job(item, force=force, economy=economy) for item in self.pdf_set]
+        jobs = [make_job(item, force=force) for item in self.pdf_set]
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         scale = self._current_scale()
         has_vision = any(job.source is not None and "pdf_path" in job.source for job in jobs)
@@ -9293,9 +9306,7 @@ class SurveyApp(ctk.CTk):
         self.neighbor_lot_radio.configure(state=state)
         self.parse_button.configure(state=state)
         self.regex_link_button.configure(state=state)
-        self.economy_check.configure(
-            state="disabled" if (state == "disabled" or self.use_llm_var.get()) else "normal"
-        )
+        self.run_mode_seg.configure(state=state)
         self.save_button.configure(state=state)
         self.save_env_button.configure(state=state)
         self.feature_auto_button.configure(state=state)
@@ -11287,6 +11298,7 @@ class PdfSetDialog:
     """
 
     MODE_LOCAL = "Локально"
+    MODE_ECONOMY = "Эконом"
     MODE_LLM = "ИИ"
     NO_MAIN = "none"
 
@@ -11482,9 +11494,10 @@ class PdfSetDialog:
             text_color=THEME["text_muted"],
         ).grid(row=0, column=6, padx=(4, 12), pady=(10, 2))
 
-        mode_var = ctk.StringVar(value=self.MODE_LLM if item.use_llm else self.MODE_LOCAL)
+        mode_var = ctk.StringVar(value=self._mode_value(item))
         mode = ctk.CTkSegmentedButton(
-            frame, values=[self.MODE_LOCAL, self.MODE_LLM], variable=mode_var, height=28,
+            frame, values=[self.MODE_LOCAL, self.MODE_ECONOMY, self.MODE_LLM],
+            variable=mode_var, height=28,
             command=lambda value, i=index: self._mode_clicked(i, value),
         )
         mode.grid(row=0, column=7, padx=(0, 8), pady=(10, 2))
@@ -11527,16 +11540,22 @@ class PdfSetDialog:
             row["error"] = ""
             if (first, last) != (item.first_page, item.last_page):
                 item.set_pages(first, last)
-                wanted = self.MODE_LLM if item.use_llm else self.MODE_LOCAL
+                wanted = self._mode_value(item)
                 row["mode_var"].set(wanted)
                 row["mode"].set(wanted)
         self._refresh_note(index)
         self._refresh_submit_text()
 
+    def _mode_value(self, item: PdfSetItem) -> str:
+        if item.use_llm:
+            return self.MODE_LLM
+        return self.MODE_ECONOMY if item.economy else self.MODE_LOCAL
+
     def _mode_clicked(self, index: int, value: str) -> None:
         if not 0 <= index < len(self.items):
             return
-        self.items[index].set_mode(str(value) == self.MODE_LLM)
+        value = str(value)
+        self.items[index].set_mode(value == self.MODE_LLM, economy=value == self.MODE_ECONOMY)
         self._refresh_note(index)
         self._refresh_submit_text()
 

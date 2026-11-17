@@ -79,6 +79,8 @@ class PdfSetItem:
     last_page: int = 1
     is_main: bool = False
     use_llm: bool = False
+    #: Режим «Эконом» (локально, ИИ при проблемах). Действует только при use_llm=False.
+    economy: bool = False
     #: Локальный OCR доступен и разрешён: скан разбирается бесплатно, без ИИ.
     ocr_ok: bool = False
     #: Этот файл уже распознавался локальным OCR (для отчёта).
@@ -126,6 +128,8 @@ class PdfSetItem:
         return f"{format_pages(self.first_page, self.last_page)} из {self.total_pages}"
 
     def mode_label(self) -> str:
+        if not self.use_llm and self.economy:
+            return "эконом: локально, ИИ при проблемах"
         if not self.use_llm:
             if self.has_legal_text():
                 return "локально, бесплатно"
@@ -142,7 +146,10 @@ class PdfSetItem:
 
     def parse_key(self) -> tuple[Any, ...]:
         """От чего зависит результат разбора; роль на него не влияет."""
-        return (str(self.path), self.first_page, self.last_page, bool(self.use_llm))
+        return (
+            str(self.path), self.first_page, self.last_page,
+            bool(self.use_llm), bool(self.economy and not self.use_llm),
+        )
 
     def signature(self) -> tuple[Any, ...]:
         return self.parse_key() + (bool(self.is_main),)
@@ -157,9 +164,10 @@ class PdfSetItem:
             # Скан при доступном локальном OCR остаётся бесплатным; иначе — как раньше, ИИ.
             self.use_llm = not (self.has_legal_text() or self.ocr_ok)
 
-    def set_mode(self, use_llm: bool) -> None:
+    def set_mode(self, use_llm: bool, economy: bool = False) -> None:
         """Способ выбран пользователем и больше не меняется сам."""
         self.use_llm = bool(use_llm)
+        self.economy = bool(economy and not use_llm)
         self.auto_mode = False
 
     def forget_result(self) -> None:
@@ -245,21 +253,12 @@ class PdfSetResult:
     error: str = ""
 
 
-def make_job(item: PdfSetItem, *, force: bool = False, economy: bool = False) -> PdfSetJob:
+def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
     """Готовит файл к разбору; готовый результат при тех же страницах не запрашивается заново.
 
-    В режиме «Эконом» локальный результат, который не прошёл проверку, перепроверяется:
-    теперь, возможно, нужен ответ ИИ. Ответ ИИ, сохранённый раньше, не пересчитывается.
+    Режим «Эконом» входит в ключ разбора: смена режима у файла даёт новый разбор.
     """
-    check = getattr(item.outcome, "check", None)
-    economy_retry = bool(
-        economy
-        and not item.use_llm
-        and check is not None
-        and not check.ok
-        and getattr(item.outcome, "source", "") != "llm"
-    )
-    reuse = item.has_fresh_result() and not force and not economy_retry
+    reuse = item.has_fresh_result() and not force
     source: dict[str, Any] | None = None
     source_error = ""
     if not reuse:
@@ -281,7 +280,7 @@ def make_job(item: PdfSetItem, *, force: bool = False, economy: bool = False) ->
         fixes=tuple(item.fixes) if reuse else (),
         ocr=bool(source is not None and "ocr_path" in source),
         scan=not item.has_legal_text(),
-        economy=bool(economy and not item.use_llm),
+        economy=bool(item.economy and not item.use_llm),
     )
 
 

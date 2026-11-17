@@ -18,10 +18,11 @@ def _sq(x, y, w, h):
     return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
 
 
-def _after(main_pts, nb_pts, res):
-    """Полигон соседа после сдвига результата."""
+def _after(main_pts, nb_pts, res, band: float = 0.05):
+    """Наложение и общая межа после сдвига; полоса допуска — как у алгоритма (0.05 ft + клин)."""
     moved = affinity.translate(Polygon(nb_pts), res.dx, res.dy)
-    return Polygon(main_pts).intersection(moved).area, Polygon(main_pts).boundary.intersection(moved.boundary).length
+    main = Polygon(main_pts)
+    return main.intersection(moved).area, moved.boundary.intersection(main.boundary.buffer(band)).length
 
 
 def test_shared_fraction_is_the_join_rule():
@@ -55,7 +56,7 @@ def test_west_overlap_slides_west_to_share_the_full_side():
     assert res.status == "moved"
     assert res.distance_ft == pytest.approx(30.0, abs=0.02)
     assert res.direction_deg == pytest.approx(180.0, abs=0.5)
-    assert res.shared_ft == pytest.approx(20.0, abs=0.05)
+    assert res.shared_ft == pytest.approx(20.0, abs=0.2)
 
 
 def test_real_like_offset_rectangles_slide_along_the_side():
@@ -223,3 +224,34 @@ def test_tie_line_is_not_a_street_blocker(gui):
     app._preview_neighbor_plans = [nb2]
     app._slide_overlapping_neighbours()
     assert nb2.vertices[0][0] < 160.0  # улица не пустила соседа через линию
+
+
+def _frontage_neighbour(theta_deg: float):
+    """Сосед 25 ft по фасаду, длиной 110, заходит на нашу верхнюю сторону; фасад повёрнут на theta."""
+    base = Polygon([(20, 85), (45, 85), (45, 195), (20, 195)])
+    return list(affinity.rotate(base, theta_deg, origin=(20, 85)).exterior.coords)[:-1]
+
+
+@pytest.mark.parametrize("theta_deg", [0.56, 1.35])
+def test_frontage_with_document_angle_mismatch_slides_out_to_the_line(theta_deg):
+    """
+    Как в превью: стороны расходятся на 0.56° и 1.35° (расхождение в документах). Сосед уходит
+    наружу (вверх, через нашу сторону) до касания ближайшей точкой; клин остаётся в полосе допуска.
+    """
+    main = _sq(0, 0, 100, 100)
+    nb = _frontage_neighbour(theta_deg)
+    res = slide_off_overlap(main, nb)
+    assert res.status == "moved", res.note
+    assert res.direction_deg == pytest.approx(90.0, abs=3.0)
+    wedge = 25.0 * math.sin(math.radians(theta_deg))  # клин на фасаде 25 ft
+    area, shared = _after(main, nb, res, band=0.05 + wedge)
+    assert area <= 0.5
+    assert shared >= 11.0 - 1e-6  # 10% большей стороны (110 ft)
+
+
+def test_large_angle_still_needs_a_turn():
+    main = _sq(0, 0, 100, 100)
+    nb = _frontage_neighbour(5.0)
+    res = slide_off_overlap(main, nb)
+    assert res.status == "not_found"
+    assert "поворот" in res.note

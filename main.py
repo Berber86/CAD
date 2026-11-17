@@ -135,7 +135,7 @@ import deed_store
 import nyc_portal
 import ocr_pages
 import rcclerk
-from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING, figure_line
+from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING, figure_line, reading_summary
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
@@ -7943,6 +7943,11 @@ class SurveyApp(ctk.CTk):
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
+                # Итог чтения легального описания — в журнал уровнем «ключ»: виден и в упрощённом режиме.
+                post(
+                    "reading_summary",
+                    f"[{idx}/{total}] {job.path.name}: {reading_summary(getattr(result.outcome, 'check', None))}",
+                )
                 description = apply_changes(result.outcome.data, fix_changes(job.fixes))
                 plan = builder.plan(description, scale=scale, is_neighbor=not job.is_main)
                 if result.ocr:
@@ -9093,6 +9098,8 @@ class SurveyApp(ctk.CTk):
                 )
         elif kind == "consensus_label":
             self._last_consensus_label = payload
+        elif kind == "reading_summary":
+            self._log_line(str(payload), level=log_mode.LEVEL_KEY)
         elif kind == "progress":
             self._set_status(str(payload))
         elif kind == "error":
@@ -10220,6 +10227,7 @@ class SurveyApp(ctk.CTk):
                 f"POB ({plan.pob[0]:+.2f}, {plan.pob[1]:+.2f}) ft, "
                 f"Closure Error {plan.closure.distance:.3f} ft",
             )
+            post("reading_summary", reading_summary(getattr(outcome, "check", None)))
             ask_on_doubt = bool(cfg.get("api", {}).get("ask_on_doubt", True))
             has_typo_suspicion = bool(outcome.typo_suspicions)
             has_risky_draw_geometry = (

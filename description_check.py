@@ -217,6 +217,25 @@ def figure_line(check: DescriptionCheck | None) -> str:
     return line
 
 
+def reading_summary(check: DescriptionCheck | None) -> str:
+    """Итог для упрощённого журнала: сколько обязательных значений легального описания прочитано.
+
+    Строка короткая по смыслу, но записывается уровнем «ключ» (всегда видна), поэтому её длина
+    не ограничивается порогом информационных записей.
+    """
+    if check is None or check.score is None:
+        return "Легал дескрипшен: не разобран"
+    score = check.score
+    parts = ", ".join(f"{item.label} {item.found} из {item.required}" for item in score.items)
+    line = (
+        f"Легал дескрипшен: прочитано {score.found_total} из {score.required_total} ({parts}); "
+        f"{_STATUS_WORDS.get(check.status, check.status)}"
+    )
+    if score.missing:
+        line += "; не найдено: " + "; ".join(score.missing)
+    return line
+
+
 def check_description(model: Any, source_text: str = "") -> DescriptionCheck:
     """Проверяет разобранную модель LegalDescription и считает баллы фигуры."""
     check = _check_description_core(model, source_text)

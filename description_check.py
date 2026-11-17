@@ -38,6 +38,10 @@ _STANDARD_DEED_RE = re.compile(
 )
 _DISTANT_RE = re.compile(r"\bdistant\s+\d[\d,]*(?:\.\d+)?\s*(?:feet|ft|')", re.IGNORECASE)
 _THENCE_RE = re.compile(r"\bTHENCE\b", re.IGNORECASE)
+#: Описание начинается от угла: «BEGINNING at the corner formed by …» — расстояние не нужно.
+_AT_CORNER_START_RE = re.compile(
+    r"BEGINNING\s+at\s+(?:the\s+)?(?:corner|intersection|point\s+of\s+intersection)", re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,17 @@ def check_description(model: Any, source_text: str = "") -> DescriptionCheck:
             + ", ".join(f"№{index}" for index in unbearing),
         )
 
+    # Румб вычислен по замыканию (одна сторона без румба в тексте): контур сходится по построению,
+    # поэтому это всегда сомнение, а не «ok».
+    solved = [index for index, seg in enumerate(segments, start=1) if getattr(seg, "bearing_solved", False)]
+    if solved:
+        check.add(
+            STATUS_WARNING,
+            "румб не прочитан в тексте, вычислен по замыканию: сторона(ы) "
+            + ", ".join(f"№{index}" for index in solved) + " — сверьте с документом",
+            side=solved[0],
+        )
+
     # Замыкание считается только если у всех сторон есть румб. Поэтому статус «ok»
     # возможен только с вычисленным замыканием: пропущенная или нечитаемая сторона
     # не может пройти как «ok».
@@ -180,5 +195,13 @@ def check_description(model: Any, source_text: str = "") -> DescriptionCheck:
         distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
         if _DISTANT_RE.search(text) and distance <= 1e-6:
             check.add(STATUS_FAILED, "в тексте есть «distant … feet», но расстояние до угла не найдено")
+        elif distance <= 1e-6 and not _AT_CORNER_START_RE.search(text):
+            # Строка с расстоянием могла потеряться при OCR целиком: без точки начала контур
+            # построен от угла улицы. Это сомнение, а не «ok».
+            check.add(
+                STATUS_WARNING,
+                "расстояние от угла до точки начала не найдено — участок построен от угла улицы; "
+                "сверьте с документом",
+            )
 
     return check

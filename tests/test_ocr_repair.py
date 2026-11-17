@@ -200,3 +200,126 @@ def test_real_lot114_page_reads_clean_with_two_renders(tmp_path):
     assert model.distance_to_corner_ft == pytest.approx(74.96, abs=0.01)
     assert check.status in (STATUS_OK, STATUS_WARNING)
     assert check.closure_ft is not None and check.closure_ft <= 0.5
+
+
+# ------------------------------------------------------------------ 3.57: реальные рендеры и вычисленный румб
+
+RENDERS = DATA
+LOT114_TRUTH_DIST = 74.96
+
+
+def _read_render(name: str) -> str:
+    return (RENDERS / name).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "garbled, expected_distance",
+    [
+        ("West on hundred feet", 100.0),  # «one» потеряно, «on» вместо «one»
+        ("seconds east hundred feet", 100.0),  # «one» потеряно полностью
+        ("40 fect to the point", 40.0),  # «feet» распознано как «fect»
+    ],
+)
+def test_lost_number_words_and_feet_are_repaired(garbled, expected_distance):
+    from llm_parser import _distance_after, _spell_numbers_before_feet
+
+    fixed = llm_parser._normalize_legal_text(garbled)
+    spelled, _ = _spell_numbers_before_feet(fixed)
+    assert _distance_after(spelled) == pytest.approx(expected_distance)
+
+
+def test_degree_sign_read_as_question_mark_is_repaired():
+    fixed = llm_parser._normalize_legal_text("South 56? 36 minutes 12 seconds east")
+    assert "56° 36" in fixed
+    assert "56°36" in llm_parser._normalize_legal_text("South 56?36 minutes")
+
+
+def test_distance_without_the_corner_phrase_is_read_from_the_street_reference():
+    """Строка «from the corner formed by…» потеряна при OCR, остальное на месте (OUR LOT 114, native)."""
+    text = _read_render("lot114_render_native.txt")
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert model.distance_to_corner_ft == pytest.approx(LOT114_TRUTH_DIST)
+
+
+def test_orphan_second_course_gets_its_bearing_from_closure():
+    """
+    OUR LOT 114, рендер 600 dpi: строка «THENCE along said last mentioned land south 42°03'54" east»
+    потеряна целиком, остался фрагмент «east 25.41 feet». Румб вычисляется по замыканию и
+    совпадает с документом; статус — warning, потому что румб не прочитан.
+    """
+    text = _read_render("lot114_render_e600.txt")
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert len(model.segments) == 4
+    solved = [seg for seg in model.segments if seg.bearing_solved]
+    assert len(solved) == 1
+    seg = solved[0]
+    assert (seg.ns, seg.ew, seg.degrees, seg.minutes) == ("S", "E", 42, 3)
+    assert abs(seg.seconds - 54.0) < 10.0
+    assert seg.distance_ft == pytest.approx(25.41)
+    check = check_description(model, text)
+    assert check.status == STATUS_WARNING
+    assert any("вычислен по замыканию" in issue.text for issue in check.issues)
+
+
+def test_orphan_is_not_solved_when_closure_does_not_match_its_length():
+    """Сумма остальных сторон не равна длине фрагмента: румб не вычисляется, сторона — «не прочитан»."""
+    text = (
+        "THENCE North 90 degrees 00 minutes 00 seconds East 100.00 feet; running\n"
+        "THENCE South 00 degrees 00 minutes 00 seconds East 25.00 feet; running\n"
+        "THENCE South 90 degrees 00 minutes 00 seconds West 100.00 feet; running\n"
+        "east 30.00 feet to land now or formerly of Smith; running\n"
+        "THENCE North 00 degrees 00 minutes 00 seconds West 25.00 feet to the point or place of BEGINNING."
+    )
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert not any(seg.bearing_solved for seg in model.segments)
+    check = check_description(model, text)
+    assert check.status == STATUS_FAILED
+
+
+def test_orphan_is_not_solved_when_its_direction_word_contradicts_the_closure():
+    """Замыкание даёт направление на запад, а в тексте «east»: румб не выдумываем."""
+    text = (
+        "THENCE North 90 degrees 00 minutes 00 seconds East 100.00 feet; running\n"
+        "THENCE South 00 degrees 00 minutes 00 seconds East 25.00 feet; running\n"
+        "east 100.00 feet to land now or formerly of Smith; running\n"
+        "THENCE North 00 degrees 00 minutes 00 seconds West 25.00 feet to the point or place of BEGINNING."
+    )
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert not any(seg.bearing_solved for seg in model.segments)
+
+
+def test_solved_bearing_is_never_ok():
+    text = _read_render("lot114_render_e600.txt")
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert check_description(model, text).status != STATUS_OK
+
+
+def test_missing_corner_distance_is_not_ok_when_the_text_does_not_start_at_a_corner():
+    """Строка с расстоянием потеряна (OUR 70, native): проверка не должна давать «ok» с расстоянием 0."""
+    lines = [line for line in FULL_LINES if "distant" not in line and "corner" not in line]
+    lines[0] = "BEGINNING at a point on the northwesterly side of Stafford Avenue, 60 feet wide,"
+    text = "\n".join(lines)
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert not model.distance_to_corner_ft
+    check = check_description(model, text)
+    assert check.status == STATUS_WARNING
+    assert any("расстояние от угла" in issue.text for issue in check.issues)
+
+
+def test_corner_start_without_distance_is_still_ok():
+    """Описание начинается от угла — расстояние не нужно, ok сохраняется."""
+    lines = list(FULL_LINES)
+    lines[0] = "BEGINNING at the corner formed by the northwesterly side of Stafford Avenue and Carlton Boulevard,"
+    lines[1] = "running"
+    text = "\n".join(lines)
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    check = check_description(model, text)
+    assert check.status == STATUS_OK
+
+
+def test_lot72_render_with_lost_words_reads_all_four_sides():
+    text = _read_render("lot72_render_e600.txt")
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    assert len(model.segments) == 4
+    assert model.distance_to_corner_ft == pytest.approx(241.0)
+    assert check_description(model, text).status == STATUS_OK

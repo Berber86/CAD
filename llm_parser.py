@@ -47,6 +47,7 @@ import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 import street_names
+from description_check import CLOSURE_OK_FT
 
 __all__ = [
     "ASPENWALL_SAMPLES",
@@ -962,6 +963,14 @@ class Segment(BaseModel):
     interior_angle: str | None = Field(
         default=None,
         description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
+    )
+
+    bearing_solved: bool = Field(
+        default=False,
+        description=(
+            "True, если румб не прочитан в тексте, а вычислен по замыканию контура "
+            "(одна сторона без румба, длина известна). Такой румб нужно сверить с документом."
+        ),
     )
 
     @model_validator(mode="before")
@@ -3002,6 +3011,13 @@ _DISTANCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Запасной вариант расстояния до угла, когда строка «from the corner …» потеряна при OCR:
+#: «distant 74.96 feet U.S. Standard (75.00) feet Deed) of Doty Avenue». Требует улицу с заглавной.
+_DISTANT_OF_STREET_RE = re.compile(
+    r"(?i:\bdistant)\s+(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')[^;]{0,90}?"
+    r"\b(?:of|from)\s+(?:the\s+)?(?=[A-Z])",
+)
+
 # Числа прописью перед «feet»/«foot» («one hundred forty-one feet», «hundred feet»).
 # Сами по себе не разбираются _DISTANCE_RE, поэтому переводятся в цифры до разбора.
 _WORD_UNITS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
@@ -3180,8 +3196,10 @@ _OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"thcrcof", "thereof"),
         (r"northwcsterly|northweaterly", "northwesterly"),
         (r"northeaterly|northcasterly", "northeasterly"),
+        (r"fect|fcet|feot", "feet"),
     )
 )
+
 
 #: Словарь юридических слов для поиска опечаток: слово из 6+ букв в нижнем регистре,
 #: отличающееся на одну букву от слова словаря, заменяется на него. Короче — не трогаем.
@@ -3266,6 +3284,7 @@ def _normalize_legal_text(text: str) -> str:
     text = _replace_vulgar_fractions(text)
     text = _drop_margin_noise(text)
     text = _fix_ocr_words(_fix_ocr_number_tokens(text))
+    text = re.sub(r"(?<=\d)\?(?=\s*\d)", "°", text)
     replacements = {
         "\uff08": "(", "\uff09": ")", "\uff0c": ",", "\uff1a": ":", "\uff1b": ";",
         "\u00ba": "°", "\u02da": "°", "\u00b0": "°",
@@ -3612,7 +3631,114 @@ def _wordy_street_courses(
     return found
 
 
-def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+#: Фрагмент курса без румба внутри куска между двумя румбами: «…running\neast 25.41 feet …».
+#: Начало курса («THENCE along said … south 42°…») потеряно, длина и одно направление остались.
+_ORPHAN_COURSE_RE = re.compile(
+    r"(?:^|[;\n])[ \t]*(?P<dir>(?:north|south|east|west)(?:erly|ward)?"
+    r"(?:\s+(?:north|south|east|west)(?:erly|ward)?)?)\s+(?P<num>\d+(?:\.\d+)?)\s*(?:feet|ft|')",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _orphan_courses(
+    text: str, matches: Sequence[re.Match[str]], wordy_starts: Sequence[int],
+) -> list[tuple[int, dict[str, Any], str | None, str | None]]:
+    """
+    Находит курсы без румба, которые стоят между курсами с румбами: вторая длина в куске
+    после первой длины стороны. Возвращает ``[(позиция, сторона, N/S-подсказка, E/W-подсказка)]``.
+    Сторона получает номинальный азимут и ``has_bearing=False``; румб решает замыкание.
+    """
+    found: list[tuple[int, dict[str, Any], str | None, str | None]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        end = min([end] + [start for start in wordy_starts if start > match.end()])
+        chunk = text[match.end() : end]
+        first = _DISTANCE_RE.search(chunk)
+        if first is None:
+            continue
+        for frag in _ORPHAN_COURSE_RE.finditer(chunk):
+            if frag.start("dir") <= first.start():
+                continue
+            distance = _distance_after(chunk[frag.start("dir") :])
+            if distance is None:
+                continue
+            word = re.sub(r"\s+", "", frag.group("dir").lower()).replace("ward", "erly")
+            ns_hint = "N" if "north" in word else ("S" if "south" in word else None)
+            ew_hint = "E" if "east" in word else ("W" if "west" in word else None)
+            nominal = _CARDINAL_AZIMUTH.get(word)
+            if nominal is None:
+                nominal = _CARDINAL_AZIMUTH.get(word.replace("erly", ""), None)
+            if nominal is None:
+                continue
+            seg = _azimuth_to_quadrant_dict(nominal)
+            seg["distance_ft"] = distance
+            seg["has_bearing"] = False
+            seg["course_note"] = None
+            found.append((match.end() + frag.start("dir"), seg, ns_hint, ew_hint))
+    return found
+
+
+def _bearing_vector(seg: dict[str, Any]) -> tuple[float, float]:
+    """Вектор стороны с румбом: x — восток, y — север."""
+    theta = math.radians(seg["degrees"] + seg["minutes"] / 60.0 + float(seg["seconds"]) / 3600.0)
+    length = float(seg["distance_ft"])
+    dx = length * math.sin(theta) * (1.0 if seg["ew"] == "E" else -1.0)
+    dy = length * math.cos(theta) * (1.0 if seg["ns"] == "N" else -1.0)
+    return dx, dy
+
+
+def _solve_orphan_bearing(
+    segs: list[dict[str, Any]], hints: dict[int, tuple[str | None, str | None]],
+) -> None:
+    """
+    Если ровно одна сторона без румба, у остальных румбы есть, а её длина и направление
+    из текста известны, румб вычисляется по замыканию: сумма остальных сторон должна быть
+    по длине равна стороне без румба (допуск CLOSURE_OK_FT), направление — совпасть с текстом.
+    Иначе ничего не меняется: сторона остаётся без румба и проверка скажет «не прочитан».
+    """
+    unsolved = [i for i, seg in enumerate(segs) if not seg.get("has_bearing", True)]
+    if len(unsolved) != 1 or unsolved[0] not in hints:
+        return
+    k = unsolved[0]
+    others = [seg for i, seg in enumerate(segs) if i != k]
+    if len(others) < 2 or any(not seg.get("has_bearing", True) for seg in others):
+        return
+    sx = sy = 0.0
+    for seg in others:
+        dx, dy = _bearing_vector(seg)
+        sx += dx
+        sy += dy
+    length = math.hypot(sx, sy)
+    if abs(length - float(segs[k]["distance_ft"])) > CLOSURE_OK_FT:
+        return
+    vx, vy = -sx, -sy
+    ew = "E" if vx > 0 else "W"
+    ns = "N" if vy > 0 else "S"
+    ns_hint, ew_hint = hints[k]
+    if (ns_hint and ns_hint != ns) or (ew_hint and ew_hint != ew):
+        return
+    angle = math.degrees(math.atan2(abs(vx), abs(vy)))
+    degrees = int(angle)
+    minutes_f = (angle - degrees) * 60.0
+    minutes = int(minutes_f)
+    seconds = round((minutes_f - minutes) * 60.0, 2)
+    if seconds >= 60.0:
+        seconds, minutes = 0.0, minutes + 1
+    if minutes >= 60:
+        minutes, degrees = 0, degrees + 1
+    segs[k].update(
+        ns=ns, degrees=degrees, minutes=minutes, seconds=seconds, ew=ew,
+        has_bearing=True, bearing_solved=True,
+    )
+
+
+def _segments_from_regex(
+    text: str, *, recover_orphans: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Стороны из текста по румбам. ``recover_orphans`` — собирать фрагменты без начала курса
+    (только для тела описания; в привязке COMMENCING такие фрагменты не трогаем).
+    """
     warnings: list[str] = []
     matches = _bearing_matches(text)
     if not matches:
@@ -3623,7 +3749,8 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
 
     wordy = _wordy_street_courses(text, matches)
     wordy_starts = [position for position, _ in wordy]
-    placed: list[tuple[int, dict[str, Any]]] = list(wordy)
+    orphans = _orphan_courses(text, matches, wordy_starts) if recover_orphans else []
+    placed: list[tuple[int, dict[str, Any]]] = list(wordy) + [(pos, seg) for pos, seg, _, _ in orphans]
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         # Длина этой стороны не ищется в следующем курсе без румба.
@@ -3667,7 +3794,18 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
         )
 
     placed.sort(key=lambda entry: entry[0])
-    return [seg for _, seg in placed], warnings
+    segs = [seg for _, seg in placed]
+    if orphans:
+        hints = {}
+        for pos, seg, ns_hint, ew_hint in orphans:
+            position = next(i for i, (_, s) in enumerate(placed) if s is seg)
+            hints[position] = (ns_hint, ew_hint)
+        _solve_orphan_bearing(segs, hints)
+        for pos, seg, _, _ in orphans:
+            if not seg.get("has_bearing", True):
+                continue
+            warnings.append("сторона без начала курса: румб вычислен по замыканию — сверьте с документом")
+    return segs, warnings
 
 
 def _street_mentions(text: str) -> list[tuple[int, str]]:
@@ -4027,9 +4165,11 @@ def _extract_streets(
             text,
             re.IGNORECASE,
         )
+        if distance_match is None:
+            distance_match = _DISTANT_OF_STREET_RE.search(text)
         if distance_match:
             feet_val = float(distance_match.group("num").replace(",", ""))
-            inch_raw = distance_match.group("inch")
+            inch_raw = distance_match.groupdict().get("inch")
             inch_val = float(inch_raw) / 12.0 if inch_raw else 0.0
             distance_to_corner = feet_val + inch_val
         elif preamble:
@@ -4138,7 +4278,7 @@ def parse_with_regex(
     # OCR пишет составные румбы через пробел («north westerly»): иначе не находится угол улицы.
     normalized = re.sub(r"\b(north|south)\s+(east|west)erly\b", r"\1\2erly", normalized, flags=re.IGNORECASE)
     preamble, lot_body = _split_preamble_and_body(normalized)
-    raw_segments, warnings = _segments_from_regex(lot_body)
+    raw_segments, warnings = _segments_from_regex(lot_body, recover_orphans=True)
     warnings.extend(spelled_notes)
     if not raw_segments:
         raise LegalDescriptionError(

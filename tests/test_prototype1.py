@@ -517,7 +517,8 @@ def test_llm_not_configured_raises_clear_error():
 
     cfg = load_config()
     cfg["api"]["api_key"] = ""
-    unchecked = (Path(__file__).parent / "data" / "lot114_ocr_p1.txt").read_text(encoding="utf-8")
+    # Хаотичный кеш (плитки 2×2): локально не сходится, значит ИИ нужен и ключа нет.
+    unchecked = (Path(__file__).parent / "data" / "lot114_cache_chaos.txt").read_text(encoding="utf-8-sig")
     with pytest.raises(LLMParseError):
         parse_legal_description_full(text=unchecked, cfg=cfg, use_llm=True)
 

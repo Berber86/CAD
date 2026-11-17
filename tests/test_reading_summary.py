@@ -40,14 +40,13 @@ def test_missing_bearing_is_counted_and_named():
     assert "НЕ СХОДИТСЯ" in line
 
 
-def test_summary_is_visible_in_simple_journal_even_when_long():
-    """Уровень «ключ» не режется порогом информационных строк упрощённого журнала."""
+def test_summary_is_hidden_in_simple_journal_and_shown_in_full():
+    """По решению пользователя строка «прочитано N из M» — только в подробном журнале."""
     out = llm_parser.parse_legal_description_full(text=CLEAN, use_llm=False, ask_on_doubt=True)
-    line = reading_summary(out.check)
-    assert len(line) > log_mode.SIMPLE_INFO_MAX_CHARS
-    assert log_mode.filter_entries([(log_mode.LEVEL_KEY, "12:00:00  " + line)], log_mode.SIMPLE) == [
-        "12:00:00  " + line
-    ]
+    line = "12:00:00  " + reading_summary(out.check)
+    entries = [(log_mode.LEVEL_INFO, line)]
+    assert log_mode.filter_entries(entries, log_mode.SIMPLE) == []
+    assert log_mode.filter_entries(entries, log_mode.FULL) == [line]
 
 
 def test_summary_without_score_says_not_read():

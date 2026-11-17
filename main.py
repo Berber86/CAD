@@ -9107,7 +9107,8 @@ class SurveyApp(ctk.CTk):
         elif kind == "consensus_label":
             self._last_consensus_label = payload
         elif kind == "reading_summary":
-            self._log_line(str(payload), level=log_mode.LEVEL_KEY)
+            # Информационная строка: только в подробном журнале (в упрощённом её нет по решению пользователя).
+            self._log_line(str(payload), level=log_mode.LEVEL_INFO)
         elif kind == "progress":
             self._set_status(str(payload))
         elif kind == "error":

@@ -7749,7 +7749,7 @@ class SurveyApp(ctk.CTk):
             return "ответ ИИ не лучше кеша — кеш не изменён"
         target = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
         try:
-            target.write_text(rendered, encoding="utf-8")
+            target.write_text(ocr_pages.description_key_lines(rendered) or rendered, encoding="utf-8")
         except OSError as exc:
             return f"кеш не записан: {exc}"
         return f"кеш Шага 0 обновлён ответом ИИ ({target.name})"
@@ -7875,7 +7875,11 @@ class SurveyApp(ctk.CTk):
                                     # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
                                     target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
                                     try:
-                                        target_cache.write_text(best_text, encoding="utf-8")
+                                        # В кеш — только строки описания участка (без шапки и страниц);
+                                        # если блок не найден — полный текст, чтобы не потерять данные.
+                                        target_cache.write_text(
+                                            ocr_pages.description_key_lines(best_text) or best_text, encoding="utf-8",
+                                        )
                                     except OSError:
                                         pass
 

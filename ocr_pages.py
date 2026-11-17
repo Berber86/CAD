@@ -319,6 +319,71 @@ def _line_key(line: str) -> str:
     return re.sub(r"[^a-z0-9]", "", line.lower())
 
 
+# Похожие по написанию символы, которыми OCR путает цифры (в числовом контексте).
+_DIGIT_LOOKALIKES = {"l": "1", "I": "1", "i": "1", "|": "1", "o": "0", "O": "0"}
+# Слова описания участка: вариант слова из этого списка выигрывает у «испорченного» варианта.
+_DESCRIPTION_WORDS = frozenset(
+    """avenue street boulevard road place thence beginning running feet degrees minutes seconds
+    north south east west northerly southerly easterly westerly northeasterly northwesterly
+    southeasterly southwesterly side corner formerly known distant point intersection of the along
+    land now or city york said and to from with line continuation thereof party first second part
+    coordinates which""".split()
+)
+
+
+def _is_numeric_token(token: str) -> bool:
+    core = token.strip(".,;:()\"'")
+    return bool(core) and any(c.isdigit() for c in core) and all(
+        c.isdigit() or c in _DIGIT_LOOKALIKES or c in ".," for c in core
+    )
+
+
+def vote_tokens(first: str, second: str) -> str:
+    """Выбор между двумя чтениями одного слова (разные рендеры одной страницы)."""
+    if first == second:
+        return first
+    if _is_numeric_token(first) and _is_numeric_token(second):
+        norm_first = "".join(_DIGIT_LOOKALIKES.get(c, c) for c in first)
+        norm_second = "".join(_DIGIT_LOOKALIKES.get(c, c) for c in second)
+        if norm_first == norm_second:
+            return norm_first  # l/i/o внутри числа — это 1 и 0
+        return first if sum(c.isdigit() for c in first) >= sum(c.isdigit() for c in second) else second
+    word_first = re.sub(r"[^a-z]", "", first.lower())
+    word_second = re.sub(r"[^a-z]", "", second.lower())
+    if word_first not in _DESCRIPTION_WORDS and word_second in _DESCRIPTION_WORDS:
+        return second
+    return first
+
+
+def _split_words(line: str) -> list[str]:
+    return re.findall(r"[^\s,;]+|[,;]", line)
+
+
+def vote_line(first: str, second: str) -> str:
+    """Слияние двух чтений одной строки по словам: там, где слово расходится с соседним один на один,
+    выбирается правдоподобный вариант (`vote_tokens`). Лишние слова не добавляются — это делает
+    выравнивание строк в `merge_line_texts`."""
+    import difflib  # noqa: PLC0415
+
+    # Запятая и «;» отделяются от слов: «Avenue,North» в одном рендере и «Avenue, North» в другом
+    # иначе дают разное число слов и выравнивание не работает.
+    a_tokens, b_tokens = _split_words(first), _split_words(second)
+    matcher = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False)
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "replace" and (i2 - i1) == (j2 - j1):
+            out.extend(vote_tokens(x, y) for x, y in zip(a_tokens[i1:i2], b_tokens[j1:j2]))
+        else:
+            out.extend(a_tokens[i1:i2])
+    return " ".join(out)
+
+
+def _vote_pair(x: str, y: str) -> str:
+    """Пара одной строки: основа — более длинная (обрыв короче), слова — голосование."""
+    base, other = (x, y) if len(x) >= len(y) else (y, x)
+    return vote_line(base, other)
+
+
 def merge_line_texts(primary: str, secondary: str, *, similar: float = 0.6) -> str:
     """
     Сливает два распознавания одной страницы (разные разрешения) строка за строкой.
@@ -359,7 +424,7 @@ def merge_line_texts(primary: str, secondary: str, *, similar: float = 0.6) -> s
                     if emitted_b not in pairs.values() and kb[emitted_b]:
                         out.append(b[emitted_b])
                     emitted_b += 1
-                out.append(a[i] if len(a[i]) >= len(b[j]) else b[j])
+                out.append(_vote_pair(a[i], b[j]))
                 emitted_b = j + 1
             else:
                 out.append(a[i])
@@ -372,10 +437,42 @@ def merge_line_texts(primary: str, secondary: str, *, similar: float = 0.6) -> s
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for i, j in zip(range(i1, i2), range(j1, j2)):
-                out.append(a[i] if len(a[i]) >= len(b[j]) else b[j])
+                out.append(_vote_pair(a[i], b[j]))
         else:
             merge_block(i1, i2, j1, j2)
     return "\n".join(out)
+
+
+_DESCRIPTION_START_RE = re.compile(r"\ball\s+that\b", re.IGNORECASE)
+_DESCRIPTION_END_RE = re.compile(r"point\s+or\s+place\s+of\s+beginn\w*", re.IGNORECASE)
+_BEGINNING_RE = re.compile(r"\bbeginn\w*\b", re.IGNORECASE)
+_DESCRIPTION_KEY_RE = re.compile(
+    r"\b(all\s+that|beginn\w*|thence|running|feet|foot|degree\w*|minute\w*|second\w*|distant|"
+    r"formerly|known\s+as|corner|intersection|point\s+or\s+place|north\w*|south\w*|east\w*|west\w*|"
+    r"continuation|land\s+now|coordinates|along|thereof|premises)\b|°",
+    re.IGNORECASE,
+)
+
+
+def description_key_lines(text: str) -> str:
+    """Строки описания участка для кеша: блок от «ALL that certain» до «point or place of BEGINNING»,
+    без шапки документа и номеров страниц. Если блок не найден, возвращается пустая строка —
+    тогда кеш сохраняет полный текст, а не теряет данные."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    start = next((i for i, line in enumerate(lines) if _DESCRIPTION_START_RE.search(line)), None)
+    if start is None:
+        start = next((i for i, line in enumerate(lines) if _BEGINNING_RE.search(line)), None)
+    if start is None:
+        return ""
+    end = next(
+        (j for j in range(start, len(lines)) if _DESCRIPTION_END_RE.search(lines[j])), len(lines) - 1,
+    )
+    kept = []
+    for line in lines[start:end + 1]:
+        alnum = len(re.sub(r"\W", "", line))
+        if _DESCRIPTION_KEY_RE.search(line) or (alnum >= 4 and re.search(r"\d", line)):
+            kept.append(line)
+    return "\n".join(kept)
 
 
 def _page_tiles(page: Any, dpi: int, tile: int, folder: Path) -> list[Path]:

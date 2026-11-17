@@ -346,14 +346,14 @@ class OcrPass:
     seconds: float = 0.0
     pages: tuple[int, int] = (1, 1)
     dpi: int = SCAN_OCR_DPI
+    #: True — рендер ровно на dpi; False — по нативному разрешению скана (второй рендер).
+    exact: bool = True
 
     def summary(self) -> str:
         if self.error:
             return f"ошибка за {self.seconds:.1f} с: {self.error}"
-        return (
-            f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, "
-            f"рендер {self.dpi} dpi"
-        )
+        how = f"рендер {self.dpi} dpi" if self.exact else "рендер по разрешению скана"
+        return f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, {how}"
 
 
 #: Курс «north/south … east/west» в свободном тексте — для оценки, когда разбор не удался.
@@ -384,6 +384,7 @@ def text_quality(text: str) -> tuple[int, int, int]:
 
 def ocr_scan_once(
     path: str | Path, source: dict[str, Any] | None, *, progress: Callable[[str], None] | None = None,
+    exact: bool = True,
 ) -> OcrPass:
     """
     Единственный проход локального OCR для скана в фоновом разборе.
@@ -399,18 +400,19 @@ def ocr_scan_once(
     try:
         first, last = pages_from_spec(src.get("ocr_pages") or src.get("pdf_pages") or "1")
     except PDFError as exc:
-        return OcrPass(error=str(exc), seconds=0.0, dpi=SCAN_OCR_DPI)
+        return OcrPass(error=str(exc), seconds=0.0, dpi=SCAN_OCR_DPI, exact=exact)
     pages = (first, last)
     try:
         text = ocr_pages.ocr_pdf_pages(
-            pdf, first, last, dpi=SCAN_OCR_DPI, progress=progress, use_cache=False, exact_dpi=True,
+            pdf, first, last, dpi=SCAN_OCR_DPI, progress=progress, use_cache=False, exact_dpi=exact,
         )
     except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
         return OcrPass(
-            error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI,
+            error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages,
+            dpi=SCAN_OCR_DPI, exact=exact,
         )
     return OcrPass(
-        text=text.strip(), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI,
+        text=text.strip(), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI, exact=exact,
     )
 
 

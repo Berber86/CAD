@@ -315,6 +315,69 @@ def _lines_to_text(result: Any) -> str:
     return "\n".join(text for _y, _x, text in rows)
 
 
+def _line_key(line: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", line.lower())
+
+
+def merge_line_texts(primary: str, secondary: str, *, similar: float = 0.6) -> str:
+    """
+    Сливает два распознавания одной страницы (разные разрешения) строка за строкой.
+
+    Один рендер иногда теряет целую строку, а другой — расстояние до угла. Строки выравниваются
+    по порядку. Для похожих строк берётся более длинная: обрыв из-за куска или ошибки чтения
+    делает строку короче. Строки второго текста, которых нет в первом, вставляются на место
+    перед ближайшей совпавшей строкой.
+    """
+    import difflib  # noqa: PLC0415
+
+    a = [line for line in primary.splitlines() if line.strip()]
+    b = [line for line in secondary.splitlines() if line.strip()]
+    ka = [_line_key(line) for line in a]
+    kb = [_line_key(line) for line in b]
+    out: list[str] = []
+
+    def merge_block(ia1: int, ia2: int, jb1: int, jb2: int) -> None:
+        # Сопоставляем жадно: для каждой строки второго текста — лучшая непарная строка первого.
+        pairs: dict[int, int] = {}
+        taken: set[int] = set()
+        for j in range(jb1, jb2):
+            best_i, best_r = -1, 0.0
+            for i in range(ia1, ia2):
+                if i in taken or not kb[j] or not ka[i]:
+                    continue
+                ratio = difflib.SequenceMatcher(None, ka[i], kb[j]).ratio()
+                if ratio > best_r:
+                    best_i, best_r = i, ratio
+            if best_i >= 0 and best_r >= similar:
+                pairs[best_i] = j
+                taken.add(best_i)
+        emitted_b = jb1
+        for i in range(ia1, ia2):
+            if i in pairs:
+                j = pairs[i]
+                while emitted_b < j:  # несопоставленные строки второго текста перед парой
+                    if emitted_b not in pairs.values() and kb[emitted_b]:
+                        out.append(b[emitted_b])
+                    emitted_b += 1
+                out.append(a[i] if len(a[i]) >= len(b[j]) else b[j])
+                emitted_b = j + 1
+            else:
+                out.append(a[i])
+        while emitted_b < jb2:
+            if emitted_b not in pairs.values() and kb[emitted_b]:
+                out.append(b[emitted_b])
+            emitted_b += 1
+
+    matcher = difflib.SequenceMatcher(None, ka, kb, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                out.append(a[i] if len(a[i]) >= len(b[j]) else b[j])
+        else:
+            merge_block(i1, i2, j1, j2)
+    return "\n".join(out)
+
+
 def _page_tiles(page: Any, dpi: int, tile: int, folder: Path) -> list[Path]:
     """Куски страницы в порядке чтения (слева направо, сверху вниз)."""
     import pymupdf  # noqa: PLC0415 - уже зависимость программы

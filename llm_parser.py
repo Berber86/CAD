@@ -3149,7 +3149,7 @@ _STOP_WORDS = {
 # OCR путает цифры с буквами внутри числа: «1l5.15», «lio.68», «1O0 feet».
 # Исправляется только токен, в котором есть цифра и который стоит перед «.dd» или «feet».
 _OCR_NUMBER_RE = re.compile(
-    r"(?<![A-Za-z])([0-9Il|iOo]{2,8})(?=\.\d{2}\b|\s*(?:feet|foot|ft\b|'))"
+    r"(?<![A-Za-z])([0-9Il|iOo]{2,8})(?=\.\d{2}\b|\s*(?:feet|foot|ft\b|'|\s+degr\w*|\s+ainut\w*|\s+minut\w*|\s+secon\w*|\s+scconds))"
 )
 _OCR_DIGIT_TABLE = str.maketrans({"l": "1", "I": "1", "|": "1", "i": "1", "O": "0", "o": "0"})
 
@@ -3168,22 +3168,86 @@ _OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"northweaterly", "northwesterly"),
         (r"thcreof", "thereof"),
         (r"Descrlbed", "Described"),
+        # Из реальных сканов (3.55): направления, единицы, союзы и названия улиц.
+        (r"wcat|wcst", "west"),
+        (r"ainutes|minutcs", "minutes"),
+        (r"scconds|secouds", "seconds"),
+        (r"degreca|degrccs|degrces", "degrees"),
+        (r"snid", "said"),
+        (r"Bouth", "South"),
+        (r"Avcnue|Avenuc", "Avenue"),
+        (r"Statea", "Staten"),
+        (r"thcrcof", "thereof"),
+        (r"northwcsterly|northweaterly", "northwesterly"),
+        (r"northeaterly|northcasterly", "northeasterly"),
     )
 )
+
+#: Словарь юридических слов для поиска опечаток: слово из 6+ букв в нижнем регистре,
+#: отличающееся на одну букву от слова словаря, заменяется на него. Короче — не трогаем.
+_LEGAL_VOCAB: frozenset[str] = frozenset(
+    "degrees minutes seconds feet thence northerly southerly easterly westerly "
+    "northeasterly northwesterly southeasterly southwesterly beginning distant formerly "
+    "intersection continuation thereof premises described running standard deed corner "
+    "centerline abutting adjoining mentioned northeast northwest southeast southwest "
+    "between avenue street boulevard "
+    .split()
+)
+_LOWER_WORD_RE = re.compile(r"\b[a-z]{6,}\b")
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    i = j = edits = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+            j += 1
+        elif len(a) > len(b):
+            i += 1
+        else:
+            j += 1
+    return edits + (len(a) - i) + (len(b) - j) <= 1
+
+
+def _fix_vocab_typos(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        word = match.group(0)
+        if word in _LEGAL_VOCAB:
+            return word
+        hits = [v for v in _LEGAL_VOCAB if abs(len(v) - len(word)) <= 1 and _within_one_edit(word, v)]
+        return hits[0] if len(hits) == 1 else word
+
+    return _LOWER_WORD_RE.sub(repl, text)
 
 
 def _fix_ocr_words(text: str) -> str:
     for pattern, repl in _OCR_WORD_FIXES:
         text = pattern.sub(repl, text)
-    return text
+    return _fix_vocab_typos(text)
 
 
 # Номера строк и помехи на полях скана: отдельные строки «7331», «0», «o».
-_MARGIN_NOISE_LINE_RE = re.compile(r"(?m)^[ \t]*(?:[0-9|]{1,4}|[oO])[ \t]*(?:\n|\Z)")
+_MARGIN_NOISE_LINE_RE = re.compile(r"(?m)^[ \t]*(?:[0-9|]{1,6}|[oO])[ \t]*(?:\n|\Z)")
+# Штамп на полях (REEL / PAGE с номерами, «3 1 8 2», «0 0 7») может попасть в середину строки.
+_STAMP_WORD_RE = re.compile(r"\b(?:REEL|PAGE)\b", re.IGNORECASE)
+_STAMP_DIGITS_LINE_RE = re.compile(r"(?m)^[ \t]*(?:\d[ \t]+){2,}\d[ \t]*(?:\n|\Z)")
 
 
 def _drop_margin_noise(text: str) -> str:
-    return _MARGIN_NOISE_LINE_RE.sub("", text)
+    text = _MARGIN_NOISE_LINE_RE.sub("", text)
+    text = _STAMP_DIGITS_LINE_RE.sub("", text)
+    return _STAMP_WORD_RE.sub("", text)
 
 
 def _fix_ocr_number_tokens(text: str) -> str:

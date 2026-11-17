@@ -7768,12 +7768,33 @@ class SurveyApp(ctk.CTk):
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
                                 else:
+                                    best_text = ocr.text
+                                    # Проверка не пройдена: второй рендер по нативному разрешению и слияние
+                                    # строк двух распознаваний. Одиночный рендер иногда теряет строку.
+                                    if ocr_candidate.status_rank < _STATUS_OK_RANK:
+                                        second = ocr_scan_once(job.path, job.source, progress=progress_of, exact=False)
+                                        progress_of(f"{job.path.name}: второй рендер — {second.summary()}")
+                                        if second.text:
+                                            variants = [(ocr.text, ocr_candidate)]
+                                            merged = ocr_pages.merge_line_texts(ocr.text, second.text)
+                                            for text_v in (second.text, merged):
+                                                try:
+                                                    variants.append((text_v, judge({"text": text_v}, False)))
+                                                except Exception as exc:  # noqa: BLE001
+                                                    last_exc = exc
+                                            text_best, cand_best = max(variants, key=lambda v: v[1].rank)
+                                            if cand_best.rank > ocr_candidate.rank:
+                                                progress_of(
+                                                    f"{job.path.name}: слияние двух рендеров дало "
+                                                    f"{'ok' if cand_best.status_rank >= _STATUS_OK_RANK else 'неполный'} разбор"
+                                                )
+                                                best_text, ocr_candidate = text_best, cand_best
                                     if best is None or ocr_candidate.rank > best.rank:
                                         best = ocr_candidate
                                         # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
                                         target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
                                         try:
-                                            target_cache.write_text(ocr.text, encoding="utf-8")
+                                            target_cache.write_text(best_text, encoding="utf-8")
                                         except OSError:
                                             pass
 

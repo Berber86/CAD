@@ -353,17 +353,18 @@ def test_key_status_names_the_reason_when_missing_everywhere(gui, monkeypatch):
     assert "не задан API-ключ" in reason
 
 
-def test_background_worker_runs_one_pass_and_reports_it(gui, tmp_path, monkeypatch):
+def test_clean_scan_is_read_once_without_a_second_render(gui, tmp_path, monkeypatch):
+    """Чистый текст с первого прохода (статус ok): второго рендера нет."""
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
     progress: list[str] = []
     done: dict = {}
-    calls: list[int] = []
+    calls: list[bool] = []
 
     def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
                  use_cache=True, tile=1, exact_dpi=False):
-        calls.append(tile)
-        return LEGAL
+        calls.append(exact_dpi)
+        return CLEAN
 
     monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", fake_ocr)
 
@@ -382,9 +383,60 @@ def test_background_worker_runs_one_pass_and_reports_it(gui, tmp_path, monkeypat
     _run_worker(gui, stub, job)
     results, _ = done["payload"]
     assert results[0].error == ""
-    assert results[0].plan is not None
-    assert calls == [1], "один проход, без кусков 2×2"
-    assert any("OCR —" in line and "без кеша" in line for line in progress), progress
+    assert calls == [True], "один проход: статус ok, второй рендер не нужен"
+    assert not any("второй рендер" in line for line in progress), progress
+
+
+# Строки одного описания: 4 стороны, расстояние до угла в строке 1.
+FULL_LINES = [
+    "ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on the northwesterly side of Stafford Avenue,",
+    "distant 161.00 feet southwesterly from the corner formed by the intersection of the northwesterly side of Stafford Avenue",
+    "and the southwesterly side of Carlton Boulevard; RUNNING THENCE North 56 degrees 36 minutes 12 seconds West 100.00 feet",
+    "to a point; THENCE South 33 degrees 23 minutes 48 seconds West 40.00 feet to a point;",
+    "THENCE South 56 degrees 36 minutes 12 seconds East 100.00 feet to a point;",
+    "THENCE North 33 degrees 23 minutes 48 seconds East 40.00 feet to the point or place of BEGINNING.",
+]
+
+
+def test_second_render_is_merged_when_the_first_pass_loses_a_line(gui, tmp_path, monkeypatch):
+    """
+    Регресс OUR LOT 114: один рендер теряет расстояние до угла, другой — сторону.
+    Проверка первого прохода не ok → второй рендер → слияние строк даёт ok.
+    """
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    primary = "\n".join(line for i, line in enumerate(FULL_LINES) if i not in (1, 2))  # без расстояния
+    secondary = "\n".join(line for i, line in enumerate(FULL_LINES) if i != 4)  # без стороны 3
+    calls: list[bool] = []
+    done: dict = {}
+
+    def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+                 use_cache=True, tile=1, exact_dpi=False):
+        calls.append(exact_dpi)
+        return primary if exact_dpi else secondary
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", fake_ocr)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job)
+    results, _ = done["payload"]
+    assert calls == [True, False], calls
+    assert results[0].error == ""
+    assert results[0].outcome.data.distance_to_corner_ft == pytest.approx(161.0)
+    assert len(results[0].outcome.data.segments) == 4
+    assert results[0].outcome.check.status == "ok"
+    written = list(tmp_path.glob("*_text.txt"))
+    assert len(written) == 1, written
+    assert "distant 161.00 feet" in written[0].read_text(encoding="utf-8")
 
 
 def test_background_worker_reports_ocr_error(gui, tmp_path, monkeypatch):

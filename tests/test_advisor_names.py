@@ -178,3 +178,32 @@ def test_rename_printed_in_one_lot_is_shared_by_the_whole_set():
     assert not lot_b.description.street_aliases
     note, warn = _check_street_reference_and_frontage(scene.plan(lot_a), scene.plan(lot_b))
     assert not warn and "Amboy Road" in note  # общий перекрёсток: предупреждения о разных углах нет
+
+
+def test_advisor_prompt_teaches_gluing_sides_and_anchoring():
+    """Советник знает правила склейки общих сторон и привязки к углу; не выдумывает расстояний."""
+    import conflict_resolver
+
+    prompt = conflict_resolver.ADVISOR_SYSTEM_PROMPT
+    assert "GLUING SIDES AND ANCHORING" in prompt
+    assert "shared boundary" in prompt
+    assert "several parcels" in prompt
+    assert "Do not invent a distance" in prompt
+    assert "Never change side lengths" in prompt
+    assert "Python applies your proposal on its own" in prompt
+
+
+def test_advisor_verified_needs_closed_contour_and_fitting_shared_boundaries():
+    """Советник применяется сам только при замкнутом контуре и совпадении общей межи."""
+    from conflict_resolver import Metrics, advisor_verdict, judge
+
+    before = Metrics(closure_ft=3.0, overlap_sqft=500.0, edge_errors=2, edge_warnings=0, gap_ft=0.0)
+    fitted = Metrics(closure_ft=0.01, overlap_sqft=0.0, edge_errors=0, edge_warnings=0, gap_ft=0.0)
+    misfit = Metrics(closure_ft=0.01, overlap_sqft=0.0, edge_errors=1, edge_warnings=0, gap_ft=0.0)
+    open_lot = Metrics(closure_ft=0.5, overlap_sqft=0.0, edge_errors=0, edge_warnings=0, gap_ft=0.0)
+
+    assert judge(before, fitted) == "verified"
+    assert advisor_verdict(before, fitted) == "verified"
+    assert advisor_verdict(before, misfit) == "partial"
+    assert advisor_verdict(before, open_lot) != "verified"
+    assert advisor_verdict(None, fitted) == "rejected"

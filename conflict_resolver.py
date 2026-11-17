@@ -610,6 +610,20 @@ def judge(before: Metrics | None, after: Metrics | None) -> str:
     return "verified" if closure_ok and not overlap_worse else "partial"
 
 
+def advisor_verdict(before: Metrics | None, after: Metrics | None) -> str:
+    """
+    Вердикт совета ИИ. Советник получает ``verified`` (его можно применить одним действием
+    «все подтверждённые») только если контур замыкается, наложения нет и общие межи совпадают
+    с соседями (ни одной ошибки стыка). Иначе вердикт остаётся ``partial`` — решает геодезист.
+    """
+    verdict = judge(before, after)
+    if verdict != "verified" or after is None:
+        return verdict
+    if after.closure_ft > CLOSURE_LIMIT_FT or after.edge_errors > 0:
+        return "partial"
+    return verdict
+
+
 def _proposal_id(lot: LotInput, changes: Sequence[Change]) -> str:
     raw = lot.key + "|" + "|".join(
         f"{c.target}:{c.index}:{c.field}:{c.new_label}:{c.distance_ft:.4f}" for c in changes
@@ -1253,6 +1267,13 @@ WORK THROUGH THIS CHECKLIST FOR EVERY REMAINING CONFLICT:
 6. The lots are not actually adjacent, or the wrong page or the wrong parcel was parsed.
 7. A genuine conflict between the recorded documents (the overlap or gap exists on paper). Say so plainly.
 
+GLUING SIDES AND ANCHORING A NEIGHBOUR TO A CORNER (read before you propose any tie change):
+- A shared boundary is a side of one lot that lies on the same line as a side of another lot: the two bearings are reversed (for example S 56 degrees 36 minutes 12 seconds E against N 56 degrees 36 minutes 12 seconds W) and the lengths are equal, or one length is a part of the other. A deeper lot's side may run past a shorter neighbour's side; the rest of it then borders a third lot. This is not an error. Check this on the printed values before you blame a tie or a length.
+- A lot may consist of several parcels printed in ONE document ("PARCEL I", "PARCEL II", "Parcel II being the same premises ..."). They form one lot. If a neighbour's point of beginning or side lies on the outer boundary of such a parcel and the figure does not contain that parcel, the figure is incomplete. Say so in the explanation. The operations you have cannot add a parcel: do not invent sides for it.
+- Anchoring: a neighbour's figure is attached to our figure through the street corner its own text names. Re-tying it to a different corner (cross_street, street_alias, or a tie distance) is allowed only when the names and numbers are printed in that lot's own text. If the neighbour's tie is measured from a corner whose position relative to our corner is not printed in any document (for example "distant 965.57 feet southeasterly from the corner formed by ... Boulevard and ... Road" while no document gives the distance from that corner to our corner), you cannot compute the offset. Do not invent a distance. Say that the neighbour must be placed by the shared boundary, name the two sides that coincide, and state which printed distance would settle it.
+- When our side and the neighbour's side coincide in direction and length but the neighbour's polygon sits off by a distance, the cause is the anchor (the tie), not the side lengths. Never change side lengths to remove that offset.
+- Python applies your proposal on its own only when the lot closes, nothing overlaps and every shared boundary fits its neighbour; otherwise the surveyor decides. Propose the change anyway when the printed values support it.
+
 HARD RULES:
 - Never invent numbers. A proposed value must be printed in one of the documents (quote the words) or follow from printed values by arithmetic that you state.
 - Never change a value only to make a polygon close.
@@ -1727,7 +1748,7 @@ def _advisor_proposals(
         before = scene.metrics(lot, base, state=scene.virtual)
         after = scene.metrics(lot, base + tuple(changes), state=scene.virtual)
         # Правка названий геометрию не меняет: её подтверждает напечатанный текст, а не замер.
-        verdict = "partial" if name_only and before is not None and after is not None else judge(before, after)
+        verdict = "partial" if name_only and before is not None and after is not None else advisor_verdict(before, after)
         if verdict == "rejected" or before is None or after is None:
             detail = (
                 "участок с такой правкой не строится" if after is None or before is None

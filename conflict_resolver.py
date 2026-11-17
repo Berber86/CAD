@@ -1853,7 +1853,7 @@ JOIN_SHIFT_TOLERANCE_DEG = ALTERNATE_AXIS_TOLERANCE_ARCSEC / 3600.0
 #: Допуск, на котором общая межа считается лежащей на одной прямой.
 JOIN_LINE_TOLERANCE_FT = 0.05
 #: Общая межа должна совпасть не меньше чем на эту долю длины большей из двух сторон (исключает дикие совпадения).
-JOIN_MIN_SHARED_FRACTION = 0.40
+JOIN_MIN_SHARED_FRACTION = 0.10
 
 
 def _wrap_rad(angle: float) -> float:

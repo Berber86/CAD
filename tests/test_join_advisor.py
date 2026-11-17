@@ -319,9 +319,9 @@ def test_join_finds_the_same_direction_fit_for_an_opposite_winding_neighbour():
     assert advisor_verdict(before, after) == "partial"
 
 
-@pytest.mark.parametrize("neighbour_side_ft, accepted", [(30.0, False), (45.0, True)])
-def test_shared_boundary_must_cover_forty_percent_of_the_longer_side(neighbour_side_ft, accepted):
-    """Наша сторона 100 ft: общая межа 30 ft (30%) отклоняется, 45 ft (45%) принимается."""
+@pytest.mark.parametrize("neighbour_side_ft, accepted", [(5.0, False), (15.0, True)])
+def test_shared_boundary_must_cover_ten_percent_of_the_longer_side(neighbour_side_ft, accepted):
+    """Наша сторона 100 ft: общая межа 5 ft (5%) отклоняется, 15 ft (15%) принимается."""
     from conflict_resolver import _join_candidates
 
     ours_sides = [
@@ -343,4 +343,4 @@ def test_shared_boundary_must_cover_forty_percent_of_the_longer_side(neighbour_s
         assert candidates and problem is None
     else:
         assert candidates == []
-        assert "нужно не меньше 40.00 ft" in problem
+        assert "нужно не меньше 10.00 ft" in problem

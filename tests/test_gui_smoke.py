@@ -365,7 +365,13 @@ def gui(monkeypatch, tmp_path):
     # sample config while preserving its real defaults for every smoke test.
     import llm_parser
     config_path = tmp_path / "config.json"
-    config_path.write_bytes((ROOT / "config.json").read_bytes())
+    # Черновик для печати — отдельный план при «Начертить». Подсчёты отрисовки в этих тестах
+    # относятся к основной схеме, поэтому черновик выключен; его проверяет
+    # test_print_draft_is_added_only_for_main_lot_when_enabled ниже и tests/test_print_draft.py.
+    import json as _json  # noqa: PLC0415
+    _cfg_data = _json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    _cfg_data.setdefault("print_draft", {})["enabled"] = False
+    config_path.write_text(_json.dumps(_cfg_data, ensure_ascii=False, indent=2), encoding="utf-8")
     local_config_path = tmp_path / "config.local.json"
     env_path = tmp_path / ".env"
     for module in (llm_parser, gui_module):
@@ -4354,3 +4360,30 @@ def test_log_mode_switch_saves_to_config_and_keeps_other_keys(gui):
     app.log_mode_var.set(False)
     app._apply_log_mode()
     assert json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))["ui"]["log_mode"] == "simple"
+
+
+def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
+    """«Начертить» добавляет черновик для печати только к основному участку и только при enabled."""
+    from types import SimpleNamespace
+
+    from llm_parser import ASPENWALL_SAMPLES, load_config, parse_with_regex
+
+    main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    main_plan = gui.AcadBuilder(load_config()).plan(main_desc, scale=10, is_neighbor=False)
+    print_cfg = dict(load_config().get("print_draft") or {})
+    assert print_cfg, "в config.json должна быть секция print_draft"
+
+    def owner(plan, enabled):
+        cfg = {"print_draft": {**print_cfg, "enabled": enabled}}
+        return SimpleNamespace(
+            _preview_main_plan=plan, config_data=cfg, _plan_source_labels={id(plan): "тест"},
+        )
+
+    drafts = gui.SurveyApp._print_draft_plans(owner(main_plan, True))
+    assert len(drafts) == 1
+    name, draft = drafts[0]
+    assert name.startswith("Черновик для печати") and draft.print_draft is True
+    assert draft.is_neighbor is False
+    assert gui.SurveyApp._print_draft_plans(owner(main_plan, False)) == []
+    assert gui.SurveyApp._print_draft_plans(owner(None, True)) == []
+

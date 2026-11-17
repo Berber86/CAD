@@ -1251,7 +1251,8 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
-    assert result.warnings == []
+    # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
+    assert [w for w in result.warnings if "окно листа" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
@@ -2820,6 +2821,7 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     for layer, edges in (("PROPERTY_LINE", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
         lines = [line for line in space.lines if line.Layer == layer]
         assert len(lines) == len(edges)
+        # Перекрёсток (0, 0) плана в AutoCAD встаёт в окно листа (5000, 5000) — см. config drawing.
         for line, (start, end) in zip(lines, edges):
-            assert line.StartPoint == pytest.approx([*start, 0])
-            assert line.EndPoint == pytest.approx([*end, 0])
+            assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
+            assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])

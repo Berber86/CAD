@@ -111,7 +111,24 @@
     "leave_gap_open": true,
     "rounding_gap_tolerance_ft": 0.015,
     "zoom_extents": true,
-    "zoom_margin_scale": 0.84
+    "zoom_margin_scale": 0.84,
+    "sheet_origin_ft": [5000.0, 5000.0],
+    "sheet_window_ft": [5000.0, 8000.0]
+  },
+  "print_draft": {
+    "enabled": true,
+    "shift_ft": [1000.0, 0.0],
+    "tie_length_ft": 40.0,
+    "layers": {
+      "property_line": "PROPERTY_LINE_PRINT",
+      "boundary_text": "BOUNDARY_TEXT_PRINT",
+      "street_row": "STREET_ROW_PRINT"
+    },
+    "layer_colors": {
+      "property_line": 7,
+      "boundary_text": 7,
+      "street_row": 1
+    }
   },
   "layers": {
     "property_line": "PROPERTY_LINE",

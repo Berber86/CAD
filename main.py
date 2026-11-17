@@ -70,6 +70,7 @@ from acad_builder import (
     AcadBuilderError,
     AcadConnectionError,
     DrawPlan,
+    make_print_draft,
     DrawResult,
     FeatureLabelResult,
     LotSuspicionReport,
@@ -9991,8 +9992,21 @@ class SurveyApp(ctk.CTk):
         self._busy = True
         self._set_controls_busy(True)
         self.progress.start()
+        # Черновик для печати — отдельным планом, первым: итоговым результатом остаётся основной участок.
+        draw_plans = (self._print_draft_plans() + plans) if not neighbors_only else plans
         self._set_status(f"Рисую рассчитанную схему в AutoCAD: {len(plans)} уч. Без повторного разбора и запроса к ИИ…")
-        self._start_background(self._draw_scene_worker, args=(plans, cfg))
+        self._start_background(self._draw_scene_worker, args=(draw_plans, cfg))
+
+    def _print_draft_plans(self) -> list[tuple[str, DrawPlan]]:
+        """Черновик для печати из основного участка: без соседей, на +1000 по X, отдельные слои."""
+        main = self._preview_main_plan
+        if main is None or main.is_neighbor:
+            return []
+        print_cfg = dict((self.config_data or {}).get("print_draft") or {})
+        if not print_cfg.get("enabled", False):
+            return []
+        label = self._plan_source_labels.get(id(main), "текст")
+        return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg))]
 
     def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any]) -> None:
         post = self._worker_poster()

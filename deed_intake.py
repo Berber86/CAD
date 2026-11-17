@@ -5,7 +5,8 @@
 
 1. ``rcclerk.results_url`` → страница списка документов участка;
 2. ``rcclerk.parse_document_rows`` + ``rcclerk.choose_documents`` → что качать
-   (Deed, иначе Mortgage; нашему лоту — свежий и старый, соседу — свежий);
+   (Deed новее 2015 года, иначе свежая Mortgage с 2015 года и древний Deed как старый;
+   нашему лоту — свежий и старый, соседу — свежий);
 3. ``rcclerk.download_with_fallback`` → лестница «прямо → браузер → человек»;
 4. ``deed_pages`` + ``deed_store`` → страницы описания, обрезанная копия, имя,
    паспорт, ``_manifest.json``.
@@ -245,7 +246,11 @@ def collect_deeds(
                 f"страница пустая или устроена иначе: {rcclerk.results_url(block_no, lot_value, base=base_url)}"
             )
             continue
-        say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}")
+        listed = "; ".join(
+            f"{row.doc_type or '?'} {row.doc_date.strftime('%d.%m.%Y') if row.doc_date else 'без даты'}"
+            for row in rows
+        )
+        say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}: {listed}")
         chosen = rcclerk.choose_documents(
             rows, role=role, with_old_for_neighbour=with_old_for_neighbour
         )

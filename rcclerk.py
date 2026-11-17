@@ -5,7 +5,8 @@
 
 1. по block/lot открывается список документов участка:
    ``/Search/ShowResultsBlocks/0?Block=6323&Lot=32&SelectedDocumentIdentifier=0``;
-2. в списке берутся строки **Deed**, а если их нет — **Mortgage**;
+2. в списке берутся строки **Deed** новее 2015 года; если такого нет, а есть **Mortgage**
+   с 2015 года — берётся она (NEW), а самый древний **Deed** становится OLD;
 3. по строке открывается карточка ``/Search/ViewDocumentInfo/<id>``, а из неё —
    сам PDF ``/ViewVscmsDocument/ViewContent?p_endorsementId=<id>``;
 4. для **нашего** лота качаются самый свежий и самый старый документ, для
@@ -386,27 +387,56 @@ def _sorted_by_date(rows: Iterable[DeedRow]) -> list[DeedRow]:
     return sorted(dated, key=lambda row: (row.doc_date, -row.index)) + undated
 
 
+#: Deed имеет приоритет над Mortgage, только если он новее этого года (правило Коли, 17.11.2026).
+#: Mortgage, начиная с этого года, при отсутствии свежего Deed становится NEW, а древний Deed — OLD.
+DEED_PRIORITY_FROM_YEAR = 2015
+
+
+def _is_fresh(row: DeedRow) -> bool:
+    return row.doc_date is not None and row.doc_date.year >= DEED_PRIORITY_FROM_YEAR
+
+
 def choose_documents(
     rows: Iterable[DeedRow], *, role: str = "our", with_old_for_neighbour: bool = False
 ) -> list[tuple[DeedRow, str]]:
     """
     Какие документы качать: ``[(строка, "NEW" | "OLD"), …]``.
 
-    Правило Коли: ищем Deed; если Deed нет — Mortgage. Для нашего участка берём
-    самый свежий **и самый старый** документ, для соседей — только свежий
+    Правило Коли:
+
+    * есть Deed новее ``DEED_PRIORITY_FROM_YEAR`` → NEW = самый свежий Deed;
+    * иначе, если есть Mortgage с ``DEED_PRIORITY_FROM_YEAR`` года и позже → NEW = самая
+      свежая такая ипотека, а OLD (только для нашего участка) = самый древний Deed;
+    * иначе, если Deed есть → как раньше: NEW = самый свежий Deed, OLD = самый древний;
+    * иначе Mortgage: NEW = самая свежая, OLD = самая древняя.
+
+    Для нашего участка берём свежий **и** старый, для соседей — только свежий
     (``with_old_for_neighbour`` добавляет старый, когда с межой соседа проблемы).
+    Строка без даты не считается «новее 2015 года».
     """
     rows = list(rows)
     deeds = [row for row in rows if row.is_deed]
-    pool = deeds or [row for row in rows if row.is_mortgage]
-    if not pool:
+    mortgages = [row for row in rows if row.is_mortgage]
+    fresh_deeds = [row for row in deeds if _is_fresh(row)]
+    fresh_mortgages = [row for row in mortgages if _is_fresh(row)]
+    if not deeds and not mortgages:
         return []
-    ordered = _sorted_by_date(pool)
-    dated = [row for row in ordered if row.doc_date is not None]
-    # «Свежий» — самый поздний из датированных: строка без даты не может быть
-    # новее документа 2019 года, её честное место — среди старых.
-    newest = dated[-1] if dated else ordered[-1]
-    oldest = next((row for row in ordered if row.endorsement_id != newest.endorsement_id), None)
+    if deeds and not fresh_deeds and fresh_mortgages:
+        # Древний Deed не побеждает свежую ипотеку: ипотека — NEW, Deed — OLD.
+        newest = _sorted_by_date(fresh_mortgages)[-1]
+        oldest_pool = deeds
+    else:
+        pool = deeds or mortgages
+        ordered = _sorted_by_date(pool)
+        dated = [row for row in ordered if row.doc_date is not None]
+        # «Свежий» — самый поздний из датированных: строка без даты не может быть
+        # новее документа 2019 года, её честное место — среди старых.
+        newest = dated[-1] if dated else ordered[-1]
+        oldest_pool = pool
+    oldest = next(
+        (row for row in _sorted_by_date(oldest_pool) if row.endorsement_id != newest.endorsement_id),
+        None,
+    )
     take_old = role == "our" or with_old_for_neighbour
     chosen: list[tuple[DeedRow, str]] = [(newest, NEW_TAG)]
     if take_old and oldest is not None:

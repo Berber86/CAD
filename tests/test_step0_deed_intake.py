@@ -157,6 +157,66 @@ def test_rows_without_dates_do_not_break_the_choice():
     assert [tag for _row, tag in chosen] == ["NEW", "OLD"]
 
 
+# Правило Коли (уточнение 17.11.2026): приоритет Deed над Mortgage — только если Deed
+# новее 2015 года. Если свежего Deed нет, а есть Mortgage с 2015 года — NEW становится
+# свежая ипотека, а древний Deed — OLD (для нашего участка).
+
+
+def test_old_deed_and_fresh_mortgage_make_the_mortgage_new_and_the_deed_old():
+    """Сценарий заказчика: Deed 1985 и Mortgage 2025 → NEW = ипотека 2025, OLD = Deed 1985."""
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("900001", "NEW"), ("351707", "OLD"),
+    ]
+
+
+def test_neighbour_gets_only_the_fresh_mortgage_when_the_deed_is_old():
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="neighbour")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [("900001", "NEW")]
+
+
+def test_fresh_deed_still_beats_a_newer_mortgage():
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        (str(NEWEST_ID), "Deed", "05/14/2019"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        (str(NEWEST_ID), "NEW"), ("351707", "OLD"),
+    ]
+
+
+def test_old_deed_with_an_old_mortgage_keeps_the_deed_as_new():
+    """Ипотека до 2015 не даёт права стать NEW: остаётся Deed, как и раньше."""
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "01/09/2002"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [("351707", "NEW")]
+
+
+def test_oldest_deed_becomes_old_when_several_old_deeds_and_a_fresh_mortgage():
+    rows = _rows([
+        ("500", "Deed", "01/01/1961"),
+        (str(OLDEST_ID), "Deed", "06/14/1974"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("900001", "NEW"), ("500", "OLD"),
+    ]
+
+
 def test_no_deeds_and_no_mortgages_means_nothing_to_download():
     rows = _rows([("1", "Satisfaction", "01/01/2000")])
     assert rcclerk.choose_documents(rows, role="our") == []

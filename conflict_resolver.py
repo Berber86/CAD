@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
@@ -133,7 +134,7 @@ class Proposal:
     id: str
     lot_key: str
     lot_name: str
-    kind: str  # "street_bearing" | "closing_course" | "neighbor_value" | "advisor"
+    kind: str  # "street_bearing" | "closing_course" | "neighbor_value" | "advisor" | "street_name"
     origin: str  # "rule" — правило Python, "ai" — ИИ-советник
     title: str
     changes: tuple[Change, ...]
@@ -1281,7 +1282,7 @@ For "tie" there are two operations:
 Two more operations change NAMES, not geometry. Python accepts them only when the name is printed in that lot's own text:
   - {"target": "cross_street", "name": "Seaside Boulevard"}: the street that this lot's corner is tied to (the cross street), exactly as printed in this lot's document. Use it when the lot is attached to a different intersection only because its cross street is named differently or wrongly.
   - {"target": "street_alias", "current": "Father Capodanno Blvd", "old": "Seaside Boulevard"}: a printed renaming ("X (now Y)", "Y (formerly X)", "f/k/a", "a/k/a", "also known as"). Both names must be printed in this lot's text, together with that marker.
-Put a naming fix in its own proposal, with "changes" holding only these items, and quote the printed words in "source_quote".
+If a street name in a lot is misread (for example a neighbouring corner street spelled differently from the other documents), the fix MUST be a proposal with a cross_street or street_alias change, not only an explanation. Put a naming fix in its own proposal, with "changes" holding only these items, and quote the printed words in "source_quote".
 "source_lot" and "source_quote" may be null when the value is computed."""
 
 
@@ -1453,6 +1454,91 @@ def _street_in_text(name: str, text: str) -> bool:
     compact = re.sub(r"[^a-z0-9]", "", str(text or "").lower())
     tail = "(?:" + "|".join(forms) + ")" if forms else ""
     return re.search(re.escape(core) + tail, compact) is not None
+
+
+_STREET_NAME_IN_TEXT_RE = re.compile(
+    r"((?:[A-Za-z][A-Za-z'.-]*\s+){0,3}[A-Za-z][A-Za-z'-]*)\s+("
+    + "|".join(sorted(_STREET_SUFFIX_FORMS, key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
+#: Насколько похожи два написания одной улицы (0..1), чтобы считать опиской, а не другой улицей.
+STREET_TYPO_SIMILARITY = 0.5
+
+
+def _street_name_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
+    """
+    Перекрёсток, которого нет в тексте участка, но есть похожая улица, напечатанная в нём же
+    и подтверждённая соседом набора. Пример: «Boby Avenue» вместо напечатанного «Doty Avenue»,
+    а у соседа перекрёсток «Doty Avenue». Одна подходящая улица — находка; несколько — молчим.
+    Правка только названия: геометрию не меняет, поэтому вердикт «подтверждено частично».
+    """
+    text = lot.source_text or ""
+    base = scene.virtual.get(lot.key, ())
+    desc = scene.description(lot, base)
+    if desc is None or not desc.cross_street or not text.strip():
+        return []
+    if _street_in_text(desc.cross_street, text):
+        return []
+    cross_tokens = re.findall(r"[a-z0-9]+", desc.cross_street.lower())
+    if len(cross_tokens) < 2 or cross_tokens[-1] not in _STREET_SUFFIX_FORMS:
+        return []
+    cross_core = " ".join(cross_tokens[:-1])
+    cross_suffix = _STREET_SUFFIX_FORMS[cross_tokens[-1]][0]
+    own_main = _normalize_street_key(desc.main_street)
+    agreed = {
+        _normalize_street_key(street)
+        for other in scene.lots if other is not lot
+        for street in (other.description.cross_street, other.description.main_street)
+        if street
+    }
+    found: dict[str, str] = {}
+    width = len(cross_tokens) - 1
+    for match in _STREET_NAME_IN_TEXT_RE.finditer(text):
+        words = re.findall(r"[A-Za-z0-9]+", match.group(1))
+        suffix = match.group(2).lower()
+        if len(words) < width or width < 1:
+            continue
+        core_words = words[-width:]
+        candidate_core = " ".join(core_words).lower()
+        candidate_suffix = _STREET_SUFFIX_FORMS[suffix][0]
+        if candidate_suffix != cross_suffix:
+            continue
+        ratio = difflib.SequenceMatcher(None, cross_core, candidate_core).ratio()
+        if ratio < STREET_TYPO_SIMILARITY:
+            continue
+        full = " ".join(core_words) + " " + match.group(2)
+        key = _normalize_street_key(full)
+        if key == _normalize_street_key(desc.cross_street) or key == own_main or key not in agreed:
+            continue
+        found[key] = full
+    if len(found) != 1:
+        return []
+    new_name = next(iter(found.values()))
+    change = Change(
+        target="street", index=-1, field="cross", new_label=new_name, old_label=desc.cross_street,
+    )
+    before = scene.metrics(lot, base, state=scene.virtual)
+    after = scene.metrics(lot, base + (change,), state=scene.virtual)
+    if before is None or after is None:
+        return []
+    donor = next(
+        other for other in scene.lots if other is not lot and new_name and _normalize_street_key(new_name) in {
+            _normalize_street_key(other.description.cross_street), _normalize_street_key(other.description.main_street),
+        }
+    )
+    return [Proposal(
+        id=_proposal_id(lot, [change]), lot_key=lot.key, lot_name=lot.name, kind="street_name", origin="rule",
+        title=f"Перекрёсток: «{desc.cross_street}» → «{new_name}» (так напечатано в этом тексте)",
+        changes=(change,),
+        source=f"текст участка; та же улица у соседа «{donor.name}»",
+        reasons=(
+            f"«{new_name}» напечатано в тексте участка «{lot.name}»",
+            f"у соседа «{donor.name}» та же улица",
+            "геометрия не меняется: название подтверждено текстом и соседом",
+        ),
+        before=before, after=after, verdict="partial",
+    )]
 
 
 def _value_origin(scene: _Scene, lot: LotInput, change: Change) -> str | None:
@@ -1746,6 +1832,7 @@ def analyse_conflicts(
     for lot in sorted(lots, key=lambda lot: not lot.is_main):
         proposals.extend(_street_bearing_proposals(scene, lot))
         proposals.extend(_neighbor_value_proposals(scene, lot))
+        proposals.extend(_street_name_proposals(scene, lot))
     proposals.sort(key=lambda p: (not p.verified, p.after.closure_ft))
     chosen = _accept_in_mind(scene, proposals)
 

@@ -132,3 +132,28 @@ def test_printed_renaming_already_known_to_parser_is_not_duplicated():
     change = Change(target="street", index=-1, field="alias", new_label="Amboy Road = Amboy Street")
     once = apply_changes(lots[0].description, [change])
     assert once.street_aliases.count("Amboy Road = Amboy Street") == 1
+
+
+def test_misread_cross_street_printed_in_own_text_becomes_a_button_without_advisor():
+    # У нашего участка перекрёсток прочитан с опиской («Amboi»); в его тексте напечатано «Amboy Road»,
+    # а сосед подтверждает ту же улицу. Кнопка появляется без вопроса советнику.
+    lots = [_lot("our.pdf", OUR_TEXT, main=True, cross_street="Amboi Road"), _lot("lot30.pdf", NEIGHBOUR_TEXT)]
+    analysis = _analyse(lots)
+    found = [p for p in analysis.proposals if p.kind == "street_name"]
+    assert len(found) == 1
+    assert found[0].origin == "rule" and found[0].verdict == "partial"
+    assert found[0].changes[0].describe() == "перекрёсток: «Amboi Road» → «Amboy Road»"
+    assert "у соседа «lot30.pdf» та же улица" in " ".join(found[0].reasons)
+    # Принятие: участок получает напечатанный перекрёсток, повторной находки нет.
+    lots[0].fixes = (found[0],)
+    assert not [p for p in _analyse(lots).proposals if p.kind == "street_name"]
+
+
+def test_misread_cross_street_without_a_confirming_neighbour_gives_no_button():
+    lots = [_lot("our.pdf", OUR_TEXT, main=True, cross_street="Amboi Road")]
+    assert not [p for p in _analyse(lots).proposals if p.kind == "street_name"]
+
+
+def test_name_already_printed_gives_no_button():
+    lots = [_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)]
+    assert not [p for p in _analyse(lots).proposals if p.kind == "street_name"]

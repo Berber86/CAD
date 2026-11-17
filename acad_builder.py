@@ -32,6 +32,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Iterable, Sequence
 
 from llm_parser import LegalDescription, Segment, load_config
+import street_names
 
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
 # понятное сообщение об установке зависимостей.
@@ -1761,44 +1762,33 @@ class AcadBuilder:
         street_offset = base_street_offset + front_extra
 
         if description.main_street:
-            street_note = getattr(description, "main_street_note", None)
-            if street_note:
-                note_step = 2.05 * text_height
-                if up_dot_n < 0.0:
-                    main_off = street_offset
-                    sub_off = street_offset + note_step
-                else:
-                    sub_off = street_offset
-                    main_off = street_offset + note_step
+            # Под названием улицы в скобках — ширина («(38' WIDE)», без ширины «(XX' WIDE)»),
+            # ниже — прочие примечания и старое название («(FORMERLY …)»).
+            width, extra_notes = street_names.parse_street_note(
+                getattr(description, "main_street_note", None)
+            )
+            sub_lines: list[tuple[str, str]] = [
+                (street_names.width_line(width), "main-street-note"),
+            ]
+            sub_lines += [(text, "main-street-note-extra") for text in extra_notes]
+            former = street_names.former_line(getattr(description, "main_street_former", None))
+            if former:
+                sub_lines.append((former, "main-street-note-extra"))
+            main_entry = (street_names.street_text(description.main_street), "main-street")
+            # Порядок как раньше: при одной ориентации названия ближе к улице, при другой — дальше.
+            ordered = (
+                [main_entry] + sub_lines if up_dot_n < 0.0 else list(reversed(sub_lines)) + [main_entry]
+            )
+            step = 2.05 * text_height
+            for k, (text, kind) in enumerate(ordered):
+                offset = street_offset + k * step
                 items.append(
                     TextItem(
-                        text=description.main_street.upper(),
-                        point=(midpoint[0] + nx * main_off, midpoint[1] + ny * main_off),
+                        text=text,
+                        point=(midpoint[0] + nx * offset, midpoint[1] + ny * offset),
                         rotation=rot,
-                        kind="main-street",
-                        height=street_h,
-                    )
-                )
-                items.append(
-                    TextItem(
-                        text=str(street_note).upper(),
-                        point=(midpoint[0] + nx * sub_off, midpoint[1] + ny * sub_off),
-                        rotation=rot,
-                        kind="main-street-note",
-                        height=street_note_h,
-                    )
-                )
-            else:
-                items.append(
-                    TextItem(
-                        text=description.main_street.upper(),
-                        point=(
-                            midpoint[0] + nx * street_offset,
-                            midpoint[1] + ny * street_offset,
-                        ),
-                        rotation=rot,
-                        kind="main-street",
-                        height=street_h,
+                        kind=kind,
+                        height=street_h if kind == "main-street" else street_note_h,
                     )
                 )
         else:
@@ -1847,7 +1837,7 @@ class AcadBuilder:
                 c_offset = base_street_offset + c_extra
                 items.append(
                     TextItem(
-                        text=description.cross_street.upper(),
+                        text=street_names.street_text(description.cross_street),
                         point=(c_mid[0] + cnx * c_offset, c_mid[1] + cny * c_offset),
                         rotation=text_rotation(c_angle),
                         kind="cross-street",
@@ -1898,10 +1888,11 @@ class AcadBuilder:
         dist_label = ""
         dist_width = 0.0
         if has_tie_label:
+            # Только значение, без «TO CORNER»; подпись стоит со стороны блока.
             dist_label = (
                 str(tie_note).upper()
                 if tie_note
-                else f"{format_distance(dist_val)} TO CORNER"
+                else format_distance(dist_val)
             )
             dist_width = estimate_text_width(dist_label, text_height, cfg)
 
@@ -1939,8 +1930,8 @@ class AcadBuilder:
         if has_tie_label:
             tie_text_offset = float(cfg.get("corner_distance_offset_factor", 1.9)) * text_height
             tie_mid = (
-                near_pt[0] + tux * (0.5 * tie_span) + nx * tie_text_offset,
-                near_pt[1] + tuy * (0.5 * tie_span) + ny * tie_text_offset,
+                near_pt[0] + tux * (0.5 * tie_span) - nx * tie_text_offset,
+                near_pt[1] + tuy * (0.5 * tie_span) - ny * tie_text_offset,
             )
             items.append(
                 TextItem(
@@ -1955,7 +1946,7 @@ class AcadBuilder:
         cross_normal_shift = 0.65 * street_offset
         items.append(
             TextItem(
-                text=description.cross_street.upper(),
+                text=street_names.street_text(description.cross_street),
                 point=(
                     corner_pt[0] + tux * cross_along_shift + nx * cross_normal_shift,
                     corner_pt[1] + tuy * cross_along_shift + ny * cross_normal_shift,
@@ -2017,7 +2008,7 @@ class AcadBuilder:
                     if abs(dist - round(dist)) < 1e-3
                     else format_distance(dist)
                 )
-                label = f"NEIGHBOR ({d_str} from corner)"
+                label = f"NEIGHBOR ({d_str})"
             elif description.cross_street:
                 label = "NEIGHBOR (CORNER)"
             else:

@@ -456,11 +456,12 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
     assert len(prop_lines) == 4
     assert result.boundary_line_count == 4
-    # 4 стороны + фасадная улица + пересекаемая улица + расстояние до угла
-    assert result.text_count == 7
+    # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
+    assert result.text_count == 8
     texts = {item.TextString for item in space.texts}
-    assert "MAIN STREET" in texts
-    assert "OAK AVENUE" in texts
+    assert "MAIN  STREET" in texts  # два пробела между словами названия улицы
+    assert "(XX' WIDE)" in texts  # ширины в описании нет — место для ручного заполнения
+    assert "OAK  AVENUE" in texts
     assert any(item.startswith("N 75%%d20'20\" E") for item in texts)
     assert result.text_height == pytest.approx(0.9 * 10.0 / 16.0)
     assert result.closure.distance < 1e-6
@@ -494,7 +495,8 @@ def test_front_side_drives_street_label_placement():
     street = next(item for item in plan.items if item.kind == "main-street")
     side_one = next(item for item in plan.items if item.kind == "side-1")
     # Фасад смотрит на север -> крупная подпись улицы над первой (северной) стороной.
-    assert math.dist(street.point, side_one.point) < 6.0
+    # Под названием теперь стоит строка ширины, поэтому группа подписей сдвинута на один шаг.
+    assert math.dist(street.point, side_one.point) < 6.0 + 2.05 * plan.text_height
     assert street.height is not None and street.height > plan.text_height * 1.5
     assert point_in_polygon(street.point, plan.vertices) is False
 
@@ -954,8 +956,9 @@ def test_nyc_dartmouth_loop_commencing_tie_and_narrow_townhouse():
     assert by_kind["side-1"].text == "14.00'"
     assert by_kind["side-1-note"].text == 'S 33%%d58\'44" W'
     assert "125.00'" in by_kind["side-2"].text and "side-2-note" not in by_kind
-    assert by_kind["main-street"].text == "DARTMOUTH LOOP"
-    assert by_kind["main-street-note"].text == "(38' WIDE ROADWAY EASEMENT)"
+    assert by_kind["main-street"].text == "DARTMOUTH  LOOP"
+    assert by_kind["main-street-note"].text == "(38' WIDE)"
+    assert by_kind["main-street-note-extra"].text == "(ROADWAY EASEMENT)"
     # Cross street ориентирована перпендикулярно фасадной улице
     rot_diff = abs(by_kind["cross-street"].rotation - by_kind["main-street"].rotation)
     assert rot_diff == pytest.approx(math.pi / 2.0, abs=1e-6)
@@ -1053,7 +1056,7 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
     assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
-    assert by_kind["cross-street"].text == "63RD STREET"
+    assert by_kind["cross-street"].text == "63RD  STREET"
     assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
     assert "cross-street-distance" not in by_kind
 
@@ -1558,8 +1561,8 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
 
     neighbor_texts = space.texts[-2:]
     assert [t.TextString for t in neighbor_texts] == [
-        "NEIGHBOR (365' from corner)",
-        "NEIGHBOR (475' from corner)",
+        "NEIGHBOR (365')",
+        "NEIGHBOR (475')",
     ]
     assert {t.Layer for t in neighbor_texts} == {"NEIGHBOR_LOT"}
     assert point_in_polygon(res_left.plan.items[0].point, res_left.vertices) is True

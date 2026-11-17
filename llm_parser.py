@@ -46,6 +46,8 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+import street_names
+
 __all__ = [
     "ASPENWALL_SAMPLES",
     "BoundarySegment",
@@ -1311,6 +1313,15 @@ class LegalDescription(BaseModel):
             "'(38\\' WIDE ROADWAY EASEMENT)' или '(NOT MAPPED ON FINAL CITY PLAN)'"
         ),
     )
+    main_street_former: str | None = Field(
+        default=None,
+        description=(
+            "Старое название фасадной улицы, если в описании оно указано через "
+            "'formerly', 'previously known as', 'formerly known as' или 'also known as' "
+            "(в скобках или без), например 'CARLTON STREET'. В main_street остаётся "
+            "только текущее название."
+        ),
+    )
     cross_street: str | None = Field(
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
@@ -1411,6 +1422,28 @@ class LegalDescription(BaseModel):
                     "corner_to_pob_bearing": {**tie, "distance_ft": dist},
                 }
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _split_former_street_names(cls, data: Any) -> Any:
+        """Старое название улицы уходит в main_street_former, из названий улиц его нет."""
+        if not isinstance(data, dict):
+            return data
+        main_raw = data.get("main_street")
+        cross_raw = data.get("cross_street")
+        if not isinstance(main_raw, str) and not isinstance(cross_raw, str):
+            return data
+        out = dict(data)
+        former = data.get("main_street_former") or None
+        if isinstance(main_raw, str):
+            clean, found = street_names.split_former_name(main_raw)
+            out["main_street"] = clean
+            former = former or found
+        if isinstance(cross_raw, str):
+            out["cross_street"] = street_names.split_former_name(cross_raw)[0]
+        if former:
+            out["main_street_former"] = former
+        return out
 
     @field_validator("main_street", mode="before")
     @classmethod
@@ -2273,7 +2306,8 @@ CRITICAL SURVEY RULES
      * varas (×2.77778) or chains (×66) -> decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
    - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
-   - `main_street_note`: parenthetical subtitle if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null.
+   - `main_street_note`: parenthetical subtitle of the front street if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null. Keep the street width in it when the document gives one ("60 feet wide" -> "(60' WIDE)"). Do NOT put an old street name there.
+   - `main_street_former`: the OLD name of the front street when the document gives it with "formerly", "previously known as", "formerly known as", "also known as", "a/k/a" or "f/k/a", in parentheses or without them (e.g. "Stafford Avenue (formerly Carlton Street)" -> main_street "Stafford Avenue", main_street_former "Carlton Street"). `main_street` must contain only the current name. Else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
    - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
@@ -4032,11 +4066,20 @@ def parse_with_regex(
         explicit_tie_segment=explicit_tie,
     )
 
+    note_now = meta.get("main_street_note")
+    width_text = street_names.find_width_text(normalized, main_street)
+    if width_text and not (note_now and street_names.WIDTH_RE.search(note_now)):
+        meta["main_street_note"] = f"{width_text} {note_now}" if note_now else width_text
+    former_name = meta.get("main_street_former") or street_names.find_former_name(
+        normalized, main_street
+    )
+
     try:
         model = LegalDescription.model_validate(
             {
                 "main_street": main_street,
                 "main_street_note": meta["main_street_note"],
+                "main_street_former": former_name,
                 "cross_street": cross_street,
                 "distance_to_corner_ft": distance_to_corner,
                 "corner_to_pob_bearing": corner_tie,

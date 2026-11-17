@@ -305,15 +305,6 @@ def resolve_ocr_source(
         text = ocr_pages.ocr_pdf_pages(
             path, first, last, dpi=dpi, progress=progress
         )
-        if not has_legal_courses(text):
-            # Обычный разбор (не ступень 2): второй заход по кускам 2×2, если целиком не прочитано.
-            if progress:
-                progress("целиком не разобрать — пробую по кускам 2×2")
-            tiled = ocr_pages.ocr_pdf_pages(
-                path, first, last, dpi=dpi, progress=progress, tile=2
-            )
-            if has_legal_courses(tiled):
-                text = tiled
     except ocr_pages.OcrUnavailable as exc:
         raise PDFError(
             f"локальный OCR недоступен ({exc}). "

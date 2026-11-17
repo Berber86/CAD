@@ -237,8 +237,8 @@ def test_render_dpi_honours_low_request_and_keeps_200_floor_for_normal_scan_ocr(
         doc.close()
 
 
-def test_unreadable_page_is_retried_in_tiles(tmp_path, monkeypatch):
-    """Плотная страница не читается целиком — второй заход по кускам 2×2."""
+def test_unreadable_page_is_read_once_without_tiles(tmp_path, monkeypatch):
+    """Один проход на максимальном dpi: плотная страница не перечитывается кусками 2×2."""
     from pdf_set import resolve_ocr_source
 
     monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
@@ -247,9 +247,10 @@ def test_unreadable_page_is_retried_in_tiles(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr_pages, "_engine", engine)
     scan = _scan_pdf(tmp_path / "dense.pdf", DESCRIPTION, dpi=200)  # 1700 px по ширине
 
-    resolved = resolve_ocr_source({"ocr_path": scan, "ocr_pages": "1"})
-    assert has_legal_courses(resolved["text"]) and "176.92" in resolved["text"]
-    assert engine.calls > 1 and min(engine.widths) < 1500  # куски действительно мельче
+    with pytest.raises(PDFError):
+        resolve_ocr_source({"ocr_path": scan, "ocr_pages": "1"})
+    assert engine.calls == 1, "второго захода кусками 2×2 быть не должно"
+    assert min(engine.widths) >= 1500
 
 
 def test_ocr_sorts_lines_top_down():

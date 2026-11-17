@@ -385,6 +385,27 @@ def _lacks_corner_distance(warnings: Any) -> bool:
     return any(_NO_DISTANCE_WARNING in str(item) for item in (warnings or ()))
 
 
+def _ai_key_status(
+    cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+) -> tuple[bool, str]:
+    """
+    Есть ли ключ, которым ИИ реально сможет ответить: тот же путь, что у самого вызова.
+
+    Ключ берётся из поля окна, из сохранённых настроек провайдера, из окружения и .env
+    (``resolve_api_target``). Раньше гейт смотрел только на поле и пароль, и ключ из настроек
+    не запускал ИИ, хотя запрос бы прошёл. Возвращает (есть, причина_если_нет).
+    """
+    try:
+        target = resolve_api_target(
+            cfg, provider=provider_id, model=model_name, api_key=api_key, key_secret=key_secret,
+        )
+    except Exception as exc:  # noqa: BLE001 - защищённый ключ не открылся (нет пароля или он неверный)
+        return False, f"ключ провайдера не открылся: {describe_exc(exc)}"
+    if str(target.get("api_key") or "").strip():
+        return True, ""
+    return False, "не задан API-ключ выбранного провайдера (ни в поле, ни в настройках, ни в окружении)"
+
+
 #: Ранг статуса проверки описания: больше — лучше. Сначала сравнивается статус, потом фигура.
 _STATUS_RANKS = {STATUS_OK: 2, STATUS_WARNING: 1, STATUS_FAILED: 0}
 _STATUS_OK_RANK = _STATUS_RANKS[STATUS_OK]
@@ -7578,7 +7599,7 @@ class SurveyApp(ctk.CTk):
                 key_secret=key_secret, allow_regex_fallback=False, progress=progress,
             )
         except Exception as local_exc:  # noqa: BLE001
-            if job.use_llm or not (api_key or key_secret) or job.ocr:
+            if job.use_llm or job.ocr or not _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)[0]:
                 raise
             if progress is not None:
                 progress(f"локальный парсер не справился ({local_exc}) — отправляю в ИИ…")
@@ -7677,6 +7698,7 @@ class SurveyApp(ctk.CTk):
         """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
         post = self._worker_poster()
         builder = AcadBuilder(cfg)
+        ai_ready, ai_block = _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)
         results: list[PdfSetResult] = []
         total = len(jobs)
         for idx, job in enumerate(jobs, start=1):
@@ -7756,7 +7778,7 @@ class SurveyApp(ctk.CTk):
                                             pass
 
                         if best is not None and best.status_rank < _STATUS_OK_RANK:
-                            if api_key or key_secret:
+                            if ai_ready:
                                 progress_of(f"{job.path.name}: проверка не пройдена — отправляю в ИИ…")
                                 try:
                                     # Страницы приходят строкой «2» / «3-4»: разбираем их, а не индексируем.
@@ -7786,7 +7808,7 @@ class SurveyApp(ctk.CTk):
                                     last_exc = exc
                                     best.issues.append(f"ИИ не отработал: {describe_exc(exc)}")
                             else:
-                                reason = "ИИ не вызван: не задан ключ API (поле ключа в окне программы)"
+                                reason = f"ИИ не вызван: {ai_block}"
                                 best.issues.append(reason)
                                 progress_of(f"{job.path.name}: {reason}")
 

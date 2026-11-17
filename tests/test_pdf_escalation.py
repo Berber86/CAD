@@ -272,8 +272,17 @@ def test_clean_ocr_text_skips_the_ai_even_with_a_key(gui, tmp_path, monkeypatch)
     assert results[0].llm_used is False
 
 
+_KEY_ENV = ("HYDRA_API_KEY", "OPENROUTER_API_KEY", "ROUTERAI_API_KEY", "OPENAI_API_KEY", "CAD_LLM_API_KEY")
+
+
+def _clear_key_env(monkeypatch):
+    for name in _KEY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_no_key_leaves_a_visible_reason_in_the_log(gui, tmp_path, monkeypatch):
-    """Проверка не пройдена, ключа нет: ИИ не вызван, и это написано в журнале и в замечаниях."""
+    """Проверка не пройдена, ключа нет нигде: ИИ не вызван, и это написано в журнале и в замечаниях."""
+    _clear_key_env(monkeypatch)
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
     monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
@@ -297,6 +306,51 @@ def test_no_key_leaves_a_visible_reason_in_the_log(gui, tmp_path, monkeypatch):
     assert results[0].error == ""
     assert any("ИИ не вызван" in line for line in progress), progress
     assert any("ИИ не вызван" in issue for issue in results[0].issues), results[0].issues
+
+
+def test_key_saved_in_settings_enables_the_ai_check(gui, tmp_path, monkeypatch):
+    """
+    Регресс 3.54: ключ лежит в настройках провайдера, поле и пароль пустые.
+    Раньше гейт его не видел и ИИ не запускался; теперь ИИ вызывается, как и сам вызов.
+    """
+    _clear_key_env(monkeypatch)
+    cfg = load_config()
+    provider = str(cfg["api"]["provider"])
+    cfg["api"]["providers"][provider]["api_key"] = "sk-saved-in-settings"
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    seen_llm: list[bool] = []
+    done: dict = {}
+
+    def parse_job(job, *args, **kwargs):
+        seen_llm.append(bool(job.use_llm))
+        if job.use_llm:
+            raise gui.PDFError("ИИ-заглушка")
+        return gui.SurveyApp._parse_pdf_set_job(stub, job, *args, **kwargs)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+
+    stub = _worker_stub(gui, post, parse_job=parse_job)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    gui.SurveyApp._pdf_set_worker(stub, [job], cfg, provider, "m", None, "", 1.0, False, {}, False)
+    results, _ = done["payload"]
+    assert True in seen_llm, "ИИ должен был вызваться: ключ есть в настройках"
+    assert results[0].llm_used is True
+
+
+def test_key_status_names_the_reason_when_missing_everywhere(gui, monkeypatch):
+    _clear_key_env(monkeypatch)
+    cfg = load_config()
+    cfg["api"]["providers"][str(cfg["api"]["provider"])]["api_key"] = ""
+    ok, reason = gui._ai_key_status(cfg, str(cfg["api"]["provider"]), "m", None, "")
+    assert ok is False
+    assert "не задан API-ключ" in reason
 
 
 def test_background_worker_runs_one_pass_and_reports_it(gui, tmp_path, monkeypatch):

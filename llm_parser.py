@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import dataclasses
 import getpass
 import hashlib
 import hmac
@@ -5792,6 +5793,61 @@ def _ensure_street_width(model: LegalDescription, source_text: str) -> LegalDesc
     return model.model_copy(update={"main_street_note": new_note})
 
 
+def _parse_local_then_llm(
+    *,
+    progress: Callable[[str], None] | None = None,
+    **kwargs: Any,
+) -> ParseOutcome:
+    """
+    Режим «Эконом»: локальный разбор бесплатно; ИИ — только если локальный результат не прошёл
+    проверку (статус не ok или остались сомнительные места) либо локально текст не прочитан
+    (например, PDF без текстового слоя). Текст, уже подготовленный локальным проходом, передаётся
+    ИИ без повторного чтения PDF и без повторного автоповорота.
+    """
+    local: ParseOutcome | None = None
+    local_error: LegalDescriptionError | None = None
+    try:
+        local = parse_legal_description_full(
+            **kwargs, use_llm=False, escalate_to_llm=False, progress=progress,
+        )
+    except LegalDescriptionError as exc:
+        local_error = exc
+    if local is not None and local.check.ok and not local.typo_suspicions:
+        return local
+
+    if local is not None:
+        reason = "локальный разбор не прошёл проверку"
+    else:
+        reason = f"локально не прочитано ({local_error})"
+    if progress is not None:
+        progress(f"Эконом: {reason} — вызываю ИИ…")
+
+    ai_kwargs: dict[str, Any] = dict(kwargs)
+    if local is not None:
+        ai_kwargs["prepared_input"] = (
+            local.prepared_text,
+            list(local.prepared_images),
+            list(local.base_warnings),
+        )
+        ai_kwargs["auto_orient"] = False
+        ai_kwargs["prior_usage"] = local.usage
+    try:
+        ai = parse_legal_description_full(
+            **ai_kwargs, use_llm=True, escalate_to_llm=False, progress=progress,
+        )
+    except Exception as exc:  # noqa: BLE001 — локальный результат не должен теряться из-за ИИ
+        if local is None:
+            raise
+        return dataclasses.replace(
+            local,
+            warnings=[f"Эконом: ИИ не отработал ({exc}) — результат локального разбора, проверьте", *local.warnings],
+        )
+    return dataclasses.replace(
+        ai,
+        warnings=[f"Эконом: {reason} — ответ ИИ", *ai.warnings],
+    )
+
+
 def parse_legal_description_full(
     text: str | None = None,
     pdf_path: str | Path | None = None,
@@ -5813,11 +5869,36 @@ def parse_legal_description_full(
     focus_instruction: str | None = None,
     prepared_input: tuple[str, list[str], list[str]] | None = None,
     prior_usage: TokenUsage | None = None,
+    escalate_to_llm: bool = False,
 ) -> ParseOutcome:
     """
     Полный разбор: PDF / пачка фото чертежей (JPG/PNG/TIFF/WEBP) / текст ->
     LLM (или локальный парсер) -> LegalDescription.
+
+    ``escalate_to_llm`` (режим «Эконом»): при ``use_llm=False`` сначала локальный разбор;
+    если он не прошёл проверку или не читается — ответ ИИ (см. ``_parse_local_then_llm``).
     """
+    if escalate_to_llm and not use_llm:
+        return _parse_local_then_llm(
+            text=text,
+            pdf_path=pdf_path,
+            cfg=cfg,
+            image_paths=image_paths,
+            pdf_pages=pdf_pages,
+            rotation_deg=rotation_deg,
+            enhance_scan=enhance_scan,
+            auto_orient=auto_orient,
+            ask_on_doubt=ask_on_doubt,
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            key_secret=key_secret,
+            allow_regex_fallback=allow_regex_fallback,
+            progress=progress,
+            focus_instruction=focus_instruction,
+            prepared_input=prepared_input,
+            prior_usage=prior_usage,
+        )
     cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
     eff_ask_on_doubt = (
         bool(cfg.get("api", {}).get("ask_on_doubt", True))

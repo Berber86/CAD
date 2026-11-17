@@ -640,6 +640,8 @@ class SurveyApp(ctk.CTk):
             value=default_scale(self.scale_options, self.config_data)
         )
         self.use_llm_var = ctk.BooleanVar(value=True)
+        # Эконом: локальный разбор; ИИ подключается, если локальный результат не прошёл проверку.
+        self.economy_var = ctk.BooleanVar(value=False)
 
         # Настройки 2–3 независимых проходов LLM (консенсус / арбитраж)
         cons_cfg = self.config_data["api"].get("consensus") or {}
@@ -2086,6 +2088,16 @@ class SurveyApp(ctk.CTk):
         )
         self.parse_button.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
 
+        self.economy_check = ctk.CTkCheckBox(
+            run_box,
+            text="Эконом: локально, ИИ только при проблемах",
+            variable=self.economy_var,
+            command=self._on_economy_toggled,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_main"],
+        )
+        self.economy_check.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 2))
+
         self.regex_link_button = ctk.CTkButton(
             run_box,
             text="⚡ Быстрый разбор без ИИ (regex, бесплатно)",
@@ -2096,7 +2108,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=self._run_regex_only,
         )
-        self.regex_link_button.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
+        self.regex_link_button.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 4))
 
         self.reset_session_button = ctk.CTkButton(
             run_box,
@@ -2108,7 +2120,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._reset_session_clicked,
         )
-        self.reset_session_button.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.reset_session_button.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 10))
 
         # --- Центральная колонка: шапка холста + живой CAD-предпросмотр ------
         center_head = ctk.CTkFrame(
@@ -4191,6 +4203,9 @@ class SurveyApp(ctk.CTk):
         self._refresh_consensus_rows()
         self._refresh_engine_card()
 
+    def _on_economy_toggled(self) -> None:
+        self._refresh_parse_actions()
+
     # -------------------------------------------------- Spectrum UX helpers --
     def _result_logical_pixels(self, value: float) -> float:
         reverse = getattr(self.right_panel, "_reverse_widget_scaling", None)
@@ -4297,7 +4312,12 @@ class SurveyApp(ctk.CTk):
         if self.pdf_set and self._current_source_mode() == "📄 PDF":
             # В наборе способ разбора выбран у каждого файла отдельно.
             paid = sum(1 for item in self.pdf_set if item.use_llm)
-            cost = f"ИИ: {paid} файл., платно" if paid else "бесплатно"
+            if paid:
+                cost = f"ИИ: {paid} файл., платно"
+            elif self.economy_var.get():
+                cost = "экономно: ИИ только при проблемах"
+            else:
+                cost = "бесплатно"
             self.parse_button.configure(
                 text=f"▶ Разобрать набор заново ({cost}) · Ctrl+Enter",
                 fg_color=THEME["btn_primary"],
@@ -4310,9 +4330,18 @@ class SurveyApp(ctk.CTk):
             )
             return
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
+        economy_on = bool(self.economy_var.get())
+        if hasattr(self, "economy_check"):
+            self.economy_check.configure(state="disabled" if use_llm else "normal")
         if use_llm:
             primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
             alternative = "⚡ Локальный разбор без ИИ · бесплатно"
+        elif economy_on:
+            primary = "⚖ Разобрать экономно · Ctrl+Enter"
+            alternative = (
+                "✨ Разобрать все PDF с ИИ · платно" if is_batch
+                else "✨ Разобрать с ИИ · расход токенов API"
+            )
         else:
             primary = "⚡ Разобрать бесплатно · Ctrl+Enter"
             alternative = (
@@ -7520,7 +7549,8 @@ class SurveyApp(ctk.CTk):
                 self._pending_neighbor_files.discard(item.path)
             else:
                 self._pending_neighbor_files.add(item.path)
-        jobs = [make_job(item, force=force) for item in self.pdf_set]
+        economy = bool(self.economy_var.get())
+        jobs = [make_job(item, force=force, economy=economy) for item in self.pdf_set]
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         scale = self._current_scale()
         has_vision = any(job.source is not None and "pdf_path" in job.source for job in jobs)
@@ -7536,6 +7566,9 @@ class SurveyApp(ctk.CTk):
         detail = f"ИИ: {paid}, локально: {local}"
         if by_ocr:
             detail += f" (из них OCR: {by_ocr})"
+        economy_jobs = sum(1 for job in jobs if job.economy and job.cached_outcome is None)
+        if economy_jobs:
+            detail += f", эконом: {economy_jobs} (ИИ при проблемах)"
         if reused:
             detail += f", без изменений: {reused}"
         self._set_status(f"Разбор набора PDF: {len(jobs)} файл. ({detail})…")
@@ -7592,11 +7625,17 @@ class SurveyApp(ctk.CTk):
                 provider_label=f"Расхождение {count} проходов",
             )
             return outcome, True, [issue]
+        # Эконом только для текстовых файлов: сканы уже идут лестницей OCR и сами зовут ИИ.
+        economy_escalates = bool(
+            job.economy and not job.use_llm and not job.ocr
+            and _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)[0]
+        )
         try:
             outcome = parse_legal_description_full(
                 **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
                 use_llm=job.use_llm, provider=provider_id, model=model_name, api_key=api_key,
                 key_secret=key_secret, allow_regex_fallback=False, progress=progress,
+                escalate_to_llm=economy_escalates,
             )
         except Exception as local_exc:  # noqa: BLE001
             if job.use_llm or job.ocr or not _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)[0]:
@@ -7887,7 +7926,7 @@ class SurveyApp(ctk.CTk):
                                 do_auto_orient=do_auto_orient, post=post,
                             )
                             post("progress", f"[{idx}/{total}] {job.path.name}: {ai_note}")
-                        if job.use_llm:
+                        if job.use_llm or getattr(outcome, "source", "") == "llm":
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
@@ -9254,6 +9293,9 @@ class SurveyApp(ctk.CTk):
         self.neighbor_lot_radio.configure(state=state)
         self.parse_button.configure(state=state)
         self.regex_link_button.configure(state=state)
+        self.economy_check.configure(
+            state="disabled" if (state == "disabled" or self.use_llm_var.get()) else "normal"
+        )
         self.save_button.configure(state=state)
         self.save_env_button.configure(state=state)
         self.feature_auto_button.configure(state=state)
@@ -9956,6 +9998,12 @@ class SurveyApp(ctk.CTk):
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
         passes_count = self.current_passes_count() if use_llm else 1
+        escalate_economy = False
+        if self.economy_var.get() and not use_llm:
+            economy_ready, economy_block = _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)
+            escalate_economy = economy_ready
+            if not economy_ready:
+                self._log_line(f"Эконом: ИИ не вызван при проблемах — {economy_block}")
         scale = self._current_scale()
         if not is_neighbor:
             self._main_analysis_pending = True
@@ -10054,6 +10102,7 @@ class SurveyApp(ctk.CTk):
                 scale,
                 parse_only,
                 is_neighbor,
+                escalate_economy,
             ),
         )
 
@@ -10075,6 +10124,7 @@ class SurveyApp(ctk.CTk):
         scale: float,
         parse_only: bool,
         is_neighbor: bool = False,
+        escalate_economy: bool = False,
     ) -> None:
         post = self._worker_poster()
         try:
@@ -10139,6 +10189,7 @@ class SurveyApp(ctk.CTk):
                     key_secret=key_secret,
                     allow_regex_fallback=False,
                     progress=lambda message: post("progress", message),
+                    escalate_to_llm=escalate_economy,
                 )
                 if use_llm:
                     post("valid_secret", key_secret)

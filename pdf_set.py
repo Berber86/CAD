@@ -218,6 +218,8 @@ class PdfSetJob:
     ocr: bool = False
     #: Файл — скан без текстового слоя: ответ ИИ по нему пишется в кеш Шага 0.
     scan: bool = False
+    #: Режим «Эконом»: локальный разбор, а при проблемах — ИИ (только для текстовых файлов).
+    economy: bool = False
 
     @property
     def role_label(self) -> str:
@@ -243,9 +245,21 @@ class PdfSetResult:
     error: str = ""
 
 
-def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
-    """Готовит файл к разбору; готовый результат при тех же страницах не запрашивается заново."""
-    reuse = item.has_fresh_result() and not force
+def make_job(item: PdfSetItem, *, force: bool = False, economy: bool = False) -> PdfSetJob:
+    """Готовит файл к разбору; готовый результат при тех же страницах не запрашивается заново.
+
+    В режиме «Эконом» локальный результат, который не прошёл проверку, перепроверяется:
+    теперь, возможно, нужен ответ ИИ. Ответ ИИ, сохранённый раньше, не пересчитывается.
+    """
+    check = getattr(item.outcome, "check", None)
+    economy_retry = bool(
+        economy
+        and not item.use_llm
+        and check is not None
+        and not check.ok
+        and getattr(item.outcome, "source", "") != "llm"
+    )
+    reuse = item.has_fresh_result() and not force and not economy_retry
     source: dict[str, Any] | None = None
     source_error = ""
     if not reuse:
@@ -267,6 +281,7 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         fixes=tuple(item.fixes) if reuse else (),
         ocr=bool(source is not None and "ocr_path" in source),
         scan=not item.has_legal_text(),
+        economy=bool(economy and not item.use_llm),
     )
 
 

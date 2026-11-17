@@ -33,7 +33,24 @@ _SIMPLE_LEVELS = frozenset({LEVEL_KEY, LEVEL_ERROR})
 # упрощённый журнал был примерно втрое короче полного по объёму текста.
 SIMPLE_INFO_MAX_CHARS = 70
 
-_STAMP_RE = re.compile(r"^\d\d:\d\d:\d\d {1,2}")
+_STAMP_RE = re.compile(r"^\[?\d\d:\d\d:\d\d\]?\s{1,2}")
+
+# Служебные информационные строки, которые в упрощённом журнале только отвлекают: пустые строки,
+# шаги «[3/3] …», страницы «стр. 1 из 1 · …», пояснения «→ …», разделители «--- … ---»
+# и дубль строки «Разбор набора PDF: …» (итог показан строкой «Файлов: …»).
+_SIMPLE_NOISE = (
+    re.compile(r"^\s*$"),
+    re.compile(r"^\s*→"),
+    re.compile(r"^\s*(\[\d+/\d+\]\s*)+"),
+    re.compile(r"стр\. \d+[–-]?\d* из \d+"),
+    re.compile(r"^\s*---"),
+    re.compile(r"^\s*Разбор набора PDF:"),
+)
+
+
+def is_simple_noise(body: str) -> bool:
+    """Служебная информационная строка, которую упрощённый журнал не показывает."""
+    return any(pattern.search(body) for pattern in _SIMPLE_NOISE)
 
 # Отчёт Шага 1 в упрощённом режиме: остаются заголовки, итоги, пункты с правками, ошибки
 # (⛔ ✗ 🚨) и строки о расхождении соотношения участков. Предупреждения (⚠), «ок»-строки (✓),
@@ -68,6 +85,8 @@ def level_visible(level: str, mode: str, text: str = "") -> bool:
     if level != LEVEL_INFO or not text:
         return False
     body = _STAMP_RE.sub("", text, count=1)
+    if is_simple_noise(body):
+        return False
     return "\n" not in body and len(body) <= SIMPLE_INFO_MAX_CHARS
 
 

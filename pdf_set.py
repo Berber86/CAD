@@ -351,6 +351,67 @@ def describe_exc(exc: BaseException) -> str:
     return text
 
 
+#: Разрешение, при котором ищется страница с описанием: дёшево, только для поиска.
+DESCRIPTION_SEARCH_DPI: int = 200
+#: Сколько страниц просматривать при поиске описания (документ длиннее — поиск останавливается).
+DESCRIPTION_SEARCH_MAX_PAGES: int = 40
+#: Сколько найденных страниц перечитывать при полном разрешении.
+DESCRIPTION_SEARCH_CANDIDATES: int = 3
+_DESCRIPTION_MARK_RE = re.compile(
+    r"\bBEGINNING\b|ALL\s+THAT\s+CERTAIN|POINT\s+OR\s+PLACE\s+OF\s+BEGINNING"
+    r"|LEGAL\s+DESCRIPTION|BOUNDED\s+AND\s+DESCRIBED|\bTHENCE\b",
+    re.IGNORECASE,
+)
+
+
+def find_description_page(
+    path: str | Path, *, skip: tuple[int, int], progress: Callable[[str], None] | None = None,
+) -> tuple[int, str] | None:
+    """
+    Ищет страницу с описанием участка по всему документу: нужна, когда на указанных страницах
+    обхода границ нет (например, на первой странице — штамп ипотеки, а описание на 23-й).
+
+    Все страницы, кроме уже прочитанных ``skip``, сначала просматриваются дёшево; подходящие по
+    меткам описания (BEGINNING, THENCE, ALL THAT CERTAIN…) перечитываются полным разрешением,
+    и первая страница, где есть обход границ, возвращается вместе с текстом.
+    """
+    import pymupdf  # noqa: PLC0415 - зависимость программы
+
+    pdf = Path(path)
+    try:
+        with pymupdf.open(str(pdf)) as doc:
+            total = len(doc)
+    except Exception:  # noqa: BLE001 - документ не открылся: поиска нет
+        return None
+    limit = min(total, DESCRIPTION_SEARCH_MAX_PAGES)
+    scored: list[tuple[int, int]] = []
+    for page in range(1, limit + 1):
+        if skip[0] <= page <= skip[1]:
+            continue
+        if progress is not None:
+            progress(f"{pdf.name}: ищу страницу с описанием — стр. {page} из {limit}…")
+        try:
+            light = ocr_pages.ocr_pdf_pages(pdf, page, page, dpi=DESCRIPTION_SEARCH_DPI)
+        except Exception:  # noqa: BLE001 - одна нечитаемая страница не останавливает поиск
+            continue
+        score = len(_DESCRIPTION_MARK_RE.findall(light))
+        if score >= 2:
+            scored.append((score, page))
+    for _score, page in sorted(scored, reverse=True)[:DESCRIPTION_SEARCH_CANDIDATES]:
+        if progress is not None:
+            progress(f"{pdf.name}: стр. {page} похожа на описание — перечитываю полным разрешением…")
+        try:
+            # Кусками 2×2: на целой странице строки плотной колонки терялись (проверено на LOT 118).
+            full = ocr_pages.ocr_pdf_pages(
+                pdf, page, page, dpi=SCAN_OCR_DPI, use_cache=False, exact_dpi=True, tile=2,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if has_legal_courses(full):
+            return page, full
+    return None
+
+
 @dataclass(frozen=True)
 class OcrPass:
     """Итог единственного прохода локального OCR: текст или ошибка и что реально выполнено."""
@@ -362,12 +423,15 @@ class OcrPass:
     dpi: int = SCAN_OCR_DPI
     #: True — рендер ровно на dpi; False — по нативному разрешению скана (второй рендер).
     exact: bool = True
+    #: Заметка для журнала: например, описание найдено не на указанных страницах.
+    note: str = ""
 
     def summary(self) -> str:
         if self.error:
             return f"ошибка за {self.seconds:.1f} с: {self.error}"
         how = f"рендер {self.dpi} dpi" if self.exact else "рендер по разрешению скана"
-        return f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, {how}"
+        base = f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, {how}"
+        return f"{base}; {self.note}" if self.note else base
 
 
 #: Курс «north/south … east/west» в свободном тексте — для оценки, когда разбор не удался.
@@ -425,8 +489,23 @@ def ocr_scan_once(
             error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages,
             dpi=SCAN_OCR_DPI, exact=exact,
         )
+    note = ""
+    if exact and not has_legal_courses(text):
+        # На указанных страницах обхода границ нет: описание может лежать дальше (штамп — стр. 1,
+        # описание — стр. 23). Ищем по всему документу; в журнале остаётся, где нашли.
+        try:
+            found = find_description_page(pdf, skip=pages, progress=progress)
+        except Exception as exc:  # noqa: BLE001 - поиск не должен ломать разбор
+            found = None
+            note = f"поиск страницы с описанием не удался: {describe_exc(exc)}"
+        if found is not None:
+            page_no, full_text = found
+            text = full_text
+            pages = (page_no, page_no)
+            note = f"описание не на указанных страницах — найдено на стр. {page_no}"
     return OcrPass(
         text=text.strip(), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI, exact=exact,
+        note=note,
     )
 
 

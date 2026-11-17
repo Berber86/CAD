@@ -1337,6 +1337,14 @@ class LegalDescription(BaseModel):
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
     )
+    street_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Синонимы названий улиц, которые описание само связывает: «текущее = старое» "
+            "(например «Father Capodanno Boulevard = Seaside Boulevard»). Пусто, если описание "
+            "их не связывает."
+        ),
+    )
     distance_to_corner_ft: float = Field(
         default=0.0,
         ge=0.0,
@@ -3180,7 +3188,8 @@ _OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"Descrlbed", "Described"),
         # Из реальных сканов (3.55): направления, единицы, союзы и названия улиц.
         (r"wcat|wcst", "west"),
-        (r"ainutes|minutcs", "minutes"),
+        (r"ainutes|minutcs|minotes", "minutes"),
+        (r"trence|trenco", "thence"),
         (r"scconds|secouds", "seconds"),
         (r"degreca|degrccs|degrces", "degrees"),
         (r"snid", "said"),
@@ -4334,6 +4343,7 @@ def parse_with_regex(
                 "main_street_note": meta["main_street_note"],
                 "main_street_former": former_name,
                 "cross_street": cross_street,
+                "street_aliases": [f"{cur} = {old}" for cur, old in street_names.street_aliases(normalized)],
                 "distance_to_corner_ft": distance_to_corner,
                 "corner_to_pob_bearing": corner_tie,
                 "tie_note": meta["tie_note"],

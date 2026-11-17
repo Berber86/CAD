@@ -4896,6 +4896,48 @@ def _tie_geometry_note(main_plan: DrawPlan, nb_plan: DrawPlan) -> str | None:
 TIE_OFFSET_NOTE_FT = 0.02
 
 
+def street_name_canon(*descriptions: Any) -> Callable[[str | None], str]:
+    """
+    Ключ названия улицы с учётом синонимов из описаний: «Seaside Blvd» и «Father Capodanno Blvd»
+    (одна улица под двумя именами) получают один ключ. Синонимы берутся из пар
+    ``street_aliases`` («текущее = старое») и из ``main_street_former``. Ключ группы — наименьший
+    из её ключей, поэтому результат не зависит от порядка описаний.
+    """
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        while parent.get(key, key) != key:
+            key = parent[key]
+        return key
+
+    def union(first: str, second: str) -> None:
+        a, b = find(first), find(second)
+        if a != b:
+            low, high = (a, b) if a < b else (b, a)
+            parent[high] = low
+
+    for desc in descriptions:
+        pairs: list[tuple[str, str]] = []
+        for item in getattr(desc, "street_aliases", None) or []:
+            cur, sep, old = str(item).partition(" = ")
+            if sep:
+                pairs.append((cur, old))
+        main = getattr(desc, "main_street", None)
+        former = getattr(desc, "main_street_former", None)
+        if main and former:
+            pairs.append((main, former))
+        for cur, old in pairs:
+            ka, kb = _normalize_street_key(cur), _normalize_street_key(old)
+            if ka and kb:
+                union(ka, kb)
+
+    def canon(name: str | None) -> str:
+        key = _normalize_street_key(name)
+        return find(key) if key else ""
+
+    return canon
+
+
 def _check_street_reference_and_frontage(
     main_plan: DrawPlan, nb_plan: DrawPlan
 ) -> tuple[str | None, str | None]:
@@ -4905,10 +4947,11 @@ def _check_street_reference_and_frontage(
     """
     dm = main_plan.description
     dn = nb_plan.description
-    ms_m = _normalize_street_key(dm.main_street)
-    ms_n = _normalize_street_key(dn.main_street)
-    cs_m = _normalize_street_key(dm.cross_street)
-    cs_n = _normalize_street_key(dn.cross_street)
+    canon = street_name_canon(dm, dn)
+    ms_m = canon(dm.main_street)
+    ms_n = canon(dn.main_street)
+    cs_m = canon(dm.cross_street)
+    cs_n = canon(dn.cross_street)
 
     if ms_m and ms_n and ms_m == ms_n:
         if cs_m and cs_n and cs_m != cs_n and not (cs_m.endswith(f" {cs_n}") or cs_n.endswith(f" {cs_m}")):

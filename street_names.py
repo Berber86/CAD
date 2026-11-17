@@ -90,6 +90,73 @@ def find_former_name(full_text: str, street: str | None, window: int = 160) -> s
     return None
 
 
+# Синонимы названия улицы в описании: «Father Capodanno Blvd (f/k/a Seaside Blvd)» — текущее
+# название перед словом, старое после; «Seaside Blvd (now Father Capodanno Blvd)» — наоборот.
+_STREET_SUFFIX = (
+    r"(?:Avenue|Ave|Boulevard|Blvd|Street|St|Road|Rd|Drive|Dr|Place|Pl|Lane|Ln|Parkway|Pkwy"
+    r"|Court|Ct|Terrace|Ter|Expressway|Expy|Highway|Hwy|Bridge|Plaza|Walk|Circle|Loop)\.?"
+)
+_ALIAS_NAME = rf"(?:[A-Za-z][A-Za-z'\-]*\s+){{0,4}}{_STREET_SUFFIX}"
+_ALIAS_PAREN = r"(?:\s*,?\s*\([^()]{0,40}\))*"
+_CURRENT_KW = (
+    r"(?:formerly\s+known\s+as|previously\s+known\s+as|previous(?:ly)?\s+known\s+as"
+    r"|also\s+known\s+as|formerly|previously|a/k/a|f/k/a|aka)"
+)
+_NOW_KW = r"(?:now\s+known\s+as|now)"
+# «Stafford Avenue (formerly Carlton Street)»: текущее — первое.
+_CURRENT_FIRST_RE = re.compile(
+    rf"(?P<cur>{_ALIAS_NAME}){_ALIAS_PAREN}\s*[,(]?\s*{_CURRENT_KW}\s+(?P<old>{_ALIAS_NAME})",
+    re.IGNORECASE,
+)
+# «Seaside Blvd. (100 feet wide) (now Father Capodanno Blvd.)»: старое — первое.
+_NOW_FIRST_RE = re.compile(
+    rf"(?P<old>{_ALIAS_NAME}){_ALIAS_PAREN}\s*[,(]?\s*{_NOW_KW}\s+(?P<cur>{_ALIAS_NAME})",
+    re.IGNORECASE,
+)
+# Слова перед названием, которые к нему не относятся («the northwesterly side of …»).
+_LEAD_NOISE = {
+    "the", "of", "side", "said", "along", "and", "on", "at", "to", "in", "from", "thence", "running",
+    "northerly", "southerly", "easterly", "westerly", "northeasterly", "northwesterly",
+    "southeasterly", "southwesterly", "northwesterly", "northeaster", "a", "an",
+}
+
+
+def _alias_name(raw: str) -> str:
+    words = [w for w in " ".join(raw.split()).split(" ") if w]
+    while len(words) > 1 and words[0].lower().strip(".,") in _LEAD_NOISE:
+        words.pop(0)
+    return " ".join(words).strip(" ,;")
+
+
+def street_aliases(text: str | None) -> list[tuple[str, str]]:
+    """
+    Пары (текущее название, старое или новое) из текста описания, без повторов.
+
+    Берутся только формы с явным словом «formerly / previously / a/k/a / f/k/a / also known as»
+    и «now / now known as». Имя обязано заканчиваться типовым словом улицы («Avenue», «Blvd»…),
+    поэтому имена людей и «now or formerly of …» не попадают. Смысл пары — один и тот же
+    физический отрезок улицы; сравнивать названия по парам можно только внутри одного набора.
+    """
+    body = " ".join(str(text or "").split())
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(current: str, other: str) -> None:
+        cur, old = _alias_name(current), _alias_name(other)
+        if not cur or not old or cur.lower() == old.lower():
+            return
+        key = (cur.lower(), old.lower())
+        if key not in seen:
+            seen.add(key)
+            pairs.append((cur, old))
+
+    for match in _CURRENT_FIRST_RE.finditer(body):
+        add(match.group("cur"), match.group("old"))
+    for match in _NOW_FIRST_RE.finditer(body):
+        add(match.group("cur"), match.group("old"))
+    return pairs
+
+
 def _flat(text: str | None) -> str:
     """Примечание или фрагмент описания: верхний регистр, без скобок, «SIXTY (60)» → «60»."""
     upper = str(text or "").upper()

@@ -7818,46 +7818,54 @@ class SurveyApp(ctk.CTk):
                             if ocr.error:
                                 last_exc = PDFError(f"локальный OCR: {ocr.error}")
                             elif ocr.text:
+                                # Разбор OCR-текста мог упасть: ошибка пишется в журнал, второй рендер
+                                # (нативное разрешение) и слияние строк всё равно пробуются — до ИИ.
+                                best_text = ocr.text
+                                ocr_candidate: _ScanCandidate | None = None
                                 try:
                                     ocr_candidate = judge({"text": ocr.text}, False, "OCR, 600 dpi")
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
-                                else:
-                                    best_text = ocr.text
-                                    # Проверка не пройдена: второй рендер по нативному разрешению и слияние
-                                    # строк двух распознаваний. Одиночный рендер иногда теряет строку.
-                                    if ocr_candidate.status_rank < _STATUS_OK_RANK:
-                                        progress_of(
-                                            f"{job.path.name}: проверка не ok — дальше второй рендер "
-                                            "(нативное разрешение) и слияние строк"
-                                        )
-                                        second = ocr_scan_once(job.path, job.source, progress=progress_of, exact=False)
-                                        progress_of(f"{job.path.name}: второй рендер — {second.summary()}")
-                                        if second.text:
-                                            variants = [(ocr.text, ocr_candidate)]
-                                            merged = ocr_pages.merge_line_texts(ocr.text, second.text)
-                                            for text_v, text_label in (
-                                                (second.text, "второй рендер"), (merged, "слияние строк"),
-                                            ):
-                                                try:
-                                                    variants.append((text_v, judge({"text": text_v}, False, text_label)))
-                                                except Exception as exc:  # noqa: BLE001
-                                                    last_exc = exc
+                                    progress_of(f"{job.path.name}: разбор OCR-текста не удался — {describe_exc(exc)}")
+                                if ocr_candidate is None or ocr_candidate.status_rank < _STATUS_OK_RANK:
+                                    progress_of(
+                                        f"{job.path.name}: проверка не ok — дальше второй рендер "
+                                        "(нативное разрешение) и слияние строк"
+                                    )
+                                    second = ocr_scan_once(job.path, job.source, progress=progress_of, exact=False)
+                                    progress_of(f"{job.path.name}: второй рендер — {second.summary()}")
+                                    if second.text:
+                                        variants: list[tuple[str, _ScanCandidate]] = []
+                                        if ocr_candidate is not None:
+                                            variants.append((ocr.text, ocr_candidate))
+                                        to_judge = [(second.text, "второй рендер")]
+                                        if ocr_candidate is not None:
+                                            to_judge.append(
+                                                (ocr_pages.merge_line_texts(ocr.text, second.text), "слияние строк")
+                                            )
+                                        for text_v, text_label in to_judge:
+                                            try:
+                                                variants.append((text_v, judge({"text": text_v}, False, text_label)))
+                                            except Exception as exc:  # noqa: BLE001
+                                                last_exc = exc
+                                                progress_of(f"{job.path.name}: {text_label} не разобран — {describe_exc(exc)}")
+                                        if variants:
                                             text_best, cand_best = max(variants, key=lambda v: v[1].rank)
-                                            if cand_best.rank > ocr_candidate.rank:
-                                                progress_of(
-                                                    f"{job.path.name}: слияние двух рендеров дало "
-                                                    f"{'ok' if cand_best.status_rank >= _STATUS_OK_RANK else 'неполный'} разбор"
-                                                )
+                                            if ocr_candidate is None or cand_best.rank > ocr_candidate.rank:
+                                                if ocr_candidate is not None:
+                                                    progress_of(
+                                                        f"{job.path.name}: слияние двух рендеров дало "
+                                                        f"{'ok' if cand_best.status_rank >= _STATUS_OK_RANK else 'неполный'} разбор"
+                                                    )
                                                 best_text, ocr_candidate = text_best, cand_best
-                                    if best is None or ocr_candidate.rank > best.rank:
-                                        best = ocr_candidate
-                                        # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(best_text, encoding="utf-8")
-                                        except OSError:
-                                            pass
+                                if ocr_candidate is not None and (best is None or ocr_candidate.rank > best.rank):
+                                    best = ocr_candidate
+                                    # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
+                                    target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                    try:
+                                        target_cache.write_text(best_text, encoding="utf-8")
+                                    except OSError:
+                                        pass
 
                         if best is not None and best.status_rank < _STATUS_OK_RANK:
                             if ai_ready:

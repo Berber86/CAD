@@ -6105,6 +6105,18 @@ class DiscrepancyItem:
         return f"{self.title}  →  " + "   vs   ".join(parts)
 
 
+def _with_check(outcome: ParseOutcome, source_text: str) -> ParseOutcome:
+    """Итог ИИ всегда несёт результат проверки описания.
+
+    Без него статус итога считается «не ok» (ранг 0), и даже верный ответ ИИ отбрасывается
+    как «не лучше кеша». Проверка считается по тем данным, которые выбраны в итоге.
+    """
+    if outcome.check is not None:
+        return outcome
+    from description_check import check_description  # noqa: PLC0415 — импорт здесь: цикл с llm_parser
+    return dataclasses.replace(outcome, check=check_description(outcome.data, source_text))
+
+
 @dataclass
 class ConsensusResult:
     """Результат параллельного запуска 2–3 независимых проходов LLM."""
@@ -6185,7 +6197,7 @@ class ConsensusResult:
         suspicions = detect_typo_suspicions(
             chosen.data, source_text=self.prepared_text, unanimous_llm_passes=1
         )
-        return ParseOutcome(
+        return _with_check(ParseOutcome(
             data=chosen.data,
             source=chosen.source,
             warnings=merged_warnings,
@@ -6198,7 +6210,7 @@ class ConsensusResult:
             prepared_text=self.prepared_text,
             prepared_images=list(self.prepared_images),
             base_warnings=list(self.base_warnings),
-        )
+        ), self.prepared_text)
 
 
 _STREET_SUFFIX_CANON: dict[str, str] = {
@@ -6616,7 +6628,7 @@ def run_multipass_consensus(
                     f"Проход #{pt.pass_index} ({pt.provider} / {pt.model}): {exc}"
                 ) from exc
 
-    ordered_outcomes = [outcomes_by_index[pt.pass_index] for pt in pass_targets]
+    ordered_outcomes = [_with_check(outcomes_by_index[pt.pass_index], combined) for pt in pass_targets]
     agreed, discrepancies = compare_legal_descriptions(ordered_outcomes)
 
     usage_items: list[TokenUsage | None] = [o.usage for o in ordered_outcomes]
@@ -6716,7 +6728,7 @@ def run_multipass_consensus(
         pass_outcomes=ordered_outcomes,
         pass_targets=pass_targets,
         discrepancies=discrepancies,
-        selected_outcome=selected,
+        selected_outcome=_with_check(selected, combined),
         total_usage=total_usage,
         round_number=round_number,
         prepared_text=combined,

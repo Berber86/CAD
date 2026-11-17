@@ -133,6 +133,12 @@ class _Widget:
     def after(self, *args, **kwargs):
         return None
 
+    def after_idle(self, *args, **kwargs):
+        return None
+
+    def state(self, *args, **kwargs):
+        return None
+
     def start(self):
         return None
 
@@ -1541,9 +1547,8 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
     import version
 
     assert gui.VERSION == version.APP_VERSION != "1.0.0"
-    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_DATE})"
+    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_STAMP})"
     assert app.version_badge.cget("text") == f"v{version.APP_VERSION} · STUDIO"
-    assert gui.APP_DATE == version.APP_DATE
     assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings
@@ -4124,6 +4129,8 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+    exit_codes: list[int] = []
+    monkeypatch.setattr(app, "_exit_process", lambda code: exit_codes.append(code))
 
     _finish_update(app, gui, monkeypatch)
 
@@ -4138,6 +4145,7 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
 
     assert _Path(launched[0][-1]) == _Path(gui.__file__).resolve().parent / "run.bat"
     assert destroyed, "окно должно закрыться после успешного запуска нового экземпляра"
+    assert exit_codes == [0], "процесс старой версии должен завершиться, иначе окно run.bat висит"
 
 
 def test_failed_restart_keeps_window_and_says_how_to_restart(gui, monkeypatch):
@@ -4281,6 +4289,8 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+    exit_codes: list[int] = []
+    monkeypatch.setattr(app, "_exit_process", lambda code: exit_codes.append(code))
 
     app._start_rollback()
 
@@ -4290,6 +4300,7 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
     assert any(title == "Откат выполнен" for title, _ in questions)
     assert launched and launched[0][-1].endswith("run.bat")
     assert destroyed
+    assert exit_codes == [0]
     assert app.rollback_button.cget("state") == "disabled"
 
 
@@ -4387,3 +4398,24 @@ def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
     assert gui.SurveyApp._print_draft_plans(owner(main_plan, False)) == []
     assert gui.SurveyApp._print_draft_plans(owner(None, True)) == []
 
+
+
+def test_start_source_setting_opens_chosen_tab_and_saves_choice(gui, tmp_path, monkeypatch):
+    """Настройка «стартовая вкладка»: открывается выбранный источник, выбор сохраняется в config.json."""
+    import json
+
+    import llm_parser
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"ui": {"start_source": "pdf"}}), encoding="utf-8")
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(gui, "load_config", lambda path=cfg_path: llm_parser.load_config(path))
+
+    app = gui.SurveyApp()
+    assert app.source_mode_var.get() == "📄 PDF"
+
+    # Выбор в шторке не меняет текущую вкладку, а пишет настройку.
+    app.start_source_var.set("📝 Текст")
+    app._on_start_source_changed()
+    assert app.source_mode_var.get() == "📄 PDF"
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["ui"]["start_source"] == "text"

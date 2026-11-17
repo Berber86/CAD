@@ -90,8 +90,9 @@ from conflict_resolver import (
     fix_changes,
 )
 from feature_labeler import feature_settings
-from version import APP_DATE, APP_VERSION
+from version import APP_STAMP, APP_VERSION
 import log_mode
+import start_source
 from llm_parser import (
     ASPENWALL_SAMPLES,
     legal_to_step0_text,
@@ -461,9 +462,11 @@ class SurveyApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.configure(fg_color=THEME["bg_root"])
 
-        self.title(f"{APP_TITLE}  v{VERSION} ({APP_DATE})")
+        self.title(f"{APP_TITLE}  v{VERSION} ({APP_STAMP})")
         self.geometry(APP_GEOMETRY)
         self.minsize(1100, 760)
+        # Открываемся на весь экран (окно развёрнуто; кнопки свернуть/закрыть остаются).
+        self.after_idle(self._open_maximized)
 
         # По умолчанию окно не закреплено поверх AutoCAD и других приложений.
         self.attributes("-topmost", False)
@@ -1121,7 +1124,7 @@ class SurveyApp(ctk.CTk):
         self.update_version_button.grid(row=2, column=1, padx=(0, 10), pady=(0, 6), sticky="e")
         self.update_status_label = ctk.CTkLabel(
             update_row,
-            text=f"Текущая версия: {APP_VERSION} ({APP_DATE})",
+            text=f"Текущая версия: {APP_VERSION} ({APP_STAMP})",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1309,6 +1312,48 @@ class SurveyApp(ctk.CTk):
             command=self._save_settings,
         )
         self.save_button.grid(row=0, column=1, padx=(0, 12), pady=10, sticky="e")
+
+        # 1b. Стартовая вкладка Шага 1: текст или PDF (сохраняется в config.json, ui.start_source).
+        start_card = ctk.CTkFrame(
+            drawer_body,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        start_card.grid(row=5, column=0, sticky="ew", pady=(10, 4))
+        start_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            start_card,
+            text="СТАРТОВАЯ ВКЛАДКА ШАГА 1",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.start_source_var = ctk.StringVar(
+            value=start_source.label_for(start_source.start_source_from_config(self.config_data))
+        )
+        self.start_source_switch = ctk.CTkSegmentedButton(
+            start_card,
+            values=[start_source.LABELS[start_source.TEXT], start_source.LABELS[start_source.PDF]],
+            variable=self.start_source_var,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["btn_primary"],
+            selected_hover_color=THEME["btn_primary_hover"],
+            command=self._on_start_source_changed,
+        )
+        self.start_source_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
+        ctk.CTkLabel(
+            start_card,
+            text="Что открывать при запуске программы. Действует со следующего запуска.",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
@@ -1557,7 +1602,10 @@ class SurveyApp(ctk.CTk):
         self.pdf_label.grid(row=0, column=2, sticky="e")
 
         # Сегментированный переключатель источника данных
-        self.source_mode_var = ctk.StringVar(value="📝 Текст")
+        # Стартовая вкладка источника: настройка ui.start_source (по умолчанию текст).
+        self.source_mode_var = ctk.StringVar(
+            value=start_source.label_for(start_source.start_source_from_config(self.config_data))
+        )
         self.source_mode_switch = ctk.CTkSegmentedButton(
             input_frame,
             values=["📄 PDF", "📷 Фото", "📝 Текст"],
@@ -5525,13 +5573,37 @@ class SurveyApp(ctk.CTk):
                 self.update_status_label.configure(text=text, text_color=THEME["err"])
                 self._set_status(text, error=True)
             else:
-                self.destroy()
+                self._exit_after_relaunch()
                 return
         if was_topmost:
             try:
                 self.attributes("-topmost", True)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _exit_after_relaunch(self) -> None:
+        """
+        Завершает процесс старой версии после того, как новый уже запущен.
+
+        Окно run.bat старой версии ждёт, пока завершится python.exe. Одного destroy()
+        недостаточно: если процесс задерживается (фоновые потоки, очистка интерпретатора),
+        cmd висит. Поэтому после destroy() выходим сразу с кодом 0 — run.bat тогда
+        дойдёт до конца и закроет своё окно, а не предложит откат.
+        """
+        try:
+            self.destroy()
+        except Exception:  # noqa: BLE001 - выходим в любом случае
+            pass
+        self._exit_process(0)
+
+    def _exit_process(self, code: int) -> None:
+        """Немедленный выход процесса (отдельным методом, чтобы тесты не завершали pytest)."""
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(code)
 
     def _set_rollback_enabled(self, enabled: bool) -> None:
         button = getattr(self, "rollback_button", None)
@@ -8982,6 +9054,31 @@ class SurveyApp(ctk.CTk):
     def _log_view_text(self) -> str:
         """Журнал операций в текущем режиме (без служебных уровней)."""
         return "\n".join(log_mode.filter_entries(getattr(self, "_log", []), self._log_mode()))
+
+    def _open_maximized(self) -> None:
+        """Разворачивает окно на весь экран при запуске. Сбой не мешает работе — окно остаётся обычным."""
+        try:
+            self.state("zoomed")
+        except Exception:  # noqa: BLE001 - платформа без zoomed (например, Linux без WM)
+            try:
+                self.attributes("-zoomed", True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_start_source_changed(self, _label: str = "") -> None:
+        """Настройка «стартовая вкладка»: пишет ui.start_source в config.json.
+
+        Текущую вкладку Шага 1 не меняет — только то, что откроется при следующем запуске.
+        """
+        key = start_source.key_for_label(self.start_source_var.get())
+        try:
+            start_source.save_start_source_to_file(CONFIG_PATH, key)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Стартовая вкладка не сохранена в config.json: {exc}", warn=True)
+            return
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("ui", {})["start_source"] = key
+        self._set_status(f"Стартовая вкладка: {start_source.label_for(key)} (со следующего запуска)")
 
     def _apply_log_mode(self) -> None:
         """Переключатель «Подробный журнал»: сохраняет режим и перерисовывает все журналы."""

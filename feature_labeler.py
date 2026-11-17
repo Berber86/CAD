@@ -36,7 +36,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
-from version import APP_DATE, APP_VERSION
+from version import APP_STAMP, APP_VERSION
 
 try:
     from shapely.geometry import LineString, Point, Polygon, box as shapely_box
@@ -1242,7 +1242,7 @@ class NorthArrow:
 
 #: Версия программы (``version.py``) с датой: печатается в отчёте Шага 2, чтобы
 #: было видно, какая сборка работала. Тот же номер стоит в углу окна.
-STEP2_VERSION = f"{APP_VERSION} ({APP_DATE})"
+STEP2_VERSION = f"{APP_VERSION} ({APP_STAMP})"
 
 
 @dataclass

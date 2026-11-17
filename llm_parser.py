@@ -3723,8 +3723,9 @@ def _extract_nyc_metadata(
         meta["borough_or_city"] = f"{boro.group(1).strip()}, NY"
 
     if main_street:
+        # Одна вложенная пара скобок допускается: «(SIXTY (60) FEET WIDE)».
         note_re = re.compile(
-            re.escape(main_street) + r"\s*(\([^)]{3,80}\))",
+            re.escape(main_street) + r"\s*(\((?:[^()]|\([^()]*\)){3,80}\))",
             re.IGNORECASE,
         )
         nm = note_re.search(full_text)
@@ -4067,8 +4068,8 @@ def parse_with_regex(
     )
 
     note_now = meta.get("main_street_note")
-    width_text = street_names.find_width_text(normalized, main_street)
-    if width_text and not (note_now and street_names.WIDTH_RE.search(note_now)):
+    width_text = street_names.find_width_text(normalized, main_street, stop=cross_street)
+    if width_text and not street_names.has_width(note_now):
         meta["main_street_note"] = f"{width_text} {note_now}" if note_now else width_text
     former_name = meta.get("main_street_former") or street_names.find_former_name(
         normalized, main_street
@@ -5367,6 +5368,25 @@ def _prepare_parse_input(
     return combined, image_data_urls, warnings, orient_usage
 
 
+def _ensure_street_width(model: LegalDescription, source_text: str) -> LegalDescription:
+    """
+    Если ИИ не вынес ширину фасадной улицы в примечание, берём её из текста описания.
+
+    Ширина нужна для подписи «(XX' WIDE)» на чертеже, поэтому читается и в ответе ИИ.
+    """
+    street = getattr(model, "main_street", None)
+    if not street or not source_text or street_names.has_width(model.main_street_note):
+        return model
+    width_text = street_names.find_width_text(
+        source_text, street, stop=getattr(model, "cross_street", None)
+    )
+    if not width_text:
+        return model
+    note = model.main_street_note
+    new_note = f"{width_text} {note}" if note else width_text
+    return model.model_copy(update={"main_street_note": new_note})
+
+
 def parse_legal_description_full(
     text: str | None = None,
     pdf_path: str | Path | None = None,
@@ -5459,6 +5479,7 @@ def parse_legal_description_full(
                 unanimous_llm_passes=1,
             )
             warnings.extend(repair_notes)
+            parsed_model = _ensure_street_width(parsed_model, combined)
             suspicions = detect_typo_suspicions(
                 parsed_model,
                 source_text=combined,

@@ -160,3 +160,70 @@ def test_neighbour_distance_label_has_no_from_corner():
         model, [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], 1.0, None, None
     )
     assert label.text == "NEIGHBOR (200')"
+
+
+# ------------------------------------------------------------------ ширина улицы
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Alvine Avenue (60 feet wide)",
+        "Alvine Avenue (60' WIDE)",
+        "Alvine Avenue (60 FT WIDE)",
+        "Alvine Avenue (sixty feet wide)",
+        "Alvine Avenue (sixty (60) feet wide)",
+        "Alvine Avenue, 60-foot wide,",
+        "Alvine Avenue, a 60 foot wide street,",
+        "Alvine Avenue, having a width of 60 feet,",
+        "Alvine Avenue, which has a width of sixty feet,",
+        "Alvine Avenue (60 feet in width)",
+        "Alvine Avenue (width 60 feet)",
+    ],
+)
+def test_parser_reads_width_in_every_common_form(phrase):
+    model, _ = parse_with_regex(_with_street(phrase))
+    assert model.main_street == "Alvine Avenue"
+    assert street_names.parse_street_note(model.main_street_note)[0] == "60"
+
+
+def test_nested_parentheses_do_not_leave_number_words_on_the_drawing():
+    model, _ = parse_with_regex(_with_street("Alvine Avenue (sixty (60) feet wide)"))
+    assert street_names.parse_street_note(model.main_street_note) == ("60", [])
+
+
+def test_width_is_not_taken_from_the_neighbouring_street():
+    text = "the easterly line of Alvine Avenue; running to Amboy Road (50 feet wide)"
+    assert street_names.find_width_text(text, "Alvine Avenue", stop="Amboy Road") is None
+
+
+def test_width_mentioned_at_a_later_mention_of_the_street_is_found():
+    text = (
+        "fronting Alvine Avenue; THENCE along a line; "
+        "and along the line of Alvine Avenue (45 feet wide)"
+    )
+    assert street_names.find_width_text(text, "Alvine Avenue") == "(45' WIDE)"
+
+
+def test_no_width_in_description_gives_placeholder_on_drawing():
+    plan = _plan_for("Alvine Avenue")
+    note = next(item for item in plan.items if item.kind == "main-street-note")
+    assert note.text == "(XX' WIDE)"
+
+
+def test_ai_answer_without_width_gets_it_from_the_text():
+    from llm_parser import _ensure_street_width  # noqa: PLC0415
+
+    model, _ = parse_with_regex(_with_street("Alvine Avenue"))
+    model = model.model_copy(update={"main_street_note": None})
+    fixed = _ensure_street_width(model, _with_street("Alvine Avenue (60 feet wide)"))
+    assert fixed.main_street_note == "(60' WIDE)"
+
+
+def test_ai_width_already_in_answer_is_kept():
+    from llm_parser import _ensure_street_width  # noqa: PLC0415
+
+    model, _ = parse_with_regex(_with_street("Alvine Avenue"))
+    model = model.model_copy(update={"main_street_note": "(38' WIDE)"})
+    kept = _ensure_street_width(model, _with_street("Alvine Avenue (60 feet wide)"))
+    assert kept.main_street_note == "(38' WIDE)"

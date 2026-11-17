@@ -173,3 +173,53 @@ def test_button_moves_overlapping_neighbour_and_undo_restores_it(gui):
     assert all(
         a == pytest.approx(b) for a, b in zip(nb.vertices, original)
     ) and len(nb.vertices) == len(original)
+
+
+def test_not_found_names_the_blocking_reasons():
+    """В журнале видно, что именно отсеяло сдвиги: улица, другой сосед, направление."""
+    main = _sq(0, 0, 100, 100)
+    nb = _sq(90, 40, 30, 30)
+    res = slide_off_overlap(main, nb, street_lines=[((110, -50), (110, 150))])
+    assert res.status == "not_found"
+    assert res.tried > 0
+    assert res.rejected["улица"] > 0
+    assert "улица" in res.note and "проверено сдвигов" in res.note
+
+
+def test_tie_line_is_not_a_street_blocker(gui):
+    """
+    Линия «-tie» (от угла до точки начала) — не улица: сосед через неё проходит.
+    Та же линия, но с видом улицы, — блокирует.
+    """
+    from acad_builder import AcadBuilder, LineItem, translate_plan
+    from llm_parser import LegalDescription, Segment
+
+    app = gui.SurveyApp()
+    desc = LegalDescription(
+        main_street="Oak Ave",
+        cross_street="1st St",
+        distance_to_corner_ft=50.0,
+        segments=[
+            Segment(ns="N", degrees=90, ew="E", distance_ft=100.0),
+            Segment(ns="S", degrees=0, ew="E", distance_ft=100.0),
+            Segment(ns="S", degrees=90, ew="W", distance_ft=100.0),
+            Segment(ns="N", degrees=0, ew="W", distance_ft=100.0),
+        ],
+    )
+    builder = AcadBuilder(app.config_data)
+    main = builder.plan(desc)
+    nb = translate_plan(builder.plan(desc, is_neighbor=True), 70.0, 20.0)
+    # Линия поперёк пути соседа (он поедет на восток через x = 160..240)
+    cut = LineItem(start=(160.0, -60.0), end=(240.0, -60.0), kind="main-street-row-tie")
+
+    main.lines = [cut]
+    app._preview_main_plan = main
+    app._preview_neighbor_plans = [nb]
+    app._slide_overlapping_neighbours()
+    assert nb.vertices[0][0] > 120.0 + 1e-6  # сдвинулся на восток, через линию привязки
+
+    nb2 = translate_plan(builder.plan(desc, is_neighbor=True), 70.0, 20.0)
+    main.lines = [LineItem(start=(160.0, -60.0), end=(240.0, -60.0), kind="main-street-row-1")]
+    app._preview_neighbor_plans = [nb2]
+    app._slide_overlapping_neighbours()
+    assert nb2.vertices[0][0] < 160.0  # улица не пустила соседа через линию

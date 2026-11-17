@@ -49,6 +49,9 @@ class SlideResult:
     #: Площадь наложения до сдвига, кв. футов.
     overlap_before_sqft: float = 0.0
     note: str = ""
+    #: Сколько сдвигов проверено и почему отсеяно (для журнала: что именно блокирует).
+    tried: int = 0
+    rejected: dict[str, int] | None = None
 
 
 def _polygon(points: Sequence[tuple[float, float]]) -> Polygon | None:
@@ -188,46 +191,57 @@ def slide_off_overlap(
         return SlideResult(status="no_overlap", overlap_before_sqft=before)
 
     need = shared_fraction * max(_longest_edge(main_points), _longest_edge(neighbour_points))
-    street = [LineString(seg) for seg in street_lines if len(seg) >= 2]
+    street = [LineString(seg) for seg in street_lines if len(seg) >= 2]  # только красные линии улиц
     other_polys = [p for p in (_polygon(o) for o in others) if p is not None]
 
-    def check(dx: float, dy: float) -> float | None:
-        """Общая межа после сдвига, если сдвиг допустим; иначе None."""
+    def check_reason(dx: float, dy: float) -> str | None:
+        """None — сдвиг допустим; иначе причина отказа."""
         moved = affinity.translate(neighbour, dx, dy)
         if main.intersection(moved).area > overlap_tol_sqft:
-            return None
+            return "наложение с нашим"
         if any(moved.intersection(p).area > overlap_tol_sqft for p in other_polys):
-            return None
+            return "наложение с соседом"
         if _crosses_street(moved, street):
-            return None
-        shared = _shared_length(main, moved)
-        if shared + 1e-6 < need:
-            return None
-        return shared
+            return "улица"
+        if _shared_length(main, moved) + 1e-6 < need:
+            return "общая межа короче порога"
+        return None
 
     main_c = main.centroid
     nb_c = neighbour.centroid
     away = (nb_c.x - main_c.x, nb_c.y - main_c.y)
     best: tuple[float, float, float, float] | None = None  # (|t|, dx, dy, shared)
+    rejected: dict[str, int] = {
+        "не наружу": 0, "наложение с нашим": 0, "наложение с соседом": 0,
+        "улица": 0, "общая межа короче порога": 0,
+    }
+    tried = 0
     for dx, dy in _ordered_translations(main_points, neighbour_points, need, max_move_ft):
+        tried += 1
         if not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
+            rejected["не наружу"] += 1
             continue
-        shared = check(dx, dy)
-        if shared is not None:
+        reason = check_reason(dx, dy)
+        if reason is None:
+            shared = _shared_length(main, affinity.translate(neighbour, dx, dy))
             best = (math.hypot(dx, dy), dx, dy, shared)
             break
+        rejected[reason] += 1
 
     if best is None:
+        counts = ", ".join(f"{name} — {n}" for name, n in rejected.items() if n) or "кандидатов нет"
         note = (
-            f"наружу (от нашего центра к соседу) нет сдвига до {max_move_ft:.0f} ft, при котором "
-            f"наложения нет, а общая межа не короче {need:.2f} ft; сосед не тронут"
+            f"наружу нет сдвига до {max_move_ft:.0f} ft, при котором наложения нет и общая межа "
+            f"не короче {need:.2f} ft; проверено сдвигов: {tried} (отсеяно: {counts}); сосед не тронут"
         )
         if not _has_parallel_edge(main_points, neighbour_points):
             note += (
                 "; сосед повёрнут относительно нашей межи — одним переносом общую межу не получить, "
                 "нужен поворот"
             )
-        return SlideResult(status="not_found", overlap_before_sqft=before, note=note)
+        return SlideResult(
+            status="not_found", overlap_before_sqft=before, note=note, tried=tried, rejected=rejected,
+        )
     s, dx, dy, shared = best
     direction = math.degrees(math.atan2(dy, dx)) % 360.0 if s > 0 else 0.0
     return SlideResult(

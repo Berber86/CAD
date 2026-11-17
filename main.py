@@ -6048,6 +6048,7 @@ class SurveyApp(ctk.CTk):
             (ln.start, ln.end)
             for ln in main.lines
             if str(ln.kind).startswith(("main-street-row", "cross-street-row"))
+            and not str(ln.kind).endswith("-tie")  # линия привязки от угла до POB — не улица
         ]
         moves: list[tuple[DrawPlan, float, float]] = []
         moved_count = 0

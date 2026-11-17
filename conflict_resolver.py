@@ -96,9 +96,20 @@ class Change:
 
     @property
     def where(self) -> str:
+        if self.target == "street":
+            return "перекрёсток" if self.field == "cross" else "название улицы"
         return "привязка к углу" if self.target == "tie" else f"сторона #{self.index + 1}"
 
+    @property
+    def is_name(self) -> bool:
+        """Правка названия (перекрёсток или переименование улицы): геометрию не меняет."""
+        return self.target == "street"
+
     def describe(self) -> str:
+        if self.is_name:
+            if self.field == "cross":
+                return f"перекрёсток: «{self.old_label}» → «{self.new_label}»"
+            return f"название улицы: добавить «{self.new_label}»"
         what = "румб" if self.field == "bearing" else "длина"
         return f"{self.where}: {what} {self.old_label} → {self.new_label}"
 
@@ -421,6 +432,15 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
         return description
     data = description.model_dump()
     for change in changes:
+        if change.is_name:
+            if change.field == "cross":
+                data["cross_street"] = change.new_label
+            else:
+                aliases = list(data.get("street_aliases") or [])
+                if change.new_label not in aliases:
+                    aliases.append(change.new_label)
+                data["street_aliases"] = aliases
+            continue
         if change.target == "tie" and change.field == "distance":
             # Расстояние от угла улицы до POB. Румб: если советник дал — ставим его, иначе
             # валидатор выведет румб по улице (или оставит прежний, если привязка уже есть).
@@ -1258,6 +1278,10 @@ OUTPUT: exactly one JSON object and nothing else:
 For "tie" there are two operations:
   - the distance from the street corner to the point of beginning, printed as "distant N feet <direction> from the corner": give "distance_ft": N (a number, decimal feet). Use this when the lot has no tie or the tie distance is wrong. Give "bearing" as the quadrant bearing of the course from the corner to the point of beginning if the document or a neighbour gives it, otherwise null (it is then derived from the street).
   - only the bearing of an existing tie: "bearing" with "distance_ft": null.
+Two more operations change NAMES, not geometry. Python accepts them only when the name is printed in that lot's own text:
+  - {"target": "cross_street", "name": "Seaside Boulevard"}: the street that this lot's corner is tied to (the cross street), exactly as printed in this lot's document. Use it when the lot is attached to a different intersection only because its cross street is named differently or wrongly.
+  - {"target": "street_alias", "current": "Father Capodanno Blvd", "old": "Seaside Boulevard"}: a printed renaming ("X (now Y)", "Y (formerly X)", "f/k/a", "a/k/a", "also known as"). Both names must be printed in this lot's text, together with that marker.
+Put a naming fix in its own proposal, with "changes" holding only these items, and quote the printed words in "source_quote".
 "source_lot" and "source_quote" may be null when the value is computed."""
 
 
@@ -1281,6 +1305,8 @@ def _lot_block(
         f"  fronting street: {street}; cross street: {desc.cross_street or 'none'}; "
         f"lot faces: {desc.front_side or '?'}; block {desc.block_number or '?'}, lot {desc.lot_number or '?'}"
     )
+    if desc.street_aliases:
+        lines.append("  street names printed as renamed: " + "; ".join(desc.street_aliases))
     tie = desc.corner_to_pob_bearing
     if tie is not None and desc.distance_to_corner_ft > 1e-6:
         raw_tie = raw.corner_to_pob_bearing
@@ -1392,6 +1418,43 @@ def read_advisor_reply(data: Any) -> AdvisorReply:
     return reply
 
 
+_STREET_SUFFIX_FORMS: dict[str, tuple[str, ...]] = {
+    "avenue": ("avenue", "ave"), "ave": ("avenue", "ave"),
+    "boulevard": ("boulevard", "blvd"), "blvd": ("boulevard", "blvd"),
+    "street": ("street", "st"), "st": ("street", "st"),
+    "road": ("road", "rd"), "rd": ("road", "rd"),
+    "drive": ("drive", "dr"), "dr": ("drive", "dr"),
+    "place": ("place", "pl"), "pl": ("place", "pl"),
+    "lane": ("lane", "ln"), "ln": ("lane", "ln"),
+    "parkway": ("parkway", "pkwy"), "pkwy": ("parkway", "pkwy"),
+    "court": ("court", "ct"), "ct": ("court", "ct"),
+    "terrace": ("terrace", "ter"), "ter": ("terrace", "ter"),
+}
+# Слова о переименовании. «commonly known as» (адрес) и «now or formerly» (владелец) — не они.
+_RENAME_MARK_RE = re.compile(
+    r"\(now\b|now\s+known\s+as|(?<!or )formerly|previously|also\s+known\s+as|f/k/a|a/k/a",
+    re.IGNORECASE,
+)
+
+
+def _street_in_text(name: str, text: str) -> bool:
+    """
+    Напечатано ли название улицы в тексте описания. Пробелы, регистр и формы «Blvd» /
+    «Boulevard» не важны; остальные буквы — важны, поэтому чужая улица не совпадёт.
+    """
+    tokens = re.findall(r"[a-z0-9]+", str(name or "").lower())
+    forms: tuple[str, ...] = ()
+    if len(tokens) > 1 and tokens[-1] in _STREET_SUFFIX_FORMS:
+        forms = _STREET_SUFFIX_FORMS[tokens[-1]]
+        tokens = tokens[:-1]
+    core = "".join(tokens)
+    if not core:
+        return False
+    compact = re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+    tail = "(?:" + "|".join(forms) + ")" if forms else ""
+    return re.search(re.escape(core) + tail, compact) is not None
+
+
 def _value_origin(scene: _Scene, lot: LotInput, change: Change) -> str | None:
     """Есть ли предложенное значение в разобранных данных какого-либо участка набора."""
     if change.target == "tie" and change.field == "distance":
@@ -1441,10 +1504,52 @@ def _advisor_proposals(
             continue
         changes: list[Change] = []
         problem = ""
+        text = lot.source_text or ""
         for raw in item.get("changes") or []:
             if not isinstance(raw, dict):
                 continue
-            target = "tie" if str(raw.get("target") or "side").strip().lower() == "tie" else "side"
+            kind = str(raw.get("target") or "").strip().lower()
+            if kind == "cross_street":
+                # Перекрёсток, к которому привязан участок: только название, напечатанное в его тексте.
+                name = " ".join(str(raw.get("name") or "").split())
+                if not name:
+                    problem = "не указано название пересекающей улицы"
+                    break
+                if not text.strip():
+                    problem = "у участка нет текста описания для проверки названия"
+                    break
+                if not _street_in_text(name, text):
+                    problem = f"«{name}» не напечатано в тексте описания этого участка"
+                    break
+                if desc.cross_street and _normalize_street_key(desc.cross_street) == _normalize_street_key(name):
+                    continue
+                changes.append(Change(
+                    target="street", index=-1, field="cross", new_label=name,
+                    old_label=desc.cross_street or "нет",
+                ))
+                continue
+            if kind == "street_alias":
+                current = " ".join(str(raw.get("current") or "").split())
+                old = " ".join(str(raw.get("old") or "").split())
+                if not current or not old:
+                    problem = "переименование должно содержать оба названия"
+                    break
+                if not text.strip():
+                    problem = "у участка нет текста описания для проверки переименования"
+                    break
+                if not (_street_in_text(current, text) and _street_in_text(old, text)):
+                    problem = f"«{current}» или «{old}» не напечатаны в тексте описания этого участка"
+                    break
+                if not _RENAME_MARK_RE.search(text):
+                    problem = "в тексте описания нет слова о переименовании (now / formerly / f/k/a)"
+                    break
+                label = f"{current} = {old}"
+                known = {" ".join(alias.split()).lower() for alias in (desc.street_aliases or [])}
+                if label.lower() in known:
+                    continue
+                changes.append(Change(target="street", index=-1, field="alias", new_label=label))
+                continue
+            target = "tie" if kind == "tie" else "side"
             if target == "tie" and raw.get("distance_ft") not in (None, "", "null"):
                 # Советник задаёт расстояние от угла улицы до POB (и, если знает, румб привязки).
                 try:
@@ -1524,9 +1629,11 @@ def _advisor_proposals(
                 if tie_change is not None and not desc.segments[change.index].has_bearing:
                     changes.append(tie_change)
                     slots.add(tie_change.slot)
+        name_only = all(change.is_name for change in changes)
         before = scene.metrics(lot, base, state=scene.virtual)
         after = scene.metrics(lot, base + tuple(changes), state=scene.virtual)
-        verdict = judge(before, after)
+        # Правка названий геометрию не меняет: её подтверждает напечатанный текст, а не замер.
+        verdict = "partial" if name_only and before is not None and after is not None else judge(before, after)
         if verdict == "rejected" or before is None or after is None:
             detail = (
                 "участок с такой правкой не строится" if after is None or before is None
@@ -1542,7 +1649,12 @@ def _advisor_proposals(
         reason = " ".join(str(item.get("reason") or "").split())
         if reason:
             reasons.append(f"довод советника: {reason}")
+        if name_only:
+            reasons.append("название подтверждено текстом описания этого участка; геометрия не меняется")
         for change in changes:
+            if change.is_name:
+                reasons.append(f"{change.where}: «{change.new_label}» напечатано в тексте участка «{lot.name}»")
+                continue
             origin = _value_origin(scene, lot, change)
             reasons.append(
                 f"{change.where}: значение {change.new_label} есть в разобранных данных — {origin}"

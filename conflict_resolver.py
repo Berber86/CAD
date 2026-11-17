@@ -47,9 +47,11 @@ from acad_builder import (
     NeighborVerificationReport,
     _normalize_street_key,
     polygon_intersection_area,
+    street_name_canon as acad_builder_street_canon,
     verify_with_neighbors,
 )
 from llm_parser import LegalDescription, Segment, bearing_label
+from street_names import share_street_aliases, with_shared_aliases
 from pdf_set import CLOSURE_LIMIT_FT
 
 #: Слово «southerly» допускает такой отход настоящего румба от стороны света.
@@ -491,6 +493,8 @@ class _Scene:
         self.lots = list(lots)
         self.scale = scale
         self._descriptions: dict[tuple[str, tuple[Change, ...]], LegalDescription | None] = {}
+        #: Переименования, напечатанные в любом описании набора: общие для всех участков набора.
+        self.shared_aliases = share_street_aliases(lot.description for lot in self.lots)
         self._plans: dict[tuple[str, tuple[Change, ...]], DrawPlan | None] = {}
         #: Подтверждённые находки, принятые «в уме» (после них считается остаток).
         self.virtual: dict[str, tuple[Change, ...]] = {}
@@ -499,7 +503,8 @@ class _Scene:
         key = (lot.key, tuple(extra))
         if key not in self._descriptions:
             try:
-                self._descriptions[key] = apply_changes(lot.description, fix_changes(lot.fixes) + tuple(extra))
+                built = apply_changes(lot.description, fix_changes(lot.fixes) + tuple(extra))
+                self._descriptions[key] = with_shared_aliases(built, self.shared_aliases)
             except Exception:  # noqa: BLE001 - пробная правка дала недопустимые данные
                 self._descriptions[key] = None
         return self._descriptions[key]
@@ -1485,9 +1490,11 @@ def _street_name_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
         return []
     cross_core = " ".join(cross_tokens[:-1])
     cross_suffix = _STREET_SUFFIX_FORMS[cross_tokens[-1]][0]
-    own_main = _normalize_street_key(desc.main_street)
+    canon = acad_builder_street_canon(*[scene.description(other, scene.virtual.get(other.key, ()))
+                                        or other.description for other in scene.lots])
+    own_main = canon(desc.main_street)
     agreed = {
-        _normalize_street_key(street)
+        canon(street)
         for other in scene.lots if other is not lot
         for street in (other.description.cross_street, other.description.main_street)
         if street
@@ -1508,8 +1515,8 @@ def _street_name_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
         if ratio < STREET_TYPO_SIMILARITY:
             continue
         full = " ".join(core_words) + " " + match.group(2)
-        key = _normalize_street_key(full)
-        if key == _normalize_street_key(desc.cross_street) or key == own_main or key not in agreed:
+        key = canon(full)
+        if key == canon(desc.cross_street) or key == own_main or key not in agreed:
             continue
         found[key] = full
     if len(found) != 1:
@@ -1522,9 +1529,10 @@ def _street_name_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
     after = scene.metrics(lot, base + (change,), state=scene.virtual)
     if before is None or after is None:
         return []
+    new_key = canon(new_name)
     donor = next(
-        other for other in scene.lots if other is not lot and new_name and _normalize_street_key(new_name) in {
-            _normalize_street_key(other.description.cross_street), _normalize_street_key(other.description.main_street),
+        other for other in scene.lots if other is not lot and new_key in {
+            canon(other.description.cross_street), canon(other.description.main_street),
         }
     )
     return [Proposal(

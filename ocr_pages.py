@@ -18,10 +18,15 @@ ACRIS) текстового слоя нет вовсе — ``PyMuPDF`` отда�
 
 from __future__ import annotations
 
+import getpass
 import hashlib
+import json
 import os
 import re
+import socket
+import stat
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -140,24 +145,114 @@ def _read_cache(key: str) -> str | None:
         return None
 
 
-def _write_cache(key: str, text: str) -> None:
+def _provenance_file(key: str) -> Path:
+    return cache_dir() / f"{key}.json"
+
+
+def cache_provenance(key: str) -> dict[str, Any] | None:
+    """Кто и когда записал запись кэша (None — запись старая, учёта не было)."""
     try:
+        data = json.loads(_provenance_file(key).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def describe_provenance(info: dict[str, Any] | None) -> str:
+    """Строка для журнала: «записал user на PC, 17.11.2026 10:04, версия 3.77»."""
+    if not info:
+        return "записано до ведения учёта: кто и когда — неизвестно"
+    parts = [
+        f"записал {info.get('записал', '?')} на {info.get('компьютер', '?')}",
+        str(info.get("записано", "?")),
+        f"программа {info.get('программа', '?')}",
+    ]
+    return ", ".join(parts)
+
+
+def _lock_readonly(file: Path) -> None:
+    try:
+        os.chmod(file, stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def _unlock(file: Path) -> None:
+    try:
+        os.chmod(file, stat.S_IREAD | stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _write_cache(key: str, text: str, info: dict[str, Any] | None = None) -> None:
+    """
+    Записывает распознанный текст один раз: существующую запись не перезаписывает.
+    Рядом кладётся сведение о записи (кто, с какого компьютера, когда, какой версией).
+    Файлы доступны только для чтения, поэтому случайно затереть их нельзя. Это не защита
+    от намеренной подмены: по сути это журнал записи.
+    """
+    try:
+        from version import APP_VERSION  # noqa: PLC0415 - версия программы
+
         folder = cache_dir()
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"{key}.txt").write_text(text, encoding="utf-8")
+        text_file = folder / f"{key}.txt"
+        if text_file.exists():
+            return
+        with open(text_file, "x", encoding="utf-8") as handle:
+            handle.write(text)
+        _lock_readonly(text_file)
+        meta = {
+            "записал": _safe_user(),
+            "компьютер": _safe_host(),
+            "записано": datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S %z"),
+            "программа": f"v{APP_VERSION}",
+            "распознавание": ENGINE_LABEL,
+            "версия текста": TEXT_VERSION,
+            "файл": str((info or {}).get("файл", "")),
+            "страницы": str((info or {}).get("страницы", "")),
+            "dpi": (info or {}).get("dpi"),
+        }
+        meta_file = _provenance_file(key)
+        with open(meta_file, "x", encoding="utf-8") as handle:
+            handle.write(json.dumps(meta, ensure_ascii=False, indent=2))
+        _lock_readonly(meta_file)
+    except FileExistsError:
+        pass  # запись уже есть — остаётся первая
     except OSError:
         pass  # кэш — удобство, а не условие работы
 
 
+def _safe_user() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - в некоторых средах пользователя не определить
+        return os.environ.get("USERNAME") or os.environ.get("USER") or "?"
+
+
+def _safe_host() -> str:
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "?"
+
+
 def clear_cache() -> int:
-    """Удаляет распознанные тексты; возвращает число файлов."""
+    """Удаляет распознанные тексты вместе со сведениями о записи; возвращает число текстов."""
     folder = cache_dir()
     count = 0
     if folder.is_dir():
         for file in folder.glob("*.txt"):
             try:
+                _unlock(file)
                 file.unlink()
                 count += 1
+            except OSError:
+                pass
+        for file in folder.glob("*.json"):
+            try:
+                _unlock(file)
+                file.unlink()
             except OSError:
                 pass
     return count
@@ -525,7 +620,10 @@ def ocr_pdf_pages(
         cached = _read_cache(key)
         if cached is not None:
             if progress:
-                progress("страницы уже распознаны раньше — беру из кэша")
+                progress(
+                    "страницы уже распознаны раньше — беру из кэша ("
+                    + describe_provenance(cache_provenance(key)) + ")"
+                )
             return cached
     engine = _engine_or_raise()
     try:  # noqa: PLC0415 - PyMuPDF уже зависимость программы
@@ -574,5 +672,8 @@ def ocr_pdf_pages(
         raise OcrError("на этих страницах ничего не распознано")
     text = restore_word_breaks("\n".join(parts))
     if use_cache:
-        _write_cache(key, text)
+        _write_cache(
+            key, text,
+            info={"файл": pdf.name, "страницы": f"{first}–{last}", "dpi": int(dpi)},
+        )
     return text

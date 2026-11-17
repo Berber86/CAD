@@ -157,3 +157,24 @@ def test_misread_cross_street_without_a_confirming_neighbour_gives_no_button():
 def test_name_already_printed_gives_no_button():
     lots = [_lot("our.pdf", OUR_TEXT, main=True), _lot("lot30.pdf", NEIGHBOUR_TEXT)]
     assert not [p for p in _analyse(lots).proposals if p.kind == "street_name"]
+
+
+def test_rename_printed_in_one_lot_is_shared_by_the_whole_set():
+    # Участок A напечатал переименование «Amboy Road (now Amboy Street)»; сосед B его не печатает,
+    # а назвал перекрёсток старым именем. Общие синонимы делают их одним перекрёстком для всего набора.
+    from acad_builder import _check_street_reference_and_frontage
+    from conflict_resolver import _Scene
+
+    text_a = OUR_TEXT + "\nAmboy Road (now Amboy Street) is the cross street.\n"
+    lot_a = _lot("a.pdf", text_a, main=True)
+    lot_b = _lot("b.pdf", NEIGHBOUR_TEXT, cross_street="Amboy Street")
+    assert "Amboy Street = Amboy Road" in lot_a.description.street_aliases  # «Amboy Road (now Amboy Street)»
+    assert not lot_b.description.street_aliases
+    scene = _Scene(_builder(), [lot_a, lot_b], 16)
+    desc_a = scene.description(lot_a)
+    desc_b = scene.description(lot_b)
+    assert "Amboy Street = Amboy Road" in desc_b.street_aliases
+    # Исходные описания не меняются.
+    assert not lot_b.description.street_aliases
+    note, warn = _check_street_reference_and_frontage(scene.plan(lot_a), scene.plan(lot_b))
+    assert not warn and "Amboy Road" in note  # общий перекрёсток: предупреждения о разных углах нет

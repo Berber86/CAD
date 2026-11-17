@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 PLACEHOLDER_WIDTH = "XX"
 
@@ -253,3 +254,54 @@ def former_line(former: str | None) -> str | None:
 def street_text(name: str | None) -> str:
     """Название улицы для чертежа: верхний регистр, между словами два пробела."""
     return "  ".join(str(name or "").upper().split())
+
+
+def _alias_items(description: Any) -> list[str]:
+    """Пары описания в виде «текущее = старое»: из текста и из «main (formerly …)»."""
+    items = [str(item) for item in (getattr(description, "street_aliases", None) or []) if str(item).strip()]
+    main = getattr(description, "main_street", None)
+    former = getattr(description, "main_street_former", None)
+    if main and former:
+        items.append(f"{main} = {former}")
+    return items
+
+
+def _alias_identity(item: str) -> tuple[str, str] | None:
+    cur, sep, old = item.partition(" = ")
+    if not sep:
+        return None
+    a = " ".join(cur.lower().split())
+    b = " ".join(old.lower().split())
+    return (a, b) if a and b else None
+
+
+def share_street_aliases(descriptions: Any) -> list[str]:
+    """
+    Переименования, напечатанные хотя бы в одном описании набора. Они становятся общими:
+    по ним сравниваются и строятся все участки набора. Пары без повторов, порядок — как встретились.
+    """
+    shared: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for description in descriptions:
+        for item in _alias_items(description):
+            ident = _alias_identity(item)
+            if ident is None or ident in seen:
+                continue
+            seen.add(ident)
+            shared.append(item)
+    return shared
+
+
+def with_shared_aliases(description: Any, shared: list[str]) -> Any:
+    """Копия описания, в которую добавлены общие переименования набора (исходное не меняется)."""
+    own = list(getattr(description, "street_aliases", None) or [])
+    seen = {_alias_identity(item) for item in own}
+    merged = list(own)
+    for item in shared:
+        ident = _alias_identity(item)
+        if ident is not None and ident not in seen:
+            seen.add(ident)
+            merged.append(item)
+    if merged == own:
+        return description
+    return description.model_copy(update={"street_aliases": merged})

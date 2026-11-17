@@ -24,6 +24,7 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 
 from __future__ import annotations
 
+import base64
 import copy
 import datetime as _dt
 import dataclasses
@@ -501,6 +502,12 @@ class SurveyApp(ctk.CTk):
         # Сверка описаний между собой: находки по данным соседей и ответ ИИ-советника.
         self._pdf_set_analysis: ConflictAnalysis | None = None
         self._pdf_set_advice: dict[str, AdvisorReply] = {}
+        #: Склейка по карте: режим ("turn" — перенос и поворот, "shift" — только перенос),
+        #: приложенная карта TAX_MAP (имя, data URL) и соединения, которые применятся после разбора.
+        self._pdf_set_join_mode: str = "turn"
+        self._pdf_set_tax_map: tuple[str, str] | None = None
+        self._pdf_set_tax_button: Any | None = None
+        self._pending_join_accept: list[Any] = []
         self._ready_source_signature: tuple[Any, ...] | None = None
         self._running_source_signature: tuple[Any, ...] | None = None
         self._running_source_path: Path | None = None
@@ -7657,7 +7664,9 @@ class SurveyApp(ctk.CTk):
         )
         self._start_pdf_set()
 
-    def _start_pdf_set(self, *, force: bool = False, ask_advisor: bool = False) -> None:
+    def _start_pdf_set(
+        self, *, force: bool = False, ask_advisor: bool = False, join_mode: str | None = None,
+    ) -> None:
         """
         Разбирает все участки набора одним заданием; AutoCAD запускается отдельно.
 
@@ -7719,11 +7728,14 @@ class SurveyApp(ctk.CTk):
                 f"  {job.role_label}: {job.path.name} · {job.pages_label} · {job.mode_label}"
                 + (" · результат уже есть" if job.cached_outcome is not None else "")
             )
+        join_images: tuple[str, ...] = ()
+        if join_mode and self._pdf_set_tax_map is not None:
+            join_images = (self._pdf_set_tax_map[1],)
         self._start_background(
             self._pdf_set_worker,
             args=(
                 jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient,
-                dict(self._pdf_set_advice), ask_advisor,
+                dict(self._pdf_set_advice), ask_advisor, join_mode, join_images,
             ),
         )
 
@@ -7874,6 +7886,7 @@ class SurveyApp(ctk.CTk):
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
         advice: dict[str, AdvisorReply] | None = None, ask_advisor: bool = False,
+        join_mode: str | None = None, join_images: tuple[str, ...] = (),
     ) -> None:
         """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
         post = self._worker_poster()
@@ -8115,7 +8128,7 @@ class SurveyApp(ctk.CTk):
             return
         analysis = self._analyse_pdf_set_conflicts(
             jobs, results, builder, cfg, provider_id, model_name, api_key, key_secret, scale,
-            advice or {}, ask_advisor, post,
+            advice or {}, ask_advisor, post, join_mode=join_mode, join_images=join_images,
         )
         if not self._worker_is_current():
             return
@@ -8126,6 +8139,7 @@ class SurveyApp(ctk.CTk):
         self, jobs: list[PdfSetJob], results: list[PdfSetResult], builder: AcadBuilder,
         cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None,
         key_secret: str, scale: float, advice: dict[str, AdvisorReply], ask_advisor: bool, post: Any,
+        *, join_mode: str | None = None, join_images: tuple[str, ...] = (),
     ) -> ConflictAnalysis:
         """
         Сверяет описания участков набора между собой (в фоне).
@@ -8195,6 +8209,7 @@ class SurveyApp(ctk.CTk):
                 builder, lots, scale=scale, advisor=advisor, advisor_note=note, advisor_cache=advice,
                 force_advisor=ask_advisor, max_images=int(advisor_cfg.get("max_images") or 16),
                 progress=lambda message: post("progress", message),
+                join_mode=join_mode if ask_advisor else None, join_images=join_images,
             )
         except Exception as exc:  # noqa: BLE001 - сбой анализа не срывает разбор набора
             return ConflictAnalysis(error=str(exc) or type(exc).__name__)
@@ -8282,7 +8297,15 @@ class SurveyApp(ctk.CTk):
         else:
             results, analysis = payload, None
         self._pdf_set_analysis = analysis
-        if analysis is not None and analysis.advisor_status == "ok" and analysis.advisor_reply is not None:
+        if analysis is not None and analysis.join_mode:
+            # Соединения по карте подтверждены геометрией — применяем их сами, после завершения разбора.
+            self._pending_join_accept = [
+                chained
+                for proposal in analysis.proposals
+                if proposal.verified
+                for chained in analysis.with_requirements(proposal.id)
+            ]
+        elif analysis is not None and analysis.advisor_status == "ok" and analysis.advisor_reply is not None:
             # Ответ советника хранится для этого разбора: правки его заново не запрашивают.
             self._pdf_set_advice[analysis.advisor_key] = analysis.advisor_reply
         by_path = {item.path: item for item in self.pdf_set}
@@ -8583,6 +8606,49 @@ class SurveyApp(ctk.CTk):
         self._log_line(f"↩ Правка снята — «{item.path.name}»: {dropped.title}")
         self._start_pdf_set()
 
+    def _ask_pdf_set_join_advisor(self) -> None:
+        """Платный вопрос советнику по карте: соединяет фигуры (угол к углу, общая межа)."""
+        if self._busy or not self.pdf_set:
+            return
+        from tkinter import messagebox
+
+        tax = f"карту «{self._pdf_set_tax_map[0]}»" if self._pdf_set_tax_map else "карту не приложили"
+        mode = "перенос и поворот" if self._pdf_set_join_mode == "turn" else "только перенос"
+        if not messagebox.askyesno(
+            "ИИ-советник по карте",
+            "Отправить нейросети схему фигур, страницы документов и " + tax + "?\n\n"
+            "Это платный запрос. Советник только соединяет фигуры: угол нашего участка с углом соседа "
+            "и общую межу. Длины и румбы не меняются. Режим: " + mode + ". "
+            "Соединение, которое геометрия подтвердит, применяется сразу.",
+        ):
+            return
+        self._start_pdf_set(ask_advisor=True, join_mode=self._pdf_set_join_mode)
+
+    def _pick_pdf_set_tax_map(self) -> None:
+        """Приложить карту (TAX_MAP) к запросу советнику по карте."""
+        from tkinter import filedialog, messagebox
+
+        path = filedialog.askopenfilename(
+            title="Карта участка (TAX_MAP)",
+            filetypes=[("Карта", "*.jpg *.jpeg *.png"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            messagebox.showerror("Карта", f"Не удалось прочитать файл: {exc}")
+            return
+        mime = "image/png" if Path(path).suffix.lower() == ".png" else "image/jpeg"
+        data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        self._pdf_set_tax_map = (Path(path).name, data_url)
+        if self._pdf_set_tax_button is not None:
+            self._pdf_set_tax_button.configure(text=f"📎 {Path(path).name}")
+        self._set_status(f"Карта «{Path(path).name}» приложена к запросу советнику по карте.")
+
+    def _set_pdf_set_join_mode(self, label: str) -> None:
+        self._pdf_set_join_mode = "shift" if label.startswith("только") else "turn"
+
     def _ask_pdf_set_advisor(self) -> None:
         """Платный вопрос ИИ-советнику о расхождениях набора (по кнопке — всегда заново)."""
         if self._busy or not self.pdf_set:
@@ -8720,6 +8786,25 @@ class SurveyApp(ctk.CTk):
             command=self._ask_pdf_set_advisor,
         )
         win._advisor_button.grid(row=0, column=0, padx=(0, 8))
+        win._join_advisor_button = ctk.CTkButton(
+            left, text="🗺 Спросить советника по карте", width=230, height=30,
+            fg_color=THEME["btn_amber"], hover_color=THEME["btn_amber_hover"],
+            command=self._ask_pdf_set_join_advisor,
+        )
+        win._join_advisor_button.grid(row=0, column=1, padx=(0, 8))
+        self._pdf_set_tax_button = ctk.CTkButton(
+            left, text=(f"📎 {self._pdf_set_tax_map[0]}" if self._pdf_set_tax_map else "📎 Карта TAX_MAP…"),
+            width=170, height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=self._pick_pdf_set_tax_map,
+        )
+        self._pdf_set_tax_button.grid(row=0, column=2, padx=(0, 8))
+        win._join_mode_menu = ctk.CTkOptionMenu(
+            left, values=["перенос и поворот", "только перенос"], width=170, height=30,
+            command=self._set_pdf_set_join_mode,
+        )
+        win._join_mode_menu.set("перенос и поворот" if self._pdf_set_join_mode == "turn" else "только перенос")
+        win._join_mode_menu.grid(row=0, column=3, padx=(0, 8))
         verified = [p for p in analysis.proposals if p.verified] if analysis is not None else []
         win._apply_all_button = None
         if len(verified) > 1:
@@ -8728,7 +8813,7 @@ class SurveyApp(ctk.CTk):
                 fg_color=THEME["btn_emerald"], hover_color=THEME["btn_emerald_hover"],
                 command=self._apply_all_pdf_set_fixes,
             )
-            win._apply_all_button.grid(row=0, column=1, padx=(0, 8))
+            win._apply_all_button.grid(row=0, column=4, padx=(0, 8))
 
         def _copy_report() -> None:
             self.clipboard_clear()
@@ -9491,6 +9576,9 @@ class SurveyApp(ctk.CTk):
             self._handle_feature_label_result(label_result, label_error, label_mode)
         elif kind == "done":
             self._finish_busy()
+            pending, self._pending_join_accept = self._pending_join_accept, []
+            if pending:
+                self._accept_pdf_set_fixes(pending)
 
     def _set_controls_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"

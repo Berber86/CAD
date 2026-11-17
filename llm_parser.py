@@ -4325,6 +4325,27 @@ class ParseOutcome:
     prepared_text: str = ""
     prepared_images: list[str] = field(default_factory=list)
     base_warnings: list[str] = field(default_factory=list)
+    #: Итог проверки описания (description_check.DescriptionCheck) для выбранного результата.
+    check: Any = None
+
+
+@dataclass
+class _LocalAttempt:
+    """Локальный разбор текста с его проверкой (бесплатно, без ИИ)."""
+
+    model: LegalDescription
+    warnings: list[str]
+    check: Any
+
+
+def _try_local_parse(text: str, auto_repair_typos: bool) -> _LocalAttempt | None:
+    from description_check import check_description  # noqa: PLC0415
+
+    try:
+        model, warns = parse_with_regex(text, auto_repair_typos=auto_repair_typos)
+    except Exception:  # noqa: BLE001 — локальный разбор не должен ронять путь ИИ
+        return None
+    return _LocalAttempt(model=model, warnings=list(warns), check=check_description(model, text))
 
 
 def _flip_segment_direction(seg: Segment) -> Segment:
@@ -5507,6 +5528,21 @@ def parse_legal_description_full(
         base_warnings = list(warnings)
 
     llm_error: Exception | None = None
+    local_attempt: _LocalAttempt | None = None
+    if use_llm and combined and not image_data_urls:
+        local_attempt = _try_local_parse(combined, not eff_ask_on_doubt)
+        if local_attempt is not None and local_attempt.check.ok:
+            # Текст сошёлся сам с собой (замыкание, все румбы, числа на месте) — ИИ не нужен.
+            return ParseOutcome(
+                data=local_attempt.model,
+                source="regex",
+                warnings=list(warnings) + list(local_attempt.warnings),
+                typo_suspicions=[],
+                prepared_text=combined,
+                prepared_images=list(image_data_urls),
+                base_warnings=base_warnings,
+                check=local_attempt.check,
+            )
     if use_llm:
         try:
             parsed_model, mode, usage = _extract_with_llm(
@@ -5550,9 +5586,22 @@ def parse_legal_description_full(
                     warnings.append(f"⚠ {susp.reason_ru}")
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
+            from description_check import check_description, ranks_higher  # noqa: PLC0415
+
+            llm_check = check_description(parsed_model, combined)
+            chosen_model, chosen_check = parsed_model, llm_check
+            chosen_source = "llm-vision" if image_data_urls else "llm"
+            if local_attempt is not None and ranks_higher(local_attempt.check.status, llm_check.status):
+                # ИИ при равных статусах авторитетен; но сошедшийся локальный текст лучше
+                # ответа, который не замыкается.
+                chosen_model, chosen_check = local_attempt.model, local_attempt.check
+                chosen_source = "regex"
+                warnings.append("ответ ИИ не сходится, взят локальный разбор текста — проверьте")
+                suspicions = []
+            warnings = list(chosen_check.warning_lines()) + warnings
             return ParseOutcome(
-                data=parsed_model,
-                source="llm-vision" if image_data_urls else "llm",
+                data=chosen_model,
+                source=chosen_source,
                 warnings=warnings,
                 usage=usage,
                 provider=usage.provider,
@@ -5563,6 +5612,7 @@ def parse_legal_description_full(
                 prepared_text=combined,
                 prepared_images=list(image_data_urls),
                 base_warnings=base_warnings,
+                check=chosen_check,
             )
         except Exception as exc:  # noqa: BLE001
             llm_error = exc
@@ -5588,14 +5638,18 @@ def parse_legal_description_full(
 
     if llm_error is not None:
         warnings.insert(0, "геометрия получена локальным парсером — проверьте размеры вручную")
+    from description_check import check_description  # noqa: PLC0415
+
+    local_check = check_description(parsed_model, combined)
     return ParseOutcome(
         data=parsed_model,
         source="llm" if not llm_error and use_llm else "regex",
-        warnings=warnings,
+        warnings=list(local_check.warning_lines()) + warnings,
         typo_suspicions=suspicions_rx,
         prepared_text=combined,
         prepared_images=list(image_data_urls),
         base_warnings=base_warnings,
+        check=local_check,
     )
 
 

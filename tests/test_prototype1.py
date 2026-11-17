@@ -512,12 +512,25 @@ def test_front_side_selection_uses_geometry():
 
 
 def test_llm_not_configured_raises_clear_error():
+    """Ошибка без ключа — только когда ИИ нужен: текст, который не прошёл локальную проверку."""
     from llm_parser import LLMParseError, parse_legal_description_full
 
     cfg = load_config()
     cfg["api"]["api_key"] = ""
+    unchecked = (Path(__file__).parent / "data" / "lot114_ocr_p1.txt").read_text(encoding="utf-8")
     with pytest.raises(LLMParseError):
-        parse_legal_description_full(text=EXAMPLE, cfg=cfg, use_llm=True)
+        parse_legal_description_full(text=unchecked, cfg=cfg, use_llm=True)
+
+
+def test_checked_text_skips_llm_even_without_key():
+    """Текст сходится сам (замыкание, румбы, числа) — ИИ не вызывается, ключ не нужен."""
+    from llm_parser import parse_legal_description_full
+
+    cfg = load_config()
+    cfg["api"]["api_key"] = ""
+    outcome = parse_legal_description_full(text=EXAMPLE, cfg=cfg, use_llm=True)
+    assert outcome.source == "regex"
+    assert outcome.check is not None and outcome.check.ok
 
 
 # ------------------------------------------ LLM-путь на подменённом клиенте --

@@ -18,12 +18,10 @@ ACRIS) текстового слоя нет вовсе — ``PyMuPDF`` отда�
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import os
 import re
-import socket
 import stat
 import tempfile
 from datetime import datetime
@@ -159,14 +157,17 @@ def cache_provenance(key: str) -> dict[str, Any] | None:
 
 
 def describe_provenance(info: dict[str, Any] | None) -> str:
-    """Строка для журнала: «записал user на PC, 17.11.2026 10:04, версия 3.77»."""
+    """
+    Строка для журнала: «записал: локальный OCR (RapidOCR), 17.11.2026 10:04, программа v3.77».
+    Сведения только для просмотра: в промпт ИИ они не передаются.
+    """
     if not info:
-        return "записано до ведения учёта: кто и когда — неизвестно"
-    parts = [
-        f"записал {info.get('записал', '?')} на {info.get('компьютер', '?')}",
-        str(info.get("записано", "?")),
-        f"программа {info.get('программа', '?')}",
-    ]
+        return "записано до ведения учёта: чем и когда — неизвестно"
+    parts = [f"записал: {info.get('записал', '?')}"]
+    if info.get("модель"):
+        parts.append(f"модель {info['модель']}")
+    parts.append(str(info.get("записано", "?")))
+    parts.append(f"программа {info.get('программа', '?')}")
     return ", ".join(parts)
 
 
@@ -187,9 +188,10 @@ def _unlock(file: Path) -> None:
 def _write_cache(key: str, text: str, info: dict[str, Any] | None = None) -> None:
     """
     Записывает распознанный текст один раз: существующую запись не перезаписывает.
-    Рядом кладётся сведение о записи (кто, с какого компьютера, когда, какой версией).
-    Файлы доступны только для чтения, поэтому случайно затереть их нельзя. Это не защита
-    от намеренной подмены: по сути это журнал записи.
+    Рядом кладётся сведение о записи: чем записано («записал» — локальный распознаватель
+    или модель ИИ, поле «модель»), когда и какой версией программы. Сведения лежат в отдельном
+    файле и никогда не попадают в текст, который уходит в промпт. Файлы доступны только для
+    чтения: это защита от случайной правки, а не от намеренной подмены.
     """
     try:
         from version import APP_VERSION  # noqa: PLC0415 - версия программы
@@ -203,11 +205,10 @@ def _write_cache(key: str, text: str, info: dict[str, Any] | None = None) -> Non
             handle.write(text)
         _lock_readonly(text_file)
         meta = {
-            "записал": _safe_user(),
-            "компьютер": _safe_host(),
+            "записал": str((info or {}).get("записал", "") or "локальный OCR: " + ENGINE_LABEL),
+            "модель": str((info or {}).get("модель", "") or ""),
             "записано": datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S %z"),
             "программа": f"v{APP_VERSION}",
-            "распознавание": ENGINE_LABEL,
             "версия текста": TEXT_VERSION,
             "файл": str((info or {}).get("файл", "")),
             "страницы": str((info or {}).get("страницы", "")),
@@ -223,18 +224,6 @@ def _write_cache(key: str, text: str, info: dict[str, Any] | None = None) -> Non
         pass  # кэш — удобство, а не условие работы
 
 
-def _safe_user() -> str:
-    try:
-        return getpass.getuser()
-    except Exception:  # noqa: BLE001 - в некоторых средах пользователя не определить
-        return os.environ.get("USERNAME") or os.environ.get("USER") or "?"
-
-
-def _safe_host() -> str:
-    try:
-        return socket.gethostname()
-    except OSError:
-        return "?"
 
 
 def clear_cache() -> int:
@@ -674,6 +663,9 @@ def ocr_pdf_pages(
     if use_cache:
         _write_cache(
             key, text,
-            info={"файл": pdf.name, "страницы": f"{first}–{last}", "dpi": int(dpi)},
+            info={
+                "записал": "локальный OCR: " + ENGINE_LABEL, "модель": "",
+                "файл": pdf.name, "страницы": f"{first}–{last}", "dpi": int(dpi),
+            },
         )
     return text

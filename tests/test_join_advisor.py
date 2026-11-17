@@ -58,6 +58,19 @@ def _scene(lots):
     return _Scene(AcadBuilder(load_config()), list(lots), scale=16)
 
 
+
+def first_join(scene, ours, theirs, corner_a, side_a, corner_b, side_b, mode):
+    """Первое подтверждённое соединение: (правки, причина отказа, описание)."""
+    from conflict_resolver import _join_candidates
+
+    candidates, problem = _join_candidates(
+        scene, ours, theirs, corner_a, side_a, corner_b, side_b, mode,
+    )
+    if not candidates:
+        return [], problem, ""
+    changes, summary = candidates[0]
+    return changes, None, summary
+
 def _apply(scene, neighbour, changes):
     from conflict_resolver import apply_changes
 
@@ -66,11 +79,10 @@ def _apply(scene, neighbour, changes):
 
 
 def test_join_matches_corner_and_shared_side_without_changing_shape():
-    from conflict_resolver import _join_placement
 
     ours, theirs = _lots()
     scene = _scene((ours, theirs))
-    changes, problem, _ = _join_placement(scene, ours, theirs, 3, 3, 2, 1, "turn")
+    changes, problem, _ = first_join(scene, ours, theirs, 3, 3, 2, 1, "turn")
     assert problem is None
     plan = _apply(scene, theirs, changes)
     corner_a = scene.plan(ours).vertices[2]
@@ -88,12 +100,11 @@ def apply_segments(lot, changes):
 
 
 def test_join_turns_a_turned_neighbour_into_place():
-    from conflict_resolver import _join_placement
 
     turned = [_turned(seg, 30.0) for seg in _rectangle_sides()]
     ours, theirs = _lots(neighbour_sides=turned)
     scene = _scene((ours, theirs))
-    changes, problem, summary = _join_placement(scene, ours, theirs, 3, 3, 2, 1, "turn")
+    changes, problem, summary = first_join(scene, ours, theirs, 3, 3, 2, 1, "turn")
     assert problem is None, problem
     assert "+30.0000°" in summary
     plan = _apply(scene, theirs, changes)
@@ -108,25 +119,33 @@ def test_join_turns_a_turned_neighbour_into_place():
 
 
 def test_shift_only_refuses_a_turned_neighbour():
-    from conflict_resolver import _join_placement
 
     turned = [_turned(seg, 30.0) for seg in _rectangle_sides()]
     ours, theirs = _lots(neighbour_sides=turned)
     scene = _scene((ours, theirs))
-    changes, problem, _ = _join_placement(scene, ours, theirs, 3, 3, 2, 1, "shift")
+    changes, problem, _ = first_join(scene, ours, theirs, 3, 3, 2, 1, "shift")
     assert changes == []
     assert "при переносе без поворота" in problem
 
 
 def test_join_refuses_sides_that_do_not_share_a_boundary():
-    from conflict_resolver import _join_placement
+    from conflict_resolver import advisor_verdict, _join_candidates
 
     ours, theirs = _lots()
     scene = _scene((ours, theirs))
     # Сосед приставлен своей северной стороной к углу 3 — лежит на продолжении нашей южной, без общей части.
-    changes, problem, _ = _join_placement(scene, ours, theirs, 3, 3, 1, 1, "turn")
-    assert changes == []
-    assert "короткая сторона не лежит внутри длинной" in problem
+    # Варианты, которые геометрия контуров пропустит (например, переворот на 180°), обязаны
+    # провалиться по наложению: ни один кандидат не может стать подтверждённым соединением.
+    candidates, _ = _join_candidates(scene, ours, theirs, 3, 3, 1, 1, "turn")
+    before = scene.metrics(theirs, (), state={})
+    for changes, _summary in candidates:
+        after = scene.metrics(theirs, tuple(changes), state={})
+        assert advisor_verdict(before, after, allow_stepped=True) == "rejected"
+    shift, problem = _join_candidates(scene, ours, theirs, 3, 3, 1, 1, "shift")
+    assert shift == [] or all(
+        advisor_verdict(before, scene.metrics(theirs, tuple(c), state={}), allow_stepped=True) == "rejected"
+        for c, _ in shift
+    )
 
 
 def test_read_join_reply_keeps_only_joins():
@@ -216,11 +235,10 @@ def test_join_round_rejects_neighbour_to_neighbour_and_duplicates():
 
 
 def test_join_placement_uses_ours_as_frame_for_the_neighbour_tie():
-    from conflict_resolver import _join_placement
 
     ours, theirs = _lots()
     scene = _scene((ours, theirs))
-    changes, problem, _ = _join_placement(scene, ours, theirs, 3, 3, 2, 1, "turn")
+    changes, problem, _ = first_join(scene, ours, theirs, 3, 3, 2, 1, "turn")
     assert problem is None
     tie = changes[0]
     assert tie.target == "tie" and tie.bearing_set
@@ -263,3 +281,66 @@ def test_join_button_settings_and_auto_accept_path(gui, monkeypatch):
     app._handle_event("done", None)
     assert app._pending_join_accept == []
     assert [[p.id for p in batch] for batch in accepted] == [["join-1"]]
+
+
+def test_join_finds_the_same_direction_fit_for_an_opposite_winding_neighbour():
+    """
+    Сосед обойден против часовой (как LOT 47), наш участок — по часовой. Общая межа идёт
+    в одну сторону; короткая сторона соседа (88) внутри нашей (100), остаток — уступ задней межи.
+    """
+    from conflict_resolver import _join_candidates, advisor_verdict
+
+    ours_sides = [
+        _seg("S", 56, 36, 12, "E", 100), _seg("S", 33, 23, 48, "W", 100),
+        _seg("N", 56, 36, 12, "W", 100), _seg("N", 33, 23, 48, "E", 100),
+    ]
+    nb_sides = [
+        _seg("S", 33, 23, 48, "W", 88), _seg("S", 56, 36, 12, "E", 130),
+        _seg("N", 33, 23, 48, "E", 88), _seg("N", 56, 36, 12, "W", 130),
+    ]
+    ours = _lots()[0]
+    ours = type(ours)(key="OUR", name="OUR", is_main=True,
+                      description=_rect_desc(10.0, "Alpha Avenue", "Beta Street", ours_sides))
+    theirs = type(ours)(key="NB", name="NB", is_main=False,
+                        description=_rect_desc(20.0, "Beta Street", "Alpha Avenue", nb_sides))
+    scene = _scene((ours, theirs))
+
+    candidates, problem = _join_candidates(scene, ours, theirs, 2, 2, 1, 1, "turn")
+    assert problem is None, problem
+    assert candidates
+    changes, summary = candidates[0]
+    assert "в одном направлении" in summary
+    before = scene.metrics(theirs, (), state={})
+    after = scene.metrics(theirs, tuple(changes), state={})
+    assert after.overlap_sqft < 0.5
+    assert after.stepped_edges == 1
+    assert after.closure_ft < 0.01
+    assert advisor_verdict(before, after, allow_stepped=True) == "verified"
+    assert advisor_verdict(before, after) == "partial"
+
+
+@pytest.mark.parametrize("neighbour_side_ft, accepted", [(30.0, False), (45.0, True)])
+def test_shared_boundary_must_cover_forty_percent_of_the_longer_side(neighbour_side_ft, accepted):
+    """Наша сторона 100 ft: общая межа 30 ft (30%) отклоняется, 45 ft (45%) принимается."""
+    from conflict_resolver import _join_candidates
+
+    ours_sides = [
+        _seg("S", 56, 36, 12, "E", 100), _seg("S", 33, 23, 48, "W", 100),
+        _seg("N", 56, 36, 12, "W", 100), _seg("N", 33, 23, 48, "E", 100),
+    ]
+    nb_sides = [
+        _seg("S", 33, 23, 48, "W", neighbour_side_ft), _seg("S", 56, 36, 12, "E", 130),
+        _seg("N", 33, 23, 48, "E", neighbour_side_ft), _seg("N", 56, 36, 12, "W", 130),
+    ]
+    base = _lots()[0]
+    ours = type(base)(key="OUR", name="OUR", is_main=True,
+                      description=_rect_desc(10.0, "Alpha Avenue", "Beta Street", ours_sides))
+    theirs = type(base)(key="NB", name="NB", is_main=False,
+                        description=_rect_desc(20.0, "Beta Street", "Alpha Avenue", nb_sides))
+    scene = _scene((ours, theirs))
+    candidates, problem = _join_candidates(scene, ours, theirs, 2, 2, 1, 1, "turn")
+    if accepted:
+        assert candidates and problem is None
+    else:
+        assert candidates == []
+        assert "нужно не меньше 40.00 ft" in problem

@@ -128,6 +128,8 @@ class Metrics:
     edge_warnings: int
     #: Расстояние до ближайшего соседнего контура (0 — общая граница есть).
     gap_ft: float = 0.0
+    #: Из ошибок стыка — только уступы задней межи (короткая сторона внутри длинной, остаток — к третьему).
+    stepped_edges: int = 0
 
 
 @dataclass(frozen=True)
@@ -559,12 +561,17 @@ class _Scene:
         others = [p for _, p in self._others(lot, state or {})]
         overlap, errors, warnings = 0.0, 0, 0
         gap = 0.0
+        stepped = 0
         if others:
             report = verify_with_neighbors(plan, others)
             overlap = sum(pair.overlap_area_sqft for pair in report.pair_reports)
             errors, warnings = report.error_count, report.warning_count
             gap = _nearest_gap_ft(plan, others)
-        return Metrics(plan.closure.distance, overlap, errors, warnings, gap)
+            for pair in report.pair_reports:
+                for edge in pair.shared_edges:
+                    if edge.status == "error" and edge.issue_codes and set(edge.issue_codes) == {"STEPPED_BOUNDARY_DEPTH"}:
+                        stepped += 1
+        return Metrics(plan.closure.distance, overlap, errors, warnings, gap, stepped)
 
 
 def _nearest_gap_ft(plan: DrawPlan, others: Sequence[DrawPlan]) -> float:
@@ -614,16 +621,20 @@ def judge(before: Metrics | None, after: Metrics | None) -> str:
     return "verified" if closure_ok and not overlap_worse else "partial"
 
 
-def advisor_verdict(before: Metrics | None, after: Metrics | None) -> str:
+def advisor_verdict(before: Metrics | None, after: Metrics | None, *, allow_stepped: bool = False) -> str:
     """
     Вердикт совета ИИ. Советник получает ``verified`` (его можно применить одним действием
     «все подтверждённые») только если контур замыкается, наложения нет и общие межи совпадают
     с соседями (ни одной ошибки стыка). Иначе вердикт остаётся ``partial`` — решает геодезист.
+
+    ``allow_stepped`` — для склейки по карте: уступ задней межи (короткая сторона внутри длинной,
+    остаток граничит с третьим участком) не считается ошибкой стыка.
     """
     verdict = judge(before, after)
     if verdict != "verified" or after is None:
         return verdict
-    if after.closure_ft > CLOSURE_LIMIT_FT or after.edge_errors > 0:
+    stepped = after.stepped_edges if allow_stepped else 0
+    if after.closure_ft > CLOSURE_LIMIT_FT or after.edge_errors - stepped > 0:
         return "partial"
     return verdict
 
@@ -1839,8 +1850,10 @@ All corner and side numbers are integers."""
 
 #: Допуск совпадения направлений общих сторон при переносе без поворота (как у сверки румбов).
 JOIN_SHIFT_TOLERANCE_DEG = ALTERNATE_AXIS_TOLERANCE_ARCSEC / 3600.0
-#: Допуск, на котором общая межа считается лежащей на одной прямой и короткая сторона — внутри длинной.
+#: Допуск, на котором общая межа считается лежащей на одной прямой.
 JOIN_LINE_TOLERANCE_FT = 0.05
+#: Общая межа должна совпасть не меньше чем на эту долю длины большей из двух сторон (исключает дикие совпадения).
+JOIN_MIN_SHARED_FRACTION = 0.40
 
 
 def _wrap_rad(angle: float) -> float:
@@ -1857,17 +1870,19 @@ def _vec_azimuth(vec: tuple[float, float]) -> float:
     return math.degrees(math.atan2(vec[0], vec[1])) % 360.0
 
 
-def _join_placement(
+def _join_candidates(
     scene: _Scene, lot_a: LotInput, lot_b: LotInput, corner_a: int, side_a: int,
     corner_b: int, side_b: int, mode: str,
-) -> tuple[list[Change], str | None, str]:
+) -> tuple[list[tuple[list[Change], str]], str | None]:
     """
-    Жёсткое соединение соседа с нашим участком: ``(правки, причина отказа, описание)``.
+    Жёсткие соединения соседа с нашим участком: ``([(правки, описание), ...], причина отказа)``.
 
-    Угол ``corner_b`` соседа совмещается с углом ``corner_a`` нашего участка; сторона
-    ``side_b`` ложится на сторону ``side_a`` на одну прямую в противоположном направлении.
-    ``mode`` = ``turn`` — перенос и поворот; ``shift`` — только перенос (направления
-    должны совпасть уже сейчас). Длины и форма соседа не меняются.
+    Угол ``corner_b`` соседа совмещается с углом ``corner_a`` нашего участка; сторона ``side_b``
+    ложится на сторону ``side_a`` на одну прямую. Направление зависит от обхода участков:
+    у участков одного обхода (оба по часовой) общая межа проходит в противоположных
+    направлениях, у разных — в одном. Поэтому пробуются оба варианта, и геометрия выбирает.
+    ``mode`` = ``turn`` — перенос и поворот; ``shift`` — только перенос (направление уже совпадает).
+    Длины и форма соседа не меняются.
     """
     state = scene.virtual
     base_a = state.get(lot_a.key, ())
@@ -1877,46 +1892,66 @@ def _join_placement(
     plan_a = scene.plan(lot_a, base_a)
     plan_b = scene.plan(lot_b, base_b)
     if desc_a is None or desc_b is None or plan_a is None or plan_b is None:
-        return [], "участок с такой склейкой не строится", ""
+        return [], "участок с такой склейкой не строится"
     va, vb = plan_a.vertices, plan_b.vertices
     if not (1 <= corner_a <= len(va) and 1 <= side_a <= len(desc_a.segments)):
-        return [], f"у нашего участка нет угла {corner_a} или стороны {side_a}", ""
+        return [], f"у нашего участка нет угла {corner_a} или стороны {side_a}"
     if not (1 <= corner_b <= len(vb) and 1 <= side_b <= len(desc_b.segments)):
-        return [], f"у соседа нет угла {corner_b} или стороны {side_b}", ""
+        return [], f"у соседа нет угла {corner_b} или стороны {side_b}"
     seg_a = desc_a.segments[side_a - 1]
     seg_b = desc_b.segments[side_b - 1]
     if not seg_a.has_bearing:
-        return [], f"у стороны {side_a} нашего участка нет напечатанного румба", ""
+        return [], f"у стороны {side_a} нашего участка нет напечатанного румба"
     if not seg_b.has_bearing:
-        return [], f"у стороны {side_b} соседа нет напечатанного румба", ""
+        return [], f"у стороны {side_b} соседа нет напечатанного румба"
 
     da = segment_vector(seg_a)
     db = segment_vector(seg_b)
     len_a, len_b = math.hypot(*da), math.hypot(*db)
     if len_a < 1e-6 or len_b < 1e-6:
-        return [], "нулевая сторона не может быть общей межой", ""
+        return [], "нулевая сторона не может быть общей межой"
     pa = va[corner_a - 1]
     pb = vb[corner_b - 1]
-    # Направление соседа после поворота должно быть противоположно направлению нашей стороны.
-    diff = _wrap_rad(math.atan2(-da[1], -da[0]) - math.atan2(db[1], db[0]))
+    angle_a = math.atan2(da[1], da[0])
+    angle_b = math.atan2(db[1], db[0])
+    # Поворот, при котором стороны идут противоположно (одинаковый обход) или в одну сторону (разный).
+    turns = [_wrap_rad(angle_a + math.pi - angle_b), _wrap_rad(angle_a - angle_b)]
     if mode == "shift":
-        if abs(diff) > math.radians(JOIN_SHIFT_TOLERANCE_DEG):
-            return [], (
-                f"при переносе без поворота стороны не совпадают по направлению "
-                f"(разница {math.degrees(abs(diff)) * 3600:.0f}″)"
-            ), ""
-        theta = 0.0
-    else:
-        theta = diff
+        turns = [t for t in turns if abs(t) <= math.radians(JOIN_SHIFT_TOLERANCE_DEG)]
+        if not turns:
+            return [], "при переносе без поворота стороны не совпадают по направлению"
+
+    ux, uy = da[0] / len_a, da[1] / len_a
+    candidates: list[tuple[list[Change], str]] = []
+    problems: list[str] = []
+    for theta in turns:
+        changes, problem, summary = _join_with_turn(
+            desc_b, lot_b, pa, pb, va, vb, da, db, ux, uy, len_a, len_b,
+            corner_a, side_a, corner_b, side_b, theta,
+        )
+        if problem:
+            problems.append(problem)
+        else:
+            candidates.append((changes, summary))
+    if candidates:
+        return candidates, None
+    return [], (problems[0] if problems else "соединение не получилось")
+
+
+def _join_with_turn(
+    desc_b: LegalDescription, lot_b: LotInput, pa, pb, va, vb, da, db, ux, uy, len_a, len_b,
+    corner_a: int, side_a: int, corner_b: int, side_b: int, theta: float,
+) -> tuple[list[Change], str | None, str]:
+    """Одно соединение при заданном повороте: проверка общей межи и правки данных соседа."""
 
     def place(point: tuple[float, float]) -> tuple[float, float]:
         rx, ry = _rotate_vec((point[0] - pb[0], point[1] - pb[1]), theta)
         return rx + pa[0], ry + pa[1]
 
     a0 = va[side_a - 1]
-    ux, uy = da[0] / len_a, da[1] / len_a
     b0 = place(vb[side_b - 1])
-    b1 = (b0[0] + _rotate_vec(db, theta)[0], b0[1] + _rotate_vec(db, theta)[1])
+    rotated_db = _rotate_vec(db, theta)
+    b1 = (b0[0] + rotated_db[0], b0[1] + rotated_db[1])
     for qx, qy in (b0, b1):
         offset = ux * (qy - a0[1]) - uy * (qx - a0[0])
         if abs(offset) > JOIN_LINE_TOLERANCE_FT:
@@ -1924,10 +1959,12 @@ def _join_placement(
     s0 = ux * (b0[0] - a0[0]) + uy * (b0[1] - a0[1])
     s1 = ux * (b1[0] - a0[0]) + uy * (b1[1] - a0[1])
     overlap = min(len_a, max(s0, s1)) - max(0.0, min(s0, s1))
-    if overlap < min(len_a, len_b) - JOIN_LINE_TOLERANCE_FT:
+    longer = max(len_a, len_b)
+    required = JOIN_MIN_SHARED_FRACTION * longer
+    if overlap < required - JOIN_LINE_TOLERANCE_FT:
         return [], (
-            f"короткая сторона не лежит внутри длинной: общая часть {max(overlap, 0.0):.2f} ft "
-            f"из {min(len_a, len_b):.2f} ft"
+            f"общая межа совпадает лишь на {max(overlap, 0.0):.2f} ft; нужно не меньше "
+            f"{required:.2f} ft ({JOIN_MIN_SHARED_FRACTION:.0%} большей стороны {longer:.2f} ft)"
         ), ""
 
     pob = place(vb[0])
@@ -1953,9 +1990,16 @@ def _join_placement(
             changes.append(_bearing_change("side", index, seg, _components(_vec_azimuth(turned))))
     summary = (
         f"угол {corner_a} нашего участка = угол {corner_b} «{lot_b.name}»; общая межа — сторона {side_a} "
-        f"и сторона {side_b}; поворот {math.degrees(theta):+.4f}°; общая часть {min(len_a, len_b):.2f} ft"
+        f"и сторона {side_b}; {'стороны в одном направлении' if _is_same_direction(theta, da, db) else 'стороны навстречу'}; "
+        f"поворот {math.degrees(theta):+.4f}°; общая часть {min(len_a, len_b):.2f} ft"
     )
     return changes, None, summary
+
+
+def _is_same_direction(theta: float, da, db) -> bool:
+    """Идут ли общие стороны в одну сторону после поворота (иначе — навстречу)."""
+    rotated = _rotate_vec(db, theta)
+    return rotated[0] * da[0] + rotated[1] * da[1] > 0
 
 
 def build_join_request(
@@ -2048,7 +2092,7 @@ def _join_proposals(
             f"Склейка: угол {corner_a} нашего участка = угол {corner_b} «{lot_b.name}»; "
             f"общая межа — сторона {side_a} и сторона {side_b}"
         )
-        changes, problem, summary = _join_placement(
+        candidates, problem = _join_candidates(
             scene, lot_a, lot_b, corner_a, side_a, corner_b, side_b, mode,
         )
         if problem:
@@ -2056,22 +2100,42 @@ def _join_proposals(
             continue
         base = scene.virtual.get(lot_b.key, ())
         before = scene.metrics(lot_b, base, state=scene.virtual)
-        after = scene.metrics(lot_b, base + tuple(changes), state=scene.virtual)
-        verdict = advisor_verdict(before, after)
-        if verdict == "rejected" or before is None or after is None:
-            detail = (
-                "участок с такой склейкой не строится" if before is None or after is None
-                else f"невязка {before.closure_ft:.3f} → {after.closure_ft:.3f} ft, "
-                     f"наложение {before.overlap_sqft:,.1f} → {after.overlap_sqft:,.1f} sq ft"
-            )
-            rejected.append(f"{title} — совет не подтверждён геометрией: {detail}")
+        chosen_join = None
+        last_detail = ""
+        for changes, summary in candidates:
+            after = scene.metrics(lot_b, base + tuple(changes), state=scene.virtual)
+            verdict = advisor_verdict(before, after, allow_stepped=True)
+            if verdict != "rejected" and before is not None and after is not None:
+                if chosen_join is None or verdict == "verified":
+                    chosen_join = (changes, summary, after, verdict)
+                if verdict == "verified":
+                    break
+            elif before is None or after is None:
+                last_detail = "участок с такой склейкой не строится"
+            else:
+                last_detail = (
+                    f"невязка {before.closure_ft:.3f} → {after.closure_ft:.3f} ft, "
+                    f"наложение {before.overlap_sqft:,.1f} → {after.overlap_sqft:,.1f} sq ft"
+                )
+        if chosen_join is None:
+            rejected.append(f"{title} — совет не подтверждён геометрией: {last_detail}")
             continue
+        changes, summary, after, verdict = chosen_join
+        if before is None:
+            continue
+        stepped_note = (
+            f"уступ задней межи: {after.stepped_edges} сторона(ы) короче соседней — остаток граничит "
+            "с третьим участком (проверьте по карте)"
+            if after.stepped_edges else ""
+        )
         joined.add(lot_b_label)
         reasons: list[str] = []
         reason = " ".join(str(item.get("reason") or "").split())
         if reason:
             reasons.append(f"довод советника: {reason}")
         reasons.append(f"соединение: {summary}")
+        if stepped_note:
+            reasons.append(stepped_note)
         reasons.append(
             "жёсткое перемещение: длины и форма соседа не меняются; расстояние и румб привязки "
             f"соседа вычислены от нашего угла ({changes[0].new_label}), в документе они не напечатаны"

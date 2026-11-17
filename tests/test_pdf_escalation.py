@@ -398,6 +398,46 @@ FULL_LINES = [
 ]
 
 
+def test_journal_shows_figure_score_at_each_escalation_step(gui, tmp_path, monkeypatch):
+    """
+    Подробный журнал: на каждой ступени — баллы фигуры (сколько значений нашлось), затем решение
+    «дальше второй рендер» и строка слияния. Так видно, почему результат не принят.
+    """
+    pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    primary = "\n".join(line for i, line in enumerate(FULL_LINES) if i not in (1, 2))  # без расстояния
+    secondary = "\n".join(line for i, line in enumerate(FULL_LINES) if i != 4)  # без стороны 3
+    done: dict = {}
+    progress: list[str] = []
+
+    def fake_ocr(path, first, last, *, dpi=ocr_pages.DEFAULT_DPI, progress=None,
+                 use_cache=True, tile=1, exact_dpi=False):
+        return primary if exact_dpi else secondary
+
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", fake_ocr)
+
+    def post(kind, payload):
+        if kind == "pdf_set_done":
+            done["payload"] = payload
+        elif kind == "progress":
+            progress.append(payload)
+
+    stub = _worker_stub(gui, post, parse_job=None)
+    stub._parse_pdf_set_job = types.MethodType(gui.SurveyApp._parse_pdf_set_job, stub)
+    job = PdfSetJob(
+        path=pdf, is_main=True, use_llm=False, pages_label="стр. 3–4", mode_label="локально",
+        parse_key=("x",), source={"ocr_path": pdf, "ocr_pages": "3-4", "ocr_dpi": 400}, ocr=True,
+    )
+    _run_worker(gui, stub, job)
+    lines = [line for line in progress if "фигура:" in line or "второй рендер" in line]
+    score_lines = [line for line in lines if "фигура: баллы" in line]
+    assert any("OCR, 600 dpi — фигура: баллы" in line and "расстояние до угла 0 из 1" in line for line in score_lines), lines
+    assert any("слияние строк — фигура: баллы" in line and "баллы 14 из 14" in line for line in score_lines), lines
+    # Порядок: сначала баллы первого прохода, потом решение о втором рендере, потом слияние.
+    joined = "\n".join(progress)
+    assert joined.index("OCR, 600 dpi — фигура") < joined.index("дальше второй рендер") < joined.index("слияние строк — фигура")
+
+
 def test_second_render_is_merged_when_the_first_pass_loses_a_line(gui, tmp_path, monkeypatch):
     """
     Регресс OUR LOT 114: один рендер теряет расстояние до угла, другой — сторону.

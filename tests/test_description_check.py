@@ -171,3 +171,66 @@ def test_outcome_always_carries_its_check(monkeypatch, status):
     outcome = parse_legal_description_full(text=text, cfg=_cfg(), use_llm=True)
     assert outcome.check is not None
     assert outcome.check.status in {STATUS_OK, STATUS_WARNING, STATUS_FAILED}
+
+
+# ------------------------------------------------------------------ баллы фигуры (журнал, 3.58)
+
+from description_check import figure_line, figure_score  # noqa: E402
+
+
+def _score_of(text: str):
+    model, _ = parse_with_regex(text, auto_repair_typos=True)
+    check = check_description(model, text)
+    return model, check
+
+
+def test_clean_figure_scores_full_points():
+    _, check = _score_of(CLEAN)
+    assert check.score is not None
+    assert check.score.found_total == check.score.required_total == 14  # 4 стороны ×3 + POB + замыкание
+    assert check.score.missing == []
+    assert "баллы 14 из 14" in figure_line(check)
+
+
+def test_lost_bearing_is_counted_and_named():
+    """Фрагмент без румба, который нельзя решить по замыканию: баллы на «румбах» не полные, сторона названа."""
+    text = (
+        "THENCE North 90 degrees 00 minutes 00 seconds East 100.00 feet; running\n"
+        "THENCE South 00 degrees 00 minutes 00 seconds East 25.00 feet; running\n"
+        "THENCE South 90 degrees 00 minutes 00 seconds West 100.00 feet; running\n"
+        "east 30.00 feet to land now or formerly of Smith; running\n"
+        "THENCE North 00 degrees 00 minutes 00 seconds West 25.00 feet to the point or place of BEGINNING."
+    )
+    _, check = _score_of(text)
+    rumbs = next(item for item in check.score.items if item.label == "румбов")
+    assert rumbs.found < rumbs.required
+    line = figure_line(check)
+    assert "румб стороны №4" in line
+    assert "НЕ СХОДИТСЯ" in line
+
+
+def test_missing_corner_distance_is_counted():
+    text = CLEAN.replace("distant 74.96 feet U.S. Standard (75.00 feet Deed) northwesterly from the corner", "northwesterly from the corner")
+    _, check = _score_of(text)
+    corner = next(item for item in check.score.items if item.label == "расстояние до угла")
+    assert (corner.found, corner.required) == (0, 1)
+    assert "расстояние от угла до точки начала" in figure_line(check)
+
+
+def test_unclosed_contour_costs_a_closure_point():
+    """Сторона 25.41 заменена на 40 ft: контур не сходится — баллы не сходятся с итогом."""
+    text = CLEAN.replace("25.41 feet U.S. Standard (25.00 feet Deed)", "40.00 feet")
+    _, check = _score_of(text)
+    closure = next(item for item in check.score.items if item.label == "замыкание")
+    assert closure.found == 0
+    assert "контур не замыкается" in figure_line(check)
+
+
+def test_lost_side_is_counted_against_the_thence_count():
+    """В тексте «THENCE» на сторону больше, чем разобрано — сторона пропущена, баллы это показывают."""
+    lines = CLEAN.split("\n")
+    text = "\n".join(line.replace("THENCE South 56 degrees 48 minutes 40 seconds west 115.15", "THENCE 56 degrees 48 minutes 40 seconds west 115.15") for line in lines)
+    _, check = _score_of(text)
+    sides = next(item for item in check.score.items if item.label == "сторон")
+    assert sides.found < sides.required
+    assert "сторон 3 из 4" in figure_line(check)

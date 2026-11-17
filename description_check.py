@@ -56,6 +56,8 @@ class DescriptionCheck:
     status: str = STATUS_OK
     closure_ft: float | None = None
     issues: list[CheckIssue] = field(default_factory=list)
+    #: Подсчёт обязательных значений фигуры (FigureScore); заполняет check_description.
+    score: "FigureScore | None" = None
 
     @property
     def ok(self) -> bool:
@@ -119,8 +121,111 @@ def ranks_higher(a: str, b: str) -> bool:
     return _RANK[a] > _RANK[b]
 
 
+@dataclass(frozen=True)
+class FigureItem:
+    """Одна группа обязательных значений: сколько должно быть и сколько нашлось."""
+
+    label: str
+    found: int
+    required: int
+
+
+@dataclass
+class FigureScore:
+    """
+    «Баллы» распознанной фигуры: сколько обязательных значений должно быть и сколько нашлось.
+
+    Обязательные значения: стороны (по числу «THENCE» в тексте, если их больше, чем разобрано),
+    румбы у каждой стороны, длины сторон, расстояние от угла до точки начала (если точка не у угла).
+    Замыкание — тоже обязательный показатель: контур должен сойтись (невязка ≤ CLOSURE_OK_FT).
+    Если он не сходится, баллы не сходятся с итогом, поэтому невязка входит в подсчёт.
+    """
+
+    items: list[FigureItem] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    solved_sides: list[int] = field(default_factory=list)
+    closure_ft: float | None = None
+
+    @property
+    def found_total(self) -> int:
+        return sum(item.found for item in self.items)
+
+    @property
+    def required_total(self) -> int:
+        return sum(item.required for item in self.items)
+
+    @property
+    def complete(self) -> bool:
+        return self.found_total == self.required_total and not self.missing
+
+
+def figure_score(model: Any, source_text: str = "", closure_ft: float | None = None) -> FigureScore:
+    """Считает обязательные значения фигуры и отмечает, каких не хватает (чистая функция)."""
+    segments = list(getattr(model, "segments", None) or ())
+    text = str(source_text or "")
+    n = len(segments)
+    thence = len(_THENCE_RE.findall(text)) if text else 0
+    # Каждая сторона в описании начинается с «THENCE»: в чистых разборах их ровно столько же,
+    # сколько сторон (проверено на всех текстах набора). Если «THENCE» больше — сторона потеряна.
+    required_sides = max(3, n, thence)
+    bearing_found = sum(1 for seg in segments if getattr(seg, "has_bearing", True))
+    length_found = sum(1 for seg in segments if float(getattr(seg, "distance_ft", 0.0) or 0.0) > 0)
+    at_corner = bool(text) and bool(_AT_CORNER_START_RE.search(text))
+    corner_required = 0 if at_corner else 1
+    distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
+    corner_found = 1 if distance > 1e-6 else 0
+
+    score = FigureScore(closure_ft=closure_ft)
+    score.items = [
+        FigureItem("сторон", min(n, required_sides), required_sides),
+        FigureItem("румбов", bearing_found, n),
+        FigureItem("длин", length_found, n),
+    ]
+    if corner_required:
+        score.items.append(FigureItem("расстояние до угла", corner_found, corner_required))
+    closure_found = 1 if closure_ft is not None and closure_ft <= CLOSURE_OK_FT else 0
+    score.items.append(FigureItem("замыкание", closure_found, 1))
+    if required_sides > n:
+        score.missing.append(f"сторон {n} из {required_sides} (в тексте «THENCE» {thence})")
+    for index, seg in enumerate(segments, start=1):
+        if not getattr(seg, "has_bearing", True):
+            score.missing.append(f"румб стороны №{index}")
+        elif getattr(seg, "bearing_solved", False):
+            score.solved_sides.append(index)
+    if corner_required and not corner_found:
+        score.missing.append("расстояние от угла до точки начала")
+    if closure_ft is not None and closure_ft > CLOSURE_OK_FT:
+        score.missing.append(f"контур не замыкается: невязка {closure_ft:.2f} ft")
+    return score
+
+
+_STATUS_WORDS = {STATUS_OK: "сходится", STATUS_WARNING: "есть сомнения", STATUS_FAILED: "НЕ СХОДИТСЯ"}
+
+
+def figure_line(check: DescriptionCheck | None) -> str:
+    """Одна строка для журнала: баллы фигуры, замыкание, итог и чего не хватает."""
+    if check is None or check.score is None:
+        return "фигура: не посчитана"
+    score = check.score
+    parts = [f"{item.label} {item.found} из {item.required}" for item in score.items]
+    head = f"баллы {score.found_total} из {score.required_total} ({', '.join(parts)})"
+    line = f"фигура: {head}; проверка: {_STATUS_WORDS.get(check.status, check.status)}"
+    if score.solved_sides:
+        line += "; румб вычислен по замыканию у №" + ", №".join(str(i) for i in score.solved_sides)
+    if score.missing:
+        line += "; не найдено: " + "; ".join(score.missing)
+    return line
+
+
 def check_description(model: Any, source_text: str = "") -> DescriptionCheck:
-    """Проверяет разобранную модель LegalDescription относительно исходного текста."""
+    """Проверяет разобранную модель LegalDescription и считает баллы фигуры."""
+    check = _check_description_core(model, source_text)
+    check.score = figure_score(model, source_text, check.closure_ft)
+    return check
+
+
+def _check_description_core(model: Any, source_text: str = "") -> DescriptionCheck:
+    """Статус проверки описания (без подсчёта баллов)."""
     # Импорт здесь: acad_builder тянет llm_parser, а llm_parser импортирует эту проверку.
     from acad_builder import build_polygon_points, closure_error
 

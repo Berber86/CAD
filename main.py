@@ -135,7 +135,7 @@ import deed_store
 import nyc_portal
 import ocr_pages
 import rcclerk
-from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING
+from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING, figure_line
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
@@ -7729,7 +7729,7 @@ class SurveyApp(ctk.CTk):
                         def progress_of(msg: str, i: int = idx) -> None:
                             post("progress", f"[{i}/{total}] {msg}")
 
-                        def judge(source: dict[str, Any], use_llm: bool) -> _ScanCandidate:
+                        def judge(source: dict[str, Any], use_llm: bool, label: str = "") -> _ScanCandidate:
                             """Разбирает источник, строит план и ранжирует: сначала статус проверки, затем фигура."""
                             judged_job = dataclasses.replace(job, source=source, use_llm=use_llm)
                             o, pre, iss = self._parse_pdf_set_job(
@@ -7739,6 +7739,9 @@ class SurveyApp(ctk.CTk):
                             d = apply_changes(o.data, fix_changes(job.fixes))
                             p = builder.plan(d, scale=scale, is_neighbor=not job.is_main)
                             shape = self._shape_rank(p, iss, o.warnings)
+                            if label:
+                                # Баллы фигуры: сколько обязательных значений нашлось и почему результат не ok.
+                                progress_of(f"{job.path.name}: {label} — {figure_line(getattr(o, 'check', None))}")
                             return _ScanCandidate(
                                 outcome=o, plan=p, issues=list(iss), pre_counted=bool(pre),
                                 shape_rank=tuple(shape), status_rank=_check_status_rank(o, p),
@@ -7751,7 +7754,7 @@ class SurveyApp(ctk.CTk):
                         if cached_text:
                             progress_of(f"{job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
                             try:
-                                cache_candidate = judge({"text": cached_text}, False)
+                                cache_candidate = judge({"text": cached_text}, False, "кеш Шага 0")
                                 best = cache_candidate
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
@@ -7764,7 +7767,7 @@ class SurveyApp(ctk.CTk):
                                 last_exc = PDFError(f"локальный OCR: {ocr.error}")
                             elif ocr.text:
                                 try:
-                                    ocr_candidate = judge({"text": ocr.text}, False)
+                                    ocr_candidate = judge({"text": ocr.text}, False, "OCR, 600 dpi")
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
                                 else:
@@ -7772,14 +7775,20 @@ class SurveyApp(ctk.CTk):
                                     # Проверка не пройдена: второй рендер по нативному разрешению и слияние
                                     # строк двух распознаваний. Одиночный рендер иногда теряет строку.
                                     if ocr_candidate.status_rank < _STATUS_OK_RANK:
+                                        progress_of(
+                                            f"{job.path.name}: проверка не ok — дальше второй рендер "
+                                            "(нативное разрешение) и слияние строк"
+                                        )
                                         second = ocr_scan_once(job.path, job.source, progress=progress_of, exact=False)
                                         progress_of(f"{job.path.name}: второй рендер — {second.summary()}")
                                         if second.text:
                                             variants = [(ocr.text, ocr_candidate)]
                                             merged = ocr_pages.merge_line_texts(ocr.text, second.text)
-                                            for text_v in (second.text, merged):
+                                            for text_v, text_label in (
+                                                (second.text, "второй рендер"), (merged, "слияние строк"),
+                                            ):
                                                 try:
-                                                    variants.append((text_v, judge({"text": text_v}, False)))
+                                                    variants.append((text_v, judge({"text": text_v}, False, text_label)))
                                                 except Exception as exc:  # noqa: BLE001
                                                     last_exc = exc
                                             text_best, cand_best = max(variants, key=lambda v: v[1].rank)
@@ -7812,7 +7821,7 @@ class SurveyApp(ctk.CTk):
                                         pass
                                     clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
                                     result.llm_used = True  # ИИ запущен: токены могут быть потрачены
-                                    ai = judge(clean_llm_source, True)
+                                    ai = judge(clean_llm_source, True, "ИИ")
                                     post("valid_secret", key_secret)
                                     prev_shape = best.shape_rank
                                     # ИИ авторитетен при равных статусах и фигуре (решение 3.53).
@@ -7852,6 +7861,10 @@ class SurveyApp(ctk.CTk):
                         )
                         if not self._worker_is_current():
                             return
+                        post(
+                            "progress",
+                            f"[{idx}/{total}] {job.path.name}: {figure_line(getattr(outcome, 'check', None))}",
+                        )
                         result.llm_used = bool(job.use_llm or getattr(outcome, "source", "") == "llm")
                         if job.use_llm and job.scan and not job.ocr:
                             # Скан разобран ИИ сразу: его текст — в кеш, если лучше имеющегося.

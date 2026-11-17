@@ -39,8 +39,12 @@ _STANDARD_DEED_RE = re.compile(
 _DISTANT_RE = re.compile(r"\bdistant\s+\d[\d,]*(?:\.\d+)?\s*(?:feet|ft|')", re.IGNORECASE)
 _THENCE_RE = re.compile(r"\bTHENCE\b", re.IGNORECASE)
 #: Описание начинается от угла: «BEGINNING at the corner formed by …» — расстояние не нужно.
+# Точка начала на углу: «at the corner», «at a point at the corner formed by …»,
+# «at the northeasterly corner of …», «at a point formed by the intersection of …».
+# Между «at» и «corner/intersection» допускаются только слова (до 5), без чисел: фраза
+# «distant 74.96 feet … from the corner» означает удаление от угла, а не точку на углу.
 _AT_CORNER_START_RE = re.compile(
-    r"BEGINNING\s+at\s+(?:the\s+)?(?:corner|intersection|point\s+of\s+intersection)", re.IGNORECASE,
+    r"BEGINNING\s+at\s+(?:[A-Za-z]+\s+){0,5}?(?:corner|intersection)\b", re.IGNORECASE,
 )
 
 

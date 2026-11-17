@@ -73,3 +73,27 @@ def test_economy_takes_local_result_without_corner_distance(monkeypatch):
     assert out.source == "regex"
     assert out.check.score.missing == [CORNER_GAP_MISSING]
     assert out.check.closure_ft is not None and out.check.closure_ft <= 0.5
+
+
+@pytest.mark.parametrize("phrase", [
+    "BEGINNING at the corner formed by the intersection of Doty Avenue and Father Capodanno Boulevard",
+    "BEGINNING at a point at the corner formed by the intersection of Doty Avenue and Father Capodanno Boulevard",
+    "BEGINNING at a point formed by the intersection of Doty Avenue and Father Capodanno Boulevard",
+    "BEGINNING at the northeasterly corner of Doty Avenue and Father Capodanno Boulevard",
+    "BEGINNING at the point of intersection of Doty Avenue and Father Capodanno Boulevard",
+])
+def test_lot_at_the_corner_is_not_a_missing_distance(phrase):
+    """Участок на углу: расстояния от угла нет по смыслу, это не пропуск."""
+    from description_check import _AT_CORNER_START_RE
+
+    assert _AT_CORNER_START_RE.search(phrase)
+
+
+@pytest.mark.parametrize("phrase", [
+    "BEGINNING at a point distant 74.96 feet northwesterly from the corner formed by the intersection of A",
+    "BEGINNING at a point on the southwesterly side of Doty Avenue, distant 74.96 feet from the corner",
+])
+def test_distance_from_the_corner_is_not_at_the_corner(phrase):
+    from description_check import _AT_CORNER_START_RE
+
+    assert _AT_CORNER_START_RE.search(phrase) is None

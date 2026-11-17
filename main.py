@@ -7543,6 +7543,7 @@ class SurveyApp(ctk.CTk):
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
             return
         self._dismiss_conflict_ui()
+        self._select_result_tab("🧾 Журнал")  # разбор идёт — смотрим журнал, а не ведомость
         self._running_source_signature = self._source_signature(mode="📄 PDF")
         self._running_source_path = None
         self._running_source_label = None
@@ -8246,7 +8247,18 @@ class SurveyApp(ctk.CTk):
             self._log_line(line, level=log_mode.report_line_level(line))
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
-        self._open_pdf_set_report_window()
+        # Окно итога — только когда нужно решение пользователя (не строится файл, есть ошибка
+        # контура, расхождение с соседями или находки). Всё хорошо или почти хорошо — журнал и
+        # строка состояния; окно открывается кнопкой «📋 Итог разбора».
+        error_items = [
+            item for item in built
+            if any(severity == "error" for severity, _ in self._pdf_set_issue_lines(item))
+        ]
+        needs_attention = bool(hard or failed or error_items or verify_bad or (analysis is not None and analysis.proposals))
+        if needs_attention:
+            self._open_pdf_set_report_window()
+        else:
+            self._close_pdf_set_report_window()
 
     def _pdf_set_summary_text(self) -> str:
         """Короткий список набора для левой панели: роль, файл, страницы, состояние."""
@@ -8438,20 +8450,24 @@ class SurveyApp(ctk.CTk):
             return
         self._start_pdf_set(ask_advisor=True)
 
+    def _close_pdf_set_report_window(self) -> None:
+        """Итог всегда один: прежнее окно закрывается (и при новом разборе без вопросов тоже)."""
+        previous = self._pdf_set_report_window
+        if previous is None:
+            return
+        try:
+            previous.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        if previous in self._session_windows:
+            self._session_windows.remove(previous)
+        self._pdf_set_report_window = None
+
     def _open_pdf_set_report_window(self) -> None:
         """Окно итога: что построено, замечания по каждому участку и сверка с соседями."""
         if not self.pdf_set or not self._pdf_set_report_ready:
             return
-        previous = self._pdf_set_report_window
-        if previous is not None:
-            # Итог всегда один: прежнее окно закрывается.
-            try:
-                previous.destroy()
-            except Exception:  # noqa: BLE001
-                pass
-            if previous in self._session_windows:
-                self._session_windows.remove(previous)
-            self._pdf_set_report_window = None
+        self._close_pdf_set_report_window()
         full_text = "\n".join(
             log_mode.filter_report_lines(self._pdf_set_report_text().splitlines(), self._log_mode()),
         )
@@ -9987,6 +10003,8 @@ class SurveyApp(ctk.CTk):
             # Кнопка разбора перечитывает весь набор, включая уже готовые файлы.
             self._start_pdf_set(force=True)
             return
+        if mode == "📄 PDF":
+            self._select_result_tab("🧾 Журнал")  # одиночный PDF / соседние файлы — тоже журнал
         # Один соседний PDF разбирается как отдельный участок, чтобы конфликты
         # проходов и опечатки можно было разрешить вручную в привычном диалоге.
         single_neighbor_pdf = (

@@ -209,9 +209,15 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
     dialog.submit()
     assert app._pdf_set_dialog is dialog and "отметьте наш участок" in dialog.message.cget("text")
     dialog.rows[0]["radio"].select()
+    app._select_result_tab("📋 Ведомость")  # перед стартом разбора вкладка другая
     dialog.submit()
     assert app._pdf_set_dialog is None and app._source_role_dialog is None and dialog.closed
     _wait(app)
+    # Разбор начат — сразу журнал, а не ведомость.
+    assert app.result_tab_var.get() == "🧾 Журнал"
+    # Набор без ошибок и расхождений: окно итога не открывается само, только журнал и строка состояния.
+    assert app._pdf_set_report_window is None
+    assert "ИТОГ РАЗБОРА НАБОРА PDF" in app.log_text()
 
     assert [item.is_main for item in app.pdf_set] == [True, False, False]
     assert app._preview_main_plan is not None and not app._preview_main_plan.is_neighbor
@@ -223,6 +229,7 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
     assert app.is_neighbor_mode() is False
 
     # Итог: по каждому участку и по нашему относительно соседей.
+    app._open_pdf_set_report_window()  # чистый набор окно не открывает само — открываем кнопкой
     report = app._pdf_set_report_window._report_text
     assert f"▸ НАШ УЧАСТОК — {main.name}" in report and "стр. 2 из 3 · локально" in report
     assert f"▸ СОСЕД #1 — {left.name}" in report and f"▸ СОСЕД #2 — {right.name}" in report
@@ -376,6 +383,7 @@ def test_each_file_has_its_own_parser_and_scans_send_only_their_pages(gui, tmp_p
     assert by_llm[True]["pdf_path"] == scan and by_llm[True]["pdf_pages"] == "2-3"
     assert not by_llm[True].get("text")
     assert app._preview_main_plan is not None and set(app._neighbor_plan_sources) == {scan}
+    app._open_pdf_set_report_window()  # чистый набор окно не открывает само — открываем кнопкой
     report = app._pdf_set_report_window._report_text
     assert "стр. 2–3 из 4 · ИИ / Vision по изображению страниц" in report
     assert "ИИ: 1 файл., платно" in app.parse_button.cget("text")
@@ -420,6 +428,7 @@ def test_disagreeing_ai_passes_keep_the_lot_and_flag_it(gui, tmp_path, monkeypat
     assert any("проходы ИИ разошлись" in warning for warning in plan.warnings)
     item = app.pdf_set[1]
     assert item.on_scene and not item.error and "Проход #2" in item.issues[0]
+    app._open_pdf_set_report_window()  # чистый набор окно не открывает само — открываем кнопкой
     report = app._pdf_set_report_window._report_text
     assert "построен с замечаниями" in report and "проходы ИИ разошлись" in report
     assert "с замечаниями: 1" in app.status_var.get()
@@ -502,6 +511,7 @@ def test_new_set_asks_about_the_existing_scene_and_may_have_no_main(gui, tmp_pat
     assert set(app._neighbor_plan_sources) == {left, right}
     assert len(app._neighbor_report.pair_reports) == 2
     assert "Нашего участка в наборе нет" in app.neighbor_pdf_summary.cget("text")
+    app._open_pdf_set_report_window()  # чистый набор окно не открывает само — открываем кнопкой
     report = app._pdf_set_report_window._report_text
     assert "НАШ УЧАСТОК —" not in report and app._neighbor_report.headline() in report
 
@@ -516,6 +526,7 @@ def test_new_set_asks_about_the_existing_scene_and_may_have_no_main(gui, tmp_pat
     assert app._preview_main_plan is not old_main and app._preview_main_plan is not None
     assert not app._preview_neighbor_plans and app._neighbor_report is None
     assert [item.path for item in app.pdf_set] == [main]
+    app._open_pdf_set_report_window()  # без нашего участка окно не открывается само
     assert "сверять не с чем" in app._pdf_set_report_window._report_text
 
     # Пустая схема и один файл: он предложен как наш, вопроса о схеме нет.

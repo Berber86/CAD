@@ -51,6 +51,12 @@ class CheckIssue:
     side: int | None = None  # номер стороны (1-based), если проблема относится к стороне
 
 
+#: Текст единственного предупреждения о расстоянии до угла (см. _check_description_core).
+CORNER_GAP_ISSUE_PREFIX = "расстояние от угла до точки начала не найдено"
+#: Строка «не найдено» в баллах фигуры для того же случая.
+CORNER_GAP_MISSING = "расстояние от угла до точки начала"
+
+
 @dataclass
 class DescriptionCheck:
     status: str = STATUS_OK
@@ -329,3 +335,21 @@ def _check_description_core(model: Any, source_text: str = "") -> DescriptionChe
             )
 
     return check
+
+
+def accepted_without_ai(check: "DescriptionCheck | None") -> bool:
+    """Результат можно принять без ИИ: проверка ok или не хватает только расстояния до угла.
+
+    Единственный пропуск — расстояние от угла до точки начала, а стороны, румбы и замыкание
+    на месте (контур сходится). Такой файл строится с пометкой «не найдено»: ИИ не может
+    найти значение, которого нет в тексте документа (решение пользователя).
+    """
+    if check is None:
+        return False
+    if check.ok:
+        return True
+    if check.score is None or check.score.missing != [CORNER_GAP_MISSING]:
+        return False
+    if not check.issues or not all(issue.text.startswith(CORNER_GAP_ISSUE_PREFIX) for issue in check.issues):
+        return False
+    return check.closure_ft is not None and check.closure_ft <= CLOSURE_OK_FT

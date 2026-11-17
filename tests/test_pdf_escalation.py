@@ -51,6 +51,11 @@ NO_TIE = CLEAN.replace(
     "at a point",
 )
 
+# Без расстояния до угла И с несходящимся контуром: только такой текст ещё ведёт в ИИ.
+# (Одно отсутствующее расстояние до угла ИИ не вызывает — решение пользователя, см. test_corner_gap_policy.)
+NO_TIE_BROKEN = NO_TIE.replace("South 56 degrees 36 minutes 12 seconds East 100.00 feet", "South 56 degrees 36 minutes 12 seconds East 160.00 feet")
+assert NO_TIE_BROKEN != NO_TIE
+
 
 @pytest.fixture()
 def fake_pdf(tmp_path):
@@ -216,7 +221,7 @@ def test_stage_three_gets_pages_from_the_spec_not_by_indexing(gui, tmp_path, mon
     """Регресс: «2» падал с IndexError (string index out of range) при вызове ИИ."""
     pdf = tmp_path / "LOT 72 NEW_p2.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE_BROKEN)
     monkeypatch.setattr(gui, "inspect_pdf", lambda *a, **k: {"pages": 0})
     seen: list = []
     done: dict = {}
@@ -285,7 +290,7 @@ def test_no_key_leaves_a_visible_reason_in_the_log(gui, tmp_path, monkeypatch):
     _clear_key_env(monkeypatch)
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE_BROKEN)
     progress: list[str] = []
     done: dict = {}
 
@@ -319,7 +324,7 @@ def test_key_saved_in_settings_enables_the_ai_check(gui, tmp_path, monkeypatch):
     cfg["api"]["providers"][provider]["api_key"] = "sk-saved-in-settings"
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
-    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE)
+    monkeypatch.setattr(pdf_set.ocr_pages, "ocr_pdf_pages", lambda *a, **k: NO_TIE_BROKEN)
     seen_llm: list[bool] = []
     done: dict = {}
 
@@ -517,7 +522,7 @@ def test_cache_without_corner_distance_is_rechecked_locally_and_updated_when_bet
     pdf = tmp_path / "LOT 68 NEW_p3-4.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
     cache = tmp_path / "LOT 68 NEW_text.txt"
-    cache.write_text(NO_TIE, encoding="utf-8")
+    cache.write_text(NO_TIE_BROKEN, encoding="utf-8")
     progress: list[str] = []
     done: dict = {}
     ocr_calls: list[int] = []

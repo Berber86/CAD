@@ -41,3 +41,22 @@ def test_failed_check_is_an_error_and_closure_is_not_duplicated(gui):  # noqa: F
     assert ("error", "румб стороны №2 не прочитан") in lines
     assert ("error", "не найдено: румб стороны №2") in lines
     assert not any("контур не замыкается" in text for _sev, text in lines)
+
+
+def test_scan_candidate_with_only_corner_gap_needs_no_ai(gui):  # noqa: F811
+    from description_check import CORNER_GAP_ISSUE_PREFIX, CORNER_GAP_MISSING
+
+    corner = CheckIssue(status=STATUS_WARNING, text=CORNER_GAP_ISSUE_PREFIX + " — сверьте с документом")
+    check = DescriptionCheck(
+        status=STATUS_WARNING, issues=[corner], score=FigureScore(missing=[CORNER_GAP_MISSING]), closure_ft=0.1,
+    )
+    candidate = gui._ScanCandidate(
+        outcome=SimpleNamespace(check=check), plan=None, issues=[], pre_counted=False,
+        shape_rank=(), status_rank=gui._STATUS_RANKS[STATUS_WARNING],
+    )
+    assert gui._accepted_without_ai(candidate) is True
+    # Сомнение по другому месту по-прежнему ведёт в ИИ.
+    other = CheckIssue(status=STATUS_WARNING, text="возможная опечатка в румбе стороны №3")
+    check.issues.append(other)
+    assert gui._accepted_without_ai(candidate) is False
+    assert gui._accepted_without_ai(None) is False

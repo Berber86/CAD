@@ -135,7 +135,9 @@ import deed_store
 import nyc_portal
 import ocr_pages
 import rcclerk
-from description_check import STATUS_FAILED, STATUS_OK, STATUS_WARNING, figure_line, reading_summary
+from description_check import (
+    STATUS_FAILED, STATUS_OK, STATUS_WARNING, accepted_without_ai, figure_line, reading_summary,
+)
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
@@ -422,6 +424,15 @@ def _check_status_rank(outcome: Any, plan: Any = None) -> int:
     if _lacks_corner_distance(warnings):
         rank = min(rank, _STATUS_RANKS[STATUS_WARNING])
     return rank
+
+
+def _accepted_without_ai(candidate: Any) -> bool:
+    """Вариант скана принят без ИИ: статус ok или не хватает только расстояния до угла."""
+    if candidate is None:
+        return False
+    return candidate.status_rank >= _STATUS_OK_RANK or accepted_without_ai(
+        getattr(candidate.outcome, "check", None)
+    )
 
 
 @dataclasses.dataclass
@@ -7812,7 +7823,7 @@ class SurveyApp(ctk.CTk):
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
 
-                        if best is None or best.status_rank < _STATUS_OK_RANK:
+                        if not _accepted_without_ai(best):
                             progress_of(f"{job.path.name}: распознаю локально, один проход (до {SCAN_OCR_DPI} dpi)…")
                             ocr = ocr_scan_once(job.path, job.source, progress=progress_of)
                             progress_of(f"{job.path.name}: OCR — {ocr.summary()}")
@@ -7828,7 +7839,7 @@ class SurveyApp(ctk.CTk):
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
                                     progress_of(f"{job.path.name}: разбор OCR-текста не удался — {describe_exc(exc)}")
-                                if ocr_candidate is None or ocr_candidate.status_rank < _STATUS_OK_RANK:
+                                if not _accepted_without_ai(ocr_candidate):
                                     progress_of(
                                         f"{job.path.name}: проверка не ok — дальше второй рендер "
                                         "(нативное разрешение) и слияние строк"
@@ -7868,7 +7879,9 @@ class SurveyApp(ctk.CTk):
                                     except OSError:
                                         pass
 
-                        if best is not None and best.status_rank < _STATUS_OK_RANK:
+                        if best is not None and best.status_rank < _STATUS_OK_RANK and _accepted_without_ai(best):
+                            progress_of(f"{job.path.name}: не найдено только расстояние до угла — ИИ не вызван")
+                        elif best is not None and best.status_rank < _STATUS_OK_RANK:
                             if ai_ready:
                                 progress_of(f"{job.path.name}: проверка не пройдена — отправляю в ИИ…")
                                 try:
@@ -7907,7 +7920,7 @@ class SurveyApp(ctk.CTk):
                             if last_exc is not None and not isinstance(last_exc, PDFError):
                                 raise PDFError(f"разбор скана не удался: {describe_exc(last_exc)}") from last_exc
                             raise last_exc or PDFError("не удалось распознать участок; введите текст вручную")
-                        if best.status_rank < _STATUS_OK_RANK:
+                        if not _accepted_without_ai(best):
                             best.issues.append("Требуется ручная проверка/ввод текста для этого лота")
                         result.ocr = True
                         outcome, pre_counted, issues = best.outcome, best.pre_counted, best.issues

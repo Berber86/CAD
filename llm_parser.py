@@ -48,7 +48,7 @@ import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 import street_names
-from description_check import CLOSURE_OK_FT
+from description_check import CLOSURE_OK_FT, accepted_without_ai
 
 __all__ = [
     "ASPENWALL_SAMPLES",
@@ -5812,7 +5812,7 @@ def _parse_local_then_llm(
         )
     except LegalDescriptionError as exc:
         local_error = exc
-    if local is not None and local.check.ok and not local.typo_suspicions:
+    if local is not None and accepted_without_ai(local.check) and not local.typo_suspicions:
         return local
 
     if local is not None:
@@ -5936,7 +5936,7 @@ def parse_legal_description_full(
     local_attempt: _LocalAttempt | None = None
     if use_llm and combined and not image_data_urls:
         local_attempt = _try_local_parse(combined, not eff_ask_on_doubt)
-        if local_attempt is not None and local_attempt.check.ok:
+        if local_attempt is not None and accepted_without_ai(local_attempt.check):
             # Текст сошёлся сам с собой (замыкание, все румбы, числа на месте) — ИИ не нужен.
             return ParseOutcome(
                 data=local_attempt.model,

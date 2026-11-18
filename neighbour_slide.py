@@ -434,12 +434,12 @@ def _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward)
     parts = []
     for dx, dy, band, need, _wedge in corners[:2]:
         length = math.hypot(dx, dy)
-        if length > short_nb + 1e-9:
-            why = f"длиннее короткой стороны соседа ({short_nb:.2f} ft)"
-        elif not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
+        if not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
             why = "не наружу"
         else:
-            why = check_reason(dx, dy, band, need) or "проходит (но не выбран)"
+            why = check_reason(dx, dy, band, need) or "проходит"
+        if length > short_nb + 1e-9:
+            why = f"длиннее короткой стороны соседа ({short_nb:.2f} ft); без этого ограничения: {why}"
         parts.append(f"сдвиг ({dx:.2f}, {dy:.2f}), длина {length:.2f} ft — {why}")
     return "углы: " + "; ".join(parts)
 

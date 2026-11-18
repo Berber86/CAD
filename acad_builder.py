@@ -32,6 +32,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Iterable, Sequence
 
 from llm_parser import LegalDescription, Segment, load_config
+import offsets
 import street_names
 
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
@@ -53,6 +54,7 @@ from feature_labeler import (
     fence_linetype_plan,
     fence_linetype_rule,
     fence_linetype_scale,
+    find_north_arrow,
     find_property_polygon,
     is_north_arrow_block,
     is_file_reference,
@@ -1363,6 +1365,50 @@ def _com_retry(
 # ---------------------------------------------------------------------------
 # Построитель
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class OffsetWriteResult:
+    """Что записано в чертёж шага 4."""
+
+    layer: str = ""
+    text_style: str = ""
+    text_style_native: bool = False
+    created_texts: int = 0
+    created_leaders: int = 0
+    warnings: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OffsetRunResult:
+    """Итог шага 4: план, указанная область и (если писали) что записано."""
+
+    plan: Any  # offsets.OffsetPlan
+    area: list[tuple[float, float]]
+    scale: float
+    north_deg: float
+    front_lines: int
+    feature_count: int
+    written: OffsetWriteResult | None = None
+    dry_run: bool = False
+
+
+def _geometry_points(geom: Any) -> list[tuple[float, float]]:
+    """Вершины объекта Шага 2: у контура без повтора замыкающей точки, у линии — все вершины."""
+    if geom is None or geom.is_empty:
+        return []
+    kind = geom.geom_type
+    if kind == "Polygon":
+        return [(float(x), float(y)) for x, y in list(geom.exterior.coords)[:-1]]
+    if kind in ("LineString", "LinearRing"):
+        return [(float(x), float(y)) for x, y in geom.coords]
+    if kind == "Point":
+        return [(float(geom.x), float(geom.y))]
+    out: list[tuple[float, float]] = []
+    for part in getattr(geom, "geoms", []):
+        out.extend(_geometry_points(part))
+    return out
 
 
 class AcadBuilder:
@@ -3660,6 +3706,204 @@ class AcadBuilder:
                 FenceLinetypeItem(layer=layer, length_ft=length, value=value, why=why)
             )
         return plan
+
+    # -- шаг 4: оффсеты (черновик 4.3) ----------------------------------------
+    def pick_offset_area(
+        self, app: Any, doc: Any, progress: Callable[[str], None] | None = None
+    ) -> list[tuple[float, float]]:
+        """
+        Геодезист мышкой указывает прямоугольник области: первый угол и противоположный.
+        Возвращает четыре вершины прямоугольника (мировые координаты, футы).
+        """
+        import pythoncom
+
+        notify = progress or (lambda _message: None)
+        notify("Перейдите в AutoCAD: укажите первый угол области, где ставить оффсеты…")
+        try:
+            app.Visible = True
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # вывести окно AutoCAD на передний план (только Windows)
+            import win32gui
+
+            win32gui.SetForegroundWindow(int(app.HWND))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            first = doc.Utility.GetPoint(
+                pythoncom.Missing, "\nTitle Survey AI: первый угол области оффсетов: "
+            )
+            second = doc.Utility.GetCorner(
+                _variant_point((float(first[0]), float(first[1]))),
+                "\nTitle Survey AI: противоположный угол области: ",
+            )
+        except Exception as exc:  # noqa: BLE001 - Esc или закрытие AutoCAD
+            raise AcadBuilderError(
+                f"область оффсетов не указана (Esc — отмена). Чертёж не изменён. Детали: {exc}"
+            ) from exc
+        x1, y1 = float(first[0]), float(first[1])
+        x2, y2 = float(second[0]), float(second[1])
+        if abs(x2 - x1) < 1e-6 or abs(y2 - y1) < 1e-6:
+            raise AcadBuilderError(
+                "область вырождена: укажите два разных угла прямоугольника. Чертёж не изменён."
+            )
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    @staticmethod
+    def _offset_feature(feature: Feature) -> Any | None:
+        """Объект Шага 2 → объект шага 4: дом и сарай — ``house``, забор, стена; остальное — ``other``."""
+        kind = {"house": "house", "shed": "house", "fence": "fence", "wall": "wall"}.get(
+            feature.category, "other"
+        )
+        points = _geometry_points(feature.geometry)
+        if not points:
+            return None
+        return offsets.Feature(
+            kind=kind, handle=f"{feature.layer}/{feature.feature_id}", points=tuple(points),
+        )
+
+    def build_offsets(
+        self,
+        *,
+        scale: float | None = None,
+        progress: Callable[[str], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        dry_run: bool = False,
+        area: list[tuple[float, float]] | None = None,
+    ) -> OffsetRunResult:
+        """
+        Шаг 4 целиком: геодезист указывает область мышкой, в ней ставятся оффсеты до границы участка.
+
+        Граница — автопоиск участка (как в Шаге 2); фронт — линии ``M-ROW-LINE``; север — стрелка
+        чертежа (без неё +Y). ``dry_run=True`` — только расчёт. ``area`` задаётся явно (тесты).
+        Все подписи пишутся одной отменяемой группой (один Undo).
+        """
+        notify = progress or (lambda _message: None)
+
+        def check_continue() -> None:
+            if should_continue is not None and not should_continue():
+                raise AcadBuilderError("операция отменена: чертёж не изменён")
+
+        fcfg = feature_settings(self.cfg)
+        base_scale = float(self.drawing_cfg.get("base_scale", 16.0)) or 16.0
+        scale_value = float(scale) if scale and scale > 0 else base_scale
+        app, doc = self.connect()
+        try:
+            try:
+                if getattr(doc, "ActiveSpace", 1) == 0 and not getattr(doc, "MSpace", False):
+                    doc.ActiveSpace = 1
+            except Exception:  # noqa: BLE001
+                pass
+            if area is None:
+                area = self.pick_offset_area(app, doc, notify)
+            check_continue()
+            notify("Читаю объекты активного чертежа AutoCAD…")
+            snapshot = self.read_drawing_snapshot(
+                doc, progress=progress, should_continue=should_continue
+            )
+            boundary = find_property_polygon(snapshot, self.cfg)
+            recognition = recognize_features(snapshot, boundary, self.cfg, "")
+            north = find_north_arrow(snapshot, self.cfg)
+            north_deg = float(north.north_deg) if north is not None else 90.0
+            features = [
+                item for item in (self._offset_feature(f) for f in recognition.features)
+                if item is not None
+            ]
+            front = [
+                list(line.points) for line in snapshot.lines
+                if str(line.layer).upper() == offsets.FRONT_BOUNDARY_LAYER
+            ]
+            texts = [
+                (str(t.text), tuple(t.point), float(t.height or 0.0))
+                for t in snapshot.texts if not getattr(t, "hidden", False)
+            ]
+            ring = list(boundary.polygon.exterior.coords)
+            plan = offsets.plan_offsets(
+                ring, features, front=front, area=area, scale=scale_value,
+                north_deg=north_deg, texts=texts,
+                text_width=lambda text, height: feature_text_width(text, height, fcfg),
+            )
+            result = OffsetRunResult(
+                plan=plan, area=list(area), scale=scale_value, north_deg=north_deg,
+                front_lines=len(front), feature_count=len(features), dry_run=dry_run,
+            )
+            if plan.items and not dry_run:
+                check_continue()
+                notify(f"Пишу оффсеты в слой {offsets.OFFSET_LAYER}: {len(plan.items)} шт.…")
+                result.written = self.draw_offset_labels(app, doc, plan)
+            return result
+        finally:
+            if self._com_owned:
+                self._app = None
+                self._doc = None
+                self._com_owned = False
+                self._com_thread_id = None
+                _co_uninitialize()
+
+    def draw_offset_labels(self, app: Any, doc: Any, plan: Any) -> OffsetWriteResult:
+        """
+        Пишет оффсеты плана в чертёж: текст без выноски — однострочный TEXT, выноска —
+        MText + Leader (как у подписей Шага 2). Одна отменяемая группа на все подписи.
+        """
+        fcfg = feature_settings(self.cfg)
+        result = OffsetWriteResult(layer=offsets.OFFSET_LAYER)
+        if not plan.items:
+            return result
+        try:
+            model_space = doc.ModelSpace
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
+        style, result.text_style_native = self._label_text_style(doc)
+        result.text_style = style
+        layer = self._ensure_feature_layer(
+            doc, offsets.OFFSET_LAYER, int(fcfg.get("label_output_layer_color") or 7)
+        )
+        if layer == "0":
+            result.warnings.append(
+                f"слой {offsets.OFFSET_LAYER} недоступен — оффсеты созданы в слое 0"
+            )
+        result.layer = layer
+        undo_open = False
+        try:
+            doc.StartUndoMark()
+            undo_open = True
+        except Exception:  # noqa: BLE001 - группировка отмены не критична
+            pass
+        try:
+            for item in plan.items:
+                try:
+                    if item.style == "text":
+                        self._add_text(
+                            model_space,
+                            TextItem(
+                                text=item.text, point=item.point, rotation=0.0,
+                                kind="offset", height=item.height_ft,
+                            ),
+                            item.height_ft, layer, style,
+                        )
+                        result.created_texts += 1
+                        continue
+                    label = FeatureLabelItem(
+                        feature=None, text=item.text, kind="leader", placement="leader",
+                        point=item.point, height=item.height_ft, rotation=0.0,
+                        leader_points=[item.leader[0], item.leader[1]],
+                    )
+                    mtext = self._add_mtext(model_space, label, layer, style)
+                    _leader, warning, _attached = self._add_leader(
+                        model_space, label, mtext, layer
+                    )
+                    result.created_leaders += 1
+                    if warning:
+                        result.warnings.append(warning)
+                except Exception as exc:  # noqa: BLE001 - одна подпись не валит остальные
+                    result.failed.append(f"{item.text}: {exc}")
+        finally:
+            if undo_open:
+                try:
+                    doc.EndUndoMark()
+                except Exception:  # noqa: BLE001
+                    pass
+        return result
 
     def draw_feature_labels(
         self, app: Any, doc: Any, plan: FeatureLabelPlan, *, mode: str = "auto",

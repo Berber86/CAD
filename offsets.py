@@ -1,7 +1,7 @@
 """
 Шаг 4 — оффсеты: подписи расстояний от дома, заборов и стен до границы участка.
 
-Каркас (версия 4.1). Правила заказчика, которые уже учтены:
+Черновик (версия 4.3): оффсеты в области, выбранной мышкой в AutoCAD, запись в чертёж. Правила заказчика, которые уже учтены:
 
 - граница для оффсетов на фронте — ``M-ROW-LINE`` (актуальная граница улицы и участка);
   ``M-TAX-LINE`` — линия расширения улицы по проекту, границей участка не считается;
@@ -18,8 +18,17 @@
 - измерение расстояния от вершин объектов до границы участка (``measure_candidates``);
 - высоты текста оффсетов по масштабу (``offset_height_ft``).
 
-Чего пока нет: правил выбора объектов и способа записи. ``plan_offsets`` возвращает пустой план
-с предупреждением. Правила будут добавляться по парам дампов «до» и «после», которые пришлёт заказчик.
+Черновик 4.3 (первая версия, без правил по 2-му и 3-му дампам):
+
+- геодезист указывает две точки области в AutoCAD; оффсеты ставятся только для объектов внутри неё;
+- дом и сарай — текст без выноски (``3.2'S``, высота 1.1), а если места нет — выноска ``BLDG 2.0'E``;
+- забор и стена — выноска ``FE.0.4'N`` / ``WALL 0.5'E`` (высота 0.9);
+- расстояние — до контура участка и до фронтовых линий ``M-ROW-LINE``; ``M-TAX-LINE`` не граница;
+- текст не накрывает линии объектов, границы и другие подписи; одинаковая подпись рядом не дублируется;
+- запись — слой D-TOPO-TEXT одной отменяемой группой (один Undo).
+
+Пока не сделано: размерные подписи (``27.6'``), сверка с дампами «до/после», проблема полной границы
+участка (отложена по решению пользователя).
 
 Запуск разбора эталона из корня репозитория::
 
@@ -34,7 +43,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 #: Базовый масштаб заказчика (1"=16'); высоты текста ниже даны для него.
 BASE_SCALE = 16.0
@@ -49,7 +58,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.2"
+STEP4_VERSION = "4.3"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -277,8 +286,22 @@ def point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     return inside
 
 
-# --------------------------------------------------------------------------- каркас плана
+# --------------------------------------------------------------------------- план (черновик 4.3)
 
+#: Объекты, от которых ставим оффсет. Дом и сарай — текст без выноски; забор и стена — выноска.
+OFFSET_KINDS = ("house", "fence", "wall")
+#: Меньше этого расстояния объект считаем стоящим на границе (оффсета нет), футы.
+MIN_OFFSET_FT = 0.05
+#: Расстояние от объекта до текста выноски при 1"=16' (в порядке попыток), футы.
+LEADER_DISTANCES_FT = (4.0, 5.5, 7.0)
+#: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
+LEADER_ANGLES_DEG = (90, -90, 60, -60, 120, -120, 30, -30, 150, -150, 0, 180)
+#: Зазор текста до линии и выноски, доля высоты текста.
+TEXT_GAP_FACTOR = 0.3
+#: Если рядом (футы при 1"=16') уже есть такая же подпись, оффсет не дублируем.
+DUPLICATE_RADIUS_FT = 10.0
+#: Минимальная длина выноски в высотах текста: короче AutoCAD не нарисует стрелку.
+LEADER_MIN_HEIGHTS = 2.0
 
 @dataclass(frozen=True)
 class Feature:
@@ -300,12 +323,25 @@ class OffsetCandidate:
     inside: bool  # вершина внутри участка
 
 
-def measure_candidates(property_pts: Sequence[Point], features: Sequence[Feature]) -> list[OffsetCandidate]:
-    """Для каждой вершины каждого объекта — расстояние до границы участка."""
+def measure_candidates(
+    property_pts: Sequence[Point],
+    features: Sequence[Feature],
+    *,
+    front: Sequence[Sequence[Point]] = (),
+) -> list[OffsetCandidate]:
+    """
+    Для каждой вершины каждого объекта — расстояние до границы: до контура участка и до
+    фронтовых линий ``M-ROW-LINE`` (``front``), берётся ближайшая из них.
+    """
     out: list[OffsetCandidate] = []
+    boundaries: list[tuple[Sequence[Point], bool]] = [(property_pts, True)]
+    boundaries += [(line, False) for line in front if len(line) >= 2]
     for feature in features:
         for vertex in feature.points:
-            distance, foot = perpendicular_distance(vertex, property_pts, closed=True)
+            distance, foot = min(
+                (perpendicular_distance(vertex, line, closed=closed) for line, closed in boundaries),
+                key=lambda pair: pair[0],
+            )
             out.append(
                 OffsetCandidate(
                     feature=feature,
@@ -318,65 +354,358 @@ def measure_candidates(property_pts: Sequence[Point], features: Sequence[Feature
     return out
 
 
+Rect = tuple[float, float, float, float]
+
+
+def round_offset_ft(distance_ft: float) -> float:
+    """Расстояние в подписи — до 0.1 фута, половина вверх (как у заказчика: 0.4, 3.2, 14.6)."""
+    return math.floor(distance_ft * 10.0 + 0.5) / 10.0
+
+
+def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
+    """
+    Буква направления от объекта к границе: вектор ``(dx, dy)`` идёт от вершины к основанию
+    перпендикуляра. ``north_deg`` — направление на север (градусы от +X против часовой), по
+    умолчанию +Y. Берётся главная ось: ``N``, ``S``, ``E`` или ``W``.
+    """
+    rad = math.radians(north_deg)
+    nx, ny = math.cos(rad), math.sin(rad)
+    ex, ey = ny, -nx  # восток — север, повёрнутый по часовой на 90°
+    north = dx * nx + dy * ny
+    east = dx * ex + dy * ey
+    scores = {"N": north, "S": -north, "E": east, "W": -east}
+    return max(scores, key=lambda letter: scores[letter])
+
+
+def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = False) -> str:
+    """
+    Текст оффсета в форме заказчика: ``FE.0.4'N``, ``WALL 0.5'E``. Дом без выноски — ``3.2'S``,
+    дом с выноской — ``BLDG 2.5'S`` (так у заказчика в Alvine).
+    """
+    value = f"{value_ft:.1f}'{direction}"
+    if kind == "fence":
+        return f"FE.{value}"
+    if kind == "wall":
+        return f"WALL {value}"
+    if leader:
+        return f"BLDG {value}"
+    return value
+
+
+def default_text_width(text: str, height: float) -> float:
+    """Грубая ширина строки, если программа не передала точную (шрифт romans, ~0.6 высоты на знак)."""
+    return 0.6 * float(height) * len(text)
+
+
+def _rect_at(center: Point, width: float, height: float) -> Rect:
+    cx, cy = center
+    return (cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
+
+
+def _rects_overlap(a: Rect, b: Rect) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _rect_inside_polygon(rect: Rect, polygon: Sequence[Point]) -> bool:
+    x0, y0, x1, y1 = rect
+    return all(point_in_polygon(p, polygon) for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
+
+
+def _segment_hits_rect(p: Point, q: Point, rect: Rect) -> bool:
+    """Пересекает ли отрезок ``pq`` прямоугольник (алгоритм Лианга — Барски)."""
+    x0, y0 = p
+    x1, y1 = q
+    xmin, ymin, xmax, ymax = rect
+    dx, dy = x1 - x0, y1 - y0
+    t_enter, t_leave = 0.0, 1.0
+    for num, den in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin), (dy, ymax - y0)):
+        if abs(num) < 1e-12:
+            if den < 0.0:
+                return False
+            continue
+        ratio = den / num
+        if num < 0.0:
+            if ratio > t_leave:
+                return False
+            t_enter = max(t_enter, ratio)
+        else:
+            if ratio < t_enter:
+                return False
+            t_leave = min(t_leave, ratio)
+    return t_enter <= t_leave
+
+
+def _key(text: str) -> str:
+    return re.sub(r"\s+", "", str(text)).upper()
+
+
 @dataclass(frozen=True)
 class OffsetItem:
-    """Готовая подпись оффсета (пока не заполняется: правил нет)."""
+    """Готовый оффсет: текст, где он стоит, и (для выноски) отрезок от объекта до текста."""
 
-    kind: str
+    kind: str  # "house" | "fence" | "wall"
     value_ft: float
-    direction: str | None
-    style: str  # "leader" | "dimension"
+    direction: str  # "N" | "S" | "E" | "W"
+    style: str  # "text" — без выноски; "leader" — выноска
     height_ft: float
-    anchor: Point
-    target: Point | None = None
+    anchor: Point  # вершина объекта, от которой меряем
+    target: Point  # основание перпендикуляра на границе
+    text: str
+    point: Point  # центр подписи
+    leader: tuple[Point, Point] | None = None  # (стрелка у объекта, конец у текста)
 
 
 @dataclass
 class OffsetPlan:
     items: list[OffsetItem] = field(default_factory=list)
+    #: объекты в области, которым оффсет не поставлен: (объект, причина)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def _place_beside_line(
+    anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
+    ok: Callable[[Rect, Point], bool],
+) -> Point | None:
+    """Текст без выноски — рядом с линией измерения, по перпендикуляру к ней."""
+    dx, dy = target[0] - anchor[0], target[1] - anchor[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    px, py = -dy / length, dx / length
+    width = width_of(text, height)
+    gap = TEXT_GAP_FACTOR * height
+    mid = ((anchor[0] + target[0]) / 2.0, (anchor[1] + target[1]) / 2.0)
+    half_extent = abs(px) * width / 2.0 + abs(py) * height / 2.0 + gap
+    for extra in (0.0, 0.5 * height, height, 2.0 * height):
+        for sign in (1.0, -1.0):
+            d = half_extent + extra
+            center = (mid[0] + sign * px * d, mid[1] + sign * py * d)
+            rect = _rect_at(center, width, height)
+            if ok(rect, center) and not _segment_hits_rect(anchor, target, rect):
+                return center
+    return None
+
+
+def _place_leader(
+    anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
+    ok: Callable[[Rect, Point], bool], factor: float,
+) -> tuple[Point, Point] | None:
+    """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
+    base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
+    width = width_of(text, height)
+    gap = TEXT_GAP_FACTOR * height
+    for distance in LEADER_DISTANCES_FT:
+        for angle in LEADER_ANGLES_DEG:
+            a = base + math.radians(angle)
+            d = distance * factor
+            center = (anchor[0] + d * math.cos(a), anchor[1] + d * math.sin(a))
+            rect = _rect_at(center, width, height)
+            if not ok(rect, center):
+                continue
+            # Конец выноски — на краю текста, со стороны объекта.
+            vx, vy = anchor[0] - center[0], anchor[1] - center[1]
+            norm = math.hypot(vx, vy)
+            if norm < 1e-9:
+                continue
+            ux, uy = vx / norm, vy / norm
+            half_w, half_h = width / 2.0, height / 2.0
+            reach = min(
+                half_w / abs(ux) if abs(ux) > 1e-9 else math.inf,
+                half_h / abs(uy) if abs(uy) > 1e-9 else math.inf,
+            )
+            end = (center[0] + ux * (reach + gap), center[1] + uy * (reach + gap))
+            if math.hypot(end[0] - anchor[0], end[1] - anchor[1]) < LEADER_MIN_HEIGHTS * height:
+                continue
+            return center, end
+    return None
 
 
 def plan_offsets(
     property_pts: Sequence[Point],
     features: Sequence[Feature],
     *,
+    front: Sequence[Sequence[Point]] = (),
+    area: Sequence[Point] | None = None,
     scale: float = BASE_SCALE,
+    north_deg: float = 90.0,
+    texts: Sequence[tuple[str, Point, float]] = (),
+    text_width: Callable[[str, float], float] | None = None,
 ) -> OffsetPlan:
     """
-    Шаг 4 целиком. Каркас: измерения считаются, подписи не ставятся.
+    Шаг 4, черновик 4.3: оффсеты объектов в выбранной области.
 
-    Порядок, который будет заполняться по эталонам: выбор объектов → измерение → способ записи
-    (выноска или размерная подпись) → высота по ``offset_height_ft`` → размещение → проверка
-    наложений. Пока на каждом этапе есть только заглушка, поэтому план пустой.
+    ``property_pts`` — граница участка (замкнутый контур); ``front`` — линии ``M-ROW-LINE``
+    (фронтовая граница, ``M-TAX-LINE`` сюда не передаётся); ``area`` — прямоугольник, который
+    указал геодезист (``None`` — весь участок); ``texts`` — уже стоящие подписи ``(текст, точка,
+    высота)``: рядом с тем же текстом оффсет не дублируется, а текст не накрывается.
+
+    Для каждого объекта берётся ближайшая к границе вершина внутри участка; значение — до 0.1 ft.
+    Дом и сарай — текст без выноски (высота 1.1), забор и стена — выноска (0.9). Текст ставится
+    там, где не накрывает линии объектов, границы и другие подписи; если места нет — предупреждение.
     """
     plan = OffsetPlan()
-    if len(property_pts) < 3:
+    ring = [(float(x), float(y)) for x, y in property_pts]
+    if len(ring) >= 2 and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    if len(ring) < 3:
         plan.warnings.append("граница участка: меньше трёх вершин — оффсеты не строятся")
         return plan
-    measure_candidates(property_pts, features)  # проверка, что измерение работает на входных данных
-    plan.warnings.append(
-        "шаг 4: правила выбора объектов и способа записи не заданы — подписи не созданы"
-    )
+    factor = scale / BASE_SCALE if scale and scale > 0 else 1.0
+    width_of = text_width or default_text_width
+    area_pts = [(float(x), float(y)) for x, y in area] if area else None
+    front_lines = [[(float(x), float(y)) for x, y in line] for line in front if len(line) >= 2]
+
+    known = [(str(t), (float(p[0]), float(p[1])), float(h) or LABEL_HEIGHT_FT * factor) for t, p, h in texts]
+    # Препятствия для текста: уже стоящие подписи и линии, которые текст не должен пересекать.
+    text_rects = [_rect_at(p, width_of(t, h), h) for t, p, h in known]
+    lines: list[tuple[Point, Point]] = []
+    for i in range(len(ring)):
+        lines.append((ring[i], ring[(i + 1) % len(ring)]))
+    for line in front_lines:
+        lines += list(zip(line, line[1:]))
+    for feature in features:
+        pts = list(feature.points)
+        if len(pts) >= 2:
+            closed = feature.kind == "house" and len(pts) >= 3
+            seq = pts + [pts[0]] if closed else pts
+            lines += list(zip(seq, seq[1:]))
+
+    placed: list[Rect] = []
+    dup_radius = DUPLICATE_RADIUS_FT * factor
+
+    for index, feature in enumerate(features):
+        label = feature.handle or f"#{index}"
+        in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
+        if not in_area:
+            continue
+        if feature.kind not in OFFSET_KINDS:
+            plan.skipped.append((label, "этот вид объекта в оффсетах не подписывается"))
+            continue
+        candidates = [c for c in measure_candidates(ring, [feature], front=front_lines) if c.inside]
+        if not candidates:
+            plan.skipped.append((label, "объект вне участка"))
+            continue
+        best = min(candidates, key=lambda c: c.distance_ft)
+        value = round_offset_ft(best.distance_ft)
+        if best.distance_ft < MIN_OFFSET_FT or value <= 0.0:
+            plan.skipped.append((label, "стоит на границе"))
+            continue
+        vx, vy = best.foot[0] - best.vertex[0], best.foot[1] - best.vertex[1]
+        direction = compass_letter(vx, vy, north_deg)
+        height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
+        text = offset_text(feature.kind, value, direction)
+        mid = ((best.vertex[0] + best.foot[0]) / 2.0, (best.vertex[1] + best.foot[1]) / 2.0)
+        if any(
+            _key(old) == _key(text) and min(
+                math.hypot(p[0] - best.vertex[0], p[1] - best.vertex[1]),
+                math.hypot(p[0] - mid[0], p[1] - mid[1]),
+            ) <= dup_radius
+            for old, p, _h in known
+        ):
+            plan.skipped.append((label, f"«{text}» уже стоит рядом"))
+            continue
+
+        bounds = _area_bounds(area_pts, margin=15.0 * factor)
+
+        def ok(rect: Rect, center: Point) -> bool:
+            if area_pts is not None and not _rect_inside_polygon(rect, area_pts):
+                return False
+            if not point_in_polygon(center, ring):
+                return False
+            if any(_rects_overlap(rect, other) for other in text_rects + placed):
+                return False
+            return not any(
+                _segment_hits_rect(a, b, rect)
+                for a, b in lines
+                if bounds is None or _segment_in_bounds(a, b, bounds)
+            )
+
+        item: OffsetItem | None = None
+        beside = None
+        if feature.kind == "house":
+            beside = _place_beside_line(
+                best.vertex, best.foot, text, height, width_of, ok
+            )
+        if beside is not None:
+            rect = _rect_at(beside, width_of(text, height), height)
+            item = OffsetItem(
+                kind=feature.kind, value_ft=value, direction=direction, style="text",
+                height_ft=height, anchor=best.vertex, target=best.foot, text=text,
+                point=beside, leader=None,
+            )
+        else:
+            # Дом без места под текст получает выноску с «BLDG»; забор и стена — выноску как есть.
+            leader_text = offset_text(feature.kind, value, direction, leader=True)
+            spot = _place_leader(best.vertex, best.foot, leader_text, height, width_of, ok, factor)
+            if spot is None:
+                plan.warnings.append(
+                    f"{label}: нет свободного места для «{leader_text}» в области — подпись не поставлена"
+                )
+                continue
+            center, end = spot
+            rect = _rect_at(center, width_of(leader_text, height), height)
+            item = OffsetItem(
+                kind=feature.kind, value_ft=value, direction=direction, style="leader",
+                height_ft=height, anchor=best.vertex, target=best.foot, text=leader_text,
+                point=center, leader=(best.vertex, end),
+            )
+        placed.append(rect)
+        plan.items.append(item)
+        known.append((item.text, item.point, item.height_ft))
     return plan
+
+
+def _area_bounds(area: Sequence[Point] | None, margin: float) -> Rect | None:
+    if not area:
+        return None
+    xs = [p[0] for p in area]
+    ys = [p[1] for p in area]
+    return (min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin)
+
+
+def _segment_in_bounds(a: Point, b: Point, bounds: Rect) -> bool:
+    x0, y0, x1, y1 = bounds
+    return not (max(a[0], b[0]) < x0 or min(a[0], b[0]) > x1
+                or max(a[1], b[1]) < y0 or min(a[1], b[1]) > y1)
+
+
+def plan_report_text(plan: OffsetPlan, scale: float = BASE_SCALE) -> str:
+    """Отчёт шага 4 для окна: что поставлено, что пропущено и почему, предупреждения."""
+    texts = [i for i in plan.items if i.style == "text"]
+    leaders = [i for i in plan.items if i.style == "leader"]
+    lines = [
+        f"Шаг 4 — оффсеты, черновик {STEP4_VERSION} (1\"={scale:g}')",
+        f"Подписей: {len(plan.items)} (без выноски: {len(texts)}, с выноской: {len(leaders)})",
+    ]
+    for item in plan.items:
+        lines.append(f"  {item.text}  ({'без выноски' if item.style == 'text' else 'выноска'})")
+    if plan.skipped:
+        lines.append(f"Не подписано: {len(plan.skipped)}")
+        for label, reason in plan.skipped:
+            lines.append(f"  {label}: {reason}")
+    for warning in plan.warnings:
+        lines.append(f"Внимание: {warning}")
+    return "\n".join(lines)
+
 
 
 # --------------------------------------------------------------------------- окно программы
 
 #: Этапы шага 4 и их состояние в каркасе (показываются на вкладке «Шаг 4. Оффсеты»).
 STEP4_STAGES: tuple[tuple[str, str], ...] = (
-    ("Выбор объектов: дом, заборы, стены, заезды", "правила не заданы"),
-    ("Измерение до фронтовой границы (M-ROW-LINE)", "функция есть, в окне не запускается"),
-    ("Способ записи: выноска, размерная подпись, текст без выноски", "правила не заданы"),
-    ("Текст и высота: 1.1 на дом, 0.9 на остальное", "высоты есть"),
-    ("Размещение без наложений с подписями шага 2", "не начато"),
+    ("Выбор области мышкой и объектов в ней: дом, сарай, заборы, стены", "черновик 4.3"),
+    ("Измерение до границы: контур участка и фронт M-ROW-LINE (M-TAX-LINE не граница)", "черновик 4.3"),
+    ("Способ записи: дом — текст без выноски; забор и стена — выноска", "черновик 4.3"),
+    ("Текст и высота: 1.1 на дом, 0.9 на остальное", "есть"),
+    ("Размещение без наложений с подписями и линиями", "черновик 4.3"),
     ("Проверка кадра и предупреждения", "функция есть, в окне не выводится"),
 )
 
 
 def step4_report_text(scale: float = BASE_SCALE) -> str:
     """Текст для окна шага 4: состояние этапов и высоты текста при данном масштабе."""
-    lines = [f"Шаг 4 — оффсеты (каркас {STEP4_VERSION})", ""]
+    lines = [f"Шаг 4 — оффсеты (черновик {STEP4_VERSION})", ""]
     for number, (stage, status) in enumerate(STEP4_STAGES, start=1):
         lines.append(f"{number}. {stage} — {status}")
     lines += [

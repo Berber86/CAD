@@ -135,13 +135,6 @@ def test_measure_candidates_reports_vertex_distance_and_side():
     assert all(not c.inside for c in candidates)
 
 
-def test_plan_offsets_skeleton_builds_no_items_and_warns():
-    house = off.Feature(kind="house", handle="H1", points=((4.0, 12.0),))
-    plan = off.plan_offsets(SQUARE, [house])
-    assert plan.items == []
-    assert any("не заданы" in w for w in plan.warnings)
-
-
 def test_plan_offsets_needs_a_closed_boundary():
     plan = off.plan_offsets([(0.0, 0.0), (1.0, 0.0)], [])
     assert plan.items == []

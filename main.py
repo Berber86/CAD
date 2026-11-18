@@ -4190,7 +4190,7 @@ class SurveyApp(ctk.CTk):
         panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
         panel.grid_propagate(False)
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
 
         ctk.CTkLabel(
             panel,
@@ -4224,6 +4224,16 @@ class SurveyApp(ctk.CTk):
             wraplength=420,
         )
         self.step4_status_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step4_run_button = ctk.CTkButton(
+            panel,
+            text="🖱  Выбрать область в AutoCAD и поставить оффсеты",
+            height=42,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_offsets,
+        )
+        self.step4_run_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         report_card = ctk.CTkFrame(
             page,
@@ -4256,25 +4266,118 @@ class SurveyApp(ctk.CTk):
         self._refresh_step4_report()
 
     def _refresh_step4_report(self) -> None:
-        """Перечень этапов шага 4 и высота текста при текущем масштабе шапки."""
+        """Отчёт последнего запуска шага 4, а без запуска — этапы и высота текста при текущем масштабе."""
         box = getattr(self, "step4_report_box", None)
         if box is None:
             return
-        scale = self._current_scale()
-        text = offsets.step4_report_text(scale)
+        last = getattr(self, "_step4_last_report", None)
+        text = last if last else offsets.step4_report_text(self._current_scale())
+        self._set_step4_report(text)
+        status = getattr(self, "step4_status_label", None)
+        if status is not None:
+            status.configure(
+                text=(
+                    "Укажите в AutoCAD две точки области: оффсеты появятся в ней, в слое "
+                    "D-TOPO-TEXT. Один Undo отменяет всю запись."
+                ),
+            )
+
+    def _set_step4_report(self, content: str) -> None:
+        box = getattr(self, "step4_report_box", None)
+        if box is None:
+            return
         target = getattr(box, "_textbox", box)
         try:
             target.configure(state="normal")
             target.delete("1.0", "end")
-            target.insert("1.0", text)
+            target.insert("1.0", content)
             target.configure(state="disabled")
         except Exception:  # noqa: BLE001 - окно не должно падать из-за текста отчёта
             pass
-        status = getattr(self, "step4_status_label", None)
-        if status is not None:
-            status.configure(
-                text="Запуск шага 4 пока не подключён: правила ждём по дампам заказчика.",
+
+    # ------------------------------------------- Шаг 4: запуск (черновик 4.3) ---
+    def _start_offsets(self) -> None:
+        """Шаг 4: геодезист указывает область в AutoCAD, в ней ставятся оффсеты и пишутся в чертёж."""
+        if self._busy or getattr(self, "_source_role_dialog", None) is not None:
+            return
+        scale = self._current_scale()
+        cfg, _provider, _model, _key, _secret = self._build_runtime_config()
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_step4_report(
+            "Выполняется…\n\n"
+            "Перейдите в AutoCAD: укажите два противоположных угла области, где ставить оффсеты "
+            "(Esc — отмена)."
+        )
+        self._set_status("Шаг 4: жду две точки области в AutoCAD…")
+        self._start_background(self._offsets_worker, args=(cfg, scale))
+
+    def _offsets_worker(self, cfg: dict[str, Any], scale: float) -> None:
+        post = self._worker_poster()
+        result: Any = None
+        error = ""
+        try:
+            if sys.platform != "win32":
+                raise AcadConnectionError(
+                    "Оффсеты возможны только в Windows с запущенным AutoCAD "
+                    f"(текущая ОС: {sys.platform})"
+                )
+            builder = AcadBuilder(cfg)
+            # Тот же замок, что и у Шага 2 и отрисовки: два задания не пишут в чертёж сразу.
+            with self._draw_lock:
+                if not self._worker_is_current():
+                    return
+                result = builder.build_offsets(
+                    scale=scale,
+                    progress=lambda message: post("progress", message),
+                    should_continue=self._worker_is_current,
+                )
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        post("offsets_done", (result, error))
+        post("done", None)
+
+    def _handle_offsets_result(self, result: Any, error: str) -> None:
+        """Итог шага 4: что поставлено, что пропущено и почему, что записано в чертёж."""
+        if error or result is None:
+            message = error or "неизвестная ошибка"
+            self._step4_last_report = f"ШАГ 4 НЕ ВЫПОЛНЕН\n\n{message}"
+            self._set_step4_report(self._step4_last_report)
+            self._set_status(f"Шаг 4 не выполнен: {message}", error=True)
+            return
+        plan = result.plan
+        lines = [offsets.plan_report_text(plan, result.scale)]
+        if result.dry_run:
+            lines.append("Режим расчёта: чертёж не изменён.")
+        written = result.written
+        if written is not None:
+            lines.append(
+                f"Записано в слой {written.layer}: без выноски {written.created_texts}, "
+                f"с выноской {written.created_leaders}. Текстовый стиль: {written.text_style}."
             )
+            for failure in written.failed:
+                lines.append(f"Не записано: {failure}")
+            for warning in written.warnings:
+                lines.append(f"Внимание: {warning}")
+        self._step4_last_report = "\n".join(lines)
+        self._set_step4_report(self._step4_last_report)
+        for line in self._step4_last_report.splitlines():
+            if line.strip():
+                self._log_line(f"Шаг 4 · {line.strip()}")
+        count = len(plan.items)
+        written_count = (written.created_texts + written.created_leaders) if written else 0
+        summary = (
+            f"Шаг 4: оффсетов {count}, записано {written_count}"
+            if written is not None
+            else f"Шаг 4: оффсетов {count} (чертёж не изменён)"
+        )
+        self._set_status(
+            summary,
+            error=bool(written is not None and written.failed) and written_count == 0,
+            warn=bool(plan.warnings or (written is not None and (written.failed or written.warnings))),
+            key=True,
+        )
 
     def _set_step2_report(self, content: str) -> None:
         box = getattr(self, "step2_report_box", None)
@@ -9809,6 +9912,10 @@ class SurveyApp(ctk.CTk):
             label_result, label_error, label_mode = payload
             self._finish_busy()
             self._handle_feature_label_result(label_result, label_error, label_mode)
+        elif kind == "offsets_done":
+            offsets_result, offsets_error = payload
+            self._finish_busy()
+            self._handle_offsets_result(offsets_result, offsets_error)
         elif kind == "done":
             self._finish_busy()
             pending, self._pending_join_accept = self._pending_join_accept, []
@@ -9839,6 +9946,9 @@ class SurveyApp(ctk.CTk):
         self.save_env_button.configure(state=state)
         self.feature_auto_button.configure(state=state)
         self.feature_pick_button.configure(state=state)
+        step4_button = getattr(self, "step4_run_button", None)
+        if step4_button is not None:
+            step4_button.configure(state=state)
         self.house_text_entry.configure(state=state)
         self.step2_height_entry.configure(state=state)
         self.skip_existing_labels_check.configure(state=state)

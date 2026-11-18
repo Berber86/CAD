@@ -442,3 +442,17 @@ def test_collect_passes_selected_dpi_to_default_page_search(tmp_path, monkeypatc
     assert outcome.records
     assert len(seen) == 2
     assert all(dpi == 72 and has_progress for _name, dpi, has_progress in seen)
+
+
+def test_old_deed_and_fresh_mortgage_flow_saves_mortgage_as_new_and_deed_as_old(tmp_path):
+    """Сценарий заказчика целиком: Deed 1985 и Mortgage 2025 → OUR NEW — ипотека, OUR OLD — Deed."""
+    table = {LOT: _list_html(
+        _row(111333, "MORTGAGE", "03/05/2025"),
+        _row(OUR_OLD, "DEED", "07/10/1985"),
+    )}
+    outcome = _collect(tmp_path, fetch_list=_fetch(table))
+    records = {record.file: record for record in deed_store.read_records(outcome.folder)}
+    assert set(records) == {"OUR 32 NEW.pdf", "OUR 32 OLD.pdf"}
+    assert records["OUR 32 NEW.pdf"].endorsement_id == "111333"
+    assert records["OUR 32 NEW.pdf"].doc_type == "MORTGAGE"
+    assert records["OUR 32 OLD.pdf"].endorsement_id == str(OUR_OLD)

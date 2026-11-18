@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import dataclasses
 import getpass
 import hashlib
 import hmac
@@ -45,6 +46,10 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 
 import concurrent.futures
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+import ocr_numbers
+import street_names
+from description_check import CLOSURE_OK_FT, accepted_without_ai
 
 __all__ = [
     "ASPENWALL_SAMPLES",
@@ -250,7 +255,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_stretch_spaces": 65,
         "front_side_index": 0,
         "degrees_as_control_code": True,
-        "text_style": "AI_BOUNDARY",
+        "text_style": "BOUNDARY",
         "draw_street_extensions": True,
         "property_as_lines": True,
         "leave_gap_open": True,
@@ -259,15 +264,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "zoom_margin_scale": 0.84,
     },
     "layers": {
-        "property_line": "PROPERTY_LINE",
-        "boundary_text": "BOUNDARY_TEXT_AI",
-        "street_row": "STREET_ROW_AI",
+        "property_line": "PL",
+        "boundary_text": "D-TOPO-TEXT",
+        "street_row": "M-ROW-LINE",
         "neighbor_lot": "NEIGHBOR_LOT",
     },
     "layer_colors": {
-        "property_line": 1,
-        "boundary_text": 3,
-        "street_row": 8,
+        "property_line": 3,
+        "boundary_text": 7,
+        "street_row": 5,
         "neighbor_lot": 4,
     },
     # Полный путь GitHub (репозиторий/ветка/.zip), откуда кнопка «Обновить версию»
@@ -962,6 +967,14 @@ class Segment(BaseModel):
         description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
     )
 
+    bearing_solved: bool = Field(
+        default=False,
+        description=(
+            "True, если румб не прочитан в тексте, а вычислен по замыканию контура "
+            "(одна сторона без румба, длина известна). Такой румб нужно сверить с документом."
+        ),
+    )
+
     @model_validator(mode="before")
     @classmethod
     def _preprocess_segment_raw(cls, data: Any) -> Any:
@@ -1311,9 +1324,26 @@ class LegalDescription(BaseModel):
             "'(38\\' WIDE ROADWAY EASEMENT)' или '(NOT MAPPED ON FINAL CITY PLAN)'"
         ),
     )
+    main_street_former: str | None = Field(
+        default=None,
+        description=(
+            "Старое название фасадной улицы, если в описании оно указано через "
+            "'formerly', 'previously known as', 'formerly known as' или 'also known as' "
+            "(в скобках или без), например 'CARLTON STREET'. В main_street остаётся "
+            "только текущее название."
+        ),
+    )
     cross_street: str | None = Field(
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
+    )
+    street_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Синонимы названий улиц, которые описание само связывает: «текущее = старое» "
+            "(например «Father Capodanno Boulevard = Seaside Boulevard»). Пусто, если описание "
+            "их не связывает."
+        ),
     )
     distance_to_corner_ft: float = Field(
         default=0.0,
@@ -1411,6 +1441,28 @@ class LegalDescription(BaseModel):
                     "corner_to_pob_bearing": {**tie, "distance_ft": dist},
                 }
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _split_former_street_names(cls, data: Any) -> Any:
+        """Старое название улицы уходит в main_street_former, из названий улиц его нет."""
+        if not isinstance(data, dict):
+            return data
+        main_raw = data.get("main_street")
+        cross_raw = data.get("cross_street")
+        if not isinstance(main_raw, str) and not isinstance(cross_raw, str):
+            return data
+        out = dict(data)
+        former = data.get("main_street_former") or None
+        if isinstance(main_raw, str):
+            clean, found = street_names.split_former_name(main_raw)
+            out["main_street"] = clean
+            former = former or found
+        if isinstance(cross_raw, str):
+            out["cross_street"] = street_names.split_former_name(cross_raw)[0]
+        if former:
+            out["main_street_former"] = former
+        return out
 
     @field_validator("main_street", mode="before")
     @classmethod
@@ -2273,7 +2325,8 @@ CRITICAL SURVEY RULES
      * varas (×2.77778) or chains (×66) -> decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
    - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
-   - `main_street_note`: parenthetical subtitle if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null.
+   - `main_street_note`: parenthetical subtitle of the front street if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null. Keep the street width in it when the document gives one ("60 feet wide" -> "(60' WIDE)"). Do NOT put an old street name there.
+   - `main_street_former`: the OLD name of the front street when the document gives it with "formerly", "previously known as", "formerly known as", "also known as", "a/k/a" or "f/k/a", in parentheses or without them (e.g. "Stafford Avenue (formerly Carlton Street)" -> main_street "Stafford Avenue", main_street_former "Carlton Street"). `main_street` must contain only the current name. Else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
    - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
@@ -2940,10 +2993,22 @@ _EW = r"E(?:ast)?\.?"
 
 _DMS_BEARING_RE = re.compile(
     rf"(?P<ns>(?:{_NS})|(?:S(?:outh)?\.?))\s*,?\s*"
-    r"(?P<deg>\d{1,3})\s*(?:°|º|deg(?:rees?)?\.?)\s*"
+    # «degrecs» и подобные искажения слова degrees (частые ошибки OCR)
+    r"(?P<deg>\d{1,3})\s*(?:°|º|deg(?:rees?|recs?|rces?|reos?)?\.?)\s*"
     r"(?P<min>\d{1,2})\s*(?:'|′|’|min(?:utes?)?\.?)\s*"
     r"(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|″|”|''|sec(?:onds?)?\.?)\s*"
     rf"(?P<ew>East\.?|West\.?|(?:E|W)\.?(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+# Румб словами, как в старых описаниях: «North 84 degrees, 09 minutes 22 seconds West» (запятые
+# после degrees/minutes допускаются). Без цифр-символов; слова degrees/minutes/seconds обязательны.
+_WORDY_DMS_BEARING_RE = re.compile(
+    rf"(?<![A-Za-z])(?P<ns>{_NS}|S(?:outh)?\.?)\s*,?\s*"
+    r"(?P<deg>\d{1,3})\s*(?:°|º|degrees?|deg\.?)\s*,?\s*"
+    r"(?P<min>\d{1,2})\s*(?:'|′|’|minutes?|min\.?)\s*,?\s*"
+    r"(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|″|”|''|seconds?|sec\.?)\s*,?\s*"
+    rf"(?P<ew>{_EW}|W(?:est)?\.?)(?![A-Za-z])",
     re.IGNORECASE,
 )
 
@@ -2967,6 +3032,134 @@ _DISTANCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Запасной вариант расстояния до угла, когда строка «from the corner …» потеряна при OCR:
+#: «distant 74.96 feet U.S. Standard (75.00) feet Deed) of Doty Avenue». Требует улицу с заглавной.
+_DISTANT_OF_STREET_RE = re.compile(
+    r"(?i:\bdistant)\s+(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')[^;]{0,90}?"
+    r"\b(?:of|from)\s+(?:the\s+)?(?=[A-Z])",
+)
+
+# Числа прописью перед «feet»/«foot» («one hundred forty-one feet», «hundred feet»).
+# Сами по себе не разбираются _DISTANCE_RE, поэтому переводятся в цифры до разбора.
+_WORD_UNITS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+               "eight": 8, "nine": 9}
+_WORD_TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+               "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_WORD_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+              "seventy": 70, "eighty": 80, "ninety": 90}
+_WORD_TWO_DIGIT = (
+    r"(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-]+(?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen"
+    r"|one|two|three|four|five|six|seven|eight|nine)"
+)
+_WORD_NUMBER_FEET_RE = re.compile(
+    r"\b(?P<number>(?:(?:(?:one|two|three|four|five|six|seven|eight|nine|on)\s+)?hundred"
+    r"(?:\s+(?:and\s+)?" + _WORD_TWO_DIGIT + r")?)|" + _WORD_TWO_DIGIT + r")"
+    r"\s+(?P<unit>feet|foot)\b",
+    re.IGNORECASE,
+)
+
+
+def _spelled_number_value(phrase: str) -> int | None:
+    """«one hundred forty-one» → 141; «hundred» → 100 (OCR часто теряет «one»)."""
+    tokens = [t for t in re.split(r"[\s-]+", phrase.lower()) if t and t != "and"]
+    if not tokens:
+        return None
+
+    def tail_value(words: list[str]) -> int | None:
+        total = 0
+        for word in words:
+            if word in _WORD_UNITS:
+                total += _WORD_UNITS[word]
+            elif word in _WORD_TEENS:
+                total += _WORD_TEENS[word]
+            elif word in _WORD_TENS:
+                total += _WORD_TENS[word]
+            else:
+                return None
+        return total
+
+    if "hundred" in tokens:
+        idx = tokens.index("hundred")
+        head = tokens[:idx]
+        if head and head[0] not in _WORD_UNITS and head[0] != "on":
+            return None
+        multiplier = _WORD_UNITS.get(head[0], 1) if head else 1
+        rest = tail_value(tokens[idx + 1:]) if tokens[idx + 1:] else 0
+        if rest is None:
+            return None
+        return multiplier * 100 + rest
+    return tail_value(tokens)
+
+
+def _spell_numbers_before_feet(text: str) -> tuple[str, list[str]]:
+    """Переводит числа прописью перед «feet» в цифры; каждая замена — замечание для проверки."""
+    notes: list[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        phrase = match.group("number")
+        value = _spelled_number_value(phrase)
+        if value is None:
+            return match.group(0)
+        notes.append(
+            f"число прописью «{' '.join(phrase.split())} {match.group('unit')}» прочитано как "
+            f"{value} ft — сверьте с документом"
+        )
+        return f"{value} {match.group('unit')}"
+
+    return _WORD_NUMBER_FEET_RE.sub(repl, text), notes
+
+
+_STEP0_NS = {"N": "North", "S": "South"}
+_STEP0_EW = {"E": "East", "W": "West"}
+_STEP0_SIDE = {
+    "N": "northerly", "S": "southerly", "E": "easterly", "W": "westerly",
+    "NE": "northeasterly", "NW": "northwesterly", "SE": "southeasterly", "SW": "southwesterly",
+}
+
+
+def legal_to_step0_text(data: "LegalDescription") -> str | None:
+    """
+    Пересобирает структурированный результат (в т.ч. ответ ИИ) в текст описания для кеша Шага 0.
+
+    Текст пишется в стиле документа, чтобы локальный разбор читал его так же, как OCR.
+    Если какая-то сторона без компасного румба, пересборка не даст того же контура,
+    поэтому возвращаем ``None``: в кеш такой ответ не пишем.
+    """
+    segments = list(getattr(data, "segments", None) or ())
+    main = (getattr(data, "main_street", "") or "").strip()
+    if not segments or not main:
+        return None
+    if any(not seg.has_bearing for seg in segments):
+        return None
+
+    def bearing(seg: Any) -> str:
+        sec = float(seg.seconds)
+        sec_text = str(int(sec)) if sec.is_integer() else f"{sec:.2f}"
+        return (
+            f"{_STEP0_NS[seg.ns]} {seg.degrees} degrees {seg.minutes} minutes "
+            f"{sec_text} seconds {_STEP0_EW[seg.ew]}"
+        )
+
+    front = _STEP0_SIDE.get(str(getattr(data, "front_side", "") or ""), "")
+    side_part = f"the {front} side of {main}" if front else main
+    head = f"ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on {side_part}"
+    tie = float(getattr(data, "distance_to_corner_ft", 0.0) or 0.0)
+    cross = (getattr(data, "cross_street", "") or "").strip()
+    if tie > 0 and cross:
+        head += (
+            f", distant {tie:.2f} feet from the corner formed by the intersection of "
+            f"{main} and {cross}"
+        )
+    parts = [head + ";"]
+    last = len(segments) - 1
+    for index, seg in enumerate(segments):
+        lead = "RUNNING THENCE" if index == 0 else "THENCE"
+        ending = " to the point or place of BEGINNING." if index == last else " to a point;"
+        parts.append(f"{lead} {bearing(seg)} {float(seg.distance_ft):.2f} feet{ending}")
+    return " ".join(parts)
+
+
 _STREET_SUFFIX = (
     r"(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Boulevard|Blvd|Lane|Ln|Way|Court|Ct|"
     r"Place|Pl|Parkway|Pkwy|Highway|Hwy|Circle|Cir|Trail|Trl|Terrace|Ter|Loop|Pike|"
@@ -2976,7 +3169,7 @@ _STREET_SUFFIX = (
 )
 
 _STREET_RE = re.compile(
-    rf"(?P<name>(?:[A-Za-z0-9][\w.'’-]*\s+){{0,3}}{_STREET_SUFFIX})(?![A-Za-z])",
+    rf"(?P<name>(?:[A-Za-z0-9][\w.'’-]*\s+){{0,3}}(?<![A-Za-z]){_STREET_SUFFIX})(?![A-Za-z])",
     re.IGNORECASE,
 )
 
@@ -2990,10 +3183,118 @@ _STOP_WORDS = {
 }
 
 
+# Частые искажения слов юридического текста при локальном OCR (только целые слова).
+_OCR_WORD_FIXES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(rf"\b{pattern}\b", re.IGNORECASE), repl)
+    for pattern, repl in (
+        (r"eide", "side"),
+        (r"laat", "last"),
+        (r"Iand", "land"),
+        (r"degrecs", "degrees"),
+        (r"degrces", "degrees"),
+        (r"degreos", "degrees"),
+        (r"nortlensterly", "northeasterly"),
+        (r"northweaterly", "northwesterly"),
+        (r"thcreof", "thereof"),
+        (r"Descrlbed", "Described"),
+        # Из реальных сканов (3.55): направления, единицы, союзы и названия улиц.
+        (r"wcat|wcst", "west"),
+        (r"ainutes|minutcs|minotes", "minutes"),
+        (r"trence|trenco", "thence"),
+        (r"scconds|secouds", "seconds"),
+        (r"degreca|degrccs|degrces", "degrees"),
+        (r"snid", "said"),
+        (r"Bouth", "South"),
+        (r"Avcnue|Avenuc", "Avenue"),
+        (r"Statea", "Staten"),
+        (r"thcrcof", "thereof"),
+        (r"northwcsterly|northweaterly", "northwesterly"),
+        (r"northeaterly|northcasterly", "northeasterly"),
+        (r"fect|fcet|feot", "feet"),
+    )
+)
+
+
+#: Словарь юридических слов для поиска опечаток: слово из 6+ букв в нижнем регистре,
+#: отличающееся на одну букву от слова словаря, заменяется на него. Короче — не трогаем.
+_LEGAL_VOCAB: frozenset[str] = frozenset(
+    "degrees minutes seconds feet thence northerly southerly easterly westerly "
+    "northeasterly northwesterly southeasterly southwesterly beginning distant formerly "
+    "intersection continuation thereof premises described running standard deed corner "
+    "centerline abutting adjoining mentioned northeast northwest southeast southwest "
+    "between avenue street boulevard "
+    .split()
+)
+_LOWER_WORD_RE = re.compile(r"\b[a-z]{6,}\b")
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    i = j = edits = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+            j += 1
+        elif len(a) > len(b):
+            i += 1
+        else:
+            j += 1
+    return edits + (len(a) - i) + (len(b) - j) <= 1
+
+
+def _fix_vocab_typos(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        word = match.group(0)
+        if word in _LEGAL_VOCAB:
+            return word
+        hits = [v for v in _LEGAL_VOCAB if abs(len(v) - len(word)) <= 1 and _within_one_edit(word, v)]
+        return hits[0] if len(hits) == 1 else word
+
+    return _LOWER_WORD_RE.sub(repl, text)
+
+
+def _fix_ocr_words(text: str) -> str:
+    for pattern, repl in _OCR_WORD_FIXES:
+        text = pattern.sub(repl, text)
+    return _fix_vocab_typos(text)
+
+
+# Номера строк и помехи на полях скана: отдельные строки «7331», «0», «o».
+_MARGIN_NOISE_LINE_RE = re.compile(r"(?m)^[ \t]*(?:[0-9|]{1,6}|[oO])[ \t]*(?:\n|\Z)")
+# Штамп на полях (REEL / PAGE с номерами, «3 1 8 2», «0 0 7») может попасть в середину строки.
+_STAMP_WORD_RE = re.compile(r"\b(?:REEL|PAGE)\b", re.IGNORECASE)
+_STAMP_DIGITS_LINE_RE = re.compile(r"(?m)^[ \t]*(?:\d[ \t]+){2,}\d[ \t]*(?:\n|\Z)")
+
+
+def _drop_margin_noise(text: str) -> str:
+    text = _MARGIN_NOISE_LINE_RE.sub("", text)
+    text = _STAMP_DIGITS_LINE_RE.sub("", text)
+    return _STAMP_WORD_RE.sub("", text)
+
+
+def _fix_ocr_number_tokens(text: str) -> str:
+    """Буквы вместо цифр внутри чисел (1l5.15, 3l degrees, 2l4.0O feet) — см. ocr_numbers."""
+    return ocr_numbers.fix_text(text)
+
+
 def _normalize_legal_text(text: str) -> str:
     """Приводит типографику к единому виду (градусы, минуты, секунды, дроби дюймов)."""
     text = _replace_vulgar_fractions(text)
+    text = _drop_margin_noise(text)
+    text = _fix_ocr_words(_fix_ocr_number_tokens(text))
+    text = re.sub(r"(?<=\d)\?(?=\s*\d)", "°", text)
     replacements = {
+        "\uff08": "(", "\uff09": ")", "\uff0c": ",", "\uff1a": ":", "\uff1b": ";",
         "\u00ba": "°", "\u02da": "°", "\u00b0": "°",
         "\u2032": "'", "\u2019": "'", "\u2018": "'", "\u02b9": "'",
         "\u2033": '"', "\u201d": '"', "\u201c": '"', "\u02ba": '"',
@@ -3080,7 +3381,7 @@ def _split_preamble_and_body(text: str) -> tuple[str, str]:
 
 def _bearing_matches(text: str) -> list[re.Match[str]]:
     """Сначала румбы с символами °/', затем десятичные, затем «N 45 03 12 E»."""
-    for pattern in (_DMS_BEARING_RE, _DECIMAL_BEARING_RE, _SPACED_BEARING_RE):
+    for pattern in (_DMS_BEARING_RE, _WORDY_DMS_BEARING_RE, _DECIMAL_BEARING_RE, _SPACED_BEARING_RE):
         matches = list(pattern.finditer(text))
         if matches:
             return matches
@@ -3338,7 +3639,114 @@ def _wordy_street_courses(
     return found
 
 
-def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+#: Фрагмент курса без румба внутри куска между двумя румбами: «…running\neast 25.41 feet …».
+#: Начало курса («THENCE along said … south 42°…») потеряно, длина и одно направление остались.
+_ORPHAN_COURSE_RE = re.compile(
+    r"(?:^|[;\n])[ \t]*(?P<dir>(?:north|south|east|west)(?:erly|ward)?"
+    r"(?:\s+(?:north|south|east|west)(?:erly|ward)?)?)\s+(?P<num>\d+(?:\.\d+)?)\s*(?:feet|ft|')",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _orphan_courses(
+    text: str, matches: Sequence[re.Match[str]], wordy_starts: Sequence[int],
+) -> list[tuple[int, dict[str, Any], str | None, str | None]]:
+    """
+    Находит курсы без румба, которые стоят между курсами с румбами: вторая длина в куске
+    после первой длины стороны. Возвращает ``[(позиция, сторона, N/S-подсказка, E/W-подсказка)]``.
+    Сторона получает номинальный азимут и ``has_bearing=False``; румб решает замыкание.
+    """
+    found: list[tuple[int, dict[str, Any], str | None, str | None]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        end = min([end] + [start for start in wordy_starts if start > match.end()])
+        chunk = text[match.end() : end]
+        first = _DISTANCE_RE.search(chunk)
+        if first is None:
+            continue
+        for frag in _ORPHAN_COURSE_RE.finditer(chunk):
+            if frag.start("dir") <= first.start():
+                continue
+            distance = _distance_after(chunk[frag.start("dir") :])
+            if distance is None:
+                continue
+            word = re.sub(r"\s+", "", frag.group("dir").lower()).replace("ward", "erly")
+            ns_hint = "N" if "north" in word else ("S" if "south" in word else None)
+            ew_hint = "E" if "east" in word else ("W" if "west" in word else None)
+            nominal = _CARDINAL_AZIMUTH.get(word)
+            if nominal is None:
+                nominal = _CARDINAL_AZIMUTH.get(word.replace("erly", ""), None)
+            if nominal is None:
+                continue
+            seg = _azimuth_to_quadrant_dict(nominal)
+            seg["distance_ft"] = distance
+            seg["has_bearing"] = False
+            seg["course_note"] = None
+            found.append((match.end() + frag.start("dir"), seg, ns_hint, ew_hint))
+    return found
+
+
+def _bearing_vector(seg: dict[str, Any]) -> tuple[float, float]:
+    """Вектор стороны с румбом: x — восток, y — север."""
+    theta = math.radians(seg["degrees"] + seg["minutes"] / 60.0 + float(seg["seconds"]) / 3600.0)
+    length = float(seg["distance_ft"])
+    dx = length * math.sin(theta) * (1.0 if seg["ew"] == "E" else -1.0)
+    dy = length * math.cos(theta) * (1.0 if seg["ns"] == "N" else -1.0)
+    return dx, dy
+
+
+def _solve_orphan_bearing(
+    segs: list[dict[str, Any]], hints: dict[int, tuple[str | None, str | None]],
+) -> None:
+    """
+    Если ровно одна сторона без румба, у остальных румбы есть, а её длина и направление
+    из текста известны, румб вычисляется по замыканию: сумма остальных сторон должна быть
+    по длине равна стороне без румба (допуск CLOSURE_OK_FT), направление — совпасть с текстом.
+    Иначе ничего не меняется: сторона остаётся без румба и проверка скажет «не прочитан».
+    """
+    unsolved = [i for i, seg in enumerate(segs) if not seg.get("has_bearing", True)]
+    if len(unsolved) != 1 or unsolved[0] not in hints:
+        return
+    k = unsolved[0]
+    others = [seg for i, seg in enumerate(segs) if i != k]
+    if len(others) < 2 or any(not seg.get("has_bearing", True) for seg in others):
+        return
+    sx = sy = 0.0
+    for seg in others:
+        dx, dy = _bearing_vector(seg)
+        sx += dx
+        sy += dy
+    length = math.hypot(sx, sy)
+    if abs(length - float(segs[k]["distance_ft"])) > CLOSURE_OK_FT:
+        return
+    vx, vy = -sx, -sy
+    ew = "E" if vx > 0 else "W"
+    ns = "N" if vy > 0 else "S"
+    ns_hint, ew_hint = hints[k]
+    if (ns_hint and ns_hint != ns) or (ew_hint and ew_hint != ew):
+        return
+    angle = math.degrees(math.atan2(abs(vx), abs(vy)))
+    degrees = int(angle)
+    minutes_f = (angle - degrees) * 60.0
+    minutes = int(minutes_f)
+    seconds = round((minutes_f - minutes) * 60.0, 2)
+    if seconds >= 60.0:
+        seconds, minutes = 0.0, minutes + 1
+    if minutes >= 60:
+        minutes, degrees = 0, degrees + 1
+    segs[k].update(
+        ns=ns, degrees=degrees, minutes=minutes, seconds=seconds, ew=ew,
+        has_bearing=True, bearing_solved=True,
+    )
+
+
+def _segments_from_regex(
+    text: str, *, recover_orphans: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Стороны из текста по румбам. ``recover_orphans`` — собирать фрагменты без начала курса
+    (только для тела описания; в привязке COMMENCING такие фрагменты не трогаем).
+    """
     warnings: list[str] = []
     matches = _bearing_matches(text)
     if not matches:
@@ -3349,7 +3757,8 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
 
     wordy = _wordy_street_courses(text, matches)
     wordy_starts = [position for position, _ in wordy]
-    placed: list[tuple[int, dict[str, Any]]] = list(wordy)
+    orphans = _orphan_courses(text, matches, wordy_starts) if recover_orphans else []
+    placed: list[tuple[int, dict[str, Any]]] = list(wordy) + [(pos, seg) for pos, seg, _, _ in orphans]
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         # Длина этой стороны не ищется в следующем курсе без румба.
@@ -3393,7 +3802,18 @@ def _segments_from_regex(text: str) -> tuple[list[dict[str, Any]], list[str]]:
         )
 
     placed.sort(key=lambda entry: entry[0])
-    return [seg for _, seg in placed], warnings
+    segs = [seg for _, seg in placed]
+    if orphans:
+        hints = {}
+        for pos, seg, ns_hint, ew_hint in orphans:
+            position = next(i for i, (_, s) in enumerate(placed) if s is seg)
+            hints[position] = (ns_hint, ew_hint)
+        _solve_orphan_bearing(segs, hints)
+        for pos, seg, _, _ in orphans:
+            if not seg.get("has_bearing", True):
+                continue
+            warnings.append("сторона без начала курса: румб вычислен по замыканию — сверьте с документом")
+    return segs, warnings
 
 
 def _street_mentions(text: str) -> list[tuple[int, str]]:
@@ -3481,7 +3901,7 @@ _FRONT_RE = re.compile(
     r"(?:side|line|lines|right[- ]of[- ]way)?\s*"
     r"(?:of|on|to)?\s*"
     r"(?P<block>[^.;:]{0,80}?(?:%s|%s)[^.;:]{0,20})"
-    % (_STREET_SUFFIX, r"\b\d{1,4}\b"),
+    % (r"(?<![A-Za-z])" + _STREET_SUFFIX, r"\b\d{1,4}\b"),
     re.IGNORECASE,
 )
 
@@ -3568,8 +3988,9 @@ def _extract_nyc_metadata(
         meta["borough_or_city"] = f"{boro.group(1).strip()}, NY"
 
     if main_street:
+        # Одна вложенная пара скобок допускается: «(SIXTY (60) FEET WIDE)».
         note_re = re.compile(
-            re.escape(main_street) + r"\s*(\([^)]{3,80}\))",
+            re.escape(main_street) + r"\s*(\((?:[^()]|\([^()]*\)){3,80}\))",
             re.IGNORECASE,
         )
         nm = note_re.search(full_text)
@@ -3743,15 +4164,20 @@ def _extract_streets(
         distance_match = re.search(
             r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
             r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
-            r"(?:\([^)]*\)\s*)?"
+            # «U.S. Standard (75.00 feet Deed)» между числом и направлением
+            r"(?:\s*U\.?\s*S\.?\s*(?:Standard|Survey)\.?)?"
+            r"(?:\s*\([^()]{0,40}\))?"
+            r"(?:\s*(?:feet|ft|')\s*(?:Deed\)?)?)?\s*"
             + _DIR_WORDS
             + r"?\s*(?:of|from)\s+the\s+",
             text,
             re.IGNORECASE,
         )
+        if distance_match is None:
+            distance_match = _DISTANT_OF_STREET_RE.search(text)
         if distance_match:
             feet_val = float(distance_match.group("num").replace(",", ""))
-            inch_raw = distance_match.group("inch")
+            inch_raw = distance_match.groupdict().get("inch")
             inch_val = float(inch_raw) / 12.0 if inch_raw else 0.0
             distance_to_corner = feet_val + inch_val
         elif preamble:
@@ -3773,6 +4199,14 @@ def _extract_streets(
         warnings.append("фасадная улица не распознана — подпись улицы не будет нанесена")
     if cross_street and distance_to_corner is None:
         warnings.append("пересекаемая улица найдена, но расстояние до угла не распознано")
+    if main_street and distance_to_corner is None and not re.search(
+        r"corner\s+formed|intersection\s+of", body, re.IGNORECASE
+    ):
+        # Без расстояния точка начала молча ставится к углу улицы — это надо сказать вслух.
+        warnings.append(
+            "расстояние от угла до точки начала не найдено — участок построен от угла улицы; "
+            "сверьте с документом"
+        )
     return main_street, cross_street, distance_to_corner, front_side, tie_note, warnings
 
 
@@ -3848,8 +4282,12 @@ def parse_with_regex(
         «interior angle of 93°33'29.5"») без компасных румбов.
     """
     normalized = _normalize_legal_text(text)
+    normalized, spelled_notes = _spell_numbers_before_feet(normalized)
+    # OCR пишет составные румбы через пробел («north westerly»): иначе не находится угол улицы.
+    normalized = re.sub(r"\b(north|south)\s+(east|west)erly\b", r"\1\2erly", normalized, flags=re.IGNORECASE)
     preamble, lot_body = _split_preamble_and_body(normalized)
-    raw_segments, warnings = _segments_from_regex(lot_body)
+    raw_segments, warnings = _segments_from_regex(lot_body, recover_orphans=True)
+    warnings.extend(spelled_notes)
     if not raw_segments:
         raise LegalDescriptionError(
             "локальный парсер не нашёл сторон участка: "
@@ -3899,12 +4337,24 @@ def parse_with_regex(
         explicit_tie_segment=explicit_tie,
     )
 
+    note_now = meta.get("main_street_note")
+    width_text = street_names.find_width_text(normalized, main_street, stop=cross_street)
+    if width_text and not street_names.has_width(note_now):
+        meta["main_street_note"] = f"{width_text} {note_now}" if note_now else width_text
+    former_name = (
+        meta.get("main_street_former")
+        or street_names.find_former_name(normalized, main_street)
+        or street_names.split_former_name(meta.get("main_street_note") or "")[1]
+    )
+
     try:
         model = LegalDescription.model_validate(
             {
                 "main_street": main_street,
                 "main_street_note": meta["main_street_note"],
+                "main_street_former": former_name,
                 "cross_street": cross_street,
+                "street_aliases": [f"{cur} = {old}" for cur, old in street_names.street_aliases(normalized)],
                 "distance_to_corner_ft": distance_to_corner,
                 "corner_to_pob_bearing": corner_tie,
                 "tie_note": meta["tie_note"],
@@ -4088,6 +4538,27 @@ class ParseOutcome:
     prepared_text: str = ""
     prepared_images: list[str] = field(default_factory=list)
     base_warnings: list[str] = field(default_factory=list)
+    #: Итог проверки описания (description_check.DescriptionCheck) для выбранного результата.
+    check: Any = None
+
+
+@dataclass
+class _LocalAttempt:
+    """Локальный разбор текста с его проверкой (бесплатно, без ИИ)."""
+
+    model: LegalDescription
+    warnings: list[str]
+    check: Any
+
+
+def _try_local_parse(text: str, auto_repair_typos: bool) -> _LocalAttempt | None:
+    from description_check import check_description  # noqa: PLC0415
+
+    try:
+        model, warns = parse_with_regex(text, auto_repair_typos=auto_repair_typos)
+    except Exception:  # noqa: BLE001 — локальный разбор не должен ронять путь ИИ
+        return None
+    return _LocalAttempt(model=model, warnings=list(warns), check=check_description(model, text))
 
 
 def _flip_segment_direction(seg: Segment) -> Segment:
@@ -4596,6 +5067,122 @@ def _scan_single_typo_candidate(
     return None
 
 
+def _scan_clear_lookalike_typo(
+    segments: Sequence[Segment],
+    *,
+    unanimous_llm_passes: int = 0,
+) -> TypoSuspicion | None:
+    """
+    Однозначная опечатка похожих цифр, которую программа исправляет сама, без решения человека.
+
+    Условия (все обязательны):
+      * контур до правки не замкнут (невязка > CLOSURE_OK_FT);
+      * ровно одна одиночная замена цифры в румбе (градусы/минуты/целые секунды) или в длине стороны
+        даёт замкнутый контур (невязка ≤ CLOSURE_OK_FT) и при этом не ухудшает валидность;
+      * эта замена — похожих цифр (3↔8, 6↔9 и т.п.; ``is_lookalike=True``);
+      * нет единогласного чтения ИИ (unanimous_llm_passes < 2).
+    Не зависит от настройки «Спрашивать при сомнении».
+    """
+    segs = list(segments)
+    n = len(segs)
+    if not (3 <= n <= 10) or unanimous_llm_passes >= 2:
+        return None
+    err0, _ = _trace_closure_and_validity(segs)
+    if err0 <= CLOSURE_OK_FT:
+        return None
+
+    def _digit_variants(text: str) -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
+        for pos, ch in enumerate(text):
+            if not ch.isdigit():
+                continue
+            for d in "0123456789":
+                if d != ch:
+                    out.append((text[:pos] + d + text[pos + 1 :], ch, d))
+        return out
+
+    # (idx, мутированная сторона, вид, старый текст, новый текст, пара цифр, невязка после)
+    hits: list[tuple[int, Segment, str, str, str, tuple[str, str], float]] = []
+
+    def _consider(idx: int, mutated: Segment, kind: str, old_s: str, new_s: str) -> None:
+        trial = list(segs)
+        trial[idx] = mutated
+        err, valid = _trace_closure_and_validity(trial)
+        if not valid or err > CLOSURE_OK_FT or err >= err0:
+            return
+        pair = _single_digit_diff(old_s, new_s)
+        if pair is None:
+            return
+        hits.append((idx, mutated, kind, old_s, new_s, pair, err))
+
+    for idx, seg in enumerate(segs):
+        if seg.has_bearing:
+            sec_is_int = abs(seg.seconds - round(seg.seconds)) < 1e-4
+            base: list[int | None] = [
+                seg.degrees,
+                seg.minutes,
+                int(round(seg.seconds)) if sec_is_int else None,
+            ]
+            for which in (0, 1, 2):
+                cur = base[which]
+                if cur is None:
+                    continue
+                old_text = f"{cur:02d}"
+                for new_text, _od, _nd in _digit_variants(old_text):
+                    vals = list(base)
+                    vals[which] = int(new_text)
+                    mutated = _mutate_segment_bearing(
+                        seg,
+                        degrees=vals[0],
+                        minutes=vals[1],
+                        seconds=float(vals[2]) if vals[2] is not None else None,
+                    )
+                    if mutated is None:
+                        continue
+                    _consider(idx, mutated, "angle_digit", old_text, new_text)
+        if abs(seg.distance_ft - round(seg.distance_ft, 2)) < 1e-6:
+            len_text = f"{seg.distance_ft:.2f}"
+            for new_text, _od, _nd in _digit_variants(len_text):
+                new_len = float(new_text)
+                if new_len <= 0.0:
+                    continue
+                _consider(idx, seg.model_copy(update={"distance_ft": new_len}), "length_digit", len_text, new_text)
+
+    if len(hits) != 1:
+        return None
+    idx, mutated, kind, old_s, new_s, (d_old, d_new), err_after = hits[0]
+    if not _is_lookalike_digit_pair(d_old, d_new):
+        return None
+
+    repaired = list(segs)
+    repaired[idx] = mutated
+    if kind == "angle_digit":
+        original_value = segs[idx].bearing_label
+        suggested_value = mutated.bearing_label
+        what = "в румбе"
+    else:
+        original_value = f"{old_s}'"
+        suggested_value = f"{new_s}'"
+        what = "в длине"
+    return TypoSuspicion(
+        segment_index=idx + 1,
+        kind=kind,
+        original_value=original_value,
+        suggested_value=suggested_value,
+        digit_pair=f"{d_old}→{d_new}",
+        is_lookalike=True,
+        closure_before_ft=err0,
+        closure_after_ft=err_after,
+        reason_ru=(
+            f"Исправлена очевидная опечатка цифры {what} стороны №{idx + 1} "
+            f"(цифра {d_old}→{d_new}): {original_value} → {suggested_value} "
+            f"(невязка {err0:.2f} ft → {err_after:.2f} ft)"
+        ),
+        repaired_segments=repaired,
+        unanimous_llm_passes=unanimous_llm_passes,
+    )
+
+
 def _detect_and_repair_obvious_typos(
     segments: Sequence[Segment],
     *,
@@ -4634,6 +5221,10 @@ def _detect_and_repair_obvious_typos(
     if cand is not None and cand.can_auto_apply(ask_on_doubt=not auto_apply):
         assert cand.repaired_segments is not None
         return cand.repaired_segments, old_to_new, [*align_notes, cand.reason_ru]
+    clear = _scan_clear_lookalike_typo(segs, unanimous_llm_passes=unanimous_llm_passes)
+    if clear is not None and clear.can_auto_apply(ask_on_doubt=False):
+        assert clear.repaired_segments is not None
+        return clear.repaired_segments, old_to_new, [*align_notes, clear.reason_ru]
     return segs, old_to_new, align_notes
 
 
@@ -5191,6 +5782,80 @@ def _prepare_parse_input(
     return combined, image_data_urls, warnings, orient_usage
 
 
+def _ensure_street_width(model: LegalDescription, source_text: str) -> LegalDescription:
+    """
+    Если ИИ не вынес ширину фасадной улицы в примечание, берём её из текста описания.
+
+    Ширина нужна для подписи «(XX' WIDE)» на чертеже, поэтому читается и в ответе ИИ.
+    """
+    street = getattr(model, "main_street", None)
+    if not street or not source_text or street_names.has_width(model.main_street_note):
+        return model
+    width_text = street_names.find_width_text(
+        source_text, street, stop=getattr(model, "cross_street", None)
+    )
+    if not width_text:
+        return model
+    note = model.main_street_note
+    new_note = f"{width_text} {note}" if note else width_text
+    return model.model_copy(update={"main_street_note": new_note})
+
+
+def _parse_local_then_llm(
+    *,
+    progress: Callable[[str], None] | None = None,
+    **kwargs: Any,
+) -> ParseOutcome:
+    """
+    Режим «Эконом»: локальный разбор бесплатно; ИИ — только если локальный результат не прошёл
+    проверку (статус не ok или остались сомнительные места) либо локально текст не прочитан
+    (например, PDF без текстового слоя). Текст, уже подготовленный локальным проходом, передаётся
+    ИИ без повторного чтения PDF и без повторного автоповорота.
+    """
+    local: ParseOutcome | None = None
+    local_error: LegalDescriptionError | None = None
+    try:
+        local = parse_legal_description_full(
+            **kwargs, use_llm=False, escalate_to_llm=False, progress=progress,
+        )
+    except LegalDescriptionError as exc:
+        local_error = exc
+    if local is not None and accepted_without_ai(local.check) and not local.typo_suspicions:
+        return local
+
+    if local is not None:
+        reason = "локальный разбор не прошёл проверку"
+    else:
+        reason = f"локально не прочитано ({local_error})"
+    if progress is not None:
+        progress(f"Эконом: {reason} — вызываю ИИ…")
+
+    ai_kwargs: dict[str, Any] = dict(kwargs)
+    if local is not None:
+        ai_kwargs["prepared_input"] = (
+            local.prepared_text,
+            list(local.prepared_images),
+            list(local.base_warnings),
+        )
+        ai_kwargs["auto_orient"] = False
+        ai_kwargs["prior_usage"] = local.usage
+    try:
+        ai = parse_legal_description_full(
+            **ai_kwargs, use_llm=True, escalate_to_llm=False, progress=progress,
+        )
+    except Exception as exc:  # noqa: BLE001 — локальный результат не должен теряться из-за ИИ
+        if local is None:
+            raise
+        return dataclasses.replace(
+            local,
+            warnings=[f"Эконом: ИИ не отработал ({exc}) — результат локального разбора, проверьте", *local.warnings],
+        )
+    return dataclasses.replace(
+        ai,
+        warnings=[f"Эконом: {reason} — ответ ИИ", *ai.warnings],
+    )
+
+
 def parse_legal_description_full(
     text: str | None = None,
     pdf_path: str | Path | None = None,
@@ -5212,11 +5877,36 @@ def parse_legal_description_full(
     focus_instruction: str | None = None,
     prepared_input: tuple[str, list[str], list[str]] | None = None,
     prior_usage: TokenUsage | None = None,
+    escalate_to_llm: bool = False,
 ) -> ParseOutcome:
     """
     Полный разбор: PDF / пачка фото чертежей (JPG/PNG/TIFF/WEBP) / текст ->
     LLM (или локальный парсер) -> LegalDescription.
+
+    ``escalate_to_llm`` (режим «Эконом»): при ``use_llm=False`` сначала локальный разбор;
+    если он не прошёл проверку или не читается — ответ ИИ (см. ``_parse_local_then_llm``).
     """
+    if escalate_to_llm and not use_llm:
+        return _parse_local_then_llm(
+            text=text,
+            pdf_path=pdf_path,
+            cfg=cfg,
+            image_paths=image_paths,
+            pdf_pages=pdf_pages,
+            rotation_deg=rotation_deg,
+            enhance_scan=enhance_scan,
+            auto_orient=auto_orient,
+            ask_on_doubt=ask_on_doubt,
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            key_secret=key_secret,
+            allow_regex_fallback=allow_regex_fallback,
+            progress=progress,
+            focus_instruction=focus_instruction,
+            prepared_input=prepared_input,
+            prior_usage=prior_usage,
+        )
     cfg = copy.deepcopy(cfg) if cfg is not None else load_config()
     eff_ask_on_doubt = (
         bool(cfg.get("api", {}).get("ask_on_doubt", True))
@@ -5251,6 +5941,21 @@ def parse_legal_description_full(
         base_warnings = list(warnings)
 
     llm_error: Exception | None = None
+    local_attempt: _LocalAttempt | None = None
+    if use_llm and combined and not image_data_urls:
+        local_attempt = _try_local_parse(combined, not eff_ask_on_doubt)
+        if local_attempt is not None and accepted_without_ai(local_attempt.check):
+            # Текст сошёлся сам с собой (замыкание, все румбы, числа на месте) — ИИ не нужен.
+            return ParseOutcome(
+                data=local_attempt.model,
+                source="regex",
+                warnings=list(warnings) + list(local_attempt.warnings),
+                typo_suspicions=[],
+                prepared_text=combined,
+                prepared_images=list(image_data_urls),
+                base_warnings=base_warnings,
+                check=local_attempt.check,
+            )
     if use_llm:
         try:
             parsed_model, mode, usage = _extract_with_llm(
@@ -5283,6 +5988,7 @@ def parse_legal_description_full(
                 unanimous_llm_passes=1,
             )
             warnings.extend(repair_notes)
+            parsed_model = _ensure_street_width(parsed_model, combined)
             suspicions = detect_typo_suspicions(
                 parsed_model,
                 source_text=combined,
@@ -5293,9 +5999,22 @@ def parse_legal_description_full(
                     warnings.append(f"⚠ {susp.reason_ru}")
             if mode != "structured-outputs":
                 warnings.append(f"провайдер не поддержал Structured Outputs, режим: {mode}")
+            from description_check import check_description, ranks_higher  # noqa: PLC0415
+
+            llm_check = check_description(parsed_model, combined)
+            chosen_model, chosen_check = parsed_model, llm_check
+            chosen_source = "llm-vision" if image_data_urls else "llm"
+            if local_attempt is not None and ranks_higher(local_attempt.check.status, llm_check.status):
+                # ИИ при равных статусах авторитетен; но сошедшийся локальный текст лучше
+                # ответа, который не замыкается.
+                chosen_model, chosen_check = local_attempt.model, local_attempt.check
+                chosen_source = "regex"
+                warnings.append("ответ ИИ не сходится, взят локальный разбор текста — проверьте")
+                suspicions = []
+            warnings = list(chosen_check.warning_lines()) + warnings
             return ParseOutcome(
-                data=parsed_model,
-                source="llm-vision" if image_data_urls else "llm",
+                data=chosen_model,
+                source=chosen_source,
                 warnings=warnings,
                 usage=usage,
                 provider=usage.provider,
@@ -5306,6 +6025,7 @@ def parse_legal_description_full(
                 prepared_text=combined,
                 prepared_images=list(image_data_urls),
                 base_warnings=base_warnings,
+                check=chosen_check,
             )
         except Exception as exc:  # noqa: BLE001
             llm_error = exc
@@ -5331,14 +6051,18 @@ def parse_legal_description_full(
 
     if llm_error is not None:
         warnings.insert(0, "геометрия получена локальным парсером — проверьте размеры вручную")
+    from description_check import check_description  # noqa: PLC0415
+
+    local_check = check_description(parsed_model, combined)
     return ParseOutcome(
         data=parsed_model,
         source="llm" if not llm_error and use_llm else "regex",
-        warnings=warnings,
+        warnings=list(local_check.warning_lines()) + warnings,
         typo_suspicions=suspicions_rx,
         prepared_text=combined,
         prepared_images=list(image_data_urls),
         base_warnings=base_warnings,
+        check=local_check,
     )
 
 
@@ -5387,6 +6111,18 @@ class DiscrepancyItem:
             )
             parts.append(f"{p_name}: «{self.values_by_pass[p_idx]}»")
         return f"{self.title}  →  " + "   vs   ".join(parts)
+
+
+def _with_check(outcome: ParseOutcome, source_text: str) -> ParseOutcome:
+    """Итог ИИ всегда несёт результат проверки описания.
+
+    Без него статус итога считается «не ok» (ранг 0), и даже верный ответ ИИ отбрасывается
+    как «не лучше кеша». Проверка считается по тем данным, которые выбраны в итоге.
+    """
+    if outcome.check is not None:
+        return outcome
+    from description_check import check_description  # noqa: PLC0415 — импорт здесь: цикл с llm_parser
+    return dataclasses.replace(outcome, check=check_description(outcome.data, source_text))
 
 
 @dataclass
@@ -5469,7 +6205,7 @@ class ConsensusResult:
         suspicions = detect_typo_suspicions(
             chosen.data, source_text=self.prepared_text, unanimous_llm_passes=1
         )
-        return ParseOutcome(
+        return _with_check(ParseOutcome(
             data=chosen.data,
             source=chosen.source,
             warnings=merged_warnings,
@@ -5482,7 +6218,7 @@ class ConsensusResult:
             prepared_text=self.prepared_text,
             prepared_images=list(self.prepared_images),
             base_warnings=list(self.base_warnings),
-        )
+        ), self.prepared_text)
 
 
 _STREET_SUFFIX_CANON: dict[str, str] = {
@@ -5900,7 +6636,7 @@ def run_multipass_consensus(
                     f"Проход #{pt.pass_index} ({pt.provider} / {pt.model}): {exc}"
                 ) from exc
 
-    ordered_outcomes = [outcomes_by_index[pt.pass_index] for pt in pass_targets]
+    ordered_outcomes = [_with_check(outcomes_by_index[pt.pass_index], combined) for pt in pass_targets]
     agreed, discrepancies = compare_legal_descriptions(ordered_outcomes)
 
     usage_items: list[TokenUsage | None] = [o.usage for o in ordered_outcomes]
@@ -6000,7 +6736,7 @@ def run_multipass_consensus(
         pass_outcomes=ordered_outcomes,
         pass_targets=pass_targets,
         discrepancies=discrepancies,
-        selected_outcome=selected,
+        selected_outcome=_with_check(selected, combined),
         total_usage=total_usage,
         round_number=round_number,
         prepared_text=combined,

@@ -5,7 +5,8 @@
 
 1. по block/lot открывается список документов участка:
    ``/Search/ShowResultsBlocks/0?Block=6323&Lot=32&SelectedDocumentIdentifier=0``;
-2. в списке берутся строки **Deed**, а если их нет — **Mortgage**;
+2. в списке берутся строки **Deed** новее 2015 года; если такого нет, а есть **Mortgage**
+   с 2015 года — берётся она (NEW), а самый древний **Deed** становится OLD;
 3. по строке открывается карточка ``/Search/ViewDocumentInfo/<id>``, а из неё —
    сам PDF ``/ViewVscmsDocument/ViewContent?p_endorsementId=<id>``;
 4. для **нашего** лота качаются самый свежий и самый старый документ, для
@@ -99,6 +100,18 @@ class RcclerkError(RuntimeError):
 
 class CloudflareBlocked(RcclerkError):
     """Сайт показал проверку на бота вместо PDF."""
+
+
+class DocumentServerError(RcclerkError):
+    """Сайт округа сам не смог отдать документ (его страница ошибки). Это не Cloudflare."""
+
+
+#: Фразы страницы ошибки сайта округа (HTML/JSON), которую нельзя принимать за проверку бота.
+_SERVER_ERROR_MARKERS = (
+    "could not load the requested document",
+    "unexpected error",
+    "error reading jobject",
+)
 
 
 class ManualStepNeeded(RcclerkError):
@@ -374,27 +387,56 @@ def _sorted_by_date(rows: Iterable[DeedRow]) -> list[DeedRow]:
     return sorted(dated, key=lambda row: (row.doc_date, -row.index)) + undated
 
 
+#: Deed имеет приоритет над Mortgage, только если он новее этого года (правило Коли, 17.11.2026).
+#: Mortgage, начиная с этого года, при отсутствии свежего Deed становится NEW, а древний Deed — OLD.
+DEED_PRIORITY_FROM_YEAR = 2015
+
+
+def _is_fresh(row: DeedRow) -> bool:
+    return row.doc_date is not None and row.doc_date.year >= DEED_PRIORITY_FROM_YEAR
+
+
 def choose_documents(
     rows: Iterable[DeedRow], *, role: str = "our", with_old_for_neighbour: bool = False
 ) -> list[tuple[DeedRow, str]]:
     """
     Какие документы качать: ``[(строка, "NEW" | "OLD"), …]``.
 
-    Правило Коли: ищем Deed; если Deed нет — Mortgage. Для нашего участка берём
-    самый свежий **и самый старый** документ, для соседей — только свежий
+    Правило Коли:
+
+    * есть Deed новее ``DEED_PRIORITY_FROM_YEAR`` → NEW = самый свежий Deed;
+    * иначе, если есть Mortgage с ``DEED_PRIORITY_FROM_YEAR`` года и позже → NEW = самая
+      свежая такая ипотека, а OLD (только для нашего участка) = самый древний Deed;
+    * иначе, если Deed есть → как раньше: NEW = самый свежий Deed, OLD = самый древний;
+    * иначе Mortgage: NEW = самая свежая, OLD = самая древняя.
+
+    Для нашего участка берём свежий **и** старый, для соседей — только свежий
     (``with_old_for_neighbour`` добавляет старый, когда с межой соседа проблемы).
+    Строка без даты не считается «новее 2015 года».
     """
     rows = list(rows)
     deeds = [row for row in rows if row.is_deed]
-    pool = deeds or [row for row in rows if row.is_mortgage]
-    if not pool:
+    mortgages = [row for row in rows if row.is_mortgage]
+    fresh_deeds = [row for row in deeds if _is_fresh(row)]
+    fresh_mortgages = [row for row in mortgages if _is_fresh(row)]
+    if not deeds and not mortgages:
         return []
-    ordered = _sorted_by_date(pool)
-    dated = [row for row in ordered if row.doc_date is not None]
-    # «Свежий» — самый поздний из датированных: строка без даты не может быть
-    # новее документа 2019 года, её честное место — среди старых.
-    newest = dated[-1] if dated else ordered[-1]
-    oldest = next((row for row in ordered if row.endorsement_id != newest.endorsement_id), None)
+    if deeds and not fresh_deeds and fresh_mortgages:
+        # Древний Deed не побеждает свежую ипотеку: ипотека — NEW, Deed — OLD.
+        newest = _sorted_by_date(fresh_mortgages)[-1]
+        oldest_pool = deeds
+    else:
+        pool = deeds or mortgages
+        ordered = _sorted_by_date(pool)
+        dated = [row for row in ordered if row.doc_date is not None]
+        # «Свежий» — самый поздний из датированных: строка без даты не может быть
+        # новее документа 2019 года, её честное место — среди старых.
+        newest = dated[-1] if dated else ordered[-1]
+        oldest_pool = pool
+    oldest = next(
+        (row for row in _sorted_by_date(oldest_pool) if row.endorsement_id != newest.endorsement_id),
+        None,
+    )
     take_old = role == "our" or with_old_for_neighbour
     chosen: list[tuple[DeedRow, str]] = [(newest, NEW_TAG)]
     if take_old and oldest is not None:
@@ -462,6 +504,12 @@ def download_pdf(
     if data[:5] == b"%PDF-" or "application/pdf" in content_type:
         target.write_bytes(data)
         return target
+    head = data[:4096].decode("utf-8", errors="replace").lower()
+    if any(marker in head for marker in _SERVER_ERROR_MARKERS):
+        raise DocumentServerError(
+            f"сайт округа не отдал документ {endorsement_id}: ошибка на стороне сайта. "
+            "Попробуйте позже; если повторяется — клерк округа Richmond, 718-675-7700."
+        )
     if b"<html" in data[:2048].lower() or "text/html" in content_type:
         raise CloudflareBlocked(
             "вместо PDF пришла HTML-страница — это проверка Cloudflare. "
@@ -541,6 +589,15 @@ def _drop_our_pending(path: Path, downloads_dir: Path) -> None:
         return
 
 
+#: Сколько раз повторить прямое скачивание, если сайт округа ответил ошибкой, и пауза между попытками.
+SERVER_ERROR_RETRIES = 2
+SERVER_ERROR_RETRY_PAUSE_SEC = 5.0
+
+
+class DownloadStopped(Exception):
+    """Пользователь нажал «Стоп» во время ожидания загрузки — это не ошибка документа."""
+
+
 def download_with_fallback(
     endorsement_id: int | str,
     destination: str | Path,
@@ -553,6 +610,7 @@ def download_with_fallback(
     poll: float = 1.0,
     auto_save=None,
     on_step=None,
+    should_stop=None,
 ) -> tuple[Path, str]:
     """
     Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
@@ -578,11 +636,30 @@ def download_with_fallback(
         if on_step is not None:
             on_step(message)
 
+    def check_stop() -> None:
+        if should_stop is not None and should_stop():
+            raise DownloadStopped("остановлено пользователем")
+
+    check_stop()
     step("1/3 пробую скачать напрямую…")
-    try:
-        return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
-    except CloudflareBlocked:
-        step("прямое скачивание закрыто проверкой Cloudflare — открываю браузер")
+    server_attempts = 0
+    while True:
+        try:
+            return download_pdf(endorsement_id, target, base=base, opener=opener), "direct"
+        except DocumentServerError:
+            # Ошибка сайта округа: браузер тут не поможет. Повторяем пару раз и сдаёмся.
+            server_attempts += 1
+            if server_attempts > SERVER_ERROR_RETRIES:
+                raise
+            step(f"сайт округа вернул ошибку — повтор {server_attempts} из {SERVER_ERROR_RETRIES} через "
+                 f"{int(SERVER_ERROR_RETRY_PAUSE_SEC)} с")
+            deadline = time.monotonic() + SERVER_ERROR_RETRY_PAUSE_SEC
+            while time.monotonic() < deadline:
+                check_stop()
+                time.sleep(0.2)
+        except CloudflareBlocked:
+            step("прямое скачивание закрыто проверкой Cloudflare — открываю браузер")
+            break
 
     folder = Path(downloads_dir) if downloads_dir is not None else _default_downloads_dir()
     open_it = open_browser or _open_in_browser
@@ -611,6 +688,7 @@ def download_with_fallback(
 
     deadline = time.monotonic() + max(0.0, float(watch_timeout))
     while True:
+        check_stop()
         found = find_new_pdf(folder, since=since)
         if found is not None:
             shutil.copyfile(found, target)

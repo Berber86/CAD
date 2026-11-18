@@ -19,6 +19,7 @@ VK_RETURN = 0x0D
 VK_TAB = 0x09
 VK_DOWN = 0x28
 VK_A = 0x41
+VK_T = 0x54
 VK_L = 0x4C
 KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -489,6 +490,20 @@ def press_ctrl_l() -> bool:
         _key(VK_CONTROL, up=False)
         _key(VK_L, up=False)
         _key(VK_L, up=True)
+        _key(VK_CONTROL, up=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def press_ctrl_t() -> bool:
+    """Open a new browser tab (the current tabs are left untouched)."""
+    if _user32() is None:
+        return False
+    try:
+        _key(VK_CONTROL, up=False)
+        _key(VK_T, up=False)
+        _key(VK_T, up=True)
         _key(VK_CONTROL, up=True)
         return True
     except Exception:  # noqa: BLE001

@@ -362,3 +362,214 @@ def test_apply_update_surfaces_download_errors_without_touching_disk(tmp_path, m
     with pytest.raises(app_updater.UpdateError, match="сеть недоступна"):
         app_updater.apply_update("https://github.com/Berber86/CAD", target)
     assert (target / "main.py").read_text(encoding="utf-8") == "original"
+
+
+# ------------------------------------------------------------ резервные копии и откат
+
+def _install_zip(monkeypatch, files: dict[str, bytes]) -> None:
+    zip_bytes = _zip_bytes(files)
+    monkeypatch.setattr(app_updater, "_http_get", lambda url, timeout=30.0: zip_bytes)
+
+
+def _old_install(tmp_path: Path) -> Path:
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "main.py").write_text("old main", encoding="utf-8")
+    (app / "version.py").write_text("APP_VERSION = '3.42'\n", encoding="utf-8")
+    (app / "config.json").write_text('{"provider": "mine"}', encoding="utf-8")
+    (app / ".env").write_text("KEY=secret", encoding="utf-8")
+    (app / "notes.txt").write_text("local only", encoding="utf-8")
+    return app
+
+
+def test_update_keeps_a_backup_and_rollback_restores_the_previous_version(tmp_path, monkeypatch):
+    app = _old_install(tmp_path)
+    _install_zip(monkeypatch, {
+        "main.py": b"new main",
+        "version.py": b"APP_VERSION = '3.43'\n",
+        "config.json": b'{"provider": "repo-default"}',
+        "fresh_module.py": b"print('new')",
+    })
+
+    app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", app)
+    assert (app / "main.py").read_text(encoding="utf-8") == "new main"
+    backups = app_updater.list_backups(app)
+    assert len(backups) == 1
+    assert backups[0].version == "3.42"
+    assert "fresh_module.py" in backups[0].new_files
+    # Защищённые файлы не попадают в резерв вообще.
+    assert "config.json" not in backups[0].files
+    assert ".env" not in backups[0].files
+
+    result = app_updater.rollback_latest(app)
+
+    assert result.version == "3.42"
+    assert (app / "main.py").read_text(encoding="utf-8") == "old main"
+    assert (app / "version.py").read_text(encoding="utf-8") == "APP_VERSION = '3.42'\n"
+    assert not (app / "fresh_module.py").exists()
+    # Настройки и локальные файлы пережили и обновление, и откат.
+    assert (app / "config.json").read_text(encoding="utf-8") == '{"provider": "mine"}'
+    assert (app / ".env").read_text(encoding="utf-8") == "KEY=secret"
+    assert (app / "notes.txt").read_text(encoding="utf-8") == "local only"
+    # Использованный резерв удалён.
+    assert app_updater.list_backups(app) == []
+
+
+def test_failed_extraction_puts_the_previous_files_back_by_itself(tmp_path, monkeypatch):
+    app = _old_install(tmp_path)
+    _install_zip(monkeypatch, {"main.py": b"new main", "fresh_module.py": b"x"})
+
+    def broken_extract(zip_path, target_dir, *, protected=app_updater.DEFAULT_PROTECTED_FILES):
+        (Path(target_dir) / "main.py").write_text("half written", encoding="utf-8")
+        raise OSError("диск заполнен")
+
+    monkeypatch.setattr(app_updater, "extract_update", broken_extract)
+    with pytest.raises(OSError, match="диск заполнен"):
+        app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", app)
+
+    assert (app / "main.py").read_text(encoding="utf-8") == "old main"
+    assert not (app / "fresh_module.py").exists()
+    assert app_updater.list_backups(app) == []
+
+
+def test_only_the_three_newest_backups_are_kept(tmp_path, monkeypatch):
+    app = _old_install(tmp_path)
+    for version in range(4):
+        _install_zip(monkeypatch, {"main.py": f"build {version}".encode()})
+        app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", app)
+    backups = app_updater.list_backups(app)
+    assert len(backups) == app_updater.BACKUPS_KEEP == 3
+    # Самый свежий резерв — версия перед последним обновлением (build 2).
+    restored = app_updater.rollback_latest(app)
+    assert restored is not None
+    assert (app / "main.py").read_text(encoding="utf-8") == "build 2"
+
+
+def test_rollback_twice_steps_back_through_the_older_backups(tmp_path, monkeypatch):
+    app = _old_install(tmp_path)
+    _install_zip(monkeypatch, {"main.py": b"v2"})
+    app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", app)
+    _install_zip(monkeypatch, {"main.py": b"v3"})
+    app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", app)
+
+    app_updater.rollback_latest(app)
+    assert (app / "main.py").read_text(encoding="utf-8") == "v2"
+    app_updater.rollback_latest(app)
+    assert (app / "main.py").read_text(encoding="utf-8") == "old main"
+
+
+def test_rollback_without_any_backup_says_so(tmp_path):
+    app = _old_install(tmp_path)
+    with pytest.raises(app_updater.UpdateError, match="резервной копии нет"):
+        app_updater.rollback_latest(app)
+
+
+def test_http_get_reports_bytes_received_out_of_content_length(monkeypatch):
+    """Индикатор получает (получено, всего), читая тело кусками."""
+    import urllib.request
+
+    body = b"x" * (150 * 1024)
+
+    class _Response:
+        headers = {"Content-Length": str(len(body))}
+
+        def __init__(self):
+            self._buf = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(self._buf)
+            chunk, self._buf = self._buf[:size], self._buf[size:]
+            return chunk
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Response())
+    seen = []
+    data = app_updater._http_get("https://codeload.github.com/o/r/zip/refs/heads/main",
+                                 on_progress=lambda got, total: seen.append((got, total)))
+    assert data == body
+    assert seen[-1] == (len(body), len(body))
+    assert [got for got, _ in seen] == sorted(got for got, _ in seen)  # монотонно растёт
+    assert len(seen) == 3  # 64 КБ + 64 КБ + 22 КБ
+
+
+def test_http_get_without_content_length_reports_zero_total(monkeypatch):
+    import urllib.request
+
+    class _Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __init__(self):
+            self._chunks = [b"abc", b""]
+
+        def read(self, size=-1):  # noqa: ARG002
+            return self._chunks.pop(0)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Response())
+    seen = []
+    assert app_updater._http_get("https://codeload.github.com/o/r/zip/refs/heads/main",
+                                 on_progress=lambda got, total: seen.append((got, total))) == b"abc"
+    assert seen == [(3, 0)]
+
+
+def test_apply_update_emits_download_backup_and_install_stages(tmp_path, monkeypatch):
+    target = tmp_path / "app"
+    target.mkdir()
+    (target / "old.py").write_text("old", encoding="utf-8")
+    zip_bytes = _zip_bytes({"main.py": b"updated", "util.py": b"u"})
+
+    def fake_http_get(url, timeout=30.0, on_progress=None):  # noqa: ARG001
+        half = len(zip_bytes) // 2
+        on_progress(half, len(zip_bytes))
+        on_progress(len(zip_bytes), len(zip_bytes))
+        return zip_bytes
+
+    monkeypatch.setattr(app_updater, "_http_get", fake_http_get)
+    stages = []
+    app_updater.apply_update(
+        "https://github.com/Berber86/CAD/archive/refs/heads/main.zip",
+        target,
+        on_stage=lambda name, fraction, detail: stages.append((name, fraction)),
+    )
+
+    names = [name for name, _ in stages]
+    assert names.index("download") < names.index("backup") < names.index("install")
+    download = [f for n, f in stages if n == "download"]
+    assert download[0] == 0.0 and download[-1] == 1.0
+    assert ("backup", 1.0) in stages  # все архивные файлы учтены, даже новые (их копировать не нужно)
+    assert stages[-1] == ("install", 1.0)
+
+
+def test_apply_update_without_on_stage_still_works(tmp_path, monkeypatch):
+    """Без индикатора поведение прежнее: никаких лишних аргументов в вызовах."""
+    target = tmp_path / "app"
+    target.mkdir()
+    monkeypatch.setattr(app_updater, "_http_get", lambda url, timeout=30.0: _zip_bytes({"main.py": b"x"}))
+    result = app_updater.apply_update("https://github.com/Berber86/CAD/archive/refs/heads/main.zip", target)
+    assert result.files_written == 1
+
+
+def test_download_zip_passes_progress_only_when_asked(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_http_get(url, timeout=30.0, **kwargs):  # noqa: ARG001
+        calls.append(kwargs)
+        return b"zip-bytes"
+
+    monkeypatch.setattr(app_updater, "_http_get", fake_http_get)
+    app_updater.download_zip("https://codeload.github.com/o/r/zip/refs/heads/main", tmp_path / "a.zip")
+    app_updater.download_zip("https://codeload.github.com/o/r/zip/refs/heads/main", tmp_path / "b.zip",
+                             on_progress=lambda got, total: None)
+    assert calls[0] == {}
+    assert "on_progress" in calls[1]

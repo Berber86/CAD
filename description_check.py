@@ -1,0 +1,377 @@
+"""
+Объективная проверка разобранного описания участка (до чертежа).
+
+Статус результата — одно слово, которое видит пользователь:
+
+* ``ok``       — описание замыкается, все стороны с румбами и длинами, числа сходятся с текстом;
+* ``warning``  — есть сомнения, но контур можно строить (небольшая невязка, нет расстояния
+                 до угла в тексте, которое можно найти вручную);
+* ``failed``   — контур не замыкается или данные неполные; чертёж — лучшая оценка, и его
+                 надо проверить.
+
+Функция чистая: ничего не меняет в модели, только считает признаки. Решение о том, каким
+результатом пользоваться (локальным разбором или ответом ИИ), принимает
+``llm_parser.parse_legal_description_full`` по статусу из этой проверки.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+#: Невязка, при которой описание считается замкнутым (футы).
+CLOSURE_OK_FT = 0.5
+#: Невязка, выше которой описание считается неверно прочитанным (футы).
+CLOSURE_FAILED_FT = 5.0
+
+STATUS_OK = "ok"
+STATUS_WARNING = "warning"
+STATUS_FAILED = "failed"
+
+_RANK = {STATUS_FAILED: 0, STATUS_WARNING: 1, STATUS_OK: 2}
+
+#: «25.41 feet U.S. Standard (25.00 feet Deed)» — измеренная длина и длина по документу.
+_STANDARD_DEED_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:feet|ft|')?\s*U\.?\s*S\.?\s*Standard\s*\(\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:feet|ft|')?\s*Deed",
+    re.IGNORECASE,
+)
+_DISTANT_RE = re.compile(r"\bdistant\s+\d[\d,]*(?:\.\d+)?\s*(?:feet|ft|')", re.IGNORECASE)
+_THENCE_RE = re.compile(r"\bTHENCE\b", re.IGNORECASE)
+#: Описание начинается от угла: «BEGINNING at the corner formed by …» — расстояние не нужно.
+# Точка начала на углу: «at the corner», «at a point at the corner formed by …»,
+# «at the northeasterly corner of …», «at a point formed by the intersection of …».
+# Между «at» и «corner/intersection» допускаются только слова (до 5), без чисел: фраза
+# «distant 74.96 feet … from the corner» означает удаление от угла, а не точку на углу.
+_AT_CORNER_START_RE = re.compile(
+    r"BEGINNING\s+at\s+(?:[A-Za-z]+\s+){0,5}?(?:corner|intersection)\b", re.IGNORECASE,
+)
+# «COMMENCING at the intersection of … ; running thence … to the point or place of beginning»:
+# точка начала — это и есть угол (контур возвращается в неё). Действует только если в описании
+# нет отдельного «BEGINNING at …»: тогда BEGINNING — настоящая точка начала и нужно её расстояние.
+_COMMENCE_AT_CORNER_RE = re.compile(
+    r"COMMENCING\s+at\s+(?:[A-Za-z]+\s+){0,5}?(?:corner|intersection)\b", re.IGNORECASE,
+)
+_BEGINNING_AT_RE = re.compile(r"\bBEGINNING\s+at\b", re.IGNORECASE)
+
+
+def _starts_at_corner(text: str) -> bool:
+    """Описание начинается на углу улицы (расстояние до угла не нужно)."""
+    if not text:
+        return False
+    if _AT_CORNER_START_RE.search(text):
+        return True
+    if _BEGINNING_AT_RE.search(text):
+        return False  # есть своя точка начала с расстоянием — COMMENCING тут не главный
+    return bool(_COMMENCE_AT_CORNER_RE.search(text))
+
+
+@dataclass(frozen=True)
+class CheckIssue:
+    status: str  # STATUS_WARNING или STATUS_FAILED
+    text: str
+    side: int | None = None  # номер стороны (1-based), если проблема относится к стороне
+
+
+#: Текст единственного предупреждения о расстоянии до угла (см. _check_description_core).
+CORNER_GAP_ISSUE_PREFIX = "расстояние от угла до точки начала не найдено"
+#: Строка «не найдено» в баллах фигуры для того же случая.
+CORNER_GAP_MISSING = "расстояние от угла до точки начала"
+
+
+@dataclass
+class DescriptionCheck:
+    status: str = STATUS_OK
+    closure_ft: float | None = None
+    issues: list[CheckIssue] = field(default_factory=list)
+    #: Подсчёт обязательных значений фигуры (FigureScore); заполняет check_description.
+    score: "FigureScore | None" = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+    def add(self, status: str, text: str, side: int | None = None) -> None:
+        self.issues.append(CheckIssue(status=status, text=text, side=side))
+        if _RANK[status] < _RANK[self.status]:
+            self.status = status
+
+    def warning_lines(self) -> list[str]:
+        """Строки для журнала и сводки: первая — итог, затем конкретные места."""
+        if self.status == STATUS_OK:
+            return []
+        head = {
+            STATUS_FAILED: "✗ проверка описания: НЕ СХОДИТСЯ — чертёж нужно проверить",
+            STATUS_WARNING: "⚠ проверка описания: есть сомнения",
+        }[self.status]
+        return [head] + [f"  • {issue.text}" for issue in self.issues]
+
+
+def standard_deed_pairs(text: str) -> list[tuple[float, float]]:
+    """Пары (измеренная, по документу) в порядке текста: «25.41 U.S. Standard (25.00 Deed)»."""
+    return [(float(m.group(1)), float(m.group(2))) for m in _STANDARD_DEED_RE.finditer(text or "")]
+
+
+def closure_with_deed_values(model: Any, text: str) -> tuple[float, int, float] | None:
+    """
+    Арбитр замыкания: если измеренные длины не замыкаются, а вариант «по Deed» — да.
+
+    Возвращает (невязка_измеренная, номер_стороны, длина_по_Deed) для первой пары, при замене
+    которой контур замыкается ≤ CLOSURE_OK_FT. Геометрию не меняет: решение за чертёжником.
+    None — арбитр не нужен или не помогает.
+    """
+    from acad_builder import build_polygon_points, closure_error  # noqa: PLC0415
+
+    segments = list(getattr(model, "segments", None) or ())
+    pairs = standard_deed_pairs(text)
+    if len(segments) < 3 or not pairs:
+        return None
+    if any(not getattr(seg, "has_bearing", True) for seg in segments):
+        return None
+    base = float(closure_error(build_polygon_points(segments)).distance)
+    if base <= CLOSURE_OK_FT:
+        return None
+    for measured, deed in pairs:
+        if abs(deed - measured) < 1e-6:
+            continue
+        for index, seg in enumerate(segments):
+            if abs(float(getattr(seg, "distance_ft", 0.0) or 0.0) - measured) > 0.006:
+                continue
+            trial = list(segments)
+            trial[index] = seg.model_copy(update={"distance_ft": deed})
+            if float(closure_error(build_polygon_points(trial)).distance) <= CLOSURE_OK_FT:
+                return base, index + 1, deed
+    return None
+
+
+def ranks_higher(a: str, b: str) -> bool:
+    """Статус ``a`` лучше статуса ``b``."""
+    return _RANK[a] > _RANK[b]
+
+
+@dataclass(frozen=True)
+class FigureItem:
+    """Одна группа обязательных значений: сколько должно быть и сколько нашлось."""
+
+    label: str
+    found: int
+    required: int
+
+
+@dataclass
+class FigureScore:
+    """
+    «Баллы» распознанной фигуры: сколько обязательных значений должно быть и сколько нашлось.
+
+    Обязательные значения: стороны (по числу «THENCE» в тексте, если их больше, чем разобрано),
+    румбы у каждой стороны, длины сторон, расстояние от угла до точки начала (если точка не у угла).
+    Замыкание — тоже обязательный показатель: контур должен сойтись (невязка ≤ CLOSURE_OK_FT).
+    Если он не сходится, баллы не сходятся с итогом, поэтому невязка входит в подсчёт.
+    """
+
+    items: list[FigureItem] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    solved_sides: list[int] = field(default_factory=list)
+    closure_ft: float | None = None
+
+    @property
+    def found_total(self) -> int:
+        return sum(item.found for item in self.items)
+
+    @property
+    def required_total(self) -> int:
+        return sum(item.required for item in self.items)
+
+    @property
+    def complete(self) -> bool:
+        return self.found_total == self.required_total and not self.missing
+
+
+def figure_score(model: Any, source_text: str = "", closure_ft: float | None = None) -> FigureScore:
+    """Считает обязательные значения фигуры и отмечает, каких не хватает (чистая функция)."""
+    segments = list(getattr(model, "segments", None) or ())
+    text = str(source_text or "")
+    n = len(segments)
+    thence = len(_THENCE_RE.findall(text)) if text else 0
+    # Каждая сторона в описании начинается с «THENCE»: в чистых разборах их ровно столько же,
+    # сколько сторон (проверено на всех текстах набора). Если «THENCE» больше — сторона потеряна.
+    required_sides = max(3, n, thence)
+    bearing_found = sum(1 for seg in segments if getattr(seg, "has_bearing", True))
+    length_found = sum(1 for seg in segments if float(getattr(seg, "distance_ft", 0.0) or 0.0) > 0)
+    at_corner = _starts_at_corner(text)
+    corner_required = 0 if at_corner else 1
+    distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
+    corner_found = 1 if distance > 1e-6 else 0
+
+    score = FigureScore(closure_ft=closure_ft)
+    score.items = [
+        FigureItem("сторон", min(n, required_sides), required_sides),
+        FigureItem("румбов", bearing_found, n),
+        FigureItem("длин", length_found, n),
+    ]
+    if corner_required:
+        score.items.append(FigureItem("расстояние до угла", corner_found, corner_required))
+    closure_found = 1 if closure_ft is not None and closure_ft <= CLOSURE_OK_FT else 0
+    score.items.append(FigureItem("замыкание", closure_found, 1))
+    if required_sides > n:
+        score.missing.append(f"сторон {n} из {required_sides} (в тексте «THENCE» {thence})")
+    for index, seg in enumerate(segments, start=1):
+        if not getattr(seg, "has_bearing", True):
+            score.missing.append(f"румб стороны №{index}")
+        elif getattr(seg, "bearing_solved", False):
+            score.solved_sides.append(index)
+    if corner_required and not corner_found:
+        score.missing.append("расстояние от угла до точки начала")
+    if closure_ft is not None and closure_ft > CLOSURE_OK_FT:
+        score.missing.append(f"контур не замыкается: невязка {closure_ft:.2f} ft")
+    return score
+
+
+_STATUS_WORDS = {STATUS_OK: "сходится", STATUS_WARNING: "есть сомнения", STATUS_FAILED: "НЕ СХОДИТСЯ"}
+
+
+def figure_line(check: DescriptionCheck | None) -> str:
+    """Одна строка для журнала: баллы фигуры, замыкание, итог и чего не хватает."""
+    if check is None or check.score is None:
+        return "фигура: не посчитана"
+    score = check.score
+    parts = [f"{item.label} {item.found} из {item.required}" for item in score.items]
+    head = f"баллы {score.found_total} из {score.required_total} ({', '.join(parts)})"
+    line = f"фигура: {head}; проверка: {_STATUS_WORDS.get(check.status, check.status)}"
+    if score.solved_sides:
+        line += "; румб вычислен по замыканию у №" + ", №".join(str(i) for i in score.solved_sides)
+    if score.missing:
+        line += "; не найдено: " + "; ".join(score.missing)
+    return line
+
+
+def reading_summary(check: DescriptionCheck | None) -> str:
+    """Итог для упрощённого журнала: сколько обязательных значений легального описания прочитано.
+
+    Строка короткая по смыслу, но записывается уровнем «ключ» (всегда видна), поэтому её длина
+    не ограничивается порогом информационных записей.
+    """
+    if check is None or check.score is None:
+        return "Легал дескрипшен: не разобран"
+    score = check.score
+    parts = ", ".join(f"{item.label} {item.found} из {item.required}" for item in score.items)
+    line = (
+        f"Легал дескрипшен: прочитано {score.found_total} из {score.required_total} ({parts}); "
+        f"{_STATUS_WORDS.get(check.status, check.status)}"
+    )
+    if score.missing:
+        line += "; не найдено: " + "; ".join(score.missing)
+    return line
+
+
+def check_description(model: Any, source_text: str = "") -> DescriptionCheck:
+    """Проверяет разобранную модель LegalDescription и считает баллы фигуры."""
+    check = _check_description_core(model, source_text)
+    check.score = figure_score(model, source_text, check.closure_ft)
+    return check
+
+
+def _check_description_core(model: Any, source_text: str = "") -> DescriptionCheck:
+    """Статус проверки описания (без подсчёта баллов)."""
+    # Импорт здесь: acad_builder тянет llm_parser, а llm_parser импортирует эту проверку.
+    from acad_builder import build_polygon_points, closure_error
+
+    check = DescriptionCheck()
+    segments = list(getattr(model, "segments", None) or ())
+    text = str(source_text or "")
+
+    if len(segments) < 3:
+        check.add(STATUS_FAILED, f"найдено сторон: {len(segments)} — участку нужно не меньше трёх")
+        return check
+
+    # Сторона без румба: если и заметка о ней («along the easterly line …») не нашлась,
+    # это провал. Если заметка есть — сторона описана словами, но контур без румба не
+    # замкнуть: это сомнение (warning), а не «ok».
+    unbearing: list[int] = []
+    for index, seg in enumerate(segments, start=1):
+        if not getattr(seg, "has_bearing", True):
+            unbearing.append(index)
+            if not getattr(seg, "course_note", None):
+                check.add(STATUS_FAILED, f"сторона №{index}: румб не прочитан", side=index)
+    if unbearing and check.status == STATUS_OK:
+        check.add(
+            STATUS_WARNING,
+            "сторона(ы) без румба, описаны словами: контур не проверен — "
+            + ", ".join(f"№{index}" for index in unbearing),
+        )
+
+    # Румб вычислен по замыканию (одна сторона без румба в тексте): контур сходится по построению,
+    # поэтому это всегда сомнение, а не «ok».
+    solved = [index for index, seg in enumerate(segments, start=1) if getattr(seg, "bearing_solved", False)]
+    if solved:
+        check.add(
+            STATUS_WARNING,
+            "румб не прочитан в тексте, вычислен по замыканию: сторона(ы) "
+            + ", ".join(f"№{index}" for index in solved) + " — сверьте с документом",
+            side=solved[0],
+        )
+
+    # Замыкание считается только если у всех сторон есть румб. Поэтому статус «ok»
+    # возможен только с вычисленным замыканием: пропущенная или нечитаемая сторона
+    # не может пройти как «ok».
+    if not unbearing:
+        closure = closure_error(build_polygon_points(segments))
+        check.closure_ft = float(closure.distance)
+        if closure.distance > CLOSURE_FAILED_FT:
+            check.add(
+                STATUS_FAILED,
+                f"описание не замыкается: невязка {closure.distance:.2f} ft",
+            )
+        elif closure.distance > CLOSURE_OK_FT:
+            check.add(
+                STATUS_WARNING,
+                f"невязка {closure.distance:.2f} ft — проверьте длины сторон",
+            )
+
+    if text:
+        arbiter = closure_with_deed_values(model, text)
+        if arbiter is not None:
+            base, side_no, deed = arbiter
+            check.add(
+                STATUS_WARNING,
+                f"сторона №{side_no}: по документу (Deed) {deed:.2f} ft, а измеренное значение "
+                f"не даёт замыкания (невязка {base:.2f} ft); с Deed контур замыкается — проверьте",
+                side=side_no,
+            )
+        thence = len(_THENCE_RE.findall(text))
+        if thence and thence != len(segments) and thence != len(segments) + 1:
+            check.add(
+                STATUS_WARNING,
+                f"в тексте {thence} «THENCE», разобрано сторон: {len(segments)}",
+            )
+        distance = float(getattr(model, "distance_to_corner_ft", None) or 0.0)
+        if _DISTANT_RE.search(text) and distance <= 1e-6:
+            check.add(STATUS_FAILED, "в тексте есть «distant … feet», но расстояние до угла не найдено")
+        elif distance <= 1e-6 and not _starts_at_corner(text):
+            # Строка с расстоянием могла потеряться при OCR целиком: без точки начала контур
+            # построен от угла улицы. Это сомнение, а не «ok».
+            check.add(
+                STATUS_WARNING,
+                "расстояние от угла до точки начала не найдено — участок построен от угла улицы; "
+                "сверьте с документом",
+            )
+
+    return check
+
+
+def accepted_without_ai(check: "DescriptionCheck | None") -> bool:
+    """Результат можно принять без ИИ: проверка ok или не хватает только расстояния до угла.
+
+    Единственный пропуск — расстояние от угла до точки начала, а стороны, румбы и замыкание
+    на месте (контур сходится). Такой файл строится с пометкой «не найдено»: ИИ не может
+    найти значение, которого нет в тексте документа (решение пользователя).
+    """
+    if check is None:
+        return False
+    if check.ok:
+        return True
+    if check.score is None or check.score.missing != [CORNER_GAP_MISSING]:
+        return False
+    if not check.issues or not all(issue.text.startswith(CORNER_GAP_ISSUE_PREFIX) for issue in check.issues):
+        return False
+    return check.closure_ft is not None and check.closure_ft <= CLOSURE_OK_FT

@@ -133,6 +133,12 @@ class _Widget:
     def after(self, *args, **kwargs):
         return None
 
+    def after_idle(self, *args, **kwargs):
+        return None
+
+    def state(self, *args, **kwargs):
+        return None
+
     def start(self):
         return None
 
@@ -301,6 +307,12 @@ class _FakeCanvas(_Widget):
         return len(self.items)
 
 
+
+def _step0_texts(app):
+    """Тексты записей журнала Шага 0 (записи хранятся как (уровень, текст))."""
+    return [item[1] if isinstance(item, tuple) else item for item in app._step0_lines]
+
+
 def _fake_modules() -> dict[str, types.ModuleType]:
     ctk = types.ModuleType("customtkinter")
     for name in (
@@ -359,7 +371,13 @@ def gui(monkeypatch, tmp_path):
     # sample config while preserving its real defaults for every smoke test.
     import llm_parser
     config_path = tmp_path / "config.json"
-    config_path.write_bytes((ROOT / "config.json").read_bytes())
+    # Черновик для печати — отдельный план при «Начертить». Подсчёты отрисовки в этих тестах
+    # относятся к основной схеме, поэтому черновик выключен; его проверяет
+    # test_print_draft_is_added_only_for_main_lot_when_enabled ниже и tests/test_print_draft.py.
+    import json as _json  # noqa: PLC0415
+    _cfg_data = _json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    _cfg_data.setdefault("print_draft", {})["enabled"] = False
+    config_path.write_text(_json.dumps(_cfg_data, ensure_ascii=False, indent=2), encoding="utf-8")
     local_config_path = tmp_path / "config.local.json"
     env_path = tmp_path / ".env"
     for module in (llm_parser, gui_module):
@@ -738,7 +756,7 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
     drawn_calls = []
     def fake_draw(_builder, plan):
         drawn_calls.append((plan.description.distance_to_corner_ft, plan.is_neighbor, plan))
-        layers = {"neighbor_lot": "NEIGHBOR_LOT"} if plan.is_neighbor else {"property_line": "PROPERTY_LINE"}
+        layers = {"neighbor_lot": "NEIGHBOR_LOT"} if plan.is_neighbor else {"property_line": "PL"}
         return DrawResult(plan=plan, text_count=len(plan.items), layers=layers)
 
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
@@ -893,7 +911,7 @@ def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_p
     drawn_plans = []
     def fake_draw(_builder, plan):
         drawn_plans.append(plan)
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
 
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
     monkeypatch.setattr(gui.sys, "platform", "win32")
@@ -1434,7 +1452,7 @@ def test_gui_ask_on_doubt_checkbox_prevents_silent_54_to_56_and_supports_focus_r
         return DrawResult(
             plan=plan,
             text_count=len(plan.items),
-            layers={"property_line": "PROPERTY_LINE", "boundary_text": "BOUNDARY_TEXT_AI"},
+            layers={"property_line": "PL", "boundary_text": "D-TOPO-TEXT"},
         )
 
     monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
@@ -1529,9 +1547,8 @@ def test_gui_v1_studio_viewport_zoom_pan_hover_clipboard_and_shortcuts(
     import version
 
     assert gui.VERSION == version.APP_VERSION != "1.0.0"
-    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_DATE})"
+    assert feature_labeler.STEP2_VERSION == f"{version.APP_VERSION} ({version.APP_STAMP})"
     assert app.version_badge.cget("text") == f"v{version.APP_VERSION} · STUDIO"
-    assert gui.APP_DATE == version.APP_DATE
     assert gui.APP_GEOMETRY == "1440x940"
     assert "<Control-Return>" in app._global_bindings
     assert "<F5>" in app._global_bindings
@@ -2027,7 +2044,7 @@ def test_reset_during_com_draw_serializes_new_draw_and_ignores_old_result(gui, m
         else:
             second_started.set()
         order.append(("end", distance))
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
 
     monkeypatch.setattr(gui.sys, "platform", "win32")
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
@@ -2367,7 +2384,7 @@ def test_drawing_uses_scene_objects_and_refuses_changed_or_missing_source(gui, m
     draws = []
     def fake_draw(_builder, plan):
         draws.append(plan)
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
     app._start(parse_only=False)
     assert not draws and "Нет рассчитанной схемы" in app.status_var.get()
@@ -3123,6 +3140,57 @@ def _wait_idle(app):
     raise AssertionError("фоновое задание не завершилось")
 
 
+def test_step4_offsets_tab_is_last_and_keeps_step1_keys_off(gui):
+    # Шага 3 в программе нет: после Шага 2 идёт вкладка «Шаг 4. Оффсеты» (каркас 4.1).
+    app = gui.SurveyApp()
+    assert list(app.step_tab_buttons)[-1] == gui.STEP_TAB_OFFSETS == "Шаг 4. Оффсеты"
+    assert app.step4_page._gridded is False
+
+    app._select_step_tab(gui.STEP_TAB_OFFSETS)
+    assert app.main_wrap._gridded is False
+    assert app.step2_page._gridded is False
+    assert app.step4_page._gridded is True
+    assert app.draw_button._gridded is False
+    assert app.step_tab_buttons[gui.STEP_TAB_OFFSETS].cget("fg_color") == gui.THEME["btn_primary"]
+    assert "выделите в AutoCAD" in app.step4_status_label.cget("text")
+    assert app.step4_run_button._gridded is True
+
+    started = []
+    app._start = lambda **kwargs: started.append(kwargs)
+    assert app._global_bindings["<F5>"]() is None
+    assert started == []
+
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.step4_page._gridded is False
+    assert app.main_wrap._gridded is True
+    assert app._global_bindings["<F5>"]() == "break"
+    assert started == [{"parse_only": False}]
+
+
+def test_step4_run_reports_error_and_result(gui):
+    # Шаг 4: ошибка AutoCAD (или Esc) — понятный отчёт; результат — отчёт, журнал и статус.
+    import offsets as off
+    from acad_builder import OffsetRunResult
+
+    app = gui.SurveyApp()
+    app._select_step_tab(gui.STEP_TAB_OFFSETS)
+    app._handle_offsets_result(None, "область не указана (Esc — отмена).")
+    assert "ШАГ 4 НЕ ВЫПОЛНЕН" in app.step4_report_box.get("1.0", "end")
+
+    plan = off.plan_offsets(
+        [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)],
+        [off.Feature("house", "H1", ((20.0, 10.0), (40.0, 10.0), (40.0, 30.0), (20.0, 30.0)))],
+        front=[[(0.0, 0.0), (100.0, 0.0)]],
+    )
+    run = OffsetRunResult(plan=plan, area=[], scale=16.0, north_deg=90.0,
+                          front_lines=1, feature_count=1, dry_run=True)
+    app._handle_offsets_result(run, "")
+    text = app.step4_report_box.get("1.0", "end")
+    assert "Подписей: 1" in text and "10.0'S" in text
+    assert "Режим расчёта: чертёж не изменён." in text
+    assert app.status_var.get() == "Шаг 4: оффсетов 1 (чертёж не изменён)"
+
+
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
@@ -3131,6 +3199,7 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
         "Шаг 0. Документы участка",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
+        "Шаг 4. Оффсеты",
     )
     assert list(app.step_tab_buttons) == list(gui.STEP_TABS)
     # По умолчанию открыт Шаг 1: рабочая зона границы и её кнопки на месте.
@@ -3236,14 +3305,24 @@ def test_step2_buttons_run_labeling_and_report_to_log(gui, monkeypatch, mode):
     assert app.step2_stat_vars["layers"].get() == "14"
     assert app.step2_stat_vars["labeled"].get() == "15"
     assert app.step2_stat_vars["skipped"].get() == "3"
+    # По умолчанию журнал упрощённый: в окне отчёта итоги есть, подробные строки скрыты.
+    report = app.step2_report_box.get("1.0", "end")
+    assert "ПОДПИСАНО: 15" in report
+    assert "НАЙДЕНО ОБЪЕКТОВ С ПОДПИСЬЮ: 18" in report
+    assert "по кодам и описаниям точек съёмки: 2" not in report
+    # Переключатель «Подробный журнал» перерисовывает отчёт полностью.
+    app.log_mode_var.set(True)
+    app._apply_log_mode()
     report = app.step2_report_box.get("1.0", "end")
     assert "по заметкам полевого чертёжника (перевод в формулировки заказчика): 1" in report
     assert "по кодам и описаниям точек съёмки: 2" in report
     assert "по именам слоёв: 14" in report
     assert "ПОДПИСАНО: 15" in report
     assert "полевая заметка «WOOD PORCH»" in report
+    app.log_mode_var.set(False)
+    app._apply_log_mode()
     # Тот же отчёт — в журнале операций (лог-панель).
-    log = "\n".join(app._log)
+    log = app.log_text()
     assert "Шаг 2 · • по кодам и описаниям точек съёмки: 2" in log
     assert "Шаг 2 · • по именам слоёв: 14" in log
     assert "Шаг 2 · ПОДПИСАНО: 15" in log
@@ -3448,8 +3527,8 @@ def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
     finally:
         gui.deed_intake.collect_deeds = saved
     assert collected["neighbours"] == [30]
-    assert "соседи: 30" in app._step0_lines[0]
-    assert "32" not in app._step0_lines[0].split("соседи:")[1]
+    assert "соседи: 30" in _step0_texts(app)[0]
+    assert "32" not in _step0_texts(app)[0].split("соседи:")[1]
 
 
 def test_step0_success_enables_handover_to_step1(gui, tmp_path):
@@ -3588,7 +3667,7 @@ def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, mo
     monkeypatch.setattr(gui.browser_save, "available", lambda: True)
     monkeypatch.setattr(
         gui.browser_save, "auto_save_hook",
-        lambda folder, on_attempt: seen.setdefault("attempt_notice", on_attempt) and hook,
+        lambda folder, on_attempt, **kwargs: seen.setdefault("attempt_notice", on_attempt) and hook,
     )
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", fake_collect)
     app._step0_worker(6323, 32, [], tmp_path, False)
@@ -3596,7 +3675,7 @@ def test_step0_worker_connects_the_pdf_ready_browser_save_hook(gui, tmp_path, mo
     assert seen["downloads_dir"] == gui.rcclerk.default_downloads_dir()
     assert seen["auto_save"] is hook
     assert callable(seen["attempt_notice"])
-    assert any("Ctrl+S" in line for line in app._step0_lines)
+    assert any("Ctrl+S" in line for line in _step0_texts(app))
 
 
 def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(gui, tmp_path):
@@ -3626,9 +3705,10 @@ def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(g
     _fill_step0(app, folder=folder, neighbours="30")
     app._step0_to_step1()
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
-    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf", "OUR 32 OLD.pdf"]
-    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in app._step0_lines)
-    assert any("Отправляю в Шаг 1 (3 PDF)" in line for line in app._step0_lines)
+    # Старый документ нашего участка хранится в папке, но в набор Шага 1 не передаётся (решение пользователя).
+    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
+    assert any("В manifest не было LOT 30 NEW.pdf" in line for line in _step0_texts(app))
+    assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in _step0_texts(app))
 
 
 def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gui, tmp_path):
@@ -3655,7 +3735,7 @@ def test_handover_falls_back_to_full_neighbour_pdf_if_trimmed_copy_is_missing(gu
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
     assert "LOT 30 NEW.pdf" in names
     assert any("отсутствует; передаю полный документ LOT 30 NEW.pdf" in line
-               for line in app._step0_lines)
+               for line in _step0_texts(app))
 
 
 def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
@@ -3672,9 +3752,9 @@ def test_step0_action_log_entries_have_local_time(gui, tmp_path, monkeypatch):
     _fill_step0(app, folder=tmp_path)
     app._start_step0_intake()
     _wait_step0(app)
-    lines = [line for line in app._step0_lines if "список документов" in line]
+    lines = [line for line in _step0_texts(app) if "список документов" in line]
     assert lines and re.match(r"^\[\d{2}:\d{2}:\d{2}\]", lines[0])
-    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", app._step0_lines[0])
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", _step0_texts(app)[0])
 
 
 def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, monkeypatch):
@@ -3697,7 +3777,7 @@ def test_step0_ocr_dpi_is_saved_and_passed_to_description_search(gui, tmp_path, 
     _wait_step0(app)
     assert captured["ocr_dpi"] == 88
     assert saved_configs and saved_configs[-1]["ocr"]["dpi"] == 88
-    assert any("OCR: 88 dpi" in line for line in app._step0_lines)
+    assert any("OCR: 88 dpi" in line for line in _step0_texts(app))
 
 
 def test_step0_rejects_invalid_ocr_dpi(gui):
@@ -3775,7 +3855,7 @@ def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_pa
     assert app.step0_lot_var.get() == "70"
     assert app.step0_neighbours_var.get() == "68, 72"
     assert app._session_llm_calls == 1
-    assert any("соседи слева/справа 68 / 72" in line for line in app._step0_lines)
+    assert any("соседи слева/справа 68 / 72" in line for line in _step0_texts(app))
     assert app.step0_run_button.cget("state") == "normal"
 
 
@@ -3970,6 +4050,46 @@ def test_update_version_requires_a_source_url_before_running(gui):
     assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
 
 
+def test_update_version_shows_download_percent_backup_and_install_stages(gui, monkeypatch):
+    """Полоса и подпись проходят все этапы: скачивание в процентах, резерв, установка, готово."""
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    shown = []
+    real_show = app._show_update_stage
+
+    def spy(name, fraction, detail):
+        shown.append((name, fraction))
+        real_show(name, fraction, detail)
+
+    monkeypatch.setattr(app, "_show_update_stage", spy)
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+        on_stage("download", 0.42, "1.0 из 2.4 МБ")
+        on_stage("backup", 1.0, "файлов: 3 из 3")
+        on_stage("install", 0.5, "файлов: 4 из 8")
+        return gui.app_updater.UpdateResult(zip_url="z", files_written=8, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+
+    import time
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+    names = [name for name, _ in shown]
+    assert names[0] == "download"
+    assert "backup" in names and "install" in names
+    assert names.index("backup") < names.index("install")
+    assert ("download", 0.42) in shown
+    assert app.update_progress_bar.get() == 1.0  # по итогам успешного обновления полоса полная
+
+
 def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypatch):
     from tkinter import messagebox
 
@@ -3977,7 +4097,7 @@ def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypa
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         assert source == "https://github.com/Berber86/CAD/tree/main"
         if progress:
             progress("скачиваю архив обновления: https://codeload.github.com/...")
@@ -4006,7 +4126,7 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         return gui.app_updater.UpdateResult(
             zip_url="https://codeload...",
             files_written=42,
@@ -4031,6 +4151,100 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     assert "сохранены" in status_text.lower()
 
 
+def _finish_update(app, gui, monkeypatch, files=7):
+    """Запускает обновление с подменённым архивом и дожидается его конца."""
+    import time
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+        return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=files, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
+    app._start_update_version()
+    end = time.monotonic() + 5
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
+
+
+def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
+    """Регресс: после обновления показывается вопрос о перезапуске и запускается run.bat."""
+    import subprocess
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (asked.append((title, text)) or True))
+    launched: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+    exit_codes: list[int] = []
+    monkeypatch.setattr(app, "_exit_process", lambda code: exit_codes.append(code))
+
+    _finish_update(app, gui, monkeypatch)
+
+    restart_questions = [text for title, text in asked if title == "Обновление завершено"]
+    assert restart_questions, "вопрос о перезапуске не показан"
+    assert "Перезапустить" in restart_questions[0]
+    assert launched, "run.bat не запущен"
+    assert launched[0][:3] == ["cmd", "/c", "start"]
+    assert launched[0][-1].endswith("run.bat")
+    # run.bat ищется рядом с main.py, а не в текущей папке запуска.
+    from pathlib import Path as _Path
+
+    assert _Path(launched[0][-1]) == _Path(gui.__file__).resolve().parent / "run.bat"
+    assert destroyed, "окно должно закрыться после успешного запуска нового экземпляра"
+    assert exit_codes == [0], "процесс старой версии должен завершиться, иначе окно run.bat висит"
+
+
+def test_failed_restart_keeps_window_and_says_how_to_restart(gui, monkeypatch):
+    import subprocess
+    from tkinter import messagebox
+
+    app = gui.SurveyApp()
+    app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+
+    def refuse(args, **kw):
+        raise PermissionError("доступ запрещён")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+
+    _finish_update(app, gui, monkeypatch)
+
+    assert not destroyed, "нельзя закрывать программу, если новый экземпляр не запущен"
+    text = app.update_status_label.cget("text")
+    assert "7" in text, "итог обновления не должен пропасть"
+    assert "вручную" in text and "run.bat" in text
+    assert "доступ запрещён" in text
+
+
+def test_one_failing_event_does_not_stop_the_queue(gui, monkeypatch):
+    """Регресс: исключение в обработчике не должно остановить разбор следующих событий."""
+    app = gui.SurveyApp()
+
+    def boom():
+        raise RuntimeError("тестовый сбой")
+
+    monkeypatch.setattr(app, "_finish_busy", boom)
+    app._events.put((app._generation, "done", None))
+    app._events.put((app._generation, "update_progress", "шаг после сбоя"))
+    app._drain_events()
+    # Событие после сбоя обработано: очередь не остановилась.
+    assert app.update_status_label.cget("text") == "шаг после сбоя"
+
+    # Сам сбой виден в строке статуса, если он был последним событием.
+    app._events.put((app._generation, "done", None))
+    app._drain_events()
+    assert "тестовый сбой" in app.status_var.get()
+
+
 def test_update_version_declined_confirmation_does_not_run(gui, monkeypatch):
     from tkinter import messagebox
 
@@ -4051,7 +4265,7 @@ def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def boom(source, app_dir, *, progress=None, timeout=60.0):
+    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
         raise gui.app_updater.UpdateError("сеть недоступна")
 
     monkeypatch.setattr(gui.app_updater, "apply_update", boom)
@@ -4086,3 +4300,198 @@ def test_update_source_url_autosaves_and_survives_restart(gui, tmp_path, monkeyp
     second = gui.SurveyApp()
     assert second.update_source_var.get() == "https://github.com/Berber86/CAD/tree/arena/53e1068f-cad"
     second._on_close()
+
+
+def _write_backup_fixture(app_dir):
+    """Старая версия в резерве, новая установлена поверх: как после обновления."""
+    from app_updater import create_backup
+
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "main.py").write_text("old main", encoding="utf-8")
+    (app_dir / "version.py").write_text("APP_VERSION = '3.42'\n", encoding="utf-8")
+    create_backup(app_dir, ["main.py", "version.py", "fresh.py"])
+    (app_dir / "main.py").write_text("new main", encoding="utf-8")
+    (app_dir / "fresh.py").write_text("new file", encoding="utf-8")
+
+
+def test_rollback_button_is_off_without_backups(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: tmp_path)
+    app._refresh_rollback_state()
+    assert app.rollback_button.cget("state") == "disabled"
+    assert "Резервных копий нет" in app.rollback_status_label.cget("text")
+
+
+def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path, monkeypatch):
+    import subprocess
+    from tkinter import messagebox
+
+    app_dir = tmp_path / "app"
+    _write_backup_fixture(app_dir)
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: app_dir)
+    app._refresh_rollback_state()
+    assert app.rollback_button.cget("state") == "normal"
+    assert "3.42" in app.rollback_status_label.cget("text")
+
+    questions: list[tuple[str, str]] = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (questions.append((title, text)) or True))
+    launched: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+    exit_codes: list[int] = []
+    monkeypatch.setattr(app, "_exit_process", lambda code: exit_codes.append(code))
+
+    app._start_rollback()
+
+    assert (app_dir / "main.py").read_text(encoding="utf-8") == "old main"
+    assert not (app_dir / "fresh.py").exists()
+    assert any(title == "Откат версии" for title, _ in questions)
+    assert any(title == "Откат выполнен" for title, _ in questions)
+    assert launched and launched[0][-1].endswith("run.bat")
+    assert destroyed
+    assert exit_codes == [0]
+    assert app.rollback_button.cget("state") == "disabled"
+
+
+def test_rollback_is_refused_while_an_update_is_running(gui, tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    _write_backup_fixture(app_dir)
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_update_dir", lambda: app_dir)
+    app._update_running = True
+
+    app._start_rollback()
+
+    assert (app_dir / "main.py").read_text(encoding="utf-8") == "new main"
+    assert "Дождитесь" in app.status_var.get()
+
+
+def test_child_report_windows_are_attached_to_the_main_window(gui):
+    """Окна-отчёты привязаны к главному окну (transient) и поднимаются при открытии."""
+
+    class _Win:
+        def __init__(self):
+            self.calls = []
+
+        def transient(self, master):
+            self.calls.append(("transient", master))
+
+        def lift(self):
+            self.calls.append(("lift",))
+
+    app = gui.SurveyApp()
+    win = _Win()
+    app._attach_child_window(win)
+    assert win.calls == [("transient", app), ("lift",)]
+
+
+def test_step0_portal_worker_receives_fast_mode_flag(gui, monkeypatch, tmp_path):
+    """Галочка «быстрая работа» доходит до поиска по адресу, а не только до сбора документов."""
+    import nyc_portal as portal_module
+
+    app = gui.SurveyApp()
+    received = {}
+
+    def fake_lookup(address, folder, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("стоп")
+
+    monkeypatch.setattr(portal_module, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", True, 3.5)
+    assert received.get("fast_mode") is True
+    assert received.get("fast_pause_sec") == 3.5
+
+
+def test_fast_pause_field_sits_next_to_the_checkbox_and_defaults_to_five(gui):
+    app = gui.SurveyApp()
+    assert app.step0_fast_pause_var.get() == "5"
+    assert app._step0_fast_pause_value() == 5.0  # без галочки значение не важно
+    app.step0_fast_mode_var.set(True)
+    app.step0_fast_pause_var.set("3,5")
+    assert app._step0_fast_pause_value() == 3.5
+
+
+def test_wrong_fast_pause_stops_the_portal_lookup_before_it_starts(gui, monkeypatch):
+    import nyc_portal as portal_module
+
+    app = gui.SurveyApp()
+    started = []
+    monkeypatch.setattr(portal_module, "lookup_parcel", lambda *a, **k: started.append(True))
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_fast_mode_var.set(True)
+    app.step0_fast_pause_var.set("7")
+    app._start_step0_portal_lookup()
+    assert not started
+    assert "от 1 до 5" in app.status_var.get()
+
+
+
+def test_log_mode_switch_saves_to_config_and_keeps_other_keys(gui):
+    import json  # noqa: PLC0415
+
+    before = json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))
+    app = gui.SurveyApp()
+    assert app._log_mode() == gui.log_mode.SIMPLE  # по умолчанию упрощённый
+
+    app.log_mode_var.set(True)  # то же, что щелчок по переключателю
+    app._apply_log_mode()
+    after = json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert after["ui"]["log_mode"] == "full"
+    expected = json.loads(json.dumps(before))
+    expected.setdefault("ui", {})["log_mode"] = "full"
+    assert after == expected
+
+    app.log_mode_var.set(False)
+    app._apply_log_mode()
+    assert json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))["ui"]["log_mode"] == "simple"
+
+
+def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
+    """«Начертить» добавляет черновик для печати только к основному участку и только при enabled."""
+    from types import SimpleNamespace
+
+    from llm_parser import ASPENWALL_SAMPLES, load_config, parse_with_regex
+
+    main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
+    main_plan = gui.AcadBuilder(load_config()).plan(main_desc, scale=10, is_neighbor=False)
+    print_cfg = dict(load_config().get("print_draft") or {})
+    assert print_cfg, "в config.json должна быть секция print_draft"
+
+    def owner(plan, enabled):
+        cfg = {"print_draft": {**print_cfg, "enabled": enabled}}
+        return SimpleNamespace(
+            _preview_main_plan=plan, config_data=cfg, _plan_source_labels={id(plan): "тест"},
+        )
+
+    drafts = gui.SurveyApp._print_draft_plans(owner(main_plan, True))
+    assert len(drafts) == 1
+    name, draft = drafts[0]
+    assert name.startswith("Черновик для печати") and draft.print_draft is True
+    assert draft.is_neighbor is False
+    assert gui.SurveyApp._print_draft_plans(owner(main_plan, False)) == []
+    assert gui.SurveyApp._print_draft_plans(owner(None, True)) == []
+
+
+
+def test_start_source_setting_opens_chosen_tab_and_saves_choice(gui, tmp_path, monkeypatch):
+    """Настройка «стартовая вкладка»: открывается выбранный источник, выбор сохраняется в config.json."""
+    import json
+
+    import llm_parser
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"ui": {"start_source": "pdf"}}), encoding="utf-8")
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(gui, "load_config", lambda path=cfg_path: llm_parser.load_config(path))
+
+    app = gui.SurveyApp()
+    assert app.source_mode_var.get() == "📄 PDF"
+
+    # Выбор в шторке не меняет текущую вкладку, а пишет настройку.
+    app.start_source_var.set("📝 Текст")
+    app._on_start_source_changed()
+    assert app.source_mode_var.get() == "📄 PDF"
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["ui"]["start_source"] == "text"

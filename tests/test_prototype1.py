@@ -259,7 +259,7 @@ def test_parse_full_offline_uses_regex():
 def test_config_loads_and_env_key(monkeypatch):
     cfg = load_config()
     assert cfg["drawing"]["base_scale"] == 16.0
-    assert cfg["layers"]["property_line"] == "PROPERTY_LINE"
+    assert cfg["layers"]["property_line"] == "PL"
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     assert load_config()["api"]["api_key"] == "sk-test"
 
@@ -370,7 +370,7 @@ class FakeLayer:
 
 class FakeLayers:
     def __init__(self):
-        self._items = {name: FakeLayer(name) for name in ("0", "PROPERTY_LINE", "BOUNDARY_TEXT_AI")}
+        self._items = {name: FakeLayer(name) for name in ("0", "PL", "D-TOPO-TEXT")}
 
     def Add(self, name):
         self._items[name] = FakeLayer(name)
@@ -384,7 +384,7 @@ class FakeLayers:
 
 
 class FakeTextStyle:
-    Name = "AI_BOUNDARY"
+    Name = "BOUNDARY"
 
     def SetFont(self, *args):
         self.font = args[0]
@@ -453,20 +453,21 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     space = app.doc.ModelSpace
     # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
     assert len(space.polylines) == 0
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     assert len(prop_lines) == 4
     assert result.boundary_line_count == 4
-    # 4 стороны + фасадная улица + пересекаемая улица + расстояние до угла
-    assert result.text_count == 7
+    # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
+    assert result.text_count == 8
     texts = {item.TextString for item in space.texts}
-    assert "MAIN STREET" in texts
-    assert "OAK AVENUE" in texts
+    assert "MAIN  STREET" in texts  # два пробела между словами названия улицы
+    assert "(XX' WIDE)" in texts  # ширины в описании нет — место для ручного заполнения
+    assert "OAK  AVENUE" in texts
     assert any(item.startswith("N 75%%d20'20\" E") for item in texts)
     assert result.text_height == pytest.approx(0.9 * 10.0 / 16.0)
     assert result.closure.distance < 1e-6
     assert app.zoomed is True
     # подписи создаются в слое текста и с выравниванием MiddleCenter
-    assert {item.Layer for item in space.texts} == {"BOUNDARY_TEXT_AI"}
+    assert {item.Layer for item in space.texts} == {"D-TOPO-TEXT"}
     assert {item.Alignment for item in space.texts} == {10}
 
 
@@ -494,7 +495,8 @@ def test_front_side_drives_street_label_placement():
     street = next(item for item in plan.items if item.kind == "main-street")
     side_one = next(item for item in plan.items if item.kind == "side-1")
     # Фасад смотрит на север -> крупная подпись улицы над первой (северной) стороной.
-    assert math.dist(street.point, side_one.point) < 6.0
+    # Под названием теперь стоит строка ширины, поэтому группа подписей сдвинута на один шаг.
+    assert math.dist(street.point, side_one.point) < 6.0 + 2.05 * plan.text_height
     assert street.height is not None and street.height > plan.text_height * 1.5
     assert point_in_polygon(street.point, plan.vertices) is False
 
@@ -510,12 +512,26 @@ def test_front_side_selection_uses_geometry():
 
 
 def test_llm_not_configured_raises_clear_error():
+    """Ошибка без ключа — только когда ИИ нужен: текст, который не прошёл локальную проверку."""
     from llm_parser import LLMParseError, parse_legal_description_full
 
     cfg = load_config()
     cfg["api"]["api_key"] = ""
+    # Хаотичный кеш (плитки 2×2): локально не сходится, значит ИИ нужен и ключа нет.
+    unchecked = (Path(__file__).parent / "data" / "lot114_cache_chaos.txt").read_text(encoding="utf-8-sig")
     with pytest.raises(LLMParseError):
-        parse_legal_description_full(text=EXAMPLE, cfg=cfg, use_llm=True)
+        parse_legal_description_full(text=unchecked, cfg=cfg, use_llm=True)
+
+
+def test_checked_text_skips_llm_even_without_key():
+    """Текст сходится сам (замыкание, румбы, числа) — ИИ не вызывается, ключ не нужен."""
+    from llm_parser import parse_legal_description_full
+
+    cfg = load_config()
+    cfg["api"]["api_key"] = ""
+    outcome = parse_legal_description_full(text=EXAMPLE, cfg=cfg, use_llm=True)
+    assert outcome.source == "regex"
+    assert outcome.check is not None and outcome.check.ok
 
 
 # ------------------------------------------ LLM-путь на подменённом клиенте --
@@ -857,8 +873,8 @@ def test_config_matches_shipped_file():
             assert key in shipped[section], f"{section}.{key} отсутствует в config.json"
     assert shipped["drawing"]["base_scale"] == 16.0
     assert shipped["drawing"]["base_text_height"] == 0.9
-    assert shipped["layers"]["property_line"] == "PROPERTY_LINE"
-    assert shipped["layers"]["boundary_text"] == "BOUNDARY_TEXT_AI"
+    assert shipped["layers"]["property_line"] == "PL"
+    assert shipped["layers"]["boundary_text"] == "D-TOPO-TEXT"
 
 
 def test_scale_menu_helpers():
@@ -954,8 +970,9 @@ def test_nyc_dartmouth_loop_commencing_tie_and_narrow_townhouse():
     assert by_kind["side-1"].text == "14.00'"
     assert by_kind["side-1-note"].text == 'S 33%%d58\'44" W'
     assert "125.00'" in by_kind["side-2"].text and "side-2-note" not in by_kind
-    assert by_kind["main-street"].text == "DARTMOUTH LOOP"
-    assert by_kind["main-street-note"].text == "(38' WIDE ROADWAY EASEMENT)"
+    assert by_kind["main-street"].text == "DARTMOUTH  LOOP"
+    assert by_kind["main-street-note"].text == "(38' WIDE)"
+    assert by_kind["main-street-note-extra"].text == "(ROADWAY EASEMENT)"
     # Cross street ориентирована перпендикулярно фасадной улице
     rot_diff = abs(by_kind["cross-street"].rotation - by_kind["main-street"].rotation)
     assert rot_diff == pytest.approx(math.pi / 2.0, abs=1e-6)
@@ -1053,7 +1070,7 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
     assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
-    assert by_kind["cross-street"].text == "63RD STREET"
+    assert by_kind["cross-street"].text == "63RD  STREET"
     assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
     assert "cross-street-distance" not in by_kind
 
@@ -1226,15 +1243,16 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     space = app.doc.ModelSpace
     assert len(space.polylines) == 0
     assert len(space.arcs) == 1
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
-    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert len(prop_lines) == 4
     assert len(street_lines) == 4
-    assert space.arcs[0].Layer == "BOUNDARY_TEXT_AI"
+    assert space.arcs[0].Layer == "D-TOPO-TEXT"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
-    assert result.warnings == []
+    # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
+    assert [w for w in result.warnings if "окно листа" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
@@ -1445,7 +1463,7 @@ def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monke
     builder._app, builder._doc = app, app.doc
     builder.draw(desc, scale=16.0)
     assert app.doc.ActiveSpace == 1
-    style = app.doc.TextStyles.Item("AI_BOUNDARY")
+    style = app.doc.TextStyles.Item("BOUNDARY")
     assert getattr(style, "fontFile", None) == "romans.shx"
     assert getattr(style, "Height", None) == 0.0
 
@@ -1513,7 +1531,7 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     """
     Совместная отрисовка основного участка (420') и двух соседей (365' и 475')
     в один активный ModelSpace AutoCAD:
-      * основной участок — слой PROPERTY_LINE + BOUNDARY_TEXT_AI + STREET_ROW_AI;
+      * основной участок — слой PL + D-TOPO-TEXT + M-ROW-LINE;
       * соседи — замкнутая полилиния в слое NEIGHBOR_LOT (acCyan = 4), БЕЗ подписей
         сторон/углов/улиц, только 1 компактная метка внутри центроида полигона.
     """
@@ -1541,9 +1559,9 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
 
     space = app.doc.ModelSpace
     assert len(space.polyline_entities) == 0
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
-    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert len(prop_lines) == 4
     assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
@@ -1558,8 +1576,8 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
 
     neighbor_texts = space.texts[-2:]
     assert [t.TextString for t in neighbor_texts] == [
-        "NEIGHBOR (365' from corner)",
-        "NEIGHBOR (475' from corner)",
+        "NEIGHBOR (365')",
+        "NEIGHBOR (475')",
     ]
     assert {t.Layer for t in neighbor_texts} == {"NEIGHBOR_LOT"}
     assert point_in_polygon(res_left.plan.items[0].point, res_left.vertices) is True
@@ -2800,9 +2818,10 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     assert first.plan is main_plan and second.plan is neighbor_plan
     assert first.text_height == main_plan.text_height
     space = app.doc.ModelSpace
-    for layer, edges in (("PROPERTY_LINE", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+    for layer, edges in (("PL", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
         lines = [line for line in space.lines if line.Layer == layer]
         assert len(lines) == len(edges)
+        # Перекрёсток (0, 0) плана в AutoCAD встаёт в окно листа (5000, 5000) — см. config drawing.
         for line, (start, end) in zip(lines, edges):
-            assert line.StartPoint == pytest.approx([*start, 0])
-            assert line.EndPoint == pytest.approx([*end, 0])
+            assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
+            assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])

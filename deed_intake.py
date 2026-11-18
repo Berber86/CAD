@@ -5,7 +5,8 @@
 
 1. ``rcclerk.results_url`` → страница списка документов участка;
 2. ``rcclerk.parse_document_rows`` + ``rcclerk.choose_documents`` → что качать
-   (Deed, иначе Mortgage; нашему лоту — свежий и старый, соседу — свежий);
+   (Deed новее 2015 года, иначе свежая Mortgage с 2015 года и древний Deed как старый;
+   нашему лоту — свежий и старый, соседу — свежий);
 3. ``rcclerk.download_with_fallback`` → лестница «прямо → браузер → человек»;
 4. ``deed_pages`` + ``deed_store`` → страницы описания, обрезанная копия, имя,
    паспорт, ``_manifest.json``.
@@ -126,7 +127,14 @@ def _default_downloader(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, 
     return rcclerk.download_with_fallback(row.endorsement_id, destination)
 
 
-def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, base_url: str = rcclerk.BASE_URL):
+def make_downloader(
+    *,
+    auto_save=None,
+    downloads_dir: str | Path | None = None,
+    base_url: str = rcclerk.BASE_URL,
+    progress: Progress | None = None,
+    should_stop: StopCheck | None = None,
+):
     """
     Загрузчик по лестнице; при поддержке Windows безопасно нажимает Ctrl+S в
     браузере только после того, как просмотрщик PDF уже загружен.
@@ -136,6 +144,10 @@ def make_downloader(*, auto_save=None, downloads_dir: str | Path | None = None, 
         options: dict = {"base": base_url}
         if downloads_dir is not None:
             options["downloads_dir"] = downloads_dir
+        if progress is not None:
+            options["on_step"] = progress  # шаги лестницы видны в журнале Шага 0
+        if should_stop is not None:
+            options["should_stop"] = should_stop  # «Стоп» прерывает ожидание сразу
         if auto_save is not None:
             options["auto_save"] = auto_save
         return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
@@ -193,7 +205,8 @@ def collect_deeds(
 
     fetch = fetch_list or _default_fetch_list
     download = downloader or make_downloader(
-        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url
+        auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url,
+        progress=progress, should_stop=should_stop,
     )
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
@@ -233,7 +246,11 @@ def collect_deeds(
                 f"страница пустая или устроена иначе: {rcclerk.results_url(block_no, lot_value, base=base_url)}"
             )
             continue
-        say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}")
+        listed = "; ".join(
+            f"{row.doc_type or '?'} {row.doc_date.strftime('%d.%m.%Y') if row.doc_date else 'без даты'}"
+            for row in rows
+        )
+        say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}: {listed}")
         chosen = rcclerk.choose_documents(
             rows, role=role, with_old_for_neighbour=with_old_for_neighbour
         )
@@ -288,6 +305,8 @@ def _collect_one(
         raw = Path(tmp) / f"{name}.pdf"
         try:
             result = download(row, raw)
+        except rcclerk.DownloadStopped as exc:
+            raise IntakeCancelled(str(exc) or "сбор описаний остановлен") from exc
         except (rcclerk.CloudflareBlocked, rcclerk.ManualStepNeeded) as exc:
             missing.append(f"{name}: нужен ручной шаг — {exc}")
             return None
@@ -376,13 +395,12 @@ def adopt_downloads(
     """
     Забрать из «Загрузок» самый свежий PDF и положить его по схеме.
 
-    Это ступень 2 лестницы, вызванная вручную: браузер уже скачал файл, программа
-    больше не ждёт, а забирает готовое.
+    Ручной вход: браузер уже скачал файл, программа больше не ждёт, а забирает готовое.
     """
     target = Path(folder)
     target.mkdir(parents=True, exist_ok=True)
     source = rcclerk.find_new_pdf(downloads) if downloads is not None else rcclerk.find_new_pdf(
-        rcclerk._default_downloads_dir()  # noqa: SLF001 - та же папка, что у лестницы
+        rcclerk._default_downloads_dir()  # noqa: SLF001 - та же папка, что у загрузки документа
     )
     if source is None:
         return None

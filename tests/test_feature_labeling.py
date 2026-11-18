@@ -1793,15 +1793,15 @@ def test_labels_use_the_text_style_of_the_drawing(com):
     created = [e for e in doc.ModelSpace.created if e.ObjectName in {"AcDbText", "AcDbMText"}]
     assert {e.StyleName for e in created if e.Layer == "D-TOPO-TEXT"} == {"ROMANS"}
     assert {e.StyleName for e in created if e.Layer == "0"} == {"RDS"}
-    assert "AI_BOUNDARY" not in doc.TextStyles.items
+    assert set(doc.TextStyles.items) == {"Standard", "ROMANS", "RDS"}  # свой стиль не создан
     assert "Стиль текста подписей: ROMANS (стиль чертежа)" in result.report()
 
     # Стиля заказчика нет — создаётся стиль программы.
     builder, _app, doc = com(load_brooklyn())
     result = builder.label_features(house_text=BROOKLYN_HOUSE)
-    assert (result.text_style, result.text_style_native) == ("AI_BOUNDARY", False)
-    assert "AI_BOUNDARY" in doc.TextStyles.items
-    assert "Стиль текста подписей: AI_BOUNDARY (создан программой" in result.report()
+    assert (result.text_style, result.text_style_native) == ("BOUNDARY", False)
+    assert "BOUNDARY" in doc.TextStyles.items
+    assert "Стиль текста подписей: BOUNDARY (создан программой" in result.report()
 
 
 def test_arc_leader_is_a_polyline_with_wedge_arrow(com):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 import ocr_pages
+import pdf_set
 from llm_parser import PDFError, has_legal_courses
 
 DESCRIPTION = (
@@ -129,7 +130,7 @@ def test_scan_becomes_a_free_source_when_ocr_is_available(tmp_path, ocr_ready):
     assert item.use_llm is False and item.ocr_ok is True and item.uses_ocr() is True
     assert item.mode_label() == "локальный OCR, бесплатно"
     assert item.parse_source() == {
-        "ocr_path": scan, "ocr_pages": "1", "ocr_dpi": ocr_pages.DEFAULT_DPI,
+        "ocr_path": scan, "ocr_pages": "1", "ocr_dpi": pdf_set.SCAN_OCR_DPI,
     }
 
 
@@ -236,8 +237,8 @@ def test_render_dpi_honours_low_request_and_keeps_200_floor_for_normal_scan_ocr(
         doc.close()
 
 
-def test_unreadable_page_is_retried_in_tiles(tmp_path, monkeypatch):
-    """Плотная страница не читается целиком — второй заход по кускам 2×2."""
+def test_unreadable_page_is_read_once_without_tiles(tmp_path, monkeypatch):
+    """Один проход на максимальном dpi: плотная страница не перечитывается кусками 2×2."""
     from pdf_set import resolve_ocr_source
 
     monkeypatch.setenv("TITLESURVEY_OCR_CACHE", str(tmp_path / "cache"))
@@ -246,9 +247,10 @@ def test_unreadable_page_is_retried_in_tiles(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr_pages, "_engine", engine)
     scan = _scan_pdf(tmp_path / "dense.pdf", DESCRIPTION, dpi=200)  # 1700 px по ширине
 
-    resolved = resolve_ocr_source({"ocr_path": scan, "ocr_pages": "1"})
-    assert has_legal_courses(resolved["text"]) and "176.92" in resolved["text"]
-    assert engine.calls > 1 and min(engine.widths) < 1500  # куски действительно мельче
+    with pytest.raises(PDFError):
+        resolve_ocr_source({"ocr_path": scan, "ocr_pages": "1"})
+    assert engine.calls == 1, "второго захода кусками 2×2 быть не должно"
+    assert min(engine.widths) >= 1500
 
 
 def test_ocr_sorts_lines_top_down():
@@ -306,6 +308,7 @@ def test_scan_in_the_set_is_read_locally_and_built(gui, tmp_path, monkeypatch):
         lambda **kwargs: calls.append(kwargs) or real(**kwargs),
     )
     app = gui.SurveyApp()
+    app.log_mode_var.set(True)  # этот тест проверяет подробный текст отчёта
     from tkinter import filedialog
 
     monkeypatch.setattr(
@@ -328,7 +331,7 @@ def test_scan_in_the_set_is_read_locally_and_built(gui, tmp_path, monkeypatch):
     assert len(calls) == 2
     assert all("pdf_path" not in kwargs for kwargs in calls)
     report = app._pdf_set_report_window._report_text
-    assert "Сканов распознано локально (OCR, бесплатно): 1" in report
+    assert "Сканов через OCR: 1 · без ИИ: 1" in report
     assert "текст страниц получен локальным OCR — платный запрос ИИ не делался" in report
     assert "локально, OCR" in app.neighbor_pdf_summary.cget("text")
 
@@ -405,3 +408,11 @@ def test_real_engine_reads_bearings_and_distances(tmp_path, monkeypatch):
     compact = "".join(text.split())
     for probe in ("176.92", "100.05", "40.00", "22°26"):
         assert probe in compact, (probe, text)
+
+
+def test_street_name_split_by_a_dot_or_dash_is_joined():
+    """Регресс OUR 70: «Carlton. Boulevard» и «Carlton-Boulevard» из OCR — одно название улицы."""
+    assert "Carlton Boulevard" in ocr_pages.restore_word_breaks("southwesterly side of Carlton. Boulevard; running")
+    assert "Carlton Boulevard" in ocr_pages.restore_word_breaks("Carlton-Boulevard; running")
+    # Обычная фраза со строчным словом не склеивается.
+    assert "the end. Street was" in ocr_pages.restore_word_breaks("the end. Street was")

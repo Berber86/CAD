@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
@@ -46,9 +47,12 @@ from acad_builder import (
     NeighborVerificationReport,
     _normalize_street_key,
     polygon_intersection_area,
+    segment_vector,
+    street_name_canon as acad_builder_street_canon,
     verify_with_neighbors,
 )
 from llm_parser import LegalDescription, Segment, bearing_label
+from street_names import share_street_aliases, with_shared_aliases
 from pdf_set import CLOSURE_LIMIT_FT
 
 #: Слово «southerly» допускает такой отход настоящего румба от стороны света.
@@ -87,6 +91,8 @@ class Change:
     distance_ft: float = 0.0
     old_label: str = ""
     new_label: str = ""
+    #: Для привязки к углу с новой длиной: задан ли и румб (иначе румб выводится сам).
+    bearing_set: bool = False
 
     @property
     def slot(self) -> tuple[str, int, str]:
@@ -94,9 +100,20 @@ class Change:
 
     @property
     def where(self) -> str:
+        if self.target == "street":
+            return "перекрёсток" if self.field == "cross" else "название улицы"
         return "привязка к углу" if self.target == "tie" else f"сторона #{self.index + 1}"
 
+    @property
+    def is_name(self) -> bool:
+        """Правка названия (перекрёсток или переименование улицы): геометрию не меняет."""
+        return self.target == "street"
+
     def describe(self) -> str:
+        if self.is_name:
+            if self.field == "cross":
+                return f"перекрёсток: «{self.old_label}» → «{self.new_label}»"
+            return f"название улицы: добавить «{self.new_label}»"
         what = "румб" if self.field == "bearing" else "длина"
         return f"{self.where}: {what} {self.old_label} → {self.new_label}"
 
@@ -109,6 +126,10 @@ class Metrics:
     overlap_sqft: float
     edge_errors: int
     edge_warnings: int
+    #: Расстояние до ближайшего соседнего контура (0 — общая граница есть).
+    gap_ft: float = 0.0
+    #: Из ошибок стыка — только уступы задней межи (короткая сторона внутри длинной, остаток — к третьему).
+    stepped_edges: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,7 +139,7 @@ class Proposal:
     id: str
     lot_key: str
     lot_name: str
-    kind: str  # "street_bearing" | "closing_course" | "neighbor_value" | "advisor"
+    kind: str  # "street_bearing" | "closing_course" | "neighbor_value" | "advisor" | "street_name"
     origin: str  # "rule" — правило Python, "ai" — ИИ-советник
     title: str
     changes: tuple[Change, ...]
@@ -144,6 +165,8 @@ class Proposal:
                 f"наложение на соседние участки {self.before.overlap_sqft:,.1f} → "
                 f"{self.after.overlap_sqft:,.1f} sq ft"
             )
+        if max(self.before.gap_ft, self.after.gap_ft) > 0.5:
+            parts.append(f"разрыв до соседа {self.before.gap_ft:,.2f} → {self.after.gap_ft:,.2f} ft")
         return " · ".join(parts)
 
 
@@ -194,6 +217,8 @@ class ConflictAnalysis:
     advisor_reply: AdvisorReply | None = None
     advisor_rejected: list[str] = field(default_factory=list)
     advisor_key: str = ""
+    #: "" — обычный разбор советника; иначе режим карты ("turn" или "shift").
+    join_mode: str = ""
     error: str = ""
 
     def proposal(self, proposal_id: str) -> Proposal | None:
@@ -281,7 +306,8 @@ class ConflictAnalysis:
             lines.append("")
             tag = f" ({reply.model})" if reply.model else ""
             when = "" if self.advisor_status == "ok" else " — получено ранее для этого же разбора"
-            lines.append(f"ИИ-СОВЕТНИК{tag}{when}:")
+            mode = " по карте" if self.join_mode else ""
+            lines.append(f"ИИ-СОВЕТНИК{mode}{tag}{when}:")
             if reply.analysis:
                 lines.append(f"  {reply.analysis}")
             for conflict, cause in reply.explanations:
@@ -415,6 +441,28 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
         return description
     data = description.model_dump()
     for change in changes:
+        if change.is_name:
+            if change.field == "cross":
+                data["cross_street"] = change.new_label
+            else:
+                aliases = list(data.get("street_aliases") or [])
+                if change.new_label not in aliases:
+                    aliases.append(change.new_label)
+                data["street_aliases"] = aliases
+            continue
+        if change.target == "tie" and change.field == "distance":
+            # Расстояние от угла улицы до POB. Румб: если советник дал — ставим его, иначе
+            # валидатор выведет румб по улице (или оставит прежний, если привязка уже есть).
+            data["distance_to_corner_ft"] = change.distance_ft
+            if change.bearing_set:
+                data["corner_to_pob_bearing"] = {
+                    "ns": change.ns, "degrees": change.degrees, "minutes": change.minutes,
+                    "seconds": change.seconds, "ew": change.ew,
+                    "distance_ft": change.distance_ft, "has_bearing": True,
+                }
+            elif data.get("corner_to_pob_bearing"):
+                data["corner_to_pob_bearing"]["distance_ft"] = change.distance_ft
+            continue
         if change.target == "tie":
             node = data.get("corner_to_pob_bearing")
             if not node:
@@ -451,6 +499,8 @@ class _Scene:
         self.lots = list(lots)
         self.scale = scale
         self._descriptions: dict[tuple[str, tuple[Change, ...]], LegalDescription | None] = {}
+        #: Переименования, напечатанные в любом описании набора: общие для всех участков набора.
+        self.shared_aliases = share_street_aliases(lot.description for lot in self.lots)
         self._plans: dict[tuple[str, tuple[Change, ...]], DrawPlan | None] = {}
         #: Подтверждённые находки, принятые «в уме» (после них считается остаток).
         self.virtual: dict[str, tuple[Change, ...]] = {}
@@ -459,7 +509,8 @@ class _Scene:
         key = (lot.key, tuple(extra))
         if key not in self._descriptions:
             try:
-                self._descriptions[key] = apply_changes(lot.description, fix_changes(lot.fixes) + tuple(extra))
+                built = apply_changes(lot.description, fix_changes(lot.fixes) + tuple(extra))
+                self._descriptions[key] = with_shared_aliases(built, self.shared_aliases)
             except Exception:  # noqa: BLE001 - пробная правка дала недопустимые данные
                 self._descriptions[key] = None
         return self._descriptions[key]
@@ -509,17 +560,46 @@ class _Scene:
             return None
         others = [p for _, p in self._others(lot, state or {})]
         overlap, errors, warnings = 0.0, 0, 0
+        gap = 0.0
+        stepped = 0
         if others:
             report = verify_with_neighbors(plan, others)
             overlap = sum(pair.overlap_area_sqft for pair in report.pair_reports)
             errors, warnings = report.error_count, report.warning_count
-        return Metrics(plan.closure.distance, overlap, errors, warnings)
+            gap = _nearest_gap_ft(plan, others)
+            for pair in report.pair_reports:
+                for edge in pair.shared_edges:
+                    if edge.status == "error" and edge.issue_codes and set(edge.issue_codes) == {"STEPPED_BOUNDARY_DEPTH"}:
+                        stepped += 1
+        return Metrics(plan.closure.distance, overlap, errors, warnings, gap, stepped)
+
+
+def _nearest_gap_ft(plan: DrawPlan, others: Sequence[DrawPlan]) -> float:
+    """Расстояние от контура участка до ближайшего соседнего контура (0 — касаются)."""
+    from shapely.geometry import Polygon
+
+    try:
+        mine = Polygon(plan.vertices)
+        if not mine.is_valid:
+            mine = mine.buffer(0)
+        gaps = []
+        for other in others:
+            poly = Polygon(other.vertices)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            gaps.append(mine.distance(poly))
+        return float(min(gaps)) if gaps else 0.0
+    except Exception:  # noqa: BLE001 - метрика не должна ломать разбор
+        return 0.0
 
 
 def judge(before: Metrics | None, after: Metrics | None) -> str:
     """
     Оценка пробной правки: ``verified`` — контур замыкается и хуже не стало,
     ``partial`` — стало заметно лучше, но не всё сошлось, ``rejected`` — пользы нет.
+
+    Правка, которая только ставит участок к соседу (уменьшает разрыв до него), —
+    ``partial``: её подтверждает человек, она не применяется «все подтверждённые».
     """
     if before is None or after is None:
         return "rejected"
@@ -531,11 +611,32 @@ def judge(before: Metrics | None, after: Metrics | None) -> str:
     overlap_better = overlap_gain > max(1.0, 0.5 * before.overlap_sqft)
     overlap_worse = overlap_gain < -max(1.0, 0.05 * before.overlap_sqft)
     edges_better = after.edge_errors < before.edge_errors and not overlap_worse and closure_gain > -0.02
-    if closure_worse or not (closure_better or overlap_better or edges_better):
+    gap_better = (before.gap_ft - after.gap_ft) > 1.0 and not overlap_worse
+    if closure_worse or not (closure_better or overlap_better or edges_better or gap_better):
         return "rejected"
     if overlap_worse and not closure_better:
         return "rejected"
+    if gap_better and not (closure_better or overlap_better or edges_better):
+        return "partial"
     return "verified" if closure_ok and not overlap_worse else "partial"
+
+
+def advisor_verdict(before: Metrics | None, after: Metrics | None, *, allow_stepped: bool = False) -> str:
+    """
+    Вердикт совета ИИ. Советник получает ``verified`` (его можно применить одним действием
+    «все подтверждённые») только если контур замыкается, наложения нет и общие межи совпадают
+    с соседями (ни одной ошибки стыка). Иначе вердикт остаётся ``partial`` — решает геодезист.
+
+    ``allow_stepped`` — для склейки по карте: уступ задней межи (короткая сторона внутри длинной,
+    остаток граничит с третьим участком) не считается ошибкой стыка.
+    """
+    verdict = judge(before, after)
+    if verdict != "verified" or after is None:
+        return verdict
+    stepped = after.stepped_edges if allow_stepped else 0
+    if after.closure_ft > CLOSURE_LIMIT_FT or after.edge_errors - stepped > 0:
+        return "partial"
+    return verdict
 
 
 def _proposal_id(lot: LotInput, changes: Sequence[Change]) -> str:
@@ -1181,6 +1282,13 @@ WORK THROUGH THIS CHECKLIST FOR EVERY REMAINING CONFLICT:
 6. The lots are not actually adjacent, or the wrong page or the wrong parcel was parsed.
 7. A genuine conflict between the recorded documents (the overlap or gap exists on paper). Say so plainly.
 
+GLUING SIDES AND ANCHORING A NEIGHBOUR TO A CORNER (read before you propose any tie change):
+- A shared boundary is a side of one lot that lies on the same line as a side of another lot: the two bearings are reversed (for example S 56 degrees 36 minutes 12 seconds E against N 56 degrees 36 minutes 12 seconds W) and the lengths are equal, or one length is a part of the other. A deeper lot's side may run past a shorter neighbour's side; the rest of it then borders a third lot. This is not an error. Check this on the printed values before you blame a tie or a length.
+- A lot may consist of several parcels printed in ONE document ("PARCEL I", "PARCEL II", "Parcel II being the same premises ..."). They form one lot. If a neighbour's point of beginning or side lies on the outer boundary of such a parcel and the figure does not contain that parcel, the figure is incomplete. Say so in the explanation. The operations you have cannot add a parcel: do not invent sides for it.
+- Anchoring: a neighbour's figure is attached to our figure through the street corner its own text names. Re-tying it to a different corner (cross_street, street_alias, or a tie distance) is allowed only when the names and numbers are printed in that lot's own text. If the neighbour's tie is measured from a corner whose position relative to our corner is not printed in any document (for example "distant 965.57 feet southeasterly from the corner formed by ... Boulevard and ... Road" while no document gives the distance from that corner to our corner), you cannot compute the offset. Do not invent a distance. Say that the neighbour must be placed by the shared boundary, name the two sides that coincide, and state which printed distance would settle it.
+- When our side and the neighbour's side coincide in direction and length but the neighbour's polygon sits off by a distance, the cause is the anchor (the tie), not the side lengths. Never change side lengths to remove that offset.
+- Python applies your proposal on its own only when the lot closes, nothing overlaps and every shared boundary fits its neighbour; otherwise the surveyor decides. Propose the change anyway when the printed values support it.
+
 HARD RULES:
 - Never invent numbers. A proposed value must be printed in one of the documents (quote the words) or follow from printed values by arithmetic that you state.
 - Never change a value only to make a polygon close.
@@ -1208,7 +1316,15 @@ OUTPUT: exactly one JSON object and nothing else:
     }
   ]
 }
-"target" is "side" (then "side" is the 1-based number of the side of that lot) or "tie" (the bearing from the street corner to the point of beginning). Give "bearing" in the traverse direction of that side, or null to keep it. Give "distance_ft" in decimal feet, or null to keep it. "source_lot" and "source_quote" may be null when the value is computed."""
+"target" is "side" (then "side" is the 1-based number of the side of that lot) or "tie" (the point of beginning relative to the street corner). For a side: "bearing" in the traverse direction of that side, or null to keep it; "distance_ft" in decimal feet, or null to keep it.
+For "tie" there are two operations:
+  - the distance from the street corner to the point of beginning, printed as "distant N feet <direction> from the corner": give "distance_ft": N (a number, decimal feet). Use this when the lot has no tie or the tie distance is wrong. Give "bearing" as the quadrant bearing of the course from the corner to the point of beginning if the document or a neighbour gives it, otherwise null (it is then derived from the street).
+  - only the bearing of an existing tie: "bearing" with "distance_ft": null.
+Two more operations change NAMES, not geometry. Python accepts them only when the name is printed in that lot's own text:
+  - {"target": "cross_street", "name": "Seaside Boulevard"}: the street that this lot's corner is tied to (the cross street), exactly as printed in this lot's document. Use it when the lot is attached to a different intersection only because its cross street is named differently or wrongly.
+  - {"target": "street_alias", "current": "Father Capodanno Blvd", "old": "Seaside Boulevard"}: a printed renaming ("X (now Y)", "Y (formerly X)", "f/k/a", "a/k/a", "also known as"). Both names must be printed in this lot's text, together with that marker.
+If a street name in a lot is misread (for example a neighbouring corner street spelled differently from the other documents), the fix MUST be a proposal with a cross_street or street_alias change, not only an explanation. Put a naming fix in its own proposal, with "changes" holding only these items, and quote the printed words in "source_quote".
+"source_lot" and "source_quote" may be null when the value is computed."""
 
 
 def _lot_block(
@@ -1231,6 +1347,8 @@ def _lot_block(
         f"  fronting street: {street}; cross street: {desc.cross_street or 'none'}; "
         f"lot faces: {desc.front_side or '?'}; block {desc.block_number or '?'}, lot {desc.lot_number or '?'}"
     )
+    if desc.street_aliases:
+        lines.append("  street names printed as renamed: " + "; ".join(desc.street_aliases))
     tie = desc.corner_to_pob_bearing
     if tie is not None and desc.distance_to_corner_ft > 1e-6:
         raw_tie = raw.corner_to_pob_bearing
@@ -1342,8 +1460,140 @@ def read_advisor_reply(data: Any) -> AdvisorReply:
     return reply
 
 
+_STREET_SUFFIX_FORMS: dict[str, tuple[str, ...]] = {
+    "avenue": ("avenue", "ave"), "ave": ("avenue", "ave"),
+    "boulevard": ("boulevard", "blvd"), "blvd": ("boulevard", "blvd"),
+    "street": ("street", "st"), "st": ("street", "st"),
+    "road": ("road", "rd"), "rd": ("road", "rd"),
+    "drive": ("drive", "dr"), "dr": ("drive", "dr"),
+    "place": ("place", "pl"), "pl": ("place", "pl"),
+    "lane": ("lane", "ln"), "ln": ("lane", "ln"),
+    "parkway": ("parkway", "pkwy"), "pkwy": ("parkway", "pkwy"),
+    "court": ("court", "ct"), "ct": ("court", "ct"),
+    "terrace": ("terrace", "ter"), "ter": ("terrace", "ter"),
+}
+# Слова о переименовании. «commonly known as» (адрес) и «now or formerly» (владелец) — не они.
+_RENAME_MARK_RE = re.compile(
+    r"\(now\b|now\s+known\s+as|(?<!or )formerly|previously|also\s+known\s+as|f/k/a|a/k/a",
+    re.IGNORECASE,
+)
+
+
+def _street_in_text(name: str, text: str) -> bool:
+    """
+    Напечатано ли название улицы в тексте описания. Пробелы, регистр и формы «Blvd» /
+    «Boulevard» не важны; остальные буквы — важны, поэтому чужая улица не совпадёт.
+    """
+    tokens = re.findall(r"[a-z0-9]+", str(name or "").lower())
+    forms: tuple[str, ...] = ()
+    if len(tokens) > 1 and tokens[-1] in _STREET_SUFFIX_FORMS:
+        forms = _STREET_SUFFIX_FORMS[tokens[-1]]
+        tokens = tokens[:-1]
+    core = "".join(tokens)
+    if not core:
+        return False
+    compact = re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+    tail = "(?:" + "|".join(forms) + ")" if forms else ""
+    return re.search(re.escape(core) + tail, compact) is not None
+
+
+_STREET_NAME_IN_TEXT_RE = re.compile(
+    r"((?:[A-Za-z][A-Za-z'.-]*\s+){0,3}[A-Za-z][A-Za-z'-]*)\s+("
+    + "|".join(sorted(_STREET_SUFFIX_FORMS, key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
+#: Насколько похожи два написания одной улицы (0..1), чтобы считать опиской, а не другой улицей.
+STREET_TYPO_SIMILARITY = 0.5
+
+
+def _street_name_proposals(scene: _Scene, lot: LotInput) -> list[Proposal]:
+    """
+    Перекрёсток, которого нет в тексте участка, но есть похожая улица, напечатанная в нём же
+    и подтверждённая соседом набора. Пример: «Boby Avenue» вместо напечатанного «Doty Avenue»,
+    а у соседа перекрёсток «Doty Avenue». Одна подходящая улица — находка; несколько — молчим.
+    Правка только названия: геометрию не меняет, поэтому вердикт «подтверждено частично».
+    """
+    text = lot.source_text or ""
+    base = scene.virtual.get(lot.key, ())
+    desc = scene.description(lot, base)
+    if desc is None or not desc.cross_street or not text.strip():
+        return []
+    if _street_in_text(desc.cross_street, text):
+        return []
+    cross_tokens = re.findall(r"[a-z0-9]+", desc.cross_street.lower())
+    if len(cross_tokens) < 2 or cross_tokens[-1] not in _STREET_SUFFIX_FORMS:
+        return []
+    cross_core = " ".join(cross_tokens[:-1])
+    cross_suffix = _STREET_SUFFIX_FORMS[cross_tokens[-1]][0]
+    canon = acad_builder_street_canon(*[scene.description(other, scene.virtual.get(other.key, ()))
+                                        or other.description for other in scene.lots])
+    own_main = canon(desc.main_street)
+    agreed = {
+        canon(street)
+        for other in scene.lots if other is not lot
+        for street in (other.description.cross_street, other.description.main_street)
+        if street
+    }
+    found: dict[str, str] = {}
+    width = len(cross_tokens) - 1
+    for match in _STREET_NAME_IN_TEXT_RE.finditer(text):
+        words = re.findall(r"[A-Za-z0-9]+", match.group(1))
+        suffix = match.group(2).lower()
+        if len(words) < width or width < 1:
+            continue
+        core_words = words[-width:]
+        candidate_core = " ".join(core_words).lower()
+        candidate_suffix = _STREET_SUFFIX_FORMS[suffix][0]
+        if candidate_suffix != cross_suffix:
+            continue
+        ratio = difflib.SequenceMatcher(None, cross_core, candidate_core).ratio()
+        if ratio < STREET_TYPO_SIMILARITY:
+            continue
+        full = " ".join(core_words) + " " + match.group(2)
+        key = canon(full)
+        if key == canon(desc.cross_street) or key == own_main or key not in agreed:
+            continue
+        found[key] = full
+    if len(found) != 1:
+        return []
+    new_name = next(iter(found.values()))
+    change = Change(
+        target="street", index=-1, field="cross", new_label=new_name, old_label=desc.cross_street,
+    )
+    before = scene.metrics(lot, base, state=scene.virtual)
+    after = scene.metrics(lot, base + (change,), state=scene.virtual)
+    if before is None or after is None:
+        return []
+    new_key = canon(new_name)
+    donor = next(
+        other for other in scene.lots if other is not lot and new_key in {
+            canon(other.description.cross_street), canon(other.description.main_street),
+        }
+    )
+    return [Proposal(
+        id=_proposal_id(lot, [change]), lot_key=lot.key, lot_name=lot.name, kind="street_name", origin="rule",
+        title=f"Перекрёсток: «{desc.cross_street}» → «{new_name}» (так напечатано в этом тексте)",
+        changes=(change,),
+        source=f"текст участка; та же улица у соседа «{donor.name}»",
+        reasons=(
+            f"«{new_name}» напечатано в тексте участка «{lot.name}»",
+            f"у соседа «{donor.name}» та же улица",
+            "геометрия не меняется: название подтверждено текстом и соседом",
+        ),
+        before=before, after=after, verdict="partial",
+    )]
+
+
 def _value_origin(scene: _Scene, lot: LotInput, change: Change) -> str | None:
     """Есть ли предложенное значение в разобранных данных какого-либо участка набора."""
+    if change.target == "tie" and change.field == "distance":
+        for other in scene.lots:
+            if other is lot:
+                continue
+            if abs(other.description.distance_to_corner_ft - change.distance_ft) <= 0.006:
+                return f"«{other.name}», привязка к углу ({other.description.distance_to_corner_ft:.2f}')"
+        return None
     for other in scene.lots:
         desc = other.description
         if change.field == "bearing":
@@ -1384,14 +1634,87 @@ def _advisor_proposals(
             continue
         changes: list[Change] = []
         problem = ""
+        text = lot.source_text or ""
         for raw in item.get("changes") or []:
             if not isinstance(raw, dict):
                 continue
-            target = "tie" if str(raw.get("target") or "side").strip().lower() == "tie" else "side"
+            kind = str(raw.get("target") or "").strip().lower()
+            if kind == "cross_street":
+                # Перекрёсток, к которому привязан участок: только название, напечатанное в его тексте.
+                name = " ".join(str(raw.get("name") or "").split())
+                if not name:
+                    problem = "не указано название пересекающей улицы"
+                    break
+                if not text.strip():
+                    problem = "у участка нет текста описания для проверки названия"
+                    break
+                if not _street_in_text(name, text):
+                    problem = f"«{name}» не напечатано в тексте описания этого участка"
+                    break
+                if desc.cross_street and _normalize_street_key(desc.cross_street) == _normalize_street_key(name):
+                    continue
+                changes.append(Change(
+                    target="street", index=-1, field="cross", new_label=name,
+                    old_label=desc.cross_street or "нет",
+                ))
+                continue
+            if kind == "street_alias":
+                current = " ".join(str(raw.get("current") or "").split())
+                old = " ".join(str(raw.get("old") or "").split())
+                if not current or not old:
+                    problem = "переименование должно содержать оба названия"
+                    break
+                if not text.strip():
+                    problem = "у участка нет текста описания для проверки переименования"
+                    break
+                if not (_street_in_text(current, text) and _street_in_text(old, text)):
+                    problem = f"«{current}» или «{old}» не напечатаны в тексте описания этого участка"
+                    break
+                if not _RENAME_MARK_RE.search(text):
+                    problem = "в тексте описания нет слова о переименовании (now / formerly / f/k/a)"
+                    break
+                label = f"{current} = {old}"
+                known = {" ".join(alias.split()).lower() for alias in (desc.street_aliases or [])}
+                if label.lower() in known:
+                    continue
+                changes.append(Change(target="street", index=-1, field="alias", new_label=label))
+                continue
+            target = "tie" if kind == "tie" else "side"
+            if target == "tie" and raw.get("distance_ft") not in (None, "", "null"):
+                # Советник задаёт расстояние от угла улицы до POB (и, если знает, румб привязки).
+                try:
+                    tie_distance = float(str(raw.get("distance_ft")).replace(",", ""))
+                except ValueError:
+                    problem = f"не удалось прочитать расстояние до угла «{raw.get('distance_ft')}»"
+                    break
+                if tie_distance <= 0:
+                    problem = "расстояние до угла должно быть больше нуля"
+                    break
+                if abs(tie_distance - desc.distance_to_corner_ft) <= 1e-6:
+                    continue
+                bearing_parts = None
+                if raw.get("bearing") not in (None, "", "null"):
+                    bearing_parts = parse_bearing_text(raw.get("bearing"))
+                    if bearing_parts is None:
+                        problem = f"не удалось прочитать румб привязки «{raw.get('bearing')}»"
+                        break
+                old_tie = desc.corner_to_pob_bearing
+                changes.append(Change(
+                    target="tie", index=-1, field="distance", distance_ft=tie_distance,
+                    ns=bearing_parts[0] if bearing_parts else (old_tie.ns if old_tie else "N"),
+                    degrees=bearing_parts[1] if bearing_parts else (old_tie.degrees if old_tie else 0),
+                    minutes=bearing_parts[2] if bearing_parts else (old_tie.minutes if old_tie else 0),
+                    seconds=bearing_parts[3] if bearing_parts else (old_tie.seconds if old_tie else 0.0),
+                    ew=bearing_parts[4] if bearing_parts else (old_tie.ew if old_tie else "E"),
+                    bearing_set=bearing_parts is not None,
+                    old_label=f"{desc.distance_to_corner_ft:.2f}'",
+                    new_label=f"{tie_distance:.2f}'" + (f" {_label(bearing_parts)}" if bearing_parts else ""),
+                ))
+                continue
             if target == "tie":
                 index, old = -1, desc.corner_to_pob_bearing
                 if old is None:
-                    problem = "у участка нет привязки к углу"
+                    problem = "у участка нет привязки к углу — дайте расстояние от угла (distance_ft)"
                     break
             else:
                 try:
@@ -1436,9 +1759,11 @@ def _advisor_proposals(
                 if tie_change is not None and not desc.segments[change.index].has_bearing:
                     changes.append(tie_change)
                     slots.add(tie_change.slot)
+        name_only = all(change.is_name for change in changes)
         before = scene.metrics(lot, base, state=scene.virtual)
         after = scene.metrics(lot, base + tuple(changes), state=scene.virtual)
-        verdict = judge(before, after)
+        # Правка названий геометрию не меняет: её подтверждает напечатанный текст, а не замер.
+        verdict = "partial" if name_only and before is not None and after is not None else advisor_verdict(before, after)
         if verdict == "rejected" or before is None or after is None:
             detail = (
                 "участок с такой правкой не строится" if after is None or before is None
@@ -1454,7 +1779,12 @@ def _advisor_proposals(
         reason = " ".join(str(item.get("reason") or "").split())
         if reason:
             reasons.append(f"довод советника: {reason}")
+        if name_only:
+            reasons.append("название подтверждено текстом описания этого участка; геометрия не меняется")
         for change in changes:
+            if change.is_name:
+                reasons.append(f"{change.where}: «{change.new_label}» напечатано в тексте участка «{lot.name}»")
+                continue
             origin = _value_origin(scene, lot, change)
             reasons.append(
                 f"{change.where}: значение {change.new_label} есть в разобранных данных — {origin}"
@@ -1486,6 +1816,401 @@ def advisor_cache_key(lots: Sequence[LotInput]) -> str:
     ]
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Склейка по карте: советник только соединяет фигуры (угол к углу, общая межа)
+# ---------------------------------------------------------------------------
+
+JOIN_SYSTEM_PROMPT = """You are a land surveyor's assistant. You join the figures of ADJACENT lots (New York City tax lots, metes-and-bounds descriptions).
+
+Python has parsed every lot and draws each figure from its own tie corner, which is the origin (0, 0) of the drawing. Image 1 is a sketch of the figures as the program places them now, with numbered corners and numbered sides. Coordinates are in feet. Other attached images are the document pages and, when present, the tax map.
+
+YOUR ONLY TASK: say which corner of our lot (L1) coincides with which corner of a neighbour, and which side of each is the shared boundary. Do nothing else. You do not change lengths, bearings, distances or names. Python moves the neighbour as a rigid body (no change of its shape or size) and checks the result numerically. A surveyor confirms it.
+
+NUMBERING: corner k is the start of side k; side k runs from corner k to corner k+1, and the last side ends at corner 1.
+
+A JOIN has: corner_a (a corner of L1), corner_b (a corner of the neighbour), side_a (a side of L1) and side_b (a side of the neighbour). The shared boundary is side_a of L1 and side_b of the neighbour. Python places the neighbour so that corner_b lands on corner_a and side_b lies along side_a on one line, running in the opposite direction, because the two lots are on opposite sides of their common boundary.
+
+RULES:
+- The shorter of the two shared sides must lie inside the longer one. A longer side may continue past the shorter one; the rest of it then borders a third lot. This is normal.
+- Both sides must have a printed bearing (not "NO BEARING PRINTED").
+- Use only the printed values and the printed words. Never invent a corner, a side or a number.
+- Choose the join from the documents: the printed streets, the printed tie of the neighbour and the printed courses along the boundary.
+- Join each neighbour at most once. An empty "joins" list is a valid answer when no join is clearly supported.
+
+OUTPUT: exactly one JSON object and nothing else:
+{
+  "analysis": "2 to 4 sentences in Russian: which boundary is shared and why",
+  "joins": [
+    {"lot_a": "L1", "corner_a": 3, "lot_b": "L2", "corner_b": 2, "side_a": 3, "side_b": 3, "reason": "why these corners and sides, in Russian", "source_quote": "the printed words that support the choice"}
+  ]
+}
+All corner and side numbers are integers."""
+
+#: Допуск совпадения направлений общих сторон при переносе без поворота (как у сверки румбов).
+JOIN_SHIFT_TOLERANCE_DEG = ALTERNATE_AXIS_TOLERANCE_ARCSEC / 3600.0
+#: Допуск, на котором общая межа считается лежащей на одной прямой.
+JOIN_LINE_TOLERANCE_FT = 0.05
+#: Общая межа должна совпасть не меньше чем на эту долю длины большей из двух сторон (исключает дикие совпадения).
+JOIN_MIN_SHARED_FRACTION = 0.10
+
+
+def _wrap_rad(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _rotate_vec(vec: tuple[float, float], theta: float) -> tuple[float, float]:
+    c, s = math.cos(theta), math.sin(theta)
+    return (c * vec[0] - s * vec[1], s * vec[0] + c * vec[1])
+
+
+def _vec_azimuth(vec: tuple[float, float]) -> float:
+    """Азимут вектора (x — восток, y — север), градусы, по часовой от севера."""
+    return math.degrees(math.atan2(vec[0], vec[1])) % 360.0
+
+
+def _join_candidates(
+    scene: _Scene, lot_a: LotInput, lot_b: LotInput, corner_a: int, side_a: int,
+    corner_b: int, side_b: int, mode: str,
+) -> tuple[list[tuple[list[Change], str]], str | None]:
+    """
+    Жёсткие соединения соседа с нашим участком: ``([(правки, описание), ...], причина отказа)``.
+
+    Угол ``corner_b`` соседа совмещается с углом ``corner_a`` нашего участка; сторона ``side_b``
+    ложится на сторону ``side_a`` на одну прямую. Направление зависит от обхода участков:
+    у участков одного обхода (оба по часовой) общая межа проходит в противоположных
+    направлениях, у разных — в одном. Поэтому пробуются оба варианта, и геометрия выбирает.
+    ``mode`` = ``turn`` — перенос и поворот; ``shift`` — только перенос (направление уже совпадает).
+    Длины и форма соседа не меняются.
+    """
+    state = scene.virtual
+    base_a = state.get(lot_a.key, ())
+    base_b = state.get(lot_b.key, ())
+    desc_a = scene.description(lot_a, base_a)
+    desc_b = scene.description(lot_b, base_b)
+    plan_a = scene.plan(lot_a, base_a)
+    plan_b = scene.plan(lot_b, base_b)
+    if desc_a is None or desc_b is None or plan_a is None or plan_b is None:
+        return [], "участок с такой склейкой не строится"
+    va, vb = plan_a.vertices, plan_b.vertices
+    if not (1 <= corner_a <= len(va) and 1 <= side_a <= len(desc_a.segments)):
+        return [], f"у нашего участка нет угла {corner_a} или стороны {side_a}"
+    if not (1 <= corner_b <= len(vb) and 1 <= side_b <= len(desc_b.segments)):
+        return [], f"у соседа нет угла {corner_b} или стороны {side_b}"
+    seg_a = desc_a.segments[side_a - 1]
+    seg_b = desc_b.segments[side_b - 1]
+    if not seg_a.has_bearing:
+        return [], f"у стороны {side_a} нашего участка нет напечатанного румба"
+    if not seg_b.has_bearing:
+        return [], f"у стороны {side_b} соседа нет напечатанного румба"
+
+    da = segment_vector(seg_a)
+    db = segment_vector(seg_b)
+    len_a, len_b = math.hypot(*da), math.hypot(*db)
+    if len_a < 1e-6 or len_b < 1e-6:
+        return [], "нулевая сторона не может быть общей межой"
+    pa = va[corner_a - 1]
+    pb = vb[corner_b - 1]
+    angle_a = math.atan2(da[1], da[0])
+    angle_b = math.atan2(db[1], db[0])
+    # Поворот, при котором стороны идут противоположно (одинаковый обход) или в одну сторону (разный).
+    turns = [_wrap_rad(angle_a + math.pi - angle_b), _wrap_rad(angle_a - angle_b)]
+    if mode == "shift":
+        turns = [t for t in turns if abs(t) <= math.radians(JOIN_SHIFT_TOLERANCE_DEG)]
+        if not turns:
+            return [], "при переносе без поворота стороны не совпадают по направлению"
+
+    ux, uy = da[0] / len_a, da[1] / len_a
+    candidates: list[tuple[list[Change], str]] = []
+    problems: list[str] = []
+    for theta in turns:
+        changes, problem, summary = _join_with_turn(
+            desc_b, lot_b, pa, pb, va, vb, da, db, ux, uy, len_a, len_b,
+            corner_a, side_a, corner_b, side_b, theta,
+        )
+        if problem:
+            problems.append(problem)
+        else:
+            candidates.append((changes, summary))
+    if candidates:
+        return candidates, None
+    return [], (problems[0] if problems else "соединение не получилось")
+
+
+def _join_with_turn(
+    desc_b: LegalDescription, lot_b: LotInput, pa, pb, va, vb, da, db, ux, uy, len_a, len_b,
+    corner_a: int, side_a: int, corner_b: int, side_b: int, theta: float,
+) -> tuple[list[Change], str | None, str]:
+    """Одно соединение при заданном повороте: проверка общей межи и правки данных соседа."""
+
+    def place(point: tuple[float, float]) -> tuple[float, float]:
+        rx, ry = _rotate_vec((point[0] - pb[0], point[1] - pb[1]), theta)
+        return rx + pa[0], ry + pa[1]
+
+    a0 = va[side_a - 1]
+    b0 = place(vb[side_b - 1])
+    rotated_db = _rotate_vec(db, theta)
+    b1 = (b0[0] + rotated_db[0], b0[1] + rotated_db[1])
+    for qx, qy in (b0, b1):
+        offset = ux * (qy - a0[1]) - uy * (qx - a0[0])
+        if abs(offset) > JOIN_LINE_TOLERANCE_FT:
+            return [], f"общая межа не лежит на одной прямой (отклонение {abs(offset):.2f} ft)", ""
+    s0 = ux * (b0[0] - a0[0]) + uy * (b0[1] - a0[1])
+    s1 = ux * (b1[0] - a0[0]) + uy * (b1[1] - a0[1])
+    overlap = min(len_a, max(s0, s1)) - max(0.0, min(s0, s1))
+    longer = max(len_a, len_b)
+    required = JOIN_MIN_SHARED_FRACTION * longer
+    if overlap < required - JOIN_LINE_TOLERANCE_FT:
+        return [], (
+            f"общая межа совпадает лишь на {max(overlap, 0.0):.2f} ft; нужно не меньше "
+            f"{required:.2f} ft ({JOIN_MIN_SHARED_FRACTION:.0%} большей стороны {longer:.2f} ft)"
+        ), ""
+
+    pob = place(vb[0])
+    distance = math.hypot(*pob)
+    if distance < 1e-6:
+        return [], "после соединения сосед совпал бы с углом улицы", ""
+    parts = _components(_vec_azimuth(pob))
+    changes: list[Change] = [Change(
+        target="tie", index=-1, field="distance", distance_ft=distance,
+        ns=parts[0], degrees=parts[1], minutes=parts[2], seconds=parts[3], ew=parts[4],
+        bearing_set=True,
+        old_label=f"{desc_b.distance_to_corner_ft:.2f}'",
+        new_label=f"{distance:.2f}' {_label(parts)}",
+    )]
+    if abs(theta) > 1e-12:
+        for index, seg in enumerate(desc_b.segments):
+            if not seg.has_bearing:
+                return [], (
+                    f"у стороны {index + 1} соседа нет румба в документе — поворот невозможен; "
+                    "выберите режим «только перенос»"
+                ), ""
+            turned = _rotate_vec(segment_vector(seg), theta)
+            changes.append(_bearing_change("side", index, seg, _components(_vec_azimuth(turned))))
+    summary = (
+        f"угол {corner_a} нашего участка = угол {corner_b} «{lot_b.name}»; общая межа — сторона {side_a} "
+        f"и сторона {side_b}; {'стороны в одном направлении' if _is_same_direction(theta, da, db) else 'стороны навстречу'}; "
+        f"поворот {math.degrees(theta):+.4f}°; общая часть {min(len_a, len_b):.2f} ft"
+    )
+    return changes, None, summary
+
+
+def _is_same_direction(theta: float, da, db) -> bool:
+    """Идут ли общие стороны в одну сторону после поворота (иначе — навстречу)."""
+    rotated = _rotate_vec(db, theta)
+    return rotated[0] * da[0] + rotated[1] * da[1] > 0
+
+
+def build_join_request(
+    scene: _Scene, chosen: Sequence[Proposal], remaining: Sequence[str], labels: dict[str, LotInput],
+    *, text_limit: int = 3000,
+) -> str:
+    """Текст запроса для режима карты: координаты углов и сторон каждого участка."""
+    parts = [
+        "Lots: " + ", ".join(f"{label} = {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»"
+                             for label, lot in labels.items()) + ".",
+        "Only L1 (our lot) may be joined to a neighbour; joins between two neighbours are not asked for.",
+        "Image 1 is the sketch of the figures as the program places them now.",
+    ]
+    for label, lot in labels.items():
+        base = scene.virtual.get(lot.key, ())
+        plan = scene.plan(lot, base)
+        desc = scene.description(lot, base)
+        if plan is None or desc is None:
+            parts.append(f"{label}: the figure does not build.")
+            continue
+        n = len(plan.vertices)
+        head = [f"{label} — {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»"]
+        if desc.cross_street:
+            head.append(f"tie: {desc.distance_to_corner_ft:.2f} ft from the corner of {desc.cross_street}")
+        head.append(f"closure error {plan.closure.distance:.3f} ft")
+        parts.append("; ".join(head))
+        for k, (x, y) in enumerate(plan.vertices, 1):
+            parts.append(f"  corner {k}: ({x:.2f}, {y:.2f}) ft — start of side {k}")
+        for i, seg in enumerate(desc.segments):
+            bearing = (seg.bearing_label or bearing_label(seg.ns, seg.degrees, seg.minutes, seg.seconds, seg.ew)
+                       if seg.has_bearing else "NO BEARING PRINTED")
+            parts.append(
+                f"  side {i + 1}: from corner {i + 1} to corner {(i + 1) % n + 1}, {bearing}, {seg.distance_ft:.2f} ft"
+            )
+        text = " ".join((lot.source_text or "").split())
+        if text:
+            parts.append("  document text: " + text[:text_limit])
+    if chosen:
+        parts.append("PYTHON'S VERIFIED FINDINGS (already applied): " + "; ".join(p.title for p in chosen))
+    parts.append("CONFLICTS THAT REMAIN (Python's wording, in Russian):")
+    parts.append("\n".join(f"- {text}" for text in remaining) or "- none")
+    parts.append("Propose joins only. Answer with the JSON object only.")
+    return "\n\n".join(parts)
+
+
+def read_join_reply(data: Any) -> AdvisorReply:
+    """Ответ режима карты: только соединения, остальное отбрасывается."""
+    reply = AdvisorReply()
+    if not isinstance(data, dict):
+        return reply
+    reply.analysis = " ".join(str(data.get("analysis") or "").split())
+    for item in data.get("joins") or []:
+        if isinstance(item, dict):
+            reply.proposals.append(item)
+    return reply
+
+
+def _join_proposals(
+    scene: _Scene, reply: AdvisorReply, labels: dict[str, LotInput], mode: str, chosen: Sequence[Proposal],
+) -> tuple[list[Proposal], list[str]]:
+    """Проверяет соединения геометрией: принятые находки и строки об отклонённых."""
+    accepted: list[Proposal] = []
+    rejected: list[str] = []
+    requires = tuple(p.id for p in chosen)
+    joined: set[str] = set()
+    main_labels = {label for label, lot in labels.items() if lot.is_main}
+    for item in reply.proposals:
+        lot_a_label = str(item.get("lot_a") or "").strip().upper()
+        lot_b_label = str(item.get("lot_b") or "").strip().upper()
+        lot_a = labels.get(lot_a_label)
+        lot_b = labels.get(lot_b_label)
+        if lot_a is None or lot_b is None:
+            rejected.append(f"соединение {lot_a_label or '?'}–{lot_b_label or '?'} — не указан участок")
+            continue
+        if lot_a_label not in main_labels or lot_a is lot_b:
+            rejected.append(f"«{lot_b.name}»: соединяем только с нашим участком")
+            continue
+        if lot_b_label in joined:
+            rejected.append(f"«{lot_b.name}»: соседу уже назначено соединение")
+            continue
+        try:
+            corner_a = int(item.get("corner_a"))
+            side_a = int(item.get("side_a"))
+            corner_b = int(item.get("corner_b"))
+            side_b = int(item.get("side_b"))
+        except (TypeError, ValueError):
+            rejected.append(f"«{lot_b.name}»: не указаны номера углов или сторон")
+            continue
+        title = (
+            f"Склейка: угол {corner_a} нашего участка = угол {corner_b} «{lot_b.name}»; "
+            f"общая межа — сторона {side_a} и сторона {side_b}"
+        )
+        candidates, problem = _join_candidates(
+            scene, lot_a, lot_b, corner_a, side_a, corner_b, side_b, mode,
+        )
+        if problem:
+            rejected.append(f"{title} — {problem}")
+            continue
+        base = scene.virtual.get(lot_b.key, ())
+        before = scene.metrics(lot_b, base, state=scene.virtual)
+        chosen_join = None
+        last_detail = ""
+        for changes, summary in candidates:
+            after = scene.metrics(lot_b, base + tuple(changes), state=scene.virtual)
+            verdict = advisor_verdict(before, after, allow_stepped=True)
+            if verdict != "rejected" and before is not None and after is not None:
+                if chosen_join is None or verdict == "verified":
+                    chosen_join = (changes, summary, after, verdict)
+                if verdict == "verified":
+                    break
+            elif before is None or after is None:
+                last_detail = "участок с такой склейкой не строится"
+            else:
+                last_detail = (
+                    f"невязка {before.closure_ft:.3f} → {after.closure_ft:.3f} ft, "
+                    f"наложение {before.overlap_sqft:,.1f} → {after.overlap_sqft:,.1f} sq ft"
+                )
+        if chosen_join is None:
+            rejected.append(f"{title} — совет не подтверждён геометрией: {last_detail}")
+            continue
+        changes, summary, after, verdict = chosen_join
+        if before is None:
+            continue
+        stepped_note = (
+            f"уступ задней межи: {after.stepped_edges} сторона(ы) короче соседней — остаток граничит "
+            "с третьим участком (проверьте по карте)"
+            if after.stepped_edges else ""
+        )
+        joined.add(lot_b_label)
+        reasons: list[str] = []
+        reason = " ".join(str(item.get("reason") or "").split())
+        if reason:
+            reasons.append(f"довод советника: {reason}")
+        reasons.append(f"соединение: {summary}")
+        if stepped_note:
+            reasons.append(stepped_note)
+        reasons.append(
+            "жёсткое перемещение: длины и форма соседа не меняются; расстояние и румб привязки "
+            f"соседа вычислены от нашего угла ({changes[0].new_label}), в документе они не напечатаны"
+        )
+        quote = " ".join(str(item.get("source_quote") or "").split())
+        source = "ИИ-советник по карте"
+        if quote:
+            source += f"; цитата: «{quote[:220]}»"
+        accepted.append(Proposal(
+            id=_proposal_id(lot_b, changes), lot_key=lot_b.key, lot_name=lot_b.name,
+            kind="advisor", origin="ai", title=title, changes=tuple(changes), source=source,
+            reasons=tuple(reasons), before=before, after=after, verdict=verdict, requires=requires,
+        ))
+    return accepted, rejected
+
+
+def _join_sketch_url(scene: _Scene, lots: Sequence[LotInput]) -> str | None:
+    """Схема фигур как программа их расставляет сейчас; без неё советник работает по тексту."""
+    from join_sketch import as_data_url, render_sketch
+
+    figures = []
+    for label, lot in ((f"L{i}", lot) for i, lot in enumerate(sorted(lots, key=lambda lot: not lot.is_main), 1)):
+        plan = scene.plan(lot, scene.virtual.get(lot.key, ()))
+        if plan is not None:
+            figures.append((label, lot.name, lot.is_main, list(plan.vertices)))
+    if not figures:
+        return None
+    try:
+        return as_data_url(render_sketch(figures))
+    except Exception:  # noqa: BLE001 - схема не должна срывать запрос
+        return None
+
+
+def _join_round(
+    scene: _Scene, lots: Sequence[LotInput], chosen: Sequence[Proposal], analysis: ConflictAnalysis,
+    proposals: list[Proposal], advisor: AdvisorCall | None, *, mode: str,
+    extra_images: Sequence[str], max_images: int, progress: Callable[[str], None] | None,
+) -> None:
+    """Один запрос режима карты: соединения советника, проверенные геометрией."""
+    analysis.join_mode = mode
+    labels: dict[str, LotInput] = {
+        f"L{i}": lot for i, lot in enumerate(sorted(lots, key=lambda lot: not lot.is_main), 1)
+    }
+    if advisor is None:
+        analysis.advisor_status = "skipped"
+        analysis.advisor_note = analysis.advisor_note or "не запрошен"
+        return
+    try:
+        text = build_join_request(scene, chosen, analysis.remaining, labels)
+        sketch = _join_sketch_url(scene, lots)
+        if not sketch:
+            # Без схемы промпт (картинка 1 — схема) неверен: запрос не отправляем.
+            raise ValueError("схема фигур не построена")
+        images: list[str] = [sketch]
+        for lot in sorted(lots, key=lambda lot: not lot.is_main):
+            if lot.images and len(images) + len(lot.images) <= max(0, int(max_images)):
+                images.extend(lot.images)
+        images.extend(extra_images)
+        if progress:
+            progress("ИИ-советник соединяет фигуры по карте…")
+        data, usage = advisor(JOIN_SYSTEM_PROMPT, text, images)
+        reply = read_join_reply(data)
+        reply.usage = usage
+        reply.model = str(getattr(usage, "model", "") or "")
+        analysis.advisor_status = "ok"
+    except Exception as exc:  # noqa: BLE001 - сбой советника не срывает разбор набора
+        analysis.advisor_status = "error"
+        reason = " ".join(str(exc).split()) or type(exc).__name__
+        analysis.advisor_note = f"запрос не удался — {reason}"
+        return
+    analysis.advisor_reply = reply
+    accepted, rejected = _join_proposals(scene, reply, labels, mode, chosen)
+    known = {p.id for p in proposals}
+    proposals.extend(p for p in accepted if p.id not in known)
+    analysis.advisor_rejected = rejected
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +2250,8 @@ def analyse_conflicts(
     force_advisor: bool = False,
     max_images: int = 16,
     progress: Callable[[str], None] | None = None,
+    join_mode: str | None = None,
+    join_images: Sequence[str] = (),
 ) -> ConflictAnalysis:
     """
     Сверяет данные участков набора между собой и предлагает правки.
@@ -1546,6 +2273,7 @@ def analyse_conflicts(
     for lot in sorted(lots, key=lambda lot: not lot.is_main):
         proposals.extend(_street_bearing_proposals(scene, lot))
         proposals.extend(_neighbor_value_proposals(scene, lot))
+        proposals.extend(_street_name_proposals(scene, lot))
     proposals.sort(key=lambda p: (not p.verified, p.after.closure_ft))
     chosen = _accept_in_mind(scene, proposals)
 
@@ -1559,6 +2287,15 @@ def analyse_conflicts(
 
     analysis.conflicts, _, _ = _conflicts(scene, {})
     analysis.remaining, analysis.remaining_hard, report = _conflicts(scene, scene.virtual)
+
+    if join_mode in ("turn", "shift"):
+        # Режим карты: советник только соединяет фигуры; кэш обычного ответа не трогаем.
+        _join_round(
+            scene, lots, chosen, analysis, proposals, advisor, mode=join_mode,
+            extra_images=tuple(join_images), max_images=max_images, progress=progress,
+        )
+        analysis.proposals = proposals
+        return analysis
 
     # ИИ-советник: только если Python не закрыл всё сам.
     analysis.advisor_key = advisor_cache_key(lots)

@@ -49,7 +49,7 @@ def test_lookup_uses_local_bbl_and_sends_only_map_to_one_vision_request(tmp_path
         provider="hydra", provider_label="Hydra AI", model="vision", available=True,
     )
 
-    def drive(address, path, progress=None):
+    def drive(address, path, progress=None, **_kwargs):
         calls["address"] = address
         calls["map_path"] = path
         return nyc_portal.PortalCapture("5712", "70", "Staten Island", map_image)
@@ -188,7 +188,7 @@ def test_portal_driver_stops_on_challenge_without_keypress(tmp_path, monkeypatch
     assert key_calls == []
 
 
-def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
+def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypatch):
     window = nyc_portal.browser_save.BrowserWindow(
         handle=77, title="New Tab - Google Chrome",
         executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
@@ -203,6 +203,9 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     key_events = []
     waits = []
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda seconds: waits.append(seconds))
+    new_tabs = []
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: new_tabs.append(1) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "New Tab - Google Chrome")
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
@@ -238,7 +241,8 @@ def test_non_portal_active_browser_is_reused_in_same_tab(tmp_path, monkeypatch):
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert typed == [nyc_portal.PORTAL_URL]
-    assert waits == [0.2, 0.2, 0.2, 0.2, 3.0, 0.2]
+    assert new_tabs == [1]  # портал открыт в новой вкладке
+    assert waits == [0.6, 0.2, 0.2, 0.2, 0.2, 3.0, 0.2]  # 0.6 — ждём переключения на новую вкладку
     assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
     assert key_events[-2:] == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
 
@@ -417,3 +421,147 @@ def test_select_dropdown_popup_stealing_foreground_does_not_abort_the_down_arrow
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_RETURN,
     ]
+
+
+class _FakeClock:
+    """Подмена time: monotonic() идёт вперёд только от sleep()."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _wait_setup(monkeypatch, screens):
+    clock = _FakeClock()
+    seen = []
+    monkeypatch.setattr(nyc_portal, "time", clock)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, path: Path(path).write_bytes(b"x"))
+
+    def ocr(_path):
+        seen.append(True)
+        return screens[min(len(seen), len(screens)) - 1]
+
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    return clock, seen
+
+
+def test_fast_mode_waits_five_seconds_between_screen_checks(monkeypatch):
+    select = [nyc_portal.ScreenText("Select", (20, 100, 80, 130))]
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty, empty, select])
+
+    rows = nyc_portal._wait_screen(
+        1, lambda screen: any(r.text == "Select" for r in screen),
+        timeout=60, description="страницу", pause=nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
+    )
+    assert rows == select
+    assert len(seen) == 3
+    assert clock.sleeps == [5.0, 5.0]
+
+
+def test_default_wait_keeps_the_fast_short_polling(monkeypatch):
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty])
+    with pytest.raises(nyc_portal.PortalLookupError, match="Не дождался"):
+        nyc_portal._wait_screen(1, lambda _s: False, timeout=1.5, description="страницу")
+    # Проверки при t=0, 0.6, 1.2 и у дедлайна t=1.5: последняя пауза укорочена до остатка.
+    assert len(seen) == 4
+    assert clock.sleeps == [0.6, 0.6, pytest.approx(0.3)]
+
+
+def test_wait_screen_makes_a_final_check_exactly_at_the_deadline(monkeypatch):
+    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty])
+    with pytest.raises(nyc_portal.PortalLookupError):
+        nyc_portal._wait_screen(1, lambda _s: False, timeout=5, description="окно", pause=5.0)
+    assert len(seen) == 2  # при t=0 и при t=5, а не только при t=0
+    assert clock.sleeps == [5.0]
+
+
+def test_map_is_captured_only_after_the_redraw_wait_following_the_wheel(monkeypatch):
+    import ctypes
+
+    clock = _FakeClock()
+    monkeypatch.setattr(nyc_portal, "time", clock)
+    monkeypatch.setattr(nyc_portal, "sys", type("S", (), {"platform": "win32"}))
+    wheel = []
+
+    class _User32:
+        def GetWindowRect(self, _hwnd, rect_ref):
+            rect = rect_ref._obj
+            rect.left, rect.top, rect.right, rect.bottom = 0, 0, 1000, 800
+            return 1
+
+        def SetCursorPos(self, x, y):
+            wheel.append(("cursor", x, y))
+
+        def mouse_event(self, flags, dx, dy, data, extra):
+            wheel.append(("wheel", data))
+
+    fake_windll = type("W", (), {"user32": _User32()})()
+    monkeypatch.setattr(ctypes, "windll", fake_windll, raising=False)
+    nyc_portal._zoom_out_map_pane(1)
+    assert wheel == [("cursor", 750, 400), ("wheel", -120)]
+    assert clock.sleeps == [0.1, nyc_portal.MAP_REDRAW_WAIT_SEC]
+    assert nyc_portal.MAP_REDRAW_WAIT_SEC == pytest.approx(3.8)
+
+
+def test_lookup_parcel_passes_fast_mode_to_the_portal_driver(monkeypatch, tmp_path):
+    received = {}
+
+    def drive(address, map_path, progress=None, *, fast_mode=False, fast_pause_sec=None):
+        received["fast_mode"] = fast_mode
+        received["fast_pause_sec"] = fast_pause_sec
+        raise nyc_portal.PortalLookupError("стоп после проверки аргумента")
+
+    monkeypatch.setattr(nyc_portal, "_drive_portal", drive)
+    with pytest.raises(nyc_portal.PortalLookupError, match="стоп"):
+        nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="vision",
+            fast_mode=True, fast_pause_sec=2.5,
+        )
+    assert received == {"fast_mode": True, "fast_pause_sec": 2.5}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("5", 5.0), ("1", 1.0), ("3,5", 3.5), (" 2.25 ", 2.25), ("4.9", 4.9)],
+)
+def test_fast_pause_accepts_any_number_from_one_to_five(text, expected):
+    assert nyc_portal.parse_fast_pause(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "0.9", "5.1", "6", "-1", "abc", "nan", "inf", None])
+def test_fast_pause_rejects_numbers_outside_the_range_and_garbage(text):
+    assert nyc_portal.parse_fast_pause(text) is None
+
+
+def test_address_is_not_typed_when_ctrl_t_did_not_lead_to_a_new_tab(tmp_path, monkeypatch):
+    """Если после Ctrl+T активна не новая вкладка (например, переписка), текст не печатается."""
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=77, title="Arena - Chrome", executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    typed = []
+    omnibox = []
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "Arena - Chrome")
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: omnibox.append("ctrl_l") or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
+    with pytest.raises(nyc_portal.PortalLookupError, match="не новая вкладка"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "parcel.png")
+    assert typed == [] and omnibox == []

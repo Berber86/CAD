@@ -24,7 +24,9 @@ COM-вызовы AutoCAD и HTTP-запросы к LLM выполняются в
 
 from __future__ import annotations
 
+import base64
 import copy
+import datetime as _dt
 import dataclasses
 from datetime import datetime
 import json
@@ -64,11 +66,21 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
 import app_updater
+from neighbour_slide import slide_off_overlap
+
+#: Как найден сдвиг соседа — для журнала развода.
+_SLIDE_VARIANT_TEXT = {"corner": "углы важнее направления", "direction": "направление важнее"}
+_SLIDE_METHOD_TEXT = {
+    "3.88": "обычный сдвиг, как в 3.88",
+    "corner": "соединение углов",
+    "side": "сдвиг вдоль стороны соседа",
+}
 from acad_builder import (
     AcadBuilder,
     AcadBuilderError,
     AcadConnectionError,
     DrawPlan,
+    make_print_draft,
     DrawResult,
     FeatureLabelResult,
     LotSuspicionReport,
@@ -78,6 +90,7 @@ from acad_builder import (
     format_distance,
     house_label_height,
     verify_with_neighbors,
+    translate_plan_in_place,
 )
 from conflict_resolver import (
     AdvisorReply,
@@ -88,9 +101,13 @@ from conflict_resolver import (
     fix_changes,
 )
 from feature_labeler import feature_settings
-from version import APP_DATE, APP_VERSION
+from version import APP_STAMP, APP_VERSION
+import log_mode
+import offsets
+import start_source
 from llm_parser import (
     ASPENWALL_SAMPLES,
+    legal_to_step0_text,
     CONFIG_PATH,
     ENV_PATH,
     IMAGE_EXTENSIONS,
@@ -132,16 +149,22 @@ import deed_store
 import nyc_portal
 import ocr_pages
 import rcclerk
+from description_check import (
+    STATUS_FAILED, STATUS_OK, STATUS_WARNING, accepted_without_ai, figure_line, reading_summary,
+)
 from pdf_set import (
     CLOSURE_LIMIT_FT,
     PdfSetItem,
     PdfSetJob,
     PdfSetResult,
+    describe_exc,
     format_pages,
     make_item,
     make_job,
+    pages_from_spec,
     read_page_boxes,
-    resolve_ocr_source,
+    ocr_scan_once,
+    SCAN_OCR_DPI,
     set_signature,
 )
 
@@ -161,7 +184,9 @@ RESULT_SPLITTER_WIDTH = 12
 STEP_TAB_DEEDS = "Шаг 0. Документы участка"
 STEP_TAB_BOUNDARY = "Шаг 1. Граница участка (Legal Description)"
 STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
-STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS)
+# Шага 3 в программе пока нет (пропущен в постановке): после Шага 2 идёт Шаг 4.
+STEP_TAB_OFFSETS = "Шаг 4. Оффсеты"
+STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
 #: Роль файла, который человек докачал сам: наш участок или сосед.
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
 STEP0_EMPTY_REPORT = (
@@ -173,7 +198,7 @@ STEP0_EMPTY_REPORT = (
     "Каждый сосед получает роль «сосед» и файл, например LOT 30 NEW.pdf. "
     "Если портал/ИИ недоступен, значения можно ввести самостоятельно.\n"
     "3. Нажмите «Собрать описания»: программа откроет список документов Richmond "
-    "County Clerk, возьмёт Deed (а без него Mortgage), скачает свежий и старый "
+    "County Clerk, возьмёт Deed (новее 2015 года; иначе свежую Mortgage с 2015 года), скачает свежий и старый "
     "документ нашего участка, найдёт страницы описания и положит всё в папку "
     "01_описания вместе с паспортами и _manifest.json.\n\n"
     "Если сайт закрыт проверкой Cloudflare, программа открывает ссылку в браузере "
@@ -370,6 +395,78 @@ def ocr_closure_note(plan: Any, limit: float = CLOSURE_LIMIT_FT) -> tuple[str, s
     )
 
 
+_NO_DISTANCE_WARNING = "расстояние от угла до точки начала не найдено"
+
+
+def _lacks_corner_distance(warnings: Any) -> bool:
+    """Парсер не нашёл расстояние до угла: участок построен от угла улицы (ошибка, не шум)."""
+    return any(_NO_DISTANCE_WARNING in str(item) for item in (warnings or ()))
+
+
+def _ai_key_status(
+    cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+) -> tuple[bool, str]:
+    """
+    Есть ли ключ, которым ИИ реально сможет ответить: тот же путь, что у самого вызова.
+
+    Ключ берётся из поля окна, из сохранённых настроек провайдера, из окружения и .env
+    (``resolve_api_target``). Раньше гейт смотрел только на поле и пароль, и ключ из настроек
+    не запускал ИИ, хотя запрос бы прошёл. Возвращает (есть, причина_если_нет).
+    """
+    try:
+        target = resolve_api_target(
+            cfg, provider=provider_id, model=model_name, api_key=api_key, key_secret=key_secret,
+        )
+    except Exception as exc:  # noqa: BLE001 - защищённый ключ не открылся (нет пароля или он неверный)
+        return False, f"ключ провайдера не открылся: {describe_exc(exc)}"
+    if str(target.get("api_key") or "").strip():
+        return True, ""
+    return False, "не задан API-ключ выбранного провайдера (ни в поле, ни в настройках, ни в окружении)"
+
+
+#: Ранг статуса проверки описания: больше — лучше. Сначала сравнивается статус, потом фигура.
+_STATUS_RANKS = {STATUS_OK: 2, STATUS_WARNING: 1, STATUS_FAILED: 0}
+_STATUS_OK_RANK = _STATUS_RANKS[STATUS_OK]
+
+
+def _check_status_rank(outcome: Any, plan: Any = None) -> int:
+    """
+    Ранг итога проверки. Описание без расстояния до угла — не ``ok``, даже если стороны сошлись:
+    такой кеш или текст перераспознаётся (правило из c4df930).
+    """
+    check = getattr(outcome, "check", None)
+    rank = _STATUS_RANKS.get(getattr(check, "status", STATUS_FAILED), 0)
+    warnings = list(getattr(outcome, "warnings", None) or ()) + list(getattr(plan, "warnings", None) or ())
+    if _lacks_corner_distance(warnings):
+        rank = min(rank, _STATUS_RANKS[STATUS_WARNING])
+    return rank
+
+
+def _accepted_without_ai(candidate: Any) -> bool:
+    """Вариант скана принят без ИИ: статус ok или не хватает только расстояния до угла."""
+    if candidate is None:
+        return False
+    return candidate.status_rank >= _STATUS_OK_RANK or accepted_without_ai(
+        getattr(candidate.outcome, "check", None)
+    )
+
+
+@dataclasses.dataclass
+class _ScanCandidate:
+    """Один вариант текста скана (кеш, OCR или ответ ИИ) с итогом проверки."""
+
+    outcome: Any
+    plan: Any
+    issues: list[str]
+    pre_counted: bool
+    shape_rank: tuple
+    status_rank: int
+
+    @property
+    def rank(self) -> tuple:
+        return (self.status_rank,) + tuple(self.shape_rank)
+
+
 class SurveyApp(ctk.CTk):
     """Главное окно приложения (Dark CAD Studio UI)."""
 
@@ -379,9 +476,11 @@ class SurveyApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.configure(fg_color=THEME["bg_root"])
 
-        self.title(f"{APP_TITLE}  v{VERSION} ({APP_DATE})")
+        self.title(f"{APP_TITLE}  v{VERSION} ({APP_STAMP})")
         self.geometry(APP_GEOMETRY)
         self.minsize(1100, 760)
+        # Открываемся на весь экран (окно развёрнуто; кнопки свернуть/закрыть остаются).
+        self.after_idle(self._open_maximized)
 
         # По умолчанию окно не закреплено поверх AutoCAD и других приложений.
         self.attributes("-topmost", False)
@@ -416,6 +515,12 @@ class SurveyApp(ctk.CTk):
         # Сверка описаний между собой: находки по данным соседей и ответ ИИ-советника.
         self._pdf_set_analysis: ConflictAnalysis | None = None
         self._pdf_set_advice: dict[str, AdvisorReply] = {}
+        #: Склейка по карте: режим ("turn" — перенос и поворот, "shift" — только перенос),
+        #: приложенная карта TAX_MAP (имя, data URL) и соединения, которые применятся после разбора.
+        self._pdf_set_join_mode: str = "turn"
+        self._pdf_set_tax_map: tuple[str, str] | None = None
+        self._pdf_set_tax_button: Any | None = None
+        self._pending_join_accept: list[Any] = []
         self._ready_source_signature: tuple[Any, ...] | None = None
         self._running_source_signature: tuple[Any, ...] | None = None
         self._running_source_path: Path | None = None
@@ -472,12 +577,14 @@ class SurveyApp(ctk.CTk):
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
         self.step0_fast_mode_var = ctk.BooleanVar(value=False)
+        #: Пауза «быстрой работы» в секундах, от 1 до 5 (поле рядом с галочкой).
+        self.step0_fast_pause_var = ctk.StringVar(value=str(int(nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC)))
         self.step0_ocr_dpi_var = ctk.StringVar(
             value=str((self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI))
         )
         self.step0_manual_role_var = ctk.StringVar(value=STEP0_MANUAL_ROLES[0])
         self.step0_manual_lot_var = ctk.StringVar(value="")
-        self._step0_lines: list[str] = []
+        self._step0_lines: list[tuple[str, str]] = []
         self._step0_portal_running = False
         self._step0_portal_restore_topmost: bool | None = None
         self._step0_running = False
@@ -570,6 +677,8 @@ class SurveyApp(ctk.CTk):
             value=default_scale(self.scale_options, self.config_data)
         )
         self.use_llm_var = ctk.BooleanVar(value=True)
+        # Эконом: локальный разбор; ИИ подключается, если локальный результат не прошёл проверку.
+        self.economy_var = ctk.BooleanVar(value=False)
 
         # Настройки 2–3 независимых проходов LLM (консенсус / арбитраж)
         cons_cfg = self.config_data["api"].get("consensus") or {}
@@ -835,6 +944,17 @@ class SurveyApp(ctk.CTk):
             width=36,
             command=self._apply_topmost,
         ).grid(row=0, column=3, sticky="e")
+        self.log_mode_var = ctk.BooleanVar(
+            value=log_mode.mode_from_config(self.config_data) == log_mode.FULL,
+        )
+        ctk.CTkSwitch(
+            header_tools,
+            text="Подробный журнал",
+            variable=self.log_mode_var,
+            font=ctk.CTkFont(size=11),
+            width=36,
+            command=self._apply_log_mode,
+        ).grid(row=0, column=4, sticky="e", padx=(12, 0))
 
         # 1. Глобальные вкладки шагов: «Шаг 1. Граница участка» | «Шаг 2. Автоподписание»
         self._build_step_tab_bar()
@@ -1026,7 +1146,7 @@ class SurveyApp(ctk.CTk):
         self.update_version_button.grid(row=2, column=1, padx=(0, 10), pady=(0, 6), sticky="e")
         self.update_status_label = ctk.CTkLabel(
             update_row,
-            text=f"Текущая версия: {APP_VERSION} ({APP_DATE})",
+            text=f"Текущая версия: {APP_VERSION} ({APP_STAMP})",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1034,6 +1154,10 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_dim"],
         )
         self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+        self.update_progress_bar = ctk.CTkProgressBar(update_row, height=8)
+        self.update_progress_bar.set(0)
+        self.update_progress_bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        self.update_progress_bar.grid_remove()  # показываем только во время обновления
         ctk.CTkLabel(
             update_row,
             text=(
@@ -1047,7 +1171,31 @@ class SurveyApp(ctk.CTk):
             wraplength=394,
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+
+        # Откат на резервную копию предыдущей версии (на случай критического бага).
+        self.rollback_status_label = ctk.CTkLabel(
+            update_row,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=394,
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+        )
+        self.rollback_status_label.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.rollback_button = ctk.CTkButton(
+            update_row,
+            text="↩ Откатиться на старую версию",
+            width=230,
+            height=30,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._start_rollback,
+        )
+        self.rollback_button.grid(row=6, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
+        self._refresh_rollback_state()
 
         ctk.CTkLabel(
             drawer_body,
@@ -1186,6 +1334,48 @@ class SurveyApp(ctk.CTk):
             command=self._save_settings,
         )
         self.save_button.grid(row=0, column=1, padx=(0, 12), pady=10, sticky="e")
+
+        # 1b. Стартовая вкладка Шага 1: текст или PDF (сохраняется в config.json, ui.start_source).
+        start_card = ctk.CTkFrame(
+            drawer_body,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        start_card.grid(row=5, column=0, sticky="ew", pady=(10, 4))
+        start_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            start_card,
+            text="СТАРТОВАЯ ВКЛАДКА ШАГА 1",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.start_source_var = ctk.StringVar(
+            value=start_source.label_for(start_source.start_source_from_config(self.config_data))
+        )
+        self.start_source_switch = ctk.CTkSegmentedButton(
+            start_card,
+            values=[start_source.LABELS[start_source.TEXT], start_source.LABELS[start_source.PDF]],
+            variable=self.start_source_var,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["btn_primary"],
+            selected_hover_color=THEME["btn_primary_hover"],
+            command=self._on_start_source_changed,
+        )
+        self.start_source_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
+        ctk.CTkLabel(
+            start_card,
+            text="Что открывать при запуске программы. Действует со следующего запуска.",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
@@ -1434,7 +1624,10 @@ class SurveyApp(ctk.CTk):
         self.pdf_label.grid(row=0, column=2, sticky="e")
 
         # Сегментированный переключатель источника данных
-        self.source_mode_var = ctk.StringVar(value="📝 Текст")
+        # Стартовая вкладка источника: настройка ui.start_source (по умолчанию текст).
+        self.source_mode_var = ctk.StringVar(
+            value=start_source.label_for(start_source.start_source_from_config(self.config_data))
+        )
         self.source_mode_switch = ctk.CTkSegmentedButton(
             input_frame,
             values=["📄 PDF", "📷 Фото", "📝 Текст"],
@@ -1977,6 +2170,15 @@ class SurveyApp(ctk.CTk):
         )
         self.parse_button.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
 
+        self.run_mode_seg = ctk.CTkSegmentedButton(
+            run_box,
+            values=self.RUN_MODE_LABELS,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_run_mode_clicked,
+        )
+        self.run_mode_seg.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
+
         self.regex_link_button = ctk.CTkButton(
             run_box,
             text="⚡ Быстрый разбор без ИИ (regex, бесплатно)",
@@ -1987,7 +2189,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=self._run_regex_only,
         )
-        self.regex_link_button.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
+        self.regex_link_button.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 4))
 
         self.reset_session_button = ctk.CTkButton(
             run_box,
@@ -1999,7 +2201,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._reset_session_clicked,
         )
-        self.reset_session_button.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.reset_session_button.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 10))
 
         # --- Центральная колонка: шапка холста + живой CAD-предпросмотр ------
         center_head = ctk.CTkFrame(
@@ -2077,6 +2279,45 @@ class SurveyApp(ctk.CTk):
             command=self._clear_preview_scene,
         )
         self.reset_scene_button.grid(row=0, column=1, padx=(0, 8), sticky="e")
+
+        slide_tools = ctk.CTkFrame(center_head, fg_color="transparent")
+        slide_tools.grid(row=0, column=2, sticky="e", padx=(0, 12))
+        # 3.92: два варианта для сравнения — «углы важнее направления» и «направление важнее».
+        self.slide_overlaps_button = ctk.CTkButton(
+            slide_tools,
+            text="⇲ Развод: углы",
+            width=124,
+            height=26,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self._slide_overlapping_neighbours("corner"),
+        )
+        self.slide_overlaps_button.grid(row=0, column=0, padx=(0, 6), sticky="e")
+        self.slide_direction_button = ctk.CTkButton(
+            slide_tools,
+            text="⇲ Развод: направление",
+            width=160,
+            height=26,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self._slide_overlapping_neighbours("direction"),
+        )
+        self.slide_direction_button.grid(row=0, column=1, padx=(0, 6), sticky="e")
+        self.slide_undo_button = ctk.CTkButton(
+            slide_tools,
+            text="↶ Вернуть",
+            width=84,
+            height=26,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            border_width=1,
+            border_color=THEME["border_card"],
+            font=ctk.CTkFont(size=11),
+            command=self._undo_slide_neighbours,
+        )
+        self.slide_undo_button.grid(row=0, column=2, sticky="e")
 
         # Панели конфликта проходов и сомнительных мест (между шапкой и холстом)
         self.alerts_wrap = ctk.CTkFrame(self.center_col, fg_color="transparent")
@@ -2680,6 +2921,7 @@ class SurveyApp(ctk.CTk):
         # 5. Страницы остальных глобальных вкладок (Шаг 0 и Шаг 2) — поверх той же строки
         self._build_step0_page()
         self._build_step2_page()
+        self._build_step4_page()
         self._switch_step_tab()
 
     # ------------------------------------------- глобальные вкладки шагов ---
@@ -2710,7 +2952,7 @@ class SurveyApp(ctk.CTk):
             bar,
             text=(
                 "Порядок работы: 0 — документы участка → 1 — посадка границы → "
-                "2 — подписи объектов → оффсеты"
+                "2 — подписи объектов → 4 — оффсеты"
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
@@ -2749,9 +2991,10 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(
             panel,
             text=(
-                "Staten Island — Richmond County: список документов участка, Deed, а без него "
-                "Mortgage. Наш участок — самый свежий и самый старый документ, сосед — только "
-                "свежий. Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf. "
+                "Staten Island — Richmond County: список документов участка, Deed новее 2015 года, "
+                "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
+                "документ (старый Deed), сосед — только свежий. "
+                "Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf. "
                 "Block/Lot и Borough читает локальный OCR; выбранной Vision-модели отправляется "
                 "только обрезка карты для поиска двух соседних лотов."
             ),
@@ -2831,15 +3074,30 @@ class SurveyApp(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
+        fast_row = ctk.CTkFrame(checks, fg_color="transparent")
+        fast_row.grid(row=1, column=0, sticky="w", pady=(4, 0))
         ctk.CTkCheckBox(
-            checks,
-            text="быстрая работа (меньше проверок экрана, паузы по 5 с)",
+            fast_row,
+            text="быстрая работа (меньше проверок экрана), пауза",
             variable=self.step0_fast_mode_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             checkbox_width=18,
             checkbox_height=18,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkEntry(
+            fast_row,
+            textvariable=self.step0_fast_pause_var,
+            width=48,
+            justify="center",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=1, sticky="w", padx=(6, 4))
+        ctk.CTkLabel(
+            fast_row,
+            text=f"с (от {nyc_portal.FAST_PAUSE_MIN_SEC:g} до {nyc_portal.FAST_PAUSE_MAX_SEC:g})",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=2, sticky="w")
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -2985,12 +3243,13 @@ class SurveyApp(ctk.CTk):
         """Метка местного времени для каждого события в журнале Шага 0."""
         return f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
 
-    def _step0_log(self, message: str) -> None:
-        self._step0_lines.append(self._step0_timestamp(message))
+    def _step0_log(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
+        self._step0_lines.append((level, self._step0_timestamp(message)))
         self._render_step0_log()
 
     def _render_step0_log(self) -> None:
-        self._set_step0_report("\n".join(self._step0_lines) or STEP0_EMPTY_REPORT)
+        visible = log_mode.filter_entries(self._step0_lines, self._log_mode())
+        self._set_step0_report("\n".join(visible) or STEP0_EMPTY_REPORT)
 
     def _step0_folder(self) -> Path:
         text = str(self.step0_folder_var.get() or "").strip()
@@ -3005,6 +3264,22 @@ class SurveyApp(ctk.CTk):
         if chosen:
             self.step0_folder_var.set(str(chosen))
 
+    def _step0_fast_pause_value(self) -> float | None:
+        """
+        Пауза «быстрой работы» из поля. Без галочки значение не используется — возвращаем 5 с.
+        Если галочка стоит, а число неверное, выводит сообщение и возвращает None: запуск не начинаем.
+        """
+        if not self.step0_fast_mode_var.get():
+            return nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC
+        value = nyc_portal.parse_fast_pause(self.step0_fast_pause_var.get())
+        if value is None:
+            self._set_status(
+                f"Шаг 0: пауза «быстрой работы» — число от {nyc_portal.FAST_PAUSE_MIN_SEC:g} "
+                f"до {nyc_portal.FAST_PAUSE_MAX_SEC:g} секунд.",
+                error=True,
+            )
+        return value
+
     def _start_step0_portal_lookup(self) -> None:
         """Address → NYC Portal → one user-initiated Vision extraction call."""
         if self._step0_portal_running or self._step0_running:
@@ -3016,6 +3291,9 @@ class SurveyApp(ctk.CTk):
         address = str(self.step0_address_var.get() or "").strip()
         if not address:
             self._set_status("Шаг 0: сначала введите адрес (номер дома и улицу).", error=True)
+            return
+        fast_pause = self._step0_fast_pause_value()
+        if fast_pause is None:
             return
         try:
             cfg, provider, model, api_key, key_secret = self._build_runtime_config()
@@ -3040,14 +3318,17 @@ class SurveyApp(ctk.CTk):
         self._step0_portal_running = True
         self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
         self.step0_run_button.configure(state="disabled")
-        self._step0_lines = [self._step0_timestamp(
+        self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
             f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; один Vision-запрос получит только карту."
-        )]
+        ))]
         self._render_step0_log()
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
         worker = threading.Thread(
             target=self._step0_portal_worker,
-            args=(address, folder, cfg, provider, model, target["api_key"], key_secret),
+            args=(
+                address, folder, cfg, provider, model, target["api_key"], key_secret,
+                bool(self.step0_fast_mode_var.get()), fast_pause,
+            ),
             daemon=True,
         )
         worker.start()
@@ -3061,6 +3342,8 @@ class SurveyApp(ctk.CTk):
         model: str,
         api_key: str,
         key_secret: str,
+        fast_mode: bool = False,
+        fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
         self._worker_context.generation = self._generation
@@ -3078,6 +3361,8 @@ class SurveyApp(ctk.CTk):
                 api_key=api_key,
                 key_secret=key_secret,
                 progress=progress,
+                fast_mode=fast_mode,
+                fast_pause_sec=fast_pause,
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
             self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
@@ -3098,7 +3383,7 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001 - a closing window needs no focus restoration
             pass
         if status != "ok":
-            self._step0_log(f"Поиск участка не завершён: {payload}")
+            self._step0_log(f"Поиск участка не завершён: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
         result = payload
@@ -3111,7 +3396,8 @@ class SurveyApp(ctk.CTk):
             f"Локальный OCR: Borough {result.borough or 'не распознан'}, "
             f"Block {result.block}, Lot {result.lot}. Vision только по карте: "
             f"соседи слева/справа {result.left_neighbour or '—'} / "
-            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}."
+            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}.",
+            level=log_mode.LEVEL_KEY,
         )
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
@@ -3120,6 +3406,7 @@ class SurveyApp(ctk.CTk):
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
             "проверьте соседей и затем нажмите «Собрать описания».",
             warn=result.confidence.lower() in {"low", "низкая"},
+            key=True,
         )
 
     def _start_step0_intake(self) -> None:
@@ -3155,6 +3442,9 @@ class SurveyApp(ctk.CTk):
                 error=True,
             )
             return
+        fast_pause = self._step0_fast_pause_value()
+        if fast_pause is None:
+            return
         if lot in neighbours:
             neighbours = [value for value in neighbours if value != lot]
             self._set_status("Шаг 0: наш лот убран из списка соседей — он собирается как наш участок.", warn=True)
@@ -3175,13 +3465,13 @@ class SurveyApp(ctk.CTk):
         self.step0_to_step1_button.configure(state="disabled")
         self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
         self.step0_stop_button.configure(state="normal")
-        self._step0_lines = [self._step0_timestamp(
+        self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
             f"Начинаю сбор: блок {block}, лот {lot}"
             + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
             + f"; OCR: {ocr_dpi} dpi; папка: {folder}"
-        )]
+        ))]
         if dpi_save_error:
-            self._step0_lines.append(self._step0_timestamp(dpi_save_error))
+            self._step0_lines.append((log_mode.LEVEL_ERROR, self._step0_timestamp(dpi_save_error)))
         self._render_step0_log()
         self._set_status("Шаг 0: собираю описания участка…")
         worker = threading.Thread(
@@ -3189,7 +3479,7 @@ class SurveyApp(ctk.CTk):
             args=(
                 block, lot, neighbours, folder,
                 bool(self.step0_old_neighbour_var.get()), ocr_dpi,
-                bool(self.step0_fast_mode_var.get()),
+                bool(self.step0_fast_mode_var.get()), fast_pause,
             ),
             daemon=True,
         )
@@ -3204,6 +3494,7 @@ class SurveyApp(ctk.CTk):
         with_old: bool,
         ocr_dpi: int = ocr_pages.DEFAULT_DPI,
         fast_mode: bool = False,
+        fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
@@ -3216,13 +3507,13 @@ class SurveyApp(ctk.CTk):
         if browser_save.available():
             auto_save = browser_save.auto_save_hook(
                 downloads,
-                ready_delay=5.0 if fast_mode else 4.0,
+                ready_delay=fast_pause if fast_mode else 4.0,
                 stable_for=0.0 if fast_mode else 1.0,
                 on_attempt=lambda title: progress(
                     f"PDF уже загружен в окне браузера «{title}» — нажимаю Ctrl+S один раз"
                 ),
             )
-            mode_note = " (быстрая работа: пауза 5 с)" if fast_mode else ""
+            mode_note = f" (быстрая работа: пауза {fast_pause:g} с)" if fast_mode else ""
             progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
         else:
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
@@ -3253,7 +3544,7 @@ class SurveyApp(ctk.CTk):
         if not self._step0_running:
             return
         self._step0_stop.set()
-        self._step0_log("Запрошена остановка; завершу текущий документ и сохраню собранное.")
+        self._step0_log("Запрошена остановка; завершу текущий документ и сохраню собранное.", level=log_mode.LEVEL_KEY)
         self._set_status("Шаг 0: останавливаю после текущего документа…")
 
     def _finish_step0(self, status: str, payload: Any) -> None:
@@ -3262,22 +3553,26 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
         self.step0_stop_button.configure(state="disabled")
         if status == "cancelled":
-            self._step0_log("Сбор остановлен — собранное осталось в папке.")
+            self._step0_log("Сбор остановлен — собранное осталось в папке.", level=log_mode.LEVEL_KEY)
             self._set_status("Шаг 0: сбор остановлен.", warn=True)
             return
         if status == "error":
-            self._step0_log(f"Ошибка: {payload}")
+            self._step0_log(f"Ошибка: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
             return
         outcome = payload
         self._step0_outcome = outcome
-        self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}")
-        self._step0_lines.append(outcome.report(include_notes=False))
+        self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}", level=log_mode.LEVEL_KEY)
+        self._step0_lines.append((
+            log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY,
+            outcome.report(include_notes=False),
+        ))
         self._render_step0_log()
         if outcome.ok:
             self.step0_to_step1_button.configure(state="normal")
             self._set_status(
-                f"Шаг 0: собрано документов — {len(outcome.records)}. Папка: {outcome.folder}"
+                f"Шаг 0: собрано документов — {len(outcome.records)}. Папка: {outcome.folder}",
+                key=True,
             )
         else:
             self._set_status(
@@ -3336,7 +3631,7 @@ class SurveyApp(ctk.CTk):
                 warn=True,
             )
             return
-        self._step0_log(f"Из «Загрузок» принят файл: {record.file}")
+        self._step0_log(f"Из «Загрузок» принят файл: {record.file}", level=log_mode.LEVEL_KEY)
         self._set_status(f"Шаг 0: файл «{record.file}» добавлен в папку описаний.")
 
     def _step0_to_step1(self) -> None:
@@ -3377,7 +3672,7 @@ class SurveyApp(ctk.CTk):
             sidecars = deed_store.read_records(folder)
         except Exception as exc:  # noqa: BLE001 - повреждённый паспорт не мешает остальным
             sidecars = []
-            self._step0_log(f"Не удалось прочитать паспорта файлов: {exc}")
+            self._step0_log(f"Не удалось прочитать паспорта файлов: {exc}", level=log_mode.LEVEL_ERROR)
         by_key = {item_key(item): item for item in items_meta}
         for record in sidecars:
             record_data = dataclasses.asdict(record)
@@ -3425,7 +3720,7 @@ class SurveyApp(ctk.CTk):
                     )
             else:
                 expected_name = trimmed_name or full_name or "(имя в manifest не указано)"
-                self._step0_log(f"Файл из manifest не найден и пропущен: {expected_name}")
+                self._step0_log(f"Файл из manifest не найден и пропущен: {expected_name}", level=log_mode.LEVEL_ERROR)
                 continue
             if chosen not in paths:
                 paths.append(chosen)
@@ -3433,19 +3728,20 @@ class SurveyApp(ctk.CTk):
                 our_new_paths.add(chosen)
 
         if not paths:
-            self._step0_log("Передавать нечего: в папке описаний не найдено PDF")
+            self._step0_log("Передавать нечего: в папке описаний не найдено PDF", level=log_mode.LEVEL_ERROR)
             self._set_status("Шаг 0: в папке описаний нет файлов для Шага 1.", error=True)
             return
         self._step0_log(
             f"Отправляю в Шаг 1 ({len(paths)} PDF): "
-            + "; ".join(path.name for path in paths)
+            + "; ".join(path.name for path in paths),
+            level=log_mode.LEVEL_KEY,
         )
         items, errors = self._make_pdf_set_items(paths)
         if our_new_paths:
             for item in items:
                 item.is_main = item.path in our_new_paths
         for error in errors:
-            self._step0_log(f"Файл не открылся для Шага 1: {error}")
+            self._step0_log(f"Файл не открылся для Шага 1: {error}", level=log_mode.LEVEL_ERROR)
             self._log_line(f"! Шаг 0 → Шаг 1: {error}")
         if not items:
             self._set_status(
@@ -3832,7 +4128,8 @@ class SurveyApp(ctk.CTk):
         tab = str(self.step_tab_var.get() or STEP_TAB_BOUNDARY)
         on_step2 = tab == STEP_TAB_LABELS
         on_step0 = tab == STEP_TAB_DEEDS
-        if on_step2 or on_step0:
+        on_step4 = tab == STEP_TAB_OFFSETS
+        if on_step2 or on_step0 or on_step4:
             self.main_wrap.grid_remove()
             # Кнопки отрисовки границы относятся только к Шагу 1.
             self.add_neighbor_button.grid_remove()
@@ -3850,6 +4147,11 @@ class SurveyApp(ctk.CTk):
             self.step0_page.grid(row=2, column=0, sticky="nsew")
         else:
             self.step0_page.grid_remove()
+        if on_step4:
+            self.step4_page.grid(row=2, column=0, sticky="nsew")
+            self._refresh_step4_report()
+        else:
+            self.step4_page.grid_remove()
         for label, button in getattr(self, "step_tab_buttons", {}).items():
             active = label == tab
             button.configure(
@@ -3863,6 +4165,209 @@ class SurveyApp(ctk.CTk):
         var = getattr(self, "step_tab_var", None)
         return var is not None and str(var.get()) == STEP_TAB_LABELS
 
+    def _is_step4_tab(self) -> bool:
+        var = getattr(self, "step_tab_var", None)
+        return var is not None and str(var.get()) == STEP_TAB_OFFSETS
+
+    # ----------------------------------------------- Шаг 4: оффсеты (каркас) ---
+    def _build_step4_page(self) -> None:
+        """Страница «Шаг 4. Оффсеты»: каркас — этапы и высоты; запуск появится с правилами."""
+        page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
+        page.grid(row=2, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=0)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        self.step4_page = page
+
+        panel = ctk.CTkFrame(
+            page,
+            width=460,
+            fg_color=THEME["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+
+        ctk.CTkLabel(
+            panel,
+            text=STEP_TAB_OFFSETS,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+        ctk.CTkLabel(
+            panel,
+            text=(
+                "Подписи расстояний от дома, заборов и стен до границы участка. Граница на фронте — "
+                "M-ROW-LINE. Текст может стоять с выноской, размерной подписью или без выноски "
+                "(для зданий и гаражей)."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step4_status_label = ctk.CTkLabel(
+            panel,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["warn"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.step4_status_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step4_run_button = ctk.CTkButton(
+            panel,
+            text="⚡  Построить оффсеты в выделенной области",
+            height=42,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_offsets,
+        )
+        self.step4_run_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
+
+        report_card = ctk.CTkFrame(
+            page,
+            fg_color=THEME["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        report_card.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
+        report_card.grid_columnconfigure(0, weight=1)
+        report_card.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            report_card,
+            text="Этапы и высоты",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        self.step4_report_box = ctk.CTkTextbox(
+            report_card,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=8,
+            text_color=THEME["text_main"],
+            font=self._result_fonts["log"],
+        )
+        self.step4_report_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self._refresh_step4_report()
+
+    def _refresh_step4_report(self) -> None:
+        """Отчёт последнего запуска шага 4, а без запуска — этапы и высота текста при текущем масштабе."""
+        box = getattr(self, "step4_report_box", None)
+        if box is None:
+            return
+        last = getattr(self, "_step4_last_report", None)
+        text = last if last else offsets.step4_report_text(self._current_scale())
+        self._set_step4_report(text)
+        status = getattr(self, "step4_status_label", None)
+        if status is not None:
+            status.configure(
+                text=(
+                    "Заранее выделите в AutoCAD рамкой область (или замкнутую полилинию по её "
+                    "контуру), затем нажмите кнопку здесь. Оффсеты появятся в ней, в слое "
+                    "D-TOPO-TEXT; один Undo отменяет запись."
+                ),
+            )
+
+    def _set_step4_report(self, content: str) -> None:
+        box = getattr(self, "step4_report_box", None)
+        if box is None:
+            return
+        target = getattr(box, "_textbox", box)
+        try:
+            target.configure(state="normal")
+            target.delete("1.0", "end")
+            target.insert("1.0", content)
+            target.configure(state="disabled")
+        except Exception:  # noqa: BLE001 - окно не должно падать из-за текста отчёта
+            pass
+
+    # ------------------------------------------- Шаг 4: запуск (черновик 4.3) ---
+    def _start_offsets(self) -> None:
+        """Шаг 4: область берётся из выделения в AutoCAD; оффсеты ставятся в ней и пишутся в чертёж."""
+        if self._busy or getattr(self, "_source_role_dialog", None) is not None:
+            return
+        scale = self._current_scale()
+        cfg, _provider, _model, _key, _secret = self._build_runtime_config()
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_step4_report(
+            "Выполняется…\n\n"
+            "Читаю область, выделенную в AutoCAD. Если ничего не выделено — выделите в AutoCAD "
+            "рамкой область (или замкнутую полилинию) и нажмите кнопку снова."
+        )
+        self._set_status("Шаг 4: читаю область, выделенную в AutoCAD…")
+        self._start_background(self._offsets_worker, args=(cfg, scale))
+
+    def _offsets_worker(self, cfg: dict[str, Any], scale: float) -> None:
+        post = self._worker_poster()
+        result: Any = None
+        error = ""
+        try:
+            if sys.platform != "win32":
+                raise AcadConnectionError(
+                    "Оффсеты возможны только в Windows с запущенным AutoCAD "
+                    f"(текущая ОС: {sys.platform})"
+                )
+            builder = AcadBuilder(cfg)
+            # Тот же замок, что и у Шага 2 и отрисовки: два задания не пишут в чертёж сразу.
+            with self._draw_lock:
+                if not self._worker_is_current():
+                    return
+                result = builder.build_offsets(
+                    scale=scale,
+                    progress=lambda message: post("progress", message),
+                    should_continue=self._worker_is_current,
+                )
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        post("offsets_done", (result, error))
+        post("done", None)
+
+    def _handle_offsets_result(self, result: Any, error: str) -> None:
+        """Итог шага 4: что поставлено, что пропущено и почему, что записано в чертёж."""
+        if error or result is None:
+            message = error or "неизвестная ошибка"
+            self._step4_last_report = f"ШАГ 4 НЕ ВЫПОЛНЕН\n\n{message}"
+            self._set_step4_report(self._step4_last_report)
+            self._set_status(f"Шаг 4 не выполнен: {message}", error=True)
+            return
+        plan = result.plan
+        written = result.written
+        self._step4_last_report = result.report()
+        self._set_step4_report(self._step4_last_report)
+        for line in self._step4_last_report.splitlines():
+            if line.strip():
+                self._log_line(f"Шаг 4 · {line.strip()}")
+        count = len(plan.items)
+        written_count = (written.created_texts + written.created_leaders) if written else 0
+        summary = (
+            f"Шаг 4: оффсетов {count}, записано {written_count}"
+            if written is not None
+            else f"Шаг 4: оффсетов {count} (чертёж не изменён)"
+        )
+        self._set_status(
+            summary,
+            error=bool(written is not None and written.failed) and written_count == 0,
+            warn=bool(plan.warnings or (written is not None and (written.failed or written.warnings))),
+            key=True,
+        )
+
     def _set_step2_report(self, content: str) -> None:
         box = getattr(self, "step2_report_box", None)
         if box is None:
@@ -3874,11 +4379,17 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
         box.delete("1.0", "end")
-        box.insert("1.0", content)
+        box.insert("1.0", self._step2_report_view(content))
         try:
             target.configure(state="disabled")
         except Exception:  # noqa: BLE001
             pass
+
+    def _step2_report_view(self, content: str) -> str:
+        """Отчёт Шага 2 для показа в выбранном режиме; копирование берёт полный текст."""
+        if content == STEP2_EMPTY_REPORT:
+            return content
+        return "\n".join(log_mode.filter_step2_lines(content.splitlines(), self._log_mode()))
 
     def _clear_step2_report(self) -> None:
         self.feature_label_result = None
@@ -4008,11 +4519,12 @@ class SurveyApp(ctk.CTk):
         self._set_step2_report(report)
         for line in report.splitlines():
             if line.strip():
-                self._log_line(f"Шаг 2 · {line.strip()}")
+                self._log_line(f"Шаг 2 · {line.strip()}", level=log_mode.step2_line_level(line))
         self._set_status(
             result.summary(),
             error=bool(result.failed) and result.created_labels == 0,
             warn=result.has_issues,
+            key=True,
         )
 
     # --------------------------------------------------- ящик ключей и ИИ ---
@@ -4061,6 +4573,23 @@ class SurveyApp(ctk.CTk):
     def _on_use_llm_toggled(self) -> None:
         self._refresh_consensus_rows()
         self._refresh_engine_card()
+
+    RUN_MODE_LABELS = ["Локально", "Эконом", "ИИ"]
+
+    def _on_run_mode_clicked(self, label: str) -> None:
+        """Три режима: Локально (бесплатно), Эконом (локально, ИИ при проблемах), ИИ."""
+        if label == "ИИ":
+            self.economy_var.set(False)
+            self.use_llm_var.set(True)
+        else:
+            self.economy_var.set(label == "Эконом")
+            self.use_llm_var.set(False)
+        self._on_use_llm_toggled()
+
+    def _run_mode_label(self) -> str:
+        if self.use_llm_var.get():
+            return "ИИ"
+        return "Эконом" if self.economy_var.get() else "Локально"
 
     # -------------------------------------------------- Spectrum UX helpers --
     def _result_logical_pixels(self, value: float) -> float:
@@ -4164,11 +4693,19 @@ class SurveyApp(ctk.CTk):
         """Основная кнопка показывает выбранный режим, вторая запускает альтернативу."""
         if not hasattr(self, "parse_button"):
             return
+        if hasattr(self, "run_mode_seg"):
+            self.run_mode_seg.set(self._run_mode_label())
         use_llm = bool(self.use_llm_var.get())
         if self.pdf_set and self._current_source_mode() == "📄 PDF":
             # В наборе способ разбора выбран у каждого файла отдельно.
             paid = sum(1 for item in self.pdf_set if item.use_llm)
-            cost = f"ИИ: {paid} файл., платно" if paid else "бесплатно"
+            economy_files = sum(1 for item in self.pdf_set if item.economy and not item.use_llm)
+            if paid:
+                cost = f"ИИ: {paid} файл., платно"
+            elif economy_files:
+                cost = f"эконом: {economy_files} файл., ИИ только при проблемах"
+            else:
+                cost = "бесплатно"
             self.parse_button.configure(
                 text=f"▶ Разобрать набор заново ({cost}) · Ctrl+Enter",
                 fg_color=THEME["btn_primary"],
@@ -4181,9 +4718,16 @@ class SurveyApp(ctk.CTk):
             )
             return
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
+        economy_on = bool(self.economy_var.get())
         if use_llm:
             primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
             alternative = "⚡ Локальный разбор без ИИ · бесплатно"
+        elif economy_on:
+            primary = "⚖ Разобрать экономно · Ctrl+Enter"
+            alternative = (
+                "✨ Разобрать все PDF с ИИ · платно" if is_batch
+                else "✨ Разобрать с ИИ · расход токенов API"
+            )
         else:
             primary = "⚡ Разобрать бесплатно · Ctrl+Enter"
             alternative = (
@@ -4349,7 +4893,7 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
         box.delete("1.0", "end")
-        lines = list(getattr(self, "_log", []))[-300:]
+        lines = log_mode.filter_entries(list(getattr(self, "_log", []))[-300:], self._log_mode())
         content = "\n".join(reversed(lines)) if lines else "Журнал пуст"
         box.insert("1.0", content)
         try:
@@ -5208,26 +5752,55 @@ class SurveyApp(ctk.CTk):
         confirm = getattr(self, "_confirm_update_version", None)
         if callable(confirm) and not confirm(source):
             return
-        app_dir = Path(__file__).resolve().parent
+        app_dir = self._update_dir()
         self._update_running = True
         self.update_version_button.configure(state="disabled", text="⏳ Обновляю…")
+        self._set_rollback_enabled(False)
         self.update_status_label.configure(
             text=f"Скачиваю обновление из {source}…", text_color=THEME["text_dim"],
         )
         self._set_status(f"Обновление: скачиваю архив из {source}…")
+        self._show_update_stage("download", 0.0, "подключаюсь к GitHub…")
 
         def progress(message: str) -> None:
             self._post("update_progress", str(message))
 
+        def stage(name: str, fraction: float | None, detail: str) -> None:
+            self._post("update_stage", (name, fraction, detail))
+
         def worker() -> None:
             try:
-                result = app_updater.apply_update(source, app_dir, progress=progress)
+                result = app_updater.apply_update(source, app_dir, progress=progress, on_stage=stage)
             except Exception as exc:  # noqa: BLE001 - network/zip/filesystem failures
                 self._post("update_done", ("error", f"{type(exc).__name__}: {exc}"))
                 return
             self._post("update_done", ("ok", result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _attach_child_window(self, win: Any) -> None:
+        """
+        Окно-отчёт (сверка с соседями, итог набора, журнал и т. п.) принадлежит главному окну:
+        transient держит его поверх основного окна, lift поднимает при открытии.
+        """
+        try:
+            win.transient(self)
+        except Exception:  # noqa: BLE001 - платформа не поддерживает transient — окно всё равно откроется
+            pass
+        win.lift()
+
+    def _show_update_stage(self, name: str, fraction: float | None, detail: str) -> None:
+        """Полоса и подпись: «Скачивание: 42% — 1.0 из 2.4 МБ», «Резервная копия…», «Установка…»."""
+        titles = {"download": "Скачивание", "backup": "Резервная копия", "install": "Установка"}
+        title = titles.get(name, name)
+        bar = self.update_progress_bar
+        bar.grid()
+        if fraction is None:
+            text = f"{title}: {detail}"
+        else:
+            bar.set(max(0.0, min(1.0, float(fraction))))
+            text = f"{title}: {round(max(0.0, min(1.0, float(fraction))) * 100)}% — {detail}"
+        self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
 
     def _confirm_update_version(self, source: str) -> bool:
         """Ask for confirmation before overwriting the running installation."""
@@ -5246,6 +5819,11 @@ class SurveyApp(ctk.CTk):
         self._update_running = False
         self.update_version_button.configure(state="normal", text="🔄 Обновить версию")
         if status == "ok":
+            self.update_progress_bar.set(1.0)
+        else:
+            self.update_progress_bar.set(0)
+            self.update_progress_bar.grid_remove()
+        if status == "ok":
             result: app_updater.UpdateResult = payload
             kept_note = (
                 f" Локальные настройки сохранены: {', '.join(result.protected_skipped)}."
@@ -5263,32 +5841,180 @@ class SurveyApp(ctk.CTk):
                 f"Обновление завершено: заменено файлов — {result.files_written}.{kept_note} "
                 "Перезапустите программу.",
             )
-            try:
-                was_topmost = bool(self.attributes("-topmost"))
-                if was_topmost:
-                    self.attributes("-topmost", False)
-            except Exception:  # noqa: BLE001
-                was_topmost = False
-            if messagebox.askyesno(
+            self._refresh_rollback_state()
+            self._offer_restart(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
                 "Перезапустить программу сейчас?",
-            ):
-                run_bat = app_dir() / "run.bat"
-                if run_bat.is_file():
-                    if sys.platform == "win32":
-                        subprocess.Popen(
-                            ["cmd", "/c", "start", "", str(run_bat)],
-                            cwd=str(run_bat.parent),
-                        )
-                    else:
-                        subprocess.Popen([str(run_bat)], cwd=str(run_bat.parent))
-                self.destroy()
+                base_text=str(self.update_status_label.cget("text")),
+            )
         else:
+            self._refresh_rollback_state()
             self.update_status_label.configure(
                 text=f"Обновление не удалось: {payload}", text_color=THEME["err"],
             )
             self._set_status(f"Обновление не удалось: {payload}", error=True)
+
+    def _update_dir(self) -> Path:
+        """Папка программы: обновление и откат работают только с ней."""
+        return Path(__file__).resolve().parent
+
+    def _offer_restart(self, title: str, question: str, *, base_text: str) -> None:
+        """
+        Спрашивает о перезапуске и, если пользователь согласен, запускает run.bat.
+
+        Окно закрывается только после успешного запуска нового экземпляра. Иначе
+        оно остаётся открытым, а причина и инструкция пишутся рядом с итогом.
+        """
+        from tkinter import messagebox
+
+        try:
+            was_topmost = bool(self.attributes("-topmost"))
+            if was_topmost:
+                self.attributes("-topmost", False)
+        except Exception:  # noqa: BLE001
+            was_topmost = False
+        asked = messagebox.askyesno(title, question)
+        if asked:
+            problem = self._relaunch_after_update()
+            if problem:
+                text = (
+                    f"{base_text} Не удалось перезапустить автоматически ({problem}): "
+                    "закройте программу и запустите run.bat из её папки вручную."
+                )
+                self.update_status_label.configure(text=text, text_color=THEME["err"])
+                self._set_status(text, error=True)
+            else:
+                self._exit_after_relaunch()
+                return
+        if was_topmost:
+            try:
+                self.attributes("-topmost", True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _exit_after_relaunch(self) -> None:
+        """
+        Завершает процесс старой версии после того, как новый уже запущен.
+
+        Окно run.bat старой версии ждёт, пока завершится python.exe. Одного destroy()
+        недостаточно: если процесс задерживается (фоновые потоки, очистка интерпретатора),
+        cmd висит. Поэтому после destroy() выходим сразу с кодом 0 — run.bat тогда
+        дойдёт до конца и закроет своё окно, а не предложит откат.
+        """
+        try:
+            self.destroy()
+        except Exception:  # noqa: BLE001 - выходим в любом случае
+            pass
+        self._exit_process(0)
+
+    def _exit_process(self, code: int) -> None:
+        """Немедленный выход процесса (отдельным методом, чтобы тесты не завершали pytest)."""
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(code)
+
+    def _set_rollback_enabled(self, enabled: bool) -> None:
+        button = getattr(self, "rollback_button", None)
+        if button is not None:
+            button.configure(state="normal" if enabled else "disabled")
+
+    def _refresh_rollback_state(self) -> None:
+        """Показывает, на какую версию откатимся, или что резервных копий нет."""
+        label = getattr(self, "rollback_status_label", None)
+        if label is None:
+            return
+        try:
+            backups = app_updater.list_backups(self._update_dir())
+        except OSError:
+            backups = []
+        if not backups:
+            label.configure(
+                text="Резервных копий нет: откат станет доступен после первого обновления.",
+                text_color=THEME["text_dim"],
+            )
+            self._set_rollback_enabled(False)
+            return
+        latest = backups[0]
+        when = latest.created
+        try:
+            when = _dt.datetime.fromisoformat(latest.created).strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            pass
+        label.configure(
+            text=(
+                f"Резерв: версия {latest.version or 'неизвестна'} (сохранена {when}). "
+                "Откат вернёт её файлы; настройки и ключи не меняются."
+            ),
+            text_color=THEME["text_dim"],
+        )
+        self._set_rollback_enabled(not self._update_running)
+
+    def _start_rollback(self) -> None:
+        """Возвращает файлы прежней версии из самой свежей резервной копии."""
+        if self._update_running:
+            self._set_status("Дождитесь окончания обновления, затем откатывайте версию.", warn=True)
+            return
+        from tkinter import messagebox
+
+        latest = app_updater.list_backups(self._update_dir())
+        if not latest:
+            self._refresh_rollback_state()
+            return
+        version = latest[0].version or "неизвестна"
+        if not messagebox.askyesno(
+            "Откат версии",
+            f"Вернуть файлы версии {version} из резервной копии?\n\n"
+            "Текущие файлы программы будут заменены. config.json, .env и локальные "
+            "файлы не меняются.\n\nПродолжить?",
+        ):
+            return
+        try:
+            result = app_updater.rollback_latest(self._update_dir())
+        except (app_updater.UpdateError, OSError) as exc:
+            self._refresh_rollback_state()
+            self._set_status(f"Откат не выполнен: {exc}", error=True)
+            self.update_status_label.configure(text=f"Откат не выполнен: {exc}", text_color=THEME["err"])
+            return
+        text = (
+            f"Откат выполнен: возвращена версия {result.version or 'неизвестна'} "
+            f"(файлов восстановлено — {result.files_restored}, новых удалено — {result.files_removed})."
+        )
+        self.update_status_label.configure(text=text, text_color=THEME["ok"])
+        self._set_status(text)
+        self._refresh_rollback_state()
+        self._offer_restart(
+            "Откат выполнен",
+            f"После перезапуска программа продолжит работу на версии "
+            f"{result.version or 'неизвестна'}.\n\nПерезапустить программу сейчас?",
+            base_text=text,
+        )
+
+    def _relaunch_after_update(self) -> str:
+        """
+        Запускает run.bat из папки программы, чтобы поднять обновлённую версию.
+
+        Папка берётся из пути main.py (run.bat лежит рядом с ним), а не из текущей
+        директории. Возвращает текст причины, если запуск не удался, иначе пустую строку.
+        """
+        import subprocess
+
+        run_bat = Path(__file__).resolve().parent / "run.bat"
+        if not run_bat.is_file():
+            return f"не найден {run_bat.name} в папке программы"
+        if sys.platform != "win32":
+            return "автоматический перезапуск работает в Windows"
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", str(run_bat)],
+                cwd=str(run_bat.parent),
+            )
+        except OSError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return ""
 
     def _bind_studio_shortcuts(self) -> None:
         """Привязывает студийные горячие клавиши для быстрой повседневной работы."""
@@ -5302,7 +6028,7 @@ class SurveyApp(ctk.CTk):
                     return None
                 # Клавиши разбора и отрисовки границы не срабатывают на вкладках
                 # Шага 2 и Шага 0: там другой работой занят экран.
-                if step1_only and (self._is_step2_tab() or self._is_step0_tab()):
+                if step1_only and (self._is_step2_tab() or self._is_step0_tab() or self._is_step4_tab()):
                     return None
                 action()
                 return "break"
@@ -5333,6 +6059,7 @@ class SurveyApp(ctk.CTk):
         win.configure(fg_color=THEME["bg_root"])
         try:
             win.attributes("-topmost", bool(self.topmost_var.get()))
+            self._attach_child_window(win)
         except Exception:  # noqa: BLE001
             pass
         win.grid_columnconfigure(0, weight=1)
@@ -5537,6 +6264,70 @@ class SurveyApp(ctk.CTk):
         )
         self._set_inspector_text(hint)
         self._redraw_preview_canvas()
+
+    def _slide_overlapping_neighbours(self, variant: str = "corner") -> None:
+        """
+        Развод наложений в предпросмотре: сосед, лежащий поверх нашего участка, съезжает наружу
+        до появления общей межи (алгоритм — neighbour_slide.py). Зазоры не трогаем.
+        ``variant``: «corner» — углы важнее направления; «direction» — направление важнее (3.92).
+        Сосед переносится жёстко: форма, длины и румбы не меняются, меняется только положение на
+        схеме; описание (legal description) не меняется.
+        """
+        main = self._preview_main_plan
+        neighbours = list(self._preview_neighbor_plans)
+        if main is None or not neighbours:
+            self._set_status("Развод: на схеме нет нашего участка или соседей", warn=True)
+            return
+        streets = [
+            (ln.start, ln.end)
+            for ln in main.lines
+            if str(ln.kind).startswith(("main-street-row", "cross-street-row"))
+            and not str(ln.kind).endswith("-tie")  # линия привязки от угла до POB — не улица
+        ]
+        moves: list[tuple[DrawPlan, float, float]] = []
+        moved_count = 0
+        self._log_line(f"Развод наложений — вариант «{_SLIDE_VARIANT_TEXT.get(variant, variant)}»")
+        for idx, plan in enumerate(neighbours, 1):
+            others = [other.vertices for other in neighbours if other is not plan]
+            res = slide_off_overlap(
+                main.vertices, plan.vertices, street_lines=streets, others=others, variant=variant,
+            )
+            if res.status == "moved":
+                translate_plan_in_place(plan, res.dx, res.dy)
+                moves.append((plan, res.dx, res.dy))
+                moved_count += 1
+                self._log_line(
+                    f"Развод: СОСЕД #{idx} сдвинут на {res.distance_ft:.2f} ft "
+                    f"(направление {res.direction_deg:.1f}°, "
+                    f"{_SLIDE_METHOD_TEXT.get(res.method, res.method)}), "
+                    f"общая межа {res.shared_ft:.2f} ft; клин (расхождение сторон на дальнем конце) "
+                    f"{res.wedge_ft:.2f} ft — примечание; было наложение {res.overlap_before_sqft:,.1f} кв. ft",
+                )
+                if res.corner_note:
+                    self._log_line(f"Развод: СОСЕД #{idx} — {res.corner_note}")
+            elif res.status == "no_overlap":
+                self._log_line(f"Развод: СОСЕД #{idx} — наложения нет, не трогаем (зазор не сдвигаем)")
+            else:
+                self._log_line(f"Развод: СОСЕД #{idx} не сдвинут — {res.note}", level=log_mode.LEVEL_WARN)
+        self._slide_undo = moves
+        self._redraw_preview_canvas()
+        if moved_count:
+            self._set_status(f"Развод наложений ({_SLIDE_VARIANT_TEXT.get(variant, variant)}): сдвинуто соседей — {moved_count}")
+        else:
+            self._set_status("Развод наложений: сдвигать нечего (см. журнал)", warn=True)
+
+    def _undo_slide_neighbours(self) -> None:
+        """Возвращает соседей на места, с которых их сдвинул последний «Развести наложения»."""
+        moves = list(getattr(self, "_slide_undo", []) or [])
+        if not moves:
+            self._set_status("Отменять нечего: последний развод не сдвигал соседей", warn=True)
+            return
+        for plan, dx, dy in reversed(moves):
+            translate_plan_in_place(plan, -dx, -dy)
+        self._slide_undo = []
+        self._redraw_preview_canvas()
+        self._log_line(f"Развод отменён: соседей возвращено на места — {len(moves)}")
+        self._set_status("Развод отменён")
 
     def _on_preview_mode_changed(self, _mode_label: str = "") -> None:
         self._reset_viewport_state()
@@ -5823,6 +6614,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("860x560")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
@@ -5904,6 +6696,7 @@ class SurveyApp(ctk.CTk):
 
     def _clear_preview_scene(self) -> None:
         self._preview_main_plan = None
+        self._slide_undo = []
         self._pdf_set_main_plan = None
         self._pdf_set_scene_neighbors.clear()
         self._pdf_set_main_pending = False
@@ -5999,7 +6792,7 @@ class SurveyApp(ctk.CTk):
         self, plan: DrawPlan, *, extra_warnings: list[str] | None = None
     ) -> str:
         desc = plan.description
-        role = "СОСЕДНИЙ УЧАСТОК (NEIGHBOR_LOT)" if plan.is_neighbor else "ОСНОВНОЙ УЧАСТОК (PROPERTY_LINE)"
+        role = "СОСЕДНИЙ УЧАСТОК (NEIGHBOR_LOT)" if plan.is_neighbor else "ОСНОВНОЙ УЧАСТОК (PL)"
         lines: list[str] = [f"▸ {role}"]
 
         if desc.block_number or desc.lot_number or desc.borough_or_city:
@@ -6325,7 +7118,7 @@ class SurveyApp(ctk.CTk):
             gy_val += grid_step
             grid_guard += 1
 
-        # 1. Пунктирные линии красных линий улиц (STREET_ROW_AI) + подписи улиц
+        # 1. Пунктирные линии красных линий улиц (M-ROW-LINE) + подписи улиц
         labeled_streets: set[str] = set()
         for pl in plans:
             for idx_rl, rl in enumerate(pl.lines):
@@ -6378,7 +7171,7 @@ class SurveyApp(ctk.CTk):
                 font=("Segoe UI", 8, "bold"),
             )
 
-        # 4. Основной участок (PROPERTY_LINE, контур + узлы + подсветка наведения + POB + GAP)
+        # 4. Основной участок (PL, контур + узлы + подсветка наведения + POB + GAP)
         focus_plan = self._preview_main_plan or self._last_active_plan
         if focus_plan is not None:
             if math.hypot(focus_plan.pob[0], focus_plan.pob[1]) > 1e-3:
@@ -6972,6 +7765,7 @@ class SurveyApp(ctk.CTk):
         win.configure(fg_color=THEME["bg_root"])
         win.transient(self)
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkLabel(
             win, text=f"Какой участок содержится в {source_label}?",
@@ -7197,7 +7991,9 @@ class SurveyApp(ctk.CTk):
         )
         self._start_pdf_set()
 
-    def _start_pdf_set(self, *, force: bool = False, ask_advisor: bool = False) -> None:
+    def _start_pdf_set(
+        self, *, force: bool = False, ask_advisor: bool = False, join_mode: str | None = None,
+    ) -> None:
         """
         Разбирает все участки набора одним заданием; AutoCAD запускается отдельно.
 
@@ -7210,6 +8006,7 @@ class SurveyApp(ctk.CTk):
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
             return
         self._dismiss_conflict_ui()
+        self._select_result_tab("🧾 Журнал")  # разбор идёт — смотрим журнал, а не ведомость
         self._running_source_signature = self._source_signature(mode="📄 PDF")
         self._running_source_path = None
         self._running_source_label = None
@@ -7246,6 +8043,9 @@ class SurveyApp(ctk.CTk):
         detail = f"ИИ: {paid}, локально: {local}"
         if by_ocr:
             detail += f" (из них OCR: {by_ocr})"
+        economy_jobs = sum(1 for job in jobs if job.economy and job.cached_outcome is None)
+        if economy_jobs:
+            detail += f", эконом: {economy_jobs} (ИИ при проблемах)"
         if reused:
             detail += f", без изменений: {reused}"
         self._set_status(f"Разбор набора PDF: {len(jobs)} файл. ({detail})…")
@@ -7255,11 +8055,14 @@ class SurveyApp(ctk.CTk):
                 f"  {job.role_label}: {job.path.name} · {job.pages_label} · {job.mode_label}"
                 + (" · результат уже есть" if job.cached_outcome is not None else "")
             )
+        join_images: tuple[str, ...] = ()
+        if join_mode and self._pdf_set_tax_map is not None:
+            join_images = (self._pdf_set_tax_map[1],)
         self._start_background(
             self._pdf_set_worker,
             args=(
                 jobs, cfg, provider_id, model_name, api_key, key_secret, scale, do_auto_orient,
-                dict(self._pdf_set_advice), ask_advisor,
+                dict(self._pdf_set_advice), ask_advisor, join_mode, join_images,
             ),
         )
 
@@ -7302,14 +8105,20 @@ class SurveyApp(ctk.CTk):
                 provider_label=f"Расхождение {count} проходов",
             )
             return outcome, True, [issue]
+        # Эконом только для текстовых файлов: сканы уже идут лестницей OCR и сами зовут ИИ.
+        economy_escalates = bool(
+            job.economy and not job.use_llm and not job.ocr
+            and _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)[0]
+        )
         try:
             outcome = parse_legal_description_full(
                 **source, cfg=cfg, enhance_scan=enhance, auto_orient=auto_orient,
                 use_llm=job.use_llm, provider=provider_id, model=model_name, api_key=api_key,
                 key_secret=key_secret, allow_regex_fallback=False, progress=progress,
+                escalate_to_llm=economy_escalates,
             )
         except Exception as local_exc:  # noqa: BLE001
-            if job.use_llm or not (api_key or key_secret) or job.ocr:
+            if job.use_llm or job.ocr or not _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)[0]:
                 raise
             if progress is not None:
                 progress(f"локальный парсер не справился ({local_exc}) — отправляю в ИИ…")
@@ -7330,34 +8139,86 @@ class SurveyApp(ctk.CTk):
         return None
 
     @staticmethod
-    def _shape_rank(plan: Any, issues: list[str]) -> tuple[int, int, float]:
+    def _shape_rank(plan: Any, issues: list[str], warnings: Any = ()) -> tuple[int, int, float]:
         if plan is None:
-            return (0, -999, -9999.0)
+            return (0, -999, -9999.0, 0)
         where, _ = ocr_closure_note(plan)
-        severe_count = len(issues) + (1 if where == "issue" else 0)
+        suspicion = getattr(plan, "suspicion", None)
+        suspicious = bool(suspicion is not None and suspicion.is_suspicious)
+        no_distance = _lacks_corner_distance(list(warnings or ()) + list(getattr(plan, "warnings", None) or ()))
+        severe_count = (
+            len(issues) + (1 if where == "issue" else 0)
+            + (1 if suspicious else 0) + (1 if no_distance else 0)
+        )
         closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
-        return (1, -severe_count, -round(closure, 4))
+        # При равной фигуре больше данных о расстояниях (угол, длины сторон) — лучше.
+        desc = getattr(plan, "description", None)
+        info = 0
+        if desc is not None:
+            info += 1 if float(getattr(desc, "distance_to_corner_ft", 0.0) or 0.0) > 0 else 0
+            info += sum(
+                1 for seg in (getattr(desc, "segments", None) or ())
+                if float(getattr(seg, "distance_ft", 0.0) or 0.0) > 0 and getattr(seg, "has_bearing", True)
+            )
+        return (1, -severe_count, -round(closure, 4), info)
 
-    @staticmethod
-    def _has_severe_shape_issues(plan: Any, issues: list[str]) -> bool:
-        if plan is None:
-            return True
-        if issues:
-            return True
-        where, _ = ocr_closure_note(plan)
-        if where == "issue":
-            return True
-        closure = float(getattr(plan, "closure_error_ft", 0.0) or 0.0)
-        return closure > 0.5
+    def _local_text_rank(
+        self, job: PdfSetJob, text: str, builder: AcadBuilder, scale: float, cfg: dict[str, Any],
+        provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+        do_auto_orient: bool, post: Any,
+    ) -> tuple[int, int, float, int] | None:
+        """Ранг текста, как его прочитает локальный разбор (без ИИ). None — текст не читается."""
+        try:
+            probe = dataclasses.replace(job, source={"text": text}, use_llm=False, ocr=True)
+            outcome, _, issues = self._parse_pdf_set_job(
+                probe, cfg, provider_id, model_name, api_key, key_secret, do_auto_orient,
+                lambda msg: None, post,
+            )
+            plan = builder.plan(outcome.data, scale=scale, is_neighbor=not job.is_main)
+        except Exception:  # noqa: BLE001 - нечитаемый текст просто не даёт ранга
+            return None
+        return self._shape_rank(plan, list(issues), outcome.warnings)
+
+    def _write_ai_to_step0_cache(
+        self, job: PdfSetJob, data: Any, *, prev_rank: tuple[int, int, float, int] | None,
+        cache_path: Path | None, builder: AcadBuilder, scale: float, cfg: dict[str, Any],
+        provider_id: str, model_name: str, api_key: str | None, key_secret: str,
+        do_auto_orient: bool, post: Any,
+    ) -> str:
+        """
+        Пишет ответ ИИ в кеш Шага 0, если пересобранный текст лучше прежнего уровня.
+
+        Лучше — строго выше ранга (фигура, затем данные о расстояниях). При равенстве кеш
+        не меняется. Возвращает строку для журнала.
+        """
+        rendered = legal_to_step0_text(data)
+        if rendered is None:
+            return "ответ ИИ нельзя записать текстом (сторона без румба) — кеш не изменён"
+        new_rank = self._local_text_rank(
+            job, rendered, builder, scale, cfg, provider_id, model_name, api_key, key_secret,
+            do_auto_orient, post,
+        )
+        if new_rank is None:
+            return "ответ ИИ не читается локально — кеш не изменён"
+        if prev_rank is not None and not new_rank > prev_rank:
+            return "ответ ИИ не лучше кеша — кеш не изменён"
+        target = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+        try:
+            target.write_text(ocr_pages.description_key_lines(rendered) or rendered, encoding="utf-8")
+        except OSError as exc:
+            return f"кеш не записан: {exc}"
+        return f"кеш Шага 0 обновлён ответом ИИ ({target.name})"
 
     def _pdf_set_worker(
         self, jobs: list[PdfSetJob], cfg: dict[str, Any], provider_id: str, model_name: str,
         api_key: str | None, key_secret: str, scale: float, do_auto_orient: bool,
         advice: dict[str, AdvisorReply] | None = None, ask_advisor: bool = False,
+        join_mode: str | None = None, join_images: tuple[str, ...] = (),
     ) -> None:
         """Фоновый разбор набора: ошибка одного файла не останавливает остальные."""
         post = self._worker_poster()
         builder = AcadBuilder(cfg)
+        ai_ready, ai_block = _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)
         results: list[PdfSetResult] = []
         total = len(jobs)
         for idx, job in enumerate(jobs, start=1):
@@ -7370,12 +8231,13 @@ class SurveyApp(ctk.CTk):
                     result.issues = list(job.cached_issues)
                     result.pre_counted = True
                     result.cached = True
+                    result.llm_used = bool(job.use_llm)
                 else:
                     if job.source is None:
                         raise PDFError(job.source_error or "нет данных для разбора")
                     if job.ocr:
-                        # Трёхступенчатая эскалация для скана:
-                        # 1) кеш Шага 0 (*_text.txt) -> 2) OCR 400 dpi -> 3) LLM -> 4) ручной ввод.
+                        # Скан: кеш Шага 0 -> один проход локального OCR -> ИИ, только если проверка
+                        # описания не пройдена (статус ok/warning/failed из description_check).
                         cache_path = self._find_step0_cache_path(job.path)
                         cached_text = ""
                         if cache_path is not None:
@@ -7384,102 +8246,144 @@ class SurveyApp(ctk.CTk):
                             except OSError:
                                 cached_text = ""
 
-                        best_outcome = None
-                        best_plan = None
-                        best_issues: list[str] = []
-                        best_text = ""
-                        best_rank = (0, -999, -9999.0)
+                        def progress_of(msg: str, i: int = idx) -> None:
+                            post("progress", f"[{i}/{total}] {msg}")
+
+                        def judge(source: dict[str, Any], use_llm: bool, label: str = "") -> _ScanCandidate:
+                            """Разбирает источник, строит план и ранжирует: сначала статус проверки, затем фигура."""
+                            judged_job = dataclasses.replace(job, source=source, use_llm=use_llm)
+                            o, pre, iss = self._parse_pdf_set_job(
+                                judged_job, cfg, provider_id, model_name, api_key, key_secret,
+                                do_auto_orient, progress_of, post,
+                            )
+                            d = apply_changes(o.data, fix_changes(job.fixes))
+                            p = builder.plan(d, scale=scale, is_neighbor=not job.is_main)
+                            shape = self._shape_rank(p, iss, o.warnings)
+                            if label:
+                                # Баллы фигуры: сколько обязательных значений нашлось и почему результат не ok.
+                                progress_of(f"{job.path.name}: {label} — {figure_line(getattr(o, 'check', None))}")
+                            return _ScanCandidate(
+                                outcome=o, plan=p, issues=list(iss), pre_counted=bool(pre),
+                                shape_rank=tuple(shape), status_rank=_check_status_rank(o, p),
+                            )
+
+                        best: _ScanCandidate | None = None
+                        cache_candidate: _ScanCandidate | None = None
                         last_exc: Exception | None = None
 
                         if cached_text:
-                            post("progress", f"[{idx}/{total}] {job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
+                            progress_of(f"{job.path.name}: проверяю кеш Шага 0 ({cache_path.name})…")
                             try:
-                                cache_job = dataclasses.replace(job, source={"text": cached_text}, use_llm=False)
-                                o1, _, iss1 = self._parse_pdf_set_job(
-                                    cache_job, cfg, provider_id, model_name, api_key, key_secret,
-                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                )
-                                d1 = apply_changes(o1.data, fix_changes(job.fixes))
-                                p1 = builder.plan(d1, scale=scale, is_neighbor=not job.is_main)
-                                best_outcome, best_plan, best_issues, best_text = o1, p1, list(iss1), cached_text
-                                best_rank = self._shape_rank(p1, iss1)
+                                cache_candidate = judge({"text": cached_text}, False, "кеш Шага 0")
+                                best = cache_candidate
                             except Exception as exc:  # noqa: BLE001
                                 last_exc = exc
 
-                        if self._has_severe_shape_issues(best_plan, best_issues):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: перераспознаю локально на 400 dpi…")
-                            pages = job.source.get("pdf_pages") or (1, 1)
-                            first_p, last_p = int(pages[0]), int(pages[1])
-                            try:
-                                total_p = int(inspect_pdf(job.path).get("pages") or 0)
-                                if 1 <= total_p <= 2:
-                                    first_p, last_p = 1, total_p
-                            except Exception:  # noqa: BLE001
-                                pass
-                            try:
-                                text_400 = ocr_pages.ocr_pdf_pages(job.path, first_p, last_p, dpi=400).strip()
-                            except Exception:  # noqa: BLE001
-                                text_400 = ""
-                            if text_400 and text_400 != cached_text:
+                        if not _accepted_without_ai(best):
+                            progress_of(f"{job.path.name}: распознаю локально, один проход (до {SCAN_OCR_DPI} dpi)…")
+                            ocr = ocr_scan_once(job.path, job.source, progress=progress_of)
+                            progress_of(f"{job.path.name}: OCR — {ocr.summary()}")
+                            if ocr.error:
+                                last_exc = PDFError(f"локальный OCR: {ocr.error}")
+                            elif ocr.text:
+                                # Разбор OCR-текста мог упасть: ошибка пишется в журнал, второй рендер
+                                # (нативное разрешение) и слияние строк всё равно пробуются — до ИИ.
+                                best_text = ocr.text
+                                ocr_candidate: _ScanCandidate | None = None
                                 try:
-                                    j400 = dataclasses.replace(job, source={"text": text_400}, use_llm=False)
-                                    o2, _, iss2 = self._parse_pdf_set_job(
-                                        j400, cfg, provider_id, model_name, api_key, key_secret,
-                                        do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                    )
-                                    d2 = apply_changes(o2.data, fix_changes(job.fixes))
-                                    p2 = builder.plan(d2, scale=scale, is_neighbor=not job.is_main)
-                                    r2 = self._shape_rank(p2, iss2)
-                                    if r2 > best_rank:
-                                        best_outcome, best_plan, best_issues, best_text, best_rank = o2, p2, list(iss2), text_400, r2
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(text_400, encoding="utf-8")
-                                        except OSError:
-                                            pass
+                                    ocr_candidate = judge({"text": ocr.text}, False, "OCR, 600 dpi")
                                 except Exception as exc:  # noqa: BLE001
                                     last_exc = exc
+                                    progress_of(f"{job.path.name}: разбор OCR-текста не удался — {describe_exc(exc)}")
+                                if not _accepted_without_ai(ocr_candidate):
+                                    progress_of(
+                                        f"{job.path.name}: проверка не ok — дальше второй рендер "
+                                        "(нативное разрешение) и слияние строк"
+                                    )
+                                    second = ocr_scan_once(job.path, job.source, progress=progress_of, exact=False)
+                                    progress_of(f"{job.path.name}: второй рендер — {second.summary()}")
+                                    if second.text:
+                                        variants: list[tuple[str, _ScanCandidate]] = []
+                                        if ocr_candidate is not None:
+                                            variants.append((ocr.text, ocr_candidate))
+                                        to_judge = [(second.text, "второй рендер")]
+                                        if ocr_candidate is not None:
+                                            to_judge.append(
+                                                (ocr_pages.merge_line_texts(ocr.text, second.text), "слияние строк")
+                                            )
+                                        for text_v, text_label in to_judge:
+                                            try:
+                                                variants.append((text_v, judge({"text": text_v}, False, text_label)))
+                                            except Exception as exc:  # noqa: BLE001
+                                                last_exc = exc
+                                                progress_of(f"{job.path.name}: {text_label} не разобран — {describe_exc(exc)}")
+                                        if variants:
+                                            text_best, cand_best = max(variants, key=lambda v: v[1].rank)
+                                            if ocr_candidate is None or cand_best.rank > ocr_candidate.rank:
+                                                if ocr_candidate is not None:
+                                                    progress_of(
+                                                        f"{job.path.name}: слияние двух рендеров дало "
+                                                        f"{'ok' if cand_best.status_rank >= _STATUS_OK_RANK else 'неполный'} разбор"
+                                                    )
+                                                best_text, ocr_candidate = text_best, cand_best
+                                if ocr_candidate is not None and (best is None or ocr_candidate.rank > best.rank):
+                                    best = ocr_candidate
+                                    # Новый текст лучше кеша (или кеша нет) — кеш обновляем.
+                                    target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
+                                    try:
+                                        # В кеш — только строки описания участка (без шапки и страниц);
+                                        # если блок не найден — полный текст, чтобы не потерять данные.
+                                        target_cache.write_text(
+                                            ocr_pages.description_key_lines(best_text) or best_text, encoding="utf-8",
+                                        )
+                                    except OSError:
+                                        pass
 
-                        if self._has_severe_shape_issues(best_plan, best_issues) and (api_key or key_secret):
-                            post("progress", f"[{idx}/{total}] {job.path.name}: 400 dpi не дал чистой фигуры — отправляю в ИИ…")
-                            try:
-                                pages_llm = job.source.get("ocr_pages") or job.source.get("pdf_pages") or (1, 1)
-                                lp1, lp2 = int(pages_llm[0]), int(pages_llm[1])
+                        if best is not None and best.status_rank < _STATUS_OK_RANK and _accepted_without_ai(best):
+                            progress_of(f"{job.path.name}: не найдено только расстояние до угла — ИИ не вызван")
+                        elif best is not None and best.status_rank < _STATUS_OK_RANK:
+                            if ai_ready:
+                                progress_of(f"{job.path.name}: проверка не пройдена — отправляю в ИИ…")
                                 try:
-                                    total_p = int(inspect_pdf(job.path).get("pages") or 0)
-                                    if 1 <= total_p <= 2:
-                                        lp1, lp2 = 1, total_p
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
-                                jllm = dataclasses.replace(job, source=clean_llm_source, use_llm=True)
-                                o3, pre3, iss3 = self._parse_pdf_set_job(
-                                    jllm, cfg, provider_id, model_name, api_key, key_secret,
-                                    do_auto_orient, lambda msg, i=idx: post("progress", f"[{i}/{total}] {msg}"), post,
-                                )
-                                post("valid_secret", key_secret)
-                                d3 = apply_changes(o3.data, fix_changes(job.fixes))
-                                p3 = builder.plan(d3, scale=scale, is_neighbor=not job.is_main)
-                                r3 = self._shape_rank(p3, iss3)
-                                if r3 > best_rank:
-                                    best_outcome, best_plan, best_issues, best_rank = o3, p3, list(iss3), r3
-                                    pre_counted = pre3
-                                    llm_raw = str(getattr(o3, "raw_text", "") or "").strip()
-                                    if llm_raw and llm_raw != best_text:
-                                        target_cache = cache_path or job.path.with_name(f"{job.path.stem}_text.txt")
-                                        try:
-                                            target_cache.write_text(llm_raw, encoding="utf-8")
-                                        except OSError:
-                                            pass
-                            except Exception as exc:  # noqa: BLE001
-                                last_exc = exc
+                                    # Страницы приходят строкой «2» / «3-4»: разбираем их, а не индексируем.
+                                    lp1, lp2 = pages_from_spec(job.source.get("ocr_pages") or job.source.get("pdf_pages") or "1")
+                                    try:
+                                        total_p = int(inspect_pdf(job.path).get("pages") or 0)
+                                        if 1 <= total_p <= 2:
+                                            lp1, lp2 = 1, total_p
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    clean_llm_source = {"pdf_path": job.path, "pdf_pages": (lp1, lp2)}
+                                    result.llm_used = True  # ИИ запущен: токены могут быть потрачены
+                                    ai = judge(clean_llm_source, True, "ИИ")
+                                    post("valid_secret", key_secret)
+                                    prev_shape = best.shape_rank
+                                    # ИИ авторитетен при равных статусах и фигуре (решение 3.53).
+                                    if ai.rank >= best.rank:
+                                        best = ai
+                                    ai_note = self._write_ai_to_step0_cache(
+                                        job, ai.outcome.data, prev_rank=prev_shape, cache_path=cache_path,
+                                        builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
+                                        model_name=model_name, api_key=api_key, key_secret=key_secret,
+                                        do_auto_orient=do_auto_orient, post=post,
+                                    )
+                                    progress_of(f"{job.path.name}: {ai_note}")
+                                except Exception as exc:  # noqa: BLE001
+                                    last_exc = exc
+                                    best.issues.append(f"ИИ не отработал: {describe_exc(exc)}")
+                            else:
+                                reason = f"ИИ не вызван: {ai_block}"
+                                best.issues.append(reason)
+                                progress_of(f"{job.path.name}: {reason}")
 
-                        if best_outcome is None:
+                        if best is None:
+                            if last_exc is not None and not isinstance(last_exc, PDFError):
+                                raise PDFError(f"разбор скана не удался: {describe_exc(last_exc)}") from last_exc
                             raise last_exc or PDFError("не удалось распознать участок; введите текст вручную")
-                        if self._has_severe_shape_issues(best_plan, best_issues):
-                            best_issues.append("Требуется ручная проверка/ввод текста для этого лота")
+                        if not _accepted_without_ai(best):
+                            best.issues.append("Требуется ручная проверка/ввод текста для этого лота")
                         result.ocr = True
-                        outcome, pre_counted, issues = best_outcome, False, best_issues
+                        outcome, pre_counted, issues = best.outcome, best.pre_counted, best.issues
                     else:
                         post(
                             "progress",
@@ -7491,10 +8395,41 @@ class SurveyApp(ctk.CTk):
                         )
                         if not self._worker_is_current():
                             return
-                        if job.use_llm:
+                        post(
+                            "progress",
+                            f"[{idx}/{total}] {job.path.name}: {figure_line(getattr(outcome, 'check', None))}",
+                        )
+                        result.llm_used = bool(job.use_llm or getattr(outcome, "source", "") == "llm")
+                        if job.use_llm and job.scan and not job.ocr:
+                            # Скан разобран ИИ сразу: его текст — в кеш, если лучше имеющегося.
+                            cache_path = self._find_step0_cache_path(job.path)
+                            prev_rank = None
+                            if cache_path is not None:
+                                try:
+                                    cache_text = cache_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+                                except OSError:
+                                    cache_text = ""
+                                if cache_text:
+                                    prev_rank = self._local_text_rank(
+                                        job, cache_text, builder, scale, cfg, provider_id, model_name,
+                                        api_key, key_secret, do_auto_orient, post,
+                                    )
+                            ai_note = self._write_ai_to_step0_cache(
+                                job, outcome.data, prev_rank=prev_rank, cache_path=cache_path,
+                                builder=builder, scale=scale, cfg=cfg, provider_id=provider_id,
+                                model_name=model_name, api_key=api_key, key_secret=key_secret,
+                                do_auto_orient=do_auto_orient, post=post,
+                            )
+                            post("progress", f"[{idx}/{total}] {job.path.name}: {ai_note}")
+                        if job.use_llm or getattr(outcome, "source", "") == "llm":
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
+                # Итог чтения легального описания — в журнал уровнем «ключ»: виден и в упрощённом режиме.
+                post(
+                    "reading_summary",
+                    f"[{idx}/{total}] {job.path.name}: {reading_summary(getattr(result.outcome, 'check', None))}",
+                )
                 description = apply_changes(result.outcome.data, fix_changes(job.fixes))
                 plan = builder.plan(description, scale=scale, is_neighbor=not job.is_main)
                 if result.ocr:
@@ -7520,7 +8455,7 @@ class SurveyApp(ctk.CTk):
             return
         analysis = self._analyse_pdf_set_conflicts(
             jobs, results, builder, cfg, provider_id, model_name, api_key, key_secret, scale,
-            advice or {}, ask_advisor, post,
+            advice or {}, ask_advisor, post, join_mode=join_mode, join_images=join_images,
         )
         if not self._worker_is_current():
             return
@@ -7531,6 +8466,7 @@ class SurveyApp(ctk.CTk):
         self, jobs: list[PdfSetJob], results: list[PdfSetResult], builder: AcadBuilder,
         cfg: dict[str, Any], provider_id: str, model_name: str, api_key: str | None,
         key_secret: str, scale: float, advice: dict[str, AdvisorReply], ask_advisor: bool, post: Any,
+        *, join_mode: str | None = None, join_images: tuple[str, ...] = (),
     ) -> ConflictAnalysis:
         """
         Сверяет описания участков набора между собой (в фоне).
@@ -7550,7 +8486,7 @@ class SurveyApp(ctk.CTk):
                     description=outcome.data, fixes=tuple(job.fixes),
                     source_text=str(getattr(outcome, "prepared_text", "") or ""),
                     images=tuple(getattr(outcome, "prepared_images", None) or ()),
-                    used_ai=bool(job.use_llm),
+                    used_ai=bool(res.llm_used),
                 ))
             advisor_cfg = cfg.get("api", {}).get("conflict_advisor") or {}
             advisor = None
@@ -7600,6 +8536,7 @@ class SurveyApp(ctk.CTk):
                 builder, lots, scale=scale, advisor=advisor, advisor_note=note, advisor_cache=advice,
                 force_advisor=ask_advisor, max_images=int(advisor_cfg.get("max_images") or 16),
                 progress=lambda message: post("progress", message),
+                join_mode=join_mode if ask_advisor else None, join_images=join_images,
             )
         except Exception as exc:  # noqa: BLE001 - сбой анализа не срывает разбор набора
             return ConflictAnalysis(error=str(exc) or type(exc).__name__)
@@ -7643,6 +8580,17 @@ class SurveyApp(ctk.CTk):
         if plan is None:
             return []
         lines: list[tuple[str, str]] = []
+        # Проверка описания — тот же источник, что и статус в журнале: если она нашла проблему
+        # или чего-то не хватает, файл не может быть «без замечаний».
+        check = getattr(item.outcome, "check", None)
+        if check is not None and check.status != STATUS_OK:
+            check_severity = "error" if check.status == STATUS_FAILED else "warn"
+            for issue in check.issues:
+                lines.append((check_severity, " ".join(str(issue.text).split())))
+            for missing in (check.score.missing if check.score is not None else []):
+                if missing.startswith("контур не замыкается"):
+                    continue  # уже показано строкой невязки ниже
+                lines.append((check_severity, f"не найдено: {missing}"))
         if plan.closure.distance > CLOSURE_LIMIT_FT:
             lines.append(("error", f"невязка {plan.closure.distance:.3f} ft — контур не замыкается"))
         for diag in self._plan_diagnostic_items(plan):
@@ -7676,7 +8624,15 @@ class SurveyApp(ctk.CTk):
         else:
             results, analysis = payload, None
         self._pdf_set_analysis = analysis
-        if analysis is not None and analysis.advisor_status == "ok" and analysis.advisor_reply is not None:
+        if analysis is not None and analysis.join_mode:
+            # Соединения по карте подтверждены геометрией — применяем их сами, после завершения разбора.
+            self._pending_join_accept = [
+                chained
+                for proposal in analysis.proposals
+                if proposal.verified
+                for chained in analysis.with_requirements(proposal.id)
+            ]
+        elif analysis is not None and analysis.advisor_status == "ok" and analysis.advisor_reply is not None:
             # Ответ советника хранится для этого разбора: правки его заново не запрашивают.
             self._pdf_set_advice[analysis.advisor_key] = analysis.advisor_reply
         by_path = {item.path: item for item in self.pdf_set}
@@ -7699,6 +8655,7 @@ class SurveyApp(ctk.CTk):
             item.error = res.error
             item.issues = list(res.issues)
             item.ocr_used = bool(res.ocr) and not res.error
+            item.llm_used = bool(res.llm_used) and not res.error
             if res.error or res.plan is None or res.outcome is None:
                 item.outcome = None
                 item.parsed_key = None
@@ -7781,10 +8738,21 @@ class SurveyApp(ctk.CTk):
         self._pdf_set_report_ready = True
         report = self._pdf_set_report_text()
         for line in report.splitlines():
-            self._log_line(line)
+            self._log_line(line, level=log_mode.report_line_level(line))
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
-        self._open_pdf_set_report_window()
+        # Окно итога — только когда нужно решение пользователя (не строится файл, есть ошибка
+        # контура, расхождение с соседями или находки). Всё хорошо или почти хорошо — журнал и
+        # строка состояния; окно открывается кнопкой «📋 Итог разбора».
+        error_items = [
+            item for item in built
+            if any(severity == "error" for severity, _ in self._pdf_set_issue_lines(item))
+        ]
+        needs_attention = bool(hard or failed or error_items or verify_bad or (analysis is not None and analysis.proposals))
+        if needs_attention:
+            self._open_pdf_set_report_window()
+        else:
+            self._close_pdf_set_report_window()
 
     def _pdf_set_summary_text(self) -> str:
         """Короткий список набора для левой панели: роль, файл, страницы, состояние."""
@@ -7798,7 +8766,7 @@ class SurveyApp(ctk.CTk):
             else:
                 mark = "⚠" if self._pdf_set_issue_lines(item) else "✓"
             role = "наш" if item.is_main else "сосед"
-            if item.use_llm:
+            if item.llm_used or (item.use_llm and item.outcome is None):
                 mode = "ИИ"
             elif item.ocr_used:
                 mode = "локально, OCR"
@@ -7825,13 +8793,19 @@ class SurveyApp(ctk.CTk):
             f"Файлов: {len(items)} · построено: {len(built)} · с замечаниями: {len(flagged)} "
             f"· не разобрано: {len(failed)}",
         ]
+        llm_count = sum(1 for item in items if item.llm_used)
+        lines.append(f"ИИ (по факту): файлов {llm_count} · локально: {len(items) - llm_count}")
         by_ocr = [item for item in items if item.ocr_used]
         if by_ocr:
-            lines.append(
-                f"Сканов распознано локально (OCR, бесплатно): {len(by_ocr)} — "
-                f"это {', '.join(item.path.name for item in by_ocr[:4])}"
-                + ("…" if len(by_ocr) > 4 else "")
-            )
+            # Скан всегда читается OCR, но ИИ подключается, если проверка не пройдена:
+            # «бесплатно» пишем только про тех, кто обошёлся без ИИ.
+            ocr_ai = [item for item in by_ocr if item.llm_used]
+            ocr_free = [item for item in by_ocr if not item.llm_used]
+            line = f"Сканов через OCR: {len(by_ocr)} · без ИИ: {len(ocr_free)}"
+            if ocr_ai:
+                line += f" · с ИИ: {', '.join(item.path.name for item in ocr_ai[:4])}"
+                line += "…" if len(ocr_ai) > 4 else ""
+            lines.append(line)
         for item in items:
             plan = self._pdf_set_plan_for(item)
             if item.is_main:
@@ -7846,7 +8820,7 @@ class SurveyApp(ctk.CTk):
             lines.append("")
             lines.append(f"▸ {role} — {item.path.name}")
             lines.append(f"   {item.pages_label()} · {item.mode_label()}")
-            if item.ocr_used:
+            if item.ocr_used and not item.llm_used:
                 lines.append(
                     "   🔍 текст страниц получен локальным OCR — платный запрос ИИ не делался"
                 )
@@ -7959,6 +8933,49 @@ class SurveyApp(ctk.CTk):
         self._log_line(f"↩ Правка снята — «{item.path.name}»: {dropped.title}")
         self._start_pdf_set()
 
+    def _ask_pdf_set_join_advisor(self) -> None:
+        """Платный вопрос советнику по карте: соединяет фигуры (угол к углу, общая межа)."""
+        if self._busy or not self.pdf_set:
+            return
+        from tkinter import messagebox
+
+        tax = f"карту «{self._pdf_set_tax_map[0]}»" if self._pdf_set_tax_map else "карту не приложили"
+        mode = "перенос и поворот" if self._pdf_set_join_mode == "turn" else "только перенос"
+        if not messagebox.askyesno(
+            "ИИ-советник по карте",
+            "Отправить нейросети схему фигур, страницы документов и " + tax + "?\n\n"
+            "Это платный запрос. Советник только соединяет фигуры: угол нашего участка с углом соседа "
+            "и общую межу. Длины и румбы не меняются. Режим: " + mode + ". "
+            "Соединение, которое геометрия подтвердит, применяется сразу.",
+        ):
+            return
+        self._start_pdf_set(ask_advisor=True, join_mode=self._pdf_set_join_mode)
+
+    def _pick_pdf_set_tax_map(self) -> None:
+        """Приложить карту (TAX_MAP) к запросу советнику по карте."""
+        from tkinter import filedialog, messagebox
+
+        path = filedialog.askopenfilename(
+            title="Карта участка (TAX_MAP)",
+            filetypes=[("Карта", "*.jpg *.jpeg *.png"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            messagebox.showerror("Карта", f"Не удалось прочитать файл: {exc}")
+            return
+        mime = "image/png" if Path(path).suffix.lower() == ".png" else "image/jpeg"
+        data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        self._pdf_set_tax_map = (Path(path).name, data_url)
+        if self._pdf_set_tax_button is not None:
+            self._pdf_set_tax_button.configure(text=f"📎 {Path(path).name}")
+        self._set_status(f"Карта «{Path(path).name}» приложена к запросу советнику по карте.")
+
+    def _set_pdf_set_join_mode(self, label: str) -> None:
+        self._pdf_set_join_mode = "shift" if label.startswith("только") else "turn"
+
     def _ask_pdf_set_advisor(self) -> None:
         """Платный вопрос ИИ-советнику о расхождениях набора (по кнопке — всегда заново)."""
         if self._busy or not self.pdf_set:
@@ -7974,21 +8991,27 @@ class SurveyApp(ctk.CTk):
             return
         self._start_pdf_set(ask_advisor=True)
 
+    def _close_pdf_set_report_window(self) -> None:
+        """Итог всегда один: прежнее окно закрывается (и при новом разборе без вопросов тоже)."""
+        previous = self._pdf_set_report_window
+        if previous is None:
+            return
+        try:
+            previous.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        if previous in self._session_windows:
+            self._session_windows.remove(previous)
+        self._pdf_set_report_window = None
+
     def _open_pdf_set_report_window(self) -> None:
         """Окно итога: что построено, замечания по каждому участку и сверка с соседями."""
         if not self.pdf_set or not self._pdf_set_report_ready:
             return
-        previous = self._pdf_set_report_window
-        if previous is not None:
-            # Итог всегда один: прежнее окно закрывается.
-            try:
-                previous.destroy()
-            except Exception:  # noqa: BLE001
-                pass
-            if previous in self._session_windows:
-                self._session_windows.remove(previous)
-            self._pdf_set_report_window = None
-        full_text = self._pdf_set_report_text()
+        self._close_pdf_set_report_window()
+        full_text = "\n".join(
+            log_mode.filter_report_lines(self._pdf_set_report_text().splitlines(), self._log_mode()),
+        )
         built = [item for item in self.pdf_set if item.on_scene]
         failed = [item for item in self.pdf_set if not item.on_scene]
         flagged = [item for item in built if self._pdf_set_issue_lines(item)]
@@ -8015,6 +9038,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("1000x760" if analysis is not None and (analysis.proposals or analysis.applied) else "1000x640")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
@@ -8089,6 +9113,25 @@ class SurveyApp(ctk.CTk):
             command=self._ask_pdf_set_advisor,
         )
         win._advisor_button.grid(row=0, column=0, padx=(0, 8))
+        win._join_advisor_button = ctk.CTkButton(
+            left, text="🗺 Спросить советника по карте", width=230, height=30,
+            fg_color=THEME["btn_amber"], hover_color=THEME["btn_amber_hover"],
+            command=self._ask_pdf_set_join_advisor,
+        )
+        win._join_advisor_button.grid(row=0, column=1, padx=(0, 8))
+        self._pdf_set_tax_button = ctk.CTkButton(
+            left, text=(f"📎 {self._pdf_set_tax_map[0]}" if self._pdf_set_tax_map else "📎 Карта TAX_MAP…"),
+            width=170, height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            command=self._pick_pdf_set_tax_map,
+        )
+        self._pdf_set_tax_button.grid(row=0, column=2, padx=(0, 8))
+        win._join_mode_menu = ctk.CTkOptionMenu(
+            left, values=["перенос и поворот", "только перенос"], width=170, height=30,
+            command=self._set_pdf_set_join_mode,
+        )
+        win._join_mode_menu.set("перенос и поворот" if self._pdf_set_join_mode == "turn" else "только перенос")
+        win._join_mode_menu.grid(row=0, column=3, padx=(0, 8))
         verified = [p for p in analysis.proposals if p.verified] if analysis is not None else []
         win._apply_all_button = None
         if len(verified) > 1:
@@ -8097,7 +9140,7 @@ class SurveyApp(ctk.CTk):
                 fg_color=THEME["btn_emerald"], hover_color=THEME["btn_emerald_hover"],
                 command=self._apply_all_pdf_set_fixes,
             )
-            win._apply_all_button.grid(row=0, column=1, padx=(0, 8))
+            win._apply_all_button.grid(row=0, column=4, padx=(0, 8))
 
         def _copy_report() -> None:
             self.clipboard_clear()
@@ -8439,6 +9482,7 @@ class SurveyApp(ctk.CTk):
         window.geometry("820x560")
         window.configure(fg_color=THEME["bg_root"])
         window.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(window)
         text = ctk.CTkTextbox(
             window,
             wrap="word",
@@ -8447,24 +9491,77 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(family="Consolas", size=12),
         )
         text.pack(fill="both", expand=True, padx=12, pady=12)
-        text.insert("1.0", self.log_text() or "Лог пуст.")
+        text.insert("1.0", self._log_view_text() or "Лог пуст.")
         text.insert("end", "\n\n--- Исходное описание ---\n" + self.text_box.get("1.0", "end"))
         target = getattr(text, "_textbox", text)
         target.configure(state="disabled")
 
     def log_text(self) -> str:
-        return "\n".join(getattr(self, "_log", []))
+        """Полный журнал операций (для сохранения); на экране — ``_log_view_text``."""
+        return "\n".join(text for _level, text in getattr(self, "_log", []))
 
-    def _log_line(self, message: str) -> None:
+    def _log_mode(self) -> str:
+        var = getattr(self, "log_mode_var", None)
+        if var is None:
+            return log_mode.DEFAULT_MODE
+        return log_mode.FULL if bool(var.get()) else log_mode.SIMPLE
+
+    def _log_view_text(self) -> str:
+        """Журнал операций в текущем режиме (без служебных уровней)."""
+        return "\n".join(log_mode.filter_entries(getattr(self, "_log", []), self._log_mode()))
+
+    def _open_maximized(self) -> None:
+        """Разворачивает окно на весь экран при запуске. Сбой не мешает работе — окно остаётся обычным."""
+        try:
+            self.state("zoomed")
+        except Exception:  # noqa: BLE001 - платформа без zoomed (например, Linux без WM)
+            try:
+                self.attributes("-zoomed", True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_start_source_changed(self, _label: str = "") -> None:
+        """Настройка «стартовая вкладка»: пишет ui.start_source в config.json.
+
+        Текущую вкладку Шага 1 не меняет — только то, что откроется при следующем запуске.
+        """
+        key = start_source.key_for_label(self.start_source_var.get())
+        try:
+            start_source.save_start_source_to_file(CONFIG_PATH, key)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Стартовая вкладка не сохранена в config.json: {exc}", warn=True)
+            return
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("ui", {})["start_source"] = key
+        self._set_status(f"Стартовая вкладка: {start_source.label_for(key)} (со следующего запуска)")
+
+    def _apply_log_mode(self) -> None:
+        """Переключатель «Подробный журнал»: сохраняет режим и перерисовывает все журналы."""
+        mode = self._log_mode()
+        try:
+            log_mode.save_mode_to_file(CONFIG_PATH, mode)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Режим журнала не сохранён в config.json: {exc}", warn=True)
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("ui", {})["log_mode"] = mode
+        self._render_step0_log()
+        self._refresh_log_view()
+        content = str(getattr(self, "_step2_report_text", "") or "")
+        if content:
+            self._set_step2_report(content)
+
+    def _log_line(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         if not hasattr(self, "_log"):
             self._log = []
         stamp = __import__("datetime").datetime.now().strftime("%H:%M:%S")
-        self._log.append(f"{stamp}  {message}")
+        self._log.append((level, f"{stamp}  {message}"))
         del self._log[:-400]
         if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
             self._refresh_log_view()
 
-    def _set_status(self, message: str, error: bool = False, *, warn: bool = False) -> None:
+    def _set_status(
+        self, message: str, error: bool = False, *, warn: bool = False, key: bool = False,
+    ) -> None:
         self.status_var.set(message)
         if error:
             color = THEME["err"]
@@ -8478,7 +9575,13 @@ class SurveyApp(ctk.CTk):
             dot.configure(
                 text_color=THEME["err"] if error else (THEME["warn"] if warn else THEME["ok"])
             )
-        self._log_line(message)
+        level = (
+            log_mode.LEVEL_ERROR if error else
+            log_mode.LEVEL_WARN if warn else
+            log_mode.LEVEL_KEY if key else
+            log_mode.LEVEL_INFO
+        )
+        self._log_line(message, level=level)
         self._refresh_stepper()
 
     def _refresh_center_badges(self, plan: DrawPlan | None, closure_ft: float | None) -> None:
@@ -8564,217 +9667,249 @@ class SurveyApp(ctk.CTk):
         """Tkinter-поток: забирает сообщения из рабочего потока."""
         if getattr(self, "_closing", False):
             return
-        while not self._events.empty():
-            try:
-                generation, kind, payload = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if generation != self._generation:
-                continue
-            if kind == "valid_secret":
-                self._last_valid_secret = str(payload)
-            elif kind == "round_usages":
-                self._record_round_usages(payload)
-                if self._session_llm_calls:
-                    total = self._session_prompt_tokens + self._session_completion_tokens
-                    self.tokens_var.set(
-                        f"Сессия ({self._session_llm_calls} выз.): "
-                        f"↑ {self._session_prompt_tokens:,} / ↓ {self._session_completion_tokens:,} "
-                        f"(всего {total:,})"
-                    )
-            elif kind == "consensus_label":
-                self._last_consensus_label = payload
-            elif kind == "progress":
-                self._set_status(str(payload))
-            elif kind == "error":
-                self._finish_busy()
-                self._set_status(str(payload), error=True)
-                self._update_closure_badge("Closure Error: —", None)
-            elif kind == "parsed":
-                self._dismiss_conflict_ui()
-                parsed_plan = None
-                if len(payload) == 5:
-                    outcome, draw, pre_counted, round_usages, parsed_plan = payload
-                    if round_usages:
-                        self._record_round_usages(round_usages)
-                elif len(payload) == 4:
-                    outcome, draw, pre_counted, round_usages = payload
-                    if round_usages:
-                        self._record_round_usages(round_usages)
-                elif len(payload) == 3:
-                    outcome, draw, pre_counted = payload
-                else:
-                    outcome, draw = payload
-                    pre_counted = False
-                if draw:
-                    self._handle_draw_result(outcome, draw, already_counted=pre_counted)
-                else:
-                    self._finish_busy()
-                    self._apply_parsed(outcome, already_counted=pre_counted)
-                    self._set_status(self._parsed_summary(outcome))
-                    try:
-                        plan = parsed_plan or AcadBuilder(self.config_data).plan(
-                            outcome.data,
-                            scale=self._current_scale(),
-                            is_neighbor=self.is_neighbor_mode(),
-                        )
-                        self._record_plan_for_preview(
-                            plan, warnings=outcome.warnings, source=self._running_source_path,
-                            source_label=self._running_source_label, outcome=outcome,
-                        )
-                        self._mark_running_source_ready(plan)
-                        self._append_suspicion_to_status(plan)
-                        self._append_neighbor_verification_to_status()
-                        self._update_closure_badge(
-                            plan.closure.short_report(), plan.closure.distance
-                        )
-                    except Exception:  # noqa: BLE001
-                        self._update_closure_badge(self._closure_text(outcome), None)
-            elif kind == "scene_drawn":
-                completed, error = payload
-                self._finish_busy()
-                draw_warnings = []
-                if completed:
-                    self.draw_result = completed[-1][1]
-                    for name, result in completed:
-                        self._log_line(f"{name}: {result.summary()}")
-                        draw_warnings.extend(f"{name}: {warning}" for warning in result.warnings)
-                if error:
-                    self._set_status(
-                        f"Отрисовка остановлена: {error}. Уже начерчено участков: {len(completed)}. "
-                        "В текущем участке могли остаться отдельные объекты; повторное нажатие может создать дубликаты.",
-                        error=True,
-                    )
-                elif draw_warnings:
-                    self._set_status(
-                        f"Начерчено участков: {len(completed)}, предупреждений AutoCAD: {len(draw_warnings)}. "
-                        f"{draw_warnings[0]} (подробности в журнале). Использованы готовые планы без запроса к ИИ.",
-                        warn=True,
-                    )
-                else:
-                    self._set_status(f"Начерчено участков: {len(completed)}. Использованы готовые планы, без запроса к ИИ.")
-                self._refresh_stepper()
-            elif kind == "conflict":
-                self._finish_busy()
-                self._present_conflict(payload)
-            elif kind == "doubt":
-                self._finish_busy()
-                self._present_doubt(payload)
-            elif kind == "batch_neighbors":
-                items_done, batch_errors, pdf_pages_spec = payload
-                self._finish_busy()
-                self.batch_neighbor_results = items_done
-                for source, out, res, pre_counted in items_done:
-                    self._apply_parsed(out, already_counted=pre_counted)
-                    self.draw_result = res
-                    self._record_plan_for_preview(res.plan, warnings=out.warnings, source=source, outcome=out)
-                    self._pending_neighbor_pdfs.discard(source)
-                    self._pending_neighbor_files.discard(source)
-                    self._neighbor_parsed_pages[source] = pdf_pages_spec
-                msg_parts = [
-                    f"Пакет соседей: обработано {len(items_done)} уч. в слое NEIGHBOR_LOT"
-                ]
-                if batch_errors:
-                    msg_parts.append(f"ошибок: {len(batch_errors)} (см. лог)")
-                    for err_line in batch_errors:
-                        self._log_line(f"! {err_line}")
-                self._set_status(
-                    "  |  ".join(msg_parts),
-                    error=bool(batch_errors and not items_done),
-                    warn=bool(batch_errors and items_done),
+        try:
+            while not self._events.empty():
+                try:
+                    generation, kind, payload = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                if generation != self._generation:
+                    continue
+                try:
+                    self._handle_event(kind, payload)
+                except Exception as exc:  # noqa: BLE001 - одно событие не останавливает очередь
+                    self._report_event_error(kind, exc)
+        finally:
+            # Опрос событий перезапускается всегда, даже если обработчик упал.
+            self.after(120, self._drain_events)
+
+    def _report_event_error(self, kind: str, exc: BaseException) -> None:
+        """Сообщает об ошибке обработчика события, не останавливая программу."""
+        traceback.print_exc()
+        text = f"Внутренняя ошибка ({kind}): {type(exc).__name__}: {exc}. Подробности — в консоли."
+        try:
+            self._set_status(text, error=True)
+        except Exception:  # noqa: BLE001 - окно могло уже закрываться
+            pass
+
+    def _handle_event(self, kind: str, payload: Any) -> None:
+        """Обработка одного сообщения из рабочего потока (тело прежнего цикла)."""
+        if kind == "valid_secret":
+            self._last_valid_secret = str(payload)
+        elif kind == "round_usages":
+            self._record_round_usages(payload)
+            if self._session_llm_calls:
+                total = self._session_prompt_tokens + self._session_completion_tokens
+                self.tokens_var.set(
+                    f"Сессия ({self._session_llm_calls} выз.): "
+                    f"↑ {self._session_prompt_tokens:,} / ↓ {self._session_completion_tokens:,} "
+                    f"(всего {total:,})"
                 )
-                for _source, _out, res, _counted in items_done:
-                    self._append_suspicion_to_status(res.plan)
-                self._append_neighbor_verification_to_status()
-                if items_done:
-                    _source, _last_out, last_res, _counted = items_done[-1]
+        elif kind == "consensus_label":
+            self._last_consensus_label = payload
+        elif kind == "reading_summary":
+            # Информационная строка: только в подробном журнале (в упрощённом её нет по решению пользователя).
+            self._log_line(str(payload), level=log_mode.LEVEL_INFO)
+        elif kind == "progress":
+            self._set_status(str(payload))
+        elif kind == "error":
+            self._finish_busy()
+            self._set_status(str(payload), error=True)
+            self._update_closure_badge("Closure Error: —", None)
+        elif kind == "parsed":
+            self._dismiss_conflict_ui()
+            parsed_plan = None
+            if len(payload) == 5:
+                outcome, draw, pre_counted, round_usages, parsed_plan = payload
+                if round_usages:
+                    self._record_round_usages(round_usages)
+            elif len(payload) == 4:
+                outcome, draw, pre_counted, round_usages = payload
+                if round_usages:
+                    self._record_round_usages(round_usages)
+            elif len(payload) == 3:
+                outcome, draw, pre_counted = payload
+            else:
+                outcome, draw = payload
+                pre_counted = False
+            if draw:
+                self._handle_draw_result(outcome, draw, already_counted=pre_counted)
+            else:
+                self._finish_busy()
+                self._apply_parsed(outcome, already_counted=pre_counted)
+                self._set_status(self._parsed_summary(outcome))
+                try:
+                    plan = parsed_plan or AcadBuilder(self.config_data).plan(
+                        outcome.data,
+                        scale=self._current_scale(),
+                        is_neighbor=self.is_neighbor_mode(),
+                    )
+                    self._record_plan_for_preview(
+                        plan, warnings=outcome.warnings, source=self._running_source_path,
+                        source_label=self._running_source_label, outcome=outcome,
+                    )
+                    self._mark_running_source_ready(plan)
+                    self._append_suspicion_to_status(plan)
+                    self._append_neighbor_verification_to_status()
                     self._update_closure_badge(
-                        last_res.closure.short_report(), last_res.closure.distance
+                        plan.closure.short_report(), plan.closure.distance
                     )
-            elif kind == "verify_neighbors_done":
-                plans_done, verify_errors, open_popup, pdf_pages_spec = payload
-                self._finish_busy()
-                for source, out, nb_plan, pre_counted in plans_done:
-                    self._apply_parsed(out, already_counted=pre_counted)
-                    self._record_plan_for_preview(nb_plan, warnings=out.warnings, source=source, outcome=out)
-                    self._pending_neighbor_pdfs.discard(source)
-                    self._pending_neighbor_files.discard(source)
-                    self._neighbor_parsed_pages[source] = pdf_pages_spec
-                if (self._running_batch_attached and self.neighbor_pdf_paths and not self._pending_neighbor_pdfs
-                    and all(path in self._neighbor_plan_sources
-                            and self._neighbor_parsed_pages.get(path) == pdf_pages_spec
-                            for path in self.neighbor_pdf_paths)):
-                    self._ready_source_signature = self._running_source_signature
-                    self._input_incomplete = False
-                for err_line in verify_errors:
-                    self._log_line(f"! {err_line}")
-                error_note = (
-                    f" Ошибок: {len(verify_errors)} (см. журнал; {verify_errors[0]})."
-                    " Повторите разбор проблемных файлов или очистите соседей перед отрисовкой."
-                    if verify_errors else ""
+                except Exception:  # noqa: BLE001
+                    self._update_closure_badge(self._closure_text(outcome), None)
+        elif kind == "scene_drawn":
+            completed, error = payload
+            self._finish_busy()
+            draw_warnings = []
+            if completed:
+                self.draw_result = completed[-1][1]
+                for name, result in completed:
+                    self._log_line(f"{name}: {result.summary()}")
+                    draw_warnings.extend(f"{name}: {warning}" for warning in result.warnings)
+            if error:
+                self._set_status(
+                    f"Отрисовка остановлена: {error}. Уже начерчено участков: {len(completed)}. "
+                    "В текущем участке могли остаться отдельные объекты; повторное нажатие может создать дубликаты.",
+                    error=True,
                 )
-                unopened = self._pending_neighbor_pdfs.difference(self.neighbor_pdf_paths)
-                if self._running_batch_attached and unopened:
-                    names = ", ".join(path.name for path in sorted(unopened))
-                    error_note += f" Не удалось открыть PDF: {names}. Исправьте выбор файлов."
-                if plans_done:
-                    last_plan = plans_done[-1][2]
-                    self._update_closure_badge(last_plan.closure.short_report(), last_plan.closure.distance)
-                if plans_done and self._neighbor_report is not None and self._neighbor_report.pair_reports:
-                    rep = self._neighbor_report
-                    self._set_status(
-                        f"Разобрано соседей: {len(plans_done)}. {rep.headline()}{error_note}",
-                        error=(rep.overall_status == "error"),
-                        warn=(bool(error_note) or rep.overall_status == "warn"),
+            elif draw_warnings:
+                self._set_status(
+                    f"Начерчено участков: {len(completed)}, предупреждений AutoCAD: {len(draw_warnings)}. "
+                    f"{draw_warnings[0]} (подробности в журнале). Использованы готовые планы без запроса к ИИ.",
+                    warn=True,
+                )
+            else:
+                self._set_status(f"Начерчено участков: {len(completed)}. Использованы готовые планы, без запроса к ИИ.")
+            self._refresh_stepper()
+        elif kind == "conflict":
+            self._finish_busy()
+            self._present_conflict(payload)
+        elif kind == "doubt":
+            self._finish_busy()
+            self._present_doubt(payload)
+        elif kind == "batch_neighbors":
+            items_done, batch_errors, pdf_pages_spec = payload
+            self._finish_busy()
+            self.batch_neighbor_results = items_done
+            for source, out, res, pre_counted in items_done:
+                self._apply_parsed(out, already_counted=pre_counted)
+                self.draw_result = res
+                self._record_plan_for_preview(res.plan, warnings=out.warnings, source=source, outcome=out)
+                self._pending_neighbor_pdfs.discard(source)
+                self._pending_neighbor_files.discard(source)
+                self._neighbor_parsed_pages[source] = pdf_pages_spec
+            msg_parts = [
+                f"Пакет соседей: обработано {len(items_done)} уч. в слое NEIGHBOR_LOT"
+            ]
+            if batch_errors:
+                msg_parts.append(f"ошибок: {len(batch_errors)} (см. лог)")
+                for err_line in batch_errors:
+                    self._log_line(f"! {err_line}")
+            self._set_status(
+                "  |  ".join(msg_parts),
+                error=bool(batch_errors and not items_done),
+                warn=bool(batch_errors and items_done),
+            )
+            for _source, _out, res, _counted in items_done:
+                self._append_suspicion_to_status(res.plan)
+            self._append_neighbor_verification_to_status()
+            if items_done:
+                _source, _last_out, last_res, _counted = items_done[-1]
+                self._update_closure_badge(
+                    last_res.closure.short_report(), last_res.closure.distance
+                )
+        elif kind == "verify_neighbors_done":
+            plans_done, verify_errors, open_popup, pdf_pages_spec = payload
+            self._finish_busy()
+            for source, out, nb_plan, pre_counted in plans_done:
+                self._apply_parsed(out, already_counted=pre_counted)
+                self._record_plan_for_preview(nb_plan, warnings=out.warnings, source=source, outcome=out)
+                self._pending_neighbor_pdfs.discard(source)
+                self._pending_neighbor_files.discard(source)
+                self._neighbor_parsed_pages[source] = pdf_pages_spec
+            if (self._running_batch_attached and self.neighbor_pdf_paths and not self._pending_neighbor_pdfs
+                and all(path in self._neighbor_plan_sources
+                        and self._neighbor_parsed_pages.get(path) == pdf_pages_spec
+                        for path in self.neighbor_pdf_paths)):
+                self._ready_source_signature = self._running_source_signature
+                self._input_incomplete = False
+            for err_line in verify_errors:
+                self._log_line(f"! {err_line}")
+            error_note = (
+                f" Ошибок: {len(verify_errors)} (см. журнал; {verify_errors[0]})."
+                " Повторите разбор проблемных файлов или очистите соседей перед отрисовкой."
+                if verify_errors else ""
+            )
+            unopened = self._pending_neighbor_pdfs.difference(self.neighbor_pdf_paths)
+            if self._running_batch_attached and unopened:
+                names = ", ".join(path.name for path in sorted(unopened))
+                error_note += f" Не удалось открыть PDF: {names}. Исправьте выбор файлов."
+            if plans_done:
+                last_plan = plans_done[-1][2]
+                self._update_closure_badge(last_plan.closure.short_report(), last_plan.closure.distance)
+            if plans_done and self._neighbor_report is not None and self._neighbor_report.pair_reports:
+                rep = self._neighbor_report
+                self._set_status(
+                    f"Разобрано соседей: {len(plans_done)}. {rep.headline()}{error_note}",
+                    error=(rep.overall_status == "error"),
+                    warn=(bool(error_note) or rep.overall_status == "warn"),
+                )
+                if rep.has_issues:
+                    self._append_neighbor_verification_to_status()
+                if self._preview_main_plan is not None:
+                    self._set_inspector_text(
+                        self._build_inspector_report(self._preview_main_plan)
                     )
-                    if rep.has_issues:
-                        self._append_neighbor_verification_to_status()
-                    if self._preview_main_plan is not None:
-                        self._set_inspector_text(
-                            self._build_inspector_report(self._preview_main_plan)
-                        )
-                    if open_popup:
-                        self._open_neighbor_report_window()
-                elif plans_done:
-                    self._set_status(
-                        f"Разобрано соседей: {len(plans_done)}. "
-                        f"Для сверки разберите основной участок.{error_note}",
-                        warn=bool(error_note),
-                    )
-                elif verify_errors:
-                    self._set_status(
-                        f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
-                        error=True,
-                    )
-            elif kind == "step0_progress":
-                text = str(payload)
-                if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
-                    text = self._step0_timestamp(text)
-                self._step0_lines.append(text)
-                self._render_step0_log()
-            elif kind == "step0_portal_done":
-                status, portal_result = payload
-                self._finish_step0_portal_lookup(status, portal_result)
-            elif kind == "update_progress":
-                text = str(payload)
-                self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
-                self._set_status(f"Обновление: {text}")
-            elif kind == "update_done":
-                status, update_payload = payload
-                self._finish_update_version(status, update_payload)
-            elif kind == "step0_done":
-                status, payload_done = payload
-                self._finish_step0(status, payload_done)
-            elif kind == "pdf_set_done":
-                self._finish_busy()
-                self._handle_pdf_set_done(payload)
-            elif kind == "feature_labeled":
-                label_result, label_error, label_mode = payload
-                self._finish_busy()
-                self._handle_feature_label_result(label_result, label_error, label_mode)
-            elif kind == "done":
-                self._finish_busy()
-        self.after(120, self._drain_events)
+                if open_popup:
+                    self._open_neighbor_report_window()
+            elif plans_done:
+                self._set_status(
+                    f"Разобрано соседей: {len(plans_done)}. "
+                    f"Для сверки разберите основной участок.{error_note}",
+                    warn=bool(error_note),
+                )
+            elif verify_errors:
+                self._set_status(
+                    f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
+                    error=True,
+                )
+        elif kind == "step0_progress":
+            text = str(payload)
+            if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
+                text = self._step0_timestamp(text)
+            self._step0_lines.append((log_mode.LEVEL_INFO, text))
+            self._render_step0_log()
+        elif kind == "step0_portal_done":
+            status, portal_result = payload
+            self._finish_step0_portal_lookup(status, portal_result)
+        elif kind == "update_progress":
+            text = str(payload)
+            self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
+            self._set_status(f"Обновление: {text}")
+        elif kind == "update_stage":
+            name, fraction, detail = payload
+            self._show_update_stage(str(name), fraction, str(detail))
+        elif kind == "update_done":
+            status, update_payload = payload
+            self._finish_update_version(status, update_payload)
+        elif kind == "step0_done":
+            status, payload_done = payload
+            self._finish_step0(status, payload_done)
+        elif kind == "pdf_set_done":
+            self._finish_busy()
+            self._handle_pdf_set_done(payload)
+        elif kind == "feature_labeled":
+            label_result, label_error, label_mode = payload
+            self._finish_busy()
+            self._handle_feature_label_result(label_result, label_error, label_mode)
+        elif kind == "offsets_done":
+            offsets_result, offsets_error = payload
+            self._finish_busy()
+            self._handle_offsets_result(offsets_result, offsets_error)
+        elif kind == "done":
+            self._finish_busy()
+            pending, self._pending_join_accept = self._pending_join_accept, []
+            if pending:
+                self._accept_pdf_set_fixes(pending)
 
     def _set_controls_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
@@ -8795,10 +9930,14 @@ class SurveyApp(ctk.CTk):
         self.neighbor_lot_radio.configure(state=state)
         self.parse_button.configure(state=state)
         self.regex_link_button.configure(state=state)
+        self.run_mode_seg.configure(state=state)
         self.save_button.configure(state=state)
         self.save_env_button.configure(state=state)
         self.feature_auto_button.configure(state=state)
         self.feature_pick_button.configure(state=state)
+        step4_button = getattr(self, "step4_run_button", None)
+        if step4_button is not None:
+            step4_button.configure(state=state)
         self.house_text_entry.configure(state=state)
         self.step2_height_entry.configure(state=state)
         self.skip_existing_labels_check.configure(state=state)
@@ -8822,6 +9961,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("880x620")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
@@ -9414,8 +10554,21 @@ class SurveyApp(ctk.CTk):
         self._busy = True
         self._set_controls_busy(True)
         self.progress.start()
+        # Черновик для печати — отдельным планом, первым: итоговым результатом остаётся основной участок.
+        draw_plans = (self._print_draft_plans() + plans) if not neighbors_only else plans
         self._set_status(f"Рисую рассчитанную схему в AutoCAD: {len(plans)} уч. Без повторного разбора и запроса к ИИ…")
-        self._start_background(self._draw_scene_worker, args=(plans, cfg))
+        self._start_background(self._draw_scene_worker, args=(draw_plans, cfg))
+
+    def _print_draft_plans(self) -> list[tuple[str, DrawPlan]]:
+        """Черновик для печати из основного участка: без соседей, на +1000 по X, отдельные слои."""
+        main = self._preview_main_plan
+        if main is None or main.is_neighbor:
+            return []
+        print_cfg = dict((self.config_data or {}).get("print_draft") or {})
+        if not print_cfg.get("enabled", False):
+            return []
+        label = self._plan_source_labels.get(id(main), "текст")
+        return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg))]
 
     def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any]) -> None:
         post = self._worker_poster()
@@ -9458,6 +10611,8 @@ class SurveyApp(ctk.CTk):
             # Кнопка разбора перечитывает весь набор, включая уже готовые файлы.
             self._start_pdf_set(force=True)
             return
+        if mode == "📄 PDF":
+            self._select_result_tab("🧾 Журнал")  # одиночный PDF / соседние файлы — тоже журнал
         # Один соседний PDF разбирается как отдельный участок, чтобы конфликты
         # проходов и опечатки можно было разрешить вручную в привычном диалоге.
         single_neighbor_pdf = (
@@ -9496,6 +10651,12 @@ class SurveyApp(ctk.CTk):
         cfg, provider_id, model_name, api_key, key_secret = self._build_runtime_config()
         use_llm = bool(self.use_llm_var.get())
         passes_count = self.current_passes_count() if use_llm else 1
+        escalate_economy = False
+        if self.economy_var.get() and not use_llm:
+            economy_ready, economy_block = _ai_key_status(cfg, provider_id, model_name, api_key, key_secret)
+            escalate_economy = economy_ready
+            if not economy_ready:
+                self._log_line(f"Эконом: ИИ не вызван при проблемах — {economy_block}")
         scale = self._current_scale()
         if not is_neighbor:
             self._main_analysis_pending = True
@@ -9594,6 +10755,7 @@ class SurveyApp(ctk.CTk):
                 scale,
                 parse_only,
                 is_neighbor,
+                escalate_economy,
             ),
         )
 
@@ -9615,6 +10777,7 @@ class SurveyApp(ctk.CTk):
         scale: float,
         parse_only: bool,
         is_neighbor: bool = False,
+        escalate_economy: bool = False,
     ) -> None:
         post = self._worker_poster()
         try:
@@ -9679,6 +10842,7 @@ class SurveyApp(ctk.CTk):
                     key_secret=key_secret,
                     allow_regex_fallback=False,
                     progress=lambda message: post("progress", message),
+                    escalate_to_llm=escalate_economy,
                 )
                 if use_llm:
                     post("valid_secret", key_secret)
@@ -9698,6 +10862,7 @@ class SurveyApp(ctk.CTk):
                 f"POB ({plan.pob[0]:+.2f}, {plan.pob[1]:+.2f}) ft, "
                 f"Closure Error {plan.closure.distance:.3f} ft",
             )
+            post("reading_summary", reading_summary(getattr(outcome, "check", None)))
             ask_on_doubt = bool(cfg.get("api", {}).get("ask_on_doubt", True))
             has_typo_suspicion = bool(outcome.typo_suspicions)
             has_risky_draw_geometry = (
@@ -9957,6 +11122,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("880x560")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         self.doubt_window = win
 
         top_banner = ctk.CTkFrame(
@@ -10329,6 +11495,7 @@ class SurveyApp(ctk.CTk):
         win.geometry("900x610")
         win.configure(fg_color=THEME["bg_root"])
         win.attributes("-topmost", bool(self.topmost_var.get()))
+        self._attach_child_window(win)
         self.conflict_window = win
 
         top_banner = ctk.CTkFrame(
@@ -10774,6 +11941,7 @@ class PdfSetDialog:
     """
 
     MODE_LOCAL = "Локально"
+    MODE_ECONOMY = "Эконом"
     MODE_LLM = "ИИ"
     NO_MAIN = "none"
 
@@ -10969,9 +12137,10 @@ class PdfSetDialog:
             text_color=THEME["text_muted"],
         ).grid(row=0, column=6, padx=(4, 12), pady=(10, 2))
 
-        mode_var = ctk.StringVar(value=self.MODE_LLM if item.use_llm else self.MODE_LOCAL)
+        mode_var = ctk.StringVar(value=self._mode_value(item))
         mode = ctk.CTkSegmentedButton(
-            frame, values=[self.MODE_LOCAL, self.MODE_LLM], variable=mode_var, height=28,
+            frame, values=[self.MODE_LOCAL, self.MODE_ECONOMY, self.MODE_LLM],
+            variable=mode_var, height=28,
             command=lambda value, i=index: self._mode_clicked(i, value),
         )
         mode.grid(row=0, column=7, padx=(0, 8), pady=(10, 2))
@@ -11014,16 +12183,22 @@ class PdfSetDialog:
             row["error"] = ""
             if (first, last) != (item.first_page, item.last_page):
                 item.set_pages(first, last)
-                wanted = self.MODE_LLM if item.use_llm else self.MODE_LOCAL
+                wanted = self._mode_value(item)
                 row["mode_var"].set(wanted)
                 row["mode"].set(wanted)
         self._refresh_note(index)
         self._refresh_submit_text()
 
+    def _mode_value(self, item: PdfSetItem) -> str:
+        if item.use_llm:
+            return self.MODE_LLM
+        return self.MODE_ECONOMY if item.economy else self.MODE_LOCAL
+
     def _mode_clicked(self, index: int, value: str) -> None:
         if not 0 <= index < len(self.items):
             return
-        self.items[index].set_mode(str(value) == self.MODE_LLM)
+        value = str(value)
+        self.items[index].set_mode(value == self.MODE_LLM, economy=value == self.MODE_ECONOMY)
         self._refresh_note(index)
         self._refresh_submit_text()
 

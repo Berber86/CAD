@@ -36,7 +36,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
-from version import APP_DATE, APP_VERSION
+from version import APP_STAMP, APP_VERSION
 
 try:
     from shapely.geometry import LineString, Point, Polygon, box as shapely_box
@@ -1174,6 +1174,8 @@ class DrawingLine:
     closed: bool = False
     kind: str = "AcDbLine"
     handle: str = ""
+    #: цвет самого объекта (ACI), если он задан не по слою; 0 — по слою или неизвестно
+    color: int = 0
 
 
 @dataclass(frozen=True)
@@ -1242,7 +1244,7 @@ class NorthArrow:
 
 #: Версия программы (``version.py``) с датой: печатается в отчёте Шага 2, чтобы
 #: было видно, какая сборка работала. Тот же номер стоит в углу окна.
-STEP2_VERSION = f"{APP_VERSION} ({APP_DATE})"
+STEP2_VERSION = f"{APP_VERSION} ({APP_STAMP})"
 
 
 @dataclass
@@ -2011,11 +2013,78 @@ def _boundary_mismatch_note(
     )
 
 
+#: Цвет, которым геодезист/Николай обводит участок (зелёный, ACI 3): линии обычно лежат в слое
+#: ST-BLDG-LINE, но цвет у них задан явно. Фасад — красная линия улицы (``property_closing_layers``).
+SURVEY_LOT_COLOR = 3
+
+
+def _survey_lot_near(
+    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+) -> PropertyBoundary | None:
+    """
+    Участок из зелёных линий (цвет ``SURVEY_LOT_COLOR``) и фасадной линии улицы: замкнутый контур,
+    который касается области и примыкает к красной линии улицы. Самый большой из таких.
+    """
+    fcfg = feature_settings(cfg)
+    green = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if line.color == SURVEY_LOT_COLOR)
+        if geom is not None
+    ]
+    closing = _as_patterns(fcfg.get("property_closing_layers"))
+    closers = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if closing and layer_matches(line.layer, closing))
+        if geom is not None
+    ]
+    if len(green) < 3 or not closers:
+        return None
+    snap_tol = float(fcfg.get("boundary_snap_tolerance_ft") or 0.0)
+    gap_tol = float(fcfg.get("boundary_gap_tolerance_ft") or 0.0)
+    polygons, gaps = polygons_from_lines(
+        green + closers, snap_tolerance=snap_tol, gap_tolerance=gap_tol,
+        min_area=float(fcfg.get("min_property_area_sqft") or 0.0), allow_chain_closure=False,
+    )
+    street = unary_union(closers).buffer(max(snap_tol, 0.1))
+    best: tuple[int, Polygon] | None = None
+    for index, poly in enumerate(polygons):
+        if poly.intersection(near).area <= 0.0:
+            continue
+        if poly.exterior.intersection(street).length <= 0.0:
+            continue  # участок должен примыкать к красной линии улицы
+        if best is None or poly.area > best[1].area:
+            best = (index, poly)
+    if best is None:
+        return None
+    polygon = _normalize_polygon(best[1])
+    if polygon is None:
+        return None
+    return PropertyBoundary(
+        polygon=polygon,
+        layer=f"зелёный контур (цвет {SURVEY_LOT_COLOR})",
+        method="auto",
+        candidates=len(polygons),
+        closed_gap_ft=float(gaps.get(best[0], 0.0)),
+        notes=[
+            "участок — зелёный контур чертежа (линии цвета 3), фасад по красной линии улицы "
+            "(M-ROW-LINE); слой участка не нужен"
+        ],
+    )
+
+
 def find_property_polygon(
-    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None = None
+    snapshot: DrawingSnapshot,
+    cfg: dict[str, Any] | None = None,
+    *,
+    near: Polygon | None = None,
 ) -> PropertyBoundary:
     """
     Автопоиск полигона участка по слоям ``property_line_layers``.
+
+    ``near`` — область, которую геодезист выделил для работы (Шаг 4): берётся замкнутый контур,
+    который с ней пересекается (самый большой по площади пересечения), а не контур с наибольшим
+    числом снятых объектов по всему чертежу. Если ни один контур области не касается, —
+    ``FeatureLabelError``.
 
     Слои проверяются в порядке приоритета из конфигурации; используется первый
     слой, линии которого образуют замкнутый контур. Если контуров несколько
@@ -2085,7 +2154,14 @@ def find_property_polygon(
             continue
         if survey_lines is None:
             survey_lines = _survey_lines(snapshot, classifier)
-        index, ambiguous = _choose_property_candidate(polygons, survey_lines)
+        if near is not None:
+            overlaps = [poly.intersection(near).area for poly in polygons]
+            index = max(range(len(polygons)), key=overlaps.__getitem__)
+            ambiguous = False
+            if overlaps[index] <= 0.0:
+                continue  # в этом слое нет контура, который касается области
+        else:
+            index, ambiguous = _choose_property_candidate(polygons, survey_lines)
         polygon = _normalize_polygon(polygons[index])
         if polygon is None:
             continue
@@ -2122,7 +2198,7 @@ def find_property_polygon(
             polygon=polygon, layer=layer_name, method="auto",
             candidates=len(polygons), closed_gap_ft=gap, notes=notes,
         )
-        if not survey_lines or _activity_score(polygon, survey_lines) > 0.0:
+        if near is not None or not survey_lines or _activity_score(polygon, survey_lines) > 0.0:
             if primary is not None:
                 # Второй контур участка в другом слое (граница Шага 1 и участок
                 # геодезиста): если они заметно расходятся — предупреждение.
@@ -2143,6 +2219,10 @@ def find_property_polygon(
             empty = found
     if primary is not None:
         return primary
+    if near is not None:
+        survey = _survey_lot_near(snapshot, cfg, near)
+        if survey is not None:
+            return survey
     if empty is not None:
         return empty
     raise FeatureLabelError(

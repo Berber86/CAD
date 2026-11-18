@@ -157,6 +157,66 @@ def test_rows_without_dates_do_not_break_the_choice():
     assert [tag for _row, tag in chosen] == ["NEW", "OLD"]
 
 
+# Правило Коли (уточнение 17.11.2026): приоритет Deed над Mortgage — только если Deed
+# новее 2015 года. Если свежего Deed нет, а есть Mortgage с 2015 года — NEW становится
+# свежая ипотека, а древний Deed — OLD (для нашего участка).
+
+
+def test_old_deed_and_fresh_mortgage_make_the_mortgage_new_and_the_deed_old():
+    """Сценарий заказчика: Deed 1985 и Mortgage 2025 → NEW = ипотека 2025, OLD = Deed 1985."""
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("900001", "NEW"), ("351707", "OLD"),
+    ]
+
+
+def test_neighbour_gets_only_the_fresh_mortgage_when_the_deed_is_old():
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="neighbour")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [("900001", "NEW")]
+
+
+def test_fresh_deed_still_beats_a_newer_mortgage():
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        (str(NEWEST_ID), "Deed", "05/14/2019"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        (str(NEWEST_ID), "NEW"), ("351707", "OLD"),
+    ]
+
+
+def test_old_deed_with_an_old_mortgage_keeps_the_deed_as_new():
+    """Ипотека до 2015 не даёт права стать NEW: остаётся Deed, как и раньше."""
+    rows = _rows([
+        ("351707", "Deed", "07/10/1985"),
+        ("900001", "Mortgage", "01/09/2002"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [("351707", "NEW")]
+
+
+def test_oldest_deed_becomes_old_when_several_old_deeds_and_a_fresh_mortgage():
+    rows = _rows([
+        ("500", "Deed", "01/01/1961"),
+        (str(OLDEST_ID), "Deed", "06/14/1974"),
+        ("900001", "Mortgage", "03/05/2025"),
+    ])
+    chosen = rcclerk.choose_documents(rows, role="our")
+    assert [(row.endorsement_id, tag) for row, tag in chosen] == [
+        ("900001", "NEW"), ("500", "OLD"),
+    ]
+
+
 def test_no_deeds_and_no_mortgages_means_nothing_to_download():
     rows = _rows([("1", "Satisfaction", "01/01/2000")])
     assert rcclerk.choose_documents(rows, role="our") == []
@@ -635,3 +695,122 @@ def test_description_search_uses_second_half_only_when_first_has_no_match(tmp_pa
     assert calls == [1, 2, 3, 4, 5]
     assert any("части 1/2" in line and "стр. 1–2" in line for line in progress)
     assert any("части 2/2" in line and "стр. 3–5" in line for line in progress)
+
+
+def test_stop_interrupts_the_browser_wait_at_once(tmp_path):
+    """«Стоп» во время ожидания Cloudflare/браузера прерывает ожидание, а не ждёт 300 с."""
+    import time
+
+    stop = {"flag": False}
+    steps: list[str] = []
+
+    def open_browser(url):
+        stop["flag"] = True  # пользователь нажал «Стоп», пока браузер открывается
+
+    started = time.monotonic()
+    with pytest.raises(rcclerk.DownloadStopped):
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=open_browser,
+            downloads_dir=tmp_path / "downloads",
+            watch_timeout=300.0, poll=0.05,
+            on_step=steps.append,
+            should_stop=lambda: stop["flag"],
+        )
+    assert time.monotonic() - started < 5.0
+    assert any("2/3" in step for step in steps)  # ступень браузера видна в журнале
+
+
+def test_stop_during_the_wait_is_a_clean_cancel_for_the_intake(tmp_path, monkeypatch):
+    """В сборе «Стоп» во время ожидания даёт IntakeCancelled, а не запись «не скачался»."""
+    import deed_intake
+
+    def stopping_downloader(row, destination):
+        raise rcclerk.DownloadStopped("остановлено пользователем")
+
+    outcome_missing: list[str] = []
+    with pytest.raises(deed_intake.IntakeCancelled):
+        deed_intake._collect_one(
+            block_no=5711, lot_value=34, role="our", row=_row_for_test(), tag="",
+            target_dir=tmp_path, base_url=rcclerk.BASE_URL,
+            download=stopping_downloader, find_pages=lambda pdf: None, ocr_dpi=200,
+            say=lambda message: None, missing=outcome_missing,
+        )
+    assert outcome_missing == []
+
+
+def _row_for_test():
+    import datetime as _dt
+
+    return rcclerk.DeedRow(endorsement_id=NEWEST_ID, doc_type="DEED", doc_date=_dt.date(2023, 9, 5))
+
+
+_CLERK_ERROR_PAGE = (
+    b"<html><body>WE COULD NOT LOAD THE REQUESTED DOCUMENT IMAGE DUE TO AN UNEXPECTED ERROR: "
+    b"ERROR READING JOBJECT FROM JSONREADER. PATH '', LINE 0, POSITION 0.. PLEASE TRY AGAIN.</body></html>"
+)
+
+
+def test_clerk_error_page_is_a_server_error_not_cloudflare(tmp_path):
+    with pytest.raises(rcclerk.DocumentServerError) as caught:
+        rcclerk.download_pdf(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(_CLERK_ERROR_PAGE, "text/html"),
+        )
+    assert not isinstance(caught.value, rcclerk.CloudflareBlocked)
+    assert "718-675-7700" in str(caught.value)
+
+
+def test_clerk_error_retries_directly_and_never_opens_the_browser(tmp_path, monkeypatch):
+    monkeypatch.setattr(rcclerk, "SERVER_ERROR_RETRY_PAUSE_SEC", 0.0)
+    attempts = {"n": 0}
+    opened = []
+
+    def opener(request, timeout=0):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return _Response(_CLERK_ERROR_PAGE, "text/html")
+        return _Response(b"%PDF-1.7 deed", "application/pdf")
+
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf", opener=opener,
+        open_browser=lambda url: opened.append(url), downloads_dir=tmp_path / "downloads",
+    )
+    assert rung == "direct" and path.read_bytes().startswith(b"%PDF-")
+    assert attempts["n"] == 3 and opened == []
+
+
+def test_persistent_clerk_error_ends_fast_without_browser_wait(tmp_path, monkeypatch):
+    import time
+
+    monkeypatch.setattr(rcclerk, "SERVER_ERROR_RETRY_PAUSE_SEC", 0.0)
+    opened = []
+    started = time.monotonic()
+    with pytest.raises(rcclerk.DocumentServerError):
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(_CLERK_ERROR_PAGE, "text/html"),
+            open_browser=lambda url: opened.append(url),
+            downloads_dir=tmp_path / "downloads", watch_timeout=300.0,
+        )
+    assert opened == []
+    assert time.monotonic() - started < 5.0
+
+
+def test_collect_skips_a_document_the_clerk_could_not_serve(tmp_path):
+    import deed_intake
+
+    missing: list[str] = []
+
+    def failing_downloader(row, destination):
+        raise rcclerk.DocumentServerError("сайт округа не отдал документ: ошибка на стороне сайта")
+
+    result = deed_intake._collect_one(
+        block_no=5711, lot_value=34, role="our", row=_row_for_test(), tag="",
+        target_dir=tmp_path, base_url=rcclerk.BASE_URL,
+        download=failing_downloader, find_pages=lambda pdf: None, ocr_dpi=200,
+        say=lambda message: None, missing=missing,
+    )
+    assert result is None
+    assert any("ошибка на стороне сайта" in item for item in missing)

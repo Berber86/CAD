@@ -105,24 +105,41 @@
     "max_stretch_spaces": 65,
     "front_side_index": 0,
     "degrees_as_control_code": true,
-    "text_style": "AI_BOUNDARY",
+    "text_style": "BOUNDARY",
     "draw_street_extensions": true,
     "property_as_lines": true,
     "leave_gap_open": true,
     "rounding_gap_tolerance_ft": 0.015,
     "zoom_extents": true,
-    "zoom_margin_scale": 0.84
+    "zoom_margin_scale": 0.84,
+    "sheet_origin_ft": [5000.0, 5000.0],
+    "sheet_window_ft": [5000.0, 8000.0]
+  },
+  "print_draft": {
+    "enabled": true,
+    "shift_ft": [1000.0, 0.0],
+    "tie_length_ft": 40.0,
+    "layers": {
+      "property_line": "PL-PRINT",
+      "boundary_text": "D-TOPO-TEXT-PRINT",
+      "street_row": "M-ROW-LINE-PRINT"
+    },
+    "layer_colors": {
+      "property_line": 7,
+      "boundary_text": 7,
+      "street_row": 1
+    }
   },
   "layers": {
-    "property_line": "PROPERTY_LINE",
-    "boundary_text": "BOUNDARY_TEXT_AI",
-    "street_row": "STREET_ROW_AI",
+    "property_line": "PL",
+    "boundary_text": "D-TOPO-TEXT",
+    "street_row": "M-ROW-LINE",
     "neighbor_lot": "NEIGHBOR_LOT"
   },
   "layer_colors": {
-    "property_line": 1,
-    "boundary_text": 3,
-    "street_row": 8,
+    "property_line": 3,
+    "boundary_text": 7,
+    "street_row": 5,
     "neighbor_lot": 4
   },
   "feature_labeling": {

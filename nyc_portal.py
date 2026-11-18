@@ -8,6 +8,7 @@ neighbour-lot labels.
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -20,6 +21,9 @@ import ocr_pages
 from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
+#: Заголовок пустой новой вкладки в разных браузерах (русский и английский интерфейс).
+NEW_TAB_TITLE_MARKS = ("new tab", "new private tab", "новая вкладка", "about:blank")
+
 PORTAL_URL_MARKS = (
     "propertyinformationportal", "property information portal", "nyc department of finance",
 )
@@ -80,6 +84,32 @@ class ParcelLookup:
 
 def _normalise(text: str) -> str:
     return "".join(char for char in str(text or "").lower() if char.isalnum())
+
+
+# Пауза между проверками экрана (OCR всего окна). В «быстрой работе» проверок меньше.
+SCREEN_CHECK_PAUSE_SEC = 0.6
+FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
+#: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
+FAST_PAUSE_MIN_SEC = 1.0
+FAST_PAUSE_MAX_SEC = 5.0
+
+
+def parse_fast_pause(text: object) -> float | None:
+    """
+    Разбирает паузу «быстрой работы» из поля: число от 1 до 5 (дробные, с точкой или запятой).
+
+    Возвращает ``None``, если это не число или оно вне пределов — такой запуск не начинаем.
+    """
+    raw = str(text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not FAST_PAUSE_MIN_SEC <= value <= FAST_PAUSE_MAX_SEC:
+        return None
+    return value
+# После прокрутки колёсиком карта перерисовывается не сразу: снимок делаем через 0.8 с + 3 с.
+MAP_REDRAW_WAIT_SEC = 0.8 + 3.0
 
 
 def _screen_ocr(image_path: str | Path) -> list[ScreenText]:
@@ -217,10 +247,12 @@ def _wait_screen(
     *,
     timeout: float,
     description: str,
+    pause: float = SCREEN_CHECK_PAUSE_SEC,
 ) -> list[ScreenText]:
+    """Ждёт, пока экран не удовлетворит ``predicate``; между проверками — ``pause`` секунд."""
     deadline = time.monotonic() + timeout
     latest: list[ScreenText] = []
-    while time.monotonic() < deadline:
+    while True:
         _focus(handle)
         with tempfile.TemporaryDirectory(prefix="tsai_pip_ocr_") as directory:
             path = Path(directory) / "screen.png"
@@ -232,7 +264,10 @@ def _wait_screen(
             )
         if predicate(latest):
             return latest
-        time.sleep(0.6)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(pause, remaining))
     raise PortalLookupError(f"Не дождался {description} на NYC Portal.")
 
 
@@ -343,9 +378,24 @@ def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: s
 
 
 def _drive_portal(
-    address: str, map_path: Path, progress: Progress | None = None,
+    address: str, map_path: Path, progress: Progress | None = None, *, fast_mode: bool = False,
+    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
 ) -> PortalCapture:
-    """Use the current browser window to select an address and retain a map-only crop."""
+    """
+    Use the current browser window to select an address and retain a map-only crop.
+
+    ``fast_mode`` — «быстрая работа»: между проверками экрана пауза ``fast_pause_sec``
+    (по умолчанию 5 с, пользователь выбирает от 1 до 5) вместо 0.6 с, то есть OCR всего окна
+    запускается заметно реже.
+    """
+    pause = fast_pause_sec if fast_mode else SCREEN_CHECK_PAUSE_SEC
+
+    def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
+             timeout: float, description: str) -> list[ScreenText]:
+        return _wait_screen(
+            handle, predicate, timeout=timeout, description=description, pause=pause,
+        )
+
     if not browser_save.available():
         raise PortalLookupError("Автоматизация окна доступна только в Windows.")
     # OCR availability is checked before touching the browser, not midway through typing.
@@ -361,17 +411,28 @@ def _drive_portal(
     _focus(window.handle)
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
-            progress("открываю NYC Property Information Portal в текущей вкладке браузера")
-        # Ctrl+L selects the current URL; Ctrl+A also clears any stale omnibox text
-        # if the browser retained a partially typed value from an earlier attempt.
+            progress("открываю NYC Property Information Portal в НОВОЙ вкладке; текущие вкладки не трогаю")
+        # Ctrl+T открывает новую вкладку; текущие вкладки (например, переписка) не меняются.
+        if not browser_save.press_ctrl_t():
+            raise PortalLookupError("Не удалось открыть новую вкладку в браузере.")
+        time.sleep(0.6)  # даём браузеру переключиться на новую вкладку
+        # Печатать можно только в пустую новую вкладку. Если заголовок активной вкладки
+        # не похож на пустую вкладку — ничего не печатаем, иначе текст уйдёт в чужую страницу.
+        active_title = (browser_save.active_window_title() or "").lower()
+        if not any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
+            raise PortalLookupError(
+                "После Ctrl+T активна не новая вкладка; адрес ничего не печатал. "
+                "Откройте NYC Portal вручную во вкладке и повторите поиск."
+            )
+        # Ctrl+L выделяет адресную строку новой вкладки; Ctrl+A очищает возможный остаток.
         if (
             not browser_save.press_ctrl_l()
             or not browser_save.press_ctrl_a()
             or not browser_save.type_text(PORTAL_URL)
         ):
-            raise PortalLookupError("Не удалось заменить адрес в текущей вкладке браузера.")
+            raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
         _key(window.handle, browser_save.VK_RETURN)
-        rows = _wait_screen(
+        rows = wait(
             window.handle,
             lambda screen: _contains(screen, "Select") or _contains(screen, "Find Another Property"),
             timeout=45,
@@ -405,7 +466,7 @@ def _drive_portal(
 
     if _contains(rows, "Find Another Property"):
         _click_text(window.handle, rows, "Find Another Property")
-        rows = _wait_screen(
+        rows = wait(
             window.handle, lambda screen: _contains(screen, "Select"),
             timeout=12, description="форму поиска адреса",
         )
@@ -422,7 +483,7 @@ def _drive_portal(
             # Down/Down/Down/Enter presses landed before anything was listening for them.
             # Confirm the option list is visible (its "Address" row appears) before
             # driving it with the keyboard, instead of guessing with a fixed delay.
-            rows = _wait_screen(
+            rows = wait(
                 window.handle, lambda screen: _has_exact_text(screen, "Address"),
                 timeout=5, description="открывшийся список Select",
             )
@@ -433,7 +494,7 @@ def _drive_portal(
         _key(window.handle, browser_save.VK_DOWN)
         time.sleep(0.2)
         _key(window.handle, browser_save.VK_RETURN)
-        rows = _wait_screen(
+        rows = wait(
             window.handle, lambda screen: _contains(screen, "Enter an Address"),
             timeout=8, description="поля Address",
         )
@@ -454,7 +515,7 @@ def _drive_portal(
     _key(window.handle, browser_save.VK_DOWN)
     time.sleep(0.2)
     _key(window.handle, browser_save.VK_RETURN)
-    rows = _wait_screen(
+    rows = wait(
         window.handle,
         lambda screen: (
             _contains(screen, "Find Another Property")
@@ -494,7 +555,7 @@ def _zoom_out_map_pane(handle: int) -> None:
         user32.SetCursorPos(int(x), int(y))
         time.sleep(0.1)
         user32.mouse_event(0x0800, 0, 0, -120, 0)  # MOUSEEVENTF_WHEEL, -120 = 1 tick back
-        time.sleep(0.8)
+        time.sleep(MAP_REDRAW_WAIT_SEC)  # карта перерисовывается; снимок делается после этого
     except Exception:  # noqa: BLE001 - best-effort zoom out
         pass
 
@@ -536,6 +597,8 @@ def lookup_parcel(
     api_key: str | None = None,
     key_secret: str = "",
     progress: Progress | None = None,
+    fast_mode: bool = False,
+    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
 ) -> ParcelLookup:
     """Navigate the portal, read BBL locally, then ask Vision only about map neighbours."""
     clean_address = str(address or "").strip()
@@ -543,7 +606,9 @@ def lookup_parcel(
         raise PortalLookupError("Введите адрес перед поиском.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     map_path = Path(screenshot_folder) / f"TAX_MAP_{stamp}.jpg"
-    capture = _drive_portal(clean_address, map_path, progress)
+    capture = _drive_portal(
+        clean_address, map_path, progress, fast_mode=fast_mode, fast_pause_sec=fast_pause_sec,
+    )
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(

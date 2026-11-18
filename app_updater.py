@@ -35,7 +35,9 @@ once against the bundled ``certifi`` CA file before giving up.
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import json
+import re
 import shutil
 import ssl
 import tempfile
@@ -43,7 +45,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 try:  # pragma: no cover - certifi is an existing transitive dependency (openai/httpx)
@@ -91,7 +93,41 @@ def _certifi_ssl_context() -> ssl.SSLContext | None:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
+_READ_CHUNK = 64 * 1024
+
+
+def _read_body(response: Any, on_progress: Callable[[int, int], None] | None) -> bytes:
+    """
+    Читает тело ответа. Без колбэка — как раньше, одним ``read()``.
+
+    С колбэком читает кусками и сообщает ``(получено, всего)``; «всего» берётся из
+    ``Content-Length`` и равно 0, если сервер его не прислал.
+    """
+    if on_progress is None:
+        return response.read()
+    headers = getattr(response, "headers", None)
+    try:
+        total = int((headers.get("Content-Length") if headers is not None else 0) or 0)
+    except (TypeError, ValueError):
+        total = 0
+    chunks: list[bytes] = []
+    received = 0
+    while True:
+        chunk = response.read(_READ_CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        received += len(chunk)
+        try:
+            on_progress(received, total)
+        except Exception:  # noqa: BLE001 - индикатор не должен обрывать скачивание
+            pass
+    return b"".join(chunks)
+
+
+def _http_get(
+    url: str, *, timeout: float = 30.0, on_progress: Callable[[int, int], None] | None = None,
+) -> bytes:
     """
     Fetch raw bytes from ``url``. The only network primitive in this module.
 
@@ -111,7 +147,7 @@ def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - GitHub only
-            return response.read()
+            return _read_body(response, on_progress)
     except urllib.error.HTTPError as exc:
         raise UpdateError(f"GitHub ответил ошибкой {exc.code} для {url}") from exc
     except urllib.error.URLError as exc:
@@ -127,7 +163,7 @@ def _http_get(url: str, *, timeout: float = 30.0) -> bytes:
             ) from exc
         try:
             with urllib.request.urlopen(request, timeout=timeout, context=context) as response:  # noqa: S310
-                return response.read()
+                return _read_body(response, on_progress)
         except urllib.error.HTTPError as retry_exc:
             raise UpdateError(f"GitHub ответил ошибкой {retry_exc.code} для {url}") from retry_exc
         except urllib.error.URLError as retry_exc:
@@ -197,9 +233,15 @@ def resolve_zip_url(source: str) -> str:
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
-def download_zip(url: str, destination: Path, *, timeout: float = 60.0) -> Path:
+def download_zip(
+    url: str, destination: Path, *, timeout: float = 60.0,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> Path:
     """Download ``url`` to ``destination`` and return the path."""
-    data = _http_get(url, timeout=timeout)
+    if on_progress is None:
+        data = _http_get(url, timeout=timeout)
+    else:
+        data = _http_get(url, timeout=timeout, on_progress=on_progress)
     if not data:
         raise UpdateError("GitHub вернул пустой архив.")
     destination = Path(destination)
@@ -235,11 +277,50 @@ def _is_protected_file(relative: str, protected: frozenset[str]) -> bool:
     return relative.endswith(".local.json")
 
 
+def _archive_entries(archive: zipfile.ZipFile, protected: frozenset[str]) -> tuple[list[tuple[str, zipfile.ZipInfo]], list[str]]:
+    """
+    Файлы архива, которые будут записаны: ``[(путь относительно папки, элемент ZIP)]``,
+    и защищённые пути, которые архив содержит, но мы их не трогаем.
+    """
+    names = archive.namelist()
+    prefix = _common_root(names)
+    entries: list[tuple[str, zipfile.ZipInfo]] = []
+    skipped: list[str] = []
+    for info in archive.infolist():
+        name = info.filename
+        if prefix:
+            if not name.startswith(prefix):
+                continue
+            relative = name[len(prefix):]
+        else:
+            relative = name
+        if not relative or relative.endswith("/"):
+            continue
+        if _is_protected_file(relative, protected):
+            skipped.append(relative)
+            continue
+        entries.append((relative, info))
+    return entries, skipped
+
+
+def _archive_targets(zip_path: Path, *, protected: frozenset[str] = DEFAULT_PROTECTED_FILES) -> list[str]:
+    """Пути, которые обновление собирается записать (без защищённых). Ошибки — как у распаковки."""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            entries, _ = _archive_entries(archive, protected)
+    except zipfile.BadZipFile as exc:
+        raise UpdateError(f"Скачанный файл не является ZIP-архивом: {exc}") from exc
+    if not entries:
+        raise UpdateError("В архиве не найдено ни одного файла для обновления.")
+    return [relative for relative, _ in entries]
+
+
 def extract_update(
     zip_path: Path,
     target_dir: Path,
     *,
     protected: frozenset[str] = DEFAULT_PROTECTED_FILES,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Forcibly overwrite files under ``target_dir`` with the archive's contents.
@@ -258,33 +339,200 @@ def extract_update(
     target_dir = Path(target_dir).resolve()
     try:
         with zipfile.ZipFile(zip_path) as archive:
-            names = archive.namelist()
-            prefix = _common_root(names)
-            for info in archive.infolist():
-                name = info.filename
-                if prefix:
-                    if not name.startswith(prefix):
-                        continue
-                    relative = name[len(prefix):]
-                else:
-                    relative = name
-                if not relative or relative.endswith("/"):
-                    continue
-                if _is_protected_file(relative, protected):
-                    skipped.append(relative)
-                    continue
+            entries, skipped = _archive_entries(archive, protected)
+            total_entries = len(entries)
+            for index, (relative, info) in enumerate(entries, 1):
                 dest_path = (target_dir / relative).resolve()
                 if not dest_path.is_relative_to(target_dir):
-                    raise UpdateError(f"Архив содержит недопустимый путь: {name}")
+                    raise UpdateError(f"Архив содержит недопустимый путь: {info.filename}")
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(info) as source, open(dest_path, "wb") as handle:
                     shutil.copyfileobj(source, handle)
                 written.append(relative)
+                if on_progress is not None:
+                    on_progress(index, total_entries)
     except zipfile.BadZipFile as exc:
         raise UpdateError(f"Скачанный файл не является ZIP-архивом: {exc}") from exc
     if not written:
         raise UpdateError("В архиве не найдено ни одного файла для обновления.")
     return written, skipped
+
+
+# ----------------------------------------------------------------- резервные копии
+
+#: Папка с резервными копиями — внутри папки программы, в git не попадает.
+BACKUP_DIR_NAME = "backups"
+#: Сколько последних резервов хранить; откат идёт с самого свежего.
+BACKUPS_KEEP = 3
+_MANIFEST = "manifest.json"
+
+
+@dataclasses.dataclass(frozen=True)
+class BackupInfo:
+    """Резервная копия перед обновлением: что в ней и какая версия была установлена."""
+
+    path: str
+    created: str
+    version: str
+    files: tuple[str, ...]  # существовавшие файлы: вернём их содержимое
+    new_files: tuple[str, ...]  # появились при обновлении: при откате удалим
+
+
+@dataclasses.dataclass(frozen=True)
+class RollbackResult:
+    version: str
+    files_restored: int
+    files_removed: int
+
+
+def _safe_join(root: Path, relative: str) -> Path:
+    dest = (root / relative).resolve()
+    if not dest.is_relative_to(root):
+        raise UpdateError(f"недопустимый путь в резервной копии: {relative}")
+    return dest
+
+
+def _installed_version(app_dir: Path) -> str:
+    """Версия из version.py текущей установки (пусто, если не найдена)."""
+    try:
+        text = (app_dir / "version.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"APP_VERSION\s*=\s*[\"']([^\"']+)[\"']", text)
+    return match.group(1) if match else ""
+
+
+def backups_root(app_dir: str | Path) -> Path:
+    return Path(app_dir).resolve() / BACKUP_DIR_NAME
+
+
+def list_backups(app_dir: str | Path) -> list[BackupInfo]:
+    """Резервные копии, самая свежая первой. Повреждённые пропускаются."""
+    root = backups_root(app_dir)
+    if not root.is_dir():
+        return []
+    found: list[BackupInfo] = []
+    for folder in sorted(root.iterdir(), reverse=True):
+        manifest = folder / _MANIFEST
+        if not (folder.is_dir() and manifest.is_file()):
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            found.append(BackupInfo(
+                path=str(folder),
+                created=str(data.get("created", "")),
+                version=str(data.get("version", "")),
+                files=tuple(data.get("files", [])),
+                new_files=tuple(data.get("new_files", [])),
+            ))
+        except (OSError, ValueError, TypeError):
+            continue
+    return found
+
+
+def create_backup(
+    app_dir: str | Path, relatives: list[str],
+    *, on_progress: Callable[[int, int], None] | None = None,
+) -> BackupInfo:
+    """Копирует файлы, которые обновление перезапишет, и запоминает, каких не было."""
+    app_dir = Path(app_dir).resolve()
+    root = backups_root(app_dir)
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = root / stamp
+    counter = 1
+    while folder.exists():
+        counter += 1
+        folder = root / f"{stamp}-{counter}"
+    folder.mkdir(parents=True)
+    files_dir = folder / "files"
+    files: list[str] = []
+    new_files: list[str] = []
+    try:
+        for index, relative in enumerate(relatives, 1):
+            source = _safe_join(app_dir, relative)
+            if source.is_file():
+                target = files_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                files.append(relative)
+            elif not source.exists():
+                new_files.append(relative)
+            else:
+                raise UpdateError(f"на месте файла «{relative}» лежит папка — резерв невозможен")
+            if on_progress is not None:
+                on_progress(index, len(relatives))
+        info = BackupInfo(
+            path=str(folder),
+            created=_dt.datetime.now().isoformat(timespec="seconds"),
+            version=_installed_version(app_dir),
+            files=tuple(files),
+            new_files=tuple(new_files),
+        )
+        (folder / _MANIFEST).write_text(
+            json.dumps({
+                "created": info.created, "version": info.version,
+                "files": list(info.files), "new_files": list(info.new_files),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    _prune_backups(app_dir, keep=BACKUPS_KEEP)
+    return info
+
+
+def _prune_backups(app_dir: Path, *, keep: int) -> None:
+    for old in list_backups(app_dir)[keep:]:
+        shutil.rmtree(old.path, ignore_errors=True)
+
+
+def restore_backup(app_dir: str | Path, backup: BackupInfo) -> RollbackResult:
+    """
+    Возвращает файлы из резерва и удаляет новые файлы обновления.
+
+    Сначала проверяется, что все файлы резерва на месте, и только потом что-либо
+    меняется. Защищённые файлы (настройки и ключи) не трогаются никогда.
+    Резерв удаляется только после полного успеха.
+    """
+    app_dir = Path(app_dir).resolve()
+    files_dir = Path(backup.path) / "files"
+    to_restore = [rel for rel in backup.files if not _is_protected_file(rel, DEFAULT_PROTECTED_FILES)]
+    to_remove = [rel for rel in backup.new_files if not _is_protected_file(rel, DEFAULT_PROTECTED_FILES)]
+    for relative in to_restore:
+        if not (files_dir / relative).is_file():
+            raise UpdateError(f"в резервной копии нет файла «{relative}» — откат невозможен")
+    restored = 0
+    for relative in to_restore:
+        dest = _safe_join(app_dir, relative)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(files_dir / relative, dest)
+        restored += 1
+    removed = 0
+    for relative in to_remove:
+        dest = _safe_join(app_dir, relative)
+        if dest.is_file():
+            dest.unlink()
+            removed += 1
+    shutil.rmtree(backup.path, ignore_errors=True)
+    return RollbackResult(version=backup.version, files_restored=restored, files_removed=removed)
+
+
+def rollback_latest(app_dir: str | Path) -> RollbackResult:
+    """Откатывает программу на самую свежую резервную копию."""
+    backups = list_backups(app_dir)
+    if not backups:
+        raise UpdateError("резервной копии нет — откатывать некуда")
+    return restore_backup(app_dir, backups[0])
+
+
+def _progress_kwargs(on_stage: Any, callback: Callable[[int, int], None]) -> dict[str, Any]:
+    """Колбэк счётчика передаётся только когда индикатор действительно подключён."""
+    return {"on_progress": callback} if on_stage is not None else {}
+
+
+def _megabytes(value: int) -> str:
+    return f"{value / (1024 * 1024):.1f}"
 
 
 def apply_update(
@@ -294,8 +542,15 @@ def apply_update(
     progress: Callable[[str], None] | None = None,
     timeout: float = 60.0,
     protected: frozenset[str] = DEFAULT_PROTECTED_FILES,
+    on_stage: Callable[[str, float | None, str], None] | None = None,
 ) -> UpdateResult:
-    """Resolve ``source``, download its ZIP and forcibly unpack it into ``app_dir``."""
+    """
+    Resolve ``source``, download its ZIP and forcibly unpack it into ``app_dir``.
+
+    ``on_stage(stage, fraction, detail)`` получает числовой ход работы: ``stage`` —
+    ``"download"``, ``"backup"`` или ``"install"``; ``fraction`` — от 0 до 1 или ``None``,
+    если размер заранее неизвестен; ``detail`` — текст для человека.
+    """
 
     def report(message: str) -> None:
         if progress is not None:
@@ -304,20 +559,62 @@ def apply_update(
             except Exception:  # noqa: BLE001 - progress must never abort the update
                 pass
 
+    def stage(name: str, fraction: float | None, detail: str) -> None:
+        if on_stage is not None:
+            try:
+                on_stage(name, fraction, detail)
+            except Exception:  # noqa: BLE001 - индикатор не должен прерывать обновление
+                pass
+
+    def on_download(received: int, total: int) -> None:
+        if total > 0:
+            stage("download", min(1.0, received / total),
+                  f"{_megabytes(received)} из {_megabytes(total)} МБ")
+        else:
+            stage("download", None, f"получено {_megabytes(received)} МБ")
+
+    def on_backup(done: int, total: int) -> None:
+        stage("backup", done / total if total else 1.0, f"файлов: {done} из {total}")
+
+    def on_install(done: int, total: int) -> None:
+        stage("install", done / total if total else 1.0, f"файлов: {done} из {total}")
+
     zip_url = resolve_zip_url(source)
     report(f"скачиваю архив обновления: {zip_url}")
     app_dir = Path(app_dir)
     with tempfile.TemporaryDirectory(prefix="tsai_update_") as tmp_name:
         zip_path = Path(tmp_name) / "update.zip"
-        download_zip(zip_url, zip_path, timeout=timeout)
+        stage("download", 0.0, "подключаюсь к GitHub…")
+        download_zip(
+            zip_url, zip_path, timeout=timeout,
+            on_progress=on_download if on_stage is not None else None,
+        )
+        targets = _archive_targets(zip_path, protected=protected)
+        report("сохраняю резервную копию текущей версии…")
+        backup = create_backup(app_dir, targets, **_progress_kwargs(on_stage, on_backup))
         report("распаковываю архив и принудительно заменяю файлы…")
-        written, skipped = extract_update(zip_path, app_dir, protected=protected)
+        stage("install", 0.0, "распаковываю архив…")
+        try:
+            written, skipped = extract_update(
+                zip_path, app_dir, protected=protected, **_progress_kwargs(on_stage, on_install),
+            )
+        except BaseException as exc:
+            # Распаковка оборвалась на полпути: возвращаем всё как было до обновления.
+            try:
+                restore_backup(app_dir, backup)
+            except Exception as restore_exc:  # noqa: BLE001
+                raise UpdateError(
+                    f"обновление не удалось ({exc}), и автоматический возврат не выполнен "
+                    f"({restore_exc}). Резервная копия: {backup.path}"
+                ) from exc
+            raise
     if skipped:
         report(
             "локальные настройки сохранены без изменений: "
             + ", ".join(sorted(skipped))
         )
     report(f"обновление завершено: заменено файлов — {len(written)}")
+    stage("install", 1.0, f"готово: заменено файлов — {len(written)}")
     return UpdateResult(
         zip_url=zip_url,
         files_written=len(written),

@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+import re
+import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -76,10 +79,14 @@ class PdfSetItem:
     last_page: int = 1
     is_main: bool = False
     use_llm: bool = False
+    #: Режим «Эконом» (локально, ИИ при проблемах). Действует только при use_llm=False.
+    economy: bool = False
     #: Локальный OCR доступен и разрешён: скан разбирается бесплатно, без ИИ.
     ocr_ok: bool = False
     #: Этот файл уже распознавался локальным OCR (для отчёта).
     ocr_used: bool = False
+    #: ИИ реально вызывался для этого файла (см. PdfSetResult.llm_used).
+    llm_used: bool = False
     #: Способ ещё не выбирали вручную — он следует за страницами.
     auto_mode: bool = True
     #: Страницы, прочитанные из имени файла (None — в имени их нет).
@@ -121,6 +128,8 @@ class PdfSetItem:
         return f"{format_pages(self.first_page, self.last_page)} из {self.total_pages}"
 
     def mode_label(self) -> str:
+        if not self.use_llm and self.economy:
+            return "эконом: локально, ИИ при проблемах"
         if not self.use_llm:
             if self.has_legal_text():
                 return "локально, бесплатно"
@@ -137,7 +146,10 @@ class PdfSetItem:
 
     def parse_key(self) -> tuple[Any, ...]:
         """От чего зависит результат разбора; роль на него не влияет."""
-        return (str(self.path), self.first_page, self.last_page, bool(self.use_llm))
+        return (
+            str(self.path), self.first_page, self.last_page,
+            bool(self.use_llm), bool(self.economy and not self.use_llm),
+        )
 
     def signature(self) -> tuple[Any, ...]:
         return self.parse_key() + (bool(self.is_main),)
@@ -152,9 +164,10 @@ class PdfSetItem:
             # Скан при доступном локальном OCR остаётся бесплатным; иначе — как раньше, ИИ.
             self.use_llm = not (self.has_legal_text() or self.ocr_ok)
 
-    def set_mode(self, use_llm: bool) -> None:
+    def set_mode(self, use_llm: bool, economy: bool = False) -> None:
         """Способ выбран пользователем и больше не меняется сам."""
         self.use_llm = bool(use_llm)
+        self.economy = bool(economy and not use_llm)
         self.auto_mode = False
 
     def forget_result(self) -> None:
@@ -181,7 +194,7 @@ class PdfSetItem:
                     return {
                         "ocr_path": self.path,
                         "ocr_pages": self.pages_spec(),
-                        "ocr_dpi": int(ocr_pages.DEFAULT_DPI),
+                        "ocr_dpi": int(SCAN_OCR_DPI),
                     }
                 raise PDFError(
                     f"на {self.pages_label()} нет текстового слоя (скан или чертёж). "
@@ -211,6 +224,10 @@ class PdfSetJob:
     fixes: tuple[Any, ...] = ()
     #: Файл — скан: текст появится из локального OCR (бесплатно), уже в фоне.
     ocr: bool = False
+    #: Файл — скан без текстового слоя: ответ ИИ по нему пишется в кеш Шага 0.
+    scan: bool = False
+    #: Режим «Эконом»: локальный разбор, а при проблемах — ИИ (только для текстовых файлов).
+    economy: bool = False
 
     @property
     def role_label(self) -> str:
@@ -230,12 +247,17 @@ class PdfSetResult:
     cached: bool = False
     #: Текст страниц получен локальным OCR (бесплатно), ИИ не вызывался.
     ocr: bool = False
+    #: ИИ реально вызывался для этого файла (в том числе ступенью 3 после OCR).
+    llm_used: bool = False
     issues: list[str] = field(default_factory=list)
     error: str = ""
 
 
 def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
-    """Готовит файл к разбору; готовый результат при тех же страницах не запрашивается заново."""
+    """Готовит файл к разбору; готовый результат при тех же страницах не запрашивается заново.
+
+    Режим «Эконом» входит в ключ разбора: смена режима у файла даёт новый разбор.
+    """
     reuse = item.has_fresh_result() and not force
     source: dict[str, Any] | None = None
     source_error = ""
@@ -257,6 +279,8 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
         cached_issues=tuple(item.issues) if reuse else (),
         fixes=tuple(item.fixes) if reuse else (),
         ocr=bool(source is not None and "ocr_path" in source),
+        scan=not item.has_legal_text(),
+        economy=bool(item.economy and not item.use_llm),
     )
 
 
@@ -290,21 +314,11 @@ def resolve_ocr_source(
         return source
     path = Path(str(source["ocr_path"]))
     first, last = pages_from_spec(source.get("ocr_pages"))
-    dpi = int(source.get("ocr_dpi") or ocr_pages.DEFAULT_DPI)
+    dpi = int(source.get("ocr_dpi") or SCAN_OCR_DPI)
     try:
         text = ocr_pages.ocr_pdf_pages(
             path, first, last, dpi=dpi, progress=progress
         )
-        if not has_legal_courses(text):
-            # Второй заход «мельче»: страница режется на 2×2 и распознаётся по кускам.
-            # Это дешевле платного Vision и спасает плотный мелкий шрифт.
-            if progress:
-                progress("целиком не разобрать — пробую по кускам 2×2")
-            tiled = ocr_pages.ocr_pdf_pages(
-                path, first, last, dpi=dpi, progress=progress, tile=2
-            )
-            if has_legal_courses(tiled):
-                text = tiled
     except ocr_pages.OcrUnavailable as exc:
         raise PDFError(
             f"локальный OCR недоступен ({exc}). "
@@ -321,6 +335,178 @@ def resolve_ocr_source(
             "Переключите файл на ИИ или укажите другие страницы."
         )
     return {"text": text, "ocr": True}
+
+
+#: Разрешение скана: один проход, не выше того, что даёт сам документ.
+SCAN_OCR_DPI: int = ocr_pages.SCAN_MAX_DPI
+
+
+def describe_exc(exc: BaseException) -> str:
+    """«IndexError: string index out of range (llm_parser.py:123)» — тип, текст и место."""
+    text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ is not None else []
+    if frames:
+        last = frames[-1]
+        text += f" ({Path(last.filename).name}:{last.lineno})"
+    return text
+
+
+#: Разрешение, при котором ищется страница с описанием: дёшево, только для поиска.
+DESCRIPTION_SEARCH_DPI: int = 200
+#: Сколько страниц просматривать при поиске описания (документ длиннее — поиск останавливается).
+DESCRIPTION_SEARCH_MAX_PAGES: int = 40
+#: Сколько найденных страниц перечитывать при полном разрешении.
+DESCRIPTION_SEARCH_CANDIDATES: int = 3
+_DESCRIPTION_MARK_RE = re.compile(
+    r"\bBEGINNING\b|ALL\s+THAT\s+CERTAIN|POINT\s+OR\s+PLACE\s+OF\s+BEGINNING"
+    r"|LEGAL\s+DESCRIPTION|BOUNDED\s+AND\s+DESCRIBED|\bTHENCE\b",
+    re.IGNORECASE,
+)
+
+
+def find_description_page(
+    path: str | Path, *, skip: tuple[int, int], progress: Callable[[str], None] | None = None,
+) -> tuple[int, str] | None:
+    """
+    Ищет страницу с описанием участка по всему документу: нужна, когда на указанных страницах
+    обхода границ нет (например, на первой странице — штамп ипотеки, а описание на 23-й).
+
+    Все страницы, кроме уже прочитанных ``skip``, сначала просматриваются дёшево; подходящие по
+    меткам описания (BEGINNING, THENCE, ALL THAT CERTAIN…) перечитываются полным разрешением,
+    и первая страница, где есть обход границ, возвращается вместе с текстом.
+    """
+    import pymupdf  # noqa: PLC0415 - зависимость программы
+
+    pdf = Path(path)
+    try:
+        with pymupdf.open(str(pdf)) as doc:
+            total = len(doc)
+    except Exception:  # noqa: BLE001 - документ не открылся: поиска нет
+        return None
+    limit = min(total, DESCRIPTION_SEARCH_MAX_PAGES)
+    scored: list[tuple[int, int]] = []
+    for page in range(1, limit + 1):
+        if skip[0] <= page <= skip[1]:
+            continue
+        if progress is not None:
+            progress(f"{pdf.name}: ищу страницу с описанием — стр. {page} из {limit}…")
+        try:
+            light = ocr_pages.ocr_pdf_pages(pdf, page, page, dpi=DESCRIPTION_SEARCH_DPI)
+        except Exception:  # noqa: BLE001 - одна нечитаемая страница не останавливает поиск
+            continue
+        score = len(_DESCRIPTION_MARK_RE.findall(light))
+        if score >= 2:
+            scored.append((score, page))
+    for _score, page in sorted(scored, reverse=True)[:DESCRIPTION_SEARCH_CANDIDATES]:
+        if progress is not None:
+            progress(f"{pdf.name}: стр. {page} похожа на описание — перечитываю полным разрешением…")
+        try:
+            # Кусками 2×2: на целой странице строки плотной колонки терялись (проверено на LOT 118).
+            full = ocr_pages.ocr_pdf_pages(
+                pdf, page, page, dpi=SCAN_OCR_DPI, use_cache=False, exact_dpi=True, tile=2,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if has_legal_courses(full):
+            return page, full
+    return None
+
+
+@dataclass(frozen=True)
+class OcrPass:
+    """Итог единственного прохода локального OCR: текст или ошибка и что реально выполнено."""
+
+    text: str = ""
+    error: str = ""
+    seconds: float = 0.0
+    pages: tuple[int, int] = (1, 1)
+    dpi: int = SCAN_OCR_DPI
+    #: True — рендер ровно на dpi; False — по нативному разрешению скана (второй рендер).
+    exact: bool = True
+    #: Заметка для журнала: например, описание найдено не на указанных страницах.
+    note: str = ""
+
+    def summary(self) -> str:
+        if self.error:
+            return f"ошибка за {self.seconds:.1f} с: {self.error}"
+        how = f"рендер {self.dpi} dpi" if self.exact else "рендер по разрешению скана"
+        base = f"{self.seconds:.1f} с, распознано заново, без кеша, {format_pages(*self.pages)}, {how}"
+        return f"{base}; {self.note}" if self.note else base
+
+
+#: Курс «north/south … east/west» в свободном тексте — для оценки, когда разбор не удался.
+_COURSE_RE = re.compile(r"\b(?:north|south)\b[^;.\n]{0,60}?\b(?:east|west)\b", re.IGNORECASE)
+
+
+def text_quality(text: str) -> tuple[int, int, int]:
+    """
+    Насколько текст похож на полное описание: (сторон, найдено ли расстояние, -замечаний).
+
+    Если разбор программы не удался, сторон считаются курсы по тексту: иначе проходы
+    с разным качеством нельзя сравнить. ИИ не вызывается.
+    """
+    if not text.strip():
+        return (0, 0, 0)
+    try:
+        from llm_parser import parse_with_regex
+
+        model, warnings = parse_with_regex(text, auto_repair_typos=True)
+    except Exception:  # noqa: BLE001 - плохой текст — оценка по тексту, а не падение
+        courses = len(_COURSE_RE.findall(text))
+        has_tie = 1 if re.search(r"\bdistant\b", text, re.IGNORECASE) else 0
+        # Разбор не прошёл — это само по себе замечание, если курсы вообще есть.
+        return (courses, has_tie, -1 if courses else 0)
+    has_tie = 1 if (model.distance_to_corner_ft or 0) > 0 else 0
+    return (len(model.segments), has_tie, -len(warnings))
+
+
+def ocr_scan_once(
+    path: str | Path, source: dict[str, Any] | None, *, progress: Callable[[str], None] | None = None,
+    exact: bool = True,
+) -> OcrPass:
+    """
+    Единственный проход локального OCR для скана в фоновом разборе.
+
+    Кеш не читается и не пишется: результат прошлого прохода не доверяем.
+    Рендер — ровно SCAN_OCR_DPI (не режется по нативному разрешению: на сканах 400–600 dpi
+    давали одинаковый чистый результат, 300 — нет). Страницы — выбранные пользователем. Ошибка не глотается:
+    она возвращается в ``error`` и попадает в отчёт.
+    """
+    src = dict(source or {})
+    pdf = Path(path)
+    started = time.monotonic()
+    try:
+        first, last = pages_from_spec(src.get("ocr_pages") or src.get("pdf_pages") or "1")
+    except PDFError as exc:
+        return OcrPass(error=str(exc), seconds=0.0, dpi=SCAN_OCR_DPI, exact=exact)
+    pages = (first, last)
+    try:
+        text = ocr_pages.ocr_pdf_pages(
+            pdf, first, last, dpi=SCAN_OCR_DPI, progress=progress, use_cache=False, exact_dpi=exact,
+        )
+    except Exception as exc:  # noqa: BLE001 - ошибка уходит в отчёт, а не теряется
+        return OcrPass(
+            error=describe_exc(exc), seconds=time.monotonic() - started, pages=pages,
+            dpi=SCAN_OCR_DPI, exact=exact,
+        )
+    note = ""
+    if exact and not has_legal_courses(text):
+        # На указанных страницах обхода границ нет: описание может лежать дальше (штамп — стр. 1,
+        # описание — стр. 23). Ищем по всему документу; в журнале остаётся, где нашли.
+        try:
+            found = find_description_page(pdf, skip=pages, progress=progress)
+        except Exception as exc:  # noqa: BLE001 - поиск не должен ломать разбор
+            found = None
+            note = f"поиск страницы с описанием не удался: {describe_exc(exc)}"
+        if found is not None:
+            page_no, full_text = found
+            text = full_text
+            pages = (page_no, page_no)
+            note = f"описание не на указанных страницах — найдено на стр. {page_no}"
+    return OcrPass(
+        text=text.strip(), seconds=time.monotonic() - started, pages=pages, dpi=SCAN_OCR_DPI, exact=exact,
+        note=note,
+    )
 
 
 def make_item(

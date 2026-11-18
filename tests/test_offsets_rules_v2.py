@@ -79,9 +79,9 @@ def test_label_may_stand_outside_the_lot_flag():
     assert off.LABEL_MUST_BE_INSIDE is False
 
 
-def test_walls_are_not_labelled_as_offsets():
-    # В эталонах Alvine и Brooklyn стены подписаны размером \A2;, а не оффсетом.
+def test_walls_are_labelled_like_other_objects():
+    # Стены подписываются оффсетом по тому же правилу, что заборы. Отсутствие подписи у заказчика
+    # не считается запретом: он мог не поставить подпись по опыту.
     wall = off.Feature(kind="wall", handle="W", points=((50.0, -2.0), (80.0, -2.0)))
     plan = off.plan_offsets(SQUARE, [wall])
-    assert plan.items == []
-    assert ("W", "стена: у заказчика подписывается размером, не оффсетом") in plan.skipped
+    assert [item.text for item in plan.items] == ["WALL 2.0'S"]

@@ -69,6 +69,7 @@ import app_updater
 from neighbour_slide import slide_off_overlap
 
 #: Как найден сдвиг соседа — для журнала развода.
+_SLIDE_VARIANT_TEXT = {"corner": "углы важнее направления", "direction": "направление важнее"}
 _SLIDE_METHOD_TEXT = {
     "3.88": "обычный сдвиг, как в 3.88",
     "corner": "соединение углов",
@@ -2278,17 +2279,29 @@ class SurveyApp(ctk.CTk):
 
         slide_tools = ctk.CTkFrame(center_head, fg_color="transparent")
         slide_tools.grid(row=0, column=2, sticky="e", padx=(0, 12))
+        # 3.92: два варианта для сравнения — «углы важнее направления» и «направление важнее».
         self.slide_overlaps_button = ctk.CTkButton(
             slide_tools,
-            text="⇲ Развести наложения",
-            width=168,
+            text="⇲ Развод: углы",
+            width=124,
             height=26,
             fg_color=THEME["btn_amber"],
             hover_color=THEME["btn_amber_hover"],
             font=ctk.CTkFont(size=11, weight="bold"),
-            command=self._slide_overlapping_neighbours,
+            command=lambda: self._slide_overlapping_neighbours("corner"),
         )
         self.slide_overlaps_button.grid(row=0, column=0, padx=(0, 6), sticky="e")
+        self.slide_direction_button = ctk.CTkButton(
+            slide_tools,
+            text="⇲ Развод: направление",
+            width=160,
+            height=26,
+            fg_color=THEME["btn_amber"],
+            hover_color=THEME["btn_amber_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self._slide_overlapping_neighbours("direction"),
+        )
+        self.slide_direction_button.grid(row=0, column=1, padx=(0, 6), sticky="e")
         self.slide_undo_button = ctk.CTkButton(
             slide_tools,
             text="↶ Вернуть",
@@ -2301,7 +2314,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=self._undo_slide_neighbours,
         )
-        self.slide_undo_button.grid(row=0, column=1, sticky="e")
+        self.slide_undo_button.grid(row=0, column=2, sticky="e")
 
         # Панели конфликта проходов и сомнительных мест (между шапкой и холстом)
         self.alerts_wrap = ctk.CTkFrame(self.center_col, fg_color="transparent")
@@ -6039,10 +6052,11 @@ class SurveyApp(ctk.CTk):
         self._set_inspector_text(hint)
         self._redraw_preview_canvas()
 
-    def _slide_overlapping_neighbours(self) -> None:
+    def _slide_overlapping_neighbours(self, variant: str = "corner") -> None:
         """
         Развод наложений в предпросмотре: сосед, лежащий поверх нашего участка, съезжает наружу
         до появления общей межи (алгоритм — neighbour_slide.py). Зазоры не трогаем.
+        ``variant``: «corner» — углы важнее направления; «direction» — направление важнее (3.92).
         Сосед переносится жёстко: форма, длины и румбы не меняются, меняется только положение на
         схеме; описание (legal description) не меняется.
         """
@@ -6059,10 +6073,11 @@ class SurveyApp(ctk.CTk):
         ]
         moves: list[tuple[DrawPlan, float, float]] = []
         moved_count = 0
+        self._log_line(f"Развод наложений — вариант «{_SLIDE_VARIANT_TEXT.get(variant, variant)}»")
         for idx, plan in enumerate(neighbours, 1):
             others = [other.vertices for other in neighbours if other is not plan]
             res = slide_off_overlap(
-                main.vertices, plan.vertices, street_lines=streets, others=others,
+                main.vertices, plan.vertices, street_lines=streets, others=others, variant=variant,
             )
             if res.status == "moved":
                 translate_plan_in_place(plan, res.dx, res.dy)
@@ -6082,7 +6097,7 @@ class SurveyApp(ctk.CTk):
         self._slide_undo = moves
         self._redraw_preview_canvas()
         if moved_count:
-            self._set_status(f"Развод наложений: сдвинуто соседей — {moved_count}")
+            self._set_status(f"Развод наложений ({_SLIDE_VARIANT_TEXT.get(variant, variant)}): сдвинуто соседей — {moved_count}")
         else:
             self._set_status("Развод наложений: сдвигать нечего (см. журнал)", warn=True)
 

@@ -8,7 +8,7 @@ import pytest
 from shapely import affinity
 from shapely.geometry import Polygon
 
-from neighbour_slide import _parallel_to_a_neighbour_side, slide_off_overlap
+from neighbour_slide import _angle_to_nearest_side_deg, slide_off_overlap
 from test_gui_smoke import gui as _gui_fixture  # фикстура окна для проверки кнопок
 
 gui = _gui_fixture
@@ -184,7 +184,7 @@ def test_button_moves_overlapping_neighbour_and_undo_restores_it(gui):
     app._preview_neighbor_plans = [nb]
     original = list(nb.vertices)
 
-    assert app.slide_overlaps_button is not None and app.slide_undo_button is not None
+    assert app.slide_overlaps_button is not None and app.slide_direction_button is not None and app.slide_undo_button is not None
     app._slide_overlapping_neighbours()
     assert nb.vertices != original
     area, shared = _after(main.vertices, original, type("R", (), {"dx": nb.vertices[0][0] - original[0][0], "dy": nb.vertices[0][1] - original[0][1]})())
@@ -261,11 +261,11 @@ def test_frontage_with_document_angle_mismatch_moves_along_a_neighbour_side(thet
     """
     main = _sq(0, 0, 100, 100)
     nb = _frontage_neighbour(theta_deg)
-    res = slide_off_overlap(main, nb)
+    res = slide_off_overlap(main, nb, variant="direction")
     assert res.status == "moved", res.note
     assert res.method == "side"
     assert math.hypot(res.dx, res.dy) <= 25.0 + 1e-9  # не длиннее короткой стороны соседа
-    assert _parallel_to_a_neighbour_side(res.dx, res.dy, nb)
+    assert _angle_to_nearest_side_deg(res.dx, res.dy, nb) <= 2.0
     wedge = 25.0 * math.sin(math.radians(theta_deg))  # клин на фасаде 25 ft
     assert res.wedge_ft == pytest.approx(wedge, abs=0.01)
     area, shared = _after(main, nb, res, band=0.05 + wedge)
@@ -279,3 +279,36 @@ def test_large_angle_still_needs_a_turn():
     res = slide_off_overlap(main, nb)
     assert res.status == "not_found"
     assert "поворот" in res.note
+
+
+@pytest.mark.parametrize("theta_deg", [0.56, 1.35])
+def test_variant_corner_joins_the_neighbour_corner_to_ours(theta_deg):
+    """
+    Вариант «углы важнее направления»: угол соседа совмещается с нашим углом (0, 100),
+    сдвиг не длиннее короткой стороны соседа (25 ft).
+    """
+    main = _sq(0, 0, 100, 100)
+    nb = _frontage_neighbour(theta_deg)
+    res = slide_off_overlap(main, nb, variant="corner")
+    assert res.status == "moved", res.note
+    assert res.method == "corner"
+    assert math.hypot(res.dx, res.dy) <= 25.0 + 1e-9
+    moved = [(x + res.dx, y + res.dy) for x, y in nb]
+    gap = min(math.hypot(x - 0.0, y - 100.0) for x, y in moved)
+    assert gap <= 1e-6
+
+
+@pytest.mark.parametrize("theta_deg", [0.56, 1.35])
+def test_variant_direction_keeps_the_shift_along_a_neighbour_side(theta_deg):
+    """Вариант «направление важнее»: угловой сдвиг 52° от стороны отброшен, сдвиг вдоль стороны."""
+    main = _sq(0, 0, 100, 100)
+    nb = _frontage_neighbour(theta_deg)
+    res = slide_off_overlap(main, nb, variant="direction")
+    assert res.status == "moved", res.note
+    assert res.method == "side"
+    assert _angle_to_nearest_side_deg(res.dx, res.dy, nb) <= 2.0
+
+
+def test_unknown_variant_is_rejected():
+    with pytest.raises(ValueError):
+        slide_off_overlap(_sq(0, 0, 100, 100), _sq(90, 40, 30, 30), variant="other")

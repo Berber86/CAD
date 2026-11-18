@@ -31,6 +31,11 @@ LEGACY_SHARED_FRACTION = 0.10
 PARALLEL_MAX_DEG = 2.0
 #: Клин, футов: расхождение сторон на дальнем конце больше этого — клин есть (3.91: 0.1 ft).
 WEDGE_EPS_FT = 0.1
+#: Вариант «направление»: соединение углов принимается, если сдвиг отклоняется от ближайшей стороны
+#: соседа не больше этого угла, градусов (3.92; число пока предварительное).
+DIRECTION_TOL_DEG = 15.0
+#: Варианты шага 2 (3.92): «corner» — углы важнее направления; «direction» — направление важнее.
+VARIANTS = ("corner", "direction")
 #: Базовая полоса допуска общей межи, футов (как JOIN_LINE_TOLERANCE_FT).
 CONTACT_BAND_FT = 0.05
 #: Общая межа на всю меньшую из двух сторон; допуск на концах, футов (3.89).
@@ -240,17 +245,17 @@ def _sidewise_translations(
     return out
 
 
-def _parallel_to_a_neighbour_side(dx: float, dy: float, points_b, tol_deg: float = PARALLEL_MAX_DEG) -> bool:
-    """Сдвиг (dx, dy) параллелен одной из сторон соседа (с допуском в градусах)."""
+def _angle_to_nearest_side_deg(dx: float, dy: float, points_b) -> float:
+    """Наименьший угол (0–90°) между сдвигом (dx, dy) и одной из сторон соседа."""
     norm = math.hypot(dx, dy)
     if norm <= 1e-12:
-        return False
+        return 90.0
     ux, uy = dx / norm, dy / norm
-    sin_tol = math.sin(math.radians(tol_deg))
+    best = 90.0
     for *_, vx, vy, _, _ in _edges_with_points(points_b):
-        if abs(ux * vy - uy * vx) <= sin_tol:
-            return True
-    return False
+        sin_a = abs(ux * vy - uy * vx)
+        best = min(best, math.degrees(math.asin(min(1.0, sin_a))))
+    return best
 
 
 def _has_parallel_edge(points_a, points_b, tol_deg: float = PARALLEL_MAX_DEG) -> bool:
@@ -297,6 +302,7 @@ def slide_off_overlap(
     max_move_ft: float = MAX_MOVE_FT,
     overlap_tol_sqft: float = OVERLAP_TOL_SQFT,
     allow_inward: bool = False,
+    variant: str = "corner",
 ) -> SlideResult:
     """
     Сдвиг соседа ``neighbour_points`` с нашего участка ``main_points`` до появления общей межи.
@@ -307,6 +313,8 @@ def slide_off_overlap(
     ``street_lines`` — отрезки красных линий улиц (пары точек), в которые сосед не заходит.
     ``others`` — контуры уже развёденных соседей, на которые сосед не должен наехать.
     """
+    if variant not in VARIANTS:
+        raise ValueError(f"неизвестный вариант развода: {variant!r}")
     main = _polygon(main_points)
     neighbour = _polygon(neighbour_points)
     if main is None or neighbour is None:
@@ -364,14 +372,24 @@ def slide_off_overlap(
 
     # Шаг 2: клин есть (или обычного сдвига нет) — соединение углов или сдвиг вдоль стороны соседа.
     corners = _corner_translations(main_points, neighbour_points, max_move_ft)
-    kept = [c for c in corners if _parallel_to_a_neighbour_side(c[0], c[1], neighbour_points)]
-    rejected["не вдоль стороны соседа"] += len(corners) - len(kept)
+    if variant == "direction":
+        # Направление важнее: угловой сдвиг принимается, только если он близок к стороне соседа.
+        kept = [c for c in corners if _angle_to_nearest_side_deg(c[0], c[1], neighbour_points) <= DIRECTION_TOL_DEG]
+        rejected["не вдоль стороны соседа"] += len(corners) - len(kept)
+    else:
+        # Углы важнее: соединение углов принимается при любом направлении.
+        kept = corners
     short_nb = min((r[4] for r in _edges_with_points(neighbour_points)), default=0.0)
-    tagged = [(c, "corner") for c in kept] + [
+    corner_part = [(c, "corner") for c in kept if math.hypot(c[0], c[1]) <= short_nb + 1e-9]
+    side_part = [
         (s, "side") for s in _sidewise_translations(main_points, neighbour_points, max_move_ft)
+        if math.hypot(s[0], s[1]) <= short_nb + 1e-9
     ]
-    tagged = [t for t in tagged if math.hypot(t[0][0], t[0][1]) <= short_nb + 1e-9]
-    tagged.sort(key=lambda t: math.hypot(t[0][0], t[0][1]))
+    if variant == "direction":
+        tagged = sorted(corner_part + side_part, key=lambda t: math.hypot(t[0][0], t[0][1]))
+    else:
+        # Сначала соединение углов (по длине), затем сдвиг вдоль стороны соседа.
+        tagged = corner_part + side_part
     found = None
     for cand, method in tagged:
         hit = first_valid([cand], None)

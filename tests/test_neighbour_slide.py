@@ -321,3 +321,19 @@ def test_journal_says_why_the_corner_join_was_not_taken():
     res = slide_off_overlap(main, nb, variant="direction")
     assert res.method == "side"
     assert res.corner_note.startswith("углы:")
+
+
+def test_variant_corner_allows_a_join_up_to_150_percent_of_the_short_side():
+    """
+    Вариант «углы»: соединение углов не длиннее 150% короткой стороны соседа (25 ft → 37.5 ft).
+    Сдвиг 29.15 ft (116%) проходит; вариант «направление» (ограничение 100%) его не берёт.
+    """
+    main = _sq(0, 0, 100, 100)
+    base = Polygon([(25, 85), (50, 85), (50, 195), (25, 195)])
+    nb = list(affinity.rotate(base, 0.56, origin=(25, 85)).exterior.coords)[:-1]
+    corners = slide_off_overlap(main, nb, variant="corner")
+    assert corners.status == "moved", corners.note
+    assert corners.method == "corner"
+    assert math.hypot(corners.dx, corners.dy) > 25.0
+    assert math.hypot(corners.dx, corners.dy) <= 1.5 * 25.0 + 1e-9
+    assert slide_off_overlap(main, nb, variant="direction").method == "side"

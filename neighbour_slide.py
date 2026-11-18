@@ -34,6 +34,8 @@ WEDGE_EPS_FT = 0.1
 #: Вариант «направление»: соединение углов принимается, если сдвиг отклоняется от ближайшей стороны
 #: соседа не больше этого угла, градусов (3.92; число пока предварительное).
 DIRECTION_TOL_DEG = 15.0
+#: Вариант «углы» (3.95): соединение углов не длиннее этой доли короткой стороны соседа.
+CORNER_MAX_LEN_FACTOR = 1.5
 #: Варианты шага 2 (3.92): «corner» — углы важнее направления; «direction» — направление важнее.
 VARIANTS = ("corner", "direction")
 #: Базовая полоса допуска общей межи, футов (как JOIN_LINE_TOLERANCE_FT).
@@ -382,8 +384,9 @@ def slide_off_overlap(
         # Углы важнее: соединение углов принимается при любом направлении.
         kept = corners
     short_nb = min((r[4] for r in _edges_with_points(neighbour_points)), default=0.0)
-    corner_part = [(c, "corner") for c in kept if math.hypot(c[0], c[1]) <= short_nb + 1e-9]
-    corner_note = _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward)
+    corner_limit = short_nb * (CORNER_MAX_LEN_FACTOR if variant == "corner" else 1.0)
+    corner_part = [(c, "corner") for c in kept if math.hypot(c[0], c[1]) <= corner_limit + 1e-9]
+    corner_note = _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward)
     side_part = [
         (s, "side") for s in _sidewise_translations(main_points, neighbour_points, max_move_ft)
         if math.hypot(s[0], s[1]) <= short_nb + 1e-9
@@ -425,7 +428,7 @@ def slide_off_overlap(
     return replace(result, corner_note=corner_note if method != "corner" else "")
 
 
-def _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward) -> str:
+def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward) -> str:
     """
     Для журнала: почему угловые сдвиги не приняты (ближайший по длине). Не влияет на выбор.
     """
@@ -438,8 +441,8 @@ def _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward)
             why = "не наружу"
         else:
             why = check_reason(dx, dy, band, need) or "проходит"
-        if length > short_nb + 1e-9:
-            why = f"длиннее короткой стороны соседа ({short_nb:.2f} ft); без этого ограничения: {why}"
+        if length > corner_limit + 1e-9:
+            why = f"длиннее допустимого для углов ({corner_limit:.2f} ft); без этого ограничения: {why}"
         parts.append(f"сдвиг ({dx:.2f}, {dy:.2f}), длина {length:.2f} ft — {why}")
     return "углы: " + "; ".join(parts)
 

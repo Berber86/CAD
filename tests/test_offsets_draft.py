@@ -62,7 +62,7 @@ def test_offset_text_forms_match_customer_examples():
 
 def test_house_gets_text_without_leader_at_house_height():
     plan = off.plan_offsets(RING, [_house()], front=FRONT, scale=16)
-    assert [i.text for i in plan.items] == ["10.0'S"]
+    assert [i.text for i in plan.items] == ["10.0'N"]
     item = plan.items[0]
     assert item.style == "text"
     assert item.leader is None
@@ -76,7 +76,7 @@ def test_fence_gets_leader_and_fence_prefix():
     plan = off.plan_offsets(RING, [_fence([(60.0, 5.0), (60.0, 20.0)])], front=FRONT, scale=16)
     assert len(plan.items) == 1
     item = plan.items[0]
-    assert item.text == "FE.5.0'S"
+    assert item.text == "FE.5.0'N"
     assert item.style == "leader"
     assert item.height_ft == pytest.approx(0.9)
     tip, end = item.leader
@@ -86,9 +86,9 @@ def test_fence_gets_leader_and_fence_prefix():
 
 
 def test_nearest_boundary_decides_direction():
-    # дальний забор на y = 30: до фронта 30 ft, до задней границы (y = 50) 20 ft → N
+    # дальний забор на y = 30: до фронта 30 ft, до задней границы (y = 50) 20 ft; забор южнее задней линии → S
     plan = off.plan_offsets(RING, [_fence([(60.0, 30.0), (80.0, 30.0)])], front=FRONT)
-    assert [i.text for i in plan.items] == ["FE.20.0'N"]
+    assert [i.text for i in plan.items] == ["FE.20.0'S"]
 
 
 def test_only_objects_in_area_are_labelled_and_others_are_silent():
@@ -96,7 +96,7 @@ def test_only_objects_in_area_are_labelled_and_others_are_silent():
     far = _fence([(10.0, 40.0), (30.0, 40.0)], handle="FAR")
     area = [(50.0, 0.0), (70.0, 0.0), (70.0, 25.0), (50.0, 25.0)]
     plan = off.plan_offsets(RING, [near, far], front=FRONT, area=area)
-    assert [i.text for i in plan.items] == ["FE.5.0'S"]
+    assert [i.text for i in plan.items] == ["FE.5.0'N"]
     assert all(reason != "объект вне участка" for _, reason in plan.skipped)
 
 
@@ -123,7 +123,7 @@ def test_unsupported_kind_is_reported_inside_area_only():
 
 
 def test_same_text_nearby_is_not_duplicated():
-    existing = [("10.0'S", (22.0, 5.0), 1.1)]
+    existing = [("10.0'N", (22.0, 5.0), 1.1)]
     plan = off.plan_offsets(RING, [_house()], front=FRONT, texts=existing)
     assert plan.items == []
     assert any("уже стоит рядом" in reason for _, reason in plan.skipped)
@@ -151,7 +151,7 @@ def test_leader_does_not_cross_building_outline():
 
 def test_no_room_gives_warning_not_silent_drop():
     # очень маленькая область: текст не помещается, программа предупреждает
-    # область содержит вершину забора (60, 5), но текст «FE.5.0'S» в ней не умещается
+    # область содержит вершину забора (60, 5), но текст «FE.5.0'N» в ней не умещается
     area = [(59.0, 4.0), (61.0, 4.0), (61.0, 6.0), (59.0, 6.0)]
     plan = off.plan_offsets(RING, [_fence([(60.0, 5.0), (60.0, 20.0)])], front=FRONT, area=area)
     assert plan.items == []
@@ -166,7 +166,7 @@ def test_small_polygon_is_refused_with_warning():
 def test_closing_point_in_ring_is_ignored():
     closed = RING + [RING[0]]
     plan = off.plan_offsets(closed, [_house()], front=FRONT)
-    assert [i.text for i in plan.items] == ["10.0'S"]
+    assert [i.text for i in plan.items] == ["10.0'N"]
 
 
 def test_report_text_lists_items_and_skips():
@@ -178,11 +178,11 @@ def test_report_text_lists_items_and_skips():
     text = off.plan_report_text(plan, 16)
     assert f"черновик {off.STEP4_VERSION}" in text
     assert "Подписей: 2 (без выноски: 1, с выноской: 1)" in text
-    assert "10.0'S  (без выноски)" in text
+    assert "10.0'N  (без выноски)" in text
     assert "E: стоит на границе" in text
 
 
 def test_scale_changes_heights_only_not_values():
     small = off.plan_offsets(RING, [_house()], front=FRONT, scale=20)
-    assert small.items[0].text == "10.0'S"
+    assert small.items[0].text == "10.0'N"
     assert small.items[0].height_ft == pytest.approx(1.375)

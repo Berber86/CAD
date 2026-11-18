@@ -160,3 +160,16 @@ def test_real_dump_brooklyn_lot_is_found():
     boundary = fl.find_property_polygon(snap, near=area)
     assert boundary.polygon.bounds == pytest.approx((4043.57, 4864.15, 4061.57, 4964.15), abs=0.05)
     assert boundary.polygon.area == pytest.approx(1800.0, abs=5.0)
+
+
+def test_offset_letter_names_the_side_the_object_stands_on():
+    """Николай: «FE.0.4'N» — забор севернее линии участка (буква — сторона объекта)."""
+    import offsets as off
+
+    square = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)]
+    north_fence = off.Feature(kind="fence", handle="N", points=((10.0, 3.0), (40.0, 3.0)))
+    plan = off.plan_offsets(square, [north_fence])
+    assert [item.text for item in plan.items] == ["FE.3.0'N"]
+    south_fence = off.Feature(kind="fence", handle="S", points=((10.0, 97.0), (40.0, 97.0)))
+    plan = off.plan_offsets(square, [south_fence])
+    assert [item.text for item in plan.items] == ["FE.3.0'S"]

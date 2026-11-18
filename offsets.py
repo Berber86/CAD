@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.8"
+STEP4_VERSION = "4.9"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -365,8 +365,8 @@ def round_offset_ft(distance_ft: float) -> float:
 
 def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
     """
-    Буква направления от объекта к границе: вектор ``(dx, dy)`` идёт от вершины к основанию
-    перпендикуляра. ``north_deg`` — направление на север (градусы от +X против часовой), по
+    Буква направления вектора ``(dx, dy)``. В оффсетах вектор идёт от границы к объекту
+    (сторона, где стоит объект). ``north_deg`` — направление на север (градусы от +X против часовой), по
     умолчанию +Y. Берётся главная ось: ``N``, ``S``, ``E`` или ``W``.
     """
     rad = math.radians(north_deg)
@@ -600,7 +600,9 @@ def plan_offsets(
         if best.distance_ft < MIN_OFFSET_FT or value <= 0.0:
             plan.skipped.append((label, "стоит на границе"))
             continue
-        vx, vy = best.foot[0] - best.vertex[0], best.foot[1] - best.vertex[1]
+        # Буква — с какой стороны от границы стоит объект: «FE.0.4'N» — забор севернее линии.
+        # Так подписывает заказчик (проверено на Alvine 8 из 8 и Brooklyn 5 из 5).
+        vx, vy = best.vertex[0] - best.foot[0], best.vertex[1] - best.foot[1]
         direction = compass_letter(vx, vy, north_deg)
         height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
         text = offset_text(feature.kind, value, direction)

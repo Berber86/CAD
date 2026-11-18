@@ -446,6 +446,83 @@ def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = Fa
     return value
 
 
+#: Размеры стен дома (R6, R8, R10): текст — длина стены между её углами, без буквы, параллельно стене,
+#: снаружи дома. Выключено: какие стены заказчик размеряет, не подтверждено. На 192 Geldner он размерил
+#: 2 стены из 4 (26.5' и 46.5'), а 26.4' и 46.4' не подписал; правило выбора стен он не назвал.
+DIMENSION_LABELS = False
+#: Стены короче этого (футы) не размеряются: там отрезки крыльца и ступеней.
+DIMENSION_MIN_FT = 5.0
+#: Зазор между стеной и текстом размера, в высотах текста.
+DIMENSION_GAP_FACTOR = 0.3
+
+
+@dataclass(frozen=True)
+class WallDimension:
+    """Размер стены дома: текст без буквы, центр текста и угол поворота вдоль стены."""
+
+    text: str
+    value_ft: float
+    start: Point
+    end: Point
+    point: Point
+    angle_deg: float
+
+
+def wall_dimension_text(length_ft: float) -> str:
+    """Текст размера стены: ``26.5'`` — без буквы направления (R8)."""
+    return f"{round_offset_ft(length_ft):.1f}'"
+
+
+def house_wall_dimensions(
+    house_pts: Sequence[Point],
+    *,
+    scale: float = BASE_SCALE,
+    min_length_ft: float = DIMENSION_MIN_FT,
+) -> list[WallDimension]:
+    """
+    Размеры каждой стены дома от угла до угла (R6). Текст стоит снаружи дома, параллельно стене (R10).
+    ``house_pts`` — контур дома; если он незамкнутый, замыкается сам. Стены короче ``min_length_ft`` пропускаются.
+    Наружная сторона стены определяется проверкой точки на шаг наружу: контур может быть невыпуклым.
+    """
+    pts = [(float(x), float(y)) for x, y in house_pts]
+    if len(pts) >= 2 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    if len(pts) < 3:
+        return []
+    factor = scale / BASE_SCALE if scale and scale > 0 else 1.0
+    height = LABEL_HEIGHT_FT * factor
+    offset = height * (0.5 + DIMENSION_GAP_FACTOR)
+    out: list[WallDimension] = []
+    for i in range(len(pts)):
+        a, b = pts[i], pts[(i + 1) % len(pts)]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length < min_length_ft or length < 1e-9:
+            continue
+        nx, ny = -dy / length, dx / length  # перпендикуляр к стене
+        mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+        probe = (mid[0] + nx * 0.5, mid[1] + ny * 0.5)
+        if point_in_polygon(probe, pts):
+            nx, ny = -nx, -ny  # внутрь дома — меняем на наружу
+        center = (mid[0] + nx * offset, mid[1] + ny * offset)
+        angle = math.degrees(math.atan2(dy, dx))
+        while angle <= -90.0:
+            angle += 180.0
+        while angle > 90.0:
+            angle -= 180.0
+        out.append(
+            WallDimension(
+                text=wall_dimension_text(length),
+                value_ft=round_offset_ft(length),
+                start=a,
+                end=b,
+                point=center,
+                angle_deg=round(angle, 2),
+            )
+        )
+    return out
+
+
 def default_text_width(text: str, height: float) -> float:
     """Грубая ширина строки, если программа не передала точную (шрифт romans, ~0.6 высоты на знак)."""
     return 0.6 * float(height) * len(text)

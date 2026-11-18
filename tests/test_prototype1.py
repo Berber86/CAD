@@ -259,7 +259,7 @@ def test_parse_full_offline_uses_regex():
 def test_config_loads_and_env_key(monkeypatch):
     cfg = load_config()
     assert cfg["drawing"]["base_scale"] == 16.0
-    assert cfg["layers"]["property_line"] == "PROPERTY_LINE"
+    assert cfg["layers"]["property_line"] == "PL"
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     assert load_config()["api"]["api_key"] == "sk-test"
 
@@ -370,7 +370,7 @@ class FakeLayer:
 
 class FakeLayers:
     def __init__(self):
-        self._items = {name: FakeLayer(name) for name in ("0", "PROPERTY_LINE", "BOUNDARY_TEXT_AI")}
+        self._items = {name: FakeLayer(name) for name in ("0", "PL", "D-TOPO-TEXT")}
 
     def Add(self, name):
         self._items[name] = FakeLayer(name)
@@ -384,7 +384,7 @@ class FakeLayers:
 
 
 class FakeTextStyle:
-    Name = "AI_BOUNDARY"
+    Name = "BOUNDARY"
 
     def SetFont(self, *args):
         self.font = args[0]
@@ -453,7 +453,7 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     space = app.doc.ModelSpace
     # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
     assert len(space.polylines) == 0
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     assert len(prop_lines) == 4
     assert result.boundary_line_count == 4
     # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
@@ -467,7 +467,7 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     assert result.closure.distance < 1e-6
     assert app.zoomed is True
     # подписи создаются в слое текста и с выравниванием MiddleCenter
-    assert {item.Layer for item in space.texts} == {"BOUNDARY_TEXT_AI"}
+    assert {item.Layer for item in space.texts} == {"D-TOPO-TEXT"}
     assert {item.Alignment for item in space.texts} == {10}
 
 
@@ -873,8 +873,8 @@ def test_config_matches_shipped_file():
             assert key in shipped[section], f"{section}.{key} отсутствует в config.json"
     assert shipped["drawing"]["base_scale"] == 16.0
     assert shipped["drawing"]["base_text_height"] == 0.9
-    assert shipped["layers"]["property_line"] == "PROPERTY_LINE"
-    assert shipped["layers"]["boundary_text"] == "BOUNDARY_TEXT_AI"
+    assert shipped["layers"]["property_line"] == "PL"
+    assert shipped["layers"]["boundary_text"] == "D-TOPO-TEXT"
 
 
 def test_scale_menu_helpers():
@@ -1243,11 +1243,11 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     space = app.doc.ModelSpace
     assert len(space.polylines) == 0
     assert len(space.arcs) == 1
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
-    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert len(prop_lines) == 4
     assert len(street_lines) == 4
-    assert space.arcs[0].Layer == "BOUNDARY_TEXT_AI"
+    assert space.arcs[0].Layer == "D-TOPO-TEXT"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
@@ -1463,7 +1463,7 @@ def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monke
     builder._app, builder._doc = app, app.doc
     builder.draw(desc, scale=16.0)
     assert app.doc.ActiveSpace == 1
-    style = app.doc.TextStyles.Item("AI_BOUNDARY")
+    style = app.doc.TextStyles.Item("BOUNDARY")
     assert getattr(style, "fontFile", None) == "romans.shx"
     assert getattr(style, "Height", None) == 0.0
 
@@ -1531,7 +1531,7 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     """
     Совместная отрисовка основного участка (420') и двух соседей (365' и 475')
     в один активный ModelSpace AutoCAD:
-      * основной участок — слой PROPERTY_LINE + BOUNDARY_TEXT_AI + STREET_ROW_AI;
+      * основной участок — слой PL + D-TOPO-TEXT + M-ROW-LINE;
       * соседи — замкнутая полилиния в слое NEIGHBOR_LOT (acCyan = 4), БЕЗ подписей
         сторон/углов/улиц, только 1 компактная метка внутри центроида полигона.
     """
@@ -1559,9 +1559,9 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
 
     space = app.doc.ModelSpace
     assert len(space.polyline_entities) == 0
-    prop_lines = [ln for ln in space.lines if ln.Layer == "PROPERTY_LINE"]
+    prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
-    street_lines = [ln for ln in space.lines if ln.Layer == "STREET_ROW_AI"]
+    street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert len(prop_lines) == 4
     assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
@@ -2818,7 +2818,7 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     assert first.plan is main_plan and second.plan is neighbor_plan
     assert first.text_height == main_plan.text_height
     space = app.doc.ModelSpace
-    for layer, edges in (("PROPERTY_LINE", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+    for layer, edges in (("PL", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
         lines = [line for line in space.lines if line.Layer == layer]
         assert len(lines) == len(edges)
         # Перекрёсток (0, 0) плана в AutoCAD встаёт в окно листа (5000, 5000) — см. config drawing.

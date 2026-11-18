@@ -222,10 +222,10 @@ def test_main_lot_is_drawn_at_the_intersection_and_draft_next_to_it(fake_autocad
 
     builder, doc = fake_autocad(plan)
     main_result = builder.draw_plan(plan)
-    main_lines = [ln for ln in doc.ModelSpace.lines if ln.Layer == "PROPERTY_LINE"]
+    main_lines = [ln for ln in doc.ModelSpace.lines if ln.Layer == "PL"]
     assert len(main_lines) == 4
     # Перекрёсток (0, 0) плана стоит в (5000, 5000): линия до перекрёстка начинается там.
-    tie = next(ln for ln in doc.ModelSpace.lines if ln.Layer == "STREET_ROW_AI")
+    tie = next(ln for ln in doc.ModelSpace.lines if ln.Layer == "M-ROW-LINE")
     assert tie.StartPoint[0] == pytest.approx(5000.0, abs=1e-6)
     assert tie.StartPoint[1] == pytest.approx(5000.0, abs=1e-6)
     # Участок LOT 72 лежит юго-западнее перекрёстка: часть координат меньше 5000, и это названо
@@ -236,17 +236,17 @@ def test_main_lot_is_drawn_at_the_intersection_and_draft_next_to_it(fake_autocad
     builder2, doc2 = fake_autocad(draft)
     result = builder2.draw_plan(draft)
     assert set(result.layers) == {"print_property_line", "print_boundary_text", "print_street_row"}
-    assert result.layers["print_property_line"] == "PROPERTY_LINE_PRINT"
-    assert result.layers["print_street_row"] == "STREET_ROW_PRINT"
-    assert result.layers["print_property_line"] != "PROPERTY_LINE"
+    assert result.layers["print_property_line"] == "PL-PRINT"
+    assert result.layers["print_street_row"] == "M-ROW-LINE-PRINT"
+    assert result.layers["print_property_line"] != "PL"
 
     layers = doc2.Layers._items
-    assert layers["STREET_ROW_PRINT"].color == 1  # красные линии улиц
-    assert layers["PROPERTY_LINE_PRINT"].color == 7
+    assert layers["M-ROW-LINE-PRINT"].color == 1  # красные линии улиц
+    assert layers["PL-PRINT"].color == 7
 
     draft_lines = doc2.ModelSpace.lines
-    print_lines = [ln for ln in draft_lines if ln.Layer == "PROPERTY_LINE_PRINT"]
-    street_lines = [ln for ln in draft_lines if ln.Layer == "STREET_ROW_PRINT"]
+    print_lines = [ln for ln in draft_lines if ln.Layer == "PL-PRINT"]
+    street_lines = [ln for ln in draft_lines if ln.Layer == "M-ROW-LINE-PRINT"]
     assert len(print_lines) == 4
     assert street_lines, "улицы черновика должны быть нарисованы"
     # Черновик на +1000 по X относительно перекрёстка (5000, 5000) → (6000, 5000).

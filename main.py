@@ -6792,7 +6792,7 @@ class SurveyApp(ctk.CTk):
         self, plan: DrawPlan, *, extra_warnings: list[str] | None = None
     ) -> str:
         desc = plan.description
-        role = "СОСЕДНИЙ УЧАСТОК (NEIGHBOR_LOT)" if plan.is_neighbor else "ОСНОВНОЙ УЧАСТОК (PROPERTY_LINE)"
+        role = "СОСЕДНИЙ УЧАСТОК (NEIGHBOR_LOT)" if plan.is_neighbor else "ОСНОВНОЙ УЧАСТОК (PL)"
         lines: list[str] = [f"▸ {role}"]
 
         if desc.block_number or desc.lot_number or desc.borough_or_city:
@@ -7118,7 +7118,7 @@ class SurveyApp(ctk.CTk):
             gy_val += grid_step
             grid_guard += 1
 
-        # 1. Пунктирные линии красных линий улиц (STREET_ROW_AI) + подписи улиц
+        # 1. Пунктирные линии красных линий улиц (M-ROW-LINE) + подписи улиц
         labeled_streets: set[str] = set()
         for pl in plans:
             for idx_rl, rl in enumerate(pl.lines):
@@ -7171,7 +7171,7 @@ class SurveyApp(ctk.CTk):
                 font=("Segoe UI", 8, "bold"),
             )
 
-        # 4. Основной участок (PROPERTY_LINE, контур + узлы + подсветка наведения + POB + GAP)
+        # 4. Основной участок (PL, контур + узлы + подсветка наведения + POB + GAP)
         focus_plan = self._preview_main_plan or self._last_active_plan
         if focus_plan is not None:
             if math.hypot(focus_plan.pob[0], focus_plan.pob[1]) > 1e-3:

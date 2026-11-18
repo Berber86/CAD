@@ -756,7 +756,7 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
     drawn_calls = []
     def fake_draw(_builder, plan):
         drawn_calls.append((plan.description.distance_to_corner_ft, plan.is_neighbor, plan))
-        layers = {"neighbor_lot": "NEIGHBOR_LOT"} if plan.is_neighbor else {"property_line": "PROPERTY_LINE"}
+        layers = {"neighbor_lot": "NEIGHBOR_LOT"} if plan.is_neighbor else {"property_line": "PL"}
         return DrawResult(plan=plan, text_count=len(plan.items), layers=layers)
 
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
@@ -911,7 +911,7 @@ def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_p
     drawn_plans = []
     def fake_draw(_builder, plan):
         drawn_plans.append(plan)
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
 
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
     monkeypatch.setattr(gui.sys, "platform", "win32")
@@ -1452,7 +1452,7 @@ def test_gui_ask_on_doubt_checkbox_prevents_silent_54_to_56_and_supports_focus_r
         return DrawResult(
             plan=plan,
             text_count=len(plan.items),
-            layers={"property_line": "PROPERTY_LINE", "boundary_text": "BOUNDARY_TEXT_AI"},
+            layers={"property_line": "PL", "boundary_text": "D-TOPO-TEXT"},
         )
 
     monkeypatch.setattr(llm_parser, "_extract_with_llm", fake_extract)
@@ -2044,7 +2044,7 @@ def test_reset_during_com_draw_serializes_new_draw_and_ignores_old_result(gui, m
         else:
             second_started.set()
         order.append(("end", distance))
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
 
     monkeypatch.setattr(gui.sys, "platform", "win32")
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
@@ -2384,7 +2384,7 @@ def test_drawing_uses_scene_objects_and_refuses_changed_or_missing_source(gui, m
     draws = []
     def fake_draw(_builder, plan):
         draws.append(plan)
-        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PROPERTY_LINE"})
+        return DrawResult(plan=plan, text_count=len(plan.items), layers={"property_line": "PL"})
     monkeypatch.setattr(gui.AcadBuilder, "draw_plan", fake_draw)
     app._start(parse_only=False)
     assert not draws and "Нет рассчитанной схемы" in app.status_var.get()

@@ -8,7 +8,7 @@ acad_builder.py
 Точка начала обхода (Point of Beginning) помещается в (0, 0).
 
 Отрисовывается:
-  * замкнутая полилиния участка в слое PROPERTY_LINE;
+  * замкнутая полилиния участка в слое PL;
   * подпись каждой стороны (румб + длина) вдоль линии, снаружи полигона,
     с поворотом по линии и защитой от «вверх ногами»;
   * название фасадной улицы вдоль фасадной стороны;
@@ -1398,6 +1398,10 @@ class OffsetRunResult:
     boundary_layer: str = ""
     boundary_area: float = 0.0
     boundary_vertices: int = 0
+    #: габарит участка (x0, y0, x1, y1), футы; пусто — участка нет
+    boundary_bounds: tuple[float, ...] = ()
+    #: пояснения автопоиска участка (как участок найден, почему он не под областью)
+    boundary_notes: list[str] = field(default_factory=list)
     text_count: int = 0
 
     def report(self) -> str:
@@ -1413,10 +1417,16 @@ class OffsetRunResult:
             context.append(f"Область: выделено в AutoCAD объектов {self.selection_count}, габарит {bounds}")
         else:
             context.append(f"Область: {bounds}")
+        where = ""
+        if self.boundary_bounds:
+            x0, y0, x1, y1 = self.boundary_bounds
+            where = f", габарит x {x0:.1f}…{x1:.1f}, y {y0:.1f}…{y1:.1f} ft"
         context.append(
             f"Участок: слой {self.boundary_layer or '—'}, вершин {self.boundary_vertices}, "
-            f"площадь {self.boundary_area:.0f} кв. ft; текстов в чертеже: {self.text_count}"
+            f"площадь {self.boundary_area:.0f} кв. ft{where}; текстов в чертеже: {self.text_count}"
         )
+        for note in self.boundary_notes:
+            context.append(f"Участок, пояснение: {note}")
         context.append(
             f"Фронт M-ROW-LINE: линий {self.front_lines}; направление на север: {self.north_deg:g}°"
         )
@@ -1434,6 +1444,23 @@ class OffsetRunResult:
             for warning in self.written.warnings:
                 lines.append(f"Внимание: {warning}")
         return "\n".join(lines)
+
+
+def _entity_color(entity: Any) -> int:
+    """Цвет объекта, если он задан явно (ACI); ByLayer (256) и ByBlock (0) → 0."""
+    try:
+        color = int(entity.Color)
+    except Exception:  # noqa: BLE001 - у части объектов свойства цвета нет
+        return 0
+    return 0 if color in (0, 256) else color
+
+
+def _area_polygon(area: Sequence[tuple[float, float]] | None) -> Polygon | None:
+    """Область шага 4 как полигон (для выбора участка под ней); ``None`` — области нет."""
+    if not area or len(area) < 3:
+        return None
+    polygon = Polygon([(float(x), float(y)) for x, y in area])
+    return polygon if polygon.is_valid else polygon.buffer(0)
 
 
 def _geometry_points(geom: Any) -> list[tuple[float, float]]:
@@ -1498,16 +1525,16 @@ class AcadBuilder:
         """Слои черновика — отдельные от реальной границы участка."""
         layers = self.print_draft_cfg().get("layers", {})
         return {
-            "property_line": str(layers.get("property_line") or "PROPERTY_LINE_PRINT"),
-            "boundary_text": str(layers.get("boundary_text") or "BOUNDARY_TEXT_PRINT"),
-            "street_row": str(layers.get("street_row") or "STREET_ROW_PRINT"),
+            "property_line": str(layers.get("property_line") or "PL-PRINT"),
+            "boundary_text": str(layers.get("boundary_text") or "D-TOPO-TEXT-PRINT"),
+            "street_row": str(layers.get("street_row") or "M-ROW-LINE-PRINT"),
         }
 
     def layer_names(self) -> tuple[str, str]:
         layers = self.cfg.get("layers", {})
         return (
-            str(layers.get("property_line", "PROPERTY_LINE")),
-            str(layers.get("boundary_text", "BOUNDARY_TEXT_AI")),
+            str(layers.get("property_line", "PL")),
+            str(layers.get("boundary_text", "D-TOPO-TEXT")),
         )
 
     @staticmethod
@@ -2534,11 +2561,13 @@ class AcadBuilder:
         return name
 
     def _ensure_text_style(self, doc: Any) -> str:
-        style_name = str(self.drawing_cfg.get("text_style") or "AI_BOUNDARY")
+        style_name = str(self.drawing_cfg.get("text_style") or "BOUNDARY")
         try:
             styles = doc.TextStyles
             try:
-                style_obj = styles.Item(style_name)
+                styles.Item(style_name)
+                # Стиль уже есть в чертеже (например, ROMANS заказчика) — берём как есть, не меняя его.
+                return style_name
             except Exception:  # noqa: BLE001
                 style_obj = _com_retry(styles.Add, style_name)
             # В AutoCAD ActiveX SHX-шрифт задаётся свойством fontFile (SetFont — только для TrueType).
@@ -2652,7 +2681,7 @@ class AcadBuilder:
         drawing = self.drawing_cfg
         layers_cfg = self.cfg.get("layers", {})
         line_layer_name, text_layer_name = self.layer_names()
-        street_row_layer_name = str(layers_cfg.get("street_row") or "STREET_ROW_AI")
+        street_row_layer_name = str(layers_cfg.get("street_row") or "M-ROW-LINE")
         neighbor_layer_name = str(layers_cfg.get("neighbor_lot") or "NEIGHBOR_LOT")
         colors = self.cfg.get("layer_colors", {})
 
@@ -2717,15 +2746,15 @@ class AcadBuilder:
                 street_row_layer = neighbor_layer
             else:
                 line_layer = self._ensure_layer(
-                    doc, line_layer_name, int(colors.get("property_line", 1))
+                    doc, line_layer_name, int(colors.get("property_line", 3))
                 )
                 text_layer = self._ensure_layer(
-                    doc, text_layer_name, int(colors.get("boundary_text", 3))
+                    doc, text_layer_name, int(colors.get("boundary_text", 7))
                 )
                 street_row_layer = text_layer
                 if geo.lines:
                     street_row_layer = self._ensure_layer(
-                        doc, street_row_layer_name, int(colors.get("street_row", 8))
+                        doc, street_row_layer_name, int(colors.get("street_row", 5))
                     )
                 if line_layer == "0":
                     warnings.append(
@@ -3101,7 +3130,10 @@ class AcadBuilder:
         points, closed = geometry
         if len(points) >= 2:
             snapshot.lines.append(
-                DrawingLine(layer=layer, points=tuple(points), closed=closed, kind=kind)
+                DrawingLine(
+                    layer=layer, points=tuple(points), closed=closed, kind=kind,
+                    color=_entity_color(entity),
+                )
             )
 
     @staticmethod
@@ -3210,7 +3242,7 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001
             pass
 
-        set_name = "TSAI_BOUNDARY_PICK"
+        set_name = "BOUNDARY_PICK"
         try:
             selection_sets = doc.SelectionSets
         except Exception as exc:  # noqa: BLE001
@@ -3855,7 +3887,16 @@ class AcadBuilder:
             snapshot = self.read_drawing_snapshot(
                 doc, progress=progress, should_continue=should_continue
             )
-            boundary = find_property_polygon(snapshot, self.cfg)
+            # Участок — контур, который касается выделенной области (а не самый «снятый» по чертежу).
+            near = _area_polygon(area)
+            try:
+                boundary = find_property_polygon(snapshot, self.cfg, near=near)
+            except FeatureLabelError:
+                boundary = find_property_polygon(snapshot, self.cfg)
+                boundary.notes.append(
+                    "в выделенной области контур участка не найден: взят контур по всему чертежу — "
+                    "проверьте, что область выделена внутри участка"
+                )
             recognition = recognize_features(snapshot, boundary, self.cfg, "")
             north = find_north_arrow(snapshot, self.cfg)
             north_deg = float(north.north_deg) if north is not None else 90.0
@@ -3882,6 +3923,8 @@ class AcadBuilder:
                 front_lines=len(front), feature_count=len(features), dry_run=dry_run,
                 selection_count=selection_count, boundary_layer=str(boundary.layer),
                 boundary_area=float(boundary.area_sqft), boundary_vertices=int(boundary.vertex_count),
+                boundary_bounds=tuple(float(v) for v in boundary.polygon.bounds),
+                boundary_notes=list(boundary.notes),
                 text_count=len(texts),
             )
             if plan.items and not dry_run:

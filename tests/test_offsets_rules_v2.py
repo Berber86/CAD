@@ -85,3 +85,19 @@ def test_walls_are_labelled_like_other_objects():
     wall = off.Feature(kind="wall", handle="W", points=((50.0, -2.0), (80.0, -2.0)))
     plan = off.plan_offsets(SQUARE, [wall])
     assert [item.text for item in plan.items] == ["WALL 2.0'S"]
+
+
+def test_each_house_corner_gets_its_own_label_by_parallel_side():
+    # Дом у западной стороны: два угла на разном расстоянии (2.3 и 2.1 — как у Николая в Brooklyn).
+    # Каждый угол подписывается до параллельной стороны участка, а не только ближайший.
+    rect = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+    house = off.Feature("house", "H2", ((2.3, 10.0), (10.0, 10.0), (10.0, 20.0), (2.1, 20.0)))
+    plan = off.plan_offsets(rect, [house], front=[[(0.0, 0.0), (100.0, 0.0)]])
+    values = sorted(item.value_ft for item in plan.items if item.anchor[0] < 3.0)
+    assert values == [2.1, 2.3]
+
+
+def test_corner_rule_keeps_one_label_for_both_ends_of_a_straight_fence():
+    # Два конца прямого забора на одинаковом расстоянии от стороны — одна подпись, не две.
+    plan = off.plan_offsets(SQUARE, [_fence([(50.0, -0.066), (50.0, 0.088)])])
+    assert len(plan.items) == 1

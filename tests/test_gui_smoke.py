@@ -3140,6 +3140,32 @@ def _wait_idle(app):
     raise AssertionError("фоновое задание не завершилось")
 
 
+def test_step4_offsets_tab_is_last_and_keeps_step1_keys_off(gui):
+    # Шага 3 в программе нет: после Шага 2 идёт вкладка «Шаг 4. Оффсеты» (каркас 4.1).
+    app = gui.SurveyApp()
+    assert list(app.step_tab_buttons)[-1] == gui.STEP_TAB_OFFSETS == "Шаг 4. Оффсеты"
+    assert app.step4_page._gridded is False
+
+    app._select_step_tab(gui.STEP_TAB_OFFSETS)
+    assert app.main_wrap._gridded is False
+    assert app.step2_page._gridded is False
+    assert app.step4_page._gridded is True
+    assert app.draw_button._gridded is False
+    assert app.step_tab_buttons[gui.STEP_TAB_OFFSETS].cget("fg_color") == gui.THEME["btn_primary"]
+    assert "Запуск шага 4 пока не подключён" in app.step4_status_label.cget("text")
+
+    started = []
+    app._start = lambda **kwargs: started.append(kwargs)
+    assert app._global_bindings["<F5>"]() is None
+    assert started == []
+
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.step4_page._gridded is False
+    assert app.main_wrap._gridded is True
+    assert app._global_bindings["<F5>"]() == "break"
+    assert started == [{"parse_only": False}]
+
+
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
@@ -3148,6 +3174,7 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
         "Шаг 0. Документы участка",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
+        "Шаг 4. Оффсеты",
     )
     assert list(app.step_tab_buttons) == list(gui.STEP_TABS)
     # По умолчанию открыт Шаг 1: рабочая зона границы и её кнопки на месте.

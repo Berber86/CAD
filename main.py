@@ -103,6 +103,7 @@ from conflict_resolver import (
 from feature_labeler import feature_settings
 from version import APP_STAMP, APP_VERSION
 import log_mode
+import offsets
 import start_source
 from llm_parser import (
     ASPENWALL_SAMPLES,
@@ -183,7 +184,9 @@ RESULT_SPLITTER_WIDTH = 12
 STEP_TAB_DEEDS = "Шаг 0. Документы участка"
 STEP_TAB_BOUNDARY = "Шаг 1. Граница участка (Legal Description)"
 STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
-STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS)
+# Шага 3 в программе пока нет (пропущен в постановке): после Шага 2 идёт Шаг 4.
+STEP_TAB_OFFSETS = "Шаг 4. Оффсеты"
+STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
 #: Роль файла, который человек докачал сам: наш участок или сосед.
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
 STEP0_EMPTY_REPORT = (
@@ -2918,6 +2921,7 @@ class SurveyApp(ctk.CTk):
         # 5. Страницы остальных глобальных вкладок (Шаг 0 и Шаг 2) — поверх той же строки
         self._build_step0_page()
         self._build_step2_page()
+        self._build_step4_page()
         self._switch_step_tab()
 
     # ------------------------------------------- глобальные вкладки шагов ---
@@ -2948,7 +2952,7 @@ class SurveyApp(ctk.CTk):
             bar,
             text=(
                 "Порядок работы: 0 — документы участка → 1 — посадка границы → "
-                "2 — подписи объектов → оффсеты"
+                "2 — подписи объектов → 4 — оффсеты"
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
@@ -4124,7 +4128,8 @@ class SurveyApp(ctk.CTk):
         tab = str(self.step_tab_var.get() or STEP_TAB_BOUNDARY)
         on_step2 = tab == STEP_TAB_LABELS
         on_step0 = tab == STEP_TAB_DEEDS
-        if on_step2 or on_step0:
+        on_step4 = tab == STEP_TAB_OFFSETS
+        if on_step2 or on_step0 or on_step4:
             self.main_wrap.grid_remove()
             # Кнопки отрисовки границы относятся только к Шагу 1.
             self.add_neighbor_button.grid_remove()
@@ -4142,6 +4147,11 @@ class SurveyApp(ctk.CTk):
             self.step0_page.grid(row=2, column=0, sticky="nsew")
         else:
             self.step0_page.grid_remove()
+        if on_step4:
+            self.step4_page.grid(row=2, column=0, sticky="nsew")
+            self._refresh_step4_report()
+        else:
+            self.step4_page.grid_remove()
         for label, button in getattr(self, "step_tab_buttons", {}).items():
             active = label == tab
             button.configure(
@@ -4154,6 +4164,117 @@ class SurveyApp(ctk.CTk):
     def _is_step2_tab(self) -> bool:
         var = getattr(self, "step_tab_var", None)
         return var is not None and str(var.get()) == STEP_TAB_LABELS
+
+    def _is_step4_tab(self) -> bool:
+        var = getattr(self, "step_tab_var", None)
+        return var is not None and str(var.get()) == STEP_TAB_OFFSETS
+
+    # ----------------------------------------------- Шаг 4: оффсеты (каркас) ---
+    def _build_step4_page(self) -> None:
+        """Страница «Шаг 4. Оффсеты»: каркас — этапы и высоты; запуск появится с правилами."""
+        page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
+        page.grid(row=2, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=0)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        self.step4_page = page
+
+        panel = ctk.CTkFrame(
+            page,
+            width=460,
+            fg_color=THEME["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            panel,
+            text=STEP_TAB_OFFSETS,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+        ctk.CTkLabel(
+            panel,
+            text=(
+                "Подписи расстояний от дома, заборов и стен до границы участка. Граница на фронте — "
+                "M-ROW-LINE. Текст может стоять с выноской, размерной подписью или без выноски "
+                "(для зданий и гаражей)."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.step4_status_label = ctk.CTkLabel(
+            panel,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["warn"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.step4_status_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        report_card = ctk.CTkFrame(
+            page,
+            fg_color=THEME["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=THEME["border_card"],
+        )
+        report_card.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
+        report_card.grid_columnconfigure(0, weight=1)
+        report_card.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            report_card,
+            text="Этапы и высоты",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        self.step4_report_box = ctk.CTkTextbox(
+            report_card,
+            wrap="word",
+            fg_color=THEME["bg_editor"],
+            border_width=1,
+            border_color=THEME["border_subtle"],
+            corner_radius=8,
+            text_color=THEME["text_main"],
+            font=self._result_fonts["log"],
+        )
+        self.step4_report_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self._refresh_step4_report()
+
+    def _refresh_step4_report(self) -> None:
+        """Перечень этапов шага 4 и высота текста при текущем масштабе шапки."""
+        box = getattr(self, "step4_report_box", None)
+        if box is None:
+            return
+        scale = self._current_scale()
+        text = offsets.step4_report_text(scale)
+        target = getattr(box, "_textbox", box)
+        try:
+            target.configure(state="normal")
+            target.delete("1.0", "end")
+            target.insert("1.0", text)
+            target.configure(state="disabled")
+        except Exception:  # noqa: BLE001 - окно не должно падать из-за текста отчёта
+            pass
+        status = getattr(self, "step4_status_label", None)
+        if status is not None:
+            status.configure(
+                text="Запуск шага 4 пока не подключён: правила ждём по дампам заказчика.",
+            )
 
     def _set_step2_report(self, content: str) -> None:
         box = getattr(self, "step2_report_box", None)
@@ -5815,7 +5936,7 @@ class SurveyApp(ctk.CTk):
                     return None
                 # Клавиши разбора и отрисовки границы не срабатывают на вкладках
                 # Шага 2 и Шага 0: там другой работой занят экран.
-                if step1_only and (self._is_step2_tab() or self._is_step0_tab()):
+                if step1_only and (self._is_step2_tab() or self._is_step0_tab() or self._is_step4_tab()):
                     return None
                 action()
                 return "break"

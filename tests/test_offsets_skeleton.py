@@ -166,3 +166,11 @@ def test_dimension_and_leader_styles_unchanged():
     items = {i.handle: i for i in off.parse_observed_offsets(_load(FINAL_ASPINWALL))}
     assert items["26627"].style == "dimension"
     assert items["26128"].style == "leader"
+
+
+def test_step4_window_report_lists_stages_and_heights():
+    text = off.step4_report_text(16)
+    assert text.startswith("Шаг 4 — оффсеты")
+    assert "1.100 ft" in text and "0.900 ft" in text
+    assert "6. Проверка кадра и предупреждения" in text
+    assert "1.375 ft" in off.step4_report_text(20)

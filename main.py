@@ -67,6 +67,13 @@ except ImportError:  # pragma: no cover
 
 import app_updater
 from neighbour_slide import slide_off_overlap
+
+#: Как найден сдвиг соседа — для журнала развода.
+_SLIDE_METHOD_TEXT = {
+    "3.88": "обычный сдвиг, как в 3.88",
+    "corner": "соединение углов",
+    "side": "сдвиг вдоль стороны соседа",
+}
 from acad_builder import (
     AcadBuilder,
     AcadBuilderError,
@@ -6064,7 +6071,7 @@ class SurveyApp(ctk.CTk):
                 self._log_line(
                     f"Развод: СОСЕД #{idx} сдвинут на {res.distance_ft:.2f} ft "
                     f"(направление {res.direction_deg:.1f}°, "
-                    f"{'соединение углов' if res.method == 'corner' else 'перебор сдвигов'}), "
+                    f"{_SLIDE_METHOD_TEXT.get(res.method, res.method)}), "
                     f"общая межа {res.shared_ft:.2f} ft; клин (расхождение сторон на дальнем конце) "
                     f"{res.wedge_ft:.2f} ft — примечание; было наложение {res.overlap_before_sqft:,.1f} кв. ft",
                 )

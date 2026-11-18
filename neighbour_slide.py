@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 from shapely import affinity
@@ -68,6 +68,8 @@ class SlideResult:
     #: ``side`` — сдвиг параллельно стороне соседа.
     method: str = ""
     note: str = ""
+    #: Почему соединение углов не принято (для журнала; пусто, если углы приняты).
+    corner_note: str = ""
     #: Сколько сдвигов проверено и почему отсеяно (для журнала: что именно блокирует).
     tried: int = 0
     rejected: dict[str, int] | None = None
@@ -381,6 +383,7 @@ def slide_off_overlap(
         kept = corners
     short_nb = min((r[4] for r in _edges_with_points(neighbour_points)), default=0.0)
     corner_part = [(c, "corner") for c in kept if math.hypot(c[0], c[1]) <= short_nb + 1e-9]
+    corner_note = _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward)
     side_part = [
         (s, "side") for s in _sidewise_translations(main_points, neighbour_points, max_move_ft)
         if math.hypot(s[0], s[1]) <= short_nb + 1e-9
@@ -415,9 +418,30 @@ def slide_off_overlap(
             note += "; сосед повёрнут относительно нашей межи — одним переносом общую межу не получить, нужен поворот"
         return SlideResult(
             status="not_found", overlap_before_sqft=before, note=note, tried=tried, rejected=rejected,
+            corner_note=corner_note,
         )
     (dx, dy, band, need, wedge), method = found
-    return _moved(main, neighbour, dx, dy, band, before, wedge, method)
+    result = _moved(main, neighbour, dx, dy, band, before, wedge, method)
+    return replace(result, corner_note=corner_note if method != "corner" else "")
+
+
+def _corner_diagnosis(corners, kept, short_nb, check_reason, away, allow_inward) -> str:
+    """
+    Для журнала: почему угловые сдвиги не приняты (ближайший по длине). Не влияет на выбор.
+    """
+    if not corners:
+        return "углы: совмещение не строится (стороны не параллельны в пределах 2°)"
+    parts = []
+    for dx, dy, band, need, _wedge in corners[:2]:
+        length = math.hypot(dx, dy)
+        if length > short_nb + 1e-9:
+            why = f"длиннее короткой стороны соседа ({short_nb:.2f} ft)"
+        elif not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
+            why = "не наружу"
+        else:
+            why = check_reason(dx, dy, band, need) or "проходит (но не выбран)"
+        parts.append(f"сдвиг ({dx:.2f}, {dy:.2f}), длина {length:.2f} ft — {why}")
+    return "углы: " + "; ".join(parts)
 
 
 def _moved(main: Polygon, neighbour: Polygon, dx: float, dy: float, band: float,

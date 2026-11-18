@@ -312,3 +312,12 @@ def test_variant_direction_keeps_the_shift_along_a_neighbour_side(theta_deg):
 def test_unknown_variant_is_rejected():
     with pytest.raises(ValueError):
         slide_off_overlap(_sq(0, 0, 100, 100), _sq(90, 40, 30, 30), variant="other")
+
+
+def test_journal_says_why_the_corner_join_was_not_taken():
+    """В журнале видно, почему углы не соединились (для вариантов «углы» и «направление»)."""
+    main = _sq(0, 0, 100, 100)
+    nb = _frontage_neighbour(1.35)
+    res = slide_off_overlap(main, nb, variant="direction")
+    assert res.method == "side"
+    assert res.corner_note.startswith("углы:")

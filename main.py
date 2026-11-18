@@ -6090,6 +6090,8 @@ class SurveyApp(ctk.CTk):
                     f"общая межа {res.shared_ft:.2f} ft; клин (расхождение сторон на дальнем конце) "
                     f"{res.wedge_ft:.2f} ft — примечание; было наложение {res.overlap_before_sqft:,.1f} кв. ft",
                 )
+                if res.corner_note:
+                    self._log_line(f"Развод: СОСЕД #{idx} — {res.corner_note}")
             elif res.status == "no_overlap":
                 self._log_line(f"Развод: СОСЕД #{idx} — наложения нет, не трогаем (зазор не сдвигаем)")
             else:

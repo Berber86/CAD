@@ -320,7 +320,7 @@ def test_journal_says_why_the_corner_join_was_not_taken():
     nb = _frontage_neighbour(1.35)
     res = slide_off_overlap(main, nb, variant="direction")
     assert res.method == "side"
-    assert res.corner_note.startswith("углы:")
+    assert res.corner_note.startswith("углы (")
 
 
 def test_variant_corner_allows_a_join_up_to_150_percent_of_the_short_side():

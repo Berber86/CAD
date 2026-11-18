@@ -4,10 +4,15 @@
 Правила (см. docs/customer_rules.md, раздел «Развод наложений (3.86)»):
 - Двигаем только наложения (площадь пересечения больше порога). Зазоры не трогаем.
 - Сосед переносится жёстко: форма, длины и румбы не меняются, меняется только положение.
+  Наш участок не меняется никогда: его румбы и длины — по нашему описанию.
+- Кандидаты сдвига (3.89): сначала соединение ближайших углов — ближайший угол соседа
+  совмещается с нашим углом, пары углов сопоставляются по порядку вдоль фронта. Хорда между
+  углами становится общей межой; расхождение сторон на дальнем конце (клин) — примечание.
+  Если соединение углов не проходит, — перебор сдвигов по нормалям сторон.
+- Общая межа — на всю длину меньшей из двух сторон (допуск CORNER_SHARE_TOL_FT).
 - Направление: сдвиг только наружу — от центра нашего участка к центру соседа (сосед уже лежит
-  с этой стороны, и «слезать» логично туда же). Из нормалей сторон обоих участков берётся тот
-  сдвиг, после которого наложения нет, а общая межа совпала не меньше чем на 10% большей стороны.
-  Побеждает самый короткий сдвиг. Внутрь (через наш участок) не двигаем, если явно не разрешено.
+  с этой стороны, и «слезать» логично туда же). Побеждает первый проходящий кандидат
+  (соединение углов, затем кратчайший сдвиг). Внутрь (через наш участок) не двигаем, если явно не разрешено.
 - Сосед не заходит на красные линии улиц (нашего участка) и не ложится на уже развёденных соседей.
 - Если такого сдвига нет в пределах ``max_move_ft`` — соседа не трогаем, пишем причину.
 """
@@ -23,9 +28,8 @@ from shapely.geometry import LineString, Polygon
 
 #: Площадь пересечения, меньше которой наложением не считаем (как в сверке: «0.5 кв. ft — не наложение»).
 OVERLAP_TOL_SQFT = 0.5
-#: Общая межа — не короче этой доли большей стороны. Должна совпадать с JOIN_MIN_SHARED_FRACTION
-#: в conflict_resolver (проверяется тестом).
-SHARED_FRACTION = 0.10
+#: Общая межа — вся длина меньшей из двух сторон; допуск на концах, футов (3.89).
+CORNER_SHARE_TOL_FT = 0.5
 #: Допуск параллельности сторон, градусов. Сторона соседа может расходиться с нашей на такой угол
 #: (расхождение в документах); клин от него войдёт в полосу допуска общей межи.
 PARALLEL_MAX_DEG = 2.0
@@ -53,6 +57,10 @@ class SlideResult:
     shared_ft: float = 0.0
     #: Площадь наложения до сдвига, кв. футов.
     overlap_before_sqft: float = 0.0
+    #: Клин: расхождение сторон на дальнем конце общей межи, футов (примечание в журнале).
+    wedge_ft: float = 0.0
+    #: Как найден сдвиг: ``corner`` — соединение углов, ``normal`` — перебор нормалей.
+    method: str = ""
     note: str = ""
     #: Сколько сдвигов проверено и почему отсеяно (для журнала: что именно блокирует).
     tried: int = 0
@@ -84,23 +92,24 @@ def _edges(points: Sequence[tuple[float, float]]) -> list[tuple[float, float, fl
 
 
 def _ordered_translations(
-    points_a, points_b, need: float, max_move_ft: float, sample_ft: float = 0.25, max_samples: int = 800,
-) -> list[tuple[float, float, float]]:
+    points_a, points_b, max_move_ft: float, sample_ft: float = 0.25, max_samples: int = 800,
+) -> list[tuple[float, float, float, float, float]]:
     """
-    Сдвиги соседа, при которых его сторона ложится на нашу сторону с общей частью ``need``.
+    Сдвиги соседа, при которых его сторона ложится на нашу сторону на всю меньшую из двух.
 
     Для пары сторон (наша A, соседа B) направление n — наружу от участка. Сосед сдвигается так,
     чтобы его ближайшая к нам точка стороны B легла на линию A (наложения нет). Сдвиг
     t = c·n + s·u, где u — направление A. Общая часть как функция s линейна: допустимо отрезком
-    ``s ∈ [need − hi0, LA − need − lo0]`` (lo0/hi0 — проекции стороны B на u при s = 0).
-    Возвращаются (dx, dy, полоса допуска), отсортировано по длине сдвига.
+    ``s ∈ [need − hi0, LA − need − lo0]`` (lo0/hi0 — проекции стороны B на u при s = 0),
+    где need = min(LA, LB) − CORNER_SHARE_TOL_FT.
+    Возвращаются (dx, dy, полоса допуска, need, клин), отсортировано по длине сдвига.
     Полоса = CONTACT_BAND_FT + клин от угла между сторонами на меньшей из них.
     """
     A = _edges_with_points(points_a)
     B = _edges_with_points(points_b)
     outward_sign = 1.0 if Polygon(points_a).exterior.is_ccw else -1.0
     sin_par = math.sin(math.radians(PARALLEL_MAX_DEG))
-    out: list[tuple[float, float, float]] = []
+    out: list[tuple[float, float, float, float, float]] = []
     for ax0, ay0, ax1, ay1, la, ux, uy, nx0, ny0 in A:
         nx, ny = -nx0 * outward_sign, -ny0 * outward_sign  # наружу от нашего участка
         for bx0, by0, bx1, by1, lb, vx, vy, _, _ in B:
@@ -109,7 +118,8 @@ def _ordered_translations(
                 continue  # не параллельны в пределах допуска
             wedge = min(la, lb) * abs(cross)
             band = CONTACT_BAND_FT + wedge
-            if lb < need - 1e-9 or la < need - 1e-9:
+            need = min(la, lb) - CORNER_SHARE_TOL_FT
+            if need <= 0:
                 continue
             d0 = (bx0 - ax0) * nx + (by0 - ay0) * ny
             d1 = (bx1 - ax0) * nx + (by1 - ay0) * ny
@@ -130,7 +140,43 @@ def _ordered_translations(
                 dx = c * nx + s * ux
                 dy = c * ny + s * uy
                 if math.hypot(dx, dy) <= max_move_ft:
-                    out.append((dx, dy, band))
+                    out.append((dx, dy, band, need, wedge))
+    out.sort(key=lambda d: math.hypot(d[0], d[1]))
+    return out
+
+
+def _corner_translations(
+    points_a, points_b, max_move_ft: float,
+) -> list[tuple[float, float, float, float, float]]:
+    """
+    Соединение ближайших углов (3.89): у параллельных сторон пары (наша A, соседа B) пары концов
+    сопоставляются по порядку вдоль фронта; сдвиг совмещает угол соседа с нашим углом.
+    Хорда между совмещёнными углами — общая межа; расхождение на дальнем конце — клин.
+    Возвращает (dx, dy, полоса, need, клин), отсортировано по длине сдвига.
+    """
+    A = _edges_with_points(points_a)
+    B = _edges_with_points(points_b)
+    sin_par = math.sin(math.radians(PARALLEL_MAX_DEG))
+    out: list[tuple[float, float, float, float, float]] = []
+    for ax0, ay0, ax1, ay1, la, ux, uy, _, _ in A:
+        for bx0, by0, bx1, by1, lb, vx, vy, _, _ in B:
+            cross = ux * vy - uy * vx
+            if abs(cross) > sin_par:
+                continue
+            wedge = min(la, lb) * abs(cross)
+            band = CONTACT_BAND_FT + wedge
+            need = min(la, lb) - CORNER_SHARE_TOL_FT
+            if need <= 0:
+                continue
+            same_dir = ux * vx + uy * vy >= 0.0
+            if same_dir:
+                pairs = [((ax0, ay0), (bx0, by0)), ((ax1, ay1), (bx1, by1))]
+            else:
+                pairs = [((ax0, ay0), (bx1, by1)), ((ax1, ay1), (bx0, by0))]
+            for (pax, pay), (pbx, pby) in pairs:
+                dx, dy = pax - pbx, pay - pby
+                if math.hypot(dx, dy) <= max_move_ft:
+                    out.append((dx, dy, band, need, wedge))
     out.sort(key=lambda d: math.hypot(d[0], d[1]))
     return out
 
@@ -191,7 +237,6 @@ def slide_off_overlap(
     *,
     street_lines: Sequence[Sequence[tuple[float, float]]] = (),
     others: Sequence[Sequence[tuple[float, float]]] = (),
-    shared_fraction: float = SHARED_FRACTION,
     max_move_ft: float = MAX_MOVE_FT,
     overlap_tol_sqft: float = OVERLAP_TOL_SQFT,
     allow_inward: bool = False,
@@ -199,6 +244,8 @@ def slide_off_overlap(
     """
     Сдвиг соседа ``neighbour_points`` с нашего участка ``main_points`` до появления общей межи.
 
+    Сначала пробуется соединение ближайших углов (хорда — общая межа), затем перебор сдвигов по
+    нормалям сторон. Общая межа — на всю меньшую из двух сторон (с допуском CORNER_SHARE_TOL_FT).
     ``street_lines`` — отрезки красных линий улиц (пары точек), в которые сосед не заходит.
     ``others`` — контуры уже развёденных соседей, на которые сосед не должен наехать.
     """
@@ -211,11 +258,10 @@ def slide_off_overlap(
     if before <= overlap_tol_sqft:
         return SlideResult(status="no_overlap", overlap_before_sqft=before)
 
-    need = shared_fraction * max(_longest_edge(main_points), _longest_edge(neighbour_points))
     street = [LineString(seg) for seg in street_lines if len(seg) >= 2]  # только красные линии улиц
     other_polys = [p for p in (_polygon(o) for o in others) if p is not None]
 
-    def check_reason(dx: float, dy: float, band: float) -> str | None:
+    def check_reason(dx: float, dy: float, band: float, need: float) -> str | None:
         """None — сдвиг допустим; иначе причина отказа."""
         moved = affinity.translate(neighbour, dx, dy)
         if main.intersection(moved).area > overlap_tol_sqft:
@@ -225,35 +271,43 @@ def slide_off_overlap(
         if _crosses_street(moved, street):
             return "улица"
         if _shared_length_banded(main, moved, band) + 1e-6 < need:
-            return "общая межа короче порога"
+            return "общая межа короче меньшей стороны"
         return None
 
     main_c = main.centroid
     nb_c = neighbour.centroid
     away = (nb_c.x - main_c.x, nb_c.y - main_c.y)
-    best: tuple[float, float, float, float] | None = None  # (|t|, dx, dy, shared)
     rejected: dict[str, int] = {
         "не наружу": 0, "наложение с нашим": 0, "наложение с соседом": 0,
-        "улица": 0, "общая межа короче порога": 0,
+        "улица": 0, "общая межа короче меньшей стороны": 0,
     }
     tried = 0
-    for dx, dy, band in _ordered_translations(main_points, neighbour_points, need, max_move_ft):
-        tried += 1
-        if not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
-            rejected["не наружу"] += 1
-            continue
-        reason = check_reason(dx, dy, band)
-        if reason is None:
-            shared = _shared_length_banded(main, affinity.translate(neighbour, dx, dy), band)
-            best = (math.hypot(dx, dy), dx, dy, shared)
+    best: tuple[str, float, float, float, float, float] | None = None  # (метод, dx, dy, полоса, need, клин)
+    # Соединение углов — первым; перебор нормалей — если углы не проходят.
+    candidates = [
+        ("corner", _corner_translations(main_points, neighbour_points, max_move_ft)),
+        ("normal", _ordered_translations(main_points, neighbour_points, max_move_ft)),
+    ]
+    for method, options in candidates:
+        for dx, dy, band, need, wedge in options:
+            tried += 1
+            if not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
+                rejected["не наружу"] += 1
+                continue
+            reason = check_reason(dx, dy, band, need)
+            if reason is None:
+                best = (method, dx, dy, band, need, wedge)
+                break
+            rejected[reason] += 1
+        if best is not None:
             break
-        rejected[reason] += 1
 
     if best is None:
         counts = ", ".join(f"{name} — {n}" for name, n in rejected.items() if n) or "кандидатов нет"
         note = (
             f"наружу нет сдвига до {max_move_ft:.0f} ft, при котором наложения нет и общая межа "
-            f"не короче {need:.2f} ft; проверено сдвигов: {tried} (отсеяно: {counts}); сосед не тронут"
+            f"не короче меньшей из сторон (минус {CORNER_SHARE_TOL_FT:.1f} ft); проверено сдвигов: "
+            f"{tried} (отсеяно: {counts}); сосед не тронут"
         )
         if not _has_parallel_edge(main_points, neighbour_points):
             note += (
@@ -263,8 +317,10 @@ def slide_off_overlap(
         return SlideResult(
             status="not_found", overlap_before_sqft=before, note=note, tried=tried, rejected=rejected,
         )
-    s, dx, dy, shared = best
+    method, dx, dy, band, need, wedge = best
+    s = math.hypot(dx, dy)
     direction = math.degrees(math.atan2(dy, dx)) % 360.0 if s > 0 else 0.0
+    shared = _shared_length_banded(main, affinity.translate(neighbour, dx, dy), band)
     return SlideResult(
         status="moved",
         dx=dx,
@@ -273,4 +329,6 @@ def slide_off_overlap(
         direction_deg=direction,
         shared_ft=shared,
         overlap_before_sqft=before,
+        wedge_ft=wedge,
+        method=method,
     )

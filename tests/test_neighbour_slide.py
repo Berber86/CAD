@@ -8,7 +8,7 @@ import pytest
 from shapely import affinity
 from shapely.geometry import Polygon
 
-from neighbour_slide import SHARED_FRACTION, slide_off_overlap
+from neighbour_slide import slide_off_overlap
 from test_gui_smoke import gui as _gui_fixture  # фикстура окна для проверки кнопок
 
 gui = _gui_fixture
@@ -25,12 +25,6 @@ def _after(main_pts, nb_pts, res, band: float = 0.05):
     return main.intersection(moved).area, moved.boundary.intersection(main.boundary.buffer(band)).length
 
 
-def test_shared_fraction_is_the_join_rule():
-    from conflict_resolver import JOIN_MIN_SHARED_FRACTION
-
-    assert SHARED_FRACTION == JOIN_MIN_SHARED_FRACTION
-
-
 def test_gap_is_not_touched():
     main = _sq(0, 0, 100, 100)
     res = slide_off_overlap(main, _sq(110, 0, 40, 40))
@@ -39,14 +33,28 @@ def test_gap_is_not_touched():
 
 
 def test_corner_overlap_moves_out_with_a_shared_edge():
+    """Сосед 60 ft по фасаду наезжает на верхнюю сторону; угол соседа совмещается с нашим, общая межа — 60 ft."""
     main = _sq(0, 0, 100, 100)
-    nb = _sq(90, 90, 50, 50)
+    nb = _sq(20, 90, 60, 50)
     res = slide_off_overlap(main, nb)
     assert res.status == "moved"
-    assert res.distance_ft == pytest.approx(10.0, abs=0.02)
+    # Угол соседа совмещён с нашим угловым (левым или правым — равноудалённые): сдвиг 20 по X и 10 вверх.
+    assert res.method == "corner"
+    assert abs(res.dx) == pytest.approx(20.0, abs=0.02) and res.dy == pytest.approx(10.0, abs=0.02)
     area, shared = _after(main, nb, res)
     assert area <= 0.5
-    assert shared >= 10.0 - 1e-6
+    assert shared >= 60.0 - 0.5 - 1e-6  # вся меньшая сторона
+
+
+def test_protruding_corner_without_full_side_is_not_moved():
+    """
+    Сосед 50×50 выступает углом: вывести его наружу с общей межой в 50 ft нельзя (сдвиг внутрь
+    запрещён). По правилу «вся меньшая сторона» соседа не трогаем, причина — в примечании.
+    """
+    main = _sq(0, 0, 100, 100)
+    res = slide_off_overlap(main, _sq(90, 90, 50, 50))
+    assert res.status == "not_found"
+    assert "меньшей из сторон" in res.note
 
 
 def test_west_overlap_slides_west_to_share_the_full_side():
@@ -54,9 +62,11 @@ def test_west_overlap_slides_west_to_share_the_full_side():
     nb = _sq(-20, 40, 50, 20)
     res = slide_off_overlap(main, nb)
     assert res.status == "moved"
-    assert res.distance_ft == pytest.approx(30.0, abs=0.02)
-    assert res.direction_deg == pytest.approx(180.0, abs=0.5)
-    assert res.shared_ft == pytest.approx(20.0, abs=0.2)
+    assert res.method == "corner"  # ближайший угол соседа (30, 60) совмещён с нашим (0, 100)
+    assert res.dx < 0 and res.dy > 0
+    area, shared = _after(main, nb, res)
+    assert area <= 0.5
+    assert shared >= 20.0 - 0.5 - 1e-6  # вся меньшая сторона (20 ft)
 
 
 def test_real_like_offset_rectangles_slide_along_the_side():
@@ -79,7 +89,7 @@ def test_real_like_offset_rectangles_slide_along_the_side():
     assert res.status == "moved", res.note
     area, shared = _after(main, nb, res)
     assert area <= 0.5
-    assert shared >= 0.10 * 130.0 - 1e-6
+    assert shared >= 100.0 - 0.5 - 1e-6  # вся меньшая сторона (наша, 100 ft)
     # Сдвиг наружу: от нашего центра к соседу.
     cx = sum(p[0] for p in main) / 4
     cy = sum(p[1] for p in main) / 4
@@ -168,7 +178,7 @@ def test_button_moves_overlapping_neighbour_and_undo_restores_it(gui):
     app._slide_overlapping_neighbours()
     assert nb.vertices != original
     area, shared = _after(main.vertices, original, type("R", (), {"dx": nb.vertices[0][0] - original[0][0], "dy": nb.vertices[0][1] - original[0][1]})())
-    assert area <= 0.5 and shared >= 10.0 - 1e-6
+    assert area <= 0.5 and shared >= 100.0 - 0.5 - 1e-6
 
     app._undo_slide_neighbours()
     assert all(
@@ -233,20 +243,22 @@ def _frontage_neighbour(theta_deg: float):
 
 
 @pytest.mark.parametrize("theta_deg", [0.56, 1.35])
-def test_frontage_with_document_angle_mismatch_slides_out_to_the_line(theta_deg):
+def test_frontage_with_document_angle_mismatch_joins_corners(theta_deg):
     """
-    Как в превью: стороны расходятся на 0.56° и 1.35° (расхождение в документах). Сосед уходит
-    наружу (вверх, через нашу сторону) до касания ближайшей точкой; клин остаётся в полосе допуска.
+    Как в превью: стороны расходятся на 0.56° и 1.35° (расхождение в документах). Ближайший угол
+    соседа совмещается с нашим углом; хорда — общая межа на всю фасадную сторону 25 ft; клин
+    (расхождение на дальнем конце) — примечание, он в полосе допуска.
     """
     main = _sq(0, 0, 100, 100)
     nb = _frontage_neighbour(theta_deg)
     res = slide_off_overlap(main, nb)
     assert res.status == "moved", res.note
-    assert res.direction_deg == pytest.approx(90.0, abs=3.0)
+    assert res.method == "corner"
     wedge = 25.0 * math.sin(math.radians(theta_deg))  # клин на фасаде 25 ft
+    assert res.wedge_ft == pytest.approx(wedge, abs=0.01)
     area, shared = _after(main, nb, res, band=0.05 + wedge)
     assert area <= 0.5
-    assert shared >= 11.0 - 1e-6  # 10% большей стороны (110 ft)
+    assert shared >= 25.0 - 0.5 - 1e-6  # вся фасадная сторона
 
 
 def test_large_angle_still_needs_a_turn():

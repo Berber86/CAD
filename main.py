@@ -6063,8 +6063,10 @@ class SurveyApp(ctk.CTk):
                 moved_count += 1
                 self._log_line(
                     f"Развод: СОСЕД #{idx} сдвинут на {res.distance_ft:.2f} ft "
-                    f"(направление {res.direction_deg:.1f}°), общая межа {res.shared_ft:.2f} ft; "
-                    f"было наложение {res.overlap_before_sqft:,.1f} кв. ft",
+                    f"(направление {res.direction_deg:.1f}°, "
+                    f"{'соединение углов' if res.method == 'corner' else 'перебор сдвигов'}), "
+                    f"общая межа {res.shared_ft:.2f} ft; клин (расхождение сторон на дальнем конце) "
+                    f"{res.wedge_ft:.2f} ft — примечание; было наложение {res.overlap_before_sqft:,.1f} кв. ft",
                 )
             elif res.status == "no_overlap":
                 self._log_line(f"Развод: СОСЕД #{idx} — наложения нет, не трогаем (зазор не сдвигаем)")

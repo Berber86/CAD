@@ -3976,7 +3976,8 @@ class AcadBuilder:
                         self._add_text(
                             model_space,
                             TextItem(
-                                text=item.text, point=item.point, rotation=0.0,
+                                text=item.text, point=item.point,
+                                rotation=math.radians(float(getattr(item, "rotation_deg", 0.0))),
                                 kind="offset", height=item.height_ft,
                             ),
                             item.height_ft, layer, style,

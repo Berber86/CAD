@@ -153,6 +153,9 @@
     "property_closing_layers": [
       "M-ROW-LINE"
     ],
+    "property_side_layers": [
+      "ST-BLDG-LINE"
+    ],
     "point_label_layers": [
       "POINT_LABELS",
       "PNT-X",

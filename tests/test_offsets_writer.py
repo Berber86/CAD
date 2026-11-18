@@ -56,7 +56,8 @@ def test_write_creates_one_undo_group_on_offset_layer(com):
     created = [e for e in doc.ModelSpace.created if e.Layer == off.OFFSET_LAYER]
     assert created, "оффсеты не записаны в слой"
     written_texts = {getattr(e, "TextString", None) for e in created}
-    assert {item.text for item in result.plan.items} <= written_texts
+    # Многострочная подпись (две стороны у одной вершины) уходит в MText как \P.
+    assert {item.text.replace("\n", "\\P") for item in result.plan.items} <= written_texts
 
 
 def test_leader_offsets_get_leader_objects_text_offsets_do_not(com):

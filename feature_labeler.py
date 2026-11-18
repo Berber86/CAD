@@ -102,6 +102,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: линии, которыми замыкается граница, если в слое участка её не хватает:
     #: фасадная сторона участка обычно начерчена только как красная линия улицы
     "property_closing_layers": ["M-ROW-LINE"],
+    "property_side_layers": ["ST-BLDG-LINE"],
     "point_label_layers": ["POINT_LABELS", "PNT-X", "PNTS"],
     "fence_layers": ["S-FENCE", "FENCE", "CODE_CREW", "FENCE_*"],
     "fence_layer_exclude": ["*_NOTE"],
@@ -2018,31 +2019,23 @@ def _boundary_mismatch_note(
 SURVEY_LOT_COLOR = 3
 
 
-def _survey_lot_near(
-    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+def _frontage_lot(
+    sides: list[LineString],
+    closers: list[LineString],
+    near: Polygon,
+    fcfg: dict[str, Any],
+    *,
+    layer_label: str,
+    note: str,
 ) -> PropertyBoundary | None:
     """
-    Участок из зелёных линий (цвет ``SURVEY_LOT_COLOR``) и фасадной линии улицы: замкнутый контур,
-    который касается области и примыкает к красной линии улицы. Самый большой из таких.
+    Замкнутый контур из линий ``sides`` (стороны участка) и фасадных линий ``closers`` (красная
+    линия улицы), который касается области ``near`` и примыкает к фасаду. Самый большой из таких.
     """
-    fcfg = feature_settings(cfg)
-    green = [
-        geom for geom in (line_to_shapely(line) for line in snapshot.lines
-                          if line.color == SURVEY_LOT_COLOR)
-        if geom is not None
-    ]
-    closing = _as_patterns(fcfg.get("property_closing_layers"))
-    closers = [
-        geom for geom in (line_to_shapely(line) for line in snapshot.lines
-                          if closing and layer_matches(line.layer, closing))
-        if geom is not None
-    ]
-    if len(green) < 3 or not closers:
-        return None
     snap_tol = float(fcfg.get("boundary_snap_tolerance_ft") or 0.0)
     gap_tol = float(fcfg.get("boundary_gap_tolerance_ft") or 0.0)
     polygons, gaps = polygons_from_lines(
-        green + closers, snap_tolerance=snap_tol, gap_tolerance=gap_tol,
+        sides + closers, snap_tolerance=snap_tol, gap_tolerance=gap_tol,
         min_area=float(fcfg.get("min_property_area_sqft") or 0.0), allow_chain_closure=False,
     )
     street = unary_union(closers).buffer(max(snap_tol, 0.1))
@@ -2059,16 +2052,89 @@ def _survey_lot_near(
     polygon = _normalize_polygon(best[1])
     if polygon is None:
         return None
+    notes = [note]
+    # Строение у границы (его стены идут по линиям слоя сторон) вдаётся внутрь контура, и
+    # полигон огибает его выемкой. Внешняя сторона участка — выпуклая оболочка; берём её, если
+    # контур занимает не меньше половины оболочки (вытянутый или L-образный участок не трогаем).
+    hull = polygon.convex_hull
+    if hull.geom_type == "Polygon" and hull.area > polygon.area >= 0.5 * hull.area:
+        polygon = _normalize_polygon(hull) or polygon
+        notes.append(
+            "строения у границы вдаются внутрь контура: взят внешний контур (выпуклая оболочка) — "
+            "проверьте фасад и боковые стороны"
+        )
     return PropertyBoundary(
         polygon=polygon,
-        layer=f"зелёный контур (цвет {SURVEY_LOT_COLOR})",
+        layer=layer_label,
         method="auto",
         candidates=len(polygons),
         closed_gap_ft=float(gaps.get(best[0], 0.0)),
-        notes=[
+        notes=notes,
+    )
+
+
+def _survey_lot_near(
+    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+) -> PropertyBoundary | None:
+    """
+    Участок из зелёных линий (цвет ``SURVEY_LOT_COLOR``) и фасадной линии улицы.
+    """
+    fcfg = feature_settings(cfg)
+    green = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if line.color == SURVEY_LOT_COLOR)
+        if geom is not None
+    ]
+    closing = _as_patterns(fcfg.get("property_closing_layers"))
+    closers = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if closing and layer_matches(line.layer, closing))
+        if geom is not None
+    ]
+    if len(green) < 3 or not closers:
+        return None
+    return _frontage_lot(
+        green, closers, near, fcfg,
+        layer_label=f"зелёный контур (цвет {SURVEY_LOT_COLOR})",
+        note=(
             "участок — зелёный контур чертежа (линии цвета 3), фасад по красной линии улицы "
             "(M-ROW-LINE); слой участка не нужен"
-        ],
+        ),
+    )
+
+
+def _side_lot_near(
+    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+) -> PropertyBoundary | None:
+    """
+    Участок из линий слоя сторон (``property_side_layers``, по умолчанию ST-BLDG-LINE, где
+    Николай ведёт границу без цвета) и фасадной линии улицы. Нужен, когда слоёв границы
+    (``property_line_layers``) на чертеже нет. Контур обязан касаться фасада и области.
+    """
+    fcfg = feature_settings(cfg)
+    side_patterns = _as_patterns(fcfg.get("property_side_layers"))
+    closing = _as_patterns(fcfg.get("property_closing_layers"))
+    if not side_patterns or not closing:
+        return None
+    sides = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if layer_matches(line.layer, side_patterns))
+        if geom is not None
+    ]
+    closers = [
+        geom for geom in (line_to_shapely(line) for line in snapshot.lines
+                          if layer_matches(line.layer, closing))
+        if geom is not None
+    ]
+    if len(sides) < 3 or not closers:
+        return None
+    return _frontage_lot(
+        sides, closers, near, fcfg,
+        layer_label=f"контур из слоёв {', '.join(side_patterns)} + {', '.join(closing)}",
+        note=(
+            f"участок замкнут линиями слоёв {', '.join(side_patterns)}, фасад по красной линии "
+            f"улицы ({', '.join(closing)}); слоя границы участка на чертеже нет — проверьте контур"
+        ),
     )
 
 
@@ -2111,6 +2177,10 @@ def find_property_polygon(
 
     layer_list = ", ".join(_as_patterns(fcfg.get("property_line_layers")))
     if not by_rank:
+        if near is not None:
+            fallback = _survey_lot_near(snapshot, cfg, near) or _side_lot_near(snapshot, cfg, near)
+            if fallback is not None:
+                return fallback
         raise FeatureLabelError(
             f"На чертеже нет линий в слоях границы участка ({layer_list}). "
             "Начертите границу (Шаг 1) или укажите её в AutoCAD вручную."
@@ -2221,6 +2291,8 @@ def find_property_polygon(
         return primary
     if near is not None:
         survey = _survey_lot_near(snapshot, cfg, near)
+        if survey is None:
+            survey = _side_lot_near(snapshot, cfg, near)
         if survey is not None:
             return survey
     if empty is not None:

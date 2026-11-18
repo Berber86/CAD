@@ -3186,7 +3186,7 @@ def test_step4_run_reports_error_and_result(gui):
                           front_lines=1, feature_count=1, dry_run=True)
     app._handle_offsets_result(run, "")
     text = app.step4_report_box.get("1.0", "end")
-    assert "Подписей: 1" in text and "10.0'S" in text
+    assert "Подписей: 1" in text and "10.0'N" in text
     assert "Режим расчёта: чертёж не изменён." in text
     assert app.status_var.get() == "Шаг 4: оффсетов 1 (чертёж не изменён)"
 

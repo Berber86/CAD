@@ -22,6 +22,11 @@
   python inspect_dwg.py --select --tag final имя файла: <чертёж>.final.dump.json
   python inspect_dwg.py --out D:\\dumps       папка для файлов
   python inspect_dwg.py --no-blocks --no-layouts   без определений блоков и листов
+  python inspect_dwg.py --lean --tag before       для сравнения «до/после» расстановки оффсетов:
+  python inspect_dwg.py --lean --tag after        без листов и без слоя рамки BORDER; дамп «до»
+                                                  и «после» одного чертежа — объекты сохраняют handle,
+                                                  новые подписи = разница (tests/dump_diff.py)
+  python inspect_dwg.py --skip-layer BORDER --skip-layer TITLE   пропустить слои по имени (повторяемый)
 
 Пришлите оба файла (.json и .txt).
 """
@@ -39,6 +44,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 FORMAT = "survey-dwg-dump/2"
+#: слои, которые в режиме --lean не пишутся: рамка листа (чертёж заказчика, не объекты участка)
+LEAN_SKIP_LAYERS = ("BORDER",)
 ROUND = 4  # знаков после запятой в координатах
 SELECTION_SET = "SURVEY_DUMP_SELECTION"
 BLOCK_ENTITY_LIMIT = 3000
@@ -640,9 +647,15 @@ def collect_dump(
     scope: str = "all",
     with_blocks: bool = True,
     with_layouts: bool = True,
+    skip_layers: Iterable[str] = (),
+    stage: str = "",
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Собирает весь дамп в словарь (COM читается только здесь)."""
+    """Собирает весь дамп в словарь (COM читается только здесь).
+
+    ``skip_layers`` — имена слоёв, объекты которых не пишутся (без учёта регистра); в дампе
+    остаётся число пропущенных по каждому слою. ``stage`` — «before»/«after» и т.п., для сравнения.
+    """
     errors: list[dict[str, Any]] = []
     model_space = com_call(getattr, doc, "ModelSpace")
     model_count = int(com_call(getattr, model_space, "Count"))
@@ -650,6 +663,16 @@ def collect_dump(
     entities, _total = collect_entities(
         source, errors, label="ModelSpace" if container is None else "выбор", progress=progress
     )
+    skip = {str(name).upper() for name in skip_layers if str(name).strip()}
+    skipped_layers: Counter = Counter()
+    if skip:
+        kept = []
+        for record in entities:
+            if str(record.get("layer", "")).upper() in skip:
+                skipped_layers[record.get("layer", "")] += 1
+            else:
+                kept.append(record)
+        entities = kept
     dump: dict[str, Any] = {
         "format": FORMAT,
         "drawing": {
@@ -657,8 +680,10 @@ def collect_dump(
             "path": text(prop(doc, "FullName")) or "",
             "dumped_at": datetime.now().isoformat(timespec="seconds"),
             "scope": scope,
+            "stage": stage,
             "modelspace_count": model_count,
             "dumped_count": len(entities),
+            "skipped_layers": dict(sorted(skipped_layers.items())),
         },
         "variables": collect_variables(doc),
         "layers": collect_table(prop(doc, "Layers"), describe_layer),
@@ -782,6 +807,11 @@ def build_summary(dump: dict[str, Any]) -> str:
         f"Область: {scope} · объектов в ModelSpace: {drawing.get('modelspace_count', 0)} · "
         f"записано: {drawing.get('dumped_count', 0)} · ошибок чтения: {len(errors)}",
     ]
+    if drawing.get("stage"):
+        lines.append(f"Этап: {drawing['stage']}")
+    if drawing.get("skipped_layers"):
+        skipped = ", ".join(f"{name} ({count})" for name, count in drawing["skipped_layers"].items())
+        lines.append(f"Не записаны слои (по настройке): {skipped}")
     units = variables.get("INSUNITS")
     if units is not None:
         lines.append(
@@ -1045,6 +1075,10 @@ def main(argv: list[str] | None = None, connect: Callable[[], tuple[Any, Any]] |
     parser.add_argument("--out", default=".", help="папка для файлов (по умолчанию текущая)")
     parser.add_argument("--no-blocks", action="store_true", help="не писать определения блоков")
     parser.add_argument("--no-layouts", action="store_true", help="не писать объекты листов")
+    parser.add_argument("--lean", action="store_true",
+                        help="для сравнения до/после: без листов и без слоя рамки BORDER")
+    parser.add_argument("--skip-layer", action="append", default=[], metavar="СЛОЙ",
+                        help="не писать объекты слоя (можно повторять)")
     args = parser.parse_args(argv)
 
     for stream in (sys.stdout, sys.stderr):
@@ -1074,9 +1108,13 @@ def main(argv: list[str] | None = None, connect: Callable[[], tuple[Any, Any]] |
 
     started = time.time()
     try:
+        skip_layers = list(args.skip_layer) + (list(LEAN_SKIP_LAYERS) if args.lean else [])
         dump = collect_dump(
             doc, container=container, scope=scope,
-            with_blocks=not args.no_blocks, with_layouts=not args.no_layouts,
+            with_blocks=not args.no_blocks,
+            with_layouts=not (args.no_layouts or args.lean),
+            skip_layers=skip_layers,
+            stage=args.tag,
             progress=progress,
         )
     finally:

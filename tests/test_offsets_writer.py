@@ -154,3 +154,25 @@ def test_geometry_points_of_feature_shapes():
     line = LineString([(0, 0), (5, 0)])
     assert ab._geometry_points(line) == [(0.0, 0.0), (5.0, 0.0)]
     assert ab._geometry_points(None) == []
+
+
+def test_report_explains_zero_when_area_misses_objects(com):
+    # Область выделена не там, где объекты: отчёт называет шаг, на котором всё отсеялось.
+    builder, _app, _doc = com()
+    result = builder.build_offsets(area=[(500.0, 500.0), (510.0, 500.0), (510.0, 510.0), (500.0, 510.0)],
+                                   dry_run=True)
+    text = result.report()
+    assert "Подписей: 0" in text
+    assert "в выделенной области: 0" in text
+    assert "ни один распознанный объект не попал в выделенную область" in text
+    assert "Участок: слой" in text and "Фронт M-ROW-LINE" in text
+
+
+def test_report_counts_selection_and_area_bounds(com):
+    builder, _app, doc = com()
+    doc.PickfirstSelectionSet = _Selection(_closed_polyline(WHOLE_LOT))
+    result = builder.build_offsets(dry_run=True)
+    text = result.report()
+    assert "выделено в AutoCAD объектов 1" in text
+    assert "x -5.0…50.0, y -5.0…110.0 ft" in text
+    assert "в выделенной области:" in text and "Подписей:" in text

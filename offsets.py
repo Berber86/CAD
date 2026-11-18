@@ -1,7 +1,7 @@
 """
 Шаг 4 — оффсеты: подписи расстояний от дома, заборов и стен до границы участка.
 
-Черновик (версия 4.4): оффсеты в области, выделенной в AutoCAD, запись в чертёж. Правила заказчика, которые уже учтены:
+Черновик (версия 4.5): оффсеты в области, выделенной в AutoCAD, запись в чертёж. Правила заказчика, которые уже учтены:
 
 - граница для оффсетов на фронте — ``M-ROW-LINE`` (актуальная граница улицы и участка);
   ``M-TAX-LINE`` — линия расширения улицы по проекту, границей участка не считается;
@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.4"
+STEP4_VERSION = "4.5"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -287,7 +287,7 @@ def point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     return inside
 
 
-# --------------------------------------------------------------------------- план (черновик 4.4)
+# --------------------------------------------------------------------------- план (черновик 4.5)
 
 #: Объекты, от которых ставим оффсет. Дом и сарай — текст без выноски; забор и стена — выноска.
 OFFSET_KINDS = ("house", "fence", "wall")
@@ -462,6 +462,9 @@ class OffsetPlan:
     #: объекты в области, которым оффсет не поставлен: (объект, причина)
     skipped: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: счётчики для отчёта: zone — объектов в зоне участка; in_area / outside — в области и вне её;
+    #: in_area_<вид> — в области по видам (house, fence, wall, other)
+    counts: dict[str, int] = field(default_factory=dict)
 
 
 def _place_beside_line(
@@ -534,7 +537,7 @@ def plan_offsets(
     text_width: Callable[[str, float], float] | None = None,
 ) -> OffsetPlan:
     """
-    Шаг 4, черновик 4.4: оффсеты объектов в выбранной области.
+    Шаг 4, черновик 4.5: оффсеты объектов в выбранной области.
 
     ``property_pts`` — граница участка (замкнутый контур); ``front`` — линии ``M-ROW-LINE``
     (фронтовая граница, ``M-TAX-LINE`` сюда не передаётся); ``area`` — прямоугольник, который
@@ -575,11 +578,16 @@ def plan_offsets(
     placed: list[Rect] = []
     dup_radius = DUPLICATE_RADIUS_FT * factor
 
+    plan.counts["zone"] = len(features)
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
         if not in_area:
+            plan.counts["outside"] = plan.counts.get("outside", 0) + 1
             continue
+        plan.counts["in_area"] = plan.counts.get("in_area", 0) + 1
+        kind_key = f"in_area_{feature.kind if feature.kind in OFFSET_KINDS else 'other'}"
+        plan.counts[kind_key] = plan.counts.get(kind_key, 0) + 1
         if feature.kind not in OFFSET_KINDS:
             plan.skipped.append((label, "этот вид объекта в оффсетах не подписывается"))
             continue
@@ -671,16 +679,37 @@ def _segment_in_bounds(a: Point, b: Point, bounds: Rect) -> bool:
                 or max(a[1], b[1]) < y0 or min(a[1], b[1]) > y1)
 
 
-def plan_report_text(plan: OffsetPlan, scale: float = BASE_SCALE) -> str:
-    """Отчёт шага 4 для окна: что поставлено, что пропущено и почему, предупреждения."""
+def plan_report_text(plan: OffsetPlan, scale: float = BASE_SCALE, context: Sequence[str] = ()) -> str:
+    """
+    Отчёт шага 4 для окна: контекст запуска (область, участок), счётчики объектов, что поставлено,
+    что пропущено и почему, предупреждения. Если подписей нет — сказано, на каком шаге.
+    """
     texts = [i for i in plan.items if i.style == "text"]
     leaders = [i for i in plan.items if i.style == "leader"]
-    lines = [
-        f"Шаг 4 — оффсеты, черновик {STEP4_VERSION} (1\"={scale:g}')",
-        f"Подписей: {len(plan.items)} (без выноски: {len(texts)}, с выноской: {len(leaders)})",
-    ]
+    c = plan.counts
+    lines = [f"Шаг 4 — оффсеты, черновик {STEP4_VERSION} (1\"={scale:g}')", *context]
+    lines.append(
+        f"Распознано в зоне участка: {c.get('zone', 0)}; в выделенной области: {c.get('in_area', 0)} "
+        f"(дом и сарай {c.get('in_area_house', 0)}, забор {c.get('in_area_fence', 0)}, "
+        f"стена {c.get('in_area_wall', 0)}, прочее {c.get('in_area_other', 0)}); "
+        f"вне области: {c.get('outside', 0)}"
+    )
+    lines.append(f"Подписей: {len(plan.items)} (без выноски: {len(texts)}, с выноской: {len(leaders)})")
     for item in plan.items:
         lines.append(f"  {item.text}  ({'без выноски' if item.style == 'text' else 'выноска'})")
+    if not plan.items:
+        if c.get("zone", 0) == 0:
+            lines.append(
+                "Внимание: в зоне участка не распознано ни одного объекта. Проверьте, что участок "
+                "найден (слой границы) и что чертёж тот же, что в Шаге 2."
+            )
+        elif c.get("in_area", 0) == 0:
+            lines.append(
+                "Внимание: ни один распознанный объект не попал в выделенную область. Проверьте, что "
+                "область выделена на этом же чертеже и внутри участка (координаты — в строках выше)."
+            )
+        elif not plan.skipped and not plan.warnings:
+            lines.append("Внимание: в области есть объекты, но оффсеты для них не получились — см. причины.")
     if plan.skipped:
         lines.append(f"Не подписано: {len(plan.skipped)}")
         for label, reason in plan.skipped:
@@ -695,11 +724,11 @@ def plan_report_text(plan: OffsetPlan, scale: float = BASE_SCALE) -> str:
 
 #: Этапы шага 4 и их состояние в каркасе (показываются на вкладке «Шаг 4. Оффсеты»).
 STEP4_STAGES: tuple[tuple[str, str], ...] = (
-    ("Область — выделение в AutoCAD; объекты в ней: дом, сарай, заборы, стены", "черновик 4.4"),
-    ("Измерение до границы: контур участка и фронт M-ROW-LINE (M-TAX-LINE не граница)", "черновик 4.4"),
-    ("Способ записи: дом — текст без выноски; забор и стена — выноска", "черновик 4.4"),
+    ("Область — выделение в AutoCAD; объекты в ней: дом, сарай, заборы, стены", "черновик 4.5"),
+    ("Измерение до границы: контур участка и фронт M-ROW-LINE (M-TAX-LINE не граница)", "черновик 4.5"),
+    ("Способ записи: дом — текст без выноски; забор и стена — выноска", "черновик 4.5"),
     ("Текст и высота: 1.1 на дом, 0.9 на остальное", "есть"),
-    ("Размещение без наложений с подписями и линиями", "черновик 4.4"),
+    ("Размещение без наложений с подписями и линиями", "черновик 4.5"),
     ("Проверка кадра и предупреждения", "функция есть, в окне не выводится"),
 )
 

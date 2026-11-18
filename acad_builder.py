@@ -1392,6 +1392,48 @@ class OffsetRunResult:
     feature_count: int
     written: OffsetWriteResult | None = None
     dry_run: bool = False
+    #: выделено в AutoCAD объектов (0, если область задана явно)
+    selection_count: int = 0
+    #: граница участка: слой, площадь (кв. футы), число вершин; подписей текста в чертеже
+    boundary_layer: str = ""
+    boundary_area: float = 0.0
+    boundary_vertices: int = 0
+    text_count: int = 0
+
+    def report(self) -> str:
+        """Полный отчёт шага 4: откуда взята область, что найдено, что поставлено, что записано."""
+        context: list[str] = []
+        xs = [p[0] for p in self.area]
+        ys = [p[1] for p in self.area]
+        bounds = (
+            f"x {min(xs):.1f}…{max(xs):.1f}, y {min(ys):.1f}…{max(ys):.1f} ft"
+            if xs else "не задана"
+        )
+        if self.selection_count:
+            context.append(f"Область: выделено в AutoCAD объектов {self.selection_count}, габарит {bounds}")
+        else:
+            context.append(f"Область: {bounds}")
+        context.append(
+            f"Участок: слой {self.boundary_layer or '—'}, вершин {self.boundary_vertices}, "
+            f"площадь {self.boundary_area:.0f} кв. ft; текстов в чертеже: {self.text_count}"
+        )
+        context.append(
+            f"Фронт M-ROW-LINE: линий {self.front_lines}; направление на север: {self.north_deg:g}°"
+        )
+        text = offsets.plan_report_text(self.plan, self.scale, context=context)
+        lines = [text]
+        if self.dry_run:
+            lines.append("Режим расчёта: чертёж не изменён.")
+        if self.written is not None:
+            lines.append(
+                f"Записано в слой {self.written.layer}: без выноски {self.written.created_texts}, "
+                f"с выноской {self.written.created_leaders}. Текстовый стиль: {self.written.text_style}."
+            )
+            for failure in self.written.failed:
+                lines.append(f"Не записано: {failure}")
+            for warning in self.written.warnings:
+                lines.append(f"Внимание: {warning}")
+        return "\n".join(lines)
 
 
 def _geometry_points(geom: Any) -> list[tuple[float, float]]:
@@ -3722,6 +3764,7 @@ class AcadBuilder:
         except Exception as exc:  # noqa: BLE001
             raise AcadBuilderError(f"не удалось прочитать выделение в AutoCAD: {exc}") from exc
         entities = list(self._iter_com(picked)) if picked is not None else []
+        self.offset_selection_count = len(entities)
         if not entities:
             raise AcadBuilderError(
                 "область не выделена в AutoCAD. Перейдите в AutoCAD, выделите рамкой область "
@@ -3802,9 +3845,11 @@ class AcadBuilder:
                     doc.ActiveSpace = 1
             except Exception:  # noqa: BLE001
                 pass
+            selection_count = 0
             if area is None:
                 notify("Читаю область, выделенную в AutoCAD…")
                 area = self.read_offset_area(doc)
+                selection_count = int(getattr(self, "offset_selection_count", 0))
             check_continue()
             notify("Читаю объекты активного чертежа AutoCAD…")
             snapshot = self.read_drawing_snapshot(
@@ -3835,6 +3880,9 @@ class AcadBuilder:
             result = OffsetRunResult(
                 plan=plan, area=list(area), scale=scale_value, north_deg=north_deg,
                 front_lines=len(front), feature_count=len(features), dry_run=dry_run,
+                selection_count=selection_count, boundary_layer=str(boundary.layer),
+                boundary_area=float(boundary.area_sqft), boundary_vertices=int(boundary.vertex_count),
+                text_count=len(texts),
             )
             if plan.items and not dry_run:
                 check_continue()

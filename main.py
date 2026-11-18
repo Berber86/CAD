@@ -4348,20 +4348,8 @@ class SurveyApp(ctk.CTk):
             self._set_status(f"Шаг 4 не выполнен: {message}", error=True)
             return
         plan = result.plan
-        lines = [offsets.plan_report_text(plan, result.scale)]
-        if result.dry_run:
-            lines.append("Режим расчёта: чертёж не изменён.")
         written = result.written
-        if written is not None:
-            lines.append(
-                f"Записано в слой {written.layer}: без выноски {written.created_texts}, "
-                f"с выноской {written.created_leaders}. Текстовый стиль: {written.text_style}."
-            )
-            for failure in written.failed:
-                lines.append(f"Не записано: {failure}")
-            for warning in written.warnings:
-                lines.append(f"Внимание: {warning}")
-        self._step4_last_report = "\n".join(lines)
+        self._step4_last_report = result.report()
         self._set_step4_report(self._step4_last_report)
         for line in self._step4_last_report.splitlines():
             if line.strip():

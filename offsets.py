@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.10"
+STEP4_VERSION = "4.11"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -328,6 +328,10 @@ def point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
 OFFSET_KINDS = ("house", "fence", "wall")
 #: Меньше этого расстояния объект считаем стоящим на границе (оффсета нет), футы.
 MIN_OFFSET_FT = 0.05
+#: подпись может стоять снаружи участка (в яру, у ворот): у заказчика 4 из 8 подписей вне линии участка
+LABEL_MUST_BE_INSIDE = False
+#: стены подписываются размером \A2; (эталоны Alvine и Brooklyn: ни одной подписи «WALL x'S» как оффсета)
+WALL_OFFSETS = False
 #: Расстояние от объекта до текста выноски при 1"=16' (в порядке попыток), футы.
 LEADER_DISTANCES_FT = (4.0, 5.5, 7.0)
 #: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
@@ -639,6 +643,9 @@ def plan_offsets(
         if feature.kind not in OFFSET_KINDS:
             plan.skipped.append((label, "этот вид объекта в оффсетах не подписывается"))
             continue
+        if feature.kind == "wall" and not WALL_OFFSETS:
+            plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
+            continue
         candidates = [
             c for c in measure_candidates(ring, [feature], front=front_lines)
             if c.outside_ft <= OUTSIDE_MAX_FT
@@ -646,11 +653,18 @@ def plan_offsets(
         if not candidates:
             plan.skipped.append((label, "объект вне участка"))
             continue
+        # Вершины, которые лежат на самой линии участка, не подписываются, но не отменяют остальные вершины
+        # объекта: в Brooklyn заборы с такой вершиной подписаны по другим вершинам (FE.0.2'N, FE.0.1'S).
+        on_line = [c for c in candidates if c.distance_ft < MIN_OFFSET_FT]
+        candidates = [c for c in candidates if c.distance_ft >= MIN_OFFSET_FT]
+        if not candidates:
+            plan.skipped.append((label, "стоит на границе"))
+            continue
         # При одинаковом значении после округления (0.1) берём вершину внутри участка: так подписал заказчик
         # в Brooklyn (0.088 внутри вместо 0.066 снаружи, оба дают 0.1).
         best = min(candidates, key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft))
         value = round_offset_ft(best.distance_ft)
-        if best.distance_ft < MIN_OFFSET_FT or value <= 0.0:
+        if value <= 0.0:
             plan.skipped.append((label, "стоит на границе"))
             continue
         # Буква — с какой стороны от границы стоит объект: «FE.0.4'N» — забор севернее линии.
@@ -681,7 +695,7 @@ def plan_offsets(
         def ok(rect: Rect, center: Point) -> bool:
             if area_pts is not None and not _rect_inside_polygon(rect, area_pts):
                 return False
-            if not point_in_polygon(center, ring):
+            if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
                 return False
             if any(_rects_overlap(rect, other) for other in text_rects + placed):
                 return False

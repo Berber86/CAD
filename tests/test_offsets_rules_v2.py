@@ -56,3 +56,32 @@ def test_tie_after_rounding_prefers_vertex_inside_lot():
     fence = _fence([(50.0, -0.066), (50.0, 0.088)])
     plan = off.plan_offsets(SQUARE, [fence])
     assert [item.text for item in plan.items] == ["FE.0.1'N"]
+
+
+def test_vertex_on_the_line_is_ignored_not_the_whole_fence():
+    # Вершина (99.98, 0.02) лежит на линии (0.02 < MIN_OFFSET), вершина (50, 0.2) — 0.2 ft внутри.
+    # Раньше забор целиком отбрасывался как «стоит на границе»; теперь подписывается по второй вершине.
+    fence = _fence([(99.98, 0.02), (60.0, 0.02), (50.0, 0.2)])
+    plan = off.plan_offsets(SQUARE, [fence])
+    # Вершина внутри участка у южной стороны: объект севернее линии, буква N.
+    assert [item.text for item in plan.items] == ["FE.0.2'N"]
+
+
+def test_fence_entirely_on_the_line_is_still_skipped_as_on_boundary():
+    fence = _fence([(10.0, 0.01), (60.0, 0.02)])
+    plan = off.plan_offsets(SQUARE, [fence])
+    assert plan.items == []
+    assert ("F", "стоит на границе") in plan.skipped
+
+
+def test_label_may_stand_outside_the_lot_flag():
+    # Заказчик ставит подписи в яру, снаружи участка (4 из 8 на Brooklyn). Правило включено флагом.
+    assert off.LABEL_MUST_BE_INSIDE is False
+
+
+def test_walls_are_not_labelled_as_offsets():
+    # В эталонах Alvine и Brooklyn стены подписаны размером \A2;, а не оффсетом.
+    wall = off.Feature(kind="wall", handle="W", points=((50.0, -2.0), (80.0, -2.0)))
+    plan = off.plan_offsets(SQUARE, [wall])
+    assert plan.items == []
+    assert ("W", "стена: у заказчика подписывается размером, не оффсетом") in plan.skipped

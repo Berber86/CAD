@@ -4226,7 +4226,7 @@ class SurveyApp(ctk.CTk):
         self.step4_status_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
         self.step4_run_button = ctk.CTkButton(
             panel,
-            text="🖱  Выбрать область в AutoCAD и поставить оффсеты",
+            text="⚡  Построить оффсеты в выделенной области",
             height=42,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
@@ -4277,8 +4277,9 @@ class SurveyApp(ctk.CTk):
         if status is not None:
             status.configure(
                 text=(
-                    "Укажите в AutoCAD две точки области: оффсеты появятся в ней, в слое "
-                    "D-TOPO-TEXT. Один Undo отменяет всю запись."
+                    "Заранее выделите в AutoCAD рамкой область (или замкнутую полилинию по её "
+                    "контуру), затем нажмите кнопку здесь. Оффсеты появятся в ней, в слое "
+                    "D-TOPO-TEXT; один Undo отменяет запись."
                 ),
             )
 
@@ -4297,7 +4298,7 @@ class SurveyApp(ctk.CTk):
 
     # ------------------------------------------- Шаг 4: запуск (черновик 4.3) ---
     def _start_offsets(self) -> None:
-        """Шаг 4: геодезист указывает область в AutoCAD, в ней ставятся оффсеты и пишутся в чертёж."""
+        """Шаг 4: область берётся из выделения в AutoCAD; оффсеты ставятся в ней и пишутся в чертёж."""
         if self._busy or getattr(self, "_source_role_dialog", None) is not None:
             return
         scale = self._current_scale()
@@ -4307,10 +4308,10 @@ class SurveyApp(ctk.CTk):
         self.progress.start()
         self._set_step4_report(
             "Выполняется…\n\n"
-            "Перейдите в AutoCAD: укажите два противоположных угла области, где ставить оффсеты "
-            "(Esc — отмена)."
+            "Читаю область, выделенную в AutoCAD. Если ничего не выделено — выделите в AutoCAD "
+            "рамкой область (или замкнутую полилинию) и нажмите кнопку снова."
         )
-        self._set_status("Шаг 4: жду две точки области в AutoCAD…")
+        self._set_status("Шаг 4: читаю область, выделенную в AutoCAD…")
         self._start_background(self._offsets_worker, args=(cfg, scale))
 
     def _offsets_worker(self, cfg: dict[str, Any], scale: float) -> None:

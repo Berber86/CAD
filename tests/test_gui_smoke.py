@@ -3152,7 +3152,7 @@ def test_step4_offsets_tab_is_last_and_keeps_step1_keys_off(gui):
     assert app.step4_page._gridded is True
     assert app.draw_button._gridded is False
     assert app.step_tab_buttons[gui.STEP_TAB_OFFSETS].cget("fg_color") == gui.THEME["btn_primary"]
-    assert "две точки области" in app.step4_status_label.cget("text")
+    assert "выделите в AutoCAD" in app.step4_status_label.cget("text")
     assert app.step4_run_button._gridded is True
 
     started = []

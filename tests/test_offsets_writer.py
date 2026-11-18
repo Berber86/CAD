@@ -4,15 +4,12 @@
 Сцена — тот же синтетический участок, что в тестах Шага 2 (40 × 100 ft, дом, сарай, заборы).
 """
 
-import sys
-import types
-
 import pytest
 
 import acad_builder as ab
 import offsets as off
 from llm_parser import load_config
-from test_feature_labeling import build_scene, fake_autocad
+from test_feature_labeling import FakeEntity, build_scene, fake_autocad
 
 WHOLE_LOT = [(-5.0, -5.0), (50.0, -5.0), (50.0, 110.0), (-5.0, 110.0)]
 
@@ -81,49 +78,72 @@ def test_nothing_to_write_does_not_open_undo_group(com):
     assert doc.undo_marks == []
 
 
-def test_pick_area_returns_rectangle_from_two_corners(com, monkeypatch):
-    monkeypatch.setitem(sys.modules, "pythoncom", types.SimpleNamespace(Missing=None))
-    builder, app, doc = com()
+class _Selection:
+    """Набор выделения AutoCAD: Count и Item, как у COM-коллекции."""
 
-    class Utility:
-        def GetPoint(self, _base, _prompt):
-            return (10.0, 20.0, 0.0)
+    def __init__(self, *entities):
+        self._items = list(entities)
 
-        def GetCorner(self, base, _prompt):
-            assert tuple(base)[:2] == (10.0, 20.0)
-            return (30.0, 50.0, 0.0)
+    @property
+    def Count(self):
+        return len(self._items)
 
-    doc.Utility = Utility()
-    assert builder.pick_offset_area(app, doc) == [(10.0, 20.0), (30.0, 20.0), (30.0, 50.0), (10.0, 50.0)]
+    def Item(self, index):
+        return self._items[index]
 
 
-def test_pick_area_escape_is_a_clean_error(com, monkeypatch):
-    monkeypatch.setitem(sys.modules, "pythoncom", types.SimpleNamespace(Missing=None))
-    builder, app, doc = com()
-
-    class Utility:
-        def GetPoint(self, _base, _prompt):
-            raise RuntimeError("user cancelled")
-
-    doc.Utility = Utility()
-    with pytest.raises(ab.AcadBuilderError, match="Чертёж не изменён"):
-        builder.pick_offset_area(app, doc)
+def _window_object(x0, y0, x1, y1, kind="AcDbLine"):
+    entity = FakeEntity(kind, "CODE_CREW")
+    entity.GetBoundingBox = lambda: ((x0, y0, 0.0), (x1, y1, 0.0))
+    return entity
 
 
-def test_degenerate_area_is_refused(com, monkeypatch):
-    monkeypatch.setitem(sys.modules, "pythoncom", types.SimpleNamespace(Missing=None))
-    builder, app, doc = com()
+def _closed_polyline(points):
+    flat = tuple(value for point in points for value in point)
+    return FakeEntity("AcDbPolyline", "AREA", Coordinates=flat, Closed=True)
 
-    class Utility:
-        def GetPoint(self, _base, _prompt):
-            return (10.0, 20.0, 0.0)
 
-        def GetCorner(self, _base, _prompt):
-            return (10.0, 60.0, 0.0)  # та же X: прямоугольника нет
+def test_area_from_window_selection_is_bounding_box(com):
+    builder, _app, doc = com()
+    doc.PickfirstSelectionSet = _Selection(
+        _window_object(10.0, 20.0, 30.0, 25.0),
+        _window_object(12.0, 40.0, 28.0, 50.0),
+    )
+    assert builder.read_offset_area(doc) == [(10.0, 20.0), (30.0, 20.0), (30.0, 50.0), (10.0, 50.0)]
 
-    doc.Utility = Utility()
+
+def test_area_from_single_closed_polyline_is_its_outline(com):
+    builder, _app, doc = com()
+    square = [(0.0, 0.0), (20.0, 0.0), (20.0, 30.0), (0.0, 30.0)]
+    doc.PickfirstSelectionSet = _Selection(_closed_polyline(square))
+    assert builder.read_offset_area(doc) == square
+
+
+def test_no_selection_is_a_clean_error_and_leaves_drawing(com):
+    builder, _app, doc = com()
+    before = len(doc.ModelSpace.entities)
+    doc.PickfirstSelectionSet = _Selection()
+    with pytest.raises(ab.AcadBuilderError, match="не выделена в AutoCAD"):
+        builder.read_offset_area(doc)
+    assert len(doc.ModelSpace.entities) == before
+    assert doc.undo_marks == []
+
+
+def test_single_line_selection_is_degenerate(com):
+    builder, _app, doc = com()
+    doc.PickfirstSelectionSet = _Selection(_window_object(0.0, 5.0, 30.0, 5.0))
     with pytest.raises(ab.AcadBuilderError, match="вырождена"):
-        builder.pick_offset_area(app, doc)
+        builder.read_offset_area(doc)
+
+
+def test_build_offsets_reads_selection_when_no_area_is_given(com):
+    # Сценарий пользователя: область выделена заранее, кнопка программы строит оффсеты в ней.
+    builder, _app, doc = com()
+    doc.PickfirstSelectionSet = _Selection(_closed_polyline(WHOLE_LOT))
+    result = builder.build_offsets(dry_run=False)
+    assert result.area == WHOLE_LOT
+    assert result.written is not None and result.written.created_texts + result.written.created_leaders == len(result.plan.items)
+    assert doc.undo_marks == ["start", "end"]
 
 
 def test_geometry_points_of_feature_shapes():

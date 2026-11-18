@@ -176,7 +176,7 @@ def test_report_text_lists_items_and_skips():
         front=FRONT,
     )
     text = off.plan_report_text(plan, 16)
-    assert "черновик 4.3" in text
+    assert f"черновик {off.STEP4_VERSION}" in text
     assert "Подписей: 2 (без выноски: 1, с выноской: 1)" in text
     assert "10.0'S  (без выноски)" in text
     assert "E: стоит на границе" in text

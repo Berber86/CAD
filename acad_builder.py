@@ -3708,46 +3708,54 @@ class AcadBuilder:
         return plan
 
     # -- шаг 4: оффсеты (черновик 4.3) ----------------------------------------
-    def pick_offset_area(
-        self, app: Any, doc: Any, progress: Callable[[str], None] | None = None
-    ) -> list[tuple[float, float]]:
+    def read_offset_area(self, doc: Any) -> list[tuple[float, float]]:
         """
-        Геодезист мышкой указывает прямоугольник области: первый угол и противоположный.
-        Возвращает четыре вершины прямоугольника (мировые координаты, футы).
+        Область шага 4 — то, что геодезист выделил в AutoCAD заранее, до нажатия кнопки программы:
+
+        - одна замкнутая полилиния — её контур;
+        - иначе — прямоугольник по габаритам всех выделенных объектов (например, рамка).
+
+        Читается текущее выделение AutoCAD (``PickfirstSelectionSet``), программа ничего не выбирает.
         """
-        import pythoncom
-
-        notify = progress or (lambda _message: None)
-        notify("Перейдите в AutoCAD: укажите первый угол области, где ставить оффсеты…")
         try:
-            app.Visible = True
-        except Exception:  # noqa: BLE001
-            pass
-        try:  # вывести окно AutoCAD на передний план (только Windows)
-            import win32gui
-
-            win32gui.SetForegroundWindow(int(app.HWND))
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            first = doc.Utility.GetPoint(
-                pythoncom.Missing, "\nTitle Survey AI: первый угол области оффсетов: "
-            )
-            second = doc.Utility.GetCorner(
-                _variant_point((float(first[0]), float(first[1]))),
-                "\nTitle Survey AI: противоположный угол области: ",
-            )
-        except Exception as exc:  # noqa: BLE001 - Esc или закрытие AutoCAD
+            picked = doc.PickfirstSelectionSet
+        except Exception as exc:  # noqa: BLE001
+            raise AcadBuilderError(f"не удалось прочитать выделение в AutoCAD: {exc}") from exc
+        entities = list(self._iter_com(picked)) if picked is not None else []
+        if not entities:
             raise AcadBuilderError(
-                f"область оффсетов не указана (Esc — отмена). Чертёж не изменён. Детали: {exc}"
-            ) from exc
-        x1, y1 = float(first[0]), float(first[1])
-        x2, y2 = float(second[0]), float(second[1])
-        if abs(x2 - x1) < 1e-6 or abs(y2 - y1) < 1e-6:
-            raise AcadBuilderError(
-                "область вырождена: укажите два разных угла прямоугольника. Чертёж не изменён."
+                "область не выделена в AutoCAD. Перейдите в AutoCAD, выделите рамкой область "
+                "(или замкнутую полилинию по её контуру) и нажмите кнопку здесь снова. "
+                "Чертёж не изменён."
             )
-        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        if len(entities) == 1:
+            kind = str(getattr(entities[0], "ObjectName", ""))
+            if kind in _FEATURE_LINE_KINDS:
+                try:
+                    geometry = self._entity_polyline(entities[0], kind)
+                except Exception:  # noqa: BLE001 - объект без геометрии ломаной: берём габарит
+                    geometry = None
+                if geometry is not None and geometry[1] and len(geometry[0]) >= 3:
+                    return [(float(x), float(y)) for x, y in geometry[0]]
+        xs: list[float] = []
+        ys: list[float] = []
+        for entity in entities:
+            box = self._entity_bbox(entity)
+            if box is None:
+                continue
+            xs.extend((box[0], box[2]))
+            ys.extend((box[1], box[3]))
+        if not xs:
+            raise AcadBuilderError(
+                "у выделенных объектов нет габаритов в AutoCAD. Чертёж не изменён."
+            )
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        if x1 - x0 < 1e-6 or y1 - y0 < 1e-6:
+            raise AcadBuilderError(
+                "выделенная область вырождена (нулевая ширина или высота). Выделите рамкой "
+                "площадь, а не одну линию. Чертёж не изменён."
+            )
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
     @staticmethod
     def _offset_feature(feature: Feature) -> Any | None:
@@ -3772,7 +3780,7 @@ class AcadBuilder:
         area: list[tuple[float, float]] | None = None,
     ) -> OffsetRunResult:
         """
-        Шаг 4 целиком: геодезист указывает область мышкой, в ней ставятся оффсеты до границы участка.
+        Шаг 4 целиком: область читается из выделения в AutoCAD, в ней ставятся оффсеты до границы участка.
 
         Граница — автопоиск участка (как в Шаге 2); фронт — линии ``M-ROW-LINE``; север — стрелка
         чертежа (без неё +Y). ``dry_run=True`` — только расчёт. ``area`` задаётся явно (тесты).
@@ -3795,7 +3803,8 @@ class AcadBuilder:
             except Exception:  # noqa: BLE001
                 pass
             if area is None:
-                area = self.pick_offset_area(app, doc, notify)
+                notify("Читаю область, выделенную в AutoCAD…")
+                area = self.read_offset_area(doc)
             check_continue()
             notify("Читаю объекты активного чертежа AutoCAD…")
             snapshot = self.read_drawing_snapshot(

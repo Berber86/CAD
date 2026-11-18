@@ -332,3 +332,14 @@ def test_main_select_asks_on_screen_and_cleans_up(tmp_path, capsys):
     assert events == [f"add {dwg.SELECTION_SET}", "select", "delete"]
     data = json.loads((tmp_path / "87 Stafford.x.dump.json").read_text(encoding="utf-8"))
     assert [record["type"] for record in data["entities"]] == ["Leader", "AlignedDimension"]
+
+
+def test_skip_layers_drops_frame_objects_and_counts_them():
+    full = dwg.collect_dump(make_doc())
+    lean = dwg.collect_dump(make_doc(), skip_layers=["fence_chain_left"], stage="before")
+    left = [r for r in full["entities"] if r["layer"] == "FENCE_CHAIN_LEFT"]
+    assert left, "в фикстуре должны быть объекты слоя FENCE_CHAIN_LEFT"
+    assert lean["drawing"]["skipped_layers"] == {"FENCE_CHAIN_LEFT": len(left)}
+    assert lean["drawing"]["dumped_count"] == full["drawing"]["dumped_count"] - len(left)
+    assert lean["drawing"]["stage"] == "before"
+    assert all(r["layer"] != "FENCE_CHAIN_LEFT" for r in lean["entities"])

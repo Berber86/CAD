@@ -3001,6 +3001,17 @@ _DMS_BEARING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Румб словами, как в старых описаниях: «North 84 degrees, 09 minutes 22 seconds West» (запятые
+# после degrees/minutes допускаются). Без цифр-символов; слова degrees/minutes/seconds обязательны.
+_WORDY_DMS_BEARING_RE = re.compile(
+    rf"(?<![A-Za-z])(?P<ns>{_NS}|S(?:outh)?\.?)\s*,?\s*"
+    r"(?P<deg>\d{1,3})\s*(?:°|º|degrees?|deg\.?)\s*,?\s*"
+    r"(?P<min>\d{1,2})\s*(?:'|′|’|minutes?|min\.?)\s*,?\s*"
+    r"(?P<sec>\d{1,2}(?:\.\d+)?)\s*(?:\"|″|”|''|seconds?|sec\.?)\s*,?\s*"
+    rf"(?P<ew>{_EW}|W(?:est)?\.?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
 _DECIMAL_BEARING_RE = re.compile(
     rf"(?P<ns>{_NS}|S(?:outh)?\.?)\s*,?\s*(?P<ddeg>\d{{1,3}}\.\d+)\s*°?\s*"
     rf"(?P<ew>{_EW}|W(?:est)?\.?)(?![A-Za-z])",
@@ -3370,7 +3381,7 @@ def _split_preamble_and_body(text: str) -> tuple[str, str]:
 
 def _bearing_matches(text: str) -> list[re.Match[str]]:
     """Сначала румбы с символами °/', затем десятичные, затем «N 45 03 12 E»."""
-    for pattern in (_DMS_BEARING_RE, _DECIMAL_BEARING_RE, _SPACED_BEARING_RE):
+    for pattern in (_DMS_BEARING_RE, _WORDY_DMS_BEARING_RE, _DECIMAL_BEARING_RE, _SPACED_BEARING_RE):
         matches = list(pattern.finditer(text))
         if matches:
             return matches

@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Sequence
 
 from shapely import affinity
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 #: Площадь пересечения, меньше которой наложением не считаем (как в сверке: «0.5 кв. ft — не наложение»).
 OVERLAP_TOL_SQFT = 0.5
@@ -386,7 +386,19 @@ def slide_off_overlap(
     short_nb = min((r[4] for r in _edges_with_points(neighbour_points)), default=0.0)
     corner_limit = short_nb * (CORNER_MAX_LEN_FACTOR if variant == "corner" else 1.0)
     corner_part = [(c, "corner") for c in kept if math.hypot(c[0], c[1]) <= corner_limit + 1e-9]
-    corner_note = _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward)
+    def overlap_detail(dx: float, dy: float) -> tuple[float, float]:
+        """Площадь наложения с нашим участком (кв. ft) и глубина — самая дальняя точка внутри нас (ft)."""
+        inter = main.intersection(affinity.translate(neighbour, dx, dy))
+        if inter.is_empty or inter.area <= 0:
+            return 0.0, 0.0
+        depth = 0.0
+        for geom in getattr(inter, "geoms", [inter]):
+            if hasattr(geom, "exterior"):
+                for x, y in geom.exterior.coords:
+                    depth = max(depth, main.boundary.distance(Point(x, y)))
+        return inter.area, depth
+
+    corner_note = _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward, overlap_detail)
     side_part = [
         (s, "side") for s in _sidewise_translations(main_points, neighbour_points, max_move_ft)
         if math.hypot(s[0], s[1]) <= short_nb + 1e-9
@@ -428,7 +440,7 @@ def slide_off_overlap(
     return replace(result, corner_note=corner_note if method != "corner" else "")
 
 
-def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward) -> str:
+def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inward, overlap_detail) -> str:
     """
     Для журнала: почему угловые сдвиги не приняты (ближайший по длине). Не влияет на выбор.
     """
@@ -441,6 +453,9 @@ def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inw
             why = "не наружу"
         else:
             why = check_reason(dx, dy, band, need) or "проходит"
+            if why == "наложение с нашим":
+                area, depth = overlap_detail(dx, dy)
+                why = f"наложение с нашим {area:.2f} кв. ft, глубина {depth:.3f} ft (≈{depth * 304.8:.1f} мм)"
         if length > corner_limit + 1e-9:
             why = f"длиннее допустимого для углов ({corner_limit:.2f} ft); без этого ограничения: {why}"
         parts.append(f"сдвиг ({dx:.2f}, {dy:.2f}), длина {length:.2f} ft — {why}")

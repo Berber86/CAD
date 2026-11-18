@@ -337,3 +337,16 @@ def test_variant_corner_allows_a_join_up_to_150_percent_of_the_short_side():
     assert math.hypot(corners.dx, corners.dy) > 25.0
     assert math.hypot(corners.dx, corners.dy) <= 1.5 * 25.0 + 1e-9
     assert slide_off_overlap(main, nb, variant="direction").method == "side"
+
+
+def test_journal_gives_overlap_area_and_depth_for_a_corner_candidate():
+    """В журнале для углового варианта с наложением видно площадь и глубину (мм)."""
+    from neighbour_slide import _corner_diagnosis
+
+    corners = [(10.0, 0.0, 0.05, 1.0, 0.0)]
+    text = _corner_diagnosis(
+        corners, corners, 36.6, lambda dx, dy, band, need: "наложение с нашим", (0.0, 1.0), False,
+        lambda dx, dy: (1.5, 0.02),
+    )
+    assert "наложение с нашим 1.50 кв. ft" in text
+    assert "мм" in text

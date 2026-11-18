@@ -435,7 +435,7 @@ def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inw
     if not corners:
         return "углы: совмещение не строится (стороны не параллельны в пределах 2°)"
     parts = []
-    for dx, dy, band, need, _wedge in corners[:2]:
+    for dx, dy, band, need, _wedge in corners[:6]:
         length = math.hypot(dx, dy)
         if not allow_inward and dx * away[0] + dy * away[1] < -1e-9:
             why = "не наружу"
@@ -444,7 +444,9 @@ def _corner_diagnosis(corners, kept, corner_limit, check_reason, away, allow_inw
         if length > corner_limit + 1e-9:
             why = f"длиннее допустимого для углов ({corner_limit:.2f} ft); без этого ограничения: {why}"
         parts.append(f"сдвиг ({dx:.2f}, {dy:.2f}), длина {length:.2f} ft — {why}")
-    return "углы: " + "; ".join(parts)
+    total = len(corners)
+    head = f"углы (всего вариантов {total}, показаны кратчайшие {min(total, 6)}): "
+    return head + "; ".join(parts)
 
 
 def _moved(main: Polygon, neighbour: Polygon, dx: float, dy: float, band: float,

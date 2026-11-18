@@ -91,15 +91,28 @@ def report(before: dict, after: dict) -> str:
     lines.append("Новые подписи (текст | слой | точка):")
     for record in result["new"]:
         if record.get("type") in TEXT_TYPES or label_text(record):
-            pt = label_point(record)
-            where = f"({pt[0]:.2f}, {pt[1]:.2f})" if pt else "-"
-            lines.append(f"  {label_text(record)!r:<28} | {record.get('layer', '')} | {where} | {record.get('type', '')}")
-    if result["changed"]:
+            lines.append(_row(record, "новая"))
+    rewritten = [(old, new) for old, new in result["changed"] if label_text(new) != label_text(old)]
+    if rewritten:
+        # Николай часто дописывает существующий текст («V.FE.» → «V.FE.\P0.7'E») — это тоже подпись
         lines.append("")
-        lines.append("Изменённые (было → стало):")
-        for old, new in result["changed"]:
-            lines.append(f"  {old.get('type')} {old.get('handle')} {old.get('layer')}: {label_text(old)!r} → {label_text(new)!r}")
+        lines.append("Переписанные подписи (было → стало | слой | точка):")
+        for old, new in rewritten:
+            lines.append(f"  {label_text(old)!r} → {label_text(new)!r} | {new.get('layer', '')} | {_where(new)}")
+    other = [(old, new) for old, new in result["changed"] if label_text(new) == label_text(old)]
+    if other:
+        lines.append("")
+        lines.append(f"Изменены без текста (геометрия, стиль): {len(other)}")
     return "\n".join(lines)
+
+
+def _where(record: dict) -> str:
+    pt = label_point(record)
+    return f"({pt[0]:.2f}, {pt[1]:.2f})" if pt else "-"
+
+
+def _row(record: dict, kind: str) -> str:
+    return f"  {label_text(record)!r:<28} | {record.get('layer', '')} | {_where(record)} | {record.get('type', '')} ({kind})"
 
 
 if __name__ == "__main__":

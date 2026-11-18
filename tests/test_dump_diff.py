@@ -36,3 +36,10 @@ def test_report_prints_label_text_and_point():
     after = _dump({"type": "MText", "handle": "B2", "layer": "D-TOPO-TEXT", "text": "3.5'S", "pt": [1.0, 2.0]})
     text = dd.report(before, after)
     assert "3.5'S" in text and "(1.00, 2.00)" in text
+
+
+def test_rewritten_label_is_reported_with_old_and_new_text():
+    before = _dump({"type": "MText", "handle": "C1", "layer": "D-TOPO-TEXT", "text": "V.FE.", "pt": [3.0, 4.0]})
+    after = _dump({"type": "MText", "handle": "C1", "layer": "D-TOPO-TEXT", "text": "V.FE.\\P0.7'E", "pt": [3.0, 4.0]})
+    text = dd.report(before, after)
+    assert "Переписанные подписи" in text and "'V.FE.' → " in text and "0.7'E" in text

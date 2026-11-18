@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.9"
+STEP4_VERSION = "4.10"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -272,6 +272,41 @@ def perpendicular_distance(point: Point, polyline: Sequence[Point], *, closed: b
     return best
 
 
+def _side_projections(
+    point: Point, polyline: Sequence[Point], closed: bool, *, extension_ft: float | None = None,
+) -> list[tuple[float, Point, int]]:
+    """
+    Для каждой стороны ломаной: перпендикуляр от точки до её прямой, основание на прямой и номер стороны.
+    Основание может лежать за концом стороны, но не дальше ``extension_ft`` (0 — только внутри стороны).
+    """
+    if extension_ft is None:
+        extension_ft = LINE_EXTENSION_FT
+    out: list[tuple[float, Point, int]] = []
+    for index, (a, b) in enumerate(_segments(polyline, closed)):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-12:
+            continue
+        t = ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (length * length)
+        beyond = max(0.0, -t * length, (t - 1.0) * length)
+        if beyond > extension_ft:
+            continue
+        foot = (a[0] + t * dx, a[1] + t * dy)
+        out.append((math.dist(point, foot), foot, index))
+    return out
+
+
+def perpendicular_line_distance(point: Point, polyline: Sequence[Point], *, closed: bool = True) -> tuple[float, Point]:
+    """
+    Расстояние от точки до прямой стороны (до продолжения стороны, в пределах ``LINE_EXTENSION_FT``).
+    Если подходящей стороны нет, возвращается расстояние до ближайшей точки границы.
+    """
+    best = min(_side_projections(point, polyline, closed), key=lambda item: item[0], default=None)
+    if best is None:
+        return perpendicular_distance(point, polyline, closed=closed)
+    return best[0], best[1]
+
+
 def point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     """Лучевой метод: точка внутри замкнутого контура."""
     x, y = point
@@ -303,6 +338,15 @@ TEXT_GAP_FACTOR = 0.3
 DUPLICATE_RADIUS_FT = 10.0
 #: Минимальная длина выноски в высотах текста: короче AutoCAD не нарисует стрелку.
 LEADER_MIN_HEIGHTS = 2.0
+#: Основание перпендикуляра может лежать на продолжении стороны за её концом не дальше этого, футы.
+#: Заказчик меряет до продолжения линии: «FE.1.8'S» — 1.84 ft до продолжения северной стороны (Alvine).
+LINE_EXTENSION_FT = 5.0
+#: Объект за границей участка подписываем, если он не дальше этого от неё, футы.
+#: Заказчик подписывает и «3.2'S» у строения за южной линией (Alvine), и «FE.0.2'S» в 0.24 ft снаружи.
+OUTSIDE_MAX_FT = 5.0
+#: Вторая сторона у той же вершины: если она ближе этого, пишем её второй строкой той же выноски.
+#: Примеры: «FE.1.8'S \\P FE.1.4'E» (1.84 и 1.44), «FE.0.1'S \\P FE.0.5'W» (0.07 и 0.52).
+SECOND_SIDE_FT = 2.0
 
 @dataclass(frozen=True)
 class Feature:
@@ -322,6 +366,7 @@ class OffsetCandidate:
     distance_ft: float
     foot: Point  # основание перпендикуляра на границе
     inside: bool  # вершина внутри участка
+    outside_ft: float = 0.0  # если снаружи — расстояние до контура участка, футы; внутри 0
 
 
 def measure_candidates(
@@ -340,16 +385,19 @@ def measure_candidates(
     for feature in features:
         for vertex in feature.points:
             distance, foot = min(
-                (perpendicular_distance(vertex, line, closed=closed) for line, closed in boundaries),
+                (perpendicular_line_distance(vertex, line, closed=closed) for line, closed in boundaries),
                 key=lambda pair: pair[0],
             )
+            inside = point_in_polygon(vertex, property_pts)
+            outside = 0.0 if inside else perpendicular_distance(vertex, property_pts, closed=True)[0]
             out.append(
                 OffsetCandidate(
                     feature=feature,
                     vertex=vertex,
                     distance_ft=round(distance, 4),
                     foot=foot,
-                    inside=point_in_polygon(vertex, property_pts),
+                    inside=inside,
+                    outside_ft=round(outside, 4),
                 )
             )
     return out
@@ -497,14 +545,14 @@ def _place_leader(
 ) -> tuple[Point, Point] | None:
     """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
-    width = width_of(text, height)
+    width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
     for distance in LEADER_DISTANCES_FT:
         for angle in LEADER_ANGLES_DEG:
             a = base + math.radians(angle)
             d = distance * factor
             center = (anchor[0] + d * math.cos(a), anchor[1] + d * math.sin(a))
-            rect = _rect_at(center, width, height)
+            rect = _rect_at(center, width, block_h)
             if not ok(rect, center):
                 continue
             # Конец выноски — на краю текста, со стороны объекта.
@@ -513,7 +561,7 @@ def _place_leader(
             if norm < 1e-9:
                 continue
             ux, uy = vx / norm, vy / norm
-            half_w, half_h = width / 2.0, height / 2.0
+            half_w, half_h = width / 2.0, block_h / 2.0
             reach = min(
                 half_w / abs(ux) if abs(ux) > 1e-9 else math.inf,
                 half_h / abs(uy) if abs(uy) > 1e-9 else math.inf,
@@ -591,11 +639,16 @@ def plan_offsets(
         if feature.kind not in OFFSET_KINDS:
             plan.skipped.append((label, "этот вид объекта в оффсетах не подписывается"))
             continue
-        candidates = [c for c in measure_candidates(ring, [feature], front=front_lines) if c.inside]
+        candidates = [
+            c for c in measure_candidates(ring, [feature], front=front_lines)
+            if c.outside_ft <= OUTSIDE_MAX_FT
+        ]
         if not candidates:
             plan.skipped.append((label, "объект вне участка"))
             continue
-        best = min(candidates, key=lambda c: c.distance_ft)
+        # При одинаковом значении после округления (0.1) берём вершину внутри участка: так подписал заказчик
+        # в Brooklyn (0.088 внутри вместо 0.066 снаружи, оба дают 0.1).
+        best = min(candidates, key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft))
         value = round_offset_ft(best.distance_ft)
         if best.distance_ft < MIN_OFFSET_FT or value <= 0.0:
             plan.skipped.append((label, "стоит на границе"))
@@ -606,6 +659,12 @@ def plan_offsets(
         direction = compass_letter(vx, vy, north_deg)
         height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
         text = offset_text(feature.kind, value, direction)
+        extra: list[tuple[float, str]] = []
+        if feature.kind in ("fence", "wall"):
+            boundaries: list[tuple[Sequence[Point], bool]] = [(ring, True)]
+            boundaries += [(line, False) for line in front_lines]
+            taken = (value, direction)
+            extra = _extra_sides(best.vertex, best.foot, taken, boundaries, north_deg)
         mid = ((best.vertex[0] + best.foot[0]) / 2.0, (best.vertex[1] + best.foot[1]) / 2.0)
         if any(
             _key(old) == _key(text) and min(
@@ -647,7 +706,10 @@ def plan_offsets(
             )
         else:
             # Дом без места под текст получает выноску с «BLDG»; забор и стена — выноску как есть.
-            leader_text = offset_text(feature.kind, value, direction, leader=True)
+            leader_text = "\n".join(
+                [offset_text(feature.kind, value, direction)]
+                + [offset_text(feature.kind, v, d) for v, d in extra]
+            )
             spot = _place_leader(best.vertex, best.foot, leader_text, height, width_of, ok, factor)
             if spot is None:
                 plan.warnings.append(
@@ -655,7 +717,8 @@ def plan_offsets(
                 )
                 continue
             center, end = spot
-            rect = _rect_at(center, width_of(leader_text, height), height)
+            rect_w, rect_h = _text_block(leader_text, height, width_of)
+            rect = _rect_at(center, rect_w, rect_h)
             item = OffsetItem(
                 kind=feature.kind, value_ft=value, direction=direction, style="leader",
                 height_ft=height, anchor=best.vertex, target=best.foot, text=leader_text,
@@ -665,6 +728,41 @@ def plan_offsets(
         plan.items.append(item)
         known.append((item.text, item.point, item.height_ft))
     return plan
+
+
+def _extra_sides(
+    vertex: Point, best_foot: Point, taken: tuple[float, str],
+    boundaries: Sequence[tuple[Sequence[Point], bool]], north_deg: float,
+) -> list[tuple[float, str]]:
+    """
+    Другие стороны участка, к которым та же вершина ближе ``SECOND_SIDE_FT``: заказчик пишет
+    их второй строкой той же выноски. Возвращает (значение, буква), ближайшая первой.
+    """
+    found: list[tuple[float, float, str]] = []
+    for line, closed in boundaries:
+        # Только основание внутри стороны: продолжение за углом даёт ложные вторые части.
+        for distance, foot, _index in _side_projections(vertex, line, closed, extension_ft=0.0):
+            if math.dist(foot, best_foot) < 1e-6 or distance > SECOND_SIDE_FT:
+                continue
+            value = round_offset_ft(distance)
+            if value <= 0.0:
+                continue
+            direction = compass_letter(vertex[0] - foot[0], vertex[1] - foot[1], north_deg)
+            found.append((distance, value, direction))
+    found.sort()
+    out: list[tuple[float, str]] = []
+    for _distance, value, direction in found:
+        pair = (value, direction)
+        if pair != taken and pair not in out:
+            out.append(pair)
+    return out
+
+
+def _text_block(text: str, height: float, width_of: Callable[[str, float], float]) -> tuple[float, float]:
+    """Размер многострочной подписи (строки разделены ``\\n``): ширина самой длинной и общая высота."""
+    lines = text.split("\n")
+    width = max(width_of(line, height) for line in lines)
+    return width, height * len(lines)
 
 
 def _area_bounds(area: Sequence[Point] | None, margin: float) -> Rect | None:
@@ -698,7 +796,8 @@ def plan_report_text(plan: OffsetPlan, scale: float = BASE_SCALE, context: Seque
     )
     lines.append(f"Подписей: {len(plan.items)} (без выноски: {len(texts)}, с выноской: {len(leaders)})")
     for item in plan.items:
-        lines.append(f"  {item.text}  ({'без выноски' if item.style == 'text' else 'выноска'})")
+        shown = item.text.replace("\n", " + ")  # две стороны одной вершины — в одной строке журнала
+        lines.append(f"  {shown}  ({'без выноски' if item.style == 'text' else 'выноска'})")
     if not plan.items:
         if c.get("zone", 0) == 0:
             lines.append(

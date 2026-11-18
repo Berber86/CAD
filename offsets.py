@@ -148,6 +148,11 @@ def parse_observed_offsets(dump: dict[str, Any]) -> list[ObservedOffset]:
 # --------------------------------------------------------------------------- кадр двух дампов
 
 
+#: Доля объектов, совпавших по координатам, при которой дампы считаются одной системой.
+#: Остальные объекты могли быть передвинуты самим заказчиком (в Alvine — 8 из 278).
+SAME_FRAME_SHARE = 0.9
+
+
 @dataclass(frozen=True)
 class FrameCheck:
     """Сравнение двух дампов по handle: сняты ли они в одной системе координат."""
@@ -158,7 +163,7 @@ class FrameCheck:
 
     @property
     def same_frame(self) -> bool:
-        return self.common > 0 and self.different == 0
+        return self.common > 0 and self.same / self.common >= SAME_FRAME_SHARE
 
 
 def _first_point(entity: dict[str, Any]) -> Point | None:
@@ -188,6 +193,12 @@ def same_frame(before: dict[str, Any], after: dict[str, Any]) -> FrameCheck:
         else:
             different += 1
     return FrameCheck(common=common, same=same, different=different)
+
+
+def added_offsets(before: dict[str, Any], after: dict[str, Any]) -> list[ObservedOffset]:
+    """Оффсеты, которых не было в дампе «до» (по handle подписи). Это то, что поставил заказчик."""
+    known = {str(e.get("handle")) for e in before.get("entities", []) if e.get("handle")}
+    return [item for item in parse_observed_offsets(after) if item.handle not in known]
 
 
 # --------------------------------------------------------------------------- геометрия

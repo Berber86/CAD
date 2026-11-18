@@ -462,8 +462,9 @@ def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = Fa
 DIMENSION_LABELS = False
 #: Стены короче этого (футы) не размеряются: там отрезки крыльца и ступеней.
 DIMENSION_MIN_FT = 5.0
-#: Зазор между стеной и текстом размера, в высотах текста.
-DIMENSION_GAP_FACTOR = 0.3
+#: Текст размера ставится внутри дома, на это расстояние от стены, футы (192 Geldner: 1.1 и 1.5 у двух стен,
+#: 1.0 у размера 7.0'). Текст — в середине размерной линии (4 из 4).
+DIMENSION_TEXT_OFFSET_FT = 1.1
 
 
 @dataclass(frozen=True)
@@ -490,9 +491,9 @@ def house_wall_dimensions(
     min_length_ft: float = DIMENSION_MIN_FT,
 ) -> list[WallDimension]:
     """
-    Размеры каждой стены дома от угла до угла (R6). Текст стоит снаружи дома, параллельно стене (R10).
+    Размеры каждой стены дома от угла до угла (R6). Текст стоит внутри дома, у стены, параллельно ей (R10).
     ``house_pts`` — контур дома; если он незамкнутый, замыкается сам. Стены короче ``min_length_ft`` пропускаются.
-    Наружная сторона стены определяется проверкой точки на шаг наружу: контур может быть невыпуклым.
+    Сторона определяется проверкой точки на шаг внутрь: контур может быть невыпуклым.
     """
     pts = [(float(x), float(y)) for x, y in house_pts]
     if len(pts) >= 2 and pts[0] == pts[-1]:
@@ -501,7 +502,7 @@ def house_wall_dimensions(
         return []
     factor = scale / BASE_SCALE if scale and scale > 0 else 1.0
     height = LABEL_HEIGHT_FT * factor
-    offset = height * (0.5 + DIMENSION_GAP_FACTOR)
+    offset = DIMENSION_TEXT_OFFSET_FT * factor
     out: list[WallDimension] = []
     for i in range(len(pts)):
         a, b = pts[i], pts[(i + 1) % len(pts)]
@@ -512,8 +513,8 @@ def house_wall_dimensions(
         nx, ny = -dy / length, dx / length  # перпендикуляр к стене
         mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
         probe = (mid[0] + nx * 0.5, mid[1] + ny * 0.5)
-        if point_in_polygon(probe, pts):
-            nx, ny = -nx, -ny  # внутрь дома — меняем на наружу
+        if not point_in_polygon(probe, pts):
+            nx, ny = -nx, -ny  # наружу дома — меняем на внутрь: текст размера ставится внутри
         center = (mid[0] + nx * offset, mid[1] + ny * offset)
         angle = math.degrees(math.atan2(dy, dx))
         while angle <= -90.0:

@@ -27,11 +27,18 @@ def test_rectangle_gives_two_pairs_of_walls_with_corner_to_corner_lengths():
     assert sorted(d.text for d in dims) == sorted(["26.4'", "26.4'", "46.4'", "46.4'"])
 
 
-def test_text_is_outside_the_house():
+def test_text_is_inside_the_house_near_its_wall():
+    # 192 Geldner: текст размера внутри дома, примерно в 1.1 ft от стены, в середине стены.
     dims = off.house_wall_dimensions(RECT_HOUSE)
     for d in dims:
         x, y = d.point
-        assert not (0.0 < x < 26.4 and 0.0 < y < 46.4), "размер не должен стоять внутри дома"
+        assert 0.0 < x < 26.4 and 0.0 < y < 46.4, "размер должен стоять внутри дома"
+        (ax, ay), (bx, by) = d.start, d.end
+        dist = off._point_segment_distance(d.point, (d.start, d.end))
+        assert math.isclose(dist, off.DIMENSION_TEXT_OFFSET_FT, abs_tol=0.01)
+        mid = ((ax + bx) / 2.0, (ay + by) / 2.0)
+        along = math.hypot(d.point[0] - mid[0], d.point[1] - mid[1])
+        assert along <= off.DIMENSION_TEXT_OFFSET_FT + 1e-6
 
 
 def test_text_is_parallel_to_its_wall():

@@ -79,15 +79,23 @@ def test_label_may_stand_outside_the_lot_flag():
     assert off.LABEL_MUST_BE_INSIDE is False
 
 
-def test_walls_are_labelled_like_other_objects():
-    # Стены подписываются оффсетом по тому же правилу, что заборы. Отсутствие подписи у заказчика
-    # не считается запретом: он мог не поставить подпись по опыту.
+def test_walls_are_not_labelled_by_default():
+    # 4.14: стены не подписываются оффсетом. У Николая в эталонах оффсетов по стенам нет (0 подписей),
+    # а мы ставим лишние — по критерию «лишних не больше 50% от его подписей» правило не проходит.
+    wall = off.Feature(kind="wall", handle="W", points=((50.0, -2.0), (80.0, -2.0)))
+    plan = off.plan_offsets(SQUARE, [wall])
+    assert plan.items == []
+
+
+def test_walls_labelled_when_switched_on(monkeypatch):
+    monkeypatch.setattr(off, "WALL_OFFSETS", True)
     wall = off.Feature(kind="wall", handle="W", points=((50.0, -2.0), (80.0, -2.0)))
     plan = off.plan_offsets(SQUARE, [wall])
     assert [item.text for item in plan.items] == ["WALL 2.0'S"]
 
 
-def test_each_house_corner_gets_its_own_label_by_parallel_side():
+def test_each_house_corner_gets_its_own_label_by_parallel_side(monkeypatch):
+    monkeypatch.setattr(off, "CORNER_LABELS", True)
     # Дом у западной стороны: два угла на разном расстоянии (2.3 и 2.1 — как у Николая в Brooklyn).
     # Каждый угол подписывается до параллельной стороны участка, а не только ближайший.
     rect = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
@@ -97,7 +105,8 @@ def test_each_house_corner_gets_its_own_label_by_parallel_side():
     assert values == [2.1, 2.3]
 
 
-def test_corner_rule_keeps_one_label_for_both_ends_of_a_straight_fence():
+def test_corner_rule_keeps_one_label_for_both_ends_of_a_straight_fence(monkeypatch):
+    monkeypatch.setattr(off, "CORNER_LABELS", True)
     # Два конца прямого забора на одинаковом расстоянии от стороны — одна подпись, не две.
     plan = off.plan_offsets(SQUARE, [_fence([(50.0, -0.066), (50.0, 0.088)])])
     assert len(plan.items) == 1

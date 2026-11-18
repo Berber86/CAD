@@ -99,3 +99,22 @@ def test_same_frame_still_rejects_different_systems():
     edited = json.loads((docs / "edited for MLP 225 Aspinwall Street, Staten Island.dump.json").read_text(encoding="utf-8"))
     final = json.loads((docs / "225 Aspinwall Street, Staten Island.final.dump.json").read_text(encoding="utf-8"))
     assert not off.same_frame(edited, final).same_frame
+
+
+def test_bare_text_offsets_have_their_own_style(pair):
+    # Ответ заказчика (4.1): «3.2'S» без выноски — допустимая форма, для зданий и гаражей.
+    before, after = pair
+    added = {i.handle: i for i in off.added_offsets(before, after)}
+    assert added["26283"].style == "text"
+    assert added["2627E"].style == "text"
+    assert added["26297"].style == "leader"
+
+
+def test_front_boundary_is_m_row_line_not_widening_line(pair):
+    # M-TAX-LINE — линия расширения улицы (x = 3373.39), M-ROW-LINE — фронтовая граница (x = 3368.39).
+    _, after = pair
+    segs = off.front_boundary_segments(after)
+    assert len(segs) == 5
+    vertical_front = [s for s in segs if abs(s[0][0] - 3368.3904) < 0.01 and abs(s[1][0] - 3368.3904) < 0.01]
+    assert len(vertical_front) == 3
+    assert not any(abs(p[0] - 3373.3904) < 0.01 for s in segs for p in s)

@@ -1,7 +1,15 @@
 """
 Шаг 4 — оффсеты: подписи расстояний от дома, заборов и стен до границы участка.
 
-Каркас (версия 3.99). Что уже есть:
+Каркас (версия 4.1). Правила заказчика, которые уже учтены:
+
+- граница для оффсетов на фронте — ``M-ROW-LINE`` (актуальная граница улицы и участка);
+  ``M-TAX-LINE`` — линия расширения улицы по проекту, границей участка не считается;
+- оффсет можно записать тремя способами: размерная подпись без выноски (``\\A2;27.6'``),
+  выноска (``FE.0.6'N``), текст без стрелки (``3.2'S`` — для зданий и гаражей);
+- ``FE.0.4'N`` — оффсет от забора до границы участка (property line).
+
+Что уже есть:
 
 - разбор эталонных дампов финального чертежа заказчика: какие оффсеты он поставил и в каком виде
   (размерная подпись ``\\A2;27.6'`` или выноска ``FE.0.6'N`` / ``BLDG 5.2'W``);
@@ -36,6 +44,10 @@ LABEL_HEIGHT_FT = 0.9
 HOUSE_OFFSET_HEIGHT_FT = 1.1
 #: Слой, на котором заказчик пишет оффсеты (в финальных дампах).
 OFFSET_LAYER = "D-TOPO-TEXT"
+#: Фронтовая граница участка — актуальная граница улицы и участка (ответ заказчика, 4.1).
+FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
+#: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
+WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -85,7 +97,7 @@ class ObservedOffset:
     """Оффсет, который заказчик уже поставил на финальном чертеже (эталон для правил)."""
 
     handle: str
-    style: str  # "dimension" — размерная подпись \A2;N'; "leader" — подпись с выноской
+    style: str  # "dimension" — размерная подпись \A2;N'; "leader" — с выноской; "text" — без выноски (текстом)
     text: str  # очищенный текст
     raw: str  # как в дампе
     parts: tuple[OffsetPart, ...]
@@ -136,9 +148,11 @@ def parse_observed_offsets(dump: dict[str, Any]) -> list[ObservedOffset]:
             for m in _PART_RE.finditer(text)
         )
         if parts:
+            # Без выноски — тоже допустимая форма (ответ заказчика, 4.1): текст без стрелки,
+            # обычно для зданий и гаражей, например «3.2'S» на углу соседнего дома.
             found.append(
                 ObservedOffset(
-                    handle, "leader", text, raw, parts, height, leader, pt, rot,
+                    handle, "leader" if leader else "text", text, raw, parts, height, leader, pt, rot,
                     line_mark="O/L" in text,
                 )
             )
@@ -193,6 +207,16 @@ def same_frame(before: dict[str, Any], after: dict[str, Any]) -> FrameCheck:
         else:
             different += 1
     return FrameCheck(common=common, same=same, different=different)
+
+
+def front_boundary_segments(dump: dict[str, Any]) -> list[tuple[Point, Point]]:
+    """Отрезки фронтовой границы участка (слой ``M-ROW-LINE``) из дампа."""
+    out: list[tuple[Point, Point]] = []
+    for e in dump.get("entities", []):
+        if e.get("layer") == FRONT_BOUNDARY_LAYER and e.get("type") == "Line" and e.get("pts"):
+            a, b = e["pts"][0], e["pts"][1]
+            out.append(((float(a[0]), float(a[1])), (float(b[0]), float(b[1]))))
+    return out
 
 
 def added_offsets(before: dict[str, Any], after: dict[str, Any]) -> list[ObservedOffset]:

@@ -153,3 +153,16 @@ def test_cli_prints_observed_table(capsys):
     out = capsys.readouterr().out
     assert "Оффсетов в эталоне: 19" in out
     assert "BLDG 6.2'E" in out
+
+
+def test_leaderless_text_offsets_are_style_text():
+    # Brooklyn: «BLDG 5.2'W» и «5.2'E» без выноски — стиль text, не leader.
+    items = {i.handle: i for i in off.parse_observed_offsets(_load(FINAL_BROOKLYN))}
+    assert items["26804"].style == "text"
+    assert items["26811"].style == "text"
+
+
+def test_dimension_and_leader_styles_unchanged():
+    items = {i.handle: i for i in off.parse_observed_offsets(_load(FINAL_ASPINWALL))}
+    assert items["26627"].style == "dimension"
+    assert items["26128"].style == "leader"

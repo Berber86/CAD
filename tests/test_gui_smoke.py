@@ -5357,3 +5357,101 @@ def test_retry_finalization_still_asks_for_independent_risky_geometry(gui, monke
                                  parse_only=False, is_neighbor=False)
     assert events[0][0] == "doubt"
     assert events[0][1]["plan"].closure.distance > 0.08
+
+
+def test_developer_chat_triple_click_is_temporary_and_requests_are_independent(gui, monkeypatch):
+    import developer_chat
+    from llm_parser import TokenUsage
+    import time
+    calls = []
+    def ask(text, cfg, **kwargs):
+        calls.append((text, kwargs["provider"], kwargs["model"], kwargs["api_key"]))
+        return f"ответ {text}", TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5, available=True)
+    monkeypatch.setattr(developer_chat, "ask_once", ask)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("hydra-key")
+    app.provider_key_vars["openrouter"].set("router-key")
+    assert not getattr(app, "_developer_chat", None)
+    assert "<Triple-Button-1>" in app.brand_logo._bindings
+    assert "<Triple-Button-1>" in app.brand_title._bindings
+    app.brand_logo._bindings["<Triple-Button-1>"](None)
+    page = app._developer_chat
+    assert page is not None
+    app.brand_title._bindings["<Triple-Button-1>"](None)
+    assert app._developer_chat is page
+    app.select_provider("Hydra AI")
+    before = gui.CONFIG_PATH.read_text(encoding="utf-8")
+    page.input.insert("1.0", "секретный вопрос один")
+    page.send()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert "ответ секретный вопрос один" in page.transcript.get("1.0", "end")
+    assert "токены: 3 → 2" in page.status.get()
+    page.copy_reply()
+    assert app._clipboard == "ответ секретный вопрос один"
+    page._on_provider("OpenRouter")
+    page.model_var.set("custom/test-model")
+    page.input.insert("1.0", "вопрос два")
+    page._send_shortcut()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert calls == [("секретный вопрос один", "hydra", calls[0][2], "hydra-key"),
+                     ("вопрос два", "openrouter", "custom/test-model", "router-key")]
+    assert "секретный вопрос один" not in app.log_text()
+    assert "вопрос два" not in app.log_text()
+    assert gui.CONFIG_PATH.read_text(encoding="utf-8") == before
+    page.clear()
+    assert not page.transcript.get("1.0", "end") and not page.last_reply
+    page.close()
+    assert app._developer_chat is None
+    app._open_developer_chat()
+    assert not app._developer_chat.transcript.get("1.0", "end")
+    app._on_close()
+    assert app._developer_chat is None
+
+
+def test_developer_chat_close_or_clear_discards_inflight_answer(gui, monkeypatch):
+    import developer_chat
+    import threading
+    import time
+    started, release = threading.Event(), threading.Event()
+    def ask(*args, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return "очень секретный ответ", None
+    monkeypatch.setattr(developer_chat, "ask_once", ask)
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    page = app._developer_chat
+    page.input.insert("1.0", "test")
+    page.send()
+    assert started.wait(1)
+    page.clear()
+    assert page._inflight and "отброшен" in page.status.get()
+    release.set()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert not page._inflight and not page.transcript.get("1.0", "end")
+    assert "отброшен" in page.status.get()
+    started.clear(); release.clear()
+    page.input.insert("1.0", "again")
+    page.send()
+    assert started.wait(1)
+    page.close()
+    app._open_developer_chat()
+    fresh = app._developer_chat
+    release.set()
+    time.sleep(.03)
+    page._poll(); fresh._poll()
+    assert page._queue.empty() and not fresh.transcript.get("1.0", "end")
+    assert not fresh._inflight
+    app._on_close()

@@ -105,6 +105,7 @@ from feature_labeler import feature_settings
 from version import APP_STAMP, APP_VERSION
 import log_mode
 import local_settings
+import developer_chat
 import offsets
 import start_source
 import ui_theme
@@ -801,7 +802,7 @@ class SurveyApp(ctk.CTk):
 
         brand_box = ctk.CTkFrame(self.header, fg_color="transparent")
         brand_box.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=9)
-        ctk.CTkLabel(
+        self.brand_logo = ctk.CTkLabel(
             brand_box,
             text="📐",
             width=34,
@@ -810,17 +811,21 @@ class SurveyApp(ctk.CTk):
             fg_color=THEME["btn_primary"],
             text_color="#ffffff",
             font=ctk.CTkFont(size=15, weight="bold"),
-        ).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 10))
+        )
+        self.brand_logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 10))
+        self.brand_logo.bind("<Triple-Button-1>", self._open_developer_chat)
         brand_titles = ctk.CTkFrame(brand_box, fg_color="transparent")
         brand_titles.grid(row=0, column=1, sticky="w")
         title_row = ctk.CTkFrame(brand_titles, fg_color="transparent")
         title_row.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
+        self.brand_title = ctk.CTkLabel(
             title_row,
             text="Title Survey AI",
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#ffffff",
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.brand_title.grid(row=0, column=0, sticky="w")
+        self.brand_title.bind("<Triple-Button-1>", self._open_developer_chat)
         self.version_badge = ctk.CTkLabel(
             title_row,
             text=f"v{VERSION} · STUDIO",
@@ -5987,6 +5992,13 @@ class SurveyApp(ctk.CTk):
                 level=log_mode.LEVEL_INFO,
             )
 
+    def _open_developer_chat(self, _event: Any = None) -> None:
+        page = getattr(self, "_developer_chat", None)
+        if page is not None and not page._closed:
+            page.window.lift()
+            return
+        self._developer_chat = developer_chat.DeveloperChat(self, ctk, THEME)
+
     def _attach_child_window(self, win: Any) -> None:
         """
         Окно-отчёт (сверка с соседями, итог набора, журнал и т. п.) принадлежит главному окну:
@@ -7614,6 +7626,9 @@ class SurveyApp(ctk.CTk):
 
     # -------------------------------------------------------------- helpers --
     def _on_close(self) -> None:
+        page = getattr(self, "_developer_chat", None)
+        if page is not None:
+            page.close()
         self._persist_ai_preferences(report_error=False)
         self._closing = True
         self._generation += 1

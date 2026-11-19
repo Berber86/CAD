@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.35"
+STEP4_VERSION = "4.36"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -393,6 +393,8 @@ WALL_OFFSETS = False
 #: правилу компаса при севере 139.9° сходится. Во всех шести парах это единственные подписи
 #: стен (2 из 69), поэтому правило узкое: только в пределах ``EDGE_MAX_FT`` от фронта.
 FRONT_WALL_OFFSETS = True
+#: То же правило под именем, по которому его называет заказчик: кирпичная колонна (BRICK COLUMN).
+BRICK_COLUMN_OFFSETS = FRONT_WALL_OFFSETS
 #: R17: устой стоит **на** боковой линии участка — его вершина ближе этого к линии стороны
 #: (у Николая 0.08 и 0.31 ft; мерится до продолжения стороны, а не до её отрезка: устои
 #: стоят за фасадом, в полосе улицы).
@@ -524,6 +526,22 @@ MAX_CORNERS_PER_SIDE_HOUSE = 2
 #: разнос вдоль стороны (R13c). Кэп выше (1 для забора, 2 для дома) решает, сколько подписей
 #: ставить, а этот потолок — сколько их вообще можно поставить на одну линию.
 MAX_CORNERS_PER_SIDE_LIMIT = 2
+#: R24 (4.35, ответ заказчика 19.11.2026, вопрос 7): боковые оффсеты дома. Фронтальная сторона
+#: подписывается всегда (до двух углов). Из боковых сторон подписывается **одна — та, где
+#: расстояние до границы участка меньше**; вторая добавляется, только если её замер меньше
+#: ``HOUSE_SECOND_SIDE_FT``:
+#: «Оба фронтальных оффсета. И даю инструкции для простановки боковых оффсетов на дома: даётся
+#: один боковой оффсет — на ту сторону, где расстояние до границы участка меньше. Но если больший
+#: оффсет имеет малое значение — меньше 5, то на вторую сторону тоже даётся оффсет».
+HOUSE_SIDE_RULE = True
+#: R24: «малое значение» для второй боковой стороны дома, футы (ответ заказчика: «меньше 5»).
+HOUSE_SECOND_SIDE_FT = 5.0
+#: Кирпичная колонна (устой) в полосе улицы — R17/вопрос 12: в описаниях заказчика она называется
+#: ``BRICK COLUMN`` / ``BRICK COL.`` / ``BR.COL.``. Оффсет показывает, насколько колонна вылезла
+#: **за границу участка** — то есть до дальней от линии дороги грани (ответ 19.11.2026).
+BRICK_COLUMN_WORDS = (
+    "BRICK COLUMN", "BRICK COL", "BRICK COL.", "BR COL", "BR COL.", "BR.COL", "BR.COL."
+)
 #: R13d «перекос»: второй угол на той же стороне участка подписывается, если его замер
 #: отличается от уже подписанного хотя бы на столько, футы. У Николая подписаны оба конца
 #: стены, идущей вдоль границы непараллельно: на 378 Mother Gaston забор fence/4 подписан
@@ -1317,7 +1335,7 @@ def _feature_candidates(
     return parallel + rest
 
 
-def front_wall_offset(
+def brick_column_offset(
     feature: "Feature",
     ring: Sequence[Point],
     front_segs: Sequence[tuple[Point, Point]],
@@ -1327,22 +1345,35 @@ def front_wall_offset(
     far_slack_ft: float = 1.2,
 ) -> tuple[Point, Point, float] | None:
     """
-    R17: устой, стоящий на боковой линии участка, — замер до фронта (нижняя/верхняя улица).
+    R17 + ответ на вопрос 12 (19.11.2026): **кирпичная колонна** в полосе улицы.
+
+    Название — по заказчику: ``BRICK COLUMN`` / ``BRICK COL.`` / ``BR.COL.``
+    (``BRICK_COLUMN_WORDS``); в наших документах до 4.36 она называлась «устой».
+
+    Оффсет показывает, **насколько колонна вылезла за пределы границы участка**: меряется
+    **дальняя от линии дороги грань** (та, что глубже всего в полосе улицы), а не ближняя.
+    На 1412 East 64th Street колонны 1 × 1 ft прижаты к боковым линиям, и Николай пишет
+    `3.0'E` — 2.98 и 3.06 ft до красной линии, то есть именно дальнюю грань, а не ближнюю
+    (2.0 ft): «оффсет должен показать насколько далеко за пределы границы участка вылезла
+    данная колонна».
 
     Возвращает ``(вершина, основание на фронте, значение)`` или ``None``. Правило узкое:
 
-    * устой стоит **на** боковой линии — вершина ближе ``on_line_ft`` к продолжению стороны;
-    * устой стоит в пределах ``max_ft`` от фронта (``EDGE_MAX_FT``) — ближайшая его вершина;
-    * подписывается **задняя грань** устоя — дальняя от улицы вершина в пределах
-      ``max_ft + far_slack_ft``. На 1412 East 64th Street кирпичные устои 1 × 1 ft прижаты
-      к боковым линиям, и Николай пишет `3.0'E` — 2.98 и 3.06 ft до красной линии, то есть
-      именно заднюю грань, а не ближнюю (2.0 ft).
+    * колонна стоит **на** боковой линии участка — вершина ближе ``on_line_ft`` к продолжению
+      стороны (на 1412 East 64th обе колонны стоят в 0.08 и 0.31 ft от боковых линий);
+    * колонна стоит в пределах ``max_ft`` от фронта (``EDGE_MAX_FT``) — ближайшая её вершина;
+    * подписывается дальняя грань — самая удалённая от фронта вершина в пределах
+      ``max_ft + far_slack_ft``.
     """
     if not front_segs or len(ring) < 3:
         return None
     vertices = feature_contour(feature)[0]
     if len(vertices) < 2:
         return None
+    # Колонна стоит на боковой линии участка (0.5 ft) — на 1412 East 64th обе колонны стоят
+    # именно так (0.08 и 0.31 ft). Колонна в середине полосы улицы без привязки к боковой линии
+    # у заказчика не подписана: на том же листе третий кирпичный столб стоит в 3 ft от фронта
+    # и оффсета не получил (3.0'E стоят только у двух колонн на боковых линиях).
     near_side = min(perpendicular_line_distance(vertex, ring)[0] for vertex in vertices)
     if near_side > on_line_ft:
         return None
@@ -1372,6 +1403,180 @@ def front_wall_offset(
         sum(vertex[1] for vertex in far) / len(far),
     )
     return anchor, to_front(anchor)[1], value
+
+
+#: Прежнее имя (до 4.36 объект назывался «устой»); оставлено для совместимости.
+front_wall_offset = brick_column_offset
+
+
+def _opposite_letter(letter: str) -> str:
+    return {"N": "S", "S": "N", "E": "W", "W": "E"}.get(letter, letter)
+
+
+def _side_of_foot(foot: Point, sides: Sequence[SideLine]) -> SideLine | None:
+    """Сторона участка, на которой лежит основание перпендикуляра (допуск 0.05 ft)."""
+    best: tuple[float, SideLine] | None = None
+    for side in sides:
+        span = math.dist(side.a, side.b)
+        if span <= 1e-9:
+            continue
+        ux, uy = (side.b[0] - side.a[0]) / span, (side.b[1] - side.a[1]) / span
+        along = (foot[0] - side.a[0]) * ux + (foot[1] - side.a[1]) * uy
+        if along < -1e-6 or along > span + 1e-6:
+            continue
+        off = abs((foot[0] - side.a[0]) * side.normal[0] + (foot[1] - side.a[1]) * side.normal[1])
+        if off <= 0.05 and (best is None or off < best[0]):
+            best = (off, side)
+    return best[1] if best else None
+
+
+def front_side_letters(
+    sides: Sequence[SideLine],
+    front: Sequence[Sequence[Point]] = (),
+) -> set[str]:
+    """
+    Буквы сторон участка, которые совпадают с фронтовой линией ``M-ROW-LINE``.
+
+    ``SideLine.from_front`` помечает только **добавленные** фронтовые отрезки: если фронт
+    совпадает со стороной контура (обычный случай), ``side_lines`` выбрасывает дубль и признака
+    нет. Поэтому здесь сторона считается фронтовой по геометрии: её отрезок лежит на фронтовой
+    линии (концы не дальше 0.1 ft от неё).
+    """
+    letters: set[str] = set()
+    segs: list[tuple[Point, Point]] = []
+    for line in front:
+        pts = [(float(p[0]), float(p[1])) for p in line]
+        segs += list(zip(pts, pts[1:]))
+    for side in sides:
+        if side.from_front or not segs:
+            if side.from_front:
+                letters.add(side.letter)
+            continue
+        for a, b in segs:
+            if (
+                _point_segment_distance(side.a, (a, b)) <= 0.1
+                and _point_segment_distance(side.b, (a, b)) <= 0.1
+            ):
+                letters.add(side.letter)
+                break
+    return letters
+
+
+def house_side_filter(
+    feature: "Feature",
+    rows_by_vertex: dict[Point, list[EdgeRow]],
+    sides: Sequence[SideLine],
+    front: Sequence[Sequence[Point]] = (),
+    *,
+    second_ft: float = HOUSE_SECOND_SIDE_FT,
+) -> dict[Point, list[EdgeRow]]:
+    """
+    R24 (ответ заказчика 19.11.2026, вопрос 7): какие стороны дома подписываются.
+
+    «**Оба фронтальных оффсета.** И даю инструкции для простановки боковых оффсетов на дома:
+    даётся **один боковой оффсет — на ту сторону, где расстояние до границы участка меньше**.
+    Но если **больший оффсет имеет малое значение — меньше 5**, то на вторую сторону тоже даётся
+    оффсет».
+
+    Раскладка подписей у нас угловая (подпись у вершины), поэтому правило применяется так:
+
+    * **фронтальные** — стороны, параллельные фронтовой линии (``M-ROW-LINE``): их углы остаются
+      все (до двух на сторону, R23);
+    * **боковые** — стороны, перпендикулярные фронту: остаётся **один угол на боковую сторону**,
+      и только у той стороны, что ближе к границе участка; вторая боковая сторона получает угол
+      лишь тогда, когда её замер меньше ``second_ft``;
+    * **тыл** (сторона, противоположная фронту) правилом не описан и не трогается.
+
+    Правило работает только по замкнутому контуру дома: у разомкнутой ломаной нет ни фронтальной,
+    ни боковой стены, и подписи остаются как были.
+    """
+    if not rows_by_vertex or not sides:
+        return rows_by_vertex
+    pts, closed = feature_contour(feature)
+    if not closed or not 3 <= len(pts) <= 12:
+        return rows_by_vertex
+    front_letters = front_side_letters(sides, front)
+    if not front_letters:
+        return rows_by_vertex
+
+    def best_side(mid: Point, normal: Point) -> tuple[float, SideLine] | None:
+        """Сторона участка, к которой повёрнута стена: по параллельности нормалей, затем по замеру."""
+        best: tuple[float, float, SideLine] | None = None
+        for side in sides:
+            parallel = abs(normal[0] * side.normal[0] + normal[1] * side.normal[1])
+            if parallel < math.cos(math.radians(15.0)):
+                continue
+            off = abs((mid[0] - side.a[0]) * side.normal[0] + (mid[1] - side.a[1]) * side.normal[1])
+            if best is None or (parallel, -off) > (best[0], -best[1]):
+                best = (parallel, off, side)
+        return (best[1], best[2]) if best else None
+
+    lateral: dict[str, float] = {}
+    frontal_walls = 0
+    for index in range(len(pts)):
+        a, b = pts[index], pts[(index + 1) % len(pts)]
+        mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+        span = math.dist(a, b)
+        if span <= 1e-9:
+            continue
+        # Внешняя нормаль стены: контур обходится в любую сторону — проверяем точкой внутри.
+        nx, ny = -(b[1] - a[1]) / span, (b[0] - a[0]) / span
+        if point_in_polygon((mid[0] + nx * 0.2, mid[1] + ny * 0.2), pts):
+            nx, ny = -nx, -ny
+        found = best_side(mid, (nx, ny))
+        if found is None:
+            continue
+        letter = found[1].letter
+        if letter in front_letters:
+            frontal_walls += 1
+            continue
+        lateral[letter] = min(lateral.get(letter, found[0]), found[0])
+    if not frontal_walls:
+        # Дом стоит к границам не параллельно (ни одной стены вдоль фронта) — «фронтальных» и
+        # «боковых» стен у него не выделить, правило вопроса 7 применить нечем.
+        return rows_by_vertex
+
+    # Боковые стороны, которым подпись положена: ближняя всегда, дальняя — только при замере < 5.
+    kept_lateral: set[str] = set()
+    if lateral:
+        nearest = min(lateral, key=lambda letter: lateral[letter])
+        kept_lateral.add(nearest)
+        for letter, distance in lateral.items():
+            if letter != nearest and distance < second_ft:
+                kept_lateral.add(letter)
+
+    # Подпись у вершины: буквы всех её строк. Вершина фронтального угла (у неё есть строка на
+    # фронтовую сторону) остаётся всегда — это «оба фронтальных оффсета».
+    def letters_of(rows: Sequence[EdgeRow]) -> set[str]:
+        out: set[str] = set()
+        for row in rows:
+            side = _side_of_foot(row.foot, sides)
+            if side is not None:
+                out.add(side.letter)
+        return out
+
+    out: dict[Point, list[EdgeRow]] = {}
+    chosen_lateral: dict[str, tuple[float, Point]] = {}
+    for vertex, rows in rows_by_vertex.items():
+        letters = letters_of(rows)
+        if letters & front_letters:
+            out[vertex] = rows
+            continue
+        side = _side_of_foot(rows[0].foot, sides)
+        letter = side.letter if side is not None else rows[0].direction
+        if letter in lateral:
+            # Боковая сторона: у ближней — один угол, у дальней (если замер < 5) — тоже один.
+            if letter not in kept_lateral:
+                continue
+            best = chosen_lateral.get(letter)
+            if best is None or rows[0].value_ft < best[0]:
+                chosen_lateral[letter] = (rows[0].value_ft, vertex)
+            continue
+        # Тыл и всё, что не боковая сторона, — как было.
+        out[vertex] = rows
+    for _letter, (_value, vertex) in chosen_lateral.items():
+        out[vertex] = rows_by_vertex[vertex]
+    return out
 
 
 def plan_offsets(
@@ -1504,7 +1709,7 @@ def plan_offsets(
             # R17: единственная подпись стены — устой у улицы, замер до фронта. Без точек съёмки
             # и без красной линии правила нет: стена остаётся без оффсета, как раньше.
             if FRONT_WALL_OFFSETS and EDGE_NORMAL_OFFSETS and survey_points and front_wall_segs:
-                wall_front = front_wall_offset(
+                wall_front = brick_column_offset(
                     feature, ring, front_wall_segs,
                     max_ft=EDGE_MAX_FT, on_line_ft=ON_LINE_FT,
                 )
@@ -1585,7 +1790,7 @@ def plan_offsets(
                                 rows_by_vertex[vertex] = rows
             if feature.kind == "wall" and FRONT_WALL_OFFSETS and front_wall_segs:
                 # R17: у стены (устоя) подпись одна — замер до фронта, задней гранью устоя.
-                front_wall = front_wall_offset(
+                front_wall = brick_column_offset(
                     feature, ring, front_wall_segs, max_ft=EDGE_MAX_FT
                 )
                 if front_wall is not None:
@@ -1620,6 +1825,40 @@ def plan_offsets(
                     v: rows for v, rows in rows_by_vertex.items()
                     if vertex_describes_object(v, survey_notes_list, feature.kind)
                 }
+            if (
+                feature.kind == "house"
+                and HOUSE_SIDE_RULE
+                and HOUSE_SECOND_SIDE_FT > EDGE_MAX_FT
+            ):
+                # R24: вторая боковая сторона дома подписывается и в 3–5 ft от границы — общий
+                # предел EDGE_MAX_FT её не пускает. Расширяем предел только для боковых сторон:
+                # тыл правилом вопроса 7 не описан, у него предел остаётся общим.
+                front_letters = front_side_letters(edge_sides, front_lines)
+                rear_letters = {_opposite_letter(letter) for letter in front_letters}
+            else:
+                front_letters = set()
+            if front_letters:
+                wide = vertex_offset_rows(
+                    feature, edge_sides, max_ft=HOUSE_SECOND_SIDE_FT, ring=ring,
+                    north_deg=north_deg, keep_online=ONLINE_LABELS,
+                )
+                for vertex, rows in wide.items():
+                    if vertex in rows_by_vertex:
+                        continue
+                    side = _side_of_foot(rows[0].foot, edge_sides)
+                    if side is None or side.letter in front_letters | rear_letters:
+                        continue
+                    if len(rows) > 1:
+                        # Угол с двумя строками в тесном месте не влезает (e55 house/19) —
+                        # вторая боковая сторона остаётся без подписи, а не с предупреждением.
+                        continue
+                    rows_by_vertex[vertex] = rows
+            if feature.kind == "house" and HOUSE_SIDE_RULE:
+                # R24: фронт подписывается целиком, из боковых — только ближняя сторона,
+                # вторая — если её замер меньше HOUSE_SECOND_SIDE_FT (вопрос 7).
+                rows_by_vertex = house_side_filter(
+                    feature, rows_by_vertex, edge_sides, front_lines
+                )
             crossings: dict[Point, list[EdgeRow]] = {}
             if CROSSING_LABELS and feature.kind == "fence":
                 # Точки, где забор снаружи обходит угол участка: там Николай тоже ставит
@@ -2230,6 +2469,7 @@ class EdgeRow:
     edge_index: int  # 0 — «своя» сторона (нормаль края), 1 — ближайшая из остальных
     side_angle_deg: float  # угол стороны участка, градусы
     parallel: bool = True  # нормаль стороны параллельна нормали края вершины (R11)
+    from_front: bool = False  # замер до фронтовой линии (``M-ROW-LINE``), а не до контура, R24
 
 
 @dataclass(frozen=True)
@@ -2414,6 +2654,7 @@ def side_rows(
                     math.atan2(side.b[1] - side.a[1], side.b[0] - side.a[0])
                 ) % 180.0,
                 parallel=parallel,
+                from_front=side.from_front,
             )
         )
     rows.sort(key=lambda row: (row.edge_index, row.value_ft))
@@ -2689,7 +2930,11 @@ def vertex_describes_object(
     строения (``1 STY FRAME``, ``BRICK``, ``SHED``) или его отсутствие — эталон Николая
     подписывает углы домов, где в DESC2 стоят и размеры, и материалы.
     """
-    words = FENCE_DESC_WORDS if kind == "fence" else WALL_DESC_WORDS if kind == "wall" else ()
+    words = (
+        FENCE_DESC_WORDS if kind == "fence"
+        else tuple(WALL_DESC_WORDS) + BRICK_COLUMN_WORDS if kind == "wall"
+        else ()
+    )
     for point, description in notes:
         if math.dist(vertex, point) > snap_ft:
             continue

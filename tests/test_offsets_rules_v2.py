@@ -140,6 +140,70 @@ def test_front_wall_pier_is_measured_to_the_street_line():
     assert item.value_ft == pytest.approx(3.0, abs=0.06)
 
 
+def _house_plan(far_ft: float):
+    """Дом 2 ft от западной стороны, `far_ft` от восточной, фронт — южная сторона участка."""
+    house = off.Feature(
+        "house", "H",
+        ((2.0, 3.0), (100.0 - far_ft, 3.0), (100.0 - far_ft, 20.0), (2.0, 20.0)),
+        closed=True,
+    )
+    corners = [(2.0, 3.0), (100.0 - far_ft, 3.0), (100.0 - far_ft, 20.0), (2.0, 20.0)]
+    return off.plan_offsets(
+        SQUARE, [house], front=[[(0.0, 0.0), (100.0, 0.0)]],
+        survey_pts=corners, survey_notes=[(p, "1 STY BRICK") for p in corners],
+    )
+
+
+def test_house_side_offset_goes_to_the_nearer_side_only():
+    """
+    R24 (4.36, ответ заказчика на вопрос 7): «даётся один боковой оффсет — на ту сторону, где
+    расстояние до границы участка меньше. Но если больший оффсет имеет малое значение — меньше 5,
+    то на вторую сторону тоже даётся оффсет».
+
+    Дом в 2 ft от западной стороны и в 9 ft от восточной: подписи только у ближней боковой
+    стороны (2.0'E) и у обоих фронтальных углов (3.0'N); дальней боковой (9.0'W) нет.
+    """
+    plan = _house_plan(9.0)
+    texts = [item.text for item in plan.items]
+    assert not any("9.0'W" in text for text in texts), texts
+    assert sum(1 for text in texts if "3.0'N" in text) == 2, texts  # оба фронтальных
+    assert sum(1 for text in texts if "2.0'E" in text) == 2, texts  # угол фасада + ближний боковой
+    assert len(plan.items) == 3, texts
+
+
+def test_house_second_side_is_added_when_the_larger_offset_is_under_five():
+    """R24: больший боковой оффсет меньше 5 ft — подписывается и вторая боковая сторона."""
+    plan = _house_plan(4.0)
+    texts = [item.text for item in plan.items]
+    assert any("4.0'W" in text for text in texts), texts
+    assert len(plan.items) == 4, texts
+
+
+def test_brick_column_is_named_like_the_customer_and_measured_to_the_far_face():
+    """
+    Вопрос 12 (ответ 19.11.2026): объект называется **BRICK COLUMN** (`BRICK COL.`, `BR.COL.`),
+    а оффсет показывает, насколько колонна вылезла за границу участка, — меряется дальняя от
+    линии дороги грань.
+    """
+    assert "BRICK COLUMN" in off.BRICK_COLUMN_WORDS
+    assert "BRICK COL." in off.BRICK_COLUMN_WORDS and "BR.COL." in off.BRICK_COLUMN_WORDS
+    # Колонна 1 × 1 ft стоит на западной линии участка в полосе улицы (как две колонны на
+    # 1412 East 64th): ближняя к улице грань в 2 ft от красной линии, дальняя — в 3 ft.
+    # Оффсет — 3.0 (насколько колонна вылезла за границу), а не 2.0 по ближней грани.
+    front = ((-20.0, -4.0), (120.0, -4.0))
+    column = off.Feature(
+        kind="wall", handle="BR.COL.",
+        points=((-1.0, -2.0), (0.0, -2.0), (0.0, -1.0), (-1.0, -1.0)),
+    )
+    plan = off.plan_offsets(
+        SQUARE, [column], front=[front],
+        survey_pts=[(0.0, -2.0), (-1.0, -1.0)],
+        survey_notes=[((0.0, -2.0), "BRICK COL."), ((-1.0, -1.0), "BR.COL.")],
+    )
+    assert [item.text for item in plan.items] == ["3.0'N"], [(i.text, i.kind) for i in plan.items]
+    assert plan.items[0].anchor == pytest.approx((-0.5, -1.0), abs=0.05)
+
+
 def test_front_wall_needs_survey_points_and_a_street_line():
     """R17 без точек съёмки или без красной линии не включается: стена остаётся без оффсета."""
     pier = off.Feature(

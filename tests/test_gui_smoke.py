@@ -748,18 +748,18 @@ def test_main_returns_console_to_screen_when_startup_fails(gui, monkeypatch, tmp
     assert shown == ["show"]
 
 
-def test_relaunch_after_update_hides_helper_console(gui, monkeypatch):
-    """Вспомогательный cmd запускается без своего окна: новое окно создаёт только start."""
+def test_relaunch_after_update_uses_explicit_cmd_c(gui, monkeypatch):
+    """cmd /c (not start /k) closes when the batch ends."""
     import subprocess
 
     app = gui.SurveyApp()
-    launched: list[dict] = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(dict(kw)))
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
     monkeypatch.setattr(gui.sys, "platform", "win32")
     assert app._relaunch_after_update() == ""
-    assert launched, "run.bat не запущен"
-    expected = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
-    assert launched[0].get("creationflags") == expected
+    command, options = launched[0]
+    assert command[1:] == ["/d", "/v:off", "/c", "run.bat"]
+    assert options["creationflags"] == int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
 
 
 def test_main_returns_success_after_mainloop(gui, monkeypatch):
@@ -4506,8 +4506,8 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     asked: list[tuple[str, str]] = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (asked.append((title, text)) or True))
-    launched: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    launched: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
@@ -4520,13 +4520,12 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
     assert restart_questions, "вопрос о перезапуске не показан"
     assert "Перезапустить" in restart_questions[0]
     assert launched, "run.bat не запущен"
-    assert launched[0][:3] == ["cmd", "/c", "start"]
-    assert launched[0][-1].endswith("run.bat")
+    assert launched[0][0][1:] == ["/d", "/v:off", "/c", "run.bat"]
     # run.bat ищется рядом с main.py, а не в текущей папке запуска.
     from pathlib import Path as _Path
 
-    assert _Path(launched[0][-1]) == _Path(gui.__file__).resolve().parent / "run.bat"
-    assert destroyed, "окно должно закрыться после успешного запуска нового экземпляра"
+    assert _Path(launched[0][1]["cwd"]) == _Path(gui.__file__).resolve().parent
+    assert not destroyed, "выход не должен зависеть от потенциально блокирующего destroy"
     assert exit_codes == [0], "процесс старой версии должен завершиться, иначе окно run.bat висит"
 
 
@@ -4666,8 +4665,8 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
 
     questions: list[tuple[str, str]] = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (questions.append((title, text)) or True))
-    launched: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    launched: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
@@ -4680,8 +4679,8 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
     assert not (app_dir / "fresh.py").exists()
     assert any(title == "Откат версии" for title, _ in questions)
     assert any(title == "Откат выполнен" for title, _ in questions)
-    assert launched and launched[0][-1].endswith("run.bat")
-    assert destroyed
+    assert launched and launched[0][0][-1] == "run.bat"
+    assert not destroyed
     assert exit_codes == [0]
     assert app.rollback_button.cget("state") == "disabled"
 
@@ -5048,3 +5047,28 @@ def test_theme_atomic_replace_failure_preserves_local_data(gui, monkeypatch):
     assert app.theme_var.get() == "Голубоватая"
     assert "не сохранена" in app.status_var.get()
     assert not list(gui.LOCAL_CONFIG_PATH.parent.glob(".theme-*.tmp"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="проверка cmd.exe доступна только в Windows")
+def test_relaunch_real_cmd_handles_special_characters(gui, tmp_path, monkeypatch):
+    import time
+    work = tmp_path / "CAD & test (папка! %PATH%)"
+    work.mkdir()
+    (work / "run.bat").write_bytes(b'@echo off\r\necho ok>started.txt\r\nexit 0\r\n')
+    app = gui.SurveyApp()
+    monkeypatch.setattr(gui, "__file__", str(work / "main.py"))
+    assert app._relaunch_after_update() == ""
+    deadline = time.monotonic() + 20
+    while not (work / "started.txt").exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert (work / "started.txt").exists()
+
+
+def test_declining_restart_keeps_current_work(gui, monkeypatch):
+    from tkinter import messagebox
+    app = gui.SurveyApp()
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
+    monkeypatch.setattr(app, "_relaunch_after_update", lambda: pytest.fail("must not relaunch"))
+    monkeypatch.setattr(app, "_exit_process", lambda code: pytest.fail("must not exit"))
+    app._offer_restart("Обновление", "Перезапустить?", base_text="Готово")
+    assert not app._closing

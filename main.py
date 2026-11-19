@@ -6068,7 +6068,7 @@ class SurveyApp(ctk.CTk):
             self._offer_restart(
                 "Обновление завершено",
                 f"Обновлено файлов: {result.files_written}.{kept_note}\n\n"
-                "Перезапустить программу сейчас?",
+                "Перезапустить программу сейчас? Несохранённая работа в этом окне будет потеряна.",
                 base_text=str(self.update_status_label.cget("text")),
             )
         else:
@@ -6086,8 +6086,8 @@ class SurveyApp(ctk.CTk):
         """
         Спрашивает о перезапуске и, если пользователь согласен, запускает run.bat.
 
-        Окно закрывается только после успешного запуска нового экземпляра. Иначе
-        оно остаётся открытым, а причина и инструкция пишутся рядом с итогом.
+        Окно закрывается после запуска помощника run.bat. Если запустить помощник
+        не удалось, оно остаётся открытым, а причина и инструкция пишутся рядом с итогом.
         """
         from tkinter import messagebox
 
@@ -6117,27 +6117,16 @@ class SurveyApp(ctk.CTk):
                 pass
 
     def _exit_after_relaunch(self) -> None:
-        """
-        Завершает процесс старой версии после того, как новый уже запущен.
+        """После запуска помощника завершаем процесс: Windows закроет старое окно.
 
-        Окно run.bat старой версии ждёт, пока завершится python.exe. Одного destroy()
-        недостаточно: если процесс задерживается (фоновые потоки, очистка интерпретатора),
-        cmd висит. Поэтому после destroy() выходим сразу с кодом 0 — run.bat тогда
-        дойдёт до конца и закроет своё окно, а не предложит откат.
+        Tk destroy() может зависнуть при завершении виджетов/фоновых потоков;
+        не вызываем его перед принудительным выходом, иначе старое окно остаётся.
         """
-        try:
-            self.destroy()
-        except Exception:  # noqa: BLE001 - выходим в любом случае
-            pass
+        self._closing = True
         self._exit_process(0)
 
     def _exit_process(self, code: int) -> None:
-        """Немедленный выход процесса (отдельным методом, чтобы тесты не завершали pytest)."""
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:  # noqa: BLE001
-                pass
+        """Немедленный выход (отдельный метод, чтобы не завершать pytest)."""
         os._exit(code)
 
     def _set_rollback_enabled(self, enabled: bool) -> None:
@@ -6212,7 +6201,8 @@ class SurveyApp(ctk.CTk):
         self._offer_restart(
             "Откат выполнен",
             f"После перезапуска программа продолжит работу на версии "
-            f"{result.version or 'неизвестна'}.\n\nПерезапустить программу сейчас?",
+            f"{result.version or 'неизвестна'}.\n\nПерезапустить программу сейчас? "
+            "Несохранённая работа в этом окне будет потеряна.",
             base_text=text,
         )
 
@@ -6230,16 +6220,12 @@ class SurveyApp(ctk.CTk):
             return f"не найден {run_bat.name} в папке программы"
         if sys.platform != "win32":
             return "автоматический перезапуск работает в Windows"
-        # CREATE_NO_WINDOW: сам вспомогательный cmd не должен показывать окно.
-        # Новое окно создаёт только start — в нём run.bat печатает прогресс проверки
-        # зависимостей и закрывается сам, как только поднимет новую версию (4.41).
-        flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        # Явный /c вместо start; относительное имя батника с cwd исключает
+        # разбор спецсимволов и %переменных% из пути папки программой cmd.
+        command = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/v:off", "/c", "run.bat"]
+        flags = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
         try:
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", str(run_bat)],
-                cwd=str(run_bat.parent),
-                creationflags=flags,
-            )
+            subprocess.Popen(command, cwd=str(run_bat.parent), creationflags=flags)
         except OSError as exc:
             return f"{type(exc).__name__}: {exc}"
         return ""

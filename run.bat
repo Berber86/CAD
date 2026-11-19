@@ -43,17 +43,21 @@ rem Окно cmd закрывается сразу после запуска п�
 rem отдельным процессом без консоли, cmd его не ждёт и не остаётся в панели задач.
 rem Раньше cmd ждал завершения python.exe, а обновление заменяло run.bat прямо во
 rem время его выполнения - старое окно зависало, и за несколько обновлений их
-rem накапливалось несколько штук.
+rem накапливалось несколько штук. exit закрывает также cmd, открытый через /k
+rem старым механизмом обновления (в том числе при ручном запуске из cmd).
 if exist ".venv\Scripts\pythonw.exe" (
+    rem OCR необязателен: сбросить его код ошибки перед проверкой start.
+    "%ComSpec%" /d /c exit 0
     start "" ".venv\Scripts\pythonw.exe" main.py
-    goto :eof
+    if errorlevel 1 goto :launch_error
+    exit 0
 )
 rem Запасной путь (pythonw.exe не нашёлся): программа работает в этой консоли,
 rem но прячет её, как только окно появится - см. console_window.py.
 set "TSAI_HIDE_CONSOLE=1"
 ".venv\Scripts\python.exe" main.py
 if not "%errorlevel%"=="0" goto :launch_error
-goto :eof
+exit 0
 
 :launch_error
 echo.

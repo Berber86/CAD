@@ -180,3 +180,52 @@ def test_install_error_does_not_start_application(launcher_dir):
     assert result.returncode == 1
     assert not (launcher_dir / "started.txt").exists()
     assert b"tsai_crash.log" not in result.stdout
+
+
+def test_successful_launcher_exits_cmd_even_if_started_with_k():
+    text = (ROOT / "run.bat").read_text(encoding="utf-8")
+    success = text.split('if exist ".venv\\Scripts\\pythonw.exe" (', 1)[1].split(")\nrem Запасной путь", 1)[0]
+    assert 'start "" ".venv\\Scripts\\pythonw.exe" main.py' in success
+    assert "if errorlevel 1 goto :launch_error" in success
+    assert "exit 0" in success and "exit /b" not in success
+
+
+@requires_windows
+def test_launcher_closes_cmd_k_while_program_remains_running(launcher_dir):
+    """The old updater could launch the batch under /k, not /c."""
+    (launcher_dir / "requirements.txt").write_text("", encoding="utf-8")
+    (launcher_dir / "main.py").write_text(
+        "from pathlib import Path\nimport time\n"
+        "Path('started.txt').write_text('ok')\n"
+        "for _ in range(600):\n"
+        "    if Path('release.txt').exists(): break\n"
+        "    time.sleep(0.1)\n"
+        "Path('finished.txt').write_text('ok')\n", encoding="utf-8",
+    )
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith("PIP_") and key.upper() not in {"PYTHONPATH", "PYTHONHOME"}}
+    env.update(PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull, USERPROFILE=str(launcher_dir))
+    with (launcher_dir / "console.log").open("wb") as log:
+        process = subprocess.Popen([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/k", "run.bat"],
+                                   cwd=launcher_dir, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=subprocess.STDOUT)
+        try:
+            assert process.wait(timeout=120) == 0
+            assert _wait_for(launcher_dir / "started.txt")
+            assert not (launcher_dir / "finished.txt").exists()
+        finally:
+            (launcher_dir / "release.txt").touch()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    assert _wait_for(launcher_dir / "finished.txt")
+
+
+@requires_windows
+def test_failed_optional_ocr_does_not_block_launch(launcher_dir):
+    (launcher_dir / "requirements.txt").write_text("", encoding="utf-8")
+    (launcher_dir / "requirements-ocr.txt").write_text("--invalid-test-option\n", encoding="utf-8")
+    (launcher_dir / "main.py").write_text("from pathlib import Path\nPath('started.txt').touch()\n", encoding="utf-8")
+    result = _run_launcher(launcher_dir)
+    assert result.returncode == 0, result.stdout.decode("utf-8", errors="replace")
+    assert _wait_for(launcher_dir / "started.txt")

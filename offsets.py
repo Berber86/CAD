@@ -42,7 +42,7 @@ import json
 import math
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -397,6 +397,17 @@ GATE_SKIP_FT = 4.0
 CORNER_MAX_FT = 6.0
 #: Часть подписи (значение + буква) не дублируется у того же угла ближе этого расстояния, футы.
 PART_DUPLICATE_FT = 2.0
+#: Угол забора подписывается только если он ближе к стороне, чем соседние вершины (H31).
+CORNER_LOCAL_MIN = True
+#: Насколько соседняя вершина должна быть дальше, чтобы угол считался местным минимумом, футы.
+CORNER_LOCAL_MIN_FT = 0.15
+#: Конец забора дальше ``OUTSIDE_MAX_FT`` снаружи подписывается, если соседний отрезок забора не короче
+#: этого, футы. 192 Geldner «FE.5.2'S» — конец 33-футового забора; на Brooklyn такой же конец
+#: 6-футового выступа (5.3) Николай не подписал (H33).
+FENCE_END_MIN_LENGTH_FT = 20.0
+#: Короткая подпись у того же угла, чья часть уже есть в полной («FE.1.2'S» рядом с
+#: «FE.0.1'E / 1.2'S»), не ставится: это одна и та же привязка (H32).
+POST_PART_DEDUPE = True
 #: Вторая сторона у той же вершины ищется и на продолжении стороны (H29), не дальше этого, футы.
 #: Николай: «W.FE. 0.1'E / 1.2'S» (северная сторона продолжена за восточный угол), «C.L.F. 0.6'S / 1.1'E».
 SECOND_SIDE_EXTENSION_FT = 5.0
@@ -421,6 +432,8 @@ class OffsetCandidate:
     inside: bool  # вершина внутри участка
     outside_ft: float = 0.0  # если снаружи — расстояние до контура участка, футы; внутри 0
     segment: int = -1  # номер отрезка объекта (для параллельных углов); -1 — ближайшая сторона без отрезка
+    #: До какого расстояния снаружи объект ещё подписывается: у обследованного конца забора — 6 ft (H33).
+    allowed_outside_ft: float = OUTSIDE_MAX_FT
 
 
 def measure_candidates(
@@ -964,15 +977,29 @@ def _surveyed_fence_corners(
         return []
     corners: list[OffsetCandidate] = []
     seen: set[tuple[float, str]] = set()
-    for candidate, _parallel in sorted(
-        _vertex_candidates(ring, feature),
-        key=lambda item: (round_offset_ft(item[0].distance_ft), not item[0].inside, item[0].distance_ft),
-    ):
-        if candidate.outside_ft > OUTSIDE_MAX_FT:
+    points = list(feature.points)
+    for index, (candidate, _parallel) in enumerate(_vertex_candidates(ring, feature)):
+        if candidate.outside_ft > CORNER_MAX_FT:
             continue
         value = round_offset_ft(candidate.distance_ft)
         if value < 0.1 or candidate.distance_ft > CORNER_MAX_FT:
             continue
+        # Концы забора подписываются всегда; внутренние вершины сравниваются с геометрическими соседями.
+        if 0 < index < len(points) - 1:
+            if CORNER_LOCAL_MIN:
+                prev_d = min(
+                    (d for d, _f, _s in _side_projections(points[index - 1], ring, True)),
+                    default=0.0,
+                )
+                next_d = min(
+                    (d for d, _f, _s in _side_projections(points[index + 1], ring, True)),
+                    default=0.0,
+                )
+                if (
+                    prev_d < candidate.distance_ft + CORNER_LOCAL_MIN_FT
+                    and next_d < candidate.distance_ft + CORNER_LOCAL_MIN_FT
+                ):
+                    continue
         description = _survey_description(candidate.vertex, survey)
         if not _is_fence_description(description):
             continue
@@ -987,7 +1014,21 @@ def _surveyed_fence_corners(
         if key in seen:
             continue
         seen.add(key)
+        # H33: конец обследованного забора подписывается и в 5–6 ft снаружи, если это конец длинного
+        # прогона (192 Geldner «FE.5.2'S»), а не короткий выступ (Brooklyn 5.3 у 6-футового отрезка).
+        if candidate.outside_ft > OUTSIDE_MAX_FT:
+            lengths = []
+            if index > 0:
+                lengths.append(math.dist(points[index - 1], candidate.vertex))
+            if index < len(points) - 1:
+                lengths.append(math.dist(candidate.vertex, points[index + 1]))
+            if min(lengths, default=0.0) < FENCE_END_MIN_LENGTH_FT:
+                continue
+            candidate = replace(candidate, allowed_outside_ft=CORNER_MAX_FT)
         corners.append(candidate)
+    corners.sort(
+        key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft)
+    )
     return corners
 
 
@@ -1157,7 +1198,7 @@ def plan_offsets(
         feature_candidates = _feature_candidates(
             ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg
         )
-        candidates = [c for c in feature_candidates if c.outside_ft <= OUTSIDE_MAX_FT]
+        candidates = [c for c in feature_candidates if c.outside_ft <= c.allowed_outside_ft]
         if not candidates:
             plan.skipped.append((label, "объект вне участка"))
             continue
@@ -1297,7 +1338,47 @@ def plan_offsets(
             plan.items.append(item)
             known.append((item.text, item.point, item.height_ft))
             used.add(seg_key)
+
+    if POST_PART_DEDUPE and plan.items:
+        # Часть, которая уже стоит в полной выноске у того же угла, отдельной подписью не повторяется.
+        kept: list[OffsetItem] = []
+        for item in plan.items:
+            parts = _text_parts(item.text)
+            redundant = len(parts) == 1 and any(
+                len(_text_parts(other.text)) > 1
+                and parts[0] in _text_parts(other.text)
+                and math.dist(item.anchor, other.anchor) <= PART_DUPLICATE_FT
+                for other in plan.items
+                if other is not item and other.kind == item.kind
+            )
+            if redundant:
+                plan.skipped.append((item.kind, f"«{item.text}» уже есть в полной подписи рядом"))
+                continue
+            kept.append(item)
+        plan.items = kept
     return plan
+
+
+def _line_projections(
+    point: Point, line: Sequence[Point], closed: bool, extension_ft: float,
+) -> list[tuple[float, Point]]:
+    """Расстояние до каждой стороны как до прямой, с продолжением за концы на ``extension_ft``."""
+    out: list[tuple[float, Point]] = []
+    segments = list(zip(line, line[1:]))
+    if closed and len(line) > 2:
+        segments.append((line[-1], line[0]))
+    for a, b in segments:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            continue
+        t = ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (length * length)
+        if not (-extension_ft / length <= t <= 1.0 + extension_ft / length):
+            continue
+        foot = (a[0] + t * dx, a[1] + t * dy)
+        distance = abs((point[0] - a[0]) * dy - (point[1] - a[1]) * dx) / length
+        out.append((distance, foot))
+    return out
 
 
 def _extra_sides(
@@ -1312,8 +1393,8 @@ def _extra_sides(
     for line, closed in boundaries:
         # H29: основание может лежать на продолжении стороны за углом (не дальше SECOND_SIDE_EXTENSION_FT).
         # Пример: «W.FE. 0.1'E / 1.2'S» — северная сторона продолжена за восточный угол участка.
-        for distance, foot, _index in _side_projections(
-            vertex, line, closed, extension_ft=SECOND_SIDE_EXTENSION_FT
+        for distance, foot in _line_projections(
+            vertex, line, closed, SECOND_SIDE_EXTENSION_FT
         ):
             if math.dist(foot, best_foot) < 1e-6 or distance > SECOND_SIDE_FT:
                 continue

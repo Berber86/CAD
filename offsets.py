@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.37"
+STEP4_VERSION = "4.38"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -407,6 +407,39 @@ ON_LINE_FT = 0.5
 #: 2.96 при тех же подписях (63) и совпадениях (35). Начать сразу с 1.2–1.5 ft нельзя — две
 #: подписи перестают влезать (63 → 61, 35 → 33). Замер: docs/step4_spatial_measure.py.
 LEADER_DISTANCES_FT = (2.0, 2.6, 1.5, 1.0, 0.5, 0.0, 3.2)
+#: R26 (4.38, замер по шести листам): подпись забора и стены стоит ПО ДРУГУЮ сторону линии
+#: участка от объекта — то есть выноска идёт через линию наружу, а не вдоль неё. У Николая
+#: 35 из 40 подписей забора снаружи контура участка в 1.5–3.0 ft от линии (медиана 2.42),
+#: внутри — только 5, и все у забора, который сам стоит снаружи линии (текст тогда внутри,
+#: то есть снова «с другой стороны от объекта»). Наши подписи до правила прижаты к линии
+#: с обеих сторон: медиана просвета 0.93 ft против его 2.42, и выноска длиннее его
+#: (медиана 3.51 против 2.61), потому что текст искался вдоль линии, а не поперёк.
+FENCE_TEXT_ACROSS_LINE = True
+#: Насколько центр блока должен отойти за линию в «поперечном» заходе, ft: у Николая минимум
+#: 1.48 ft, но это уже с его выноской 2.2 ft; ограничиваем только тем, что блок не должен
+#: лежать на самой линии (половина высоты плюс зазор дают это и так).
+FENCE_TEXT_ACROSS_MIN_FT = 0.0
+#: R27 (4.38, замер по шести листам): подпись дома не лежит на линии участка. У Николая просвет
+#: от края блока до линии ≥ 0.78 ft у всех 13 оффсетных подписей дома (снаружи медиана 2.29,
+#: внутри участка — у выносок в глубине строения — 3.7–9.0); у нас до правила 15 подписей дома
+#: с просветом 0.1–0.7 ft, то есть блок касался линии границы. Первый ярус раскладки требует
+#: просвет не меньше этого, дальше — прежние ярусы (подпись важнее просвета).
+#:
+#: Флаг ВЫКЛЮЧЕН (0.0): замер с просветом 0.8 дал совпадений 47 → 46 и предупреждений 2 → 3
+#: (1373 East 55th: текст дома не встал ни с просветом, ни без него, подпись потерялась вместе
+#: с совпадением; забор 50 → 49 каскадом из-за занятого места). По регламенту (§15) правило не
+#: включается, пока метрика хуже хотя бы на одном чертеже. Вернуться к нему вместе с ответом
+#: Николая на вопрос 11 (где он держит текст дома относительно линии).
+HOUSE_TEXT_LINE_GAP_MIN_FT = 0.0
+#: Просвет между блоком подписи и линией участка в поперечном заходе, ft: у Николая край блока
+#: стоит в 1.5–2.6 ft от линии (медиана 2.0, p90 2.6 по 36 подписям забора снаружи контура),
+#: у нас до правила — 0.9–1.6 ft, блок прилипал к линии. Верхняя граница — его p90 по всем
+#: подписям забора (4.6 ft): дальше текст отрывается от своего места.
+FENCE_TEXT_LINE_GAP_FT = (1.4, 4.6)
+#: Порядок направлений в поперечном заходе: сначала наружу от линии (выноска через линию),
+#: затем по кругу, как раньше.
+ACROSS_LEADER_ANGLES_DEG = (0.0, 30.0, -30.0, 60.0, -60.0, 90.0, -90.0, 120.0, -120.0, 150.0, -150.0, 180.0)
+ACROSS_LEADER_DISTANCES_FT = (0.5, 1.0, 1.5, 2.0, 2.6, 3.2)
 #: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
 LEADER_ANGLES_DEG = (90, -90, 60, -60, 120, -120, 30, -30, 150, -150, 0, 180)
 #: Зазор текста до линии и выноски, доля высоты текста.
@@ -1325,17 +1358,87 @@ def _place_house_text(
     return None
 
 
+def _line_gap_ok(rect: Rect, foot: Point, line_angle_deg: float, min_gap: float) -> bool:
+    """Край блока не ближе ``min_gap`` к линии измерения (R26/R27): блок не лежит на границе."""
+    ux, uy = math.cos(math.radians(line_angle_deg)), math.sin(math.radians(line_angle_deg))
+    nx, ny = -uy, ux
+    center = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0)
+    c_side = (center[0] - foot[0]) * nx + (center[1] - foot[1]) * ny
+    extent = abs(nx) * (rect[2] - rect[0]) / 2.0 + abs(ny) * (rect[3] - rect[1]) / 2.0
+    return abs(c_side) - extent >= min_gap
+
+
+def _across_line(
+    feature: "Feature", rows: Sequence["EdgeRow"], foot: Point | None = None,
+) -> tuple[Point, float] | None:
+    """
+    Линия измерения для поперечного захода выноски (R26): ``(точка на линии, угол линии)``.
+
+    Только забор и стена: у Николая их подписи стоят по другую сторону линии участка от
+    объекта (35 из 40 подписей забора снаружи контура, в 1.5–3.0 ft от линии). У дома подпись
+    живёт у стены строения — внутри него или снаружи участка, — и поперечное правило там
+    только мешало бы.
+    """
+    if not FENCE_TEXT_ACROSS_LINE or feature.kind not in ("fence", "wall") or not rows:
+        return None
+    row = rows[0]
+    return (foot if foot is not None else row.foot), row.side_angle_deg
+
+
 def _place_leader(
     anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
     ok: Callable[[Rect, Point], bool], factor: float,
+    across: tuple[Point, float] | None = None,
 ) -> tuple[Point, Point] | None:
-    """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
+    """
+    Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые.
+
+    ``across`` = ``(точка на линии измерения, угол линии)`` — R26: первым заходом текст ищется
+    ПО ДРУГУЮ сторону этой линии от объекта (выноска через линию наружу), и только в наружной
+    полусфере направлений; не нашлось места — прежний круговой поиск. У Николая подписи забора
+    стоят именно так: снаружи линии участка в 1.5–3.0 ft, конец выноски у края текста.
+    """
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
     # Текст выноски у Николая горизонтален всегда — поворот к нему не применяется (R10).
     width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
-    for extra in LEADER_DISTANCES_FT:
-        for angle in LEADER_ANGLES_DEG:
+    searches: list[tuple[Sequence[float], Callable[[Rect, Point], bool] | None, Sequence[float]]] = [
+        (LEADER_ANGLES_DEG, None, LEADER_DISTANCES_FT)
+    ]
+    if across is not None:
+        foot, line_angle_deg = across
+        ux, uy = math.cos(math.radians(line_angle_deg)), math.sin(math.radians(line_angle_deg))
+        nx, ny = -uy, ux
+        obj_side = (anchor[0] - foot[0]) * nx + (anchor[1] - foot[1]) * ny
+
+        def across_ok(rect: Rect, center: Point) -> bool:
+            c_side = (center[0] - foot[0]) * nx + (center[1] - foot[1]) * ny
+            if c_side * obj_side >= 0.0:
+                return False  # текст с той же стороны линии, что и объект — не его случай
+            extent = abs(nx) * (rect[2] - rect[0]) / 2.0 + abs(ny) * (rect[3] - rect[1]) / 2.0
+            gap = abs(c_side) - extent
+            if not FENCE_TEXT_LINE_GAP_FT[0] <= gap <= FENCE_TEXT_LINE_GAP_FT[1]:
+                return False
+            return ok(rect, center)
+
+        searches.insert(0, (ACROSS_LEADER_ANGLES_DEG, across_ok, ACROSS_LEADER_DISTANCES_FT))
+    for angles, side_ok, distances in searches:
+        spot = _leader_search(
+            anchor, base, text, width, block_h, gap, factor, height, angles,
+            ok if side_ok is None else side_ok, distances,
+        )
+        if spot is not None:
+            return spot
+    return None
+
+
+def _leader_search(
+    anchor: Point, base: float, text: str, width: float, block_h: float, gap: float,
+    factor: float, height: float, angles: Sequence[float], ok: Callable[[Rect, Point], bool],
+    distances: Sequence[float] = LEADER_DISTANCES_FT,
+) -> tuple[Point, Point] | None:
+    for extra in distances:
+        for angle in angles:
             a = base + math.radians(angle)
             ux, uy = math.cos(a), math.sin(a)
             # Расстояние до центра блока — половина его габарита в направлении выноски плюс
@@ -2152,11 +2255,18 @@ def plan_offsets(
                 plain_text = leader_text
                 if feature.kind == "house" and HOUSE_LEADER_PREFIX:
                     leader_text = "\n".join([HOUSE_LEADER_PREFIX, *leader_text.split("\n")])
-                spot = _place_leader(best.vertex, best.foot, leader_text, height, width_of, ok, factor)
+                across = None
+                if FENCE_TEXT_ACROSS_LINE and feature.kind in ("fence", "wall") and best.segment >= 0:
+                    a = ring[best.segment % len(ring)]
+                    b = ring[(best.segment + 1) % len(ring)]
+                    across = (best.foot, math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])))
+                spot = _place_leader(
+                    best.vertex, best.foot, leader_text, height, width_of, ok, factor, across=across
+                )
                 if spot is None and leader_text != plain_text:
                     leader_text = plain_text
                     spot = _place_leader(
-                        best.vertex, best.foot, leader_text, height, width_of, ok, factor
+                        best.vertex, best.foot, leader_text, height, width_of, ok, factor, across=across
                     )
                 if spot is None:
                     plan.warnings.append(
@@ -2432,8 +2542,24 @@ def _plan_edge_labels(
             if test is not None
         ]
 
-        def first_spot(placer) -> Point | None:
-            for test in tiers:
+        gap_tiers = tiers
+        if feature.kind == "house" and HOUSE_TEXT_LINE_GAP_MIN_FT > 0:
+            # R27: первым ярусом — место с просветом до линии измерения, как у Николая. Только
+            # для текста без выноски: у выноски место диктует длина стрелки, и в тесном lote
+            # (1373 East 55th) требование просвета снимало подпись и совпадение.
+            gap_foot, gap_angle = primary.foot, rows[0].side_angle_deg
+            gap_tiers = [
+                *(
+                    (lambda test: lambda rect, center: _line_gap_ok(
+                        rect, gap_foot, gap_angle, HOUSE_TEXT_LINE_GAP_MIN_FT
+                    ) and test(rect, center))(test)
+                    for test in tiers
+                ),
+                *tiers,
+            ]
+
+        def first_spot(placer, use_gap: bool = True) -> Point | None:
+            for test in gap_tiers if use_gap else tiers:
                 spot = placer(test)
                 if spot is not None:
                     return spot
@@ -2462,6 +2588,17 @@ def _plan_edge_labels(
         if beside is None and feature.kind == "house" and HOUSE_TEXT_OUTSIDE:
             # Снаружи места не нашлось — второй заход по-старому: внутри строения, потом сбоку.
             inside_tiers = [test for test in (ok_lot, ok_strict, ok) if test is not None]
+            if HOUSE_TEXT_LINE_GAP_MIN_FT > 0:
+                gap_foot2, gap_angle2 = primary.foot, rows[0].side_angle_deg
+                inside_tiers = [
+                    *(
+                        (lambda test: lambda rect, center: _line_gap_ok(
+                            rect, gap_foot2, gap_angle2, HOUSE_TEXT_LINE_GAP_MIN_FT
+                        ) and test(rect, center))(test)
+                        for test in inside_tiers
+                    ),
+                    *inside_tiers,
+                ]
             for test in inside_tiers:
                 beside = _place_house_text(
                     contour, vertex, primary.foot, label_text, height, width_of, test, rotation
@@ -2495,10 +2632,13 @@ def _plan_edge_labels(
             leader_text = label_text
             if feature.kind == "house" and not bare_number and HOUSE_LEADER_PREFIX:
                 leader_text = "\n".join([HOUSE_LEADER_PREFIX, *label_text.split("\n")])
+            across = _across_line(feature, rows)
             spot = first_spot(
                 lambda test: _place_leader(
-                    vertex, primary.foot, leader_text, height, width_of, test, factor
-                )
+                    vertex, primary.foot, leader_text, height, width_of, test, factor,
+                    across=across,
+                ),
+                use_gap=False,
             )
             if spot is None and leader_text != label_text:
                 # Двухстрочный блок со строкой типа в тесном месте не влезает (1373 East 55th:
@@ -2507,8 +2647,10 @@ def _plan_edge_labels(
                 leader_text = label_text
                 spot = first_spot(
                     lambda test: _place_leader(
-                        vertex, primary.foot, leader_text, height, width_of, test, factor
-                    )
+                        vertex, primary.foot, leader_text, height, width_of, test, factor,
+                        across=across,
+                    ),
+                    use_gap=False,
                 )
             if spot is None:
                 plan.warnings.append(
@@ -2558,11 +2700,14 @@ def _plan_edge_labels(
                 for old, p, _h in known
             )
             spot = None
+            online_across = _across_line(feature, online[vertex], foot=vertex)
             if not same_near:
                 spot = _place_leader(
-                    vertex, vertex, o_l_text, height, width_of, ok_strict, factor
+                    vertex, vertex, o_l_text, height, width_of, ok_strict, factor,
+                    across=online_across,
                 ) or _place_leader(
-                    vertex, vertex, o_l_text, height, width_of, ok, factor
+                    vertex, vertex, o_l_text, height, width_of, ok, factor,
+                    across=online_across,
                 )
             if spot is None:
                 if not same_near:

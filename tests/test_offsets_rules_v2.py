@@ -409,3 +409,56 @@ def test_label_without_number_is_not_a_part_of_the_neighbouring_label():
     assert "FE.0.3'N\nFE.1.0'E" in texts
     assert "FE.O/L" in texts
     assert off._part_keys("FE.O/L") == set()
+
+
+def test_fence_label_goes_across_the_lot_line_like_the_customer():
+    """
+    R26 (4.38): подпись забора стоит по другую сторону линии участка от объекта.
+
+    У Николая 36 из 45 подписей забора — снаружи контура участка, край блока в 1.5–2.6 ft от
+    линии (медиана 2.0); внутри — только у забора, который сам стоит снаружи линии. Забор
+    в 0.2 ft внутри южной стороны: с правилом центр подписи уходит за линию, просвет от края
+    блока до линии попадает в его полосу 1.4–4.6 ft; без правила блок прилипал к линии
+    (просвет < 1.4) или оставался внутри.
+    """
+    fence = off.Feature(kind="fence", handle="F", points=((20.0, 0.2), (60.0, 0.2)))
+    points = [(20.0, 0.2), (60.0, 0.2)]
+    def gap_of(plan, vertex):
+        item = min(plan.items, key=lambda it: math.dist(it.anchor, vertex))
+        width, height = off._text_block(item.text, item.height_ft, lambda t, h: len(t) * h * 0.7)
+        rect = off._rect_at(item.point, width, height)
+        return item, min(abs(rect[1]), abs(rect[3]))  # южная линия участка — y = 0
+
+    saved = off.FENCE_TEXT_ACROSS_LINE
+    off.FENCE_TEXT_ACROSS_LINE = True
+    try:
+        plan = off.plan_offsets(SQUARE, [fence], survey_pts=points)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = saved
+    assert {item.text for item in plan.items} == {"FE.0.2'N"}
+    item, gap = gap_of(plan, points[0])
+    assert item.point[1] < 0.0  # объект внутри участка — текст снаружи линии
+    assert off.FENCE_TEXT_LINE_GAP_FT[0] <= gap <= off.FENCE_TEXT_LINE_GAP_FT[1], gap
+    # Без правила блок прилипает к линии: просвет меньше его полосы.
+    saved = off.FENCE_TEXT_ACROSS_LINE
+    off.FENCE_TEXT_ACROSS_LINE = False
+    try:
+        plain = off.plan_offsets(SQUARE, [fence], survey_pts=points)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = saved
+    plain_item, gap0 = gap_of(plain, points[0])
+    assert gap0 < gap or plain_item.point[1] > 0.0, (gap0, gap)
+
+
+def test_fence_label_falls_back_when_across_has_no_room():
+    """
+    R26 не теряет подпись: если снаружи линии места нет (там чужой текст), остаётся прежний
+    круговой поиск выноски.
+    """
+    fence = off.Feature(kind="fence", handle="F", points=((20.0, 0.2), (60.0, 0.2)))
+    points = [(20.0, 0.2), (60.0, 0.2)]
+    blocker = [("NEIGHBOR TEXT BLOCK", (40.0, -2.0), 1.1), ("ANOTHER NEIGHBOR", (40.0, -3.5), 1.1)]
+    plan = off.plan_offsets(SQUARE, [fence], survey_pts=points, texts=blocker)
+    assert {item.text for item in plan.items} == {"FE.0.2'N"}
+    assert len(plan.items) == 2  # оба угла подписаны, ни один не потерян из-за правила
+    assert not plan.warnings

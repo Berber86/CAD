@@ -834,7 +834,9 @@ def test_text_is_kept_off_the_lot_sides():
         off.TEXT_LOT_GAP_FT = saved
     assert len(off_gaps) == len(plain_gaps)
     # Подписи не теряются: у всех, кому просвет не достался, остаётся прежнее место.
-    assert statistics.median(off_gaps) > statistics.median(plain_gaps) + 0.05
+    # С 4.38 просвет забору уже даёт R26 (выноска через линию), поэтому вклад первой ступени
+    # R19 меньше, чем был на 4.32 (0.65 → 0.78): медиана растёт, но на сотые доли фута.
+    assert statistics.median(off_gaps) > statistics.median(plain_gaps) + 0.01
     assert statistics.median(off_gaps) >= 0.7
     # Прижатых к границе подписей не становится больше.
     assert sum(1 for gap in off_gaps if gap < 0.05) <= sum(1 for gap in plain_gaps if gap < 0.05)
@@ -1017,3 +1019,73 @@ def test_whole_side_on_the_line_rule_is_measured_and_off():
     assert base[3] == dict.fromkeys(names, 0)
     # Единственная верная подпись — рядом с подписью заказчика и с той же стороны от стены.
     assert wide[4] is not None and wide[4] < 3.5, wide
+
+
+def test_fence_text_stands_off_the_lot_line_like_the_customer():
+    """
+    R26 (4.38): выноска забора и стены идёт через линию участка наружу — подпись стоит по
+    другую сторону линии от объекта, краем блока в 1.5–2.6 ft от неё, как у Николая.
+
+    Замер по шести парам (прямоугольник текста до ближайшей линии участка, `bbox` его подписей
+    против нашего габарита): у него снаружи контура 36 подписей забора из 45, просвет медиана
+    **2.23** (p10 1.50, p90 4.63), внутри 9 (медиана 1.87); у нас до правила снаружи 40 из 55 с
+    просветом **1.62** — блок прилипал к линии. С R26: снаружи медиана **2.05**, внутри **1.76**.
+    Совпадения и предупреждения не меняются (90 / 84 / **47** / **2**): правило двигает текст
+    в пределах радиуса сопоставления (6 ft), поэтому метрика совпадений к нему не чувствительна,
+    а чертёж становится похож на его. Тест держит и то, и другое: совпадения те же, просвет
+    снаружи ближе к его медиане, чем без правила.
+    """
+    paths = [PRIMER3, PRIMER2, PRIMER1, PRIMER4, PRIMER5, PRIMER7]
+
+    def gap(width_of):
+        import math as _math
+
+        def rect_of(item):
+            w, h = off._text_block(item.text, item.height_ft, width_of)
+            return off._rect_at(item.point, w, h)
+
+        def dist(rect, side):
+            return min(
+                off._point_segment_distance(p, (side.a, side.b))
+                for p in ((rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3]))
+            )
+
+        totals = labels = hits = warnings = 0
+        outside = []
+        for path in paths:
+            before, after = load_pair(path)
+            polygon = _lot_polygon(before)
+            ring = [(float(x), float(y)) for x, y in polygon.exterior.coords]
+            sides = off.side_lines(ring, front_lines(before), north_deg(before))
+            data, _nikolai = field_plan(before, after)
+            plan = data["plan"]
+            warnings += len(plan.warnings)
+            got = plan_labels(plan)
+            labels += len(got)
+            hits += score_labels(got, nikolai_labels(before, after))
+            for item in plan.items:
+                if item.kind not in ("fence", "wall"):
+                    continue
+                rect = rect_of(item)
+                side = min(sides, key=lambda s: dist(rect, s))
+                if not off.point_in_polygon(item.point, ring):
+                    outside.append(dist(rect, side))
+        outside.sort()
+        return (labels, hits, warnings), statistics.median(outside)
+
+    width_of = lambda text, height: len(text) * height * off.TEXT_CHAR_WIDTH
+    saved = off.FENCE_TEXT_ACROSS_LINE
+    off.FENCE_TEXT_ACROSS_LINE = True
+    try:
+        across, gap_across = gap(width_of)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = False
+    try:
+        plain, gap_plain = gap(width_of)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = saved
+    assert across == (84, 47, 2), across  # plan_labels считает числовые подписи
+    assert plain == across, plain
+    # Его медиана просвета снаружи 2.23: с правилом мы ближе к ней, чем без правила (1.62).
+    assert gap_across == pytest.approx(2.05, abs=0.15), gap_across
+    assert gap_plain < gap_across - 0.2, (gap_plain, gap_across)

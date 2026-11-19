@@ -242,46 +242,50 @@ def normalize_house_text(value: Any) -> str:
     lines = [" ".join(line.split()) for line in raw.split("\n")]
     return "\n".join(line for line in lines if line)
 
-# Палитра Dark CAD Studio v1.0 (Spectrum-редизайн, slate-плоскости, инженерная сетка)
+# Premium Dark: насыщенные графитово-чернильные поверхности, лавандовый акцент.
+# Цвета геометрии CAD намеренно оставлены прежними: красный участок, голубые
+# соседи и жёлтые привязки несут смысл и не должны меняться при редизайне.
 THEME: dict[str, str] = {
-    "bg_root": "#0a111a",
-    "bg_header": "#0f1926",
-    "bg_card": "#0d1622",
-    "bg_inset": "#0d1622",
-    "bg_editor": "#080e16",
-    "bg_field": "#020617",
-    "border_card": "#23354d",
-    "border_subtle": "#1e293b",
-    "border_active": "#3b82f6",
-    "text_main": "#eaf1fb",
-    "text_muted": "#94a3b8",
-    "text_dim": "#475569",
-    "blue_soft_bg": "#0c1c33",
-    "blue_soft_fg": "#bfdbfe",
-    "seg_sel": "#334155",
-    "side_label": "#a7b6c9",
+    "bg_root": "#0b0d16",
+    "bg_header": "#111321",
+    "bg_card": "#171a29",
+    "bg_inset": "#141725",
+    "bg_editor": "#0a0d17",
+    "bg_field": "#101321",
+    "border_card": "#34394e",
+    "border_subtle": "#2b3042",
+    "border_active": "#a69bff",
+    "text_main": "#f2f3fa",
+    "text_muted": "#b7bfd1",
+    "text_dim": "#9ca5bb",
+    "blue_soft_bg": "#292344",
+    "blue_soft_fg": "#ddd7ff",
+    "seg_sel": "#3b375b",
+    "side_label": "#bac4d6",
     "grid_axis": "#4d6381",
-    "btn_primary": "#2563eb",
-    "btn_primary_hover": "#1d4ed8",
-    "btn_neighbor": "#0d9488",
-    "btn_neighbor_hover": "#0f766e",
-    "btn_secondary": "#1c2c40",
-    "btn_secondary_hover": "#283d58",
-    "btn_amber": "#b45309",
-    "btn_amber_hover": "#d97706",
-    "btn_emerald": "#059669",
-    "btn_emerald_hover": "#10b981",
-    "badge_v1_bg": "#05251b",
-    "badge_v1_border": "#14543c",
-    "badge_v1_fg": "#6ee7b7",
-    "ok": "#34d399",
-    "ok_bg": "#05251b",
+    "btn_primary": "#594bc4",
+    "btn_primary_hover": "#6656d6",
+    "btn_neighbor": "#0d766f",
+    "btn_neighbor_hover": "#0f7a72",
+    "btn_secondary": "#252b3e",
+    "btn_secondary_hover": "#343b52",
+    "btn_amber": "#a54808",
+    "btn_amber_hover": "#ab500d",
+    "btn_emerald": "#08785c",
+    "btn_emerald_hover": "#087c5d",
+    "version_bg": "#27213f",
+    "version_fg": "#d6caff",
+    "badge_v1_bg": "#102d29",
+    "badge_v1_border": "#275e50",
+    "badge_v1_fg": "#87e8c3",
+    "ok": "#65deb1",
+    "ok_bg": "#102d29",
     "warn": "#fbbf24",
-    "warn_bg": "#231708",
-    "warn_border": "#92400e",
-    "err": "#f87171",
-    "err_border": "#b91c1c",
-    "sky": "#7dd3fc",
+    "warn_bg": "#302318",
+    "warn_border": "#9d6323",
+    "err": "#ff9097",
+    "err_border": "#b94c5b",
+    "sky": "#9adcf8",
     "cad_grid": "#132235",
     "cad_grid_minor": "#101c2c",
     "cad_prop": "#f87171",
@@ -291,9 +295,9 @@ THEME: dict[str, str] = {
     "cad_tie": "#fbbf24",
     "cad_hover": "#fde047",
     "cad_origin": "#94a3b8",
-    "icon_purple": "#a78bfa",
-    "teal_soft_bg": "#042f2e",
-    "teal_soft_fg": "#5eead4",
+    "icon_purple": "#c2b5ff",
+    "teal_soft_bg": "#123c39",
+    "teal_soft_fg": "#7ce8db",
 }
 
 
@@ -825,9 +829,9 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(
             brand_box,
             text="📐",
-            width=30,
-            height=30,
-            corner_radius=8,
+            width=34,
+            height=34,
+            corner_radius=10,
             fg_color=THEME["btn_primary"],
             text_color="#ffffff",
             font=ctk.CTkFont(size=15, weight="bold"),
@@ -839,23 +843,23 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(
             title_row,
             text="Title Survey AI",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#ffffff",
         ).grid(row=0, column=0, sticky="w")
         self.version_badge = ctk.CTkLabel(
             title_row,
             text=f"v{VERSION} · STUDIO",
             font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=THEME["badge_v1_bg"],
+            fg_color=THEME["version_bg"],
             corner_radius=5,
             padx=7,
             pady=1,
-            text_color=THEME["badge_v1_fg"],
+            text_color=THEME["version_fg"],
         )
         self.version_badge.grid(row=0, column=1, sticky="w", padx=(8, 0))
         ctk.CTkLabel(
             brand_titles,
-            text="Legal Description → AutoCAD",
+            text="LEGAL DESCRIPTION  /  AUTOCAD",
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
         ).grid(row=1, column=0, sticky="w", pady=(1, 0))
@@ -1016,7 +1020,8 @@ class SurveyApp(ctk.CTk):
             main_wrap,
             fg_color=THEME["bg_card"],
             corner_radius=0,
-            border_width=0,
+            border_width=1,
+            border_color=THEME["border_subtle"],
             width=360,
         )
         self.left_panel.grid(row=0, column=0, sticky="nsew")
@@ -1062,7 +1067,8 @@ class SurveyApp(ctk.CTk):
             main_wrap,
             fg_color=THEME["bg_card"],
             corner_radius=0,
-            border_width=0,
+            border_width=1,
+            border_color=THEME["border_subtle"],
             width=RESULT_PANEL_DEFAULT_WIDTH,
         )
         self.right_panel.grid(row=0, column=3, sticky="nsew")
@@ -2138,9 +2144,9 @@ class SurveyApp(ctk.CTk):
         engine_card = ctk.CTkFrame(
             input_frame,
             fg_color=THEME["bg_field"],
-            corner_radius=8,
+            corner_radius=10,
             border_width=1,
-            border_color=THEME["border_subtle"],
+            border_color=THEME["border_card"],
         )
         engine_card.grid(row=6, column=0, sticky="ew", padx=16, pady=(10, 0))
         engine_card.grid_columnconfigure(1, weight=1)
@@ -2159,7 +2165,7 @@ class SurveyApp(ctk.CTk):
             width=24,
             height=24,
             corner_radius=6,
-            fg_color="#1e1b3a",
+            fg_color=THEME["blue_soft_bg"],
             text_color=THEME["icon_purple"],
             font=ctk.CTkFont(size=12),
         ).grid(row=1, column=0, padx=(10, 8), pady=(0, 6))
@@ -2998,7 +3004,7 @@ class SurveyApp(ctk.CTk):
     # ------------------------------------------- глобальные вкладки шагов ---
     def _build_step_tab_bar(self) -> None:
         """Полоса глобальных вкладок: Шаг 1 (граница участка) | Шаг 2 (подписи объектов)."""
-        bar = ctk.CTkFrame(self, corner_radius=0, fg_color=THEME["bg_root"], border_width=0)
+        bar = ctk.CTkFrame(self, corner_radius=0, fg_color=THEME["bg_header"], border_width=0)
         bar.grid(row=1, column=0, sticky="ew")
         bar.grid_columnconfigure(len(STEP_TABS), weight=1)
         self.step_tab_bar = bar
@@ -5210,7 +5216,7 @@ class SurveyApp(ctk.CTk):
             dot.configure(
                 text="✓" if state == "done" else str(idx + 1),
                 fg_color=THEME["btn_emerald"] if state == "done" else (THEME["btn_primary"] if state == "active" else THEME["border_subtle"]),
-                text_color="#06281c" if state == "done" else ("#ffffff" if state == "active" else THEME["text_dim"]),
+                text_color="#ffffff" if state in ("done", "active") else THEME["text_dim"],
             )
             lbl.configure(text_color=fg_label)
 

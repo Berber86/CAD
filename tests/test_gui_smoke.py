@@ -4850,3 +4850,42 @@ def test_find_branch_disables_update_and_reports_result(gui, monkeypatch):
     assert not app._update_running
     assert "9.0" in app.update_status_label.cget("text")
     assert app.update_version_button.cget("state") == "normal"
+
+
+def _theme_contrast(first, second):
+    """WCAG contrast ratio for opaque hexadecimal GUI colors."""
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        channels = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
+        return sum(v * weight for v, weight in zip(channels, (0.2126, 0.7152, 0.0722)))
+    low, high = sorted((luminance(first), luminance(second)))
+    return (high + 0.05) / (low + 0.05)
+
+
+def test_premium_theme_readability_and_cad_colors(gui):
+    theme = gui.THEME
+    for foreground in ("text_main", "text_muted", "text_dim"):
+        for background in ("bg_root", "bg_header", "bg_card", "bg_field", "bg_editor"):
+            assert _theme_contrast(theme[foreground], theme[background]) >= 4.5, (foreground, background)
+    for background in ("btn_primary", "btn_primary_hover", "btn_neighbor", "btn_neighbor_hover",
+                       "btn_amber", "btn_amber_hover", "btn_emerald", "btn_emerald_hover"):
+        assert _theme_contrast(theme["text_main"], theme[background]) >= 4.5, background
+    assert _theme_contrast(theme["badge_v1_fg"], theme["badge_v1_bg"]) >= 4.5
+    assert _theme_contrast(theme["version_fg"], theme["version_bg"]) >= 4.5
+    # Geometry colors identify kinds of objects and should not change with UI skin.
+    assert theme["cad_prop"] == "#f87171"
+    assert theme["cad_neighbor"] == "#22d3ee"
+    assert theme["cad_tie"] == "#fbbf24"
+
+
+def test_premium_theme_keeps_navigation_and_actions(gui):
+    app = gui.SurveyApp()
+    assert app.header.cget("fg_color") == gui.THEME["bg_header"]
+    assert app.version_badge.cget("fg_color") == gui.THEME["version_bg"]
+    assert app.left_panel.cget("border_color") == gui.THEME["border_subtle"]
+    assert app.right_panel.cget("border_color") == gui.THEME["border_subtle"]
+    for tab, button in app.step_tab_buttons.items():
+        app._select_step_tab(tab)
+        assert button.cget("fg_color") == gui.THEME["btn_primary"]
+    assert callable(app.draw_button.cget("command"))
+    assert callable(app.update_version_button.cget("command"))

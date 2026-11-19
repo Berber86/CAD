@@ -4864,8 +4864,9 @@ def _theme_contrast(first, second):
     return (high + 0.05) / (low + 0.05)
 
 
-def test_premium_theme_readability_and_cad_colors(gui):
-    theme = gui.THEME
+@pytest.mark.parametrize("key", ["blue", "lavender", "gray"])
+def test_premium_theme_readability_and_cad_colors(gui, key):
+    theme = gui.ui_theme.PALETTES[key]
     for foreground in ("text_main", "text_muted", "text_dim"):
         for background in ("bg_root", "bg_header", "bg_card", "bg_field", "bg_editor"):
             assert _theme_contrast(theme[foreground], theme[background]) >= 4.5, (foreground, background)
@@ -4895,7 +4896,7 @@ def test_premium_theme_keeps_navigation_and_actions(gui):
 
 
 def test_neutral_theme_uses_gray_surfaces_and_accent_tokens(gui):
-    theme = gui.THEME
+    theme = gui.ui_theme.PALETTES["gray"]
     keys = ("bg_root", "bg_header", "bg_card", "bg_inset", "bg_editor", "bg_field",
             "border_card", "border_subtle", "border_active", "text_main", "text_muted",
             "text_dim", "accent_soft_bg", "accent_soft_fg", "accent_icon", "seg_sel",
@@ -4921,7 +4922,9 @@ def test_neutral_customtkinter_defaults_do_not_reintroduce_blue(gui, monkeypatch
     }
     theme = {name: {field: "#1F6AA5" for field in options} for name, options in fields.items()}
     monkeypatch.setattr(gui.ctk, "ThemeManager", types.SimpleNamespace(theme=theme), raising=False)
-    gui._apply_neutral_widget_defaults()
+    gui.THEME.clear()
+    gui.THEME.update(gui.ui_theme.PALETTES["gray"])
+    gui._apply_widget_theme_defaults()
     for options in theme.values():
         for color in options.values():
             assert color[1:3] == color[3:5] == color[5:7], color
@@ -4967,3 +4970,81 @@ def test_actual_draw_scene_adds_one_draft_not_neighbor_copies(gui, monkeypatch):
         assert copy.start == pytest.approx((edge.start[0] + 1000, edge.start[1]))
         assert copy.end == pytest.approx((edge.end[0] + 1000, edge.end[1]))
     app._on_close()
+
+
+@pytest.mark.parametrize("key,label", [("blue", "Голубоватая"), ("lavender", "Лавандовая"), ("gray", "Серая")])
+def test_theme_selection_is_saved_and_applied_on_next_launch(gui, key, label):
+    import json
+    # Local settings take precedence over the shipped configuration and must survive saves.
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"api": {"custom": "keep"}, "ui": {"other": 42, "theme": "gray"}}), encoding="utf-8")
+    app = gui.SurveyApp()
+    before = dict(gui.THEME)
+    app.theme_var.set(label)
+    app._on_theme_changed(label)
+    assert dict(gui.THEME) == before  # no redraw or data loss during the session
+    assert "перезапуска" in app.status_var.get()
+    saved = json.loads(gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert saved == {"api": {"custom": "keep"}, "ui": {"other": 42, "theme": key}}
+    assert app._build_runtime_config()[0]["ui"]["theme"] == key
+    restarted = gui.SurveyApp()
+    assert restarted.theme_var.get() == label
+    assert gui.THEME == gui.ui_theme.PALETTES[key]
+    assert restarted.header.cget("fg_color") == gui.ui_theme.PALETTES[key]["bg_header"]
+
+
+def test_theme_save_failure_keeps_selection_and_file(gui, monkeypatch):
+    app = gui.SurveyApp()
+    gui.LOCAL_CONFIG_PATH.write_text('{broken', encoding="utf-8")
+    app.theme_var.set("Серая")
+    app._on_theme_changed("Серая")
+    assert app.theme_var.get() == "Голубоватая"
+    assert app.config_data.get("ui", {}).get("theme") is None
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == '{broken'
+    assert "не сохранена" in app.status_var.get()
+
+
+@pytest.mark.parametrize("value", [None, "unknown", [], {}, 7])
+def test_theme_invalid_value_falls_back_to_blue(gui, value):
+    assert gui.ui_theme.from_config({"ui": {"theme": value}}) == "blue"
+    assert gui.ui_theme.from_config({"ui": value}) == "blue"
+
+
+def test_themes_share_cad_colors_and_have_distinct_surfaces(gui):
+    palettes = gui.ui_theme.PALETTES
+    assert len({p["bg_root"] for p in palettes.values()}) == 3
+    assert all(set(p) == set(palettes["gray"]) for p in palettes.values())
+    for key in ("cad_prop", "cad_front", "cad_neighbor", "cad_tie", "cad_street"):
+        assert len({p[key] for p in palettes.values()}) == 1
+
+
+@pytest.mark.parametrize("key", ["blue", "lavender", "gray"])
+def test_widget_defaults_use_selected_palette_before_root(gui, monkeypatch, key):
+    import json
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"ui": {"theme": key}}), encoding="utf-8")
+    custom = {"CTkButton": {}, "CTkSwitch": {}, "CTkOptionMenu": {}}
+    monkeypatch.setattr(gui.ctk, "ThemeManager", types.SimpleNamespace(theme=custom), raising=False)
+    original_init = _FakeCTkRoot.__init__
+
+    def check_theme_on_root_creation(root, *args, **kwargs):
+        assert gui.THEME == gui.ui_theme.PALETTES[key]
+        assert custom["CTkButton"]["fg_color"] == gui.THEME["btn_primary"]
+        assert custom["CTkSwitch"]["progress_color"] == gui.THEME["control_on"]
+        original_init(root, *args, **kwargs)
+
+    monkeypatch.setattr(_FakeCTkRoot, "__init__", check_theme_on_root_creation)
+    gui.SurveyApp()
+
+
+def test_theme_atomic_replace_failure_preserves_local_data(gui, monkeypatch):
+    contents = '{"ui": {"theme": "blue"}, "key": "preserve"}'
+    gui.LOCAL_CONFIG_PATH.write_text(contents, encoding="utf-8")
+    app = gui.SurveyApp()
+    def fail(*args):
+        raise OSError("write failed")
+    monkeypatch.setattr(gui.ui_theme.os, "replace", fail)
+    app.theme_var.set("Лавандовая")
+    app.theme_switch.cget("command")("Лавандовая")
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == contents
+    assert app.theme_var.get() == "Голубоватая"
+    assert "не сохранена" in app.status_var.get()
+    assert not list(gui.LOCAL_CONFIG_PATH.parent.glob(".theme-*.tmp"))

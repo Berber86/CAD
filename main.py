@@ -106,6 +106,7 @@ from version import APP_STAMP, APP_VERSION
 import log_mode
 import offsets
 import start_source
+import ui_theme
 from llm_parser import (
     ASPENWALL_SAMPLES,
     legal_to_step0_text,
@@ -242,70 +243,14 @@ def normalize_house_text(value: Any) -> str:
     lines = [" ".join(line.split()) for line in raw.split("\n")]
     return "\n".join(line for line in lines if line)
 
-# Premium Dark: чёрно-серые поверхности и нейтральные акценты.
+# Активная палитра задаётся при запуске по сохранённой теме интерфейса.
 # Цвета предпросмотра CAD показывают назначение: зелёный PL, красный фасад,
 # голубые соседи и жёлтые привязки.
-THEME: dict[str, str] = {
-    "bg_root": "#0d0d0d",
-    "bg_header": "#141414",
-    "bg_card": "#1b1b1b",
-    "bg_inset": "#181818",
-    "bg_editor": "#0b0b0b",
-    "bg_field": "#131313",
-    "border_card": "#3d3d3d",
-    "border_subtle": "#333333",
-    "border_active": "#a5a5a5",
-    "text_main": "#f2f2f2",
-    "text_muted": "#bdbdbd",
-    "text_dim": "#a6a6a6",
-    "accent_soft_bg": "#303030",
-    "accent_soft_fg": "#e2e2e2",
-    "seg_sel": "#484848",
-    "side_label": "#bfbfbf",
-    "grid_axis": "#4d6381",
-    "btn_primary": "#484848",
-    "btn_primary_hover": "#555555",
-    "control_off": "#303030",
-    "control_on": "#777777",
-    "btn_neighbor": "#0d766f",
-    "btn_neighbor_hover": "#0f7a72",
-    "btn_secondary": "#292929",
-    "btn_secondary_hover": "#393939",
-    "btn_amber": "#a54808",
-    "btn_amber_hover": "#ab500d",
-    "btn_emerald": "#08785c",
-    "btn_emerald_hover": "#087c5d",
-    "version_bg": "#303030",
-    "version_fg": "#e2e2e2",
-    "badge_v1_bg": "#102d29",
-    "badge_v1_border": "#275e50",
-    "badge_v1_fg": "#87e8c3",
-    "ok": "#65deb1",
-    "ok_bg": "#102d29",
-    "warn": "#fbbf24",
-    "warn_bg": "#302318",
-    "warn_border": "#9d6323",
-    "err": "#ff9097",
-    "err_border": "#b94c5b",
-    "sky": "#9adcf8",
-    "cad_grid": "#132235",
-    "cad_grid_minor": "#101c2c",
-    "cad_prop": "#34d399",
-    "cad_front": "#f87171",
-    "cad_neighbor": "#22d3ee",
-    "cad_street": "#f87171",
-    "cad_street_text": "#7dd3fc",
-    "cad_tie": "#fbbf24",
-    "cad_hover": "#fde047",
-    "cad_origin": "#94a3b8",
-    "accent_icon": "#d2d2d2",
-    "teal_soft_bg": "#123c39",
-    "teal_soft_fg": "#7ce8db",
-}
+THEME: dict[str, str] = dict(ui_theme.PALETTES[ui_theme.DEFAULT])
 
 
-def _apply_neutral_widget_defaults() -> None:
-    """Убрать синие дефолты CustomTkinter до сборки окна, не меняя смысловые статусы."""
+def _apply_widget_theme_defaults() -> None:
+    """Применить цвета выбранной темы к стандартным виджетам до сборки окна."""
     manager = getattr(ctk, "ThemeManager", None)
     theme = getattr(manager, "theme", None)
     if not isinstance(theme, dict):
@@ -517,9 +462,12 @@ class SurveyApp(ctk.CTk):
     def __init__(self) -> None:
         # Тема — до создания окна: иначе корень создаётся в светлой теме и весь
         # интерфейс перекрашивается уже на глазах (лишний проход перерисовки).
+        config_data = load_config()
+        THEME.clear()
+        THEME.update(ui_theme.PALETTES[ui_theme.from_config(config_data)])
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-        _apply_neutral_widget_defaults()
+        _apply_widget_theme_defaults()
         super().__init__()
         # Окно НЕ показывается, пока не собрано целиком: пока оно скрыто, виджеты
         # создаются и рисуются в памяти без перерисовок на экране — пользователь видит
@@ -551,7 +499,7 @@ class SurveyApp(ctk.CTk):
         self.attributes("-topmost", False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.config_data: dict[str, Any] = load_config()
+        self.config_data: dict[str, Any] = config_data
         self.pdf_path: Path | None = None
         self.neighbor_pdf_paths: list[Path] = []
         self._pending_neighbor_pdfs: set[Path] = set()
@@ -1479,6 +1427,27 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=400,
         ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        theme_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
+                                  border_width=1, border_color=THEME["border_subtle"])
+        theme_card.grid(row=6, column=0, sticky="ew", pady=(4, 10))
+        theme_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(theme_card, text="ТЕМА ИНТЕРФЕЙСА",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=THEME["text_dim"], anchor="w").grid(
+                         row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.theme_var = ctk.StringVar(value=ui_theme.LABELS[ui_theme.from_config(self.config_data)])
+        self.theme_switch = ctk.CTkSegmentedButton(
+            theme_card, values=list(ui_theme.LABELS.values()), variable=self.theme_var,
+            height=28, fg_color=THEME["bg_editor"], unselected_color=THEME["bg_editor"],
+            selected_color=THEME["btn_primary"], selected_hover_color=THEME["btn_primary_hover"],
+            command=self._on_theme_changed,
+        )
+        self.theme_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
+        ctk.CTkLabel(theme_card, text="Тема сохранится и применится после перезапуска программы.",
+                     font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
+                     anchor="w", justify="left", wraplength=400).grid(
+                         row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
@@ -9855,6 +9824,21 @@ class SurveyApp(ctk.CTk):
         if isinstance(self.config_data, dict):
             self.config_data.setdefault("ui", {})["start_source"] = key
         self._set_status(f"Стартовая вкладка: {start_source.label_for(key)} (со следующего запуска)")
+
+    def _on_theme_changed(self, _value: str | None = None) -> None:
+        key = ui_theme.key_for_label(self.theme_var.get())
+        previous = ui_theme.from_config(self.config_data)
+        try:
+            ui_theme.save_to_file(LOCAL_CONFIG_PATH, key)
+        except (OSError, ValueError) as exc:
+            self.theme_var.set(ui_theme.LABELS[previous])
+            self._set_status(f"Тема не сохранена в config.local.json: {exc}", warn=True)
+            return
+        if isinstance(self.config_data, dict):
+            if not isinstance(self.config_data.get("ui"), dict):
+                self.config_data["ui"] = {}
+            self.config_data["ui"]["theme"] = key
+        self._set_status(f"Тема: {ui_theme.LABELS[key]} (после перезапуска программы)")
 
     def _apply_log_mode(self) -> None:
         """Переключатель «Подробный журнал»: сохраняет режим и перерисовывает все журналы."""

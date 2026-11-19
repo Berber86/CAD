@@ -46,12 +46,12 @@ def test_fence_vertex_on_lot_line_gets_online_label(online_on):
     assert "FE.O/L" in texts
 
 
-def test_online_label_is_a_leader_next_to_the_fence(online_on):
+def test_online_label_is_text_next_to_the_fence(online_on):
     fence = _fence([(0.0, 15.0), (3.0, 15.0), (3.0, 25.0)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
     online = [it for it in plan.items if it.text == "FE.O/L"]
     assert len(online) == 1
-    assert online[0].style == "leader"
+    assert online[0].style == "text" and online[0].leader is None
     assert online[0].value_ft == 0.0
 
 

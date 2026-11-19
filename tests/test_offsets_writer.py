@@ -14,6 +14,17 @@ from test_feature_labeling import FakeEntity, build_scene, fake_autocad
 WHOLE_LOT = [(-5.0, -5.0), (50.0, -5.0), (50.0, 110.0), (-5.0, 110.0)]
 
 
+def _text_objects(plan) -> int:
+    """Сколько объектов TEXT создаёт план: у подписи без выноски каждая строка — свой TEXT."""
+    total = 0
+    for item in plan.items:
+        if item.style == "text":
+            total += len([line for line in item.text.split("\n") if line.strip()]) or 1
+        else:
+            total += 1  # MText выноски
+    return total
+
+
 @pytest.fixture()
 def com(monkeypatch):
     monkeypatch.setattr(ab, "_co_initialize", lambda: None)
@@ -50,14 +61,19 @@ def test_write_creates_one_undo_group_on_offset_layer(com):
     written = result.written
     assert written is not None
     assert written.failed == []
-    assert written.created_texts + written.created_leaders == len(result.plan.items)
+    assert written.created_texts + written.created_leaders == _text_objects(result.plan)
     assert written.layer == off.OFFSET_LAYER
     assert doc.undo_marks == ["start", "end"]
     created = [e for e in doc.ModelSpace.created if e.Layer == off.OFFSET_LAYER]
     assert created, "оффсеты не записаны в слой"
     written_texts = {getattr(e, "TextString", None) for e in created}
-    # Многострочная подпись (две стороны у одной вершины) уходит в MText как \P.
-    assert {item.text.replace("\n", "\\P") for item in result.plan.items} <= written_texts
+    written_texts |= {
+        " ".join(str(getattr(e, "TextString", "") or "").split("\\P")) for e in created
+    }
+    # Подпись столбиком (две стороны у одной вершины) — строки TEXT друг под другом («FE.0.3'N» / «1.0'E»).
+    assert {
+        line for item in result.plan.items for line in item.text.split("\n")
+    } <= written_texts
 
 
 def test_leader_offsets_get_leader_objects_text_offsets_do_not(com):
@@ -65,10 +81,9 @@ def test_leader_offsets_get_leader_objects_text_offsets_do_not(com):
     result = builder.build_offsets(area=WHOLE_LOT, dry_run=False)
     leaders = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbLeader"]
     assert len(leaders) == result.written.created_leaders
-    text_items = [i for i in result.plan.items if i.style == "text"]
     plain = [e for e in doc.ModelSpace.created
              if e.ObjectName == "AcDbText" and e.Layer == off.OFFSET_LAYER]
-    assert len(plain) == len(text_items) == result.written.created_texts
+    assert len(plain) == result.written.created_texts == _text_objects(result.plan)
 
 
 def test_nothing_to_write_does_not_open_undo_group(com):
@@ -143,7 +158,8 @@ def test_build_offsets_reads_selection_when_no_area_is_given(com):
     doc.PickfirstSelectionSet = _Selection(_closed_polyline(WHOLE_LOT))
     result = builder.build_offsets(dry_run=False)
     assert result.area == WHOLE_LOT
-    assert result.written is not None and result.written.created_texts + result.written.created_leaders == len(result.plan.items)
+    assert result.written is not None
+    assert result.written.created_texts + result.written.created_leaders == _text_objects(result.plan)
     assert doc.undo_marks == ["start", "end"]
 
 

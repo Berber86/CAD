@@ -3977,6 +3977,18 @@ class AcadBuilder:
         try:
             for item in plan.items:
                 try:
+                    if item.style == "text" and "\n" in item.text:
+                        # Столбик без выноски (как у Николая: «C.L.F.» / «0.6'S») — строки TEXT
+                        # друг под другом, тем же шагом, что у остальных подписей объектов.
+                        label = FeatureLabelItem(
+                            feature=None, text=item.text, kind="text", placement="beside",
+                            point=item.point, height=item.height_ft,
+                            rotation=math.radians(float(getattr(item, "rotation_deg", 0.0))),
+                        )
+                        result.created_texts += self._add_feature_texts(
+                            model_space, label, layer, style, fcfg
+                        )
+                        continue
                     if item.style == "text":
                         self._add_text(
                             model_space,

@@ -361,6 +361,18 @@ ONLINE_FENCE_TEXT = "FE.O/L"
 #: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
 #: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
 TEXT_FOLLOWS_BOUNDARY = False
+#: Шаг строк многострочной подписи в высотах текста (как mtext_line_spacing_factor в acad_builder).
+TEXT_LINE_SPACING = 1.67
+#: Подпись забора ставится текстом без выноски, как у Николая. В 192 Geldner все его подписи по заборам —
+#: обычный текст у линии (`FE.1.7'S`, `FE.0.7'E`), стрелок нет ни одной; наши выноски на этом чертеже
+#: накрывают подписи типа забора (`C.L.F.`, `W.FE.`) и друг друга.
+FENCE_TEXT_WITHOUT_LEADER = True
+#: Значения в подписи идут столбиком, как у Николая: тип забора строкой, под ним значения
+#: (`C.L.F.` / `0.6'S` / `1.1'E`). Одной строкой блок шире и накрывает соседние подписи.
+FENCE_TEXT_ONE_LINE = False
+#: Если рядом (6 ft) стоит подпись типа забора, подпись начинается с этого типа: `C.L.F. 0.2'S`,
+#: `W.FE. 0.6'E`, `V.FE. 0.7'E` — так у Николая (7 из 13 подписей по заборам на 192 Geldner).
+TYPE_PREFIX_FT = 6.0
 
 # --------------------------------------------------------------------------- правила 4.20 (H27–H29)
 #: Опорная точка для буквы на диагональной стороне: вектор оффсета, у которого обе составляющие больше
@@ -672,6 +684,30 @@ def _key(text: str) -> str:
     return re.sub(r"\s+", "", str(text)).upper()
 
 
+def _normalize_type(text: str) -> str:
+    """«C.L.F.», «C.L.F», «C.L.F» → «C.L.F» — для сравнения подписи типа забора."""
+    return re.sub(r"[\s.]+", "", str(text)).upper()
+
+
+#: Типы забора, которые Николай пишет в своих подписях (`C.L.F. 0.2'S`, `W.FE. 0.6'E`, `V.FE. 0.7'E`).
+_FENCE_TYPE_TEXTS = ("C.L.F", "CLF", "W.FE", "WFE", "V.FE", "VFE", "WOODFE", "FE")
+
+
+def _near_type_prefix(
+    known: Sequence[tuple[str, Point, float]], point: Point, radius: float,
+) -> str | None:
+    """Тип забора из уже стоящей рядом подписи («C.L.F.», «W.FE.», «V.FE.»), иначе None."""
+    best: tuple[float, str] | None = None
+    for text, spot, _height in known:
+        cleaned = _normalize_type(text)
+        if any(ch.isdigit() for ch in cleaned) or cleaned not in _FENCE_TYPE_TEXTS:
+            continue
+        distance = math.dist(point, spot)
+        if distance <= radius and (best is None or distance < best[0]):
+            best = (distance, str(text).strip())
+    return best[1] if best is not None else None
+
+
 def _text_parts(text: str) -> list[tuple[float, str]]:
     """Части подписи «значение + буква» (``0.4'N``, ``FE.1.2'S``) — для дедупликации по частям."""
     out: list[tuple[float, str]] = []
@@ -720,15 +756,15 @@ def _place_beside_line(
     if length < 1e-9:
         return None
     px, py = -dy / length, dx / length
-    width = width_of(text, height)
+    width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
     mid = ((anchor[0] + target[0]) / 2.0, (anchor[1] + target[1]) / 2.0)
-    half_extent = abs(px) * width / 2.0 + abs(py) * height / 2.0 + gap
-    for extra in (0.0, 0.5 * height, height, 2.0 * height):
+    half_extent = abs(px) * width / 2.0 + abs(py) * block_h / 2.0 + gap
+    for extra in (0.0, 0.5 * height, height, 2.0 * height, 3.2 * height, 4.0 * height, 5.0 * height):
         for sign in (1.0, -1.0):
             d = half_extent + extra
             center = (mid[0] + sign * px * d, mid[1] + sign * py * d)
-            rect = _rect_at(center, width, height)
+            rect = _rect_at(center, width, block_h)
             if ok(rect, center) and not _segment_hits_rect(anchor, target, rect):
                 return center
     return None
@@ -1374,6 +1410,12 @@ def plan_offsets(
             direction = offset_letter(vx, vy, north_deg)
             height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
             text = ONLINE_FENCE_TEXT if is_online else offset_text(feature.kind, value, direction)
+            # Тип забора из стоящей рядом подписи: «C.L.F. 0.2'S» вместо «FE.0.2'S» — как у Николая.
+            type_prefix = ""
+            if TYPE_PREFIX_FT and feature.kind == "fence" and not is_online:
+                type_prefix = _near_type_prefix(known, best.vertex, TYPE_PREFIX_FT) or ""
+                if type_prefix:
+                    text = f"{type_prefix} {value:.1f}'{direction}"
             extra: list[tuple[float, str]] = []
             if feature.kind in ("fence", "wall") and not is_online:
                 boundaries: list[tuple[Sequence[Point], bool]] = [(ring, True)]
@@ -1426,6 +1468,10 @@ def plan_offsets(
                     if bounds is None or _segment_in_bounds(a, b, bounds)
                 )
 
+            # Значения одной строкой: «W.FE. 0.1'E 1.2'S» (Николай) вместо двух строк выноски.
+            # Префикс типа (FE., C.L.F., W.FE.) стоит один раз в начале строки.
+            display_parts = [text] + [f"{v:.1f}'{d}" for v, d in extra]
+            line_text = " ".join(display_parts) if FENCE_TEXT_ONE_LINE else "\n".join(display_parts)
             item: OffsetItem | None = None
             beside = None
             if feature.kind == "house":
@@ -1449,8 +1495,21 @@ def plan_offsets(
                     beside = _place_beside_line(
                         corner, corner_foot, text, height, width_of, ok
                     )
+            if beside is None and feature.kind in ("fence", "wall") and FENCE_TEXT_WITHOUT_LEADER:
+                # Забор и стена: текст у линии без выноски — как у Николая — и только потом выноска.
+                beside = _place_beside_line(best.vertex, best.foot, line_text, height, width_of, ok)
+                if beside is None:
+                    # У самой линии места нет (текст накрыл бы забор) — берём свободное место рядом,
+                    # но по-прежнему без выноски: стрелок у Николая нет.
+                    spot = _place_leader(
+                        best.vertex, best.foot, line_text, height, width_of, ok, factor
+                    )
+                    if spot is not None:
+                        beside = spot[0]
+                if beside is not None:
+                    text = line_text
             if beside is not None:
-                rect = _rect_at(beside, width_of(text, height), height)
+                rect = _rect_at(beside, *_text_block(text, height, width_of))
                 item = OffsetItem(
                     kind=feature.kind, value_ft=value, direction=direction, style="text",
                     height_ft=height, anchor=best.anchor_override or best.vertex, target=best.foot, text=text,
@@ -1464,9 +1523,7 @@ def plan_offsets(
                 )
             else:
                 # Дом без места под текст получает выноску с «BLDG»; забор и стена — выноску как есть.
-                leader_text = "\n".join(
-                    [text] + [offset_text(feature.kind, v, d) for v, d in extra]
-                )
+                leader_text = line_text
                 spot = _place_leader(best.vertex, best.foot, leader_text, height, width_of, ok, factor)
                 if spot is None:
                     plan.warnings.append(
@@ -1563,7 +1620,8 @@ def _text_block(text: str, height: float, width_of: Callable[[str, float], float
     """Размер многострочной подписи (строки разделены ``\\n``): ширина самой длинной и общая высота."""
     lines = text.split("\n")
     width = max(width_of(line, height) for line in lines)
-    return width, height * len(lines)
+    # Шаг строк тот же, что у подписей объектов (mtext_line_spacing_factor = 1.67).
+    return width, height * (1.0 + TEXT_LINE_SPACING * (len(lines) - 1))
 
 
 def _area_bounds(area: Sequence[Point] | None, margin: float) -> Rect | None:

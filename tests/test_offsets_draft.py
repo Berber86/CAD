@@ -72,17 +72,16 @@ def test_house_gets_text_without_leader_at_house_height():
     assert _inside_ring(item.point)
 
 
-def test_fence_gets_leader_and_fence_prefix():
+def test_fence_gets_text_without_leader_and_fence_prefix():
+    # 4.25: у Николая подписи забора — текст у линии, без стрелок (в 192 Geldner 13 из 13).
     plan = off.plan_offsets(RING, [_fence([(60.0, 5.0), (60.0, 20.0)])], front=FRONT, scale=16)
     assert len(plan.items) == 1
     item = plan.items[0]
     assert item.text == "FE.5.0'N"
-    assert item.style == "leader"
+    assert item.style == "text"
+    assert item.leader is None
     assert item.height_ft == pytest.approx(0.9)
-    tip, end = item.leader
-    assert tip == (60.0, 5.0)
     assert _inside_ring(item.point)
-    assert math.hypot(end[0] - tip[0], end[1] - tip[1]) >= off.LEADER_MIN_HEIGHTS * 0.9
 
 
 def test_nearest_boundary_decides_direction():
@@ -138,12 +137,12 @@ def test_text_does_not_cover_existing_label():
     assert item.point != pytest.approx((22.31, 5.0), abs=0.05)
 
 
-def test_leader_does_not_cross_building_outline():
-    # забор с выноской не должен рисовать текст поверх дома
+def test_fence_text_does_not_land_on_the_house():
+    # подпись забора не должна вставать поверх дома
     house = _house(x0=50.0, y0=10.0, x1=70.0, y1=30.0, handle="H2")
     fence = _fence([(45.0, 5.0), (45.0, 8.0)], handle="F2")
     plan = off.plan_offsets(RING, [house, fence], front=FRONT)
-    fence_items = [i for i in plan.items if i.style == "leader"]
+    fence_items = [i for i in plan.items if i.kind == "fence"]
     assert fence_items, plan.warnings
     x, y = fence_items[0].point
     assert not (50.0 - 2.0 <= x <= 70.0 + 2.0 and 10.0 - 1.0 <= y <= 30.0 + 1.0)
@@ -177,9 +176,9 @@ def test_report_text_lists_items_and_skips():
     )
     text = off.plan_report_text(plan, 16)
     assert f"черновик {off.STEP4_VERSION}" in text
-    assert "Подписей: 3 (без выноски: 1, с выноской: 2)" in text
+    assert "Подписей: 3 (без выноски: 3, с выноской: 0)" in text
     assert "10.0'N  (без выноски)" in text
-    assert "FE.O/L  (выноска)" in text
+    assert "FE.O/L  (без выноски)" in text
 
 
 def test_scale_changes_heights_only_not_values():

@@ -340,6 +340,11 @@ LEADER_ANGLES_DEG = (90, -90, 60, -60, 120, -120, 30, -30, 150, -150, 0, 180)
 TEXT_GAP_FACTOR = 0.3
 #: Если рядом (футы при 1"=16') уже есть такая же подпись, оффсет не дублируем.
 DUPLICATE_RADIUS_FT = 10.0
+#: Допуск области выделения, футы: объект и подпись считаются попавшими в область, если они ближе
+#: этого к её границе. Оффсеты по определению стоят у границы участка, поэтому при выделении самой
+#: полилинии участка (``area == ring``) забор в 0.3 ft снаружи выпадал из области, а подпись у самой
+#: линии не проходила проверку «целиком внутри» (на 192 Geldner оставалось 5 подписей вместо 14).
+AREA_EDGE_TOL_FT = 6.0
 #: Минимальная длина выноски в высотах текста: короче AutoCAD не нарисует стрелку.
 LEADER_MIN_HEIGHTS = 2.0
 #: Основание перпендикуляра может лежать на продолжении стороны за её концом не дальше этого, футы.
@@ -392,6 +397,13 @@ FENCE_SIMPLIFY_DEG = 0.0
 FENCE_SAME_SIDE_SEP_FT = 0.0
 #: …и ближе этого на разных сторонах участка, футы.
 FENCE_DIFF_SIDE_SEP_FT = 0.0
+#: Не больше стольких подписей забора на одну сторону участка (0 — без предела). Углы, разнесённые
+#: вдоль стороны дальше ``SIDE_CAP_SPACING_FT``, считаются разными сторонами: на Brooklyn забор идёт
+#: вдоль запада 100 ft, и Николай подписал оба его конца.
+#: На наших трёх парах предел снимает верную подпись на Geldner (13 → 12 совпадений) и лишние не
+#: убирает, поэтому по умолчанию выключен; у соседа правило проверено на его парах.
+FENCE_SIDE_CAP = 0
+SIDE_CAP_SPACING_FT = 30.0
 #: Подписи одной вершины ближе этого не ставятся. Выключено: у Николая на одном углу стоят ДВЕ подписи
 #: в 1.5 ft друг от друга (`FE.1.7'S` и `C.L.F. 0.2'S` на 192 Geldner), и правило резало верные подписи
 #: (совпадений 13 → 7 на Geldner, 3 → 1 на Brooklyn).
@@ -688,6 +700,21 @@ def _rects_overlap(a: Rect, b: Rect) -> bool:
 def _rect_inside_polygon(rect: Rect, polygon: Sequence[Point]) -> bool:
     x0, y0, x1, y1 = rect
     return all(point_in_polygon(p, polygon) for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
+
+
+def _rect_near_polygon(rect: Rect, polygon: Sequence[Point], tol: float) -> bool:
+    """Прямоугольник целиком внутри полигона или не дальше ``tol`` от его границы."""
+    if _rect_inside_polygon(rect, polygon):
+        return True
+    x0, y0, x1, y1 = rect
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    edges = [(polygon[i], polygon[(i + 1) % len(polygon)]) for i in range(len(polygon))]
+    for corner in corners:
+        if point_in_polygon(corner, polygon):
+            return True
+        if any(_point_segment_distance(corner, edge) <= tol for edge in edges):
+            return True
+    return False
 
 
 def _segment_hits_rect(p: Point, q: Point, rect: Rect) -> bool:
@@ -1272,6 +1299,24 @@ def _surveyed_fence_corners(
     corners.sort(
         key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft)
     )
+    if FENCE_SIDE_CAP:
+        # Не больше ``FENCE_SIDE_CAP`` подписей на одну букву стороны (R13c соседа).
+        per_letter: dict[str, list[OffsetCandidate]] = {}
+        capped: list[OffsetCandidate] = []
+        for candidate in corners:
+            letter = offset_letter(
+                candidate.vertex[0] - candidate.foot[0],
+                candidate.vertex[1] - candidate.foot[1],
+                north_deg,
+            )
+            same = per_letter.setdefault(letter, [])
+            if len(same) >= FENCE_SIDE_CAP and all(
+                math.dist(candidate.vertex, other.vertex) < SIDE_CAP_SPACING_FT for other in same
+            ):
+                continue
+            same.append(candidate)
+            capped.append(candidate)
+        corners = capped
     # Шаг между подписями одного забора (H25 соседа): вдоль одной стороны 22 ft, на разных сторонах 12 ft.
     spaced: list[OffsetCandidate] = []
     for candidate in corners:
@@ -1451,6 +1496,14 @@ def plan_offsets(
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
+        if not in_area and area_pts is not None and AREA_EDGE_TOL_FT > 0:
+            # Объекты оффсетов стоят у самой границы участка, часть — снаружи неё.
+            in_area = any(
+                _point_segment_distance(p, (area_pts[i], area_pts[(i + 1) % len(area_pts)]))
+                <= AREA_EDGE_TOL_FT
+                for p in feature.points
+                for i in range(len(area_pts))
+            )
         if not in_area:
             plan.counts["outside"] = plan.counts.get("outside", 0) + 1
             continue
@@ -1574,7 +1627,7 @@ def plan_offsets(
             clearance = LABEL_CLEARANCE * height
 
             def ok(rect: Rect, center: Point) -> bool:
-                if area_pts is not None and not _rect_inside_polygon(rect, area_pts):
+                if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
                     return False
                 if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
                     return False

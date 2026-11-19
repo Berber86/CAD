@@ -148,9 +148,11 @@ def test_fence_text_does_not_land_on_the_house():
     assert not (50.0 - 2.0 <= x <= 70.0 + 2.0 and 10.0 - 1.0 <= y <= 30.0 + 1.0)
 
 
-def test_no_room_gives_warning_not_silent_drop():
+def test_no_room_gives_warning_not_silent_drop(monkeypatch):
     # очень маленькая область: текст не помещается, программа предупреждает
-    # область содержит вершину забора (60, 5), но текст «FE.5.0'N» в ней не умещается
+    # область содержит вершину забора (60, 5), но текст «FE.5.0'N» в ней не умещается.
+    # Допуск области (4.27) выключаем: он разрешает подписи у самой её границы.
+    monkeypatch.setattr(off, "AREA_EDGE_TOL_FT", 0.0)
     area = [(59.0, 4.0), (61.0, 4.0), (61.0, 6.0), (59.0, 6.0)]
     plan = off.plan_offsets(RING, [_fence([(60.0, 5.0), (60.0, 20.0)])], front=FRONT, area=area)
     assert plan.items == []

@@ -259,6 +259,39 @@ def test_r13c_cap_per_side_does_not_merge_far_apart_corners():
     assert [item.text for item in plan.items] == ["FE.0.2'N"]
 
 
+def test_r10_text_without_leader_runs_along_its_line():
+    """R10: подпись без выноски повёрнута вдоль своей линии — 0° у горизонтальной, 90° у вертикальной."""
+    ring = [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]
+    sides = off.side_lines(ring, [], 90.0)
+    # Дом внутри участка у западной (вертикальной) стороны: текст встаёт внутри строения.
+    house = off.Feature("house", "H", ((0.4, 5.0), (20.0, 5.0), (20.0, 25.0), (0.4, 25.0)))
+    assert off.TEXT_FOLLOWS_BOUNDARY is True
+    rows = off.vertex_offset_rows(house, sides, max_ft=3.0, ring=ring)
+    plan = off.plan_offsets(ring, [house], survey_pts=list(rows))
+    text_items = [item for item in plan.items if item.style == "text"]
+    assert text_items, plan.items
+    assert all(abs(item.rotation_deg - 90.0) < 1.0 for item in text_items), text_items
+    # Флаг снят — подпись горизонтальна: поворот идёт от правила, а не от раскладки.
+    saved = off.TEXT_FOLLOWS_BOUNDARY
+    off.TEXT_FOLLOWS_BOUNDARY = False
+    try:
+        plan = off.plan_offsets(ring, [house], survey_pts=list(rows))
+    finally:
+        off.TEXT_FOLLOWS_BOUNDARY = saved
+    assert all(item.rotation_deg == 0.0 for item in plan.items if item.style == "text")
+
+
+def test_r10_geldner_house_text_is_vertical_like_nikolai():
+    """На 192 Geldner подписи дома без выносок стоят у вертикальных стен — у Николая 90°."""
+    before, after = load_pair(PRIMER3)
+    data, _nikolai = field_plan(before, after)
+    items = [item for item in data["plan"].items if item.kind == "house" and item.style == "text"]
+    assert items
+    assert all(abs(item.rotation_deg - 90.0) < 1.0 for item in items), [
+        (item.text, item.rotation_deg) for item in items
+    ]
+
+
 def test_r13d_second_corner_of_the_same_side_is_labelled_when_the_wall_is_skewed():
     """R13d: второй угол стороны подписывается, если замер другой (стена идёт с перекосом)."""
     ring = [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]

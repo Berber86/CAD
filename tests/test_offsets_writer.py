@@ -4,6 +4,8 @@
 Сцена — тот же синтетический участок, что в тестах Шага 2 (40 × 100 ft, дом, сарай, заборы).
 """
 
+import math
+
 import pytest
 
 import acad_builder as ab
@@ -245,3 +247,19 @@ def test_two_line_offset_is_written_as_mtext_with_pline_breaks(com):
     ) == 1
     texts = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbText"]
     assert [e.TextString for e in texts] == ["0.4'W"]
+
+
+def test_text_rotation_is_written_to_the_offset_labels(com):
+    """R10: подпись без выноски пишется повёрнутой — угол из плана доходит до ``Rotation``."""
+    from types import SimpleNamespace
+
+    builder, _app, doc = com()
+    item = SimpleNamespace(
+        text="2.4'S", point=(10.0, 20.0), height_ft=1.1, rotation_deg=90.0,
+    )
+    assert builder._add_offset_texts(
+        doc.ModelSpace, item, off.OFFSET_LAYER, "Standard", 1.67
+    ) == 1
+    texts = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbText"]
+    assert len(texts) == 1
+    assert float(texts[0].Rotation) == pytest.approx(math.pi / 2, abs=1e-6)

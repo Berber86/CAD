@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.25"
+STEP4_VERSION = "4.26"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -417,10 +417,18 @@ ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
 #: Вторая строка подписи «на линии» у дома и стены: ``BLDG`` / ``O/L`` (378 Mother Gaston).
 ONLINE_TEXT = "O/L"
-#: Текст без выноски поворачивается вдоль ближайшей границы (R10). Выключено: на эталонах угол следует за
-#: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
-#: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
-TEXT_FOLLOWS_BOUNDARY = False
+#: R10: текст **без выноски** поворачивается вдоль своей линии (0° у горизонтальной, 90° у вертикальной);
+#: текст с выноской у Николая горизонтален, поэтому правило применяется только к ``style == "text"``.
+#: Замер 4.26 по дампам:
+#: * Ilion (участок 0.4°): «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4°, «C.L.F.\P0.1'W» — 0.4° — 18 из 19
+#:   подписей стоят по осям участка (одна, «FE.0.6'E» — 70.8°);
+#: * Aspinwall (участок 14.6°): 14.6° и 284.6° — те же две оси участка, 0 из 24 «по сетке листа»;
+#: * 6910 15th Ave: 356.5° (ось участка) у всех подписей;
+#: * четыре полевые пары: из наших подписей без выносок поворот совпал с Николаем у 5 из 5
+#:   (Gaston «2.4'S» — 88.6°, Geldner «0.4'W» — 90°), с выключенным правилом — у 2 из 5.
+#: Раньше флаг был выключен из-за чтения тех же дампов: 284.6° принималось за «не вдоль стороны»,
+#: хотя это вторая ось участка, повёрнутого на 14.6°.
+TEXT_FOLLOWS_BOUNDARY = True
 
 
 #: противоположная буква стороны участка (для объекта снаружи)
@@ -891,7 +899,7 @@ class OffsetPlan:
 
 def _place_beside_line(
     anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
-    ok: Callable[[Rect, Point], bool],
+    ok: Callable[[Rect, Point], bool], rotation_deg: float = 0.0,
 ) -> Point | None:
     """Текст без выноски — рядом с линией измерения, по перпендикуляру к ней."""
     dx, dy = target[0] - anchor[0], target[1] - anchor[1]
@@ -905,7 +913,7 @@ def _place_beside_line(
     ux, uy = dx / length, dy / length
     # Габарит всего блока: у двухстрочной подписи («0.2'E» и «1.2'S») высота вдвое больше,
     # иначе блок ложился на соседние надписи (4.24 соседней ветки).
-    width, block_height = _text_block(text, height, width_of)
+    width, block_height = _text_block(text, height, width_of, rotation_deg)
     gap = TEXT_GAP_FACTOR * height
     mid = ((anchor[0] + target[0]) / 2.0, (anchor[1] + target[1]) / 2.0)
     half_extent = abs(px) * width / 2.0 + abs(py) * block_height / 2.0 + gap
@@ -931,6 +939,7 @@ def _place_beside_line(
 def _place_house_text(
     polygon: Sequence[Point], anchor: Point, target: Point, text: str, height: float,
     width_of: Callable[[str, float], float], ok: Callable[[Rect, Point], bool],
+    rotation_deg: float = 0.0,
 ) -> Point | None:
     """
     Текст дома внутри строения, вплотную к стене (как у Николая).
@@ -958,7 +967,7 @@ def _place_house_text(
     if wall is None:
         return None
     a, b = wall
-    width, block_h = _text_block(text, height, width_of)
+    width, block_h = _text_block(text, height, width_of, rotation_deg)
     gap = TEXT_GAP_FACTOR * height
     for extra in (0.0, 0.5 * height, height, 2.0 * height, 3.0 * height):
         depth = block_h / 2.0 + gap + extra
@@ -984,6 +993,7 @@ def _place_leader(
 ) -> tuple[Point, Point] | None:
     """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
+    # Текст выноски у Николая горизонтален всегда — поворот к нему не применяется (R10).
     width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
     for extra in LEADER_DISTANCES_FT:
@@ -1609,14 +1619,17 @@ def _plan_edge_labels(
         label_text = "\n".join(
             [text] + [f"{continuation}{v:.1f}'{d}" for v, d in extras]
         )
+        # R10: подпись без выноски идёт вдоль своей линии (у Николая 0° и 90°); с выноской —
+        # всегда горизонтально, поэтому поворот считается только для текста.
+        rotation = primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0
         if feature.kind == "house" and HOUSE_TEXT_INSIDE:
             # Дом — текст внутри строения у стены; снаружи мешают заборы и чужие надписи.
             beside = _place_house_text(
                 feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, ok_strict,
+                width_of, ok_strict, rotation,
             ) or _place_house_text(
                 feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, ok,
+                width_of, ok, rotation,
             )
         if beside is None and (
             feature.kind == "house" or (
@@ -1626,19 +1639,20 @@ def _plan_edge_labels(
             # У Николая подпись забора — обычный текст у самой линии, без стрелки.
             # Выноска остаётся последним средством: она и давала «частокол» на чертеже.
             beside = _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, ok_strict
+                vertex, primary.foot, label_text, height, width_of, ok_strict, rotation
             ) or _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, ok
+                vertex, primary.foot, label_text, height, width_of, ok, rotation
             )
         if beside is not None:
             item = OffsetItem(
                 kind=feature.kind, value_ft=value, direction=direction_shown, style="text",
                 height_ft=height, anchor=vertex, target=primary.foot, text=label_text,
                 point=beside, leader=None,
-                rotation_deg=(primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0),
+                rotation_deg=rotation,
                 crossing=vertex in exempt,
             )
-            rect_w, rect_h = _text_block(label_text, height, width_of)
+            # Габарит повёрнутой подписи — по описанному прямоугольнику (R10).
+            rect_w, rect_h = _text_block(label_text, height, width_of, rotation)
             rect = _rect_at(beside, rect_w, rect_h)
         else:
             leader_text = label_text
@@ -2260,12 +2274,25 @@ def _extra_sides(
     return out
 
 
-def _text_block(text: str, height: float, width_of: Callable[[str, float], float]) -> tuple[float, float]:
-    """Размер многострочной подписи (строки разделены ``\\n``): ширина самой длинной и общая высота."""
+def _text_block(
+    text: str, height: float, width_of: Callable[[str, float], float], rotation_deg: float = 0.0,
+) -> tuple[float, float]:
+    """
+    Размер многострочной подписи (строки разделены ``\\n``): ширина самой длинной и общая высота.
+
+    ``rotation_deg`` — поворот текста вдоль своей линии (R10): возвращается габарит **повёрнутого**
+    блока (описанный прямоугольник). Без этого вертикальная подпись проверялась как горизонтальная
+    и накрывала соседние тексты (так было у соседа на 192 Geldner: повёрнутая подпись легла на «C.L.F.»).
+    """
     lines = text.split("\n")
     width = max(width_of(line, height) for line in lines)
     # Шаг строк как у MText: с шагом 1.0 блок из двух строк считался ниже, чем он есть.
-    return width, height * (1.0 + TEXT_LINE_SPACING * (len(lines) - 1))
+    block = height * (1.0 + TEXT_LINE_SPACING * (len(lines) - 1))
+    if not rotation_deg:
+        return width, block
+    a = math.radians(rotation_deg)
+    ca, sa = abs(math.cos(a)), abs(math.sin(a))
+    return width * ca + block * sa, width * sa + block * ca
 
 
 def _area_bounds(area: Sequence[Point] | None, margin: float) -> Rect | None:

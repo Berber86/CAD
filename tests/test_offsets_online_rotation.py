@@ -81,10 +81,19 @@ def rotation_on(monkeypatch):
     monkeypatch.setattr(off, "TEXT_FOLLOWS_BOUNDARY", True)
 
 
-def test_rotation_is_off_by_default():
-    assert off.TEXT_FOLLOWS_BOUNDARY is False
+def test_rotation_is_on_by_default_and_off_by_flag():
+    """С 4.26 поворот включён (R10): подпись без выноски идёт вдоль своей линии."""
+    assert off.TEXT_FOLLOWS_BOUNDARY is True
     house = _house([(6.0, 10.0), (14.0, 10.0), (14.0, 30.0), (6.0, 30.0)])
     plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
+    assert any(math.isclose(abs(it.rotation_deg), 90.0, abs_tol=0.01)
+               for it in plan.items if it.style == "text")
+    saved = off.TEXT_FOLLOWS_BOUNDARY
+    off.TEXT_FOLLOWS_BOUNDARY = False
+    try:
+        plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
+    finally:
+        off.TEXT_FOLLOWS_BOUNDARY = saved
     assert all(it.rotation_deg == 0.0 for it in plan.items)
 
 

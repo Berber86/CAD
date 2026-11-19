@@ -966,6 +966,10 @@ class Segment(BaseModel):
         default=None,
         description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
     )
+    party_wall: bool = Field(
+        default=False,
+        description="True только если именно эта сторона описана как проходящая через party wall",
+    )
 
     bearing_solved: bool = Field(
         default=False,
@@ -2315,6 +2319,7 @@ CRITICAL SURVEY RULES
      * Set `has_bearing = false` on every course without an explicit compass bearing;
      * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
      * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
+   - Set `party_wall=true` only on each boundary course explicitly described as through/along a party wall; otherwise false. Never infer it merely from a building or a neighbouring course.
 4. DISTANCES (INCLUDING 1980s FRACTIONAL INCHES):
    - `distance_ft` is in decimal feet. Convert all feet-and-inches and fractional inches accurately:
      * "13 feet 8 inches" -> 13.6667
@@ -3512,6 +3517,7 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
                     re.search(r"\b(?:at\s+right\s+angles|perpendicular)\b", clause, re.IGNORECASE)
                 ),
                 "course_note": _extract_course_note(clause),
+                "party_wall": bool(re.search(r"\bparty[\s-]+wall\b", clause, re.IGNORECASE)),
             }
         )
 
@@ -3583,6 +3589,7 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
         seg["distance_ft"] = item["distance_ft"]
         seg["has_bearing"] = False
         seg["course_note"] = item["course_note"]
+        seg["party_wall"] = item["party_wall"]
         seg["interior_angle"] = item["ia_label"]
         segments.append(seg)
 
@@ -3802,6 +3809,23 @@ def _segments_from_regex(
         )
 
     placed.sort(key=lambda entry: entry[0])
+    # Привязываем party wall только к однозначному курсу внутри THENCE;
+    # отметка до румба и после румба принадлежит одному и тому же курсу.
+    clauses = list(re.finditer(r"\b(?:RUNNING\s+)?THENCE\b", text, re.IGNORECASE))
+    for idx, clause in enumerate(clauses):
+        end = clauses[idx + 1].start() if idx + 1 < len(clauses) else len(text)
+        content = text[clause.end():end]
+        if not re.search(r"\bparty[\s-]+wall\b", content, re.IGNORECASE):
+            continue
+        candidates = [seg for pos, seg in placed if clause.end() <= pos < end]
+        if len(candidates) == 1:
+            candidates[0]["party_wall"] = True
+        else:
+            warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
+    if re.search(r"\bparty[\s-]+wall\b", text, re.IGNORECASE) and not any(
+        seg.get("party_wall") for _, seg in placed
+    ) and not any("PARTY WALL" in warning for warning in warnings):
+        warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
     segs = [seg for _, seg in placed]
     if orphans:
         hints = {}
@@ -4574,6 +4598,7 @@ def _flip_segment_direction(seg: Segment) -> Segment:
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
+        party_wall=seg.party_wall,
     )
 
 
@@ -4686,6 +4711,7 @@ def _mutate_segment_bearing(
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
+        party_wall=seg.party_wall,
     )
 
 
@@ -5989,6 +6015,25 @@ def parse_legal_description_full(
             )
             warnings.extend(repair_notes)
             parsed_model = _ensure_street_width(parsed_model, combined)
+            if re.search(r"\bparty[\s-]+wall\b", combined, re.IGNORECASE):
+                local_segments = local_attempt.model.segments if local_attempt else []
+                ai_segments = parsed_model.segments
+                same = len(local_segments) == len(ai_segments) and all(
+                    abs(a.distance_ft - b.distance_ft) < 0.02
+                    and _angle_diff_deg(a.azimuth_deg, b.azimuth_deg) < 0.02
+                    for a, b in zip(local_segments, ai_segments)
+                )
+                if same:
+                    parsed_model = parsed_model.model_copy(update={"segments": [
+                        a.model_copy(update={"party_wall": a.party_wall or b.party_wall})
+                        for a, b in zip(ai_segments, local_segments)
+                    ]})
+                else:
+                    warnings.append("PARTY WALL найден в тексте; привязку к стороне не удалось независимо сверить — проверьте документ")
+                if local_attempt:
+                    warnings.extend(w for w in local_attempt.warnings if "PARTY WALL" in w and w not in warnings)
+                if not any(s.party_wall for s in parsed_model.segments):
+                    warnings.append("PARTY WALL найден, но сторона не определена — проверьте документ")
             suspicions = detect_typo_suspicions(
                 parsed_model,
                 source_text=combined,

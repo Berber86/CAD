@@ -68,16 +68,15 @@ def test_draft_keeps_lot_shape_and_side_lengths():
     )
 
 
-def test_draft_contains_only_lot_streets_and_cross_street_label():
+def test_draft_contains_our_labels_and_original_legal_tie():
     plan = _plan("lot72_render_e600.txt")
     draft = make_print_draft(plan, _cfg()["print_draft"])
-    assert draft.print_draft is True
-    assert {item.kind for item in draft.items} == {"cross-street"}
-    assert len(draft.items) == 1
-    assert "CARLTON" in draft.items[0].text
-    # Ни соседей, ни подписей сторон, ни расстояния до угла в черновике нет.
-    assert all(item.kind == "cross-street" for item in draft.items)
-    assert not any(item.kind == "cross-street-distance" for item in draft.items)
+    assert draft.print_draft and not draft.is_neighbor
+    assert any(i.kind.startswith("side-") for i in draft.items)
+    assert any(i.kind == "main-street" for i in draft.items)
+    assert any(i.kind == "cross-street" and "CARLTON" in i.text for i in draft.items)
+    assert next(i for i in draft.items if i.kind == "cross-street-distance").text == "241.00'"
+    assert not any(i.kind.startswith("neighbor") for i in draft.items)
 
 
 def test_draft_lot_is_shifted_one_thousand_and_tie_is_40():
@@ -96,7 +95,7 @@ def test_corner_lot_draft_has_no_tie_and_no_warning():
     assert not any(ln.kind == "main-street-row-tie" for ln in plan.lines)
     draft = make_print_draft(plan, _cfg()["print_draft"])
     assert not any("линии до перекрёстка" in w for w in draft.warnings)
-    assert {item.kind for item in draft.items} == {"cross-street"}
+    assert {"cross-street", "main-street"} <= {item.kind for item in draft.items}
 
 
 def test_translate_plan_moves_everything_and_keeps_original():
@@ -168,12 +167,27 @@ class _Layers:
         return self._items[name]
 
 
+class _TextStyle:
+    def __init__(self, name):
+        self.Name = name
+        self.Height = 0.0
+        self.fontFile = ""
+
+    def SetFont(self, *args):
+        self.font = args
+
+
 class _TextStyles:
+    def __init__(self):
+        self._items = {}
+
     def Item(self, name):
-        raise KeyError(name)
+        return self._items[name]
 
     def Add(self, name):
-        return _Entity(Name=name)
+        style = _TextStyle(name)
+        self._items[name] = style
+        return style
 
 
 class _Doc:
@@ -239,8 +253,8 @@ def test_main_lot_is_drawn_at_the_intersection_and_draft_next_to_it(fake_autocad
     expected = _tie(draft)
     actual = [ln for ln in doc.ModelSpace.lines if _matches_line(ln, expected.start, expected.end)]
     assert len(actual) == 1 and math.dist(actual[0].StartPoint, actual[0].EndPoint) == pytest.approx(40.0)
-    assert len(doc.ModelSpace.texts) == len(plan.items) + 1
-    assert "CARLTON" in doc.ModelSpace.texts[-1].TextString
+    assert len(doc.ModelSpace.texts) == len(plan.items) + len(draft.items)
+    assert any("CARLTON" in item.TextString for item in doc.ModelSpace.texts)
 
 
 def _matches_line(entity, start, end, dx=0.0):
@@ -262,7 +276,8 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
     row.color, row.Linetype = 5, "EXISTING-ROAD-TYPE"
     result = builder.draw_plan(plan)
     assert result.boundary_line_count == len(plan.boundary_lines)
-    builder.draw_plan(make_print_draft(plan, {}))
+    draft = make_print_draft(plan, {})
+    builder.draw_plan(draft)
     assert len(doc.ModelSpace.polylines) == 0
     assert (pl.color, pl.Linetype) == (6, "EXISTING-PL-TYPE")
     assert (row.color, row.Linetype) == (5, "EXISTING-ROAD-TYPE")
@@ -275,7 +290,7 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
             assert matches[0].Layer == ("M-ROW-LINE" if is_front else "PL")
             assert matches[0].Color == (1 if is_front else 3)
             assert matches[0].Linetype == "ByLayer"
-    assert len(doc.ModelSpace.texts) == len(plan.items) + 1  # только название пересекающей улицы
+    assert len(doc.ModelSpace.texts) == len(plan.items) + len(draft.items)
     assert len(doc.ModelSpace.arcs) == 2 * len(plan.arcs)
 
 
@@ -381,14 +396,12 @@ def test_legacy_draft_settings_cannot_move_copy_or_change_tie():
     tie = _tie(draft)
     assert tie.end == pytest.approx((_tie(plan).end[0] + 1000, _tie(plan).end[1]))
     assert math.dist(tie.start, tie.end) == pytest.approx(40)
-    for original, copy in zip(plan.lines, draft.lines):
-        if original.kind.startswith("cross-street-row"):
-            dx = tie.start[0] - _tie(plan).start[0]
-            dy = tie.start[1] - _tie(plan).start[1]
-            assert copy.start == pytest.approx((original.start[0] + dx, original.start[1] + dy))
-            assert copy.end == pytest.approx((original.end[0] + dx, original.end[1] + dy))
-    item = next(i for i in plan.items if i.kind == "cross-street")
-    assert draft.items[0].point == pytest.approx((item.point[0] + dx, item.point[1] + dy))
+    cross = next(line for line in draft.lines if line.kind == "cross-street-row")
+    assert cross.start == pytest.approx(tie.start)
+    assert math.dist(cross.start, cross.end) == pytest.approx(100)
+    a = (tie.end[0] - tie.start[0], tie.end[1] - tie.start[1])
+    b = (cross.end[0] - cross.start[0], cross.end[1] - cross.start[1])
+    assert a[0] * b[0] + a[1] * b[1] == pytest.approx(0, abs=1e-6)
 
 
 def test_full_scene_has_one_draft_for_our_lot_and_no_neighbor_copy(fake_autocad):
@@ -410,11 +423,184 @@ def test_full_scene_has_one_draft_for_our_lot_and_no_neighbor_copy(fake_autocad)
                        for o in doc.ModelSpace.lines)
 
 
-def test_missing_draft_tie_is_reported_in_draw_result(fake_autocad):
+def test_missing_tie_is_restored_when_old_config_disabled_extensions(fake_autocad):
+    import copy
+    cfg = copy.deepcopy(_cfg())
+    cfg["drawing"]["draw_street_extensions"] = False
+    plan = AcadBuilder(cfg).plan(_model("lot72_render_e600.txt"), scale=16)
+    assert not plan.lines
+    plan = translate_plan(plan, 17, -23)
+    draft = make_print_draft(plan, {}, builder_cfg=cfg)
+    assert math.dist(_tie(draft).start, _tie(draft).end) == pytest.approx(40)
+    cross = next(line for line in draft.lines if line.kind == "cross-street-row")
+    assert math.dist(cross.start, cross.end) == pytest.approx(100)
+    assert not plan.lines and cfg["drawing"]["draw_street_extensions"] is False
+
+
+def test_missing_tie_is_reported_if_no_cross_street(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     plan.lines = [line for line in plan.lines if line.kind != "main-street-row-tie"]
+    plan.description = plan.description.model_copy(update={"cross_street": None})
     draft = make_print_draft(plan, {})
     builder, _doc = fake_autocad(plan)
     result = builder.draw_plan(draft)
     assert any("привязка 40 ft не построена" in w for w in result.warnings)
     assert result.summary().count("привязка 40 ft не построена") == 1
+
+
+def test_100_line_forms_l_not_cross_and_original_geometry_is_untouched():
+    from shapely.geometry import LineString, Point
+    plan = _plan("lot72_render_e600.txt")
+    original_lines = [(line.kind, line.start, line.end) for line in plan.lines]
+    draft = make_print_draft(plan, {})
+    tie = _tie(draft)
+    cross = next(line for line in draft.lines if line.kind == "cross-street-row")
+    assert cross.start == pytest.approx(tie.start)
+    assert math.dist(cross.start, cross.end) == pytest.approx(100)
+    u = (tie.end[0] - tie.start[0], tie.end[1] - tie.start[1])
+    v = (cross.end[0] - cross.start[0], cross.end[1] - cross.start[1])
+    assert u[0] * v[0] + u[1] * v[1] == pytest.approx(0, abs=1e-7)
+    assert LineString([tie.start, tie.end]).intersection(LineString([cross.start, cross.end])).distance(Point(tie.start)) < 1e-8
+    cx, cy = draft.centroid
+    assert (cx - tie.start[0]) * v[0] + (cy - tie.start[1]) * v[1] > 0
+    assert [(line.kind, line.start, line.end) for line in plan.lines] == original_lines
+    distance = next(item for item in draft.items if item.kind == "cross-street-distance")
+    assert distance.text == "241.00'" and distance.height == 1.6
+    mid = ((tie.start[0] + tie.end[0]) / 2, (tie.start[1] + tie.end[1]) / 2)
+    assert math.dist(mid, distance.point) == pytest.approx(3.8)
+
+
+def test_corner_draft_does_not_invent_tie_or_modify_street_lines():
+    plan = _plan("lot51_commencing_corner.txt")
+    draft = make_print_draft(plan, {})
+    assert not any(line.kind == "main-street-row-tie" for line in draft.lines)
+    assert len(plan.street_boundary_indices) == 2
+    assert len(plan.lines) == len(draft.lines)
+    for before, after in zip(plan.lines, draft.lines):
+        assert after.kind == before.kind
+        assert after.start == pytest.approx((before.start[0] + 1000, before.start[1]))
+        assert after.end == pytest.approx((before.end[0] + 1000, before.end[1]))
+
+
+def test_party_wall_in_legal_is_separate_and_only_on_correct_sides():
+    text = llm_parser.NYC_SAMPLES["147 Dartmouth Loop (Staten Island)"]
+    model, warnings = llm_parser.parse_with_regex(text)
+    assert [s.party_wall for s in model.segments] == [False, True, False, True]
+    plan = AcadBuilder(_cfg()).plan(model, scale=16)
+    draft = make_print_draft(plan, {})
+    items = [i for i in draft.items if i.kind.startswith("party-wall-")]
+    assert [i.kind for i in items] == ["party-wall-2", "party-wall-4"]
+    assert all(i.text == "PARTY WALL" and i.height == 1.6 for i in items)
+    assert not any("PARTY WALL" in item.text for item in plan.items)
+    assert not any("PARTY WALL" in warning for warning in warnings)
+    before_bearing = llm_parser._flip_segment_direction(model.segments[1])
+    assert before_bearing.party_wall
+    assert llm_parser._mutate_segment_bearing(model.segments[1]).party_wall
+
+
+def test_ambiguous_party_wall_is_not_guessed():
+    sample = llm_parser.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    # Несколько курсов внутри одного THENCE: невозможно однозначно отнести отметку.
+    sample = sample.replace("THENCE N 75°20'20\" E", "N 75°20'20\" E")
+    sample = sample.replace("100.00 feet;\n", "100.00 feet through a party wall;\n", 1)
+    model, warnings = llm_parser.parse_with_regex(sample)
+    assert not any(s.party_wall for s in model.segments)
+    assert any("PARTY WALL" in warning for warning in warnings)
+
+
+def test_print_draft_fonts_heights_and_existing_styles_are_not_modified(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, {})
+    builder, doc = fake_autocad(plan)
+    styles = doc.TextStyles
+    street_style = styles.Add("MtXpl_Times_New_Roma")
+    street_style.fontFile, street_style.Height = "customer.ttf", 0
+    roman_style = styles.Add("Romans")
+    roman_style.fontFile, roman_style.Height = "customer.shx", 0
+    builder.draw_plan(draft)
+    assert (street_style.fontFile, street_style.Height) == ("customer.ttf", 0)
+    assert (roman_style.fontFile, roman_style.Height) == ("customer.shx", 0)
+    assert len(doc.ModelSpace.texts) == len(draft.items)
+    for spec, entity in zip(draft.items, doc.ModelSpace.texts):
+        assert entity.Height == spec.height
+        if spec.kind in {"main-street", "cross-street"}:
+            assert entity.StyleName == "MtXpl_Times_New_Roma" and entity.Height == 4
+        else:
+            assert entity.StyleName == "Romans"
+            if spec.kind.startswith("side-"):
+                assert entity.Height == 2
+            else:
+                assert entity.Height == 1.6
+
+
+def test_new_styles_and_missing_style_error_are_reported(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, {})
+    builder, doc = fake_autocad(plan)
+    builder.draw_plan(draft)
+    assert doc.TextStyles.Item("Romans").fontFile == "romans.shx"
+    assert doc.TextStyles.Item("MtXpl_Times_New_Roma").font[0] == "Times New Roman"
+    builder2, doc2 = fake_autocad(plan)
+    class BrokenStyles:
+        def Item(self, name): raise KeyError(name)
+        def Add(self, name): raise RuntimeError("style unavailable")
+    doc2.TextStyles = BrokenStyles()
+    result = builder2.draw_plan(draft)
+    assert any("MtXpl_Times_New_Roma" in w for w in result.warnings)
+    assert any("Romans" in w for w in result.warnings)
+
+
+def test_ai_party_wall_is_restored_from_matching_local_parse(monkeypatch):
+    text = llm_parser.NYC_SAMPLES["147 Dartmouth Loop (Staten Island)"]
+    local, _ = llm_parser.parse_with_regex(text)
+    ai = local.model_copy(update={"segments": [s.model_copy(update={"party_wall": False}) for s in local.segments]})
+    usage = llm_parser.TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2, provider="test", model="test")
+    monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *args, **kwargs: (ai, "structured-outputs", usage))
+    result = llm_parser.parse_legal_description_full(text=text, cfg=_cfg(), use_llm=True, ask_on_doubt=False)
+    assert [s.party_wall for s in result.data.segments] == [False, True, False, True]
+
+
+def test_missing_tie_distance_and_street_name_styles_do_not_change_main(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    original_items = [(i.text, i.kind, i.height) for i in plan.items]
+    draft = make_print_draft(plan, {})
+    assert [(i.text, i.kind, i.height) for i in plan.items] == original_items
+    builder, doc = fake_autocad(plan)
+    result = builder.draw_plan(plan)
+    assert all(t.StyleName == "BOUNDARY" for t in doc.ModelSpace.texts)
+    assert "MtXpl_Times_New_Roma" not in doc.TextStyles._items
+    assert len(doc.ModelSpace.texts) == result.text_count
+    assert any(i.kind == "cross-street-distance" and i.text == "241.00'" for i in draft.items)
+
+
+def test_relative_course_notes_are_other_text_not_bearings():
+    text = llm_parser.NYC_SAMPLES["63-01 Borden Ave (Queens — без румбов)"]
+    model, _ = llm_parser.parse_with_regex(text)
+    draft = make_print_draft(AcadBuilder(_cfg()).plan(model, scale=16), {})
+    notes = [i for i in draft.items if i.kind.startswith("side-") and "-note" in i.kind]
+    dimensions = [i for i in draft.items if i.kind.startswith("side-") and "-note" not in i.kind]
+    assert notes and dimensions
+    assert all(i.height == 1.6 for i in notes)
+    assert all(i.height == 2.0 for i in dimensions)
+
+
+def test_unassignable_print_style_is_not_silently_reported_as_success(fake_autocad):
+    class RejectStyle(_Entity):
+        @property
+        def StyleName(self): return "Standard"
+        @StyleName.setter
+        def StyleName(self, value): raise RuntimeError("cannot set style")
+        def Delete(self): self.deleted = True
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, {})
+    builder, doc = fake_autocad(plan)
+    made = []
+    def add_text(text, point, height):
+        item = RejectStyle(TextString=text, InsertionPoint=point, Height=height)
+        made.append(item)
+        return item
+    doc.ModelSpace.AddText = add_text
+    result = builder.draw_plan(draft)
+    assert result.text_count == 0
+    assert made and all(item.deleted for item in made)
+    assert any("cannot set style" in warning for warning in result.warnings)

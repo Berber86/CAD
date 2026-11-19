@@ -10894,7 +10894,7 @@ class SurveyApp(ctk.CTk):
             return []
         print_cfg = dict((self.config_data or {}).get("print_draft") or {})
         label = self._plan_source_labels.get(id(main), "текст")
-        return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg))]
+        return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg, builder_cfg=self.config_data))]
 
     def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any]) -> None:
         post = self._worker_poster()

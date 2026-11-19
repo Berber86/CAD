@@ -852,6 +852,7 @@ def _place_beside_line(
 def _place_house_text(
     polygon: Sequence[Point], anchor: Point, target: Point, text: str, height: float,
     width_of: Callable[[str, float], float], ok: Callable[[Rect, Point], bool],
+    rotation_deg: float = 0.0,
 ) -> Point | None:
     """
     Текст без выноски внутри строения у стены (H38). Николай ставит его вплотную к стене изнутри и
@@ -889,7 +890,8 @@ def _place_house_text(
             )
             if not point_in_polygon(center, polygon):
                 continue
-            rect = _rect_at(center, width, height)
+            # Габарит — с учётом поворота подписи (4.31): у повёрнутого текста длина уходит в высоту.
+            rect = _text_rect(center, text, height, width_of, rotation_deg)
             corners = [
                 (rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])
             ]
@@ -1656,7 +1658,7 @@ def plan_offsets(
                 beside = None
                 if HOUSE_TEXT_INSIDE:
                     beside = _place_house_text(
-                        feature.points, best.vertex, best.foot, text, height, width_of, ok
+                        feature.points, best.vertex, best.foot, text, height, width_of, ok, rotation
                     )
                 if beside is None:
                     beside = _place_beside_line(

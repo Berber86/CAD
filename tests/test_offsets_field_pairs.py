@@ -48,10 +48,11 @@ def test_geldner_fence_labels_are_text_without_leaders():
     assert all(item.style == "text" and item.leader is None for item in fences)
 
 
-def test_geldner_labels_do_not_cover_existing_texts():
-    """Подписи не накрывают тексты, которые уже стояли на чертеже."""
-    before, after = fd.load_pair(DOCS / "primer3i.zip")
-    result, _expected, _parts = _measure("primer3i.zip")
+@pytest.mark.parametrize("name", sorted(PAIRS))
+def test_labels_do_not_cover_existing_texts(name):
+    """Подписи не накрывают тексты, которые уже стояли на чертеже (4.32: на всех четырёх парах)."""
+    before, after = fd.load_pair(DOCS / name)
+    result, _expected, _parts = _measure(name)
     from offsets import _rect_at, _rects_overlap, _text_rect, default_text_width
 
     existing = [

@@ -170,7 +170,24 @@
 - В шапке окна и в отчёте Шага 2 указаны номер версии, дата и время выпуска (местное время, Нью-Джерси).
 - В «Настройках» выбирается стартовая вкладка Шага 1: «📝 Текст» (по умолчанию) или «📄 PDF».
   Выбор действует при следующем запуске; текущая вкладка во время работы не сбрасывается.
-- После обновления старое окно run.bat закрывается сразу, когда новая версия уже запущена.
+- **4.41 (замечание 19.11.2026: «при обновлении старое cmd-окно продолжает висеть в трее; спустя 5 обновлений их там 5;
+  окно программы закрывается, а окно батника нет»)**: run.bat больше НЕ ждёт программу. Раньше cmd выполнял
+  `python.exe main.py` и ждал его завершения, а обновление заменяло сам `run.bat` прямо во время его выполнения —
+  cmd читает батник по байтовому смещению, поэтому старое окно зависало и оставалось в панели задач.
+  Теперь: проверка файлов (`compileall.compile_dir('.', maxlevels=0, quiet=1)` — побитый обновлением модуль виден
+  в консоли, и там же предлагается откат) → `start "" ".venv\Scripts\pythonw.exe" main.py` → `goto :eof`, то есть
+  окно cmd закрывается сразу после запуска программы. GUI работает без консоли (`pythonw.exe`), поэтому
+  `sys.stdout`/`sys.stderr` в нём `None` и заменены заглушкой в `main.py` (иначе `print` в диагностике сбоя дал бы
+  `RuntimeError: lost sys.stdout`); ошибки запуска по-прежнему пишутся в `%USERPROFILE%\tsai_crash.log` и показываются
+  диалогом (4.40). Запасной путь, если `pythonw.exe` в окружении нет: обычный `python.exe` в консоли run.bat,
+  но консоль прячется, как только окно программы появилось (`TSAI_HIDE_CONSOLE=1` → `console_window.hide_console()`),
+  и возвращается на экран при сбое запуска (`show_console()`), чтобы текст ошибки и вопрос об откате были видны.
+  Вспомогательный cmd при перезапуске создаётся с `CREATE_NO_WINDOW` — лишнего окна не появляется.
+  Тесты: `tests/test_console_window.py` (WinAPI подменён), `tests/test_windows_launcher.py`
+  (`test_launcher_does_not_wait_for_the_program`, `test_broken_files_are_reported_before_launch`,
+  `test_program_failure_is_reported_by_the_program`), в `tests/test_gui_smoke.py` —
+  `test_console_window_is_hidden_when_run_bat_asks`, `test_main_returns_console_to_screen_when_startup_fails`,
+  `test_relaunch_after_update_hides_helper_console`.
 
 ## Склейка по карте (3.85)
 

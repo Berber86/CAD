@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -61,6 +62,21 @@ def _run_launcher(work: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _wait_for(path: Path, timeout: float = 60.0) -> bool:
+    """
+    Ждём файл-маркер от программы.
+
+    С 4.41 run.bat поднимает GUI отдельным процессом (pythonw.exe) и закрывается сам,
+    поэтому к моменту его возврата программа может ещё запускаться.
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if path.exists():
+            return True
+        time.sleep(0.2)
+    return path.exists()
+
+
 def _make_local_wheel(work: Path) -> str:
     """Минимальный wheel, чтобы проверить установку в старую .venv без интернета."""
     filename = "launcher_probe-1.0-py3-none-any.whl"
@@ -80,33 +96,78 @@ def _make_local_wheel(work: Path) -> str:
 
 @requires_windows
 def test_existing_venv_gets_missing_dependency_before_launch(launcher_dir):
+    """Зависимости ставятся до запуска, и программа действительно поднимается."""
     wheel = _make_local_wheel(launcher_dir)
     (launcher_dir / "requirements.txt").write_text(f"./{wheel}\n", encoding="utf-8")
+    marker = launcher_dir / "started.txt"
     (launcher_dir / "main.py").write_text(
-        "import launcher_probe\nassert launcher_probe.VALUE == 'installed'\nprint('LAUNCH_OK')\n",
+        "import launcher_probe\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text(launcher_probe.VALUE, encoding='utf-8')\n",
         encoding="utf-8",
     )
     result = _run_launcher(launcher_dir)
     assert result.returncode == 0, result.stdout.decode("utf-8", errors="replace")
-    assert b"LAUNCH_OK" in result.stdout
+    assert _wait_for(marker), "программа не запущена"
+    assert marker.read_text(encoding="utf-8") == "installed"
 
 
 @requires_windows
-@pytest.mark.parametrize(
-    ("script", "marker"),
-    [
-        ("import nonexistent_launcher_probe_module\n", b"ModuleNotFoundError"),
-        ("import sys\nprint('NEGATIVE_EXIT')\nsys.exit(-1)\n", b"NEGATIVE_EXIT"),
-    ],
-    ids=("import-error", "negative-exit-code"),
-)
-def test_launch_errors_keep_diagnostics_and_return_failure(launcher_dir, script, marker):
+def test_launcher_does_not_wait_for_the_program(launcher_dir):
+    """
+    Окно cmd закрывается сразу после запуска программы (4.41).
+
+    Раньше run.bat ждал завершения python.exe, а обновление заменяло run.bat прямо во
+    время его выполнения — старое окно cmd зависало и оставалось в панели задач (за
+    несколько обновлений их накапливалось несколько). Теперь GUI поднимается отдельным
+    процессом без консоли: вывод программы в окно run.bat не попадает, а сам run.bat
+    завершается, не дожидаясь её.
+    """
     (launcher_dir / "requirements.txt").write_text("", encoding="utf-8")
-    (launcher_dir / "main.py").write_text(script, encoding="utf-8")
+    marker = launcher_dir / "started.txt"
+    (launcher_dir / "main.py").write_text(
+        "from pathlib import Path\n"
+        "print('CONSOLE_OUTPUT_OF_THE_PROGRAM')\n"
+        f"Path({str(marker)!r}).write_text('ok', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    result = _run_launcher(launcher_dir)
+    assert result.returncode == 0, result.stdout.decode("utf-8", errors="replace")
+    assert _wait_for(marker), "программа не запущена"
+    assert b"CONSOLE_OUTPUT_OF_THE_PROGRAM" not in result.stdout
+
+
+@requires_windows
+def test_broken_files_are_reported_before_launch(launcher_dir):
+    """Побитые обновлением файлы видны в консоли: запуск не начинается, предлагается откат."""
+    (launcher_dir / "requirements.txt").write_text("", encoding="utf-8")
+    (launcher_dir / "main.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
     result = _run_launcher(launcher_dir)
     assert result.returncode == 1
-    assert marker in result.stdout
+    assert b"Error compiling" in result.stdout
     assert b"tsai_crash.log" in result.stdout
+
+
+@requires_windows
+def test_program_failure_is_reported_by_the_program(launcher_dir):
+    """
+    Сбой уже запущенной программы — на её стороне, не в run.bat.
+
+    Программа работает без консоли, поэтому свои ошибки она показывает сама: пишет
+    ``tsai_crash.log`` и открывает диалог (``main._show_startup_failure``). run.bat к
+    этому моменту закрыт, и его код возврата остаётся нулевым.
+    """
+    (launcher_dir / "requirements.txt").write_text("", encoding="utf-8")
+    marker = launcher_dir / "started.txt"
+    (launcher_dir / "main.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started', encoding='utf-8')\n"
+        "raise SystemExit(-1)\n",
+        encoding="utf-8",
+    )
+    result = _run_launcher(launcher_dir)
+    assert result.returncode == 0, result.stdout.decode("utf-8", errors="replace")
+    assert _wait_for(marker), "программа не запускалась"
 
 
 @requires_windows

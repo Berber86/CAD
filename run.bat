@@ -35,6 +35,22 @@ if exist "requirements-ocr.txt" (
     if errorlevel 1 echo [2/3] Локальный OCR не установлен - сканы пойдут в ИИ.
 )
 echo [3/3] Запускаю приложение ...
+rem Проверка, что файлы программы не побиты обновлением: разбираем все модули в
+rem папке программы (без записи .pyc заново, если файл не менялся). Ошибка видна
+rem здесь же, в консоли, а ниже предлагается откат на резервную копию.
+".venv\Scripts\python.exe" -c "import compileall,sys; sys.exit(0 if compileall.compile_dir('.', maxlevels=0, quiet=1) else 1)" || goto :launch_error
+rem Окно cmd закрывается сразу после запуска программы (4.41): GUI поднимается
+rem отдельным процессом без консоли, cmd его не ждёт и не остаётся в панели задач.
+rem Раньше cmd ждал завершения python.exe, а обновление заменяло run.bat прямо во
+rem время его выполнения - старое окно зависало, и за несколько обновлений их
+rem накапливалось несколько штук.
+if exist ".venv\Scripts\pythonw.exe" (
+    start "" ".venv\Scripts\pythonw.exe" main.py
+    goto :eof
+)
+rem Запасной путь (pythonw.exe не нашёлся): программа работает в этой консоли,
+rem но прячет её, как только окно появится - см. console_window.py.
+set "TSAI_HIDE_CONSOLE=1"
 ".venv\Scripts\python.exe" main.py
 if not "%errorlevel%"=="0" goto :launch_error
 goto :eof

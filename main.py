@@ -29,6 +29,7 @@ import copy
 import datetime as _dt
 import dataclasses
 from datetime import datetime
+import io
 import json
 import math
 import os
@@ -144,6 +145,7 @@ from llm_parser import (
     save_protected_env,
 )
 import browser_save
+import console_window
 import deed_intake
 import deed_store
 import nyc_portal
@@ -167,6 +169,16 @@ from pdf_set import (
     SCAN_OCR_DPI,
     set_signature,
 )
+
+# run.bat поднимает программу через pythonw.exe — без консоли (4.41), чтобы окно cmd
+# не оставалось висеть в панели задач после каждого обновления. В таком процессе
+# sys.stdout и sys.stderr равны None, и любой print() кончается RuntimeError
+# («lost sys.stdout») — то есть диагностика сбоя ударила бы по самому себе.
+# Потоки заменяются заглушкой: настоящий отчёт уходит в tsai_crash.log и в диалог.
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1440x940"
@@ -6039,10 +6051,15 @@ class SurveyApp(ctk.CTk):
             return f"не найден {run_bat.name} в папке программы"
         if sys.platform != "win32":
             return "автоматический перезапуск работает в Windows"
+        # CREATE_NO_WINDOW: сам вспомогательный cmd не должен показывать окно.
+        # Новое окно создаёт только start — в нём run.bat печатает прогресс проверки
+        # зависимостей и закрывается сам, как только поднимет новую версию (4.41).
+        flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
         try:
             subprocess.Popen(
                 ["cmd", "/c", "start", "", str(run_bat)],
                 cwd=str(run_bat.parent),
+                creationflags=flags,
             )
         except OSError as exc:
             return f"{type(exc).__name__}: {exc}"
@@ -9589,6 +9606,15 @@ class SurveyApp(ctk.CTk):
             self.focus_set()
         except Exception:  # noqa: BLE001 - фокус не критичен
             pass
+        # Консоль run.bat прячется только теперь, когда окно уже на экране (4.41):
+        # раньше cmd оставался висеть в панели задач после каждого обновления.
+        # Просьба спрятать приходит из run.bat (TSAI_HIDE_CONSOLE) — свой терминал
+        # разработчика программа не трогает.
+        try:
+            if console_window.hide_requested():
+                console_window.hide_console()
+        except Exception:  # noqa: BLE001 - консоль не критична для работы окна
+            pass
 
     def _open_maximized(self) -> None:
         """Разворачивает окно на весь экран (заголовок и кнопки Windows остаются). Сбой не мешает работе — окно остаётся обычным."""
@@ -12542,6 +12568,12 @@ def main() -> int:
             print(f"ОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}", file=sys.stderr)
         else:
             print("Не удалось сохранить журнал ошибки.", file=sys.stderr)
+        # Консоль могла быть спрятана показом окна: возвращаем её, чтобы текст ошибки
+        # и вопрос run.bat об откате были видны (4.41).
+        try:
+            console_window.show_console()
+        except Exception:  # noqa: BLE001 - без консоли диагностика всё равно в журнале
+            pass
         _show_startup_failure(report, log_path)
         return 1
     return 0

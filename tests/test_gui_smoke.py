@@ -670,6 +670,72 @@ def test_main_shows_error_dialog_when_startup_fails(gui, monkeypatch, tmp_path, 
     assert "сборка окна упала" in capsys.readouterr().err
 
 
+def test_console_window_is_hidden_when_run_bat_asks(gui, monkeypatch):
+    """
+    Запасной путь запуска (pythonw.exe в окружении нет): программа работает в консоли
+    run.bat, но прячет её, как только окно показано, — cmd не висит в панели задач (4.41).
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: True)
+    monkeypatch.setattr(gui.console_window, "hide_console", lambda: calls.append("hide") or True)
+    app = gui.SurveyApp()
+    assert calls == ["hide"], "консоль не спрятана после показа окна"
+    assert app._visible is True
+
+
+def test_console_window_is_left_alone_without_run_bat_request(gui, monkeypatch):
+    """Свой терминал разработчика программа не прячет: просьба приходит только из run.bat."""
+    calls: list[str] = []
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: False)
+    monkeypatch.setattr(gui.console_window, "hide_console", lambda: calls.append("hide") or True)
+    gui.SurveyApp()
+    assert calls == []
+
+
+def test_console_hide_failure_does_not_break_startup(gui, monkeypatch):
+    """Сбой WinAPI не мешает окну показаться."""
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: True)
+
+    def _boom():
+        raise OSError("нет WinAPI")
+
+    monkeypatch.setattr(gui.console_window, "hide_console", _boom)
+    app = gui.SurveyApp()
+    assert app._visible is True and app._alpha == 1.0
+
+
+def test_main_returns_console_to_screen_when_startup_fails(gui, monkeypatch, tmp_path):
+    """
+    Если запуск не удался, консоль возвращается: run.bat печатает ошибку и предлагает
+    откатиться на резервную копию — этот текст должен быть виден (4.41).
+    """
+    shown: list[str] = []
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(gui.console_window, "show_console", lambda: shown.append("show") or True)
+
+    def _raise():
+        gui._STARTUP_WINDOW = None
+        raise RuntimeError("окно не собралось")
+
+    monkeypatch.setattr(gui, "SurveyApp", _raise)
+    assert gui.main() == 1
+    assert shown == ["show"]
+
+
+def test_relaunch_after_update_hides_helper_console(gui, monkeypatch):
+    """Вспомогательный cmd запускается без своего окна: новое окно создаёт только start."""
+    import subprocess
+
+    app = gui.SurveyApp()
+    launched: list[dict] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(dict(kw)))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    assert app._relaunch_after_update() == ""
+    assert launched, "run.bat не запущен"
+    expected = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    assert launched[0].get("creationflags") == expected
+
+
 def test_main_returns_success_after_mainloop(gui, monkeypatch):
     ran = []
 

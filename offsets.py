@@ -408,6 +408,19 @@ FENCE_END_MIN_LENGTH_FT = 20.0
 #: Короткая подпись у того же угла, чья часть уже есть в полной («FE.1.2'S» рядом с
 #: «FE.0.1'E / 1.2'S»), не ставится: это одна и та же привязка (H32).
 POST_PART_DEDUPE = True
+#: Дом подписывается по стенам, параллельным стороне участка (H34), а не одной ближайшей вершиной.
+HOUSE_WALL_LABELS = True
+#: Наибольшее расстояние от стены дома до границы, которое подписывается, футы.
+#: Больше ``PARALLEL_MAX_FT`` (6 ft) смысла нет: дальние стены отсекает сам ``_parallel_candidates``.
+HOUSE_WALL_MAX_FT = 6.0
+#: Стена короче этого — не стена дома, а выступ/эркер; не подписывается (H36), футы.
+HOUSE_WALL_MIN_FT = 8.0
+#: Не больше стольких стен на одно направление (N/E/S/W) у одного дома (H35).
+HOUSE_WALLS_PER_SIDE = 2
+#: Не больше стольких подписей у одного дома (H35).
+HOUSE_MAX_LABELS = 4
+#: Текст оффсета дома ставится у середины стены, как у Николая, а не у её конца (H35).
+HOUSE_TEXT_AT_WALL_MIDDLE = True
 #: Вторая сторона у той же вершины ищется и на продолжении стороны (H29), не дальше этого, футы.
 #: Николай: «W.FE. 0.1'E / 1.2'S» (северная сторона продолжена за восточный угол), «C.L.F. 0.6'S / 1.1'E».
 SECOND_SIDE_EXTENSION_FT = 5.0
@@ -434,6 +447,8 @@ class OffsetCandidate:
     segment: int = -1  # номер отрезка объекта (для параллельных углов); -1 — ближайшая сторона без отрезка
     #: До какого расстояния снаружи объект ещё подписывается: у обследованного конца забора — 6 ft (H33).
     allowed_outside_ft: float = OUTSIDE_MAX_FT
+    #: Вершина для записи «якоря» подписи, если текст ставится не у неё (дом: текст у середины стены).
+    anchor_override: Point | None = None
 
 
 def measure_candidates(
@@ -897,6 +912,60 @@ def _feature_candidates(
                     chosen.append(candidate)
         return chosen
 
+    if feature.kind == "house" and HOUSE_WALL_LABELS:
+        points = list(feature.points)
+        closed = len(points) >= 3
+        seq = points + [points[0]] if closed else points
+        walls, _covered = _parallel_candidates(ring, feature)
+        by_key: dict[tuple[float, str], OffsetCandidate] = {}
+        for candidate in walls:
+            if not (MIN_OFFSET_FT <= candidate.distance_ft <= HOUSE_WALL_MAX_FT):
+                continue
+            if candidate.outside_ft > OUTSIDE_MAX_FT:
+                continue
+            if not (0 <= candidate.segment < len(seq) - 1):
+                continue
+            if math.dist(seq[candidate.segment], seq[candidate.segment + 1]) < HOUSE_WALL_MIN_FT:
+                continue
+            letter = offset_letter(
+                candidate.vertex[0] - candidate.foot[0],
+                candidate.vertex[1] - candidate.foot[1],
+                north_deg,
+            )
+            key = (round_offset_ft(candidate.distance_ft), letter)
+            best = by_key.get(key)
+            if best is None or candidate.distance_ft < best.distance_ft:
+                by_key[key] = candidate
+        if by_key:
+            per_side: dict[str, list[tuple[float, OffsetCandidate]]] = {}
+            for (value, letter), candidate in by_key.items():
+                per_side.setdefault(letter, []).append((candidate.distance_ft, candidate))
+            chosen: list[OffsetCandidate] = []
+            for letter, items in per_side.items():
+                items.sort(key=lambda pair: pair[0])
+                chosen += [candidate for _d, candidate in items[:HOUSE_WALLS_PER_SIDE]]
+            chosen.sort(key=lambda c: c.distance_ft)
+            chosen = chosen[:HOUSE_MAX_LABELS]
+            if HOUSE_TEXT_AT_WALL_MIDDLE:
+                moved: list[OffsetCandidate] = []
+                for candidate in chosen:
+                    if not (0 <= candidate.segment < len(seq) - 1):
+                        moved.append(candidate)
+                        continue
+                    a, b = seq[candidate.segment], seq[candidate.segment + 1]
+                    middle = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+                    shift = (middle[0] - candidate.vertex[0], middle[1] - candidate.vertex[1])
+                    moved.append(
+                        replace(
+                            candidate,
+                            vertex=middle,
+                            foot=(candidate.foot[0] + shift[0], candidate.foot[1] + shift[1]),
+                            anchor_override=candidate.vertex,
+                        )
+                    )
+                chosen = moved
+            return chosen
+
     if not CORNER_LABELS:
         return nearest()
     parallel, covered = _parallel_candidates(ring, feature)
@@ -1218,10 +1287,12 @@ def plan_offsets(
         used: set[tuple] = set()
         rest_seen = False
         # Цели подписи: обычные кандидаты и (для забора на линии) вершина «FE.O/L».
-        # У забора 4.20 candidates уже выбраны по правилам H27/H28 (углы и пересечения) — каждый
-        # кандидат даёт свою подпись. Для дома и стены по-прежнему одна подпись на объект.
-        multi = CORNER_LABELS or (
-            feature.kind == "fence" and (FENCE_CORNER_LABELS or CROSSING_LABELS)
+        # У забора 4.20 и у дома 4.22 candidates уже выбраны правилами (H27/H28 и H34–H36) — каждый
+        # кандидат даёт свою подпись. Стена по-прежнему получает одну подпись на объект.
+        multi = (
+            CORNER_LABELS
+            or (feature.kind == "house" and HOUSE_WALL_LABELS)
+            or (feature.kind == "fence" and (FENCE_CORNER_LABELS or CROSSING_LABELS))
         )
         targets: list[tuple[OffsetCandidate, bool]] = [
             (best, False) for best in (candidates if multi else candidates[:1])
@@ -1309,7 +1380,7 @@ def plan_offsets(
                 rect = _rect_at(beside, width_of(text, height), height)
                 item = OffsetItem(
                     kind=feature.kind, value_ft=value, direction=direction, style="text",
-                    height_ft=height, anchor=best.vertex, target=best.foot, text=text,
+                    height_ft=height, anchor=best.anchor_override or best.vertex, target=best.foot, text=text,
                     point=beside, leader=None,
                     rotation_deg=(
                         _boundary_angle_deg(best.foot, boundary_segs) if TEXT_FOLLOWS_BOUNDARY else 0.0
@@ -1331,7 +1402,7 @@ def plan_offsets(
                 rect = _rect_at(center, rect_w, rect_h)
                 item = OffsetItem(
                     kind=feature.kind, value_ft=value, direction=direction, style="leader",
-                    height_ft=height, anchor=best.vertex, target=best.foot, text=leader_text,
+                    height_ft=height, anchor=best.anchor_override or best.vertex, target=best.foot, text=leader_text,
                     point=center, leader=(best.vertex, end),
                 )
             placed.append(rect)

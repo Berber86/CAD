@@ -1,0 +1,284 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+<title>Title Survey AI — концепт Premium Dark</title><desc>Демонстрационный векторный макет интерфейса главного окна. Все показатели и текст участка условные. Нативный заголовок Windows показан схематично.</desc>
+<defs>
+ <linearGradient id="appBackground" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#111424"/><stop offset="1" stop-color="#090c16"/></linearGradient>
+ <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8271ec"/><stop offset="1" stop-color="#5e4bc3"/></linearGradient>
+ <pattern id="minorGrid" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M 24 0 L 0 0 0 24" fill="none" stroke="#19263a" stroke-width="1"/></pattern>
+ <pattern id="majorGrid" width="120" height="120" patternUnits="userSpaceOnUse"><rect width="120" height="120" fill="url(#minorGrid)"/><path d="M 120 0 L 0 0 0 120" fill="none" stroke="#24334a" stroke-width="1"/></pattern>
+</defs>
+<rect x="0" y="0" width="1600" height="1000" rx="0" fill="url(#appBackground)"/>
+<g id="native-window-titlebar">
+<rect x="0" y="0" width="1600" height="32" rx="0" fill="#0c0e18"/>
+<text x="18" y="21" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a9b0c1" text-anchor="start" >Title Survey AI  ·  Premium Dark</text>
+<line x1="0" y1="31" x2="1600" y2="31" stroke="#262b3b" stroke-width="1" />
+<line x1="1480" y1="16" x2="1492" y2="16" stroke="#b6bccb" stroke-width="1.5" />
+<rect x="1521" y="11" width="10" height="10" rx="0" fill="none" stroke="#b6bccb" stroke-width="1"/>
+<line x1="1566" y1="11" x2="1576" y2="21" stroke="#b6bccb" stroke-width="1.3" />
+<line x1="1576" y1="11" x2="1566" y2="21" stroke="#b6bccb" stroke-width="1.3" />
+</g>
+<g id="app-header">
+<rect x="0" y="32" width="1600" height="74" rx="0" fill="#121522"/>
+<rect x="24" y="47" width="43" height="43" rx="13" fill="url(#accent)"/>
+<path d="M35 78 L45 55 L57 78 M40 70 H52 M35 78 H57" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="65" font-family="Segoe UI, Arial, sans-serif" font-size="17" font-weight="700" fill="#f2f3fa" text-anchor="start" letter-spacing="0.5">TITLE SURVEY</text>
+<text x="80" y="84" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="600" fill="#a8b0c6" text-anchor="start" letter-spacing="1.2">AI  /  CAD WORKSPACE</text>
+<rect x="236" y="55" width="78" height="25" rx="12" fill="#27223f" stroke="#4c416f" stroke-width="1"/>
+<text x="275" y="72" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#d9d1ff" text-anchor="middle" >v4.43</text>
+<text x="412" y="76" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#7c88a1" text-anchor="start" letter-spacing="1">ПРОЦЕСС</text>
+<circle cx="552" cy="69" r="11" fill="#195c51"/>
+<text x="552" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle" >✓</text>
+<text x="570" y="74" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="start" >Источник</text>
+<line x1="653" y1="69" x2="669" y2="69" stroke="#44485f" stroke-width="1" />
+<circle cx="685" cy="69" r="11" fill="#195c51"/>
+<text x="685" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle" >✓</text>
+<text x="703" y="74" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="start" >Разбор</text>
+<line x1="786" y1="69" x2="802" y2="69" stroke="#44485f" stroke-width="1" />
+<circle cx="807" cy="69" r="11" fill="#6957d4"/>
+<text x="807" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle" >3</text>
+<text x="825" y="74" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="start" >Проверка</text>
+<line x1="908" y1="69" x2="924" y2="69" stroke="#44485f" stroke-width="1" />
+<circle cx="958" cy="69" r="11" fill="#30354a"/>
+<text x="958" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle" >4</text>
+<text x="976" y="74" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="start" >AutoCAD</text>
+<rect x="1122" y="53" width="123" height="32" rx="8" fill="#1b1f2f" stroke="#303549" stroke-width="1"/>
+<text x="1135" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#e5e8f4" text-anchor="start" >1” = 16’</text>
+<text x="1228" y="73" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="600" fill="#a5afc6" text-anchor="middle" >⌄</text>
+<rect x="1256" y="53" width="117" height="32" rx="9" fill="#1b1f2f" stroke="#303549" stroke-width="1"/>
+<text x="1314.5" y="73.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >⌘  Клавиши</text>
+<rect x="1383" y="53" width="135" height="32" rx="9" fill="#292d40" stroke="#3c4157" stroke-width="1"/>
+<text x="1450.5" y="73.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="middle" >⚙  Настройки</text>
+<line x1="0" y1="105" x2="1600" y2="105" stroke="#272b3a" stroke-width="1" />
+</g>
+<g id="step-navigation">
+<rect x="0" y="106" width="1600" height="62" rx="0" fill="#111421"/>
+<rect x="24" y="120" width="213" height="34" rx="9" fill="#1b1e2d" stroke="#2e3345" stroke-width="1"/>
+<text x="130.5" y="141.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >00   Документы участка</text>
+<rect x="245" y="120" width="238" height="34" rx="9" fill="#594bc4" stroke="#8a7be3" stroke-width="1"/>
+<text x="364.0" y="141.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle" >01   Граница участка</text>
+<rect x="491" y="120" width="214" height="34" rx="9" fill="#1b1e2d" stroke="#2e3345" stroke-width="1"/>
+<text x="598.0" y="141.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >02   Подписи объектов</text>
+<rect x="713" y="120" width="151" height="34" rx="9" fill="#1b1e2d" stroke="#2e3345" stroke-width="1"/>
+<text x="788.5" y="141.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >04   Оффсеты</text>
+<text x="1576" y="142" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="600" fill="#8993a9" text-anchor="end" letter-spacing="0.6">ДЕМОНСТРАЦИОННЫЙ МАКЕТ  ·  ДАННЫЕ УСЛОВНЫЕ</text>
+<line x1="0" y1="167" x2="1600" y2="167" stroke="#262b3b" stroke-width="1" />
+</g>
+<g id="workspace-panels">
+<rect x="20" y="185" width="332" height="710" rx="14" fill="#171a29" stroke="#303549" stroke-width="1"/>
+<rect x="368" y="185" width="854" height="710" rx="14" fill="#101420" stroke="#303549" stroke-width="1"/>
+<rect x="1238" y="185" width="342" height="710" rx="14" fill="#171a29" stroke="#303549" stroke-width="1"/>
+</g>
+<g id="source-panel">
+<rect x="38" y="204" width="30" height="30" rx="9" fill="#2a2547"/>
+<text x="53" y="224" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#d7cdff" text-anchor="middle" >01</text>
+<text x="79" y="217" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#f2f3fa" text-anchor="start" >Исходные данные</text>
+<text x="79" y="234" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >Документ и способ разбора</text>
+<line x1="38" y1="251" x2="334" y2="251" stroke="#303549" stroke-width="1" />
+<rect x="38" y="267" width="296" height="38" rx="10" fill="#10131f" stroke="#303549" stroke-width="1"/>
+<text x="86" y="291" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >PDF</text>
+<text x="184" y="291" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >Фото</text>
+<rect x="233" y="271" width="97" height="30" rx="7" fill="#3c385e"/>
+<text x="281" y="291" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#f1eeff" text-anchor="middle" >Текст</text>
+<text x="40" y="333" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#969fb5" text-anchor="start" letter-spacing="1">LEGAL DESCRIPTION</text>
+<text x="332" y="333" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="500" fill="#a5afc6" text-anchor="end" >Образец  ⌄</text>
+<rect x="38" y="345" width="296" height="202" rx="10" fill="#0d111d" stroke="#303549" stroke-width="1"/>
+<text x="52" y="369" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >BEGINNING at a point on the</text>
+<text x="52" y="387" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >southerly side of Sample Street;</text>
+<text x="52" y="405" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >running thence South 00°00’00”</text>
+<text x="52" y="423" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >West, 100.00 feet; thence</text>
+<text x="52" y="441" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >East, 40.00 feet; thence</text>
+<text x="52" y="459" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >North 00°00’00” East,</text>
+<text x="52" y="477" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >100.00 feet; thence</text>
+<text x="52" y="495" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >West, 40.00 feet to</text>
+<text x="52" y="513" font-family="Consolas, DejaVu Sans Mono, monospace" font-size="11" font-weight="400" fill="#c2c9d8" text-anchor="start" >the POINT OF BEGINNING.</text>
+<text x="322" y="534" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#7c88a1" text-anchor="end" >условный текст</text>
+<rect x="38" y="560" width="296" height="42" rx="9" fill="#111522" stroke="#303549" stroke-width="1"/>
+<circle cx="54" cy="581" r="5" fill="#a69aff"/>
+<text x="68" y="585" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="start" >Основной участок</text>
+<text x="318" y="585" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="500" fill="#a5afc6" text-anchor="end" >Соседний</text>
+<rect x="38" y="617" width="296" height="98" rx="10" fill="#111522" stroke="#303549" stroke-width="1"/>
+<text x="52" y="638" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#969fb5" text-anchor="start" letter-spacing="1">РЕЖИМ РАЗБОРА</text>
+<rect x="52" y="650" width="28" height="28" rx="8" fill="#292344"/>
+<text x="66" y="669" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#c1b6ff" text-anchor="middle" >✦</text>
+<text x="91" y="663" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#f2f3fa" text-anchor="start" >Локальный разбор</text>
+<text x="91" y="681" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#91d9c3" text-anchor="start" >Без ИИ  ·  бесплатно</text>
+<text x="319" y="668" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="400" fill="#a5afc6" text-anchor="end" >⚙</text>
+<rect x="38" y="730" width="296" height="43" rx="9" fill="#594bc4" stroke="#796bd3" stroke-width="1"/>
+<text x="186.0" y="756.05" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle" >Рассчитать схему   →</text>
+<rect x="38" y="782" width="296" height="36" rx="9" fill="#252a3c" stroke="#353b50" stroke-width="1"/>
+<text x="186.0" y="804.2" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#a5afc6" text-anchor="middle" >Новый расчёт  ·  полный сброс</text>
+<text x="40" y="846" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#7c88a1" text-anchor="start" >Источники и данные останутся под</text>
+<text x="40" y="864" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#7c88a1" text-anchor="start" >вашим контролем.</text>
+</g>
+<g id="drawing-preview">
+<text x="388" y="215" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#7c88a1" text-anchor="start" letter-spacing="1.1">ПРЕДПРОСМОТР</text>
+<text x="388" y="239" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f3fa" text-anchor="start" >Схема участка</text>
+<rect x="737" y="208" width="194" height="34" rx="9" fill="#141824" stroke="#303549" stroke-width="1"/>
+<rect x="741" y="212" width="97" height="26" rx="6" fill="#3c385e"/>
+<text x="789" y="230" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#f0eefe" text-anchor="middle" >Схема CAD</text>
+<text x="885" y="230" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="500" fill="#a5afc6" text-anchor="middle" >Исходник</text>
+<rect x="951" y="208" width="108" height="34" rx="9" fill="#252a3c" stroke="#373d51" stroke-width="1"/>
+<text x="1005.0" y="228.85" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#a5afc6" text-anchor="middle" >Копировать</text>
+<rect x="1069" y="208" width="130" height="34" rx="9" fill="#252a3c" stroke="#373d51" stroke-width="1"/>
+<text x="1134.0" y="228.85" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#a5afc6" text-anchor="middle" >Сбросить</text>
+<line x1="369" y1="259" x2="1221" y2="259" stroke="#303549" stroke-width="1" />
+<rect x="382" y="274" width="826" height="605" rx="10" fill="#0b101b" stroke="#293348" stroke-width="1"/>
+<g id="canvas-grid">
+<line x1="390" y1="275" x2="390" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="414" y1="275" x2="414" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="438" y1="275" x2="438" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="462" y1="275" x2="462" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="486" y1="275" x2="486" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="510" y1="275" x2="510" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="534" y1="275" x2="534" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="558" y1="275" x2="558" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="582" y1="275" x2="582" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="606" y1="275" x2="606" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="630" y1="275" x2="630" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="654" y1="275" x2="654" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="678" y1="275" x2="678" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="702" y1="275" x2="702" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="726" y1="275" x2="726" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="750" y1="275" x2="750" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="774" y1="275" x2="774" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="798" y1="275" x2="798" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="822" y1="275" x2="822" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="846" y1="275" x2="846" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="870" y1="275" x2="870" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="894" y1="275" x2="894" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="918" y1="275" x2="918" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="942" y1="275" x2="942" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="966" y1="275" x2="966" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="990" y1="275" x2="990" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="1014" y1="275" x2="1014" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1038" y1="275" x2="1038" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1062" y1="275" x2="1062" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1086" y1="275" x2="1086" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1110" y1="275" x2="1110" y2="877" stroke="#24334a" stroke-width="1" />
+<line x1="1134" y1="275" x2="1134" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1158" y1="275" x2="1158" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1182" y1="275" x2="1182" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="1206" y1="275" x2="1206" y2="877" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="282" x2="1207" y2="282" stroke="#24334a" stroke-width="1" />
+<line x1="383" y1="306" x2="1207" y2="306" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="330" x2="1207" y2="330" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="354" x2="1207" y2="354" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="378" x2="1207" y2="378" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="402" x2="1207" y2="402" stroke="#24334a" stroke-width="1" />
+<line x1="383" y1="426" x2="1207" y2="426" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="450" x2="1207" y2="450" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="474" x2="1207" y2="474" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="498" x2="1207" y2="498" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="522" x2="1207" y2="522" stroke="#24334a" stroke-width="1" />
+<line x1="383" y1="546" x2="1207" y2="546" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="570" x2="1207" y2="570" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="594" x2="1207" y2="594" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="618" x2="1207" y2="618" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="642" x2="1207" y2="642" stroke="#24334a" stroke-width="1" />
+<line x1="383" y1="666" x2="1207" y2="666" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="690" x2="1207" y2="690" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="714" x2="1207" y2="714" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="738" x2="1207" y2="738" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="762" x2="1207" y2="762" stroke="#24334a" stroke-width="1" />
+<line x1="383" y1="786" x2="1207" y2="786" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="810" x2="1207" y2="810" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="834" x2="1207" y2="834" stroke="#19263a" stroke-width="1" />
+<line x1="383" y1="858" x2="1207" y2="858" stroke="#19263a" stroke-width="1" />
+</g>
+<rect x="401" y="293" width="210" height="29" rx="8" fill="#172030" stroke="#30415c" stroke-width="1"/>
+<circle cx="417" cy="307" r="4" fill="#b2a3ff"/>
+<text x="430" y="311" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#c3cde0" text-anchor="start" letter-spacing="0.7">УЧАСТОК  /  ДЕМО</text>
+<rect x="1030" y="293" width="154" height="29" rx="8" fill="#172030" stroke="#30415c" stroke-width="1"/>
+<text x="1107" y="312" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#a9bad2" text-anchor="middle" letter-spacing="0.7">ПРИМЕР СХЕМЫ</text>
+<rect x="522" y="404" width="535" height="72" rx="2" fill="#192635"/>
+<line x1="522" y1="405" x2="1057" y2="405" stroke="#55677d" stroke-width="1.5" />
+<line x1="522" y1="476" x2="1057" y2="476" stroke="#55677d" stroke-width="1.5" />
+<line x1="535" y1="440" x2="1045" y2="440" stroke="#627286" stroke-width="1" stroke-dasharray="8 9"/>
+<text x="790" y="431" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#a2bdd7" text-anchor="middle" letter-spacing="2">SAMPLE STREET</text>
+<path d="M 745 500 L 885 500 L 885 850 L 745 850 Z" fill="#9b879a" fill-opacity="0.07" stroke="#f78b94" stroke-width="2.5"/>
+<circle cx="745" cy="500" r="4" fill="#ffb1b6"/>
+<circle cx="885" cy="500" r="4" fill="#ffb1b6"/>
+<circle cx="885" cy="850" r="4" fill="#ffb1b6"/>
+<circle cx="745" cy="850" r="4" fill="#ffb1b6"/>
+<rect x="780" y="576" width="70" height="175" rx="2" fill="#233047" stroke="#758aab" stroke-width="1.5"/>
+<text x="815" y="650" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#b9c8dc" text-anchor="middle" letter-spacing="1">BUILDING</text>
+<text x="815" y="668" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#8da1b8" text-anchor="middle" >пример</text>
+<line x1="745" y1="486" x2="885" y2="486" stroke="#e29aa0" stroke-width="1" />
+<line x1="745" y1="482" x2="745" y2="490" stroke="#e29aa0" stroke-width="1" />
+<line x1="885" y1="482" x2="885" y2="490" stroke="#e29aa0" stroke-width="1" />
+<text x="815" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#ffd0d2" text-anchor="middle" >40.00 ft</text>
+<line x1="725" y1="500" x2="725" y2="850" stroke="#e29aa0" stroke-width="1" />
+<line x1="721" y1="500" x2="729" y2="500" stroke="#e29aa0" stroke-width="1" />
+<line x1="721" y1="850" x2="729" y2="850" stroke="#e29aa0" stroke-width="1" />
+<text x="714" y="675" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#ffd0d2" text-anchor="middle" transform="rotate(-90 714 675)">100.00 ft</text>
+<line x1="745" y1="862" x2="885" y2="862" stroke="#e29aa0" stroke-width="1" />
+<text x="815" y="875" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#ffd0d2" text-anchor="middle" >40.00 ft</text>
+<text x="899" y="675" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#ffd0d2" text-anchor="middle" transform="rotate(90 899 675)">100.00 ft</text>
+<text x="690" y="505" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#ffd274" text-anchor="start" >P.O.B.</text>
+<circle cx="745" cy="500" r="4" fill="#fbbf24"/>
+<line x1="1148" y1="389" x2="1148" y2="349" stroke="#a9b9d0" stroke-width="1.5" />
+<path d="M1148 343 L1142 357 L1148 353 L1154 357 Z" fill="#c7d1e1"/>
+<text x="1148" y="336" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#cbd6e5" text-anchor="middle" >N</text>
+<rect x="401" y="822" width="172" height="40" rx="9" fill="#18202d" stroke="#344158" stroke-width="1"/>
+<text x="421" y="847" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="600" fill="#d6ddea" text-anchor="middle" >−</text>
+<line x1="440" y1="831" x2="440" y2="852" stroke="#344158" stroke-width="1" />
+<text x="484" y="846" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#c9d3e2" text-anchor="middle" >100%</text>
+<line x1="529" y1="831" x2="529" y2="852" stroke="#344158" stroke-width="1" />
+<text x="550" y="847" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="600" fill="#d6ddea" text-anchor="middle" >+</text>
+<text x="1183" y="866" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="500" fill="#9baac0" text-anchor="end" >Колесо мыши — масштаб  ·  Перетаскивание — панорама</text>
+</g>
+<g id="result-panel">
+<rect x="1256" y="204" width="30" height="30" rx="9" fill="#2a2547"/>
+<text x="1271" y="224" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#d7cdff" text-anchor="middle" >02</text>
+<text x="1297" y="217" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#f2f3fa" text-anchor="start" >Результат</text>
+<text x="1297" y="234" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >Параметры и проверки</text>
+<line x1="1256" y1="251" x2="1562" y2="251" stroke="#303549" stroke-width="1" />
+<rect x="1256" y="268" width="306" height="36" rx="9" fill="#10131f" stroke="#303549" stroke-width="1"/>
+<rect x="1260" y="272" width="99" height="28" rx="7" fill="#3c385e"/>
+<text x="1309" y="290" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#f0eefe" text-anchor="middle" >Ведомость</text>
+<text x="1410" y="290" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#a5afc6" text-anchor="middle" >Проверки</text>
+<text x="1513" y="290" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#a5afc6" text-anchor="middle" >Журнал</text>
+<text x="1258" y="336" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#7c88a1" text-anchor="start" letter-spacing="1">ПАРАМЕТРЫ УЧАСТКА</text>
+<rect x="1256" y="348" width="146" height="83" rx="10" fill="#111522" stroke="#303549" stroke-width="1"/>
+<rect x="1416" y="348" width="146" height="83" rx="10" fill="#111522" stroke="#303549" stroke-width="1"/>
+<text x="1269" y="369" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#969fb5" text-anchor="start" letter-spacing="1">ПЛОЩАДЬ</text>
+<text x="1269" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700" fill="#f2f3fa" text-anchor="start" >4 000</text>
+<text x="1342" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >ft²</text>
+<text x="1429" y="369" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" fill="#969fb5" text-anchor="start" letter-spacing="1">ПЕРИМЕТР</text>
+<text x="1429" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700" fill="#f2f3fa" text-anchor="start" >280.00</text>
+<text x="1527" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >ft</text>
+<rect x="1256" y="443" width="306" height="72" rx="10" fill="#142923" stroke="#275c50" stroke-width="1"/>
+<circle cx="1273" cy="461" r="5" fill="#6fd9b4"/>
+<text x="1287" y="465" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#91cfb9" text-anchor="start" >Замыкание</text>
+<text x="1271" y="495" font-family="Segoe UI, Arial, sans-serif" font-size="21" font-weight="700" fill="#c3f4dd" text-anchor="start" >0.00 ft</text>
+<text x="1546" y="493" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="600" fill="#91cfb9" text-anchor="end" >Проверено</text>
+<text x="1258" y="548" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#7c88a1" text-anchor="start" letter-spacing="1">ПРОВЕРКИ</text>
+<rect x="1256" y="561" width="306" height="153" rx="10" fill="#111522" stroke="#303549" stroke-width="1"/>
+<circle cx="1274" cy="578" r="5" fill="#67cfa9"/>
+<text x="1291" y="581" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="start" >Граница замкнута</text>
+<text x="1291" y="596" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#a5afc6" text-anchor="start" >Все стороны соединены</text>
+<line x1="1270" y1="603" x2="1548" y2="603" stroke="#293042" stroke-width="1" />
+<circle cx="1274" cy="622" r="5" fill="#67cfa9"/>
+<text x="1291" y="625" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="start" >Площадь рассчитана</text>
+<text x="1291" y="640" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#a5afc6" text-anchor="start" >Геометрия без расхождений</text>
+<line x1="1270" y1="647" x2="1548" y2="647" stroke="#293042" stroke-width="1" />
+<circle cx="1274" cy="666" r="5" fill="#67cfa9"/>
+<text x="1291" y="669" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#f2f3fa" text-anchor="start" >Готово к проверке</text>
+<text x="1291" y="684" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#a5afc6" text-anchor="start" >Сверьте схему с документом</text>
+<text x="1258" y="750" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#7c88a1" text-anchor="start" letter-spacing="1">ВЫБРАННЫЙ ОБЪЕКТ</text>
+<rect x="1256" y="764" width="306" height="86" rx="10" fill="#111522" stroke="#303549" stroke-width="1"/>
+<text x="1271" y="788" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#f2f3fa" text-anchor="start" >Основной участок</text>
+<text x="1271" y="808" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >Сторон: 4   ·   Статус: пример</text>
+<text x="1271" y="832" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="400" fill="#7c88a1" text-anchor="start" >Результаты носят демонстрационный характер</text>
+</g>
+<g id="status-and-actions">
+<rect x="0" y="913" width="1600" height="87" rx="0" fill="#111421"/>
+<line x1="0" y1="913" x2="1600" y2="913" stroke="#2d3144" stroke-width="1" />
+<circle cx="30" cy="955" r="5" fill="#6ed7ac"/>
+<text x="45" y="951" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#f2f3fa" text-anchor="start" >Готово к работе</text>
+<text x="45" y="970" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="400" fill="#a5afc6" text-anchor="start" >Пример интерфейса  ·  значения условные</text>
+<rect x="1091" y="932" width="218" height="43" rx="9" fill="#225c59" stroke="#397b72" stroke-width="1"/>
+<text x="1200.0" y="957.7" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" fill="#effefa" text-anchor="middle" >Начертить соседей</text>
+<rect x="1321" y="932" width="254" height="43" rx="9" fill="#594bc4" stroke="#8d7ee5" stroke-width="1"/>
+<text x="1448.0" y="958.05" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle" >▶   Начертить в AutoCAD     F5</text>
+</g>
+</svg>

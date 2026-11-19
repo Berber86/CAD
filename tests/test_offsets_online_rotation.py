@@ -77,9 +77,9 @@ def rotation_on(monkeypatch):
 
 
 def test_house_text_follows_boundary_since_4_23():
-    # Общий TEXT_FOLLOWS_BOUNDARY по-прежнему выключен (на эталонах угол следует за участком),
-    # но текст дома у стены поворачивается вдоль границы отдельным правилом 4.23.
-    assert off.TEXT_FOLLOWS_BOUNDARY is False
+    # С 4.31 общий TEXT_FOLLOWS_BOUNDARY включён: на четырёх парах поворот совпал с Николаем у 17 подписей
+    # без выносок из 18 (было 13). Текст дома у стены поворачивался так и раньше — правилом 4.23.
+    assert off.TEXT_FOLLOWS_BOUNDARY is True
     assert off.HOUSE_TEXT_FOLLOWS_BOUNDARY is True
     house = _house([(6.0, 10.0), (14.0, 10.0), (14.0, 30.0), (6.0, 30.0)])
     plan = off.plan_offsets(LOT40, [house], north_deg=90.0)

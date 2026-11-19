@@ -370,10 +370,18 @@ ONLINE_FENCE_TEXT = "FE.O/L"
 #: подписывает там забор («FE.0.1'W»), а не дом.
 HOUSE_ONLINE_LABELS = True
 HOUSE_ONLINE_TEXT = "BLDG O/L"
-#: Текст без выноски поворачивается вдоль ближайшей границы (R10). Выключено: на эталонах угол следует за
-#: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
-#: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
-TEXT_FOLLOWS_BOUNDARY = False
+#: Текст без выноски поворачивается вдоль своей линии: 0° у горизонтальной, 90° у вертикальной (R10, 4.31).
+#: Замер по четырём парам: из 18 наших подписей без выносок поворот совпал с Николаем у 17 (с выключенным
+#: правилом — у 13). Он так пишет и без выносок (Brooklyn 4 из 5, Geldner 3 из 5, 6910 15th 4 из 4).
+#: Тексты с выноской у него почти всегда горизонтальны, но выносок мы не ставим (4.24), поэтому правило
+#: применяется ко всем нашим подписям.
+TEXT_FOLLOWS_BOUNDARY = True
+#: Метка забора повторяется в каждой строке многозначной подписи: `FE.0.4'N` и под ним `FE.1.3'W` (4.31).
+#: За: 24 Alvine — «FE.0.4'N\PFE.1.3'W», «FE.1.8'S\PFE.1.4'E»; Brooklyn — «FE.0.1'S\PFE.0.5'W». Там, где у
+#: Николая тип идёт заголовком (192 Geldner «W.FE.\P0.1'E\P1.2'S»), метки на второй строке нет, но мы
+#: заголовок типа не пишем (TYPE_PREFIX_FT = 0), поэтому повторяем общее «FE.». Замер: совпавших частей
+#: 35 против 32 (Alvine 7→9, Brooklyn 6→7), подписей столько же.
+FENCE_PREFIX_EACH_LINE = True
 #: Шаг строк многострочной подписи в высотах текста (как mtext_line_spacing_factor в acad_builder).
 TEXT_LINE_SPACING = 1.67
 #: Подпись забора ставится текстом без выноски, как у Николая. В 192 Geldner все его подписи по заборам —
@@ -679,6 +687,18 @@ def _grow_rect(rect: Rect, amount: float) -> Rect:
     return (rect[0] - amount, rect[1] - amount, rect[2] + amount, rect[3] + amount)
 
 
+def _text_rect(at: Point, text: str, height: float, width_of, rotation_deg: float = 0.0) -> Rect:
+    """Габарит блока подписи: у повёрнутого на 90° текста ширина и высота меняются местами.
+
+    Габарит нужен, чтобы подписи не накрывали друг друга и линии; без поворота (``0°``) он прежний.
+    """
+    width, block_h = _text_block(text, height, width_of)
+    angle = abs(round(float(rotation_deg) % 180.0))
+    if abs(angle - 90.0) <= 5.0:
+        width, block_h = block_h, width
+    return _rect_at(at, width, block_h)
+
+
 def _rect_at(center: Point, width: float, height: float) -> Rect:
     cx, cy = center
     return (cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
@@ -800,15 +820,22 @@ class OffsetPlan:
 
 def _place_beside_line(
     anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
-    ok: Callable[[Rect, Point], bool],
+    ok: Callable[[Rect, Point], bool], rotation_deg: float = 0.0,
 ) -> Point | None:
-    """Текст без выноски — рядом с линией измерения, по перпендикуляру к ней."""
+    """Текст без выноски — рядом с линией измерения, по перпендикуляру к ней.
+
+    ``rotation_deg`` — поворот самой подписи (4.31): у текста, повёрнутого на 90°, габарит поперёк
+    перпендикуляра — это его длина, поэтому место ищется по повёрнутому прямоугольнику.
+    """
     dx, dy = target[0] - anchor[0], target[1] - anchor[1]
     length = math.hypot(dx, dy)
     if length < 1e-9:
         return None
     px, py = -dy / length, dx / length
     width, block_h = _text_block(text, height, width_of)
+    rot = abs(round(float(rotation_deg) % 180.0))
+    if abs(rot - 90.0) <= 5.0:
+        width, block_h = block_h, width
     gap = TEXT_GAP_FACTOR * height
     mid = ((anchor[0] + target[0]) / 2.0, (anchor[1] + target[1]) / 2.0)
     half_extent = abs(px) * width / 2.0 + abs(py) * block_h / 2.0 + gap
@@ -1612,11 +1639,19 @@ def plan_offsets(
                 )
 
             # Значения одной строкой: «W.FE. 0.1'E 1.2'S» (Николай) вместо двух строк выноски.
-            # Префикс типа (FE., C.L.F., W.FE.) стоит один раз в начале строки.
-            display_parts = [text] + [f"{v:.1f}'{d}" for v, d in extra]
+            # Метка в каждой строке (FENCE_PREFIX_EACH_LINE): «FE.0.4'N» и «FE.1.3'W» — как на Alvine.
+            each_line = {"fence": "FE.", "wall": "WALL "}.get(feature.kind, "") if FENCE_PREFIX_EACH_LINE else ""
+            display_parts = [text] + [f"{each_line}{v:.1f}'{d}" for v, d in extra]
             line_text = " ".join(display_parts) if FENCE_TEXT_ONE_LINE else "\n".join(display_parts)
             item: OffsetItem | None = None
             beside = None
+            # Поворот текста без выноски — вдоль своей линии (4.31, §8.6 руководства).
+            rotation = (
+                _boundary_angle_deg(best.foot, boundary_segs)
+                if TEXT_FOLLOWS_BOUNDARY
+                or (feature.kind == "house" and HOUSE_TEXT_FOLLOWS_BOUNDARY)
+                else 0.0
+            )
             if feature.kind == "house":
                 beside = None
                 if HOUSE_TEXT_INSIDE:
@@ -1625,7 +1660,7 @@ def plan_offsets(
                     )
                 if beside is None:
                     beside = _place_beside_line(
-                        best.vertex, best.foot, text, height, width_of, ok
+                        best.vertex, best.foot, text, height, width_of, ok, rotation
                     )
                 # У середины стены места может не быть — пробуем у исходного угла (текст без выноски,
                 # как у Николая), и только потом выноску.
@@ -1636,11 +1671,13 @@ def plan_offsets(
                         corner[1] + best.foot[1] - best.vertex[1],
                     )
                     beside = _place_beside_line(
-                        corner, corner_foot, text, height, width_of, ok
+                        corner, corner_foot, text, height, width_of, ok, rotation
                     )
             if beside is None and feature.kind in ("fence", "wall") and FENCE_TEXT_WITHOUT_LEADER:
                 # Забор и стена: текст у линии без выноски — как у Николая — и только потом выноска.
-                beside = _place_beside_line(best.vertex, best.foot, line_text, height, width_of, ok)
+                beside = _place_beside_line(
+                    best.vertex, best.foot, line_text, height, width_of, ok, rotation
+                )
                 if beside is None:
                     # У самой линии места нет (текст накрыл бы забор) — берём свободное место рядом,
                     # но по-прежнему без выноски: стрелок у Николая нет.
@@ -1652,17 +1689,12 @@ def plan_offsets(
                 if beside is not None:
                     text = line_text
             if beside is not None:
-                rect = _rect_at(beside, *_text_block(text, height, width_of))
+                rect = _text_rect(beside, text, height, width_of, rotation)
                 item = OffsetItem(
                     kind=feature.kind, value_ft=value, direction=direction, style="text",
                     height_ft=height, anchor=best.anchor_override or best.vertex, target=best.foot, text=text,
                     point=beside, leader=None,
-                    rotation_deg=(
-                        _boundary_angle_deg(best.foot, boundary_segs)
-                        if TEXT_FOLLOWS_BOUNDARY
-                        or (feature.kind == "house" and HOUSE_TEXT_FOLLOWS_BOUNDARY)
-                        else 0.0
-                    ),
+                    rotation_deg=rotation,
                 )
             else:
                 # Дом без места под текст получает выноску с «BLDG»; забор и стена — выноску как есть.

@@ -39,10 +39,11 @@ def test_object_just_outside_boundary_is_labelled_with_side():
 
 
 def test_two_sides_of_one_vertex_are_two_lines_of_one_label():
-    # Вершина (1.0, 0.3) у угла: 0.3 до южной стороны (N) и 1.0 до западной (E). Один забор.
+    # Вершина (1.0, 0.3) у угла: 0.3 до южной стороны (N) и 1.0 до западной (E). Один забор,
+    # метка в каждой строке (4.31) — как «FE.0.4'N» / «FE.1.3'W» у Николая на 24 Alvine.
     fence = _fence([(1.0, 0.3), (30.0, 0.3)])
     plan = off.plan_offsets(SQUARE, [fence])
-    assert [item.text for item in plan.items] == ["FE.0.3'N\n1.0'E"]
+    assert [item.text for item in plan.items] == ["FE.0.3'N\nFE.1.0'E"]
 
 
 def test_second_side_is_not_added_beyond_threshold():

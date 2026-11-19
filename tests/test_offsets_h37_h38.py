@@ -61,6 +61,8 @@ def test_house_text_rotates_along_the_boundary():
 
 
 def test_house_text_rotation_can_be_switched_off(monkeypatch):
+    # С 4.31 поворот включает и общий TEXT_FOLLOWS_BOUNDARY, поэтому гасим оба флага.
     monkeypatch.setattr(off, "HOUSE_TEXT_FOLLOWS_BOUNDARY", False)
+    monkeypatch.setattr(off, "TEXT_FOLLOWS_BOUNDARY", False)
     plan = off.plan_offsets(LOT, [HOUSE], north_deg=90.0)
     assert all(round(item.rotation_deg) == 0 for item in plan.items)

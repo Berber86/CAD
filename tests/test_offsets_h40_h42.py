@@ -51,13 +51,14 @@ def test_fence_offset_keeps_fe_prefix_without_a_nearby_type_text():
     assert texts_out and texts_out[0].startswith("FE.")
 
 
-def test_two_sides_go_in_a_column_with_one_prefix():
-    # Две стороны одной вершины: тип один раз, значения — строками ниже (как «C.L.F. 0.6'S 1.1'E»).
+def test_two_sides_go_in_a_column_with_a_prefix_on_every_line():
+    # Две стороны одной вершины: значения строками друг под другом, метка забора — в каждой строке
+    # (4.31, FENCE_PREFIX_EACH_LINE): на 24 Alvine «FE.0.4'N» / «FE.1.3'W», на Brooklyn «FE.0.1'S» / «FE.0.5'W».
     # Угол участка: вершина забора в 0.4 ft от южной и от западной стороны — две стороны одной вершины.
     fence = _fence([(0.4, 0.4), (10.0, 0.4)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
     two_line = [item for item in plan.items if "\n" in item.text]
     assert two_line
-    style, values = two_line[0].text.split("\n")[0], two_line[0].text.split("\n")[1:]
-    assert style.count("FE.") == 1
-    assert all("FE." not in line for line in values)
+    lines = two_line[0].text.split("\n")
+    assert len(lines) == 2
+    assert all(line.startswith("FE.") for line in lines)

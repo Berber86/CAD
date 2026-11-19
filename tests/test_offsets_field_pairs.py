@@ -1,8 +1,8 @@
 """Шаг 4: контрольные цифры на полевых парах заказчика (``docs/primer*.zip``).
 
 Пары «до / после» и эталон Николая разбирает ``tests/test_field_dump.py``. Здесь — пороги,
-ниже которых правила Шага 4 не должны опускаться: они замерены на 4.26/4.27 (и 4.30 для четвёртой
-пары) и нужны, чтобы очередная правка не улучшала один чертёж за счёт остальных.
+ниже которых правила Шага 4 не должны опускаться: они замерены на 4.30 и подняты по замеру 4.31
+и нужны, чтобы очередная правка не улучшала один чертёж за счёт остальных.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ DOCS = Path(__file__).resolve().parent.parent / "docs"
 
 #: имя пары → (частей у Николая, минимум совпавших частей, максимум подписей программы)
 PAIRS = {
-    "primer3i.zip": (19, 12, 26),   # 192 Geldner Street
-    "primer1i.zip": (12, 6, 16),    # 24 Alvine Avenue
-    "primer2i.zip": (9, 3, 22),     # 1373 East 55th Street, Brooklyn
+    "primer3i.zip": (19, 13, 26),   # 192 Geldner Street
+    "primer1i.zip": (12, 9, 16),    # 24 Alvine Avenue (9 после правила 4.31 о метке в каждой строке)
+    "primer2i.zip": (9, 7, 22),     # 1373 East 55th Street, Brooklyn (7 после 4.31)
     "primer4i.zip": (11, 6, 13),    # 378 Mother Gaston Blvd, Brooklyn (4.30)
 }
 
@@ -52,7 +52,7 @@ def test_geldner_labels_do_not_cover_existing_texts():
     """Подписи не накрывают тексты, которые уже стояли на чертеже."""
     before, after = fd.load_pair(DOCS / "primer3i.zip")
     result, _expected, _parts = _measure("primer3i.zip")
-    from offsets import _rect_at, _rects_overlap, default_text_width
+    from offsets import _rect_at, _rects_overlap, _text_rect, default_text_width
 
     existing = [
         _rect_at((float(e["pt"][0]), float(e["pt"][1])), default_text_width(str(e.get("text")), float(e.get("h") or 0.9)), float(e.get("h") or 0.9))
@@ -60,9 +60,11 @@ def test_geldner_labels_do_not_cover_existing_texts():
         if e.get("type") in {"Text", "MText"} and e.get("pt")
     ]
     for item in result["plan"].items:
-        rect = _rect_at(
+        rect = _text_rect(
             (float(item.point[0]), float(item.point[1])),
-            default_text_width(item.text, item.height_ft),
+            item.text,
             item.height_ft,
+            default_text_width,
+            float(getattr(item, "rotation_deg", 0.0)),
         )
         assert not any(_rects_overlap(rect, other) for other in existing)

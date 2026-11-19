@@ -866,11 +866,19 @@ def is_north_arrow_block(name: str, layer: str, cfg: dict[str, Any] | None) -> b
     )
 
 
-def find_north_arrow(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = None) -> "NorthArrow | None":
+def find_north_arrow(
+    snapshot: "DrawingSnapshot",
+    cfg: dict[str, Any] | None = None,
+    *,
+    near: "BaseGeometry | None" = None,
+) -> "NorthArrow | None":
     """
     Стрелка севера среди вставок блоков чертежа (``snapshot.symbols``).
 
-    Блок, найденный по имени, важнее найденного только по слою. Направление —
+    Блок, найденный по имени, важнее найденного только по слою. Если передан ``near``
+    (полигон участка), берётся ближайшая к нему стрелка: в рабочих DWG на листе стоят
+    заготовки с разными поворотами (в 24 Alvine их 12), и первая найденная давала север,
+    который зависел от порядка обхода чертежа. Направление —
     поворот вставки плюс направление севера в самом блоке
     (``north_arrow_block_north_deg``), с учётом зеркальной вставки.
     """
@@ -883,7 +891,11 @@ def find_north_arrow(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = N
     found = both or by_name or by_layer
     if not found:
         return None
-    symbol = found[0]
+    symbol = (
+        min(found, key=lambda s: float(near.distance(Point(s.point))))
+        if near is not None
+        else found[0]
+    )
     try:
         own = math.radians(float(fcfg.get("north_arrow_block_north_deg")))
     except (TypeError, ValueError):

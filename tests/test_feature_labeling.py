@@ -736,6 +736,22 @@ def north_arrow(rotation_deg, *, name="NA", layer="M-NTH-ARROW", **kwargs):
     )
 
 
+def test_north_arrow_nearest_the_lot_is_used_when_several_stand_on_the_sheet():
+    # В рабочем DWG бывает несколько заготовок листа: блоки NA повёрнуты по-разному
+    # (в полном 24 Alvine — 12 блоков). Берём стрелку, ближайшую к участку, иначе север
+    # зависит от порядка обхода чертежа.
+    from shapely.geometry import Polygon
+
+    far = north_arrow(0.0, name="NA", layer="0")
+    far.point = (900.0, 900.0)
+    near = north_arrow(270.0, name="NA", layer="0")
+    near.point = (10.0, 10.0)
+    snapshot = fl.DrawingSnapshot(symbols=[far, near])
+    lot = Polygon([(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)])
+    assert fl.find_north_arrow(snapshot, {}).side == "up"  # без near — первый найденный
+    assert fl.find_north_arrow(snapshot, {}, near=lot).side == "right"
+
+
 @pytest.mark.parametrize(
     ("rotation_deg", "side", "reads"),
     [

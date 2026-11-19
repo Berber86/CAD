@@ -201,7 +201,11 @@ def test_r13b_fence_labels_need_a_fence_description_on_all_three_files(pairs):
             **common,
         )
         assert [item.text for item in real.items if "FE" in item.text], name
-        assert not [item.text for item in fake.items if "FE" in item.text], name
+        # Точки пересечения забора с продолжением стороны (H27) — не вершины объекта,
+        # у них точки съёмки не бывает; правило R13b к ним не относится.
+        assert not [
+            item.text for item in fake.items if "FE" in item.text and not item.crossing
+        ], name
         # Без описаний вообще правило не применяется — как в 4.19.
         plain = off.plan_offsets(ring, features(before), survey_notes=[], **common)
         assert len([i for i in plain.items if "FE" in i.text]) == len(
@@ -318,9 +322,11 @@ def test_h17_extra_labels_are_within_half_of_nikolai_in_total(results):
 
 def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
-    Правила R11–R14 находят больше подписей Николая, чем прежний замер до ближайшей границы.
+    Правила 4.21 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи: забор 7 → 14 (вдвое), дом 4 → 6 (+50%), лишние у дома 14 → 4.
+    Считаются подписи: забор 7 → 17 (было 14 в 4.20), дом 4 → 6, лишние у дома 14 → 4.
+    Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E)
+    и конец длинного прогона до 6 ft (5.2'S).
     """
     saved = off.EDGE_NORMAL_OFFSETS
     off.EDGE_NORMAL_OFFSETS = False
@@ -329,12 +335,13 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     finally:
         off.EDGE_NORMAL_OFFSETS = saved
     new = _label_totals()
-    assert old["fence"][2] == 7 and new["fence"][2] == 14
+    assert old["fence"][2] == 7 and new["fence"][2] == 17
     assert old["house"][2] == 4 and new["house"][2] == 6
     assert old["house"][3] == 14 and new["house"][3] == 4
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
-        assert new[kind][3] <= old[kind][3], kind
+        # H17: лишних не больше половины подписей Николая того же вида.
+        assert new[kind][3] <= 0.5 * new[kind][0], kind
 
 
 def _label_totals() -> dict[str, list[int]]:

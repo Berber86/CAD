@@ -3841,8 +3841,16 @@ class AcadBuilder:
         points = _geometry_points(feature.geometry)
         if not points:
             return None
+        # Замкнутость берётся из распознавания: если геодезист обвёл здание П-образной
+        # ломаной, замыкающая «стена» не существует и оффсет по ней ставиться не должен.
+        closed = (
+            True
+            if str(getattr(feature.geometry, "geom_type", "")) in ("Polygon", "LinearRing")
+            else False
+        )
         return offsets.Feature(
             kind=kind, handle=f"{feature.layer}/{feature.feature_id}", points=tuple(points),
+            closed=closed,
         )
 
     def build_offsets(
@@ -3898,7 +3906,10 @@ class AcadBuilder:
                     "проверьте, что область выделена внутри участка"
                 )
             recognition = recognize_features(snapshot, boundary, self.cfg, "")
-            north = find_north_arrow(snapshot, self.cfg)
+            # Север — по стрелке, ближайшей к участку: на листе бывает несколько заготовок
+            # с разными поворотами (в 24 Alvine 12 блоков NA), и первая найденная давала
+            # север, зависящий от порядка обхода чертежа.
+            north = find_north_arrow(snapshot, self.cfg, near=boundary.polygon)
             north_deg = float(north.north_deg) if north is not None else 90.0
             features = [
                 item for item in (self._offset_feature(f) for f in recognition.features)

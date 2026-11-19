@@ -200,7 +200,10 @@ def features(dump: dict) -> list[off.Feature]:
             if len(coords) < 2 or part.length < 1.0:
                 continue
             out.append(
-                off.Feature(kind=kind, handle=f"{kind}/{index}", points=tuple(coords))
+                off.Feature(
+                    kind=kind, handle=f"{kind}/{index}", points=tuple(coords),
+                    closed=_closed(coords),
+                )
             )
     return out
 

@@ -471,16 +471,23 @@ class SurveyApp(ctk.CTk):
     """Главное окно приложения (Dark CAD Studio UI)."""
 
     def __init__(self) -> None:
-        super().__init__()
+        # Тема — до создания окна: иначе корень создаётся в светлой теме и весь
+        # интерфейс перекрашивается уже на глазах (лишний проход перерисовки).
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        super().__init__()
+        # Окно НЕ показывается, пока не собрано целиком: пока оно скрыто, виджеты
+        # создаются и рисуются в памяти без перерисовок на экране — пользователь видит
+        # готовое окно один раз, а не «сборку из кусочков» (4.39).
+        self.withdraw()
         self.configure(fg_color=THEME["bg_root"])
 
         self.title(f"{APP_TITLE}  v{VERSION} ({APP_STAMP})")
         self.geometry(APP_GEOMETRY)
         self.minsize(1100, 760)
-        # Открываемся на весь экран (окно развёрнуто; кнопки свернуть/закрыть остаются).
-        self.after_idle(self._open_maximized)
+        # Развёрнутым окно становится ДО показа (_show_ready в конце __init__), а не
+        # после первого кадра: прежний after_idle давал видимую перестройку
+        # «размер APP_GEOMETRY → весь экран».
 
         # По умолчанию окно не закреплено поверх AutoCAD и других приложений.
         self.attributes("-topmost", False)
@@ -592,13 +599,14 @@ class SurveyApp(ctk.CTk):
         self._step0_stop = threading.Event()
         self.house_text_var = ctk.StringVar(value="")
         self.feature_text_height_var = ctk.StringVar(value="")
+        # Настройки Шага 2 читаются один раз: раньше каждый переключатель заново
+        # копировал весь шаблон настроек (4.39, ускорение запуска).
+        _fcfg0 = feature_settings(self.config_data)
         self.skip_existing_labels_var = ctk.BooleanVar(
-            value=bool(feature_settings(self.config_data).get("skip_existing_labels", True))
+            value=bool(_fcfg0.get("skip_existing_labels", True))
         )
         self.hide_field_notes_var = ctk.BooleanVar(
-            value=bool(
-                feature_settings(self.config_data).get("hide_field_notes_after_labeling", True)
-            )
+            value=bool(_fcfg0.get("hide_field_notes_after_labeling", True))
         )
         self.feature_label_result: FeatureLabelResult | None = None
 
@@ -760,6 +768,7 @@ class SurveyApp(ctk.CTk):
         self._refresh_stepper()
         self._render_empty_inspector()
         self.after(120, self._drain_events)
+        self._show_ready()
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self) -> None:
@@ -3753,6 +3762,9 @@ class SurveyApp(ctk.CTk):
 
     def _build_step2_page(self) -> None:
         """Страница «Шаг 2. Автоподписание объектов (D-TOPO-TEXT)»."""
+        # Настройки читаются один раз на всю страницу: подсказки и слой подписей
+        # берут их из этой переменной, а не копируют шаблон заново (4.39).
+        fcfg = feature_settings(self.config_data)
         page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
         page.grid(row=2, column=0, sticky="nsew")
         page.grid_columnconfigure(0, weight=0)
@@ -3790,7 +3802,7 @@ class SurveyApp(ctk.CTk):
                 "активный чертёж AutoCAD, находит участок и в зоне «участок + буфер» "
                 "распознаёт заборы, строения, крыльца, ступени и дорожки — по кодам "
                 "геодезических точек (POINT_LABELS) и по именам слоёв — и подписывает их "
-                f"в слое {self._feature_output_layer()}."
+                f"в слое {self._feature_output_layer(fcfg)}."
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
@@ -3851,7 +3863,7 @@ class SurveyApp(ctk.CTk):
         self.skip_existing_labels_check.grid(row=3, column=0, sticky="w", padx=16, pady=(2, 2))
         self.step2_dedup_hint = ctk.CTkLabel(
             panel,
-            text=self._feature_dedup_hint(),
+            text=self._feature_dedup_hint(fcfg),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -3873,7 +3885,7 @@ class SurveyApp(ctk.CTk):
         self.hide_field_notes_check.grid(row=5, column=0, sticky="w", padx=16, pady=(2, 2))
         self.step2_notes_hint = ctk.CTkLabel(
             panel,
-            text=self._feature_notes_hint(),
+            text=self._feature_notes_hint(fcfg),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -4047,13 +4059,17 @@ class SurveyApp(ctk.CTk):
         )
         self.step2_report_box.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self._set_step2_report(STEP2_EMPTY_REPORT)
-        self._refresh_step2_height_label()
+        # Подпись с высотой текста здесь НЕ обновляется: сразу после сборки окна
+        # __init__ вызывает _refresh_height_label(), который обновляет и её. Лишний
+        # проход — ещё один AcadBuilder и перечитывание настроек на пустом месте (4.39).
 
-    def _feature_output_layer(self) -> str:
-        return str(feature_settings(self.config_data).get("label_output_layer") or "D-TOPO-TEXT")
+    def _feature_output_layer(self, fcfg: dict[str, Any] | None = None) -> str:
+        """Слой подписей Шага 2. ``fcfg`` — уже прочитанные настройки (без повторного копирования)."""
+        fcfg = fcfg if fcfg is not None else feature_settings(self.config_data)
+        return str(fcfg.get("label_output_layer") or "D-TOPO-TEXT")
 
-    def _feature_dedup_hint(self) -> str:
-        fcfg = feature_settings(self.config_data)
+    def _feature_dedup_hint(self, fcfg: dict[str, Any] | None = None) -> str:
+        fcfg = fcfg if fcfg is not None else feature_settings(self.config_data)
         layers = ", ".join(str(name) for name in fcfg.get("existing_label_layers") or [])
         radius = float(fcfg.get("duplicate_radius_ft") or 0.0)
         return (
@@ -4062,8 +4078,8 @@ class SurveyApp(ctk.CTk):
             "(повторный запуск ничего не удваивает)."
         )
 
-    def _feature_notes_hint(self) -> str:
-        fcfg = feature_settings(self.config_data)
+    def _feature_notes_hint(self, fcfg: dict[str, Any] | None = None) -> str:
+        fcfg = fcfg if fcfg is not None else feature_settings(self.config_data)
         layers = ", ".join(str(name) for name in fcfg.get("field_note_layers") or [])
         return (
             f"Заметки слоёв {layers} — источник подписей: они переводятся в формулировки "
@@ -9510,8 +9526,29 @@ class SurveyApp(ctk.CTk):
         """Журнал операций в текущем режиме (без служебных уровней)."""
         return "\n".join(log_mode.filter_entries(getattr(self, "_log", []), self._log_mode()))
 
+    def _show_ready(self) -> None:
+        """
+        Показывает собранное окно: развёрнутым и с родным заголовком Windows.
+
+        Порядок обязателен: ``withdraw`` в начале ``__init__`` → сборка в памяти →
+        ``zoomed`` → ``update_idletasks`` (раскладка считается до показа) → ``deiconify``.
+        Так окно появляется один раз и сразу на весь экран, с верхней панелью и кнопками
+        свернуть/закрыть (``zoomed`` — не полноэкранный режим без рамки), без мельтешения
+        и перестроек размера.
+        """
+        self._open_maximized()
+        try:
+            self.update_idletasks()
+        except Exception:  # noqa: BLE001 - платформа без обновления раскладки
+            pass
+        self.deiconify()
+        try:
+            self.focus_set()
+        except Exception:  # noqa: BLE001 - фокус не критичен
+            pass
+
     def _open_maximized(self) -> None:
-        """Разворачивает окно на весь экран при запуске. Сбой не мешает работе — окно остаётся обычным."""
+        """Разворачивает окно на весь экран (заголовок и кнопки Windows остаются). Сбой не мешает работе — окно остаётся обычным."""
         try:
             self.state("zoomed")
         except Exception:  # noqa: BLE001 - платформа без zoomed (например, Linux без WM)

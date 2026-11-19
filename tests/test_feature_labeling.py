@@ -435,6 +435,34 @@ def test_shipped_config_mirrors_feature_defaults():
     assert fl.feature_settings(load_config()) == fl.DEFAULT_FEATURE_CONFIG
 
 
+def test_plain_copy_matches_deepcopy_and_stays_independent():
+    """Ускорение запуска (4.39): быстрая копия настроек равна ``copy.deepcopy``."""
+    import copy
+
+    samples = [
+        fl.DEFAULT_FEATURE_CONFIG,
+        {"a": [1, 2, {"b": (3, None)}], "c": "строка", "d": True, "e": 4.5},
+        {},
+        [],
+        # Не-«плоские» значения уходят в честный deepcopy: множество и объект.
+        {"set": {1, 2}, "obj": copy.copy(fl.DEFAULT_FEATURE_CONFIG)},
+    ]
+    for sample in samples:
+        assert fl._plain_copy(sample) == copy.deepcopy(sample)
+
+    # Вложенные списки/словари — свои, шаблон настроек не меняется.
+    result = fl.feature_settings(None)
+    result["linetype_scale_rules"]["S-FENCE"]["fixed"] = 99.0
+    result["field_note_layers"].append("MY_LAYER")
+    assert fl.DEFAULT_FEATURE_CONFIG["linetype_scale_rules"]["S-FENCE"]["fixed"] == 5.0
+    assert "MY_LAYER" not in fl.DEFAULT_FEATURE_CONFIG["field_note_layers"]
+    # Результат не связан и с конфигом заказчика: правка копии не портит вход.
+    cfg = {"feature_labeling": {"linetype_scale_rules": {"S-FENCE": {"fixed": 3.0}}}}
+    got = fl.feature_settings(cfg)
+    got["linetype_scale_rules"]["S-FENCE"]["fixed"] = 7.0
+    assert cfg["feature_labeling"]["linetype_scale_rules"]["S-FENCE"]["fixed"] == 3.0
+
+
 def test_feature_settings_override_replaces_key_and_null_keeps_default():
     cfg = {"feature_labeling": {"point_to_fence_max_ft": 5.0, "search_buffer_ft": None,
                                 "layer_label_mapping": {"MY_SHED": "SHED"}}}

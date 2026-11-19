@@ -69,6 +69,7 @@ class _Widget:
                 raise ValueError(f"transparency is not allowed for {type(self).__name__}.{name}")
 
     def __init__(self, *args, **kwargs):
+        self._wm_log: list[str] = []
         self._validate_colors(kwargs)
         self.master = args[0] if args else kwargs.get("master")
         self._children = []
@@ -136,7 +137,24 @@ class _Widget:
     def after_idle(self, *args, **kwargs):
         return None
 
+    def withdraw(self, *args, **kwargs):
+        self._wm_log.append("withdraw")
+        return None
+
+    def deiconify(self, *args, **kwargs):
+        self._wm_log.append("deiconify")
+        return None
+
+    def update_idletasks(self, *args, **kwargs):
+        self._wm_log.append("update_idletasks")
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
     def state(self, *args, **kwargs):
+        if args:
+            self._wm_log.append(f"state:{args[0]}")
         return None
 
     def start(self):
@@ -467,6 +485,24 @@ def test_main_still_reports_when_crash_log_cannot_be_written(gui, tmp_path, monk
     stderr = capsys.readouterr().err
     assert "RuntimeError: startup without writable log" in stderr
     assert "Не удалось сохранить журнал" in stderr
+
+
+def test_window_stays_hidden_until_assembled_then_opens_maximized_once(gui):
+    """
+    Окно не видно, пока оно собирается: ``withdraw`` — первым делом в ``__init__``, показ —
+    один раз в конце (``deiconify``), и уже развёрнутым (``state('zoomed')`` до показа, вместе
+    с ``update_idletasks``): пользователь не видит ни «сборку из кусочков», ни перестройку
+    «размер по умолчанию → весь экран» (4.39). ``zoomed`` сохраняет заголовок Windows
+    с кнопками — это не полноэкранный режим без рамки.
+    """
+    app = gui.SurveyApp()
+    log = app._wm_log
+    assert log[0] == "withdraw", log
+    assert log.count("deiconify") == 1 and log[-1] == "deiconify", log
+    assert "state:zoomed" in log, log
+    assert log.index("state:zoomed") < log.index("update_idletasks") < log.index("deiconify"), log
+    # Разворачивание не отложено на после первого кадра (прежний after_idle).
+    assert "withdraw" not in log[1:], log
 
 
 def test_main_returns_success_after_mainloop(gui, monkeypatch):

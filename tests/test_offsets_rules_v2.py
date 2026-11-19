@@ -226,3 +226,44 @@ def test_text_goes_along_the_object_not_the_lot_side():
     assert off._object_edge_angle(house, a, 0.0) == pytest.approx(30.0, abs=0.5)
     fence = off.Feature(kind="fence", handle="F1", points=((0.0, 0.0), (10.0, 0.0)), closed=False)
     assert off._object_edge_angle(fence, (0.0, 0.0), 0.0) == pytest.approx(0.0, abs=0.1)
+
+
+def test_two_offsets_per_object_and_line_is_the_ceiling():
+    """
+    R23 (4.34, ответ заказчика 19.11.2026, вопрос 8): не более 2 оффсетов на объект и на одну
+    и ту же линию границы участка.
+
+    Потолок жёсткий — его не обходят ни перекос (`SKEW_PAIR_FT`, R13d), ни разнос углов вдоль
+    стороны (`SIDE_CAP_SPACING_FT`, R13c). На шести парах он не срабатывает (подписи 78 и
+    совпадения 47 до и после), но теперь он явный, а не следствие кэпа: у забора
+    `MAX_CORNERS_PER_SIDE` = 1, у дома 2, а потолок — 2 на любую линию.
+    """
+    assert off.MAX_CORNERS_PER_SIDE_LIMIT == 2
+    # Забор вдоль южной стороны: четыре снятых угла, два из них с разными замерами (перекос).
+    square = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    fence = off.Feature(
+        kind="fence", handle="F1",
+        points=((5.0, 0.1), (40.0, 0.4), (70.0, 0.2), (95.0, 0.3)), closed=False,
+    )
+    data = off.plan_offsets(
+        square, [fence], front=[], scale=16.0, north_deg=90.0,
+        texts=[], survey_pts=((5.0, 0.1), (40.0, 0.4), (70.0, 0.2), (95.0, 0.3)),
+        survey_notes=(),
+    )
+    labels = [item for item in data.items if item.kind == "fence"]
+    assert 1 <= len(labels) <= off.MAX_CORNERS_PER_SIDE_LIMIT
+
+
+def test_on_line_text_is_one_line_and_threshold_matches_the_customer():
+    """
+    R23 (4.34, ответ заказчика 19.11.2026, вопросы 9–10): `O/L` при значении 0.05 и менее; если
+    оба замера `O/L` — одна строка; у дома и стены — подпись двумя строками (`BLDG` / `O/L`).
+    """
+    assert off.MIN_OFFSET_FT == pytest.approx(0.05)
+    # забор на самой линии — одна строка с приставкой
+    assert off.online_text("fence") == "FE.O/L"
+    # дом и стена — две строки: тип, затем O/L (ответ на вопрос 10)
+    assert off.online_text("house").splitlines() == ["BLDG", "O/L"]
+    assert off.online_text("wall").splitlines() == ["WALL", "O/L"]
+    # «оба замера O/L» дают ту же одну строку: второй O/L не дублируется
+    assert off.online_text("fence").count("O/L") == 1

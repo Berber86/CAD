@@ -4889,3 +4889,37 @@ def test_premium_theme_keeps_navigation_and_actions(gui):
         assert button.cget("fg_color") == gui.THEME["btn_primary"]
     assert callable(app.draw_button.cget("command"))
     assert callable(app.update_version_button.cget("command"))
+
+
+def test_neutral_theme_uses_gray_surfaces_and_accent_tokens(gui):
+    theme = gui.THEME
+    keys = ("bg_root", "bg_header", "bg_card", "bg_inset", "bg_editor", "bg_field",
+            "border_card", "border_subtle", "border_active", "text_main", "text_muted",
+            "text_dim", "accent_soft_bg", "accent_soft_fg", "accent_icon", "seg_sel",
+            "btn_primary", "btn_primary_hover", "btn_secondary", "btn_secondary_hover",
+            "version_bg", "version_fg", "control_on", "control_off")
+    for key in keys:
+        value = theme[key].lower()
+        assert value[1:3] == value[3:5] == value[5:7], (key, value)
+    assert _theme_contrast(theme["control_on"], theme["control_off"]) >= 2.5
+
+
+def test_neutral_customtkinter_defaults_do_not_reintroduce_blue(gui, monkeypatch):
+    import types
+    fields = {
+        "CTkButton": ("fg_color", "hover_color"),
+        "CTkCheckBox": ("fg_color", "hover_color"),
+        "CTkRadioButton": ("fg_color", "hover_color"),
+        "CTkSwitch": ("fg_color", "progress_color"),
+        "CTkProgressBar": ("progress_color",),
+        "CTkSlider": ("button_color", "button_hover_color"),
+        "CTkOptionMenu": ("fg_color", "button_color", "button_hover_color"),
+        "CTkSegmentedButton": ("selected_color", "selected_hover_color"),
+    }
+    theme = {name: {field: "#1F6AA5" for field in options} for name, options in fields.items()}
+    monkeypatch.setattr(gui.ctk, "ThemeManager", types.SimpleNamespace(theme=theme), raising=False)
+    gui._apply_neutral_widget_defaults()
+    for options in theme.values():
+        for color in options.values():
+            assert color[1:3] == color[3:5] == color[5:7], color
+    assert theme["CTkSwitch"]["fg_color"] != theme["CTkSwitch"]["progress_color"]

@@ -242,39 +242,41 @@ def normalize_house_text(value: Any) -> str:
     lines = [" ".join(line.split()) for line in raw.split("\n")]
     return "\n".join(line for line in lines if line)
 
-# Premium Dark: насыщенные графитово-чернильные поверхности, лавандовый акцент.
+# Premium Dark: чёрно-серые поверхности и нейтральные акценты.
 # Цвета геометрии CAD намеренно оставлены прежними: красный участок, голубые
 # соседи и жёлтые привязки несут смысл и не должны меняться при редизайне.
 THEME: dict[str, str] = {
-    "bg_root": "#0b0d16",
-    "bg_header": "#111321",
-    "bg_card": "#171a29",
-    "bg_inset": "#141725",
-    "bg_editor": "#0a0d17",
-    "bg_field": "#101321",
-    "border_card": "#34394e",
-    "border_subtle": "#2b3042",
-    "border_active": "#a69bff",
-    "text_main": "#f2f3fa",
-    "text_muted": "#b7bfd1",
-    "text_dim": "#9ca5bb",
-    "blue_soft_bg": "#292344",
-    "blue_soft_fg": "#ddd7ff",
-    "seg_sel": "#3b375b",
-    "side_label": "#bac4d6",
+    "bg_root": "#0d0d0d",
+    "bg_header": "#141414",
+    "bg_card": "#1b1b1b",
+    "bg_inset": "#181818",
+    "bg_editor": "#0b0b0b",
+    "bg_field": "#131313",
+    "border_card": "#3d3d3d",
+    "border_subtle": "#333333",
+    "border_active": "#a5a5a5",
+    "text_main": "#f2f2f2",
+    "text_muted": "#bdbdbd",
+    "text_dim": "#a6a6a6",
+    "accent_soft_bg": "#303030",
+    "accent_soft_fg": "#e2e2e2",
+    "seg_sel": "#484848",
+    "side_label": "#bfbfbf",
     "grid_axis": "#4d6381",
-    "btn_primary": "#594bc4",
-    "btn_primary_hover": "#6656d6",
+    "btn_primary": "#484848",
+    "btn_primary_hover": "#555555",
+    "control_off": "#303030",
+    "control_on": "#777777",
     "btn_neighbor": "#0d766f",
     "btn_neighbor_hover": "#0f7a72",
-    "btn_secondary": "#252b3e",
-    "btn_secondary_hover": "#343b52",
+    "btn_secondary": "#292929",
+    "btn_secondary_hover": "#393939",
     "btn_amber": "#a54808",
     "btn_amber_hover": "#ab500d",
     "btn_emerald": "#08785c",
     "btn_emerald_hover": "#087c5d",
-    "version_bg": "#27213f",
-    "version_fg": "#d6caff",
+    "version_bg": "#303030",
+    "version_fg": "#e2e2e2",
     "badge_v1_bg": "#102d29",
     "badge_v1_border": "#275e50",
     "badge_v1_fg": "#87e8c3",
@@ -295,10 +297,32 @@ THEME: dict[str, str] = {
     "cad_tie": "#fbbf24",
     "cad_hover": "#fde047",
     "cad_origin": "#94a3b8",
-    "icon_purple": "#c2b5ff",
+    "accent_icon": "#d2d2d2",
     "teal_soft_bg": "#123c39",
     "teal_soft_fg": "#7ce8db",
 }
+
+
+def _apply_neutral_widget_defaults() -> None:
+    """Убрать синие дефолты CustomTkinter до сборки окна, не меняя смысловые статусы."""
+    manager = getattr(ctk, "ThemeManager", None)
+    theme = getattr(manager, "theme", None)
+    if not isinstance(theme, dict):
+        return  # В безоконных тестах CustomTkinter заменён лёгкой заглушкой.
+    overrides = {
+        "CTkButton": {"fg_color": "btn_primary", "hover_color": "btn_primary_hover"},
+        "CTkCheckBox": {"fg_color": "btn_primary", "hover_color": "btn_primary_hover"},
+        "CTkRadioButton": {"fg_color": "btn_primary", "hover_color": "btn_primary_hover"},
+        "CTkSwitch": {"fg_color": "control_off", "progress_color": "control_on"},
+        "CTkProgressBar": {"progress_color": "btn_primary"},
+        "CTkSlider": {"button_color": "btn_primary", "button_hover_color": "btn_primary_hover"},
+        "CTkOptionMenu": {"fg_color": "btn_primary", "button_color": "btn_secondary", "button_hover_color": "btn_secondary_hover"},
+        "CTkSegmentedButton": {"selected_color": "seg_sel", "selected_hover_color": "btn_primary_hover"},
+    }
+    for widget, options in overrides.items():
+        target = theme.get(widget)
+        if isinstance(target, dict):
+            target.update({option: THEME[token] for option, token in options.items()})
 
 
 def scale_options(cfg: dict[str, Any]) -> list[str]:
@@ -494,6 +518,7 @@ class SurveyApp(ctk.CTk):
         # интерфейс перекрашивается уже на глазах (лишний проход перерисовки).
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        _apply_neutral_widget_defaults()
         super().__init__()
         # Окно НЕ показывается, пока не собрано целиком: пока оно скрыто, виджеты
         # создаются и рисуются в памяти без перерисовок на экране — пользователь видит
@@ -1078,7 +1103,7 @@ class SurveyApp(ctk.CTk):
         main_wrap.bind("<Configure>", self._on_workspace_resized)
 
         # Выезжающая шторка «Настройки»: тёмная подложка на весь экран + панель 470px справа
-        self.settings_drawer_shell = ctk.CTkFrame(self, fg_color="#05080d", corner_radius=0)
+        self.settings_drawer_shell = ctk.CTkFrame(self, fg_color="#080808", corner_radius=0)
         self.settings_drawer_shell.grid_columnconfigure(1, weight=0)
         self.settings_drawer_shell.grid_rowconfigure(0, weight=1)
 
@@ -1682,8 +1707,8 @@ class SurveyApp(ctk.CTk):
             width=24,
             height=24,
             corner_radius=6,
-            fg_color=THEME["blue_soft_bg"],
-            text_color=THEME["blue_soft_fg"],
+            fg_color=THEME["accent_soft_bg"],
+            text_color=THEME["accent_soft_fg"],
             font=ctk.CTkFont(size=12, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
@@ -1795,7 +1820,7 @@ class SurveyApp(ctk.CTk):
             text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O",
             height=64,
             fg_color=THEME["bg_field"],
-            hover_color=THEME["blue_soft_bg"],
+            hover_color=THEME["accent_soft_bg"],
             border_width=1,
             border_color=THEME["border_subtle"],
             corner_radius=10,
@@ -1851,7 +1876,7 @@ class SurveyApp(ctk.CTk):
             text="📷 Загрузить фото чертежа · Ctrl+I",
             height=30,
             fg_color=THEME["bg_field"],
-            hover_color=THEME["blue_soft_bg"],
+            hover_color=THEME["accent_soft_bg"],
             border_width=1,
             border_color=THEME["border_subtle"],
             corner_radius=10,
@@ -1908,7 +1933,7 @@ class SurveyApp(ctk.CTk):
             text="📷  Выберите фото чертежа\nJPG · PNG · TIFF · несколько кадров · Ctrl+I",
             height=132,
             fg_color=THEME["bg_field"],
-            hover_color=THEME["blue_soft_bg"],
+            hover_color=THEME["accent_soft_bg"],
             border_width=1,
             border_color=THEME["border_subtle"],
             corner_radius=10,
@@ -2165,8 +2190,8 @@ class SurveyApp(ctk.CTk):
             width=24,
             height=24,
             corner_radius=6,
-            fg_color=THEME["blue_soft_bg"],
-            text_color=THEME["icon_purple"],
+            fg_color=THEME["accent_soft_bg"],
+            text_color=THEME["accent_icon"],
             font=ctk.CTkFont(size=12),
         ).grid(row=1, column=0, padx=(10, 8), pady=(0, 6))
 
@@ -2192,8 +2217,8 @@ class SurveyApp(ctk.CTk):
             engine_card,
             text="спрашивать",
             font=ctk.CTkFont(size=9, weight="bold"),
-            fg_color=THEME["blue_soft_bg"],
-            text_color=THEME["blue_soft_fg"],
+            fg_color=THEME["accent_soft_bg"],
+            text_color=THEME["accent_soft_fg"],
             corner_radius=4,
             padx=5,
             pady=1,
@@ -2205,7 +2230,7 @@ class SurveyApp(ctk.CTk):
             text="⚙ Настроить",
             height=24,
             fg_color="transparent",
-            hover_color=THEME["blue_soft_bg"],
+            hover_color=THEME["accent_soft_bg"],
             text_color=THEME["sky"],
             font=ctk.CTkFont(size=11),
             command=self.toggle_keys_drawer,
@@ -2511,8 +2536,8 @@ class SurveyApp(ctk.CTk):
             width=24,
             height=24,
             corner_radius=6,
-            fg_color=THEME["blue_soft_bg"],
-            text_color=THEME["blue_soft_fg"],
+            fg_color=THEME["accent_soft_bg"],
+            text_color=THEME["accent_soft_fg"],
             font=ctk.CTkFont(size=12, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
@@ -5205,7 +5230,7 @@ class SurveyApp(ctk.CTk):
         ]
         colors = {
             "done": (THEME["ok"], THEME["ok_bg"], THEME["ok"]),
-            "active": ("#ffffff", THEME["blue_soft_bg"], THEME["blue_soft_fg"]),
+            "active": ("#ffffff", THEME["accent_soft_bg"], THEME["accent_soft_fg"]),
             "todo": (THEME["text_dim"], "transparent", THEME["text_dim"]),
         }
         for idx, state in enumerate(states):
@@ -12618,10 +12643,10 @@ class PdfSetDialog:
                 "выберите ИИ или другие страницы"
             ), THEME["warn"]
         elif legal:
-            text, color = f"ИИ получит текст {pages} — платный запрос", THEME["blue_soft_fg"]
+            text, color = f"ИИ получит текст {pages} — платный запрос", THEME["accent_soft_fg"]
         else:
             count = item.page_count
-            text, color = f"ИИ / Vision получит изображения: {count} стр. — платный запрос", THEME["blue_soft_fg"]
+            text, color = f"ИИ / Vision получит изображения: {count} стр. — платный запрос", THEME["accent_soft_fg"]
             if count > self.vision_limit:
                 text += f"; это больше обычного лимита в {self.vision_limit} стр."
                 color = THEME["warn"]

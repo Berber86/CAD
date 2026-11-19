@@ -24,8 +24,21 @@ from pathlib import Path
 
 import offsets as off
 
-#: слои, по которым программа собирает участок (как в Шаге 2: контур участка — PL, фолбэк M-ROW-LINE)
-LOT_LAYERS = ("PL", "M-ROW-LINE", "ST-BLDG-LINE")
+#: Слои границы участка по приоритету — те же три способа наименования, что в программе
+#: (``config.json`` → ``feature_labeling.property_line_layers``): новый стиль заказчика и наш
+#: Шаг 1 (``PL``, ``PL-PRINT``), затем старый стиль, где стороны участка начерчены линиями
+#: зданий (``ST-BLDG-LINE``). Проверяются по очереди: первый, из которого складывается контур.
+LOT_LAYER_GROUPS = (
+    # 1. Отдельный слой property line: новый стиль заказчика (`PL`) и наш Шаг 1 (`PL`, `PL-PRINT`)
+    ("PL", "PL-*", "PL_*", "PROPERTY_LINE", "PROPERTY_LINES_APPROX", "S-PROP-LINE", "PROP"),
+    # 2. Старый стиль: стороны участка начерчены линиями зданий
+    ("ST-BLDG-LINE",),
+    # 3. Резерв: линии налоговой карты
+    ("M-PROPERTY", "M-TAX-LINE"),
+)
+#: фасадная сторона участка — красная линия улицы
+LOT_CLOSING = ("M-ROW-LINE",)
+LOT_LAYERS = LOT_LAYER_GROUPS[0] + LOT_LAYER_GROUPS[1] + LOT_CLOSING
 #: точки съёмки: отдельные точки слоя PNT-X и блоки srvpno3/srvpno1 с атрибутом DESC2
 SURVEY_LAYERS = ("PNT-X", "PNTS", "PNT", "SRVPTS")
 SURVEY_BLOCKS = ("SRVPNO", "SPT")
@@ -51,37 +64,62 @@ def _segments(dump: dict) -> list[tuple[str, tuple[float, float], tuple[float, f
     return out
 
 
-def _snap(point, pool, tol=SNAP_FT):
-    best, best_d = point, tol
-    for other in pool:
-        d = math.dist(point, other)
-        if d < best_d:
-            best, best_d = other, d
-    return best
+def _snap_map(points, tol=SNAP_FT) -> dict[tuple[float, float], tuple[float, float]]:
+    """
+    Слияние концов линий: каждая точка → самая «левая-нижняя» из точек в пределах допуска.
+
+    Нужно именно слияние, а не «ближайший сосед»: до 4.27 стоял поиск ближайшей точки, и он
+    либо находил саму точку (``d=0``), либо две точки ссылались друг на друга — вершины не
+    сливались вовсе. На 18 Zoe Street концы линий ``PL`` расходятся на 0.003 ft, контур
+    4470 sq ft не собирался, и вместо участка попадался контур дома 1120 sq ft.
+    """
+    uniq = sorted({(round(p[0], 6), round(p[1], 6)) for p in points})
+    out = {}
+    for point in uniq:
+        near = [other for other in uniq if math.dist(point, other) <= tol]
+        out[point] = min(near)
+    return out
 
 
 def _lot_polygon(dump: dict):
-    """Участок — полигон по линиям PL/M-ROW-LINE/ST-BLDG-LINE с максимумом точек съёмки внутри."""
+    """
+    Участок — замкнутый контур по слоям границы с максимумом точек съёмки внутри.
+
+    Группы слоёв проверяются по приоритету (``LOT_LAYER_GROUPS``), в каждой к линиям
+    добавляется фасадная линия улицы (``LOT_CLOSING``): у заказчика фасад всегда начерчен
+    красной линией, а стороны — либо на новом слое ``PL``, либо (старый стиль) линиями
+    зданий ``ST-BLDG-LINE``.
+    """
     from shapely.geometry import LineString, Point
     from shapely.ops import polygonize, unary_union
 
-    segs = [s for s in _segments(dump) if s[0].upper() in LOT_LAYERS]
-    if not segs:
-        return None
-    ends = [p for _layer, a, b in segs for p in (a, b)]
-    lines = [
-        LineString([_snap(a, ends), _snap(b, ends)]) for _layer, a, b in segs
-    ]
+    from feature_labeler import layer_matches
+
     survey = [Point(p) for p in survey_points(dump)]
-    best = None
-    for polygon in polygonize(unary_union(lines)):
-        if polygon.area < 400:
+    closers = [s for s in _segments(dump) if layer_matches(s[0], LOT_CLOSING)]
+    for group in LOT_LAYER_GROUPS:
+        segs = [s for s in _segments(dump) if layer_matches(s[0], group)] + closers
+        if len(segs) < 3:
             continue
-        inside = sum(1 for p in survey if polygon.contains(p))
-        key = (inside, polygon.area)
-        if best is None or key > best[0]:
-            best = (key, polygon)
-    return best[1] if best else None
+        ends = [p for _layer, a, b in segs for p in (a, b)]
+        snap = _snap_map(ends)
+        lines = [
+            LineString([
+                snap[(round(a[0], 6), round(a[1], 6))], snap[(round(b[0], 6), round(b[1], 6))],
+            ])
+            for _layer, a, b in segs
+        ]
+        best = None
+        for polygon in polygonize(unary_union(lines)):
+            if polygon.area < 400:
+                continue
+            inside = sum(1 for p in survey if polygon.contains(p))
+            key = (inside, polygon.area)
+            if best is None or key > best[0]:
+                best = (key, polygon)
+        if best is not None:
+            return best[1]
+    return None
 
 
 def survey_points(dump: dict) -> list[tuple[float, float]]:
@@ -211,6 +249,24 @@ def features(dump: dict) -> list[off.Feature]:
 # ------------------------------------------------------------------ эталон Николая
 
 
+def _zip_name(info: zipfile.ZipInfo) -> str:
+    """
+    Имя файла в архиве заказчика.
+
+    Архивы приходят из Windows, и кириллица в них записана в cp866 без флага UTF-8:
+    ``zipfile`` отдаёт такие имена как cp437-кракозябры, и метки «итог»/«перед» в имени
+    не находятся. Раскодируем обратно.
+    """
+    if info.flag_bits & 0x800:
+        return info.filename
+    for encoding in ("cp866", "cp1251"):
+        try:
+            return info.filename.encode("cp437").decode(encoding)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return info.filename
+
+
 def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
     """
     Пара «до» / «после» из архива заказчика.
@@ -222,7 +278,11 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
     в имени (``before``/``final``/``перед``), а не по порядку файлов в архиве.
     """
     with zipfile.ZipFile(zip_path) as archive:
-        dumps = {n: archive.read(n).decode("utf-8") for n in archive.namelist() if n.endswith("dump.json")}
+        dumps = {
+            _zip_name(info): archive.read(info).decode("utf-8")
+            for info in archive.infolist()
+            if info.filename.endswith("dump.json")
+        }
     assert len(dumps) == 2, sorted(dumps)
     before = after = None
     for name, text in dumps.items():
@@ -237,6 +297,11 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
     if before is None:
         # Brooklyn: файл «до» назван «2) … — копия», «после» — «3_ИТОГОВЫЙ…».
         before = next(text for name, text in dumps.items() if text is not after)
+    if after is None:
+        # 18 Zoe Street: «2 … — копия» (до оффсетов) и «3 … — копия» (итог); метки в имени
+        # нет, различаем по номеру этапа, как у Gaston («2_ПОДПИСАНО» / «3_ИТОГ»).
+        numbered = {name.strip()[:1]: text for name, text in dumps.items()}
+        before, after = numbered.get("2", before), numbered.get("3")
     assert before is not None and after is not None, sorted(dumps)
     return json.loads(before), json.loads(after)
 

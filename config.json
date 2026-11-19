@@ -112,12 +112,21 @@
     "rounding_gap_tolerance_ft": 0.015,
     "zoom_extents": true,
     "zoom_margin_scale": 0.84,
-    "sheet_origin_ft": [5000.0, 5000.0],
-    "sheet_window_ft": [5000.0, 8000.0]
+    "sheet_origin_ft": [
+      5000.0,
+      5000.0
+    ],
+    "sheet_window_ft": [
+      5000.0,
+      8000.0
+    ]
   },
   "print_draft": {
     "enabled": true,
-    "shift_ft": [1000.0, 0.0],
+    "shift_ft": [
+      1000.0,
+      0.0
+    ],
     "tie_length_ft": 40.0,
     "layers": {
       "property_line": "PL-PRINT",
@@ -145,16 +154,22 @@
   "feature_labeling": {
     "property_line_layers": [
       "PROPERTY_LINE",
+      "PROPERTY_LINES_APPROX",
       "PL",
+      "PL-*",
+      "PL_*",
+      "PL *",
+      "S-PROP-LINE",
+      "PROP",
       "M-PROPERTY",
-      "M-TAX-LINE",
-      "PROPERTY_LINES_APPROX"
+      "M-TAX-LINE"
     ],
     "property_closing_layers": [
       "M-ROW-LINE"
     ],
     "property_side_layers": [
-      "ST-BLDG-LINE"
+      "ST-BLDG-LINE",
+      "S-PROP-LINE"
     ],
     "point_label_layers": [
       "POINT_LABELS",

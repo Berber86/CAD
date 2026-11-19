@@ -41,6 +41,7 @@ PRIMER3 = "docs/primer3i.zip"  # 192 Geldner Avenue
 PRIMER2 = "docs/primer2i.zip"  # 1373 East 55th Street, Brooklyn
 PRIMER1 = "docs/primer1i.zip"  # 24 Alvine Avenue
 PRIMER4 = "docs/primer4i.zip"  # 378 Mother Gaston Boulevard, Brooklyn
+PRIMER5 = "docs/primer5i.zip"  # 18 Zoe Street, Staten Island (с PDF-эталоном и PL-слоем)
 
 FILES = {
     "Geldner": PRIMER3,
@@ -491,3 +492,60 @@ def _label_totals() -> dict[str, list[int]]:
             for index, value in enumerate((len(exp), len(got), hits, len(got) - hits)):
                 totals[kind][index] += value
     return totals
+
+
+# ------------------------------------------------------------------ пятая пара: 18 Zoe Street
+
+
+@pytest.fixture(scope="module")
+def zoe():
+    before, after = load_pair(PRIMER5)
+    data, _nikolai = field_plan(before, after)
+    return {
+        "before": before,
+        "labels": plan_labels(data["plan"]),
+        "nikolai_labels": nikolai_labels(before, after),
+        "ring": data["ring"],
+        "plan": data["plan"],
+    }
+
+
+def test_fifth_pair_zoe_property_line_is_the_new_pl_layer(zoe):
+    """
+    18 Zoe Street: заказчик сменил стиль — граница участка лежит в новом слое ``PL``.
+
+    Площадь контура 4469.9 sq ft совпадает с эталоном на PDF («TOTAL AREA: 4,470.0 Sq. Feet»).
+    Слой ``PL`` — три отрезка (запад, юг, восток), фасад замыкается красной линией улицы
+    (``M-ROW-LINE``), как и у прежних пар.
+    """
+    from tests.test_field_dump import _lot_polygon
+
+    ring = _lot_polygon(zoe["before"])
+    assert ring is not None
+    assert ring.area == pytest.approx(4469.9, abs=2.0)
+    layers = {str(item.get("layer")) for item in zoe["before"]["entities"]
+              if item.get("type") in {"Line", "Polyline"}}
+    assert "PL" in layers and "M-ROW-LINE" in layers
+
+
+def test_fifth_pair_zoe_scores_by_the_same_rules(zoe):
+    """
+    Первый замер новой пары: забор 7 эталон / 8 подписей / 3 совпало, дом 2 / 0 / 0.
+
+    Совпали `FE.0.3'N`, `FE.0.5'N` и двухчастная `FE.0.4'E` / `FE.0.8'N` у юго-западного угла.
+    Не сходится: `FE.0.3'S` / `FE.0.1'W` у юго-восточного угла (у нас `FE.1.2'E` — мерим до
+    восточной стороны, он до южной и западной), `FE.5.4'W` и `FE.5.3'W` (забор у фасада),
+    `BLDG` / `6.8'S` (дом стоит в 6.6–6.8 ft от восточной стороны — дальше `EDGE_MAX_FT`, а
+    поднимать общий предел нельзя: на четырёх парах это даёт +8…+17 лишних подписей дома),
+    `2.0'N` (сарай). Все — кандидаты следующей версии.
+    """
+    for kind, (expected, produced, hits) in (
+        ("fence", (7, 8, 3)),
+        ("house", (2, 0, 0)),
+    ):
+        got = [p for p in zoe["labels"] if p["kind"] == kind]
+        exp = [p for p in zoe["nikolai_labels"] if p["kind"] == kind]
+        assert (len(exp), len(got), score_labels(got, exp)) == (expected, produced, hits), kind
+    texts = [p["text"] for p in zoe["labels"] if p["kind"] == "fence"]
+    assert "FE.0.5'N" in texts
+    assert any("0.4'S" in text and "0.8'N" in text for text in texts)

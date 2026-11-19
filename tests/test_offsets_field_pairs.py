@@ -23,6 +23,9 @@ PAIRS = {
     "primer4i.zip": (11, 6, 13),    # 378 Mother Gaston Blvd, Brooklyn (4.30)
     # 18 Zoe Street, Staten Island — новая пара 4.34/4.35: дом подписывается с предела 7 ft (4.35).
     "primer5i.zip": (12, 4, 16),
+    # 1412 East 64th Street, Brooklyn — новая пара 4.36, другой съёмщик (City Borough Land Surveying):
+    # участок 25 × 100 ft, фасад дома в 0.57 ft от `M-ROW-LINE`, стены на слое `ST-WALL`.
+    "primer7i.zip": (14, 10, 21),
 }
 
 

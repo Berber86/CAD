@@ -3970,37 +3970,33 @@ class AcadBuilder:
         spacing_factor: float,
     ) -> int:
         """
-        Подпись оффсета однострочными TEXT: каждая строка — свой ``AcDbText``.
+        Подпись оффсета: однострочная — TEXT, многострочная — MText с ``\\P``.
 
-        ``AddText`` не понимает перевод строки: двухстрочная подпись («FE.0.2'S» / «0.3'W»)
-        ушла бы в чертёж одной строкой с мусором. Строки разносятся на
-        ``mtext_line_spacing_factor`` высот — по тому же шагу, что программа отводит под
-        блок при раскладке. Возвращает число созданных объектов.
+        Так у Николая: одно значение (``0.4'W``, ``3.5'S``) — ``AcDbText``, столбик
+        (``FE.0.6'S`` / ``FE.1.1'E``, ``BLDG`` / ``2.5'S``) — ``MText``. ``AddText`` не
+        понимает перевод строки, а две отдельные ``AcDbText`` при правке расходятся
+        по строкам. Возвращает число созданных объектов.
         """
         lines = [line for line in str(item.text).split("\n") if line.strip()] or [""]
         height = float(item.height_ft)
-        spacing = spacing_factor * height
         rotation = math.radians(float(getattr(item, "rotation_deg", 0.0)))
-        # «Вверх» повёрнутого текста: поворот отсчитывается от +X против часовой.
-        up = (-math.sin(rotation), math.cos(rotation))
-        shift0 = spacing * (len(lines) - 1) / 2.0
-        created = 0
-        for index, line in enumerate(lines):
-            shift = shift0 - index * spacing
-            point = (
-                float(item.point[0]) + up[0] * shift,
-                float(item.point[1]) + up[1] * shift,
-            )
+        if len(lines) == 1:
             self._add_text(
                 model_space,
                 TextItem(
-                    text=line, point=point, rotation=rotation,
+                    text=lines[0], point=item.point, rotation=rotation,
                     kind="offset", height=height,
                 ),
                 height, layer, style,
             )
-            created += 1
-        return created
+            return 1
+        label = FeatureLabelItem(
+            feature=None, text="\n".join(lines), kind="offset", placement="leader",
+            point=item.point, height=height, rotation=rotation,
+            attachment=AC_ATTACHMENT_MIDDLE_CENTER,
+        )
+        self._add_mtext(model_space, label, layer, style)
+        return 1
 
     def draw_offset_labels(self, app: Any, doc: Any, plan: Any) -> OffsetWriteResult:
         """
@@ -4040,10 +4036,28 @@ class AcadBuilder:
                             float(fcfg.get("mtext_line_spacing_factor") or offsets.TEXT_LINE_SPACING),
                         )
                         continue
+                    # У Николая текст стоит сбоку от выноски и растёт от неё: вставка —
+                    # на ближнем к стрелке краю, привязка 4 (влево-середина) справа от
+                    # объекта и 6 (вправо-середина) слева. Так текст не накрывает arrow.
+                    attach = AC_ATTACHMENT_MIDDLE_CENTER
+                    insert = item.point
+                    leader_points = [item.leader[0], item.leader[1]]
+                    if item.leader:
+                        width = max(
+                            feature_text_width(line, item.height_ft, fcfg)
+                            for line in str(item.text).split("\n")
+                        )
+                        if item.point[0] >= item.leader[0][0]:
+                            attach = AC_ATTACHMENT_MIDDLE_LEFT
+                            insert = (item.point[0] - width / 2.0, item.point[1])
+                        else:
+                            attach = AC_ATTACHMENT_MIDDLE_RIGHT
+                            insert = (item.point[0] + width / 2.0, item.point[1])
+                        leader_points[-1] = insert
                     label = FeatureLabelItem(
                         feature=None, text=item.text, kind="leader", placement="leader",
-                        point=item.point, height=item.height_ft, rotation=0.0,
-                        leader_points=[item.leader[0], item.leader[1]],
+                        point=insert, height=item.height_ft, rotation=0.0,
+                        attachment=attach, leader_points=leader_points,
                     )
                     mtext = self._add_mtext(model_space, label, layer, style)
                     _leader, warning, _attached = self._add_leader(

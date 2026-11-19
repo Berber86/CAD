@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.22"
+STEP4_VERSION = "4.23"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -67,6 +67,45 @@ Point = tuple[float, float]
 
 
 # --------------------------------------------------------------------------- тексты и высоты
+
+
+def building_height_ft(
+    feature: Feature,
+    texts: Sequence[tuple[str, Point, float]],
+    scale: float = BASE_SCALE,
+) -> float:
+    """
+    Высота подписи строения: 1.1 у дома, 0.9 у постройки.
+
+    Постройка определяется по её же надписи в чертеже («FRAME GARAGE», «VINYL SHED»,
+    «OPEN PORCH»): у Николая такие подписи стоят на 0.9, а подписи домов — на 1.1.
+    """
+    default = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
+    if not texts or feature.kind != "house":
+        return default
+    contour, closed = feature_contour(feature)
+    if len(contour) < 3:
+        return default
+    for text, point, _height in texts:
+        clean = clean_text(text).upper()
+        if not any(word in clean for word in OUTBUILDING_WORDS):
+            continue
+        near = point_in_polygon(point, contour) or any(
+            math.dist(point, vertex) <= 3.0 for vertex in contour
+        )
+        if near:
+            return offset_height_ft("fence", scale)
+    return default
+
+
+def _vertex_on_ring(vertex: Point, ring: Sequence[Point], tol: float) -> bool:
+    """Вершина лежит на контуре участка (в пределах допуска)."""
+    if len(ring) < 2 or tol <= 0:
+        return False
+    for start, end in zip(ring, list(ring[1:]) + [ring[0]]):
+        if _point_segment_distance(vertex, (start, end)) <= tol:
+            return True
+    return False
 
 
 def offset_height_ft(kind: str, scale: float = BASE_SCALE) -> float:
@@ -339,7 +378,10 @@ LABEL_MUST_BE_INSIDE = False
 #: стены подписываются оффсетом по тому же правилу, что заборы (отсутствие подписи у заказчика — не запрет)
 WALL_OFFSETS = False
 #: Расстояние от объекта до текста выноски при 1"=16' (в порядке попыток), футы.
-LEADER_DISTANCES_FT = (4.0, 5.5, 7.0)
+#: Добавка к расстоянию «край блока + зазор» при поиске места выноски, футы.
+#: У Николая подпись стоит вплотную к концу выноски (2.7–3.5 ft от вершины при высоте 0.9),
+#: поэтому лестница короткая: 0, 0.5, 1.5, 3 ft.
+LEADER_DISTANCES_FT = (0.0, 0.5, 1.5, 3.0)
 #: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
 LEADER_ANGLES_DEG = (90, -90, 60, -60, 120, -120, 30, -30, 150, -150, 0, 180)
 #: Зазор текста до линии и выноски, доля высоты текста.
@@ -478,14 +520,38 @@ TEXT_LINE_SPACING = 1.67
 #: (0.6 высоты на знак), поэтому блоки, проверенные «впритык», в чертеже слипались.
 LABEL_CLEARANCE = 0.35
 
+#: Если со зазором места нет вовсе — пробуем ещё раз без зазора. Иначе подпись не ставится
+#: там, где Николай её поставил, потеснив соседние: у него минимальный зазор между
+#: подписями 0.72–0.84 ft (0.8 высоты), и такие места строгая проверка считала занятыми.
+LABEL_RELAXED_RETRY = True
+
+#: Подпись «на линии» (`FE.O/L`): у Николая стоит там, где забор идёт по самой границе
+#: участка и смещения нет (Geldner `FE.O/L` — на контуре в 0.48 ft от угла дома;
+#: Brooklyn `BR.WALL` / `O/L` — 0.18 ft от вершины стены).
+O_L_TOL_FT = 0.75
+O_L_TEXT = "O/L"
+#: Выключено: `FE.O/L` есть у Николая (Geldner, Brooklyn), но в дампах ни одна вершина
+#: забора не лежит на контуре участка (ближайшая — 0.05+ ft), поэтому воспроизвести
+#: условие по замерам нечем. Вернём, когда появится чертёж, где забор идёт по линии.
+O_L_LABELS = False
+
+#: Высота подписи постройки (гараж, сарай, крыльцо) — 0.9 вместо 1.1 у дома. По дампам:
+#: Brooklyn `1.9'N`, `3.0'W`, `2.3'S` и Geldner `0.4'W`, `0.3'W`, `0.8'N` стоят на 0.9,
+#: подписи самих домов (`3.5'S`, `4.0'N`, `3.2'S`, `3.5'S`, `4.9'N`) — на 1.1.
+OUTBUILDING_WORDS = ("GARAGE", "SHED", "PORCH", "DECK", "CARPORT", "GREENHOUSE", "GAZEBO")
+
 #: Текст дома — внутри строения, вплотную к стене, со сдвигом вдоль неё. Николай ставит
 #: подпись дома у стены изнутри и отодвигает её от крупной надписи («1 STY FRAME»).
 HOUSE_TEXT_INSIDE = True
 
-#: Подпись забора и стены ставится текстом у линии, а не выноской. У Николая все
-#: 13 подписей по заборам на 192 Geldner — обычный текст, стрелок нет ни одной;
-#: выноска остаётся последним средством, когда рядом с линией места нет.
-FENCE_TEXT_WITHOUT_LEADER = True
+#: Подпись забора и стены — выноской, как у Николая.
+#:
+#: В 4.21 было наоборот (по разбору соседней ветки «стрелок нет ни одной»), но дампы
+#: «после» говорят другое: у всех 14 новых подписей забора на трёх чертежах есть
+#: привязанная выноска (``Leader.annotation`` = ручка текста), все выноски по две точки
+#: и тип ``leader_type`` = 3 (сплайн со стрелкой). Текст без выноски у Николая только
+#: у домов и построек (``0.4'W``, ``3.5'S``).
+FENCE_TEXT_WITHOUT_LEADER = False
 
 #: вершины на самой линии участка: метка ставится по второму краю (первый даёт ноль)
 ON_LINE_USES_EDGE = True
@@ -573,6 +639,15 @@ def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
     return max(scores, key=lambda letter: scores[letter])
 
 
+def offset_prefix(kind: str) -> str:
+    """Префикс подписи по типу объекта: ``FE.`` у забора, ``WALL `` у стены, иначе пусто."""
+    if kind == "fence":
+        return "FE."
+    if kind == "wall":
+        return "WALL "
+    return ""
+
+
 def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = False) -> str:
     """
     Текст оффсета в форме заказчика: ``FE.0.4'N``, ``WALL 0.5'E``. Дом без выноски — ``3.2'S``,
@@ -584,7 +659,8 @@ def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = Fa
     if kind == "wall":
         return f"WALL {value}"
     if leader:
-        return f"BLDG {value}"
+        # У Николая тип стоит отдельной строкой, значение под ним: «BLDG» / «2.5'S».
+        return f"BLDG\n{value}"
     return value
 
 
@@ -666,9 +742,14 @@ def house_wall_dimensions(
     return out
 
 
+#: Ширина знака шрифта ROMANS в долях высоты текста. По ``bbox`` подписей Николая:
+#: медиана 0.705, у подписей оффсетов 0.70–0.75 (было 0.6 — блок считался на 17% уже).
+TEXT_CHAR_WIDTH = 0.70
+
+
 def default_text_width(text: str, height: float) -> float:
-    """Грубая ширина строки, если программа не передала точную (шрифт romans, ~0.6 высоты на знак)."""
-    return 0.6 * float(height) * len(text)
+    """Грубая ширина строки, если программа не передала точную (шрифт romans, 0.70 высоты на знак)."""
+    return TEXT_CHAR_WIDTH * float(height) * len(text)
 
 
 def _grow_rect(rect: Rect, amount: float) -> Rect:
@@ -881,11 +962,16 @@ def _place_leader(
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
     width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
-    for distance in LEADER_DISTANCES_FT:
+    for extra in LEADER_DISTANCES_FT:
         for angle in LEADER_ANGLES_DEG:
             a = base + math.radians(angle)
-            d = distance * factor
-            center = (anchor[0] + d * math.cos(a), anchor[1] + d * math.sin(a))
+            ux, uy = math.cos(a), math.sin(a)
+            # Расстояние до центра блока — половина его габарита в направлении выноски плюс
+            # зазор: у Николая конец выноски стоит у самого края текста, и длина выноски
+            # выходит 2.7–3.5 ft для подписи высотой 0.9 (по трём чертежам, среднее 3.1).
+            half_extent = abs(ux) * width / 2.0 + abs(uy) * block_h / 2.0
+            d = half_extent + gap + extra * factor
+            center = (anchor[0] + d * ux, anchor[1] + d * uy)
             rect = _rect_at(center, width, block_h)
             if not ok(rect, center):
                 continue
@@ -1173,6 +1259,7 @@ def plan_offsets(
             _plan_edge_labels(
                 plan, feature, label, rows_by_vertex, ring=ring, area_pts=area_pts,
                 scale_heights=scale, factor=factor, north_deg=north_deg,
+                height=building_height_ft(feature, known, scale),
                 boundary_segs=boundary_segs, lines=lines, known=known, placed=placed,
                 width_of=width_of, dup_radius=dup_radius, text_rects=text_rects,
                 known_in_plan=known_in_plan, exempt=frozenset(crossings),
@@ -1327,6 +1414,7 @@ def _plan_edge_labels(
     text_rects: Sequence[Rect] = (),
     known_in_plan: list[tuple[str, Point, float]] | None = None,
     exempt: frozenset[Point] = frozenset(),
+    height: float | None = None,
 ) -> None:
     """
     Подписи объекта по правилам R11–R13: каждая снятая вершина у границы подписывается по
@@ -1337,7 +1425,8 @@ def _plan_edge_labels(
     Порядок вершин — по возрастанию замера, поэтому первыми идут самые близкие к границе углы.
     """
     heights_kind = "house" if feature.kind == "house" else "fence"
-    height = offset_height_ft(heights_kind, scale_heights)
+    if height is None:
+        height = offset_height_ft(heights_kind, scale_heights)
     if known_in_plan is None:
         known_in_plan = []
     bounds = _area_bounds(area_pts, margin=15.0 * factor)
@@ -1348,26 +1437,35 @@ def _plan_edge_labels(
     # в чертеже слипались (4.25 соседней ветки).
     clearance = LABEL_CLEARANCE * height
 
-    def ok(rect: Rect, center: Point) -> bool:
-        if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
-            # Подпись у самой линии участка может чуть выходить за выделенную полилинию:
-            # Николай ставит текст и снаружи границы. Допуск — AREA_EDGE_TOL_FT.
-            return False
-        if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
-            return False
-        wide = _grow_rect(rect, clearance)
-        if any(
-            _rects_overlap(wide, _grow_rect(other, clearance))
-            for other in blockers + placed
-        ):
-            return False
-        return not any(
-            _segment_hits_rect(a, b, rect)
-            for a, b in lines
-            if bounds is None or _segment_in_bounds(a, b, bounds)
-        )
+    def makes_ok(gap: float) -> Callable[[Rect, Point], bool]:
+        def ok(rect: Rect, center: Point) -> bool:
+            if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
+                # Подпись у самой линии участка может чуть выходить за выделенную полилинию:
+                # Николай ставит текст и снаружи границы. Допуск — AREA_EDGE_TOL_FT.
+                return False
+            if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
+                return False
+            wide = _grow_rect(rect, gap)
+            if any(
+                _rects_overlap(wide, _grow_rect(other, gap))
+                for other in blockers + placed
+            ):
+                return False
+            return not any(
+                _segment_hits_rect(a, b, rect)
+                for a, b in lines
+                if bounds is None or _segment_in_bounds(a, b, bounds)
+            )
 
-    order = sorted(rows_by_vertex.items(), key=lambda cell: cell[1][0].value_ft)
+        return ok
+
+    ok_strict = makes_ok(clearance)
+    # Второй заход без зазора: у Николая подписи местами стоят в 0.7–0.8 высоты друг от
+    # друга, и со строгим зазором такие места считались занятыми (Geldner: FE.0.4'N).
+    ok = makes_ok(0.0) if LABEL_RELAXED_RETRY else ok_strict
+
+    cells = sorted(rows_by_vertex.items(), key=lambda cell: cell[1][0].value_ft)
+    order = list(cells)
     if MAX_SAME_VALUE_PER_FEATURE > 0:
         # R14: повтор одного и того же замера у объекта — не больше двух раз.
         seen_values: dict[tuple[float, str], int] = {}
@@ -1422,6 +1520,7 @@ def _plan_edge_labels(
             capped.append((vertex, rows))
         order = capped
     first_item = len(plan.items)
+    fresh_rects: list[Rect] = []
     for vertex, rows in order:
         primary = rows[0]
         value = round_offset_ft(primary.value_ft)
@@ -1433,7 +1532,14 @@ def _plan_edge_labels(
             if round_offset_ft(row.value_ft) > 0.0
             and (round_offset_ft(row.value_ft), row.direction) != (value, primary.direction)
         ]
-        text = offset_text(feature.kind, value, primary.direction)
+        # У Николая в двухстрочной подписи первой идёт сторона N/S, второй E/W
+        # («FE.0.4'N» / «FE.1.3'W», «FE.0.1'S» / «FE.0.5'W»): 4 из 5 случаев.
+        shown_value, shown_direction = value, primary.direction
+        if extras and primary.direction in ("E", "W") and extras[0][1] in ("N", "S"):
+            shown_value, shown_direction = extras[0]
+            extras = [(value, primary.direction)]
+        text = offset_text(feature.kind, shown_value, shown_direction)
+        value, direction_shown = shown_value, shown_direction
         mid = ((vertex[0] + primary.foot[0]) / 2.0, (vertex[1] + primary.foot[1]) / 2.0)
         # R14: один угол чертежа — одна подпись. Стык двух объектов в углу участка даёт две
         # вершины в 0.2–0.7 ft друг от друга (Brooklyn: «0.1'S \P 0.5'W» и «0.5'W \P 0.2'S»),
@@ -1459,10 +1565,18 @@ def _plan_edge_labels(
         # Столбиком, как у Николая: тип и первое значение строкой, дальше только значения
         # («C.L.F.» / «0.6'S» / «1.1'E»). Повтор «FE.» в каждой строке делал блок шире,
         # и он накрывал соседние надписи.
-        label_text = "\n".join([text] + [f"{v:.1f}'{d}" for v, d in extras])
+        # «FE.» повторяется в каждой строке, а имя типа («C.L.F.», «W.FE.», «BLDG») — только
+        # в первой: так у Николая («FE.0.4'N» / «FE.1.3'W», но «BLDG» / «2.5'S»).
+        continuation = offset_prefix(feature.kind)
+        label_text = "\n".join(
+            [text] + [f"{continuation}{v:.1f}'{d}" for v, d in extras]
+        )
         if feature.kind == "house" and HOUSE_TEXT_INSIDE:
             # Дом — текст внутри строения у стены; снаружи мешают заборы и чужие надписи.
             beside = _place_house_text(
+                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
+                width_of, ok_strict,
+            ) or _place_house_text(
                 feature_contour(feature)[0], vertex, primary.foot, label_text, height,
                 width_of, ok,
             )
@@ -1473,10 +1587,14 @@ def _plan_edge_labels(
         ):
             # У Николая подпись забора — обычный текст у самой линии, без стрелки.
             # Выноска остаётся последним средством: она и давала «частокол» на чертеже.
-            beside = _place_beside_line(vertex, primary.foot, label_text, height, width_of, ok)
+            beside = _place_beside_line(
+                vertex, primary.foot, label_text, height, width_of, ok_strict
+            ) or _place_beside_line(
+                vertex, primary.foot, label_text, height, width_of, ok
+            )
         if beside is not None:
             item = OffsetItem(
-                kind=feature.kind, value_ft=value, direction=primary.direction, style="text",
+                kind=feature.kind, value_ft=value, direction=direction_shown, style="text",
                 height_ft=height, anchor=vertex, target=primary.foot, text=label_text,
                 point=beside, leader=None,
                 rotation_deg=(primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0),
@@ -1486,7 +1604,11 @@ def _plan_edge_labels(
             rect = _rect_at(beside, rect_w, rect_h)
         else:
             leader_text = label_text
-            spot = _place_leader(vertex, primary.foot, leader_text, height, width_of, ok, factor)
+            spot = _place_leader(
+                vertex, primary.foot, leader_text, height, width_of, ok_strict, factor
+            ) or _place_leader(
+                vertex, primary.foot, leader_text, height, width_of, ok, factor
+            )
             if spot is None:
                 plan.warnings.append(
                     f"{label}: нет свободного места для «{leader_text}» в области — подпись не поставлена"
@@ -1495,15 +1617,47 @@ def _plan_edge_labels(
             center, end = spot
             rect_w, rect_h = _text_block(leader_text, height, width_of)
             item = OffsetItem(
-                kind=feature.kind, value_ft=value, direction=primary.direction, style="leader",
+                kind=feature.kind, value_ft=value, direction=direction_shown, style="leader",
                 height_ft=height, anchor=vertex, target=primary.foot, text=leader_text,
                 point=center, leader=(vertex, end), crossing=vertex in exempt,
             )
             rect = _rect_at(center, rect_w, rect_h)
         placed.append(rect)
+        fresh_rects.append(rect)
         plan.items.append(item)
         known.append((item.text, item.point, item.height_ft))
         known_in_plan.append((item.text, vertex, item.height_ft))
+    if O_L_LABELS and feature.kind == "fence" and O_L_TOL_FT > 0:
+        # Забор идёт по самой границе: смещения нет, и обычная подпись не появляется.
+        # Николай пишет там «FE.O/L» — тип и признак «на линии».
+        for vertex, rows in cells:
+            # «На линии» — ближайшая сторона участка проходит по самой вершине: смещения нет
+            # вовсе (меньше MIN_OFFSET_FT), а не «маленькое смещение» вроде 0.1'.
+            if not rows or min(row.value_ft for row in rows) > MIN_OFFSET_FT:
+                continue
+            if not _vertex_on_ring(vertex, ring, O_L_TOL_FT):
+                continue
+            o_l_text = f"{offset_prefix(feature.kind)}{O_L_TEXT}"
+            spot = _place_leader(
+                vertex, vertex, o_l_text, height, width_of, ok_strict, factor
+            ) or _place_leader(
+                vertex, vertex, o_l_text, height, width_of, ok, factor
+            )
+            if spot is None:
+                plan.skipped.append((label, f"«{o_l_text}»: нет места"))
+                continue
+            center, foot = spot
+            plan.items.append(
+                OffsetItem(
+                    kind=feature.kind, value_ft=0.0, direction="", style="leader",
+                    height_ft=height, anchor=vertex, target=vertex, text=o_l_text,
+                    point=center, leader=(vertex, foot), rotation_deg=0.0,
+                )
+            )
+            rect = _rect_at(center, *_text_block(o_l_text, height, width_of))
+            placed.append(rect)
+            fresh_rects.append(rect)
+
     if POST_PART_DEDUPE and PART_DUPLICATE_FT > 0:
         # H32: одиночная подпись не повторяет часть полной подписи того же вида объекта,
         # стоящей рядом (2 ft). Проверка идёт по уже разложенным подписям: двухстрочная
@@ -1531,6 +1685,16 @@ def _plan_edge_labels(
                 kept.append(item)
             removed = [item for item in fresh if not any(item is k for k in kept)]
             if removed:
+                # Снятая подпись не должна занимать место: иначе её прямоугольник остаётся
+                # в `placed` и глушит подписи следующих объектов (Geldner: FE.0.4'N и
+                # FE.1.1'E не находили места из-за снятых дублей).
+                for offset_index, entry in enumerate(fresh):
+                    if not any(entry is k for k in kept):
+                        stale = fresh_rects[offset_index]
+                        for position, other in enumerate(placed):
+                            if other == stale:
+                                del placed[position]
+                                break
                 del plan.items[first_item:]
                 plan.items.extend(kept)
                 for item in removed:

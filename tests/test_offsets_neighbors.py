@@ -128,23 +128,15 @@ def test_repeated_closing_vertex_keeps_both_edges_of_the_corner():
     assert len(directions[(10.0, 0.5)]) == 2
 
 
-def test_fence_label_is_text_without_leader_when_there_is_room():
-    """У Николая подписи заборов — обычный текст у линии, без стрелок."""
+def test_fence_label_always_goes_with_leader():
+    """У Николая каждая подпись забора — выноска со стрелкой (тип 3), не голый текст."""
     pts = [(20.0, 0.4), (50.0, 0.4)]
     fence = off.Feature("fence", "f", tuple(pts))
     plan = off.plan_offsets(LOT, [fence], survey_pts=pts,
                             survey_notes=[(p, "VINYL FENCE") for p in pts])
     items = _items(plan)
-    assert items and all(item.style == "text" for item in items)
-
-    saved = off.FENCE_TEXT_WITHOUT_LEADER
-    off.FENCE_TEXT_WITHOUT_LEADER = False
-    try:
-        off_plan = off.plan_offsets(LOT, [fence], survey_pts=pts,
-                                    survey_notes=[(p, "VINYL FENCE") for p in pts])
-    finally:
-        off.FENCE_TEXT_WITHOUT_LEADER = saved
-    assert all(item.style == "leader" for item in _items(off_plan))
+    assert items and all(item.style == "leader" for item in items)
+    assert all(item.leader for item in items)
 
 
 def test_part_of_a_full_label_is_not_repeated_beside_it():
@@ -165,10 +157,10 @@ def _rect(item):
     return off._rect_at(item.point, width, height)
 
 
-def test_two_line_label_is_a_column_without_repeated_prefix():
+def test_two_line_label_repeats_prefix_but_not_the_type_name():
     """
-    У Николая столбик: тип с первым значением, дальше только значения
-    («C.L.F.» / «0.6'S» / «1.1'E»). Повтор «FE.» в каждой строке делал блок шире.
+    «FE.» стоит в каждой строке («FE.0.4'N» / «FE.1.3'W»), имя типа — только в первой
+    («BLDG» / «2.5'S», «C.L.F.» / «0.6'S»): так в дампах по трём чертежам.
     """
     # Вершина у юго-восточного угла участка: замер до восточной стороны (0.2 ft)
     # и второй — до южной (0.4 ft).
@@ -182,7 +174,7 @@ def test_two_line_label_is_a_column_without_repeated_prefix():
     for item in two_line:
         first, *rest = item.text.split("\n")
         assert first.startswith("FE.")
-        assert all("FE" not in line for line in rest), item.text
+        assert rest and all(line.startswith("FE.") for line in rest), item.text
 
 
 def test_line_block_height_matches_mtext_spacing():

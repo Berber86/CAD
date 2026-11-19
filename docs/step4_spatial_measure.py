@@ -34,6 +34,10 @@ from test_field_dump import (  # noqa: E402
     _kind_of, _leader_tips, _parts, field_plan, load_pair, nikolai_labels, plan_labels, score_labels,
 )
 
+# Общая пара «наша подпись ↔ подпись Николая» — та же, что рисует картинку (docs/make_pair_preview.py).
+sys.path.insert(0, str(ROOT / "docs"))
+from make_pair_preview import match_pairs  # noqa: E402
+
 PAIRS = {
     "Geldner": "docs/primer3i.zip",
     "Brooklyn": "docs/primer2i.zip",
@@ -253,6 +257,26 @@ def main() -> None:
     print("  где наша конвенция не работает:")
     for item in examples:
         print("   ", item)
+
+    # Та же буква, но только на парах «наша подпись ↔ подпись Николая»: здесь известна сторона,
+    # до которой меряем мы, поэтому это честная доля, а не гипотеза о чужих подписях (4.30).
+    print("\n  на сопоставленных подписях (наша сторона известна):")
+    matched_ok = matched_all = 0
+    for name, row in ours.items():
+        entries = [
+            {"kind": label["kind"], "anchor": label["anchor"],
+             "parts": [(value, direction) for _l, value, direction in _parts(label["text"])]}
+            for label in row
+        ]
+        for index, target in match_pairs(entries, his[name]):
+            mine, theirs = entries[index]["parts"], his[name][target]["parts"]
+            if not mine:
+                continue
+            matched_all += 1
+            matched_ok += mine[0][1] == theirs[0][1]
+    if matched_all:
+        print(f"  наша буква совпала у {matched_ok} из {matched_all} = "
+              f"{matched_ok / matched_all:.0%} (на всех его подписях — гипотеза выше)")
 
     print("\n" + "=" * 100)
     print("ЗНАЧЕНИЯ")

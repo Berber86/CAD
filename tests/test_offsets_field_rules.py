@@ -592,8 +592,10 @@ def test_sixth_pair_east_64th_property_line_is_a_25_by_100_rectangle(east64):
 
 def test_sixth_pair_east_64th_scores_by_the_same_rules(east64):
     """
-    Первый замер шестой пары (правила под неё не подбирались): забор 8 эталон / 7 наших / 7 совпало,
-    дом 6 / 5 / 1.
+    Замер шестой пары: забор 8 эталон / 7 наших / 7 совпало, дом 6 / 7 / 3.
+
+    Дом вырос после 4.29: R17 ставит две подписи устоев (`3.0'E` и `3.1'E` — у Николая `3.0'E`
+    дважды), и обе считаются подписями дома, потому что у устоя число голое, без приставки.
 
     Забор почти весь сходится: `FE.0.2'N`, `FE.0.8'S`, `FE.1.0'S`, `FE.0.9'N`, `FE.1.7'N`,
     `FE.1.2'N` (у нас `FE.1.3'N` — 0.1 ft, в допуске) и `FE.0.2'N`; его `FE.0.1'S` у фасада у нас
@@ -609,7 +611,7 @@ def test_sixth_pair_east_64th_scores_by_the_same_rules(east64):
     """
     for kind, (expected, produced, hits) in (
         ("fence", (8, 7, 7)),
-        ("house", (6, 5, 1)),
+        ("house", (6, 7, 3)),
     ):
         got = [p for p in east64["labels"] if p["kind"] == kind]
         exp = [p for p in east64["nikolai_labels"] if p["kind"] == kind]
@@ -617,6 +619,12 @@ def test_sixth_pair_east_64th_scores_by_the_same_rules(east64):
     texts = [p["text"] for p in east64["labels"] if p["kind"] == "fence"]
     for text in ("FE.1.0'S", "FE.1.7'N", "FE.0.2'N"):
         assert any(text in line for line in texts), text
+    # R17: два устоя у улицы — голое число до красной линии, ровно у его подписей.
+    walls = [item for item in east64["plan"].items if item.kind == "wall"]
+    assert [item.text for item in walls] == ["3.0'E", "3.1'E"]
+    assert walls[0].anchor == pytest.approx((4981.42, 5085.75), abs=0.05)
+    assert walls[1].anchor == pytest.approx((5005.69, 5085.83), abs=0.05)
+    assert all(abs(item.anchor[1] - 5085.8) < 0.1 for item in walls)
 
 
 def _touch_stats(paths):

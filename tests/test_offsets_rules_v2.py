@@ -110,3 +110,43 @@ def test_corner_rule_keeps_one_label_for_both_ends_of_a_straight_fence(monkeypat
     # Два конца прямого забора на одинаковом расстоянии от стороны — одна подпись, не две.
     plan = off.plan_offsets(SQUARE, [_fence([(50.0, -0.066), (50.0, 0.088)])])
     assert len(plan.items) == 1
+
+
+def test_front_wall_pier_is_measured_to_the_street_line():
+    """
+    R17 (4.30): устой у улицы — замер до красной линии, голым числом, с выноской.
+
+    1412 East 64th Street: два кирпичных устоя 1 × 1 ft стоят на боковых линиях в полосе улицы
+    (0.08 и 0.31 ft), до `M-ROW-LINE` — 2.98 и 3.06 ft; Николай пишет `3.0'E` дважды, началом
+    выноски — середину задней грани устоя. Здесь тот же случай: устой 1 × 1 ft на западной
+    стороне, в 3 ft перед красной линией.
+    """
+    front = ((-20.0, -4.0), (120.0, -4.0))  # красная линия идёт вдоль улицы, мимо участка
+    pier = off.Feature(
+        kind="wall", handle="P",
+        points=((-1.0, -2.0), (0.0, -2.0), (0.0, -1.0), (-1.0, -1.0)),
+    )
+    plan = off.plan_offsets(
+        SQUARE, [pier], front=[front], survey_pts=[(0.0, -2.0), (-1.0, -1.0)],
+        survey_notes=[((0.0, -2.0), "BRICK WALL"), ((-1.0, -1.0), "BRICK WALL")],
+    )
+    assert [item.text for item in plan.items] == ["3.0'N"], [(i.text, i.kind) for i in plan.items]
+    item = plan.items[0]
+    assert item.kind == "wall" and item.style == "leader" and item.leader
+    # Задняя грань устоя (дальняя от улицы — здесь это y = 1.0) и середина между её вершинами.
+    assert item.anchor == pytest.approx((-0.5, -1.0), abs=0.05)
+    assert item.value_ft == pytest.approx(3.0, abs=0.06)
+
+
+def test_front_wall_needs_survey_points_and_a_street_line():
+    """R17 без точек съёмки или без красной линии не включается: стена остаётся без оффсета."""
+    pier = off.Feature(
+        kind="wall", handle="P",
+        points=((-1.0, -2.0), (0.0, -2.0), (0.0, -1.0), (-1.0, -1.0)),
+    )
+    front = ((-20.0, -4.0), (120.0, -4.0))
+    assert off.plan_offsets(SQUARE, [pier], front=[front]).items == []
+    assert off.plan_offsets(
+        SQUARE, [pier], survey_pts=[(0.0, -2.0)],
+        survey_notes=[((0.0, -2.0), "BRICK WALL")],
+    ).items == []

@@ -268,28 +268,33 @@ def test_placed_labels_keep_a_clearance_between_them():
             )
 
 
-def test_house_text_stands_inside_the_building():
-    """Подпись дома — внутри строения у стены, как у Николая, а не снаружи в заборах."""
+def test_house_text_stands_outside_the_lot():
+    """
+    R16 (4.29): подпись дома у стены — **снаружи** контура участка, как у Николая.
+
+    Замер по шести парам: 19 подписей дома без выноски, и все 19 стоят вне участка
+    (1412 East 64th Street — `BLDG 0.1'W` под задней линией, поверх описания соседа).
+    Прежнее правило 4.22 ставило текст внутрь строения — на узком участке 25 ft он ложился
+    на собственное описание дома.
+    """
     house = ((10.0, 0.5), (34.0, 0.5), (34.0, 26.0), (10.0, 26.0))
     pts = [(10.0, 0.5), (34.0, 0.5)]
+    feature = off.Feature("house", "h", house, closed=True)
     plan = off.plan_offsets(
-        LOT, [off.Feature("house", "h", house, closed=True)], survey_pts=pts,
-        survey_notes=[(p, "1 STY FRAME") for p in pts],
+        LOT, [feature], survey_pts=pts, survey_notes=[(p, "1 STY FRAME") for p in pts],
     )
     assert plan.items
-    assert all(off.point_in_polygon(item.point, house) for item in plan.items), [
+    assert all(not off.point_in_polygon(item.point, LOT) for item in plan.items), [
         item.point for item in plan.items
     ]
 
-    saved = off.HOUSE_TEXT_INSIDE
-    off.HOUSE_TEXT_INSIDE = False
+    saved = off.HOUSE_TEXT_OUTSIDE
+    off.HOUSE_TEXT_OUTSIDE = False
     try:
-        outside = off.plan_offsets(
-            LOT, [off.Feature("house", "h", house, closed=True)], survey_pts=pts,
-            survey_notes=[(p, "1 STY FRAME") for p in pts],
+        inside = off.plan_offsets(
+            LOT, [feature], survey_pts=pts, survey_notes=[(p, "1 STY FRAME") for p in pts],
         )
     finally:
-        off.HOUSE_TEXT_INSIDE = saved
-    assert outside.items and not all(
-        off.point_in_polygon(item.point, house) for item in outside.items
-    )
+        off.HOUSE_TEXT_OUTSIDE = saved
+    # Без правила (4.22) первым делом пробуется место внутри строения.
+    assert inside.items and any(off.point_in_polygon(item.point, house) for item in inside.items)

@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.14"
+STEP4_VERSION = "4.20"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -362,6 +362,84 @@ ONLINE_FENCE_TEXT = "FE.O/L"
 #: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
 TEXT_FOLLOWS_BOUNDARY = False
 
+
+#: противоположная буква стороны участка (для объекта снаружи)
+_OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+
+# --------------------------------------------------------------------------- R11–R13: правило «своей стороны»
+#
+# Три правила, которые подняли число совпадений с эталонами Николая (4.20):
+#
+# R11 (своя сторона). Оффсет меряется по нормали к СВОЕМУ краю объекта, а не к ближайшей точке
+#   границы. Замер — до той стороны участка, нормаль которой параллельна нормали края (допуск
+#   ``EDGE_PARALLEL_TOL_DEG``). Пример: забор вдоль западной границы, у которого дальний конец
+#   отогнут на 0.04 ft в сторону, у Николая подписан «0.4'W» (нормаль края), а не «0.3'N»
+#   (ближайшая точка границы). На 192 Geldner это дало 4 попадания вместо 1.
+#
+# R12 (две строки у вершины). Вершина, к которой сходятся ДВА края, подписывается по каждому краю:
+#   основной строкой — меньший замер, второй — если он не дальше ``SECOND_EDGE_FT``.
+#   Пример: «W.FE. \P 0.1'E \P 1.2'S» и «C.L.F. \P 0.6'S \P 1.1'E» (192 Geldner): 0.12 по
+#   вертикальному краю (E) и 1.23 по горизонтальному (S) — это разные края одной вершины.
+#   До 4.20 вторая строка искалась по той же стороне участка и терялась.
+#
+# R13 (какие вершины подписываются). Метка ставится только у вершины, где стоит точка съёмки
+#   (``SURVEY_POINT_SNAP_FT``): Николай подписывает снятые углы, а не каждый излом линии.
+#   Без этого правила на 192 Geldner выходит 27 подписей при 11 у Николая.
+#
+# Правила включаются флагами: выключены — поведение прежнее (4.19).
+EDGE_NORMAL_OFFSETS = True
+#: нормаль края считается параллельной нормали стороны участка при расхождении не более, градусы
+EDGE_PARALLEL_TOL_DEG = 3.0
+#: вторая строка у вершины: второй край подписывается, если он ближе этого расстояния, футы
+SECOND_EDGE_FT = 2.0
+#: метка ставится только у вершины, где есть точка съёмки (блок PNT-X), в пределах, футы
+SURVEY_POINT_SNAP_FT = 0.6
+#: только снятые вершины подписываются (R13)
+LABEL_ONLY_SURVEYED_VERTICES = True
+#: R13b: у забора/стены подписывается угол, где описание точки съёмки называет этот объект
+SURVEY_DESC_RULE = True
+#: не больше стольких углов одного объекта на одну сторону участка (углы берутся ближайшие):
+#: у Николая на одну сторону забора приходится один угол, а «второй» оказывается углом соседнего
+#: объекта в том же углу участка (Brooklyn: «0.3'W» у двух концов коротких заборов не подписаны)
+MAX_CORNERS_PER_SIDE = 1
+#: для дома/сарая — свой предел: у Николая на сторону дома приходится до трёх углов
+#: (Brooklyn: 3.5'S, 4.0'N, 3.0'W — по метке на юг, север и запад)
+MAX_CORNERS_PER_SIDE_HOUSE = 2
+#: R13c: кэп «один угол на сторону» не применяется к углам, разнесённым вдоль этой стороны
+#: дальше этого расстояния: у Brooklyn один забор идёт вдоль западной стороны 100 ft, и Николай
+#: подписал его у двух концов («0.1'S» у 4922 и «0.1'S \P 0.5'W» у 4959). Футы.
+SIDE_CAP_SPACING_FT = 30.0
+#: R13b: метка ставится у вершины, где точка съёмки ОПИСЫВАЕТ этот объект (``DESC2`` про забор,
+#: стену или дом). Николай подписывает не каждый снятый угол, а снятый угол этого объекта:
+#: на 192 Geldner 211 точки съёмки дают 11 подписей забора — только там, где в DESC2 стоит
+#: «VINYL FENCE» / «WOOD FENCE» / «F E C». Радиус привязки описания к вершине, футы.
+SURVEY_DESC_TOL_FT = 0.6
+#: слова описания точки, которые относят снятый угол к забору и к стене
+FENCE_DESC_WORDS = ("FENCE", "F.E.C", "F E C", "FEC", "C.L.F", "CHAIN", "VINYL", "WOOD")
+WALL_DESC_WORDS = ("WALL",)
+#: R16: дубль, стоящий уже в «до»-файле (тот же текст рядом с той же вершиной): не повторять
+EXISTING_LABEL_RADIUS_FT = 6.0
+#: R14: сколько раз один и тот же замер («0.3'W») ставится у одного объекта. У Николая повтор
+#: встречается у заборов (два «0.7'E» на 192 Geldner, два «0.1'S» у забора на Brooklyn),
+#: но третий такой угол уже не подписан.
+MAX_SAME_VALUE_PER_FEATURE = 2
+#: R14: две вершины одного объекта ближе этого — один угол: у прямого забора оба конца стоят
+#: у одной стороны, а стык двух заборов в углу участка даёт две вершины в 0.2 ft друг от друга
+#: (Brooklyn: «0.1'S \P 0.5'W» и «0.5'W \P 0.2'S» — у Николая одна подпись).
+NODE_DUP_FT = 0.35
+#: R14: ту же близость применяем и без совпадения замера (это один и тот же угол чертежа)
+NODE_DUP_ANY_VALUE = True
+#: R11: если своей (параллельной) стороны в пределах ``EDGE_MAX_FT`` нет, мерим до ближайшей
+#: стороны участка в пределах этого радиуса — забор в глубине участка подписан и у Николая
+EDGE_FALLBACK_FT = 0.0
+#: R11: насколько далеко от вершины может быть «своя» сторона участка, футы.
+#: Замер по нормали до параллельной стороны: 0.1–3.0 ft у заборов и домов; 4.9'N (дом Geldner)
+#: уже не входит — у Николая это замер до южной линии, а сторона с параллельной нормалью дальше.
+EDGE_MAX_FT = 3.0
+#: вершины на самой линии участка: метка ставится по второму краю (первый даёт ноль)
+ON_LINE_USES_EDGE = True
+
 @dataclass(frozen=True)
 class Feature:
     """Объект, от которого может идти оффсет: дом, забор, стена, заезд."""
@@ -581,6 +659,19 @@ def _key(text: str) -> str:
     return re.sub(r"\s+", "", str(text)).upper()
 
 
+def _part_keys(text: str) -> set[tuple[float, str]]:
+    """Части подписи как (значение, буква) — порядок строк не важен (R4, R12)."""
+    out: set[tuple[float, str]] = set()
+    for match in _PART_RE.finditer(str(text).replace("\n", " ")):
+        out.add((float(match["value"]), match["dir"]))
+    return out
+
+
+def _same_label(text: str, other: str) -> bool:
+    """Одна и та же подпись: те же части (значение и буква), порядок и метка не важны."""
+    return bool(_part_keys(text)) and _part_keys(text) == _part_keys(other)
+
+
 @dataclass(frozen=True)
 class OffsetItem:
     """Готовый оффсет: текст, где он стоит, и (для выноски) отрезок от объекта до текста."""
@@ -796,6 +887,8 @@ def plan_offsets(
     north_deg: float = 90.0,
     texts: Sequence[tuple[str, Point, float]] = (),
     text_width: Callable[[str, float], float] | None = None,
+    survey_pts: Sequence[Point] = (),
+    survey_notes: Sequence[tuple[Point, str]] = (),
 ) -> OffsetPlan:
     """
     Шаг 4, черновик 4.5: оффсеты объектов в выбранной области.
@@ -803,7 +896,9 @@ def plan_offsets(
     ``property_pts`` — граница участка (замкнутый контур); ``front`` — линии ``M-ROW-LINE``
     (фронтовая граница, ``M-TAX-LINE`` сюда не передаётся); ``area`` — прямоугольник, который
     указал геодезист (``None`` — весь участок); ``texts`` — уже стоящие подписи ``(текст, точка,
-    высота)``: рядом с тем же текстом оффсет не дублируется, а текст не накрывается.
+    высота)``: рядом с тем же текстом оффсет не дублируется, а текст не накрывается;
+    ``survey_pts`` — точки съёмки (R13: метка ставится у снятых вершин); ``survey_notes`` —
+    ``(точка, DESC2)`` (R13b: у забора — только там, где описание называет забор).
 
     Для каждого объекта берётся ближайшая к границе вершина внутри участка; значение — до 0.1 ft.
     Дом и сарай — текст без выноски (высота 1.1), забор и стена — выноска (0.9). Текст ставится
@@ -824,6 +919,8 @@ def plan_offsets(
     known = [(str(t), (float(p[0]), float(p[1])), float(h) or LABEL_HEIGHT_FT * factor) for t, p, h in texts]
     # Препятствия для текста: уже стоящие подписи и линии, которые текст не должен пересекать.
     text_rects = [_rect_at(p, width_of(t, h), h) for t, p, h in known]
+    # Подписи, уже поставленные этим планом у вершин: R14 не даёт дважды подписать один угол.
+    known_in_plan: list[tuple[str, Point, float]] = []
     lines: list[tuple[Point, Point]] = []
     for i in range(len(ring)):
         lines.append((ring[i], ring[(i + 1) % len(ring)]))
@@ -844,6 +941,14 @@ def plan_offsets(
     dup_radius = DUPLICATE_RADIUS_FT * factor
 
     plan.counts["zone"] = len(features)
+    # R11–R13: замер по нормали своего края (стороны участка), вторая строка по другому краю,
+    # метка только у снятых вершин. Список сторон строится один раз на весь план.
+    edge_sides: list[SideLine] = side_lines(ring, front_lines, north_deg) if EDGE_NORMAL_OFFSETS else []
+    survey_points = [(float(p[0]), float(p[1])) for p in survey_pts]
+    survey_notes_list = [
+        ((float(point[0]), float(point[1])), str(description))
+        for point, description in survey_notes
+    ]
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
@@ -858,6 +963,38 @@ def plan_offsets(
             continue
         if feature.kind == "wall" and not WALL_OFFSETS:
             plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
+            continue
+        # R11–R14 включаются только когда в чертеже есть точки съёмки: без них нечем отличить
+        # снятый угол от излома линии, и правило «метка у снятой вершины» (R13) не работает —
+        # тогда остаётся прежний замер до ближайшей границы.
+        if EDGE_NORMAL_OFFSETS and survey_points:
+            rows_by_vertex = vertex_offset_rows(
+                feature, edge_sides, max_ft=EDGE_MAX_FT, ring=ring, north_deg=north_deg,
+            )
+            all_rows = bool(rows_by_vertex)
+            if LABEL_ONLY_SURVEYED_VERTICES and survey_points:
+                rows_by_vertex = {
+                    v: rows for v, rows in rows_by_vertex.items()
+                    if vertex_on_survey_point(v, survey_points)
+                }
+            if SURVEY_DESC_RULE and survey_notes_list:
+                # R13b: у забора и стены — только углы, где DESC2 называет этот вид объекта.
+                rows_by_vertex = {
+                    v: rows for v, rows in rows_by_vertex.items()
+                    if vertex_describes_object(v, survey_notes_list, feature.kind)
+                }
+            if not rows_by_vertex:
+                plan.skipped.append(
+                    (label, "стоит на границе" if not all_rows else "нет снятых вершин у границы (нет точки съёмки)")
+                )
+                continue
+            _plan_edge_labels(
+                plan, feature, label, rows_by_vertex, ring=ring, area_pts=area_pts,
+                scale_heights=scale, factor=factor, north_deg=north_deg,
+                boundary_segs=boundary_segs, lines=lines, known=known, placed=placed,
+                width_of=width_of, dup_radius=dup_radius, text_rects=text_rects,
+                known_in_plan=known_in_plan,
+            )
             continue
         candidates = [
             c for c in _feature_candidates(ring, feature, front_lines)
@@ -986,6 +1123,462 @@ def plan_offsets(
             known.append((item.text, item.point, item.height_ft))
             used.add(seg_key)
     return plan
+
+
+def _plan_edge_labels(
+    plan: OffsetPlan,
+    feature: Feature,
+    label: str,
+    rows_by_vertex: dict[Point, list[EdgeRow]],
+    *,
+    ring: Sequence[Point],
+    area_pts: Sequence[Point] | None,
+    scale_heights: float,
+    factor: float,
+    north_deg: float,
+    boundary_segs: Sequence[tuple[Point, Point]],
+    lines: Sequence[tuple[Point, Point]],
+    known: list[tuple[str, Point, float]],
+    placed: list[Rect],
+    width_of: Callable[[str, float], float],
+    dup_radius: float,
+    text_rects: Sequence[Rect] = (),
+    known_in_plan: list[tuple[str, Point, float]] | None = None,
+) -> None:
+    """
+    Подписи объекта по правилам R11–R13: каждая снятая вершина у границы подписывается по
+    нормали своего края; если к вершине сходятся два края и второй ближе ``SECOND_EDGE_FT``,
+    он идёт второй строкой той же подписи.
+
+    Дом и сарай — текст без выноски (высота 1.1), забор и стена — выноска (0.9).
+    Порядок вершин — по возрастанию замера, поэтому первыми идут самые близкие к границе углы.
+    """
+    heights_kind = "house" if feature.kind == "house" else "fence"
+    height = offset_height_ft(heights_kind, scale_heights)
+    if known_in_plan is None:
+        known_in_plan = []
+    bounds = _area_bounds(area_pts, margin=15.0 * factor)
+    blockers = list(text_rects)
+
+    def ok(rect: Rect, center: Point) -> bool:
+        if area_pts is not None and not _rect_inside_polygon(rect, area_pts):
+            return False
+        if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
+            return False
+        if any(_rects_overlap(rect, other) for other in blockers + placed):
+            return False
+        return not any(
+            _segment_hits_rect(a, b, rect)
+            for a, b in lines
+            if bounds is None or _segment_in_bounds(a, b, bounds)
+        )
+
+    order = sorted(rows_by_vertex.items(), key=lambda cell: cell[1][0].value_ft)
+    if MAX_SAME_VALUE_PER_FEATURE > 0:
+        # R14: повтор одного и того же замера у объекта — не больше двух раз.
+        seen_values: dict[tuple[float, str], int] = {}
+        unique: list[tuple[Point, list[EdgeRow]]] = []
+        for vertex, rows in order:
+            pairs = []
+            for row in rows:
+                value = round_offset_ft(row.value_ft)
+                if value <= 0.0:
+                    continue
+                key = (value, row.direction)
+                if seen_values.get(key, 0) >= MAX_SAME_VALUE_PER_FEATURE:
+                    continue
+                seen_values[key] = seen_values.get(key, 0) + 1
+                pairs.append(row)
+            if pairs:
+                unique.append((vertex, pairs))
+        order = unique
+    cap = MAX_CORNERS_PER_SIDE_HOUSE if feature.kind == "house" else MAX_CORNERS_PER_SIDE
+    if cap > 0:
+        # R13: у Николая на одну сторону участка приходится не больше двух углов объекта —
+        # берём ближайшие к стороне, остальные не подписываем. Сторона — по букве: у участка
+        # бывает несколько отрезков с одной и той же нормалью (запад в двух частях).
+        # R13c: углы, разнесённые вдоль стороны дальше SIDE_CAP_SPACING_FT, считаются отдельно:
+        # у длинной стороны забора Николай подписывает оба конца.
+        per_side: dict[str, list[Point]] = {}
+        capped: list[tuple[Point, list[EdgeRow]]] = []
+        for vertex, rows in order:
+            key = rows[0].direction
+            taken = per_side.setdefault(key, [])
+            if len(taken) >= cap and not (
+                SIDE_CAP_SPACING_FT > 0
+                and all(
+                    math.hypot(vertex[0] - other[0], vertex[1] - other[1]) > SIDE_CAP_SPACING_FT
+                    for other in taken
+                )
+            ):
+                continue
+            taken.append(vertex)
+            capped.append((vertex, rows))
+        order = capped
+    for vertex, rows in order:
+        primary = rows[0]
+        value = round_offset_ft(primary.value_ft)
+        if value <= 0.0:
+            continue
+        extras = [
+            (round_offset_ft(row.value_ft), row.direction)
+            for row in rows[1:]
+            if round_offset_ft(row.value_ft) > 0.0
+            and (round_offset_ft(row.value_ft), row.direction) != (value, primary.direction)
+        ]
+        text = offset_text(feature.kind, value, primary.direction)
+        mid = ((vertex[0] + primary.foot[0]) / 2.0, (vertex[1] + primary.foot[1]) / 2.0)
+        # R14: один угол чертежа — одна подпись. Стык двух объектов в углу участка даёт две
+        # вершины в 0.2–0.7 ft друг от друга (Brooklyn: «0.1'S \P 0.5'W» и «0.5'W \P 0.2'S»),
+        # и у Николая там одна подпись. Тот же текст у той же вершины — тоже дубль.
+        same_text_near = any(
+            (_key(old) == _key(text) or _same_label(old, text))
+            and min(
+                math.hypot(p[0] - vertex[0], p[1] - vertex[1]),
+                math.hypot(p[0] - mid[0], p[1] - mid[1]),
+            ) <= dup_radius
+            for old, p, _h in known
+        )
+        same_corner = NODE_DUP_FT > 0 and any(
+            math.hypot(p[0] - vertex[0], p[1] - vertex[1]) <= NODE_DUP_FT
+            for _t, p, _h in known_in_plan
+        )
+        if same_text_near or same_corner:
+            plan.skipped.append((label, f"«{text}» уже стоит рядом"))
+            continue
+
+        item: OffsetItem | None = None
+        beside = None
+        if feature.kind == "house":
+            beside = _place_beside_line(vertex, primary.foot, text, height, width_of, ok)
+        if beside is not None:
+            item = OffsetItem(
+                kind=feature.kind, value_ft=value, direction=primary.direction, style="text",
+                height_ft=height, anchor=vertex, target=primary.foot, text=text,
+                point=beside, leader=None,
+                rotation_deg=(primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0),
+            )
+            rect = _rect_at(beside, width_of(text, height), height)
+        else:
+            leader_text = "\n".join(
+                [text] + [offset_text(feature.kind, v, d) for v, d in extras]
+            )
+            spot = _place_leader(vertex, primary.foot, leader_text, height, width_of, ok, factor)
+            if spot is None:
+                plan.warnings.append(
+                    f"{label}: нет свободного места для «{leader_text}» в области — подпись не поставлена"
+                )
+                continue
+            center, end = spot
+            rect_w, rect_h = _text_block(leader_text, height, width_of)
+            item = OffsetItem(
+                kind=feature.kind, value_ft=value, direction=primary.direction, style="leader",
+                height_ft=height, anchor=vertex, target=primary.foot, text=leader_text,
+                point=center, leader=(vertex, end),
+            )
+            rect = _rect_at(center, rect_w, rect_h)
+        placed.append(rect)
+        plan.items.append(item)
+        known.append((item.text, item.point, item.height_ft))
+        known_in_plan.append((item.text, vertex, item.height_ft))
+
+
+@dataclass(frozen=True)
+class EdgeRow:
+    """Строка оффсета у вершины: замер по нормали своего края объекта (R11)."""
+
+    value_ft: float  # расстояние до стороны участка, футы (не округлённое)
+    direction: str  # буква: сторона, где стоит объект относительно стороны участка
+    foot: Point  # основание перпендикуляра на стороне участка
+    edge_index: int  # 0 — «своя» сторона (нормаль края), 1 — ближайшая из остальных
+    side_angle_deg: float  # угол стороны участка, градусы
+    parallel: bool = True  # нормаль стороны параллельна нормали края вершины (R11)
+
+
+@dataclass(frozen=True)
+class SideLine:
+    """Сторона участка (контур или фронтовая линия) с внешней нормалью и буквой."""
+
+    a: Point
+    b: Point
+    normal: Point  # внешняя нормаль (наружу участка)
+    letter: str  # буква стороны по компасу
+    length_ft: float
+    from_front: bool = False
+
+
+def side_lines(
+    ring: Sequence[Point],
+    front: Sequence[Sequence[Point]] = (),
+    north_deg: float = 90.0,
+) -> list[SideLine]:
+    """
+    Стороны участка для меры оффсета: контур + фронтовые линии ``M-ROW-LINE``.
+    У каждой — внешняя нормаль и буква стороны (север из стрелки чертежа).
+    """
+    pts = [(float(x), float(y)) for x, y in ring]
+    if len(pts) >= 2 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    out: list[SideLine] = []
+
+    def add(a: Point, b: Point, front_flag: bool) -> None:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return
+        nx, ny = -dy / length, dx / length
+        mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+        if len(pts) >= 3 and point_in_polygon((mid[0] + nx * 0.2, mid[1] + ny * 0.2), pts):
+            nx, ny = -nx, -ny  # нормаль должна смотреть наружу участка
+        out.append(
+            SideLine(
+                a=(float(a[0]), float(a[1])),
+                b=(float(b[0]), float(b[1])),
+                normal=(nx, ny),
+                letter=compass_letter(nx, ny, north_deg),
+                length_ft=length,
+                from_front=front_flag,
+            )
+        )
+
+    for i in range(len(pts)):
+        add(pts[i], pts[(i + 1) % len(pts)], False)
+    for line in front:
+        seq = [(float(p[0]), float(p[1])) for p in line]
+        for a, b in zip(seq, seq[1:]):
+            # Фронтовая линия часто продублирована контуром участка: одна и та же прямая
+            # с противоположными нормалями дала бы вторую букву у той же вершины.
+            if any(
+                _same_line(a, b, side)
+                or _same_line(side.a, side.b, SideLine(a=a, b=b, normal=(0.0, 0.0), letter="?", length_ft=0.0))
+                for side in out
+            ):
+                continue
+            add(a, b, True)
+    return out
+
+
+def _same_line(a: Point, b: Point, side: "SideLine", tol_ft: float = 0.05) -> bool:
+    """Лежат ли две стороны на одной прямой (для отбрасывания дублей контур/фронт)."""
+    return (
+        _point_segment_distance(a, (side.a, side.b)) <= tol_ft
+        and _point_segment_distance(b, (side.a, side.b)) <= tol_ft
+    )
+
+
+def edge_rows(
+    vertex: Point,
+    edge_dirs: Sequence[Point],
+    sides: Sequence[SideLine],
+    *,
+    max_ft: float = 6.0,
+    parallel_tol_deg: float | None = None,
+    extension_ft: float | None = None,
+) -> list[EdgeRow]:
+    """
+    Замеры вершины по нормалям её краёв (R11): для каждого края берётся ближайшая сторона
+    участка, нормаль которой параллельна нормали края («своя» сторона). Строки отсортированы
+    по расстоянию; ``parallel`` у них всегда True.
+    """
+    return [
+        row
+        for row in side_rows(
+            vertex, sides, edge_dirs=edge_dirs, max_ft=max_ft,
+            parallel_tol_deg=parallel_tol_deg, extension_ft=extension_ft,
+        )
+        if row.parallel
+    ]
+
+
+def side_rows(
+    vertex: Point,
+    sides: Sequence[SideLine],
+    *,
+    edge_dirs: Sequence[Point] = (),
+    max_ft: float = 6.0,
+    parallel_tol_deg: float | None = None,
+    extension_ft: float | None = None,
+    north_deg: float = 90.0,
+) -> list[EdgeRow]:
+    """
+    Все замеры вершины до сторон участка в пределах ``max_ft`` (R11): у каждой строки — значение,
+    буква стороны, основание перпендикуляра и признак «своя сторона» (нормаль стороны параллельна
+    нормали одного из краёв вершины). ``edge_dirs`` — единичные направления краёв в этой вершине.
+
+    Своя сторона идёт первой при равном расстоянии: заказчик меряет оффсет по нормали своего края,
+    а не по ближайшей точке границы. Если своей стороны в пределах ``max_ft`` нет — меряем до
+    ближайшей стороны (забор в середине участка, короткий отрезок у чужой линии).
+    """
+    if parallel_tol_deg is None:
+        parallel_tol_deg = EDGE_PARALLEL_TOL_DEG
+    tol = math.cos(math.radians(parallel_tol_deg))
+    if extension_ft is None:
+        extension_ft = LINE_EXTENSION_FT
+    # Вершина на самой линии участка не даёт оффсета (R13: «на линии» не подписывается).
+    if any(
+        abs((vertex[0] - side.a[0]) * side.normal[0] + (vertex[1] - side.a[1]) * side.normal[1])
+        < MIN_OFFSET_FT
+        for side in sides
+    ):
+        return []
+    normals = [(-uy, ux) for ux, uy in edge_dirs]
+    rows: list[EdgeRow] = []
+    seen: set[tuple[float, float]] = set()
+    for side in sides:
+        vx, vy = vertex[0] - side.a[0], vertex[1] - side.a[1]
+        signed = vx * side.normal[0] + vy * side.normal[1]
+        parallel = any(abs(nx * side.normal[0] + ny * side.normal[1]) >= tol for nx, ny in normals)
+        cap_ft = max_ft if parallel else max(max_ft, EDGE_FALLBACK_FT)
+        if abs(signed) > cap_ft:
+            continue
+        along = vx * (side.b[0] - side.a[0]) + vy * (side.b[1] - side.a[1])
+        along /= max(side.length_ft, 1e-9)
+        beyond = max(0.0, -along, along - side.length_ft)
+        if beyond > extension_ft:
+            continue
+        foot = (vertex[0] - signed * side.normal[0], vertex[1] - signed * side.normal[1])
+        key = (round(foot[0], 3), round(foot[1], 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        # Буква стороны, где стоит объект: снаружи — буква самой стороны, внутри — противоположная.
+        # Забор в 0.5 ft западнее западной линии участка — «0.5'W» (Brooklyn), тот же забор в 0.5 ft
+        # внутри неё — «0.5'E»: подпись называет сторону, на которой объект лежит относительно линии.
+        letter = side.letter if signed > 0 else _OPPOSITE[side.letter]
+        rows.append(
+            EdgeRow(
+                value_ft=abs(signed),
+                direction=letter,
+                foot=foot,
+                edge_index=0 if parallel else 1,
+                side_angle_deg=math.degrees(
+                    math.atan2(side.b[1] - side.a[1], side.b[0] - side.a[0])
+                ) % 180.0,
+                parallel=parallel,
+            )
+        )
+    rows.sort(key=lambda row: (row.edge_index, row.value_ft))
+    return rows
+
+
+def feature_edge_directions(feature: Feature) -> dict[Point, list[tuple[float, float]]]:
+    """
+    Для каждой вершины объекта — единичные направления краёв, которые в ней сходятся.
+    Замкнутый контур дома замыкается, ломаная забора — нет.
+    """
+    pts = [(float(x), float(y)) for x, y in feature.points]
+    out: dict[Point, list[tuple[float, float]]] = {}
+    if len(pts) < 2:
+        return out
+    closed = feature.kind == "house" and len(pts) >= 3
+    seq = pts + [pts[0]] if closed else pts
+    for a, b in zip(seq, seq[1:]):
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        if length < 1e-9:
+            continue
+        ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+        out.setdefault(a, []).append((ux, uy))
+        out.setdefault(b, []).append((ux, uy))
+    return out
+
+
+def vertex_offset_rows(
+    feature: Feature,
+    sides: Sequence[SideLine],
+    *,
+    max_ft: float = 6.0,
+    second_ft: float | None = None,
+    parallel_tol_deg: float | None = None,
+    ring: Sequence[Point] = (),
+    north_deg: float = 90.0,
+) -> dict[Point, list[EdgeRow]]:
+    """
+    Строки оффсета по каждой вершине объекта (R11, R12): основной замер и вторая строка
+    по другому краю, если он ближе ``second_ft``. Вершины на линии участка (замер меньше
+    ``MIN_OFFSET_FT``) остаются без строки — правило «на линии» выключено (``ONLINE_LABELS``).
+    """
+    if second_ft is None:
+        second_ft = SECOND_EDGE_FT
+    out: dict[Point, list[EdgeRow]] = {}
+    for vertex, dirs in feature_edge_directions(feature).items():
+        rows = side_rows(
+            vertex, sides, edge_dirs=dirs, max_ft=max_ft,
+            parallel_tol_deg=parallel_tol_deg, north_deg=north_deg,
+        )
+        rows = [row for row in rows if row.value_ft >= MIN_OFFSET_FT]
+        if not rows:
+            continue
+        primary = rows[0]
+        kept = [primary]
+        taken = (round_offset_ft(primary.value_ft), primary.direction)
+        for row in rows[1:]:
+            if row.edge_index != 0 and row.parallel is False and len(kept) == 1 and primary.parallel is False:
+                # Своей стороны у вершины нет: основной замер — ближайшая сторона участка, и
+                # вторая строка тогда тоже допустима (вершина в глубине участка).
+                pass
+            if row.value_ft > second_ft:
+                continue
+            pair = (round_offset_ft(row.value_ft), row.direction)
+            if pair == taken or row.direction == primary.direction:
+                # Вторая строка — по другому краю вершины, то есть по другой стороне участка:
+                # у Николая вторая строка всегда с другой буквой (0.1'E + 1.2'S).
+                continue
+            kept.append(row)
+        out[vertex] = kept
+    if NODE_DUP_FT > 0 and len(out) > 1:
+        # Две вершины рядом и с одинаковым округлённым замером — один и тот же оффсет.
+        # Из пары оставляем вершину внутри участка (заказчик подписывает снятый угол в участке).
+        def _inside(point: Point) -> bool:
+            return bool(ring) and point_in_polygon(point, ring)
+
+        merged: list[tuple[Point, list[EdgeRow]]] = []
+        for vertex, rows in sorted(out.items(), key=lambda cell: cell[1][0].value_ft):
+            twin = None
+            for index, (other, other_rows) in enumerate(merged):
+                if math.dist(vertex, other) > NODE_DUP_FT:
+                    continue
+                if NODE_DUP_ANY_VALUE or (
+                    round_offset_ft(other_rows[0].value_ft) == round_offset_ft(rows[0].value_ft)
+                ):
+                    twin = index
+                    break
+            if twin is None:
+                merged.append((vertex, rows))
+            elif _inside(vertex) and not _inside(merged[twin][0]):
+                merged[twin] = (vertex, rows)
+        out = dict(merged)
+    return out
+
+
+def vertex_on_survey_point(vertex: Point, points: Sequence[Point], snap_ft: float = SURVEY_POINT_SNAP_FT) -> bool:
+    """Стоит ли в вершине точка съёмки (R13)."""
+    return any(math.dist(vertex, p) <= snap_ft for p in points)
+
+
+def vertex_describes_object(
+    vertex: Point,
+    notes: Sequence[tuple[Point, str]],
+    kind: str,
+    snap_ft: float = SURVEY_DESC_TOL_FT,
+) -> bool:
+    """
+    Описывает ли точка съёмки у этой вершины данный объект (R13b).
+
+    ``notes`` — ``(точка, DESC2)``. У забора и стены описание должно называть этот вид объекта
+    (``VINYL FENCE``, ``WOOD FENCE``, ``F E C``, ``WALL``); у дома и сарая подходит любое описание
+    строения (``1 STY FRAME``, ``BRICK``, ``SHED``) или его отсутствие — эталон Николая
+    подписывает углы домов, где в DESC2 стоят и размеры, и материалы.
+    """
+    words = FENCE_DESC_WORDS if kind == "fence" else WALL_DESC_WORDS if kind == "wall" else ()
+    for point, description in notes:
+        if math.dist(vertex, point) > snap_ft:
+            continue
+        if not words:
+            return True
+        text = str(description or "").upper()
+        if any(word in text for word in words):
+            return True
+    return False
 
 
 def _extra_sides(

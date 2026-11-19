@@ -3913,9 +3913,19 @@ class AcadBuilder:
                 for t in snapshot.texts if not getattr(t, "hidden", False)
             ]
             ring = list(boundary.polygon.exterior.coords)
+            # Точки съёмки — из блоков с описанием угла (R13): метка ставится у снятых вершин.
+            # Описания снятых углов (DESC2) — признак объекта (R13b): «VINYL FENCE» у угла забора.
+            survey_pts = [
+                (float(p.point[0]), float(p.point[1])) for p in snapshot.survey_points
+            ]
+            survey_notes = [
+                ((float(p.point[0]), float(p.point[1])), str(p.description or ""))
+                for p in snapshot.survey_points
+            ]
             plan = offsets.plan_offsets(
                 ring, features, front=front, area=area, scale=scale_value,
-                north_deg=north_deg, texts=texts,
+                north_deg=north_deg, texts=texts, survey_pts=survey_pts,
+                survey_notes=survey_notes,
                 text_width=lambda text, height: feature_text_width(text, height, fcfg),
             )
             result = OffsetRunResult(

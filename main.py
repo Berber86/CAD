@@ -8410,6 +8410,10 @@ class SurveyApp(ctk.CTk):
         Лучше — строго выше ранга (фигура, затем данные о расстояниях). При равенстве кеш
         не меняется. Возвращает строку для журнала.
         """
+        # Кеш хранит только текст: если записать туда изменённые числа, при
+        # следующем чтении потеряется факт автоматической замены и выноска.
+        if any(getattr(seg, "_auto_corrections", ()) for seg in getattr(data, "segments", ())):
+            return "кеш не изменён: ответ содержит автоисправление, которое нужно отметить на чертеже"
         rendered = legal_to_step0_text(data)
         if rendered is None:
             return "ответ ИИ нельзя записать текстом (сторона без румба) — кеш не изменён"
@@ -10056,6 +10060,9 @@ class SurveyApp(ctk.CTk):
                 for name, result in completed:
                     self._log_line(f"{name}: {result.summary()}")
                     draw_warnings.extend(f"{name}: {warning}" for warning in result.warnings)
+            # Ошибка пометки важнее второстепенных сообщений черновика:
+            # Николай должен видеть, если автоисправление не отмечено в DWG.
+            draw_warnings.sort(key=lambda text: 0 if "пометк" in text.lower() else 1)
             if error:
                 self._set_status(
                     f"Отрисовка остановлена: {error}. Уже начерчено участков: {len(completed)}. "

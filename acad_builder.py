@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from llm_parser import LegalDescription, Segment, format_feet_inches_source, load_config
 import offsets
+import drawing_warnings
 import street_names
 
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
@@ -3121,6 +3122,49 @@ class AcadBuilder:
                 except Exception as exc:  # noqa: BLE001
                     warnings.append(f"не удалось создать текст «{item.text}»: {exc}")
 
+            callout_count = 0
+            # Временные пометки действий программы: только основной участок,
+            # независимо от того, через какой сценарий GUI был рассчитан план.
+            try:
+                callouts, callout_warnings = drawing_warnings.plan_callouts(geo, segment_distance_label)
+                warnings.extend(callout_warnings)
+                if callouts:
+                    warning_layer = self._ensure_survey_layer(doc, drawing_warnings.LAYER, 7, warnings)
+                    for note in callouts:
+                        mtext = None
+                        leader = None
+                        try:
+                            mtext = _com_retry(model_space.AddMText, _variant_point(note.text_point), 0.0, note.text)
+                            mtext.Layer = warning_layer
+                            mtext.Color = 7
+                            mtext.Height = note.height
+                            mtext.AttachmentPoint = note.attachment
+                            mtext.InsertionPoint = _variant_point(note.text_point)
+                            try:
+                                mtext.StyleName = style
+                            except Exception:  # noqa: BLE001 - остаётся стиль AutoCAD
+                                pass
+                            spec = FeatureLabelItem(
+                                feature=None, text=note.plain_text, kind="leader", placement="leader",
+                                point=note.text_point, height=note.height, attachment=note.attachment,
+                                leader_points=[note.tip, note.text_point],
+                            )
+                            leader, warning, _attached = self._add_leader(model_space, spec, mtext, warning_layer)
+                            leader.Color = 7
+                            callout_count += 1
+                            if warning:
+                                warnings.append(f"пометка стороны #{note.side_index + 1}: {warning}")
+                        except Exception as exc:  # noqa: BLE001 - остальные стороны рисуем
+                            for entity in (leader, mtext):
+                                if entity is not None:
+                                    try:
+                                        entity.Delete()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                            warnings.append(f"не удалось создать пометку автоисправления стороны #{note.side_index + 1}: {exc}")
+            except Exception as exc:  # noqa: BLE001 - не прячем невозможность отметить исправление
+                warnings.append(f"не удалось подготовить пометки автоисправлений: {exc}")
+
             if drawing.get("zoom_extents", True):
                 zoomed = False
                 try:
@@ -3158,6 +3202,9 @@ class AcadBuilder:
                 }
                 if geo.lines or geo.street_boundary_indices:
                     result_layers["street_row"] = street_row_layer
+
+            if callout_count:
+                result_layers["risk_warnings"] = drawing_warnings.LAYER
 
             if geo.print_draft:
                 result_layers = {

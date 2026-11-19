@@ -45,7 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 import concurrent.futures
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+import drawing_warnings
 
 import ocr_numbers
 import street_names
@@ -937,6 +938,7 @@ class Segment(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+    _auto_corrections: list[drawing_warnings.AutoCorrection] = PrivateAttr(default_factory=list)
 
     ns: Literal["N", "S"] = Field(description="Первая буква румба: N или S")
     degrees: int = Field(ge=0, le=90, description="Градусы румба, 0..90")
@@ -5342,11 +5344,17 @@ def _detect_and_repair_obvious_typos(
     )
     if cand is not None and cand.can_auto_apply(ask_on_doubt=not auto_apply):
         assert cand.repaired_segments is not None
-        return cand.repaired_segments, old_to_new, [*align_notes, cand.reason_ru]
+        repaired = list(cand.repaired_segments)
+        idx = cand.segment_index - 1
+        repaired[idx] = drawing_warnings.mark_auto_correction(segs[idx], repaired[idx])
+        return repaired, old_to_new, [*align_notes, cand.reason_ru]
     clear = _scan_clear_lookalike_typo(segs, unanimous_llm_passes=unanimous_llm_passes)
     if clear is not None and clear.can_auto_apply(ask_on_doubt=False):
         assert clear.repaired_segments is not None
-        return clear.repaired_segments, old_to_new, [*align_notes, clear.reason_ru]
+        repaired = list(clear.repaired_segments)
+        idx = clear.segment_index - 1
+        repaired[idx] = drawing_warnings.mark_auto_correction(segs[idx], repaired[idx])
+        return repaired, old_to_new, [*align_notes, clear.reason_ru]
     return segs, old_to_new, align_notes
 
 

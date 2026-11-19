@@ -5072,3 +5072,59 @@ def test_declining_restart_keeps_current_work(gui, monkeypatch):
     monkeypatch.setattr(app, "_exit_process", lambda code: pytest.fail("must not exit"))
     app._offer_restart("Обновление", "Перезапустить?", base_text="Готово")
     assert not app._closing
+
+
+def test_automatic_correction_is_not_written_to_text_cache(gui, tmp_path):
+    from test_clear_typo_autofix import RECT
+    text = RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west")
+    outcome = gui.parse_legal_description_full(text=text, use_llm=False, ask_on_doubt=True)
+    cache = tmp_path / "lot_text.txt"
+    cache.write_text("original data", encoding="utf-8")
+    app = gui.SurveyApp()
+    msg = app._write_ai_to_step0_cache(
+        None, outcome.data, prev_rank=None, cache_path=cache, builder=None, scale=16,
+        cfg={}, provider_id="", model_name="", api_key=None, key_secret="",
+        do_auto_orient=False, post=lambda *args: None,
+    )
+    assert "автоисправление" in msg
+    assert cache.read_text(encoding="utf-8") == "original data"
+
+
+def test_auto_correction_survives_step1_preview_and_main_draw_only(gui, monkeypatch):
+    from tkinter import messagebox
+    import drawing_warnings
+    import acad_builder
+    from acad_builder import DrawResult
+    from test_clear_typo_autofix import RECT
+
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west"))
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(gui.SurveyApp, "_print_draft_plans", gui._real_print_draft_plans)
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app._preview_main_plan is not None
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 2 and drawn[0].print_draft and not drawn[1].print_draft
+    assert not drawing_warnings.plan_callouts(drawn[0], acad_builder.segment_distance_label)[0]
+    notes, _ = drawing_warnings.plan_callouts(drawn[1], acad_builder.segment_distance_label)
+    assert len(notes) == 1 and "{\\C1;3}1" in notes[0].text
+
+
+def test_failed_drawing_callout_is_prioritized_in_status(gui):
+    from acad_builder import DrawResult
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    plan = app._preview_main_plan
+    first = DrawResult(plan=plan, text_count=0, layers={}, warnings=["обычное предупреждение черновика"])
+    second = DrawResult(plan=plan, text_count=0, layers={}, warnings=["не удалось создать пометку автоисправления стороны #1"])
+    app._handle_event("scene_drawn", ([("черновик", first), ("основной", second)], ""))
+    assert "пометку автоисправления" in app.status_var.get()

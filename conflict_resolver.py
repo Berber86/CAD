@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import hashlib
 import json
@@ -479,7 +480,12 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
             node.pop("bearing_label", None)
         elif change.target == "side":
             node["distance_ft"] = change.distance_ft
-    return LegalDescription.model_validate(data)
+    updated = LegalDescription.model_validate(data)
+    # model_dump не содержит приватного происхождения автоправок: переносим его
+    # по индексам, не приписывая пользовательским правкам статус автоматических.
+    for old, new in zip(description.segments, updated.segments):
+        new._auto_corrections = copy.deepcopy(old._auto_corrections)
+    return updated
 
 
 def fix_changes(fixes: Sequence[Proposal]) -> tuple[Change, ...]:

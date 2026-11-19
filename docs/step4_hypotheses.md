@@ -3,6 +3,7 @@
 Статусы: **подтверждена** (совпала с эталонами без противоречий), **рабочая** (совпадает, но мало примеров),
 **открыта** (нет данных или примеры расходятся), **отклонена** (не проходит критерий или противоречит эталону).
 R1–R10 — из `docs/step4_rules_from_examples.md`; H11+ — новые, выведены в этой работе.
+Свод всех действующих правил и их оформления — `docs/step4_offset_rules.md`.
 
 ## Как судим (критерий заказчика)
 
@@ -455,7 +456,7 @@ TEXT, значения идут столбиком, текст дома стои
 
 **Что не взято (и почему):**
 
-- **`FE.O/L`** (Geldner, Brooklyn) — реализовано (`O_L_TOL_FT`, `O_L_LABELS`), но **выключено**:
+- **`FE.O/L`** (Geldner, Brooklyn) — реализовано (`ONLINE_LABELS`, `ONLINE_TOL_FT`), но **выключено**:
   ни в одной паре вершина забора не лежит на контуре участка (ближайшая — 0.05+ ft), воспроизвести
   условие по замерам нечем.
 - **`3'-6" R.O.W. EASEMENT`** — стоит уже в «до» (Brooklyn): это не подпись Николая, а готовая
@@ -482,7 +483,7 @@ TEXT, значения идут столбиком, текст дома стои
 число строк — 16, `FE.` в строках — 15 из 16 возможных.
 
 **Версия 4.23:** `TEXT_CHAR_WIDTH`, `FENCE_TEXT_WITHOUT_LEADER`=False, `LEADER_DISTANCES_FT`,
-`LABEL_RELAXED_RETRY`, `OUTBUILDING_WORDS`/`building_height_ft`, `O_L_LABELS`, `offset_prefix`,
+`LABEL_RELAXED_RETRY`, `OUTBUILDING_WORDS`/`building_height_ft`, `ONLINE_TOL_FT`/`offset_prefix`,
 `_add_offset_texts` (MText с `\P`), привязка 4/6 в `draw_offset_labels`; тесты — 3 переписаны под
 дампы (`test_two_line_offset_is_written_as_mtext_with_pline_breaks`,
 `test_fence_label_always_goes_with_leader`, `test_two_line_label_repeats_prefix_but_not_the_type_name`)

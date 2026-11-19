@@ -83,7 +83,13 @@ def find_former_name(full_text: str, street: str | None, window: int = 160) -> s
         return None
     for pos in re.finditer(re.escape(street), full_text, re.IGNORECASE):
         chunk = full_text[pos.end(): pos.end() + window]
-        match = FORMER_NAME_RE.search(chunk)
+        match = FORMER_NAME_RE.match(chunk)
+        if not match:
+            # Разрешаем промежуточную скобку с шириной/примечанием, но не
+            # переход к следующей улице в той же фразе перекрёстка.
+            prefix = re.match(r"\s*\((?!\s*" + _FORMER_PHRASE + r"\b)[^()]*\)", chunk, re.IGNORECASE)
+            if prefix:
+                match = FORMER_NAME_RE.match(" " + chunk[prefix.end():])
         if match:
             former = " ".join(match.group("name").split()).strip(" ,;")
             if former:

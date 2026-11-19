@@ -944,6 +944,10 @@ class Segment(BaseModel):
     seconds: float = Field(ge=0, le=60, description="Секунды, 0..60")
     ew: Literal["E", "W"] = Field(description="Вторая буква румба: E или W")
     distance_ft: float = Field(gt=0, description="Длина стороны в футах")
+    distance_source: str | None = Field(
+        default=None,
+        description="Исходный размер этой стороны в футах и дюймах, только если так напечатано; например 13 feet 8 inches",
+    )
     bearing_label: str | None = Field(
         default=None,
         description='Готовая подпись румба, например N 75°20\'20" E',
@@ -985,6 +989,11 @@ class Segment(BaseModel):
         if not isinstance(data, dict):
             return data
         item = dict(data)
+        raw_distance = item.get("distance_ft")
+        if isinstance(raw_distance, str) and not item.get("distance_source"):
+            raw_normalized = _replace_vulgar_fractions(raw_distance.strip())
+            if _FEET_INCHES_STR_RE.fullmatch(raw_normalized):
+                item["distance_source"] = raw_normalized
 
         # Нормализация кардинальных сокращений от LLM (напр. ns="E", degrees=0 -> N 90° E)
         raw_ns = str(item.get("ns") or "").strip().upper()[:1]
@@ -1064,7 +1073,7 @@ class Segment(BaseModel):
             raise ValueError(f"длина стороны должна быть > 0, получено {number}")
         return number
 
-    @field_validator("bearing_label", "course_note", "interior_angle", mode="before")
+    @field_validator("bearing_label", "course_note", "interior_angle", "distance_source", mode="before")
     @classmethod
     def _normalize_label(cls, value: Any) -> str | None:
         return _clean_name(value)
@@ -1341,6 +1350,10 @@ class LegalDescription(BaseModel):
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
     )
+    cross_street_former: str | None = Field(
+        default=None,
+        description="Старое название пересекаемой улицы, если прямо указано в источнике",
+    )
     street_aliases: list[str] = Field(
         default_factory=list,
         description=(
@@ -1356,6 +1369,10 @@ class LegalDescription(BaseModel):
             "Расстояние вдоль фасадной улицы до угла/пересечения (0.0, 0.0), футы "
             "(0.0 для углового участка или если привязка к углу отсутствует)"
         ),
+    )
+    distance_to_corner_source: str | None = Field(
+        default=None,
+        description="Исходное расстояние привязки в футах и дюймах, только если прямо указано",
     )
     corner_to_pob_bearing: Segment | None = Field(
         default=None,
@@ -1463,7 +1480,10 @@ class LegalDescription(BaseModel):
             out["main_street"] = clean
             former = former or found
         if isinstance(cross_raw, str):
-            out["cross_street"] = street_names.split_former_name(cross_raw)[0]
+            clean_cross, cross_former = street_names.split_former_name(cross_raw)
+            out["cross_street"] = clean_cross
+            if cross_former and not out.get("cross_street_former"):
+                out["cross_street_former"] = cross_former
         if former:
             out["main_street_former"] = former
         return out
@@ -1476,6 +1496,8 @@ class LegalDescription(BaseModel):
     @field_validator(
         "main_street_note",
         "cross_street",
+        "cross_street_former",
+        "distance_to_corner_source",
         "tie_note",
         "block_number",
         "lot_number",
@@ -2319,6 +2341,7 @@ CRITICAL SURVEY RULES
      * Set `has_bearing = false` on every course without an explicit compass bearing;
      * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
      * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
+   - If a boundary course explicitly uses feet and inches, put its printed value (e.g. "13 feet 8 inches" or "25'-6 1/2\"") in `distance_source`; otherwise null. Keep `distance_ft` as decimal feet.
    - Set `party_wall=true` only on each boundary course explicitly described as through/along a party wall; otherwise false. Never infer it merely from a building or a neighbouring course.
 4. DISTANCES (INCLUDING 1980s FRACTIONAL INCHES):
    - `distance_ft` is in decimal feet. Convert all feet-and-inches and fractional inches accurately:
@@ -2334,6 +2357,8 @@ CRITICAL SURVEY RULES
    - `main_street_former`: the OLD name of the front street when the document gives it with "formerly", "previously known as", "formerly known as", "also known as", "a/k/a" or "f/k/a", in parentheses or without them (e.g. "Stafford Avenue (formerly Carlton Street)" -> main_street "Stafford Avenue", main_street_former "Carlton Street"). `main_street` must contain only the current name. Else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
    - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
+   - `distance_to_corner_source`: the original feet-and-inches notation for the tie distance, if explicitly printed (else null).
+   - `cross_street_former`: former name of the intersecting street only when explicitly associated with it in the document, otherwise null.
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
@@ -3147,13 +3172,16 @@ def legal_to_step0_text(data: "LegalDescription") -> str | None:
         )
 
     front = _STEP0_SIDE.get(str(getattr(data, "front_side", "") or ""), "")
-    side_part = f"the {front} side of {main}" if front else main
+    display_main = main + (f" (formerly {data.main_street_former})" if data.main_street_former else "")
+    side_part = f"the {front} side of {display_main}" if front else display_main
     head = f"ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on {side_part}"
     tie = float(getattr(data, "distance_to_corner_ft", 0.0) or 0.0)
     cross = (getattr(data, "cross_street", "") or "").strip()
     if tie > 0 and cross:
+        if getattr(data, "cross_street_former", None):
+            cross += f" (formerly {data.cross_street_former})"
         head += (
-            f", distant {tie:.2f} feet from the corner formed by the intersection of "
+            f", distant {format_feet_inches_source(data.distance_to_corner_source, tie) or f'{tie:.2f} feet'} from the corner formed by the intersection of "
             f"{main} and {cross}"
         )
     parts = [head + ";"]
@@ -3161,7 +3189,10 @@ def legal_to_step0_text(data: "LegalDescription") -> str | None:
     for index, seg in enumerate(segments):
         lead = "RUNNING THENCE" if index == 0 else "THENCE"
         ending = " to the point or place of BEGINNING." if index == last else " to a point;"
-        parts.append(f"{lead} {bearing(seg)} {float(seg.distance_ft):.2f} feet{ending}")
+        source = format_feet_inches_source(seg.distance_source, seg.distance_ft)
+        dimension = source if source else f"{float(seg.distance_ft):.2f} feet"
+        wall = " through a party wall" if seg.party_wall else ""
+        parts.append(f"{lead} {bearing(seg)}{wall} {dimension}{ending}")
     return " ".join(parts)
 
 
@@ -3339,6 +3370,57 @@ def _distance_after(chunk: str) -> float | None:
     return None
 
 
+def _feet_inches_source(chunk: str, distance: float | None) -> str | None:
+    """Сохраняем написание только для выбранной длины, а не иного числа курса."""
+    if distance is None:
+        return None
+    fi = _FEET_INCHES_STR_RE.search(chunk)
+    plain = _DISTANCE_RE.search(chunk)
+    if not fi or (plain and fi.start() > plain.start()):
+        return None
+    if abs(_feet_inches_match_to_ft(fi) - float(distance)) > 0.0001:
+        return None
+    return fi.group(0).strip()
+
+
+def format_feet_inches_source(source: str | None, distance: float) -> str | None:
+    """Формат feet + inches, только при соответствии текущей длине стороны."""
+    if not source:
+        return None
+    raw = _replace_vulgar_fractions(source.strip().replace("′", "'").replace("″", '"'))
+    fi = _FEET_INCHES_STR_RE.fullmatch(raw)
+    if not fi or abs(_feet_inches_match_to_ft(fi) - float(distance)) > 0.0001:
+        return None
+    if ((fi.group("fden") and int(fi.group("fden")) == 0)
+            or (fi.group("pden") and int(fi.group("pden")) == 0)):
+        return None
+    feet = fi.group("ft")
+    inches = fi.group("in") or ""
+    if fi.group("fnum"):
+        inches += f" {fi.group('fnum')}/{fi.group('fden')}"
+    elif fi.group("pnum"):
+        inches = f"{fi.group('pnum')}/{fi.group('pden')}"
+    return f"{feet}' {inches.strip()}\""
+
+
+def _corner_feet_inches_source(preamble: str, lot_body: str, distance: float | None) -> str | None:
+    if not distance:
+        return None
+    intro = re.split(r"\b(?:RUNNING\s+)?THENCE\b", lot_body, maxsplit=1, flags=re.IGNORECASE)[0]
+    for mark in re.finditer(r"\b(?:distant|distance\s+of)\s+", intro, re.IGNORECASE):
+        match = _FEET_INCHES_STR_RE.match(intro, mark.end())
+        if match and abs(_feet_inches_match_to_ft(match) - distance) <= 0.0001:
+            return match.group(0).strip()
+    # При COMMENCING источником может быть последнее звено привязки.
+    if preamble:
+        bearings = _bearing_matches(preamble)
+        if bearings:
+            source = _feet_inches_source(preamble[bearings[-1].end():], distance)
+            if source:
+                return source
+    return None
+
+
 def _has_min_courses(body: str, minimum: int = 3) -> bool:
     if len(_bearing_matches(body)) >= minimum:
         return True
@@ -3511,6 +3593,7 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
                 "clause": clause,
                 "nominal_az": nominal_az,
                 "distance_ft": dist,
+                "distance_source": _feet_inches_source(clause, dist),
                 "ia_deg": ia_deg,
                 "ia_label": ia_label,
                 "right_angle": bool(
@@ -3587,6 +3670,7 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
         prev_az = az
         seg = _azimuth_to_quadrant_dict(az)
         seg["distance_ft"] = item["distance_ft"]
+        seg["distance_source"] = item["distance_source"]
         seg["has_bearing"] = False
         seg["course_note"] = item["course_note"]
         seg["party_wall"] = item["party_wall"]
@@ -3640,6 +3724,7 @@ def _wordy_street_courses(
         note = re.sub(r"[\s,]*\b(?:a\s+)?distance\s+of$", "", note, flags=re.IGNORECASE).strip(" ,;:.")
         seg = _azimuth_to_quadrant_dict(nominal)
         seg["distance_ft"] = distance
+        seg["distance_source"] = _feet_inches_source(clause, distance)
         seg["has_bearing"] = False
         seg["course_note"] = note or None
         found.append((mark.start(), seg))
@@ -3687,6 +3772,7 @@ def _orphan_courses(
                 continue
             seg = _azimuth_to_quadrant_dict(nominal)
             seg["distance_ft"] = distance
+            seg["distance_source"] = _feet_inches_source(chunk[frag.start("dir"):], distance)
             seg["has_bearing"] = False
             seg["course_note"] = None
             found.append((match.end() + frag.start("dir"), seg, ns_hint, ew_hint))
@@ -3803,6 +3889,7 @@ def _segments_from_regex(
                     "seconds": seconds,
                     "ew": ew,
                     "distance_ft": distance,
+                    "distance_source": _feet_inches_source(chunk, distance),
                     "has_bearing": True,
                 },
             )
@@ -4207,7 +4294,12 @@ def _extract_streets(
         elif preamble:
             tie_dists = list(_DISTANCE_RE.finditer(preamble))
             if tie_dists:
-                last_tie = float(tie_dists[-1].group("num").replace(",", ""))
+                # Берём длину последнего курса, а не ширину улицы после него.
+                tie_bearings = _bearing_matches(preamble)
+                last_tie = (_distance_after(preamble[tie_bearings[-1].end():])
+                            if tie_bearings else None)
+                if last_tie is None:
+                    last_tie = _distance_after(preamble[tie_dists[-1].start():])
                 distance_to_corner = last_tie
                 deed_vs_tm = re.search(
                     r"(\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s*\(\s*DEED\s*\)"
@@ -4378,8 +4470,10 @@ def parse_with_regex(
                 "main_street_note": meta["main_street_note"],
                 "main_street_former": former_name,
                 "cross_street": cross_street,
+                "cross_street_former": street_names.find_former_name(normalized, cross_street),
                 "street_aliases": [f"{cur} = {old}" for cur, old in street_names.street_aliases(normalized)],
                 "distance_to_corner_ft": distance_to_corner,
+                "distance_to_corner_source": _corner_feet_inches_source(preamble, lot_body, distance_to_corner),
                 "corner_to_pob_bearing": corner_tie,
                 "tie_note": meta["tie_note"],
                 "front_side": front_side,
@@ -4595,6 +4689,7 @@ def _flip_segment_direction(seg: Segment) -> Segment:
         seconds=seg.seconds,
         ew=ew_flipped,
         distance_ft=seg.distance_ft,
+        distance_source=seg.distance_source,
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
@@ -4708,6 +4803,7 @@ def _mutate_segment_bearing(
         seconds=s_val,
         ew=seg.ew if ew is None else ew,
         distance_ft=seg.distance_ft,
+        distance_source=seg.distance_source,
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
@@ -6015,6 +6111,24 @@ def parse_legal_description_full(
             )
             warnings.extend(repair_notes)
             parsed_model = _ensure_street_width(parsed_model, combined)
+            if local_attempt and len(local_attempt.model.segments) == len(parsed_model.segments):
+                local_segments = local_attempt.model.segments
+                ai_segments = parsed_model.segments
+                if all(abs(a.distance_ft - b.distance_ft) < 0.0001
+                       and _angle_diff_deg(a.azimuth_deg, b.azimuth_deg) < 0.02
+                       for a, b in zip(ai_segments, local_segments)):
+                    parsed_model = parsed_model.model_copy(update={"segments": [
+                        a.model_copy(update={"distance_source": b.distance_source or a.distance_source})
+                        for a, b in zip(ai_segments, local_segments)
+                    ]})
+            if local_attempt and not parsed_model.distance_to_corner_source:
+                local = local_attempt.model
+                if abs(parsed_model.distance_to_corner_ft - local.distance_to_corner_ft) < 0.0001:
+                    parsed_model = parsed_model.model_copy(update={"distance_to_corner_source": local.distance_to_corner_source})
+            if combined and parsed_model.cross_street and not parsed_model.cross_street_former:
+                former = street_names.find_former_name(combined, parsed_model.cross_street)
+                if former:
+                    parsed_model = parsed_model.model_copy(update={"cross_street_former": former})
             if re.search(r"\bparty[\s-]+wall\b", combined, re.IGNORECASE):
                 local_segments = local_attempt.model.segments if local_attempt else []
                 ai_segments = parsed_model.segments

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, replace as dc_replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Iterable, Sequence
 
-from llm_parser import LegalDescription, Segment, load_config
+from llm_parser import LegalDescription, Segment, format_feet_inches_source, load_config
 import offsets
 import street_names
 
@@ -801,6 +801,11 @@ def estimate_text_width(text: str, text_height: float, cfg: dict[str, Any]) -> f
     return width
 
 
+def segment_distance_label(segment: Segment) -> str:
+    """Печатные футы и дюймы сохраняем, если они соответствуют текущему размеру."""
+    return format_feet_inches_source(segment.distance_source, segment.distance_ft) or format_distance(segment.distance_ft)
+
+
 def build_side_label(
     segment: Segment,
     text_height: float,
@@ -818,7 +823,7 @@ def build_side_label(
     """
     use_control = bool(cfg.get("degrees_as_control_code", True))
     bearing = format_bearing(segment, use_control_code=use_control)
-    distance = format_distance(segment.distance_ft)
+    distance = segment_distance_label(segment)
     threshold = float(cfg.get("long_side_threshold_ft", 40.0))
     if side_length <= threshold:
         return f"{bearing} {distance}", False
@@ -927,11 +932,19 @@ def build_side_lines(
       * для обычных/длинных сторон — 1 строка из ``build_side_label`` (с растяжкой > 40 ft).
     """
     use_control = bool(cfg.get("degrees_as_control_code", True))
-    distance = format_distance(segment.distance_ft)
+    distance = segment_distance_label(segment)
     if not getattr(segment, "has_bearing", True):
         note = getattr(segment, "course_note", None)
         if note:
-            clean_note = str(note).upper()
+            clean_note = re.sub(
+                r"\bPART\s+OF\s+THE\s+DISTANCE\s+THROUGH\s+(?:A\s+|THE\s+)?PARTY[\s-]+WALL\b",
+                "", str(note), flags=re.IGNORECASE,
+            )
+            if segment.party_wall or re.fullmatch(r"\s*PARTY[\s-]+WALL\s*", clean_note, re.IGNORECASE):
+                clean_note = re.sub(r"\bPARTY[\s-]+WALL\b", "", clean_note, flags=re.IGNORECASE)
+            clean_note = re.sub(r"\s+", " ", clean_note).strip(" ,;:-").upper()
+            if not clean_note:
+                return [distance], False
             if use_control:
                 clean_note = clean_note.replace("°", "%%d")
             note_h = text_height * 0.82
@@ -1141,7 +1154,7 @@ def make_print_draft(
                 point = (new_mid[0] + nx * 3.8, new_mid[1] + ny * 3.8)
             else:
                 point = lot_pt(item.point)
-        elif item.kind == "cross-street" and tie:
+        elif item.kind in {"cross-street", "cross-street-former"} and tie:
             point = corner_pt(item.point)
         else:
             point = lot_pt(item.point)
@@ -1156,7 +1169,10 @@ def make_print_draft(
 
     # Отдельная строка у той стороны, к которой относится отметка в описании.
     for index, segment in enumerate(plan.description.segments):
-        if not getattr(segment, "party_wall", False) or index >= len(plan.boundary_lines):
+        described_wall = bool(getattr(segment, "party_wall", False)) or bool(
+            re.search(r"\bPARTY[\s-]+WALL\b", segment.course_note or "", re.IGNORECASE)
+        )
+        if not described_wall or index >= len(plan.boundary_lines):
             continue
         edge = plan.boundary_lines[index]
         nx, ny, edge_length = layout_builder._outward_normal(edge.start, edge.end, plan.ccw)
@@ -1164,13 +1180,37 @@ def make_print_draft(
             warnings.append(f"черновик: PARTY WALL на стороне {index + 1} не размещён — нулевая длина")
             continue
         mid = ((edge.start[0] + edge.end[0]) / 2, (edge.start[1] + edge.end[1]) / 2)
-        side_prefix = f"side-{index + 1}"
-        offsets = [(i.point[0] - (mid[0] + sx)) * nx + (i.point[1] - (mid[1] + sy)) * ny
-                   for i in items if i.kind == side_prefix or i.kind.startswith(side_prefix + "-")]
-        offset = max(offsets, default=3.6) + 3.0
-        items.append(TextItem("PARTY WALL", lot_pt((mid[0] + nx * offset, mid[1] + ny * offset)),
-                              text_rotation(math.atan2(edge.end[1] - edge.start[1], edge.end[0] - edge.start[0])),
-                              kind=f"party-wall-{index + 1}", height=1.6))
+        # Надпись ставится на внутренней стороне границы. Для узких и
+        # вогнутых участков проверяем саму точку и предупреждаем, если не нашли.
+        point = None
+        inside_anchor = None
+        rotation = text_rotation(math.atan2(edge.end[1] - edge.start[1], edge.end[0] - edge.start[0]))
+        width = estimate_text_width("PARTY WALL", 1.6, layout_builder.drawing_cfg)
+        axis = (math.cos(rotation), math.sin(rotation))
+        normal = (-axis[1], axis[0])
+        polygon = Polygon(plan.vertices)
+        for offset in (2.0, 3.0, 1.2, 1.0, 0.5, 0.2, 0.05):
+            candidate = (mid[0] - nx * offset, mid[1] - ny * offset)
+            if not point_in_polygon(candidate, plan.vertices):
+                continue
+            inside_anchor = inside_anchor or candidate
+            corners = [
+                (candidate[0] + along * axis[0] + across * normal[0],
+                 candidate[1] + along * axis[1] + across * normal[1])
+                for along, across in ((-width/2, -0.8), (width/2, -0.8),
+                                      (width/2, 0.8), (-width/2, 0.8))
+            ]
+            if polygon.is_valid and polygon.covers(Polygon(corners)):
+                point = candidate
+                break
+        if point is None and inside_anchor is not None:
+            point = inside_anchor
+            warnings.append(f"черновик: PARTY WALL на стороне {index + 1} может выходить за границу — проверьте")
+        if point is None:
+            warnings.append(f"черновик: PARTY WALL на стороне {index + 1} не удалось поставить внутри участка — проверьте")
+            continue
+        items.append(TextItem("PARTY WALL", lot_pt(point),
+                              rotation, kind=f"party-wall-{index + 1}", height=1.6))
 
     lines: list[LineItem] = []
     for ln in source_lines:
@@ -1189,9 +1229,10 @@ def make_print_draft(
             lines.append(dc_replace(ln, start=corner, end=(corner[0] + 100 * ux, corner[1] + 100 * uy)))
             # Подпись улицы располагаем вдоль новой линии, ближе к её середине.
             for pos, item in enumerate(items):
-                if item.kind == "cross-street":
-                    items[pos] = dc_replace(item, point=(corner[0] + 50 * ux - 4 * dx / length,
-                                                         corner[1] + 50 * uy - 4 * dy / length),
+                if item.kind in {"cross-street", "cross-street-former"}:
+                    along = 4.0 if item.kind == "cross-street" else 8.1
+                    items[pos] = dc_replace(item, point=(corner[0] + 50 * ux - along * dx / length,
+                                                         corner[1] + 50 * uy - along * dy / length),
                                             rotation=text_rotation(math.atan2(uy, ux)))
         elif ln.kind.startswith("cross-street-row"):
             lines.append(dc_replace(ln, start=corner_pt(ln.start), end=corner_pt(ln.end)))
@@ -2172,6 +2213,14 @@ class AcadBuilder:
                         height=street_h,
                     )
                 )
+                former = street_names.former_line(getattr(description, "cross_street_former", None))
+                if former:
+                    former_offset = c_offset + 2.05 * text_height
+                    items.append(TextItem(
+                        text=former,
+                        point=(c_mid[0] + cnx * former_offset, c_mid[1] + cny * former_offset),
+                        rotation=text_rotation(c_angle), kind="cross-street-former", height=street_note_h,
+                    ))
                 if draw_ext:
                     f_ext = max(12.0 * text_height, min(20.0 * text_height, 0.35 * length))
                     row_lines.append(
@@ -2220,7 +2269,8 @@ class AcadBuilder:
             dist_label = (
                 str(tie_note).upper()
                 if tie_note
-                else format_distance(dist_val)
+                else (format_feet_inches_source(description.distance_to_corner_source, dist_val)
+                      or format_distance(dist_val))
             )
             dist_width = estimate_text_width(dist_label, text_height, cfg)
 
@@ -2284,6 +2334,16 @@ class AcadBuilder:
                 height=street_h,
             )
         )
+
+        former = street_names.former_line(getattr(description, "cross_street_former", None))
+        if former:
+            items.append(TextItem(
+                text=former,
+                point=(corner_pt[0] + tux * (cross_along_shift + 2.05 * text_height) + nx * cross_normal_shift,
+                       corner_pt[1] + tuy * (cross_along_shift + 2.05 * text_height) + ny * cross_normal_shift),
+                rotation=text_rotation(angle + math.pi / 2.0),
+                kind="cross-street-former", height=street_note_h,
+            ))
 
         if draw_ext:
             far_ext = max(10.0 * text_height, min(18.0 * text_height, 0.35 * length))
@@ -2406,6 +2466,13 @@ class AcadBuilder:
         raw_vertices = raw_traverse[:-1]
         warnings: list[str] = []
         notes: list[str] = []
+        for index, segment in enumerate(description.segments):
+            if segment.distance_source and not format_feet_inches_source(segment.distance_source, segment.distance_ft):
+                warnings.append(f"сторона #{index + 1}: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
+        if description.distance_to_corner_source and not format_feet_inches_source(
+            description.distance_to_corner_source, description.distance_to_corner_ft
+        ):
+            warnings.append("привязка: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
 
         signed_area = polygon_signed_area(raw_vertices)
         ccw = signed_area > 0.0

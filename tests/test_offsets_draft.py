@@ -69,7 +69,8 @@ def test_house_gets_text_without_leader_at_house_height():
     assert item.height_ft == pytest.approx(1.1)
     assert item.anchor == (20.0, 5.0)  # вершина стены, от которой мерили
     assert item.target == pytest.approx((30.0, 0.0))  # H35: середина стены
-    assert _inside_ring(item.point)
+    # R16 (4.38): текст дома без выноски стоит снаружи контура, как у Николая (18 из 18).
+    assert not _inside_ring(item.point)
 
 
 def test_fence_gets_text_without_leader_and_fence_prefix():

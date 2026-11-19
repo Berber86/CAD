@@ -449,7 +449,7 @@ def draw_rules(doc):
     page_frame(
         page,
         "OFFSET LABELS — STYLE RULES",
-        "What the program writes and how it must look on the sheet  ·  rules as implemented in version 4.37",
+        "What the program writes and how it must look on the sheet  ·  rules as implemented in version 4.38",
         "Full rule book (in Russian) with every flag: docs/step4_offsets_rules.md  ·  this sheet: English summary.",
     )
 

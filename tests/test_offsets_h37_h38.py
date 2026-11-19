@@ -33,22 +33,25 @@ def test_online_labels_can_be_switched_off(monkeypatch):
     assert "FE.2.0'N" in _texts(plan)
 
 
-def test_house_text_stands_inside_the_building():
+def test_house_text_stands_outside_the_lot():
+    """R16 (4.38): текст дома без выноски — снаружи контура участка (у Николая 18 из 18)."""
+    assert off.HOUSE_TEXT_OUTSIDE
     plan = off.plan_offsets(LOT, [HOUSE], north_deg=90.0)
     texts = [item for item in plan.items if item.style == "text"]
     assert texts
     for item in texts:
-        assert off.point_in_polygon(item.point, HOUSE.points), item.text
+        assert not off.point_in_polygon(item.point, LOT), item.text
 
 
-def test_house_text_goes_between_wall_and_boundary_without_the_rule(monkeypatch):
-    monkeypatch.setattr(off, "HOUSE_TEXT_INSIDE", False)
+def test_house_text_falls_back_inside_the_building_without_the_rule(monkeypatch):
+    """Без R16 текст возвращается внутрь строения (правило H38 осталось вторым заходом)."""
+    monkeypatch.setattr(off, "HOUSE_TEXT_OUTSIDE", False)
     plan = off.plan_offsets(LOT, [HOUSE], north_deg=90.0)
-    outside = [
+    inside = [
         item for item in plan.items
-        if item.style == "text" and not off.point_in_polygon(item.point, HOUSE.points)
+        if item.style == "text" and off.point_in_polygon(item.point, HOUSE.points)
     ]
-    assert outside
+    assert inside
 
 
 def test_house_text_rotates_along_the_boundary():

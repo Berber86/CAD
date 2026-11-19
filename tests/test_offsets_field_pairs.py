@@ -25,7 +25,8 @@ PAIRS = {
     "primer5i.zip": (12, 5, 17),
     # 1412 East 64th Street, Brooklyn — новая пара 4.36, другой съёмщик (City Borough Land Surveying):
     # участок 25 × 100 ft, фасад дома в 0.57 ft от `M-ROW-LINE`, стены на слое `ST-WALL`.
-    "primer7i.zip": (14, 10, 21),
+    # 4.38: две подписи устоев (`3.0'E`) по правилу R17 из ветки 385e6c78 — 10 → 12 совпадений.
+    "primer7i.zip": (14, 12, 23),
 }
 
 

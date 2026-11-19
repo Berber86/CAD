@@ -332,6 +332,22 @@ MIN_OFFSET_FT = 0.05
 LABEL_MUST_BE_INSIDE = False
 #: стены подписываются оффсетом по тому же правилу, что заборы (отсутствие подписи у заказчика — не запрет)
 WALL_OFFSETS = False
+
+#: R17 (взято из ветки 385e6c78, 4.30): устой у улицы подписывается замером **до красной линии** —
+#: голым числом (`3.0'E`), без приставки `WALL`. Правило узкое: устой стоит на боковой линии участка
+#: (вершина ближе ``ON_LINE_FT``), до фронта не дальше ``FRONT_WALL_MAX_FT``, и мерится **задняя**
+#: грань устоя (дальняя от улицы). 1412 East 64th Street: два кирпичных устоя 1 × 1 ft в полосе
+#: улицы, у Николая `3.0'E` — 2.98 и 3.06 ft до `M-ROW-LINE`; наши `WALL 0.3'…` не совпадали.
+FRONT_WALL_OFFSETS = True
+#: R17: устой стоит на боковой линии участка, если его вершина не дальше этого от контура, футы.
+ON_LINE_FT = 0.5
+#: R17: наибольшее расстояние от устоя до красной линии, при котором он подписывается, футы.
+FRONT_WALL_MAX_FT = 3.0
+#: R17: насколько задняя грань устоя может быть дальше предела — она и подписывается, футы.
+FRONT_WALL_FAR_SLACK_FT = 1.2
+#: R17: устой начерчен двумя ломаными (задняя грань-оголовок и ствол); подписывается только задняя
+#: грань. Две подписи ближе этого друг к другу — один устой, остаётся дальняя от улицы, футы.
+FRONT_WALL_PIER_FT = 2.0
 #: Расстояние от объекта до текста выноски при 1"=16' (в порядке попыток), футы.
 LEADER_DISTANCES_FT = (4.0, 5.5, 7.0)
 #: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
@@ -491,6 +507,11 @@ HOUSE_MAX_LABELS = 5
 HOUSE_TEXT_AT_WALL_MIDDLE = True
 #: Текст оффсета дома ставится внутри строения у стены, как у Николая, а не между стеной и границей (H38).
 HOUSE_TEXT_INSIDE = True
+#: R16 (взято из ветки 385e6c78, 4.30): текст дома без выноски ставится **снаружи контура участка**.
+#: Замер по шести парам 4.38: у Николая 18 текстов дома без выноски, и все 18 стоят вне участка;
+#: у нас внутри стояли 16 из 36. Внутри строения текст остаётся вторым заходом (узкий участок,
+#: снаружи места нет), выноска — третьим. Счёт частей от этого не меняется, меняется только место.
+HOUSE_TEXT_OUTSIDE = True
 #: Текст оффсета дома поворачивается вдоль границы: 0° у горизонтальной, 90° у вертикальной (H37).
 #: Николай: 4.9'N — 90° при вертикальной восточной границе, 3.2'S и 3.5'S — 0° при южной (3 из 3).
 HOUSE_TEXT_FOLLOWS_BOUNDARY = True
@@ -727,6 +748,101 @@ def _rects_overlap(a: Rect, b: Rect) -> bool:
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+def _rect_outside_polygon(rect: Rect, polygon: Sequence[Point]) -> bool:
+    """Прямоугольник целиком снаружи участка: ни один угол и ни одна середина не внутри (R16)."""
+    if len(polygon) < 3:
+        return True
+    x0, y0, x1, y1 = rect
+    probes = (
+        (x0, y0), (x1, y0), (x1, y1), (x0, y1),
+        ((x0 + x1) / 2.0, y0), ((x0 + x1) / 2.0, y1),
+        (x0, (y0 + y1) / 2.0), (x1, (y0 + y1) / 2.0),
+        ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+    )
+    return not any(point_in_polygon(probe, polygon) for probe in probes)
+
+
+def front_wall_candidates(
+    features: Sequence[Feature],
+    ring: Sequence[Point],
+    front_lines: Sequence[Sequence[Point]],
+    *,
+    pier_ft: float = FRONT_WALL_PIER_FT,
+) -> dict[str, OffsetCandidate]:
+    """
+    R17: устои у улицы — по одной подписи на устой (``handle`` → кандидат).
+
+    Устой начерчен двумя ломаными: задняя грань с оголовком (3.0 ft до улицы) и ствол (2.0 ft).
+    Николай подписывает заднюю грань, поэтому из двух кандидатов ближе ``pier_ft`` остаётся тот,
+    что дальше от улицы.
+    """
+    found: list[OffsetCandidate] = []
+    for feature in features:
+        if feature.kind != "wall" or len(feature.points) < 2:
+            continue
+        candidate = front_wall_offset(feature, ring, front_lines)
+        if candidate is not None:
+            found.append(candidate)
+    found.sort(key=lambda item: item.distance_ft, reverse=True)
+    kept: list[OffsetCandidate] = []
+    for candidate in found:
+        if any(math.dist(candidate.vertex, other.vertex) <= pier_ft for other in kept):
+            continue
+        kept.append(candidate)
+    return {candidate.feature.handle: candidate for candidate in kept}
+
+
+def front_wall_offset(
+    feature: Feature,
+    ring: Sequence[Point],
+    front_lines: Sequence[Sequence[Point]],
+    *,
+    max_ft: float = FRONT_WALL_MAX_FT,
+    on_line_ft: float = ON_LINE_FT,
+    far_slack_ft: float = FRONT_WALL_FAR_SLACK_FT,
+) -> OffsetCandidate | None:
+    """
+    R17: устой, стоящий на боковой линии участка, — замер до красной линии **задней** гранью.
+
+    Возвращает готового кандидата или ``None``. Условия одновременно: устой стоит на стороне
+    (ближайшая вершина не дальше ``on_line_ft`` от контура), ближайшая его вершина — в пределах
+    ``max_ft`` от фронта, и в чертеже есть линия улицы. Мерится дальняя (задняя) грань устоя:
+    на 1412 East 64th Street Николай пишет `3.0'E` по задней грани 1-футовых устоев.
+    """
+    if not front_lines or len(ring) < 3 or len(feature.points) < 2:
+        return None
+    vertices = list(feature.points)
+    if min(perpendicular_line_distance(vertex, ring, closed=True)[0] for vertex in vertices) > on_line_ft:
+        return None
+
+    def to_front(vertex: Point) -> tuple[float, Point]:
+        return min(
+            (perpendicular_line_distance(vertex, line, closed=False) for line in front_lines),
+            key=lambda pair: pair[0],
+        )
+
+    rows = [(to_front(vertex)[0], to_front(vertex)[1], vertex) for vertex in vertices]
+    closest = min(row[0] for row in rows)
+    if not (MIN_OFFSET_FT < closest <= max_ft):
+        return None
+    reachable = [row for row in rows if row[0] <= max_ft + far_slack_ft]
+    distance = max(row[0] for row in reachable)
+    far = [row[2] for row in reachable if abs(row[0] - distance) <= 0.05]
+    vertex = (
+        sum(point[0] for point in far) / len(far),
+        sum(point[1] for point in far) / len(far),
+    )
+    inside = point_in_polygon(vertex, ring)
+    return OffsetCandidate(
+        feature=feature,
+        vertex=vertex,
+        distance_ft=distance,
+        foot=to_front(vertex)[1],
+        inside=inside,
+        outside_ft=0.0 if inside else perpendicular_distance(vertex, ring, closed=True)[0],
+    )
+
+
 def _rect_inside_polygon(rect: Rect, polygon: Sequence[Point]) -> bool:
     x0, y0, x1, y1 = rect
     return all(point_in_polygon(p, polygon) for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
@@ -915,6 +1031,43 @@ def _place_house_text(
                 (rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])
             ]
             if not all(point_in_polygon(corner, polygon) for corner in corners):
+                continue
+            if ok(rect, center):
+                return center
+    return None
+
+
+def _place_house_text_outside(
+    ring: Sequence[Point], anchor: Point, target: Point, text: str, height: float,
+    width_of: Callable[[str, float], float], ok: Callable[[Rect, Point], bool],
+    rotation_deg: float = 0.0,
+) -> Point | None:
+    """
+    Текст дома без выноски **снаружи** контура участка (R16).
+
+    Ставится от основания перпендикуляра ``target`` наружу. У Николая все 18 текстов дома без
+    выноски стоят вне контура: на узком участке внутри текст ложится на описание здания
+    («1 STY FRAME», «No. 1412»). Место проверяется целым габаритом: он должен быть снаружи.
+    """
+    if len(ring) < 3:
+        return None
+    dx, dy = target[0] - anchor[0], target[1] - anchor[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    outward = (dx / length, dy / length)
+    if not point_in_polygon(anchor, ring):
+        # Объект сам снаружи участка — текст ставится с его стороны, дальше от контура.
+        outward = (-outward[0], -outward[1])
+    tangent = (-outward[1], outward[0])
+    for distance in (0.55, 0.8, 1.2, 1.7, 2.4, 3.2, 4.2):
+        for along in (0.0, 0.8, -0.8, 1.6, -1.6, 2.6, -2.6):
+            center = (
+                target[0] + outward[0] * distance * height + tangent[0] * along * height,
+                target[1] + outward[1] * distance * height + tangent[1] * along * height,
+            )
+            rect = _text_rect(center, text, height, width_of, rotation_deg)
+            if not _rect_outside_polygon(rect, ring):
                 continue
             if ok(rect, center):
                 return center
@@ -1549,6 +1702,12 @@ def plan_offsets(
             for candidate in measure_candidates(ring, list(features), front=front_lines)
             if candidate.feature.kind == "fence" and candidate.distance_ft >= MIN_OFFSET_FT
         ]
+    # R17: устои у улицы считаются один раз на весь план — по одной подписи на устой.
+    front_walls = (
+        front_wall_candidates(list(features), ring, front_lines)
+        if FRONT_WALL_OFFSETS and not WALL_OFFSETS and front_lines
+        else {}
+    )
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
@@ -1569,12 +1728,19 @@ def plan_offsets(
         if feature.kind not in OFFSET_KINDS:
             plan.skipped.append((label, "этот вид объекта в оффсетах не подписывается"))
             continue
+        front_wall: OffsetCandidate | None = None
         if feature.kind == "wall" and not WALL_OFFSETS:
-            plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
-            continue
-        feature_candidates = _feature_candidates(
-            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg,
-            numbered=numbered_vertices,
+            # R17: единственная подпись стены — устой у улицы, замер до красной линии.
+            front_wall = front_walls.get(feature.handle)
+            if front_wall is None:
+                plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
+                continue
+        feature_candidates = (
+            [front_wall] if front_wall is not None
+            else _feature_candidates(
+                ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg,
+                numbered=numbered_vertices,
+            )
         )
         candidates = [c for c in feature_candidates if c.outside_ft <= c.allowed_outside_ft]
         if not candidates:
@@ -1636,6 +1802,9 @@ def plan_offsets(
             height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
             if is_online:
                 text = ONLINE_FENCE_TEXT if feature.kind == "fence" else HOUSE_ONLINE_TEXT
+            elif front_wall is not None:
+                # R17: у устоя приставки нет — Николай пишет голое число («3.0'E»).
+                text = offset_text("house", value, direction)
             else:
                 text = offset_text(feature.kind, value, direction)
             # Тип забора из стоящей рядом подписи: «C.L.F. 0.2'S» вместо «FE.0.2'S» — как у Николая.
@@ -1645,7 +1814,7 @@ def plan_offsets(
                 if type_prefix:
                     text = f"{type_prefix} {value:.1f}'{direction}"
             extra: list[tuple[float, str]] = []
-            if feature.kind in ("fence", "wall") and not is_online:
+            if feature.kind in ("fence", "wall") and not is_online and front_wall is None:
                 boundaries: list[tuple[Sequence[Point], bool]] = [(ring, True)]
                 boundaries += [(line, False) for line in front_lines]
                 taken = (value, direction)
@@ -1716,7 +1885,13 @@ def plan_offsets(
 
             # Значения одной строкой: «W.FE. 0.1'E 1.2'S» (Николай) вместо двух строк выноски.
             # Метка в каждой строке (FENCE_PREFIX_EACH_LINE): «FE.0.4'N» и «FE.1.3'W» — как на Alvine.
-            each_line = {"fence": "FE.", "wall": "WALL "}.get(feature.kind, "") if FENCE_PREFIX_EACH_LINE else ""
+            each_line = (
+                ""
+                if front_wall is not None
+                else {"fence": "FE.", "wall": "WALL "}.get(feature.kind, "")
+                if FENCE_PREFIX_EACH_LINE
+                else ""
+            )
             display_parts = [text] + [f"{each_line}{v:.1f}'{d}" for v, d in extra]
             line_text = " ".join(display_parts) if FENCE_TEXT_ONE_LINE else "\n".join(display_parts)
             item: OffsetItem | None = None
@@ -1730,7 +1905,12 @@ def plan_offsets(
             )
             if feature.kind == "house":
                 beside = None
-                if HOUSE_TEXT_INSIDE:
+                if HOUSE_TEXT_OUTSIDE:
+                    # R16: первым — место снаружи участка, как у Николая.
+                    beside = _place_house_text_outside(
+                        ring, best.vertex, best.foot, text, height, width_of, ok, rotation
+                    )
+                if beside is None and HOUSE_TEXT_INSIDE:
                     beside = _place_house_text(
                         feature.points, best.vertex, best.foot, text, height, width_of, ok, rotation
                     )

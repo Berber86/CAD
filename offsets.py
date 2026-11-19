@@ -362,6 +362,14 @@ SECOND_SIDE_FT = 2.0
 #: Противоречивые эталоны — выключено по умолчанию, как CORNER_LABELS и WALL_OFFSETS.
 ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
+#: Дом, стена которого стоит на линии **улицы** (``M-ROW-LINE``, до ``MIN_OFFSET_FT``), подписывается
+#: «BLDG O/L» — «по линии», без числа.
+#: За: 378 Mother Gaston (4.30) — три подписи «BLDG O/L» у дома, фасад которого стоит на линии улицы
+#: (две выноской и одна текстом), и ни одного числа у этой стены.
+#: Только улица: на том же чертеже линия оверхата по задней меже стоит на линии участка, и Николай
+#: подписывает там забор («FE.0.1'W»), а не дом.
+HOUSE_ONLINE_LABELS = True
+HOUSE_ONLINE_TEXT = "BLDG O/L"
 #: Текст без выноски поворачивается вдоль ближайшей границы (R10). Выключено: на эталонах угол следует за
 #: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
 #: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
@@ -1007,6 +1015,14 @@ def _boundary_angle_deg(point: Point, segments: Sequence[tuple[Point, Point]]) -
     return round(angle, 2)
 
 
+def _on_front_line(point: Point, front_lines: Sequence[Sequence[Point]]) -> bool:
+    """Точка стоит на линии улицы (``M-ROW-LINE``) — там, где Николай пишет «BLDG O/L»."""
+    return any(
+        len(line) >= 2 and perpendicular_line_distance(point, line, closed=False)[0] <= 0.05
+        for line in front_lines
+    )
+
+
 def _feature_candidates(
     ring: Sequence[Point], feature: Feature, front_lines: Sequence[Sequence[Point]],
     *,
@@ -1058,8 +1074,42 @@ def _feature_candidates(
         seq = points + [points[0]] if closed else points
         walls, _covered = _parallel_candidates(ring, feature)
         by_key: dict[tuple[float, str], OffsetCandidate] = {}
+        # Стены, стоящие на линии улицы, дают «BLDG O/L» (HOUSE_ONLINE_LABELS), а не число.
+        # _parallel_candidates стену ровно на линии не возвращает (расстояние 0), поэтому ищем её
+        # по самому контуру дома: оба конца стены лежат на линии улицы.
+        on_line: list[OffsetCandidate] = []
+        if HOUSE_ONLINE_LABELS:
+            for index, (a, b) in enumerate(zip(seq, seq[1:])):
+                if math.dist(a, b) < HOUSE_WALL_MIN_FT:
+                    continue
+                if not (_on_front_line(a, front_lines) and _on_front_line(b, front_lines)):
+                    continue
+                middle = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+                if any(math.dist(middle, other.vertex) <= HOUSE_WALL_MIN_FT for other in on_line):
+                    continue
+                # Только в пределах своего участка: у соседа фасад тоже стоит на линии улицы
+                # (378 Mother Gaston — дом No. 376 в 16 ft западнее), но его не подписываем.
+                xs = [p[0] for p in ring]
+                ys = [p[1] for p in ring]
+                if not (
+                    min(xs) - 0.5 <= middle[0] <= max(xs) + 0.5
+                    and min(ys) - 0.5 <= middle[1] <= max(ys) + 0.5
+                ):
+                    continue
+                on_line.append(
+                    OffsetCandidate(
+                        feature=feature,
+                        vertex=middle,
+                        distance_ft=0.0,
+                        foot=middle,
+                        inside=True,
+                        segment=index,
+                    )
+                )
         for candidate in walls:
-            if not (MIN_OFFSET_FT <= candidate.distance_ft <= HOUSE_WALL_MAX_FT):
+            if candidate.distance_ft < MIN_OFFSET_FT:
+                continue
+            if candidate.distance_ft > HOUSE_WALL_MAX_FT:
                 continue
             if candidate.outside_ft > OUTSIDE_MAX_FT:
                 continue
@@ -1104,7 +1154,11 @@ def _feature_candidates(
                         )
                     )
                 chosen = moved
+            if HOUSE_ONLINE_LABELS:
+                chosen = chosen + on_line
             return chosen
+        if HOUSE_ONLINE_LABELS and on_line:
+            return on_line
         # Ни одной стены в пределах HOUSE_WALL_MAX_FT: дом в глубине участка не подписывается.
         # Раньше в этом случае подпись всё равно ставилась по ближайшей вершине на любом расстоянии —
         # оттуда и брались «12.2'E», «13.1'S», «14.1'S» на Geldner и Alvine.
@@ -1436,7 +1490,10 @@ def plan_offsets(
         # объекта: в Brooklyn заборы с такой вершиной подписаны по другим вершинам (FE.0.2'N, FE.0.1'S).
         on_line = [c for c in candidates if c.distance_ft < MIN_OFFSET_FT]
         candidates = [c for c in candidates if c.distance_ft >= MIN_OFFSET_FT]
-        if not candidates and not (ONLINE_LABELS and feature.kind == "fence" and on_line):
+        online_labelled = (ONLINE_LABELS and feature.kind == "fence") or (
+            HOUSE_ONLINE_LABELS and feature.kind == "house"
+        )
+        if not candidates and not (online_labelled and on_line):
             plan.skipped.append((label, "стоит на границе"))
             continue
         # При одинаковом значении после округления (0.1) берём вершину внутри участка: так подписал заказчик
@@ -1458,7 +1515,7 @@ def plan_offsets(
         targets: list[tuple[OffsetCandidate, bool]] = [
             (best, False) for best in (candidates if multi else candidates[:1])
         ]
-        if ONLINE_LABELS and feature.kind == "fence" and on_line:
+        if online_labelled and on_line:
             targets.append((on_line[0], True))
         for best, is_online in targets:
             value = round_offset_ft(best.distance_ft)
@@ -1478,7 +1535,10 @@ def plan_offsets(
             vx, vy = best.vertex[0] - best.foot[0], best.vertex[1] - best.foot[1]
             direction = offset_letter(vx, vy, north_deg)
             height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
-            text = ONLINE_FENCE_TEXT if is_online else offset_text(feature.kind, value, direction)
+            if is_online:
+                text = ONLINE_FENCE_TEXT if feature.kind == "fence" else HOUSE_ONLINE_TEXT
+            else:
+                text = offset_text(feature.kind, value, direction)
             # Тип забора из стоящей рядом подписи: «C.L.F. 0.2'S» вместо «FE.0.2'S» — как у Николая.
             type_prefix = ""
             if TYPE_PREFIX_FT and feature.kind == "fence" and not is_online:

@@ -66,7 +66,13 @@ def _snap(point, pool, tol=SNAP_FT):
 
 
 def _lot_polygon(dump: dict):
-    """Участок — полигон по линиям PL/M-ROW-LINE/ST-BLDG-LINE с максимумом точек съёмки внутри."""
+    """Участок — полигон по линиям PL/M-ROW-LINE/ST-BLDG-LINE с максимумом точек съёмки внутри.
+
+    Участок бывает разрезан линией поперёк (378 Mother Gaston: межа дома между северной и южной
+    половинами), и тогда polygonize даёт две половины. Берём половину с максимумом точек съёмки и
+    добавляем соседние, которые лежат в её рамке и касаются её: половины того же участка. Чужие
+    участки сбоку выходят за рамку и не добавляются.
+    """
     from shapely.geometry import LineString, Point
     from shapely.ops import polygonize, unary_union
 
@@ -78,15 +84,37 @@ def _lot_polygon(dump: dict):
         LineString([_snap(a, ends), _snap(b, ends)]) for _layer, a, b in segs
     ]
     survey = [Point(p) for p in survey_points(dump)]
+    polygons = [p for p in polygonize(unary_union(lines)) if p.area >= 400]
+    if not polygons:
+        return None
     best = None
-    for polygon in polygonize(unary_union(lines)):
-        if polygon.area < 400:
-            continue
+    for polygon in polygons:
         inside = sum(1 for p in survey if polygon.contains(p))
         key = (inside, polygon.area)
         if best is None or key > best[0]:
             best = (key, polygon)
-    return best[1] if best else None
+    lot = best[1]
+    # Половина, на которой нет фронта (M-ROW-LINE), — это кусок участка, разрезанного межой:
+    # у настоящего участка улица в границе есть. Тогда добавляем соседние половины.
+    front = unary_union([LineString([a, b]) for layer, a, b in segs if layer.upper() == off.FRONT_BOUNDARY_LAYER])
+    cut_in_half = front.is_empty or lot.boundary.intersection(front).length < 1.0
+    used = {id(lot)}
+    changed = cut_in_half
+    while changed:
+        changed = False
+        minx, miny, maxx, maxy = lot.bounds
+        for polygon in polygons:
+            if id(polygon) in used:
+                continue
+            px0, py0, px1, py1 = polygon.bounds
+            if px0 < minx - 1.0 or py0 < miny - 1.0 or px1 > maxx + 1.0 or py1 > maxy + 1.0:
+                continue
+            if lot.intersection(polygon).length < 5.0:
+                continue
+            lot = unary_union([lot, polygon])
+            used.add(id(polygon))
+            changed = True
+    return lot
 
 
 def survey_points(dump: dict) -> list[tuple[float, float]]:
@@ -233,7 +261,7 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
         low = name.lower()
         if "before" in low or "перед_оффсетами" in low or "ручные_подписи" in low:
             before = text
-        elif any(mark in low for mark in ("after", "final", "итоговый", "завершённый", "оффсеты")):
+        elif any(mark in low for mark in ("after", "final", "итог", "завершённый", "оффсеты")):
             after = text
     if before is None:
         # Brooklyn: файл «до» назван «2) … — копия», «после» — «3_ИТОГОВЫЙ…».
@@ -350,9 +378,16 @@ def _frame_transform(before: dict, after: dict, tol: float = 0.15):
 
 
 def _to_before(transform, point) -> tuple[float, float]:
+    """Перевод точки из системы «после» в систему «до» (обратное подобие).
+
+    ``_frame_transform`` подбирает ``после = scale · rot · до + shift``, поэтому обратный ход —
+    ``до = rotᵀ · (после − shift) / scale``. Раньше здесь применялось прямое преобразование:
+    на 1373 East 55th это сходило с рук (поворот около 180° — сам себе обратный, а сдвиг мал),
+    а на 378 Mother Gaston (сдвиг 1440 ft) подписи улетали на соседний участок.
+    """
     import numpy as np
 
-    mapped = transform["scale"] * transform["rot"] @ np.array(point[:2], float) + transform["shift"]
+    mapped = transform["rot"].T @ (np.array(point[:2], float) - transform["shift"]) / transform["scale"]
     return (float(mapped[0]), float(mapped[1]))
 
 
@@ -542,23 +577,97 @@ def score(produced: list[dict], expected: list[dict], radius: float = 6.0, tol: 
     return hits
 
 
+def _mapped(dump: dict, transform, keep_handles: set[str] | None = None) -> dict:
+    """Копия дампа с координатами, перенесёнными в систему «до».
+
+    Нужна 378 Mother Gaston: файл «до» снят выделением (191 объект из 4296), и контур участка по
+    неполному выделению не восстанавливается — выходил узкий клин 1113 sq ft вместо 3357 sq ft.
+    Геометрия берётся из полного файла «после», перенесённого в систему «до», а тексты-помехи —
+    из «до»: подписи Николая не должны мешать программе искать место.
+    """
+    if keep_handles is not None:
+        out = {
+            "entities": [
+                e for e in dump.get("entities", []) if str(e.get("handle")) not in keep_handles
+            ],
+            "drawing": dump.get("drawing", {}),
+        }
+    else:
+        out = dict(dump)
+    entities = []
+    for entity in out.get("entities", []):
+        item = dict(entity)
+        if item.get("pt"):
+            item["pt"] = list(_to_before(transform, item["pt"]))
+        if item.get("pts"):
+            item["pts"] = [list(_to_before(transform, p)) for p in item["pts"]]
+        entities.append(item)
+    out["entities"] = entities
+    return out
+
+
+def _nearby(dump: dict, reference: dict, margin: float = 200.0) -> dict:
+    """Объекты дампа в пределах рамки второго дампа (плюс запас).
+
+    В файле «после» нарисованы два квартала (наш и соседний в 1344 ft); без рамки контур участка
+    выбирается по чужому кварталу.
+    """
+    xs = [float(e["pt"][0]) for e in reference.get("entities", []) if e.get("pt")]
+    ys = [float(e["pt"][1]) for e in reference.get("entities", []) if e.get("pt")]
+    for entity in reference.get("entities", []):
+        for point in entity.get("pts") or []:
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
+    if not xs:
+        return dump
+    box = (min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin)
+    keep = []
+    for entity in dump.get("entities", []):
+        points = list(entity.get("pts") or [])
+        if entity.get("pt"):
+            points.append(entity["pt"])
+        if any(box[0] <= float(p[0]) <= box[2] and box[1] <= float(p[1]) <= box[3] for p in points):
+            keep.append(entity)
+    out = dict(dump)
+    out["entities"] = keep
+    return out
+
+
+def field_geometry(before: dict, after: dict) -> dict:
+    """Чертёж, по которому строятся участок и объекты.
+
+    Обычно это файл «до». Если он снят выделением (``scope = selection``), геометрии в нём не
+    хватает: берём полный файл «после» в системе «до» и обрезаем по рамке выделения.
+    """
+    if str(before.get("drawing", {}).get("scope")) != "selection":
+        return before
+    if off.same_frame(before, after).same_frame:
+        full = after
+    else:
+        transform = _frame_transform(before, after)
+        assert transform is not None, "не удалось совместить системы координат"
+        full = _mapped(after, transform)
+    return _nearby(full, before)
+
+
 def field_plan(before: dict, after: dict):
     """План программы по файлу «до» и эталон Николая из файла «после»."""
-    polygon = _lot_polygon(before)
+    geometry = field_geometry(before, after)
+    polygon = _lot_polygon(geometry)
     assert polygon is not None, "контур участка не восстановлен"
     ring = [(float(x), float(y)) for x, y in polygon.exterior.coords]
     plan = off.plan_offsets(
         ring,
-        features(before),
-        front=front_lines(before),
+        features(geometry),
+        front=front_lines(geometry),
         scale=16.0,
-        north_deg=north_deg(before),
+        north_deg=north_deg(geometry),
         texts=[
             (str(e.get("text")), tuple(e["pt"][:2]), float(e.get("h") or 0.0))
             for e in before.get("entities", [])
             if e.get("type") in {"Text", "MText"} and e.get("pt")
         ],
-        survey=survey_notes(before),
+        survey=survey_notes(geometry),
     )
     return {"plan": plan, "parts": plan_parts(plan), "ring": ring}, nikolai_parts(before, after)
 
@@ -572,6 +681,7 @@ __all__ = [
     "added_labels",
     "load_pair",
     "features",
+    "field_geometry",
     "field_plan",
     "front_lines",
     "nikolai_labels",

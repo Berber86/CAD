@@ -362,6 +362,11 @@ SECOND_SIDE_FT = 2.0
 #: Противоречивые эталоны — выключено по умолчанию, как CORNER_LABELS и WALL_OFFSETS.
 ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
+#: «FE.O/L» не пишется, если в этом радиусе (футы) у вершины уже стоит число: это один и тот же
+#: угол забора, и две подписи на нём спорят друг с другом. 18 Zoe Street: `FE.O/L` стоял в 0.85 ft
+#: от `FE.0.6'S` (4.35). Радиус намеренно маленький: у Николая вершина забора, стоящая на линии,
+#: получает `FE.O/L` и тогда, когда соседний угол подписан числом в 2–3 ft (правило 4.23).
+ONLINE_MIN_GAP_FT = 1.0
 #: Дом, стена которого стоит на линии **улицы** (``M-ROW-LINE``, до ``MIN_OFFSET_FT``), подписывается
 #: «BLDG O/L» — «по линии», без числа.
 #: За: 378 Mother Gaston (4.30) — три подписи «BLDG O/L» у дома, фасад которого стоит на линии улицы
@@ -398,11 +403,11 @@ FENCE_TEXT_ONE_LINE = False
 #: `FE.1.4'E`, `FE.5.2'S`, `FE.0.1'W` на том же чертеже.
 TYPE_PREFIX_FT = 0.0
 #: Дом дальше этого от линии не подписывается вовсе (та же граница, что у стен дома, H34), футы.
-#: Самая дальняя подпись Николая по дому — 4.9 ft (192 Geldner). Раньше «дом без параллельной стены»
-#: всё равно получал подпись по ближайшей вершине на любом расстоянии — это и были наши лишние
-#: «12.2'E», «13.1'S», «14.1'S» в глубине участка. Со правилом: 45 → 41 подпись на трёх парах
-#: при тех же 31 совпадении.
-KIND_MAX_FT = 6.0
+#: Самая дальняя подпись Николая по дому — 6.8 ft (18 Zoe Street, `BLDG 6.8'S`: стена дома в 6.77 ft
+#: от Zoe Street). До 4.35 стояло 6 ft, и на 18 Zoe дом не подписывался вовсе. 7 ft даёт на Zoe
+#: 13 → 15 подписей и совпадений 3 → 4, на Geldner +1 подпись, на остальных парах ничего не меняет;
+#: 8 ft — ещё 4 подписи без прироста совпадений, поэтому 7.
+KIND_MAX_FT = 7.0
 #: Подписи одной вершины ближе этого не ставятся. Выключено: у Николая на одном углу стоят ДВЕ подписи
 #: в 1.5 ft друг от друга (`FE.1.7'S` и `C.L.F. 0.2'S` на 192 Geldner), и правило резало верные подписи
 #: (совпадений 13 → 7 на Geldner, 3 → 1 на Brooklyn).
@@ -468,8 +473,9 @@ LABEL_RELAXED_RETRY = True
 #: Дом подписывается по стенам, параллельным стороне участка (H34), а не одной ближайшей вершиной.
 HOUSE_WALL_LABELS = True
 #: Наибольшее расстояние от стены дома до границы, которое подписывается, футы.
-#: Больше ``PARALLEL_MAX_FT`` (6 ft) смысла нет: дальние стены отсекает сам ``_parallel_candidates``.
-HOUSE_WALL_MAX_FT = 6.0
+#: Больше ``PARALLEL_MAX_FT`` смысла нет: дальние стены отсекает сам ``_parallel_candidates``.
+#: 6 → 7 в 4.35 вместе с ``KIND_MAX_FT`` и ``PARALLEL_MAX_FT`` (замер — см. ``KIND_MAX_FT``).
+HOUSE_WALL_MAX_FT = 7.0
 #: Стена короче этого — не стена дома, а выступ/эркер; не подписывается (H36), футы.
 HOUSE_WALL_MIN_FT = 8.0
 #: Не больше стольких стен на одно направление (N/E/S/W) у одного дома (H35).
@@ -955,22 +961,30 @@ def _place_leader(
 CORNER_LABELS = False
 #: допуск параллельности края стороне участка, градусы
 PARALLEL_TOL_DEG = 3.0
+#: Насколько сторона участка может отойти от оси чертежа и всё ещё считаться «осевой» (°).
+#: Раньше требовалось точное совпадение координат (1e-6): из-за зазора 0.003 ft у угла PL
+#: восточная сторона 18 Zoe Street (сдвиг 0.0015 ft на 109 ft, то есть 0.0008°) переставала
+#: быть стороной участка, и стены дома, параллельные ей, не измерялись вовсе.
+AXIS_SIDE_TOL_DEG = 0.05
 #: основание перпендикуляра на параллельной стороне может лежать за её концом не дальше, футы
 PARALLEL_EXTENSION_FT = 5.0
 #: параллельная сторона учитывается, только если она ближе этого расстояния; дальше — ближайшая сторона
-PARALLEL_MAX_FT = 6.0
+#: Предел расстояния от конца стены дома до параллельной стороны участка, футы (4.35: 6 → 7).
+PARALLEL_MAX_FT = 7.0
 
 
 def _axis_sides(ring: Sequence[Point]) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
     """Горизонтальные стороны участка (y, x0, x1) и вертикальные (x, y0, y1)."""
     horizontal: list[tuple[float, float, float]] = []
     vertical: list[tuple[float, float, float]] = []
+    tan_tol = math.tan(math.radians(AXIS_SIDE_TOL_DEG))
     for i in range(len(ring)):
         (x1, y1), (x2, y2) = ring[i], ring[(i + 1) % len(ring)]
-        if abs(y1 - y2) <= 1e-6 * max(1.0, abs(x1 - x2)):
-            horizontal.append((y1, min(x1, x2), max(x1, x2)))
-        elif abs(x1 - x2) <= 1e-6 * max(1.0, abs(y1 - y2)):
-            vertical.append((x1, min(y1, y2), max(y1, y2)))
+        dx, dy = x2 - x1, y2 - y1
+        if abs(dy) <= tan_tol * abs(dx):
+            horizontal.append(((y1 + y2) / 2.0, min(x1, x2), max(x1, x2)))
+        elif abs(dx) <= tan_tol * abs(dy):
+            vertical.append(((x1 + x2) / 2.0, min(y1, y2), max(y1, y2)))
     return horizontal, vertical
 
 
@@ -1073,6 +1087,7 @@ def _feature_candidates(
     survey: Sequence[tuple[Point, str]] = (),
     gates: Sequence[Point] = (),
     north_deg: float = 90.0,
+    numbered: Sequence[Point] = (),
 ) -> list[OffsetCandidate]:
     """Кандидаты для объекта: при CORNER_LABELS — углы по параллельным сторонам, иначе ближайшая сторона."""
     base = measure_candidates(ring, [feature], front=front_lines)
@@ -1099,7 +1114,21 @@ def _feature_candidates(
         if not chosen:
             chosen = nearest()
         # Вершины на самой линии не подписываются, но нужны для «FE.O/L» (ONLINE_LABELS).
-        chosen = chosen + [c for c in base if c.distance_ft < MIN_OFFSET_FT]
+        on_line = [c for c in base if c.distance_ft < MIN_OFFSET_FT]
+        if ONLINE_MIN_GAP_FT > 0.0:
+            # Рядом с такой вершиной уже стоит число — «FE.O/L» его только перебивает (4.35).
+            on_line = [
+                candidate for candidate in on_line
+                if not any(
+                    math.dist(candidate.vertex, other.vertex) <= ONLINE_MIN_GAP_FT
+                    and other.distance_ft >= MIN_OFFSET_FT
+                    for other in base
+                )
+                and not any(
+                    math.dist(candidate.vertex, spot) <= ONLINE_MIN_GAP_FT for spot in numbered
+                )
+            ]
+        chosen = chosen + on_line
         if CROSSING_LABELS:
             for candidate in _crossing_candidates(ring, feature, north_deg, survey, gates):
                 value = round_offset_ft(candidate.distance_ft)
@@ -1506,6 +1535,15 @@ def plan_offsets(
     dup_radius = DUPLICATE_RADIUS_FT * factor
 
     plan.counts["zone"] = len(features)
+    # Вершины заборов, у которых получилось число (а не 0): рядом с ними «FE.O/L» не пишется (4.35),
+    # причём считать надо по всему чертежу — соседняя вершина часто принадлежит другому забору.
+    numbered_vertices: list[Point] = []
+    if ONLINE_MIN_GAP_FT > 0.0 and ONLINE_LABELS:
+        numbered_vertices = [
+            candidate.vertex
+            for candidate in measure_candidates(ring, list(features), front=front_lines)
+            if candidate.feature.kind == "fence" and candidate.distance_ft >= MIN_OFFSET_FT
+        ]
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
@@ -1530,7 +1568,8 @@ def plan_offsets(
             plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
             continue
         feature_candidates = _feature_candidates(
-            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg
+            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg,
+            numbered=numbered_vertices,
         )
         candidates = [c for c in feature_candidates if c.outside_ft <= c.allowed_outside_ft]
         if not candidates:

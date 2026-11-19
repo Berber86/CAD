@@ -21,6 +21,8 @@ PAIRS = {
     "primer1i.zip": (12, 9, 16),    # 24 Alvine Avenue (9 после правила 4.31 о метке в каждой строке)
     "primer2i.zip": (9, 7, 22),     # 1373 East 55th Street, Brooklyn (7 после 4.31)
     "primer4i.zip": (11, 6, 13),    # 378 Mother Gaston Blvd, Brooklyn (4.30)
+    # 18 Zoe Street, Staten Island — новая пара 4.34/4.35: дом подписывается с предела 7 ft (4.35).
+    "primer5i.zip": (12, 4, 16),
 }
 
 

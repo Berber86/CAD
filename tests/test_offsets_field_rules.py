@@ -413,10 +413,12 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
     Правила 4.21–4.25 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 9, лишние у дома 17 → 7.
+    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 17 → 10.
     Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E),
     конец длинного прогона до 6 ft (5.2'S) и второй угол стены с перекосом (4.25, R13d);
-    по дому — вторая строка у вершины до 3 ft (4.25, R12).
+    по дому — вторая строка у вершины до 3 ft (4.25, R12) и запасной предел 4 ft для дома,
+    который стоит дальше общего предела целиком (4.31, взято из ветки соседа 4.37: 24 Alvine,
+    `3.5'S`).
     """
     saved = off.EDGE_NORMAL_OFFSETS
     off.EDGE_NORMAL_OFFSETS = False
@@ -426,8 +428,8 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
         off.EDGE_NORMAL_OFFSETS = saved
     new = _label_totals()
     assert old["fence"][2] == 9 and new["fence"][2] == 23
-    assert old["house"][2] == 7 and new["house"][2] == 9
-    assert old["house"][3] == 17 and new["house"][3] == 7
+    assert old["house"][2] == 7 and new["house"][2] == 11
+    assert old["house"][3] == 17 and new["house"][3] == 10
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
@@ -553,6 +555,30 @@ def test_fifth_pair_zoe_scores_by_the_same_rules(zoe):
     texts = [p["text"] for p in zoe["labels"] if p["kind"] == "fence"]
     assert "FE.0.5'N" in texts
     assert any("0.4'S" in text and "0.8'N" in text for text in texts)
+
+
+def test_house_standing_beyond_the_common_limit_is_labelled(results):
+    """
+    R18 (4.31): дом, который стоит дальше общего предела целиком, меряется до ``HOUSE_EDGE_MAX_FT``.
+
+    Взято из ветки соседа (`arena/3c6f7f95-cad`, 4.37: предел дома 7 ft); у нас правило работает
+    как запасной предел и только для дома, у которого нет ни одной вершины ближе ``EDGE_MAX_FT``.
+    24 Alvine: стена дома 3.5 ft от южной стороны, у Николая `3.5'S`, у нас `3.4'S` (0.1 ft).
+    С выключенным правилом подписи нет, а счёт по четырём парам падает на два совпадения.
+    """
+    alvine = [p for p in results["Alvine"]["labels"] if p["kind"] == "house"]
+    assert any(abs(part[0] - 3.4) < 0.11 for p in alvine for part in p["parts"]), [
+        p["text"] for p in alvine
+    ]
+    saved = off.HOUSE_EDGE_MAX_FT
+    off.HOUSE_EDGE_MAX_FT = 0.0
+    try:
+        before, after = load_pair(PRIMER1)
+        data, _nikolai = field_plan(before, after)
+        narrow = [p for p in plan_labels(data["plan"]) if p["kind"] == "house"]
+    finally:
+        off.HOUSE_EDGE_MAX_FT = saved
+    assert len(alvine) > len(narrow)
 
 
 # --------------------------------------- шестая пара: 1412 East 64th Street, Brooklyn

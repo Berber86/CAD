@@ -150,3 +150,21 @@ def test_front_wall_needs_survey_points_and_a_street_line():
         SQUARE, [pier], survey_pts=[(0.0, -2.0)],
         survey_notes=[((0.0, -2.0), "BRICK WALL")],
     ).items == []
+
+
+def test_house_limit_is_a_fallback_not_a_blanket():
+    """
+    R18: расширенный предел дома — запасной, а не общий.
+
+    Дом с одной стеной в 2 ft и другой в 3.5 ft подписывается только по ближней стене:
+    расширение включается, лишь когда **все** стены дома дальше общего предела (иначе на
+    плотных чертежах подписей дома вдвое больше, чем у Николая: 1373 East 55th, 6 → 10).
+    """
+    house = ((10.0, 2.0), (40.0, 2.0), (40.0, 40.0), (10.0, 40.0))  # стена в 2 ft от южной
+    plan = off.plan_offsets(
+        SQUARE, [off.Feature("house", "h", house, closed=True)],
+        survey_pts=[(10.0, 2.0), (40.0, 2.0)],
+        survey_notes=[((10.0, 2.0), "1 STY BRICK"), ((40.0, 2.0), "1 STY BRICK")],
+    )
+    house_items = [item for item in plan.items if item.kind == "house"]
+    assert house_items and all(item.value_ft <= off.EDGE_MAX_FT + 1e-6 for item in house_items)

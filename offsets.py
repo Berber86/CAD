@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.30"
+STEP4_VERSION = "4.31"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -535,6 +535,21 @@ EDGE_FALLBACK_FT = 0.0
 #: Замер по нормали до параллельной стороны: 0.1–3.0 ft у заборов и домов; 4.9'N (дом Geldner)
 #: уже не входит — у Николая это замер до южной линии, а сторона с параллельной нормалью дальше.
 EDGE_MAX_FT = 3.0
+#: Предел замера **дома** от стороны участка, футы. Действует как **запасной**: включается,
+#: только если у дома нет ни одной вершины ближе общего ``EDGE_MAX_FT`` — то есть дом стоит
+#: дальше общего предела целиком.
+#:
+#: Взято из ветки соседа (`arena/3c6f7f95-cad`, 4.37: «предел дома 7 ft», у них 4 → 5 подписей
+#: дома и +3 совпадения), но проверено на нашем стенде из шести пар. У них правило
+#: безусловное (любая стена дома до 7 ft + кэпы), у нас так получается +8 подписей на +3
+#: совпадения и H17 по дому 60% (порог 50%). Вариант «дом целиком дальше предела» даёт
+#: **+2 совпадения без регрессии на парах** и H17 ровно 50%:
+#:
+#: * 24 Alvine: стена дома 3.5 ft — у Николая `3.5'S`, появляется наша (было 2 совпадения из 6,
+#:   стало 4 из 5 подписей);
+#: * 1373 East 55th, 192 Geldner, 378 Mother Gaston, 18 Zoe, 1412 East 64th — без изменений;
+#: * 5 и 7 ft дают те же совпадения при +2…+8 подписях, поэтому взят ближний край — 4.0.
+HOUSE_EDGE_MAX_FT = 4.0
 #: Часть подписи не повторяется отдельной подписью рядом с полной (H32 соседней ветки).
 #: Когда у вершины стоит двухстрочная подпись «0.1'E / 1.2'S», отдельная «1.2'S» в 2 ft от
 #: неё — дубль; на 192 Geldner это снимает 3 из 19 подписей по заборам, не теряя совпадений.
@@ -1368,17 +1383,34 @@ def plan_offsets(
         # снятый угол от излома линии, и правило «метка у снятой вершины» (R13) не работает —
         # тогда остаётся прежний замер до ближайшей границы.
         if EDGE_NORMAL_OFFSETS and survey_points:
+            # Предел замера: у дома он может быть больше общего (HOUSE_EDGE_MAX_FT), но только
+            # когда у дома **нет ни одной** вершины ближе EDGE_MAX_FT — то есть дом стоит дальше
+            # общего предела целиком (24 Alvine: стена 3.5 ft). Иначе расширение добавляет
+            # подписи у домов, где ближние стены и так подписаны (Brooklyn: 6 → 10 подписей).
+            edge_max = EDGE_MAX_FT
+            if feature.kind == "house" and HOUSE_EDGE_MAX_FT > edge_max:
+                edge_max = HOUSE_EDGE_MAX_FT
             rows_by_vertex = vertex_offset_rows(
-                feature, edge_sides, max_ft=EDGE_MAX_FT, ring=ring, north_deg=north_deg,
+                feature, edge_sides, max_ft=edge_max, ring=ring, north_deg=north_deg,
                 keep_online=ONLINE_LABELS,
             )
+            if edge_max > EDGE_MAX_FT:
+                near = [
+                    vertex for vertex, rows in rows_by_vertex.items()
+                    if any(row.value_ft <= EDGE_MAX_FT for row in rows)
+                ]
+                if near:
+                    rows_by_vertex = vertex_offset_rows(
+                        feature, edge_sides, max_ft=EDGE_MAX_FT, ring=ring,
+                        north_deg=north_deg, keep_online=ONLINE_LABELS,
+                    )
             if feature.kind == "fence" and FENCE_END_MAX_FT > EDGE_MAX_FT:
                 # Конец длинного прогона забора Николай подписывает и в 5–6 ft от стороны
                 # (192 Geldner: FE.5.2'S при 5.17 ft). Короткий выступ так не подписывается.
                 ends = fence_end_vertices(feature, FENCE_END_MIN_LENGTH_FT)
                 if ends:
                     wide = vertex_offset_rows(
-                        feature, edge_sides, max_ft=FENCE_END_MAX_FT, ring=ring,
+                        feature, edge_sides, max_ft=max(FENCE_END_MAX_FT, edge_max), ring=ring,
                         north_deg=north_deg,
                     )
                     for vertex, rows in wide.items():
@@ -1669,6 +1701,7 @@ def _plan_edge_labels(
 
     cells = sorted(rows_by_vertex.items(), key=lambda cell: cell[1][0].value_ft)
     order = list(cells)
+
     if MAX_SAME_VALUE_PER_FEATURE > 0:
         # R14: повтор одного и того же замера у объекта — не больше двух раз.
         seen_values: dict[tuple[float, str], int] = {}

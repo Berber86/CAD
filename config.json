@@ -146,9 +146,13 @@
     "property_line_layers": [
       "PROPERTY_LINE",
       "PL",
+      "PL-PRINT",
       "M-PROPERTY",
       "M-TAX-LINE",
       "PROPERTY_LINES_APPROX"
+    ],
+    "property_line_layers_fallback": [
+      "ST-BLDG-LINE"
     ],
     "property_closing_layers": [
       "M-ROW-LINE"

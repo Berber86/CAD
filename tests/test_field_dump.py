@@ -30,7 +30,12 @@ from pathlib import Path
 import offsets as off
 
 #: слои, по которым программа собирает участок (как в Шаге 2: контур участка — PL, фолбэк M-ROW-LINE)
-LOT_LAYERS = ("PL", "M-ROW-LINE", "ST-BLDG-LINE")
+#: Слои контура участка. Новый слой Николая и наш собственный Шаг 1 — ``PL``; старый (до
+#: переименования 2026-11) — ``ST-BLDG-LINE``, и он же слой стен дома, поэтому идёт отдельным
+#: запасным списком: контур по нему строится только там, где на ``PL`` ничего не замыкается
+#: (18 Zoe Street: на ``ST-BLDG-LINE`` лежит дом на 1121 sq ft, участок — 4470 sq ft).
+LOT_LAYERS = ("PL", "PL-PRINT", "PROPERTY_LINE", "M-PROPERTY", "M-ROW-LINE")
+LOT_FALLBACK_LAYERS = ("ST-BLDG-LINE",)
 #: точки съёмки: отдельные точки слоя PNT-X и блоки srvpno3/srvpno1 с атрибутом DESC2
 SURVEY_LAYERS = ("PNT-X", "PNTS", "PNT", "SRVPTS")
 SURVEY_BLOCKS = ("SRVPNO", "SPT")
@@ -65,6 +70,34 @@ def _snap(point, pool, tol=SNAP_FT):
     return best
 
 
+def _snap_all(points, tol=SNAP_FT):
+    """Склеить концы отрезков, разошедшиеся меньше допуска.
+
+    ``_snap`` не годится, когда в пуле есть сам конец: он находит себя на расстоянии 0 и ничего
+    не склеивает. На 18 Zoe Street контур участка не замыкался из-за 0.003 ft между диагональю и
+    восточной стороной (``polygonize`` давал 0 полигонов). Здесь — кластеры: все точки ближе
+    допуска получают общего представителя.
+    """
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if math.dist(points[i], points[j]) < tol:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+    out = []
+    for i, point in enumerate(points):
+        out.append(points[find(i)])
+    return out
+
+
 def _lot_polygon(dump: dict):
     """Участок — полигон по линиям PL/M-ROW-LINE/ST-BLDG-LINE с максимумом точек съёмки внутри.
 
@@ -78,15 +111,30 @@ def _lot_polygon(dump: dict):
 
     segs = [s for s in _segments(dump) if s[0].upper() in LOT_LAYERS]
     if not segs:
-        return None
+        segs = [s for s in _segments(dump) if s[0].upper() in LOT_FALLBACK_LAYERS]
+        if not segs:
+            return None
     ends = [p for _layer, a, b in segs for p in (a, b)]
+    snapped = _snap_all(ends)
     lines = [
-        LineString([_snap(a, ends), _snap(b, ends)]) for _layer, a, b in segs
+        LineString([snapped[2 * i], snapped[2 * i + 1]]) for i, (_layer, a, b) in enumerate(segs)
     ]
     survey = [Point(p) for p in survey_points(dump)]
     polygons = [p for p in polygonize(unary_union(lines)) if p.area >= 400]
     if not polygons:
-        return None
+        # Нового слоя на чертеже нет (или он не замкнут) — старый ``ST-BLDG-LINE``.
+        old_segs = [s for s in _segments(dump) if s[0].upper() in LOT_FALLBACK_LAYERS]
+        if not old_segs:
+            return None
+        ends = [p for _layer, a, b in segs + old_segs for p in (a, b)]
+        snapped = _snap_all(ends)
+        lines = [
+            LineString([snapped[2 * i], snapped[2 * i + 1]])
+            for i, (_layer, a, b) in enumerate(segs + old_segs)
+        ]
+        polygons = [p for p in polygonize(unary_union(lines)) if p.area >= 400]
+        if not polygons:
+            return None
     best = None
     for polygon in polygons:
         inside = sum(1 for p in survey if polygon.contains(p))
@@ -265,7 +313,15 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
             after = text
     if before is None:
         # Brooklyn: файл «до» назван «2) … — копия», «после» — «3_ИТОГОВЫЙ…».
+        # 18 Zoe Street: «2       18 Zoe Street … — копия» и «3       18 Zoe Street … — копия» —
+        # различаются только ведущей цифрой шага, поэтому «до» — тот, что не «после».
         before = next(text for name, text in dumps.items() if text is not after)
+    if after is None:
+        # Ни одной метки в именах: «после» — файл, чьё имя начинается с «3» (шаг 3 в его наборе).
+        numbered = {name: text for name, text in dumps.items() if name.strip()[:1].isdigit()}
+        if numbered:
+            after = next(text for name, text in numbered.items() if name.strip().startswith("3"))
+            before = next(text for name, text in dumps.items() if text is not after)
     assert before is not None and after is not None, sorted(dumps)
     return json.loads(before), json.loads(after)
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import sys
@@ -402,8 +403,10 @@ def test_shipped_config_mirrors_feature_defaults():
     assert section == fl.DEFAULT_FEATURE_CONFIG
     # Ключи из постановки задачи.
     assert section["property_line_layers"] == [
-        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+        "PROPERTY_LINE", "PL", "PL-PRINT", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
     ]
+    # Старое имя линии участка — только запасной вариант, не в общем списке.
+    assert section["property_line_layers_fallback"] == ["ST-BLDG-LINE"]
     assert section["point_label_layers"] == ["POINT_LABELS", "PNT-X", "PNTS"]
     assert section["label_output_layer"] == "D-TOPO-TEXT"
     assert section["point_to_fence_max_ft"] == 3.5
@@ -523,6 +526,38 @@ def test_property_polygon_from_selected_lines():
     boundary = fl.property_polygon_from_selection(picked, snap, {})
     assert boundary.method == "pick"
     assert boundary.area_sqft == pytest.approx(4000.0, abs=0.01)
+
+
+def _rename_layers(snap, mapping):
+    """Копия снимка, в которой слои линий переименованы (``{было: стало}``)."""
+    return dataclasses.replace(
+        snap,
+        lines=[
+            dataclasses.replace(line, layer=mapping.get(line.layer.upper(), line.layer))
+            for line in snap.lines
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("new_layer", "old_name_note"),
+    [
+        ("PL", False),            # современное имя линии участка (со обратными штрихами)
+        ("PL-PRINT", False),      # наш собственный печатный слой Шага 1
+        ("ST-BLDG-LINE", True),   # старое имя: на нём же начерчены стены дома
+    ],
+)
+def test_property_line_three_ways_18_zoe_street(new_layer, old_name_note):
+    """18 Zoe Street: участок узнаётся по всем трём способам записи линии участка."""
+    snap = _rename_layers(load_field_fixture("zoe_field.txt"), {"PL": new_layer})
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.layer == new_layer
+    assert boundary.area_sqft == pytest.approx(4470.0, abs=5.0)
+    assert boundary.vertex_count == 4
+    assert any("контур построен по старому имени линии участка" in note
+               for note in boundary.notes) is old_name_note
+    # Ложного предупреждения о расхождении с контуром строений быть не должно.
+    assert not any("расходится" in note for note in boundary.notes)
 
 
 @pytest.mark.parametrize(("angle", "gap"), [(0.0, 0.0), (17.0, 0.4), (-63.0, 0.0)])

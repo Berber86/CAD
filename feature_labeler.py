@@ -96,9 +96,17 @@ __all__ = [
 #: полный и окончательный список правил). ``null`` в config.json = «по умолчанию».
 DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- слои входящего чертежа (шаблоны * и ?, регистр не важен) ----------
+    #: Линия участка: наш Шаг 1 чертит её на ``PL`` (``layers.property_line``), Николай с 2026-11
+    #: тоже пишет ``PL``; ``PL-PRINT`` — наш печатный черновик.
     "property_line_layers": [
-        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+        "PROPERTY_LINE", "PL", "PL-PRINT", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
     ],
+    #: Старое имя линии участка у Николая (до переименования в ``PL``, 2026-11). Отдельный список,
+    #: а не последний пункт основного: на том же слое ``ST-BLDG-LINE`` лежат стены дома, и если
+    #: держать его в общем списке, программа каждый раз сравнивает участок с домом и пишет
+    #: «граница расходится с контуром ST-BLDG-LINE». Запасной слой берётся, только когда на
+    #: основных слоях не нашлось ни одной линии.
+    "property_line_layers_fallback": ["ST-BLDG-LINE"],
     #: линии, которыми замыкается граница, если в слое участка её не хватает:
     #: фасадная сторона участка обычно начерчена только как красная линия улицы
     "property_closing_layers": ["M-ROW-LINE"],
@@ -1982,6 +1990,35 @@ def _activity_score(polygon: Polygon, survey_lines: Sequence[LineString]) -> flo
     return total
 
 
+def _independent_activity(
+    polygon: Polygon,
+    snapshot: DrawingSnapshot,
+    classifier: LayerClassifier,
+    own_patterns: Sequence[str],
+) -> float:
+    """Съёмка внутри контура без линий самого старого слоя участка (заборы, строения, точки)."""
+    total = 0.0
+    for line in snapshot.lines:
+        if own_patterns and layer_matches(line.layer, list(own_patterns)):
+            continue
+        if not (classifier.is_fence(line.layer) or classifier.structure_category(line.layer)):
+            continue
+        geom = line_to_shapely(line)
+        if geom is None:
+            continue
+        mid = geom.interpolate(0.5, normalized=True)
+        if polygon.contains(mid):
+            total += geom.length
+    for point in snapshot.survey_points:
+        try:
+            spot = Point(point.point)
+        except (TypeError, ValueError):
+            continue
+        if polygon.contains(spot):
+            total += 1.0
+    return total
+
+
 def _choose_property_candidate(
     polygons: Sequence[Polygon], survey_lines: Sequence[LineString]
 ) -> tuple[int, bool]:
@@ -2172,22 +2209,43 @@ def find_property_polygon(
     fcfg = feature_settings(cfg)
     snap_snapshot_vertices(snapshot, cfg)
     classifier = LayerClassifier(fcfg)
-    by_rank: dict[int, dict[str, list[LineString]]] = {}
     closing_layers = _as_patterns(fcfg.get("property_closing_layers"))
     closers: dict[str, list[LineString]] = {}
-    for line in snapshot.lines:
-        rank = classifier.property_rank(line.layer)
-        if rank is None:
-            if closing_layers and layer_matches(line.layer, closing_layers):
+
+    def collect(layer_patterns: list[str]) -> dict[int, dict[str, list[LineString]]]:
+        """Линии слоёв участка по рангам: раньше в списке — выше приоритет."""
+        found: dict[int, dict[str, list[LineString]]] = {}
+        for rank, pattern in enumerate(layer_patterns):
+            for line in snapshot.lines:
+                if not layer_matches(line.layer, [pattern]):
+                    continue
                 geom = line_to_shapely(line)
                 if geom is not None:
-                    closers.setdefault(line.layer, []).append(geom)
-            continue
-        geom = line_to_shapely(line)
-        if geom is not None:
-            by_rank.setdefault(rank, {}).setdefault(line.layer, []).append(geom)
+                    found.setdefault(rank, {}).setdefault(line.layer, []).append(geom)
+        return found
 
-    layer_list = ", ".join(_as_patterns(fcfg.get("property_line_layers")))
+    primary_patterns = _as_patterns(fcfg.get("property_line_layers"))
+    fallback_patterns: list[str] = []
+    by_rank = collect(primary_patterns)
+    old_layer_note = ""
+    if not by_rank and near is None:
+        # Старое имя линии участка (``ST-BLDG-LINE`` до переименования в ``PL``): берём его, только
+        # если на основных слоях линий нет вовсе — иначе стены дома выдают себя за участок.
+        fallback_patterns = _as_patterns(fcfg.get("property_line_layers_fallback"))
+        if fallback_patterns:
+            by_rank = collect(fallback_patterns)
+            if by_rank:
+                old_layer_note = (
+                    f"на слоях {', '.join(primary_patterns)} линий участка нет: контур построен "
+                    f"по старому имени линии участка ({', '.join(sorted({l for g in by_rank.values() for l in g}))})"
+                )
+    for line in snapshot.lines:
+        if closing_layers and layer_matches(line.layer, closing_layers):
+            geom = line_to_shapely(line)
+            if geom is not None:
+                closers.setdefault(line.layer, []).append(geom)
+
+    layer_list = ", ".join(primary_patterns)
     if not by_rank:
         if near is not None:
             fallback = _survey_lot_near(snapshot, cfg, near) or _side_lot_near(snapshot, cfg, near)
@@ -2216,7 +2274,10 @@ def find_property_polygon(
             min_area=min_area, allow_chain_closure=True,
         )
         closed_by = ""
-        if not polygons and closers:
+        # Старое имя слоя участка (``ST-BLDG-LINE``): на нём же лежат стены дома, и без красной
+        # линии улицы замкнутым оказывается дом. Поэтому запасной слой всегда пробуем вместе
+        # с замыкающими линиями, а не только когда своих контуров не нашлось (18 Zoe Street).
+        if (not polygons or old_layer_note) and closers:
             # Фасадной стороны в слое участка нет — она начерчена красной линией улицы.
             extra = [geom for group in closers.values() for geom in group]
             candidates, gaps = polygons_from_lines(
@@ -2236,6 +2297,7 @@ def find_property_polygon(
             continue
         if survey_lines is None:
             survey_lines = _survey_lines(snapshot, classifier)
+        notes_street = False
         if near is not None:
             overlaps = [poly.intersection(near).area for poly in polygons]
             index = max(range(len(polygons)), key=overlaps.__getitem__)
@@ -2244,10 +2306,29 @@ def find_property_polygon(
                 continue  # в этом слое нет контура, который касается области
         else:
             index, ambiguous = _choose_property_candidate(polygons, survey_lines)
+            if old_layer_note and closers and len(polygons) > 1:
+                # Старое имя слоя участка: на ST-BLDG-LINE вместе с участком лежат стены дома,
+                # и «контур с наибольшим числом снятых объектов» может оказаться домом.
+                # Участок узнаём по фасаду: его сторона идёт по красной линии улицы.
+                street = unary_union([geom for group in closers.values() for geom in group])
+                street = street.buffer(max(snap_tol, 0.5))
+                shares = [
+                    poly.exterior.intersection(street).length / max(poly.exterior.length, 1e-9)
+                    for poly in polygons
+                ]
+                if max(shares) >= 0.15:
+                    index = max(range(len(polygons)), key=lambda i: (shares[i], polygons[i].area))
+                    notes_street = True
+                else:
+                    notes_street = False
+            else:
+                notes_street = False
         polygon = _normalize_polygon(polygons[index])
         if polygon is None:
             continue
         notes: list[str] = []
+        if old_layer_note:
+            notes.append(old_layer_note)
         if closed_by:
             notes.append(
                 f"в слое {layer_name} граница не замкнута: недостающая сторона взята "
@@ -2270,6 +2351,11 @@ def find_property_polygon(
                         "(красная линия улицы)"
                     )
             notes.append(note)
+        if notes_street:
+            notes.append(
+                "контур участка выбран по стороне, идущей вдоль красной линии улицы: "
+                "в старом слое вместе с участком начерчены стены дома"
+            )
         if len(polygons) > 1:
             notes.append(
                 f"в слое {layer_name} найдено замкнутых контуров: {len(polygons)}; выбран "
@@ -2299,6 +2385,18 @@ def find_property_polygon(
         # в стороне): смотрим следующие слои, этот оставляем запасным.
         if empty is None and primary is None:
             empty = found
+    if old_layer_note:
+        # Старое имя слоя участка без указанной области: на этом же слое лежат и стены домов,
+        # поэтому пустой прямоугольник без съёмки внутри за участок не считаем.
+        chosen = primary if primary is not None else empty
+        if chosen is None or _independent_activity(
+            chosen.polygon, snapshot, classifier, fallback_patterns
+        ) <= 0.0:
+            raise FeatureLabelError(
+                f"Линии участка есть только на старом слое ({', '.join(sorted({l for g in by_rank.values() for l in g}))}), "
+                "а снятых заборов и строений внутри найденного контура нет: на этом слое начерчены и стены домов. "
+                "Укажите участок в AutoCAD или начертите границу на слое PL."
+            )
     if primary is not None:
         return primary
     if near is not None:

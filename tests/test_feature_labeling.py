@@ -3789,3 +3789,18 @@ def test_fence_on_wall_duplicate_check_knows_abbreviations_both_ways():
         assert fl.labels_similar(existing, label, synonyms), (existing, label)
     assert not fl.labels_similar("VINYL FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL", synonyms)
     assert not fl.labels_similar("C.L.F. ATOP CONC. WALL", "C.L.F.", synonyms)
+
+
+def test_north_arrow_nearest_the_lot_is_used_when_several_stand_on_the_sheet():
+    # В рабочем DWG бывает несколько заготовок листа: блоки NA повёрнуты по-разному
+    # (в полном 24 Alvine — 12 блоков). Берём стрелку, ближайшую к участку.
+    from shapely.geometry import Polygon
+
+    far = north_arrow(0.0, name="NA", layer="0")
+    far.point = (900.0, 900.0)
+    near = north_arrow(270.0, name="NA", layer="0")
+    near.point = (10.0, 10.0)
+    snapshot = fl.DrawingSnapshot(symbols=[far, near])
+    lot = Polygon([(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)])
+    assert fl.find_north_arrow(snapshot, {}).side == "up"  # без near — первый найденный
+    assert fl.find_north_arrow(snapshot, {}, near=lot).side == "right"

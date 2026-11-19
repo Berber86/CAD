@@ -3961,6 +3961,47 @@ class AcadBuilder:
                 self._com_thread_id = None
                 _co_uninitialize()
 
+    def _add_offset_texts(
+        self,
+        model_space: Any,
+        item: Any,
+        layer: str,
+        style: str,
+        spacing_factor: float,
+    ) -> int:
+        """
+        Подпись оффсета однострочными TEXT: каждая строка — свой ``AcDbText``.
+
+        ``AddText`` не понимает перевод строки: двухстрочная подпись («FE.0.2'S» / «0.3'W»)
+        ушла бы в чертёж одной строкой с мусором. Строки разносятся на
+        ``mtext_line_spacing_factor`` высот — по тому же шагу, что программа отводит под
+        блок при раскладке. Возвращает число созданных объектов.
+        """
+        lines = [line for line in str(item.text).split("\n") if line.strip()] or [""]
+        height = float(item.height_ft)
+        spacing = spacing_factor * height
+        rotation = math.radians(float(getattr(item, "rotation_deg", 0.0)))
+        # «Вверх» повёрнутого текста: поворот отсчитывается от +X против часовой.
+        up = (-math.sin(rotation), math.cos(rotation))
+        shift0 = spacing * (len(lines) - 1) / 2.0
+        created = 0
+        for index, line in enumerate(lines):
+            shift = shift0 - index * spacing
+            point = (
+                float(item.point[0]) + up[0] * shift,
+                float(item.point[1]) + up[1] * shift,
+            )
+            self._add_text(
+                model_space,
+                TextItem(
+                    text=line, point=point, rotation=rotation,
+                    kind="offset", height=height,
+                ),
+                height, layer, style,
+            )
+            created += 1
+        return created
+
     def draw_offset_labels(self, app: Any, doc: Any, plan: Any) -> OffsetWriteResult:
         """
         Пишет оффсеты плана в чертёж: текст без выноски — однострочный TEXT, выноска —
@@ -3994,16 +4035,10 @@ class AcadBuilder:
             for item in plan.items:
                 try:
                     if item.style == "text":
-                        self._add_text(
-                            model_space,
-                            TextItem(
-                                text=item.text, point=item.point,
-                                rotation=math.radians(float(getattr(item, "rotation_deg", 0.0))),
-                                kind="offset", height=item.height_ft,
-                            ),
-                            item.height_ft, layer, style,
+                        result.created_texts += self._add_offset_texts(
+                            model_space, item, layer, style,
+                            float(fcfg.get("mtext_line_spacing_factor") or offsets.TEXT_LINE_SPACING),
                         )
-                        result.created_texts += 1
                         continue
                     label = FeatureLabelItem(
                         feature=None, text=item.text, kind="leader", placement="leader",

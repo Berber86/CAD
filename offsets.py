@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.21"
+STEP4_VERSION = "4.22"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -469,6 +469,19 @@ FENCE_END_MIN_LENGTH_FT = 20.0
 DIAGONAL_SHEET_AXES = True
 DIAGONAL_TOL_DEG = 10.0
 
+#: Шаг строк многострочной подписи в высотах текста — тот же, что у подписей объектов
+#: (`mtext_line_spacing_factor` = 1.67 в настройках). С шагом 1.0 двухстрочный блок
+#: считался ниже, чем он есть, и при раскладке наезжал на соседние надписи.
+TEXT_LINE_SPACING = 1.67
+
+#: Зазор между подписями при раскладке, в высотах текста. Шрифт в AutoCAD шире нашей оценки
+#: (0.6 высоты на знак), поэтому блоки, проверенные «впритык», в чертеже слипались.
+LABEL_CLEARANCE = 0.35
+
+#: Текст дома — внутри строения, вплотную к стене, со сдвигом вдоль неё. Николай ставит
+#: подпись дома у стены изнутри и отодвигает её от крупной надписи («1 STY FRAME»).
+HOUSE_TEXT_INSIDE = True
+
 #: Подпись забора и стены ставится текстом у линии, а не выноской. У Николая все
 #: 13 подписей по заборам на 192 Geldner — обычный текст, стрелок нет ни одной;
 #: выноска остаётся последним средством, когда рядом с линией места нет.
@@ -658,6 +671,11 @@ def default_text_width(text: str, height: float) -> float:
     return 0.6 * float(height) * len(text)
 
 
+def _grow_rect(rect: Rect, amount: float) -> Rect:
+    """Прямоугольник с зазором по краям — подписи не должны сходиться вплотную."""
+    return (rect[0] - amount, rect[1] - amount, rect[2] + amount, rect[3] + amount)
+
+
 def _rect_at(center: Point, width: float, height: float) -> Rect:
     cx, cy = center
     return (cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
@@ -801,6 +819,56 @@ def _place_beside_line(
         for center in candidates:
             rect = _rect_at(center, width, block_height)
             if ok(rect, center) and not _segment_hits_rect(anchor, target, rect):
+                return center
+    return None
+
+
+def _place_house_text(
+    polygon: Sequence[Point], anchor: Point, target: Point, text: str, height: float,
+    width_of: Callable[[str, float], float], ok: Callable[[Rect, Point], bool],
+) -> Point | None:
+    """
+    Текст дома внутри строения, вплотную к стене (как у Николая).
+
+    Подпись дома у Николая стоит внутри здания у стены: снаружи мешают заборы и чужие
+    надписи, а внутри — только крупное имя строения («1 STY FRAME», «FRAME GARAGE»).
+    Поэтому точка идёт вдоль стены шагами (середина, затем к углам) и отодвигается от
+    стены на 1–4 высоты, пока блок ничего не накрывает.
+    """
+    if len(polygon) < 3:
+        return None
+    dx, dy = anchor[0] - target[0], anchor[1] - target[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    inward = (dx / length, dy / length)
+    # Стена, от которой меряется оффсет, — ближайший отрезок контура.
+    best = math.inf
+    wall: tuple[Point, Point] | None = None
+    seq = list(polygon) + [polygon[0]]
+    for a, b in zip(seq, seq[1:]):
+        distance = _point_segment_distance(anchor, (a, b))
+        if distance < best:
+            best, wall = distance, (a, b)
+    if wall is None:
+        return None
+    a, b = wall
+    width, block_h = _text_block(text, height, width_of)
+    gap = TEXT_GAP_FACTOR * height
+    for extra in (0.0, 0.5 * height, height, 2.0 * height, 3.0 * height):
+        depth = block_h / 2.0 + gap + extra
+        for share in (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9):
+            wall_point = (a[0] + (b[0] - a[0]) * share, a[1] + (b[1] - a[1]) * share)
+            center = (wall_point[0] + inward[0] * depth, wall_point[1] + inward[1] * depth)
+            if not point_in_polygon(center, polygon):
+                continue
+            rect = _rect_at(center, width, block_h)
+            corners = (
+                (rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])
+            )
+            if not all(point_in_polygon(corner, polygon) for corner in corners):
+                continue
+            if ok(rect, center):
                 return center
     return None
 
@@ -1275,6 +1343,11 @@ def _plan_edge_labels(
     bounds = _area_bounds(area_pts, margin=15.0 * factor)
     blockers = list(text_rects)
 
+    # Зазор между подписями: сравниваются прямоугольники, расширенные на LABEL_CLEARANCE.
+    # Шрифт в AutoCAD шире оценки «0.6 высоты на знак», и блоки, проверенные впритык,
+    # в чертеже слипались (4.25 соседней ветки).
+    clearance = LABEL_CLEARANCE * height
+
     def ok(rect: Rect, center: Point) -> bool:
         if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
             # Подпись у самой линии участка может чуть выходить за выделенную полилинию:
@@ -1282,7 +1355,11 @@ def _plan_edge_labels(
             return False
         if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
             return False
-        if any(_rects_overlap(rect, other) for other in blockers + placed):
+        wide = _grow_rect(rect, clearance)
+        if any(
+            _rects_overlap(wide, _grow_rect(other, clearance))
+            for other in blockers + placed
+        ):
             return False
         return not any(
             _segment_hits_rect(a, b, rect)
@@ -1379,9 +1456,20 @@ def _plan_edge_labels(
 
         item: OffsetItem | None = None
         beside = None
-        label_text = "\n".join([text] + [offset_text(feature.kind, v, d) for v, d in extras])
-        if feature.kind == "house" or (
-            FENCE_TEXT_WITHOUT_LEADER and feature.kind in ("fence", "wall")
+        # Столбиком, как у Николая: тип и первое значение строкой, дальше только значения
+        # («C.L.F.» / «0.6'S» / «1.1'E»). Повтор «FE.» в каждой строке делал блок шире,
+        # и он накрывал соседние надписи.
+        label_text = "\n".join([text] + [f"{v:.1f}'{d}" for v, d in extras])
+        if feature.kind == "house" and HOUSE_TEXT_INSIDE:
+            # Дом — текст внутри строения у стены; снаружи мешают заборы и чужие надписи.
+            beside = _place_house_text(
+                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
+                width_of, ok,
+            )
+        if beside is None and (
+            feature.kind == "house" or (
+                FENCE_TEXT_WITHOUT_LEADER and feature.kind in ("fence", "wall")
+            )
         ):
             # У Николая подпись забора — обычный текст у самой линии, без стрелки.
             # Выноска остаётся последним средством: она и давала «частокол» на чертеже.
@@ -1397,9 +1485,7 @@ def _plan_edge_labels(
             rect_w, rect_h = _text_block(label_text, height, width_of)
             rect = _rect_at(beside, rect_w, rect_h)
         else:
-            leader_text = "\n".join(
-                [text] + [offset_text(feature.kind, v, d) for v, d in extras]
-            )
+            leader_text = label_text
             spot = _place_leader(vertex, primary.foot, leader_text, height, width_of, ok, factor)
             if spot is None:
                 plan.warnings.append(
@@ -1910,7 +1996,8 @@ def _text_block(text: str, height: float, width_of: Callable[[str, float], float
     """Размер многострочной подписи (строки разделены ``\\n``): ширина самой длинной и общая высота."""
     lines = text.split("\n")
     width = max(width_of(line, height) for line in lines)
-    return width, height * len(lines)
+    # Шаг строк как у MText: с шагом 1.0 блок из двух строк считался ниже, чем он есть.
+    return width, height * (1.0 + TEXT_LINE_SPACING * (len(lines) - 1))
 
 
 def _area_bounds(area: Sequence[Point] | None, margin: float) -> Rect | None:

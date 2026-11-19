@@ -157,3 +157,90 @@ def test_part_of_a_full_label_is_not_repeated_beside_it():
     texts = [item.text.replace("\n", " ") for item in _items(plan)]
     parts = [text.split() for text in texts]
     assert sum(len(p) for p in parts) == len(set(c for p in parts for c in p)), texts
+
+
+# ---------------------------------------------------------------- раскладка (4.22)
+def _rect(item):
+    width, height = off._text_block(item.text, item.height_ft, off.default_text_width)
+    return off._rect_at(item.point, width, height)
+
+
+def test_two_line_label_is_a_column_without_repeated_prefix():
+    """
+    У Николая столбик: тип с первым значением, дальше только значения
+    («C.L.F.» / «0.6'S» / «1.1'E»). Повтор «FE.» в каждой строке делал блок шире.
+    """
+    # Вершина у юго-восточного угла участка: замер до восточной стороны (0.2 ft)
+    # и второй — до южной (0.4 ft).
+    fence = off.Feature("fence", "f", ((60.2, 0.4), (60.2, 30.0)))
+    plan = off.plan_offsets(
+        LOT, [fence], survey_pts=[(60.2, 0.4), (60.2, 30.0)],
+        survey_notes=[((60.2, 0.4), "VINYL FENCE"), ((60.2, 30.0), "VINYL FENCE")],
+    )
+    two_line = [item for item in _items(plan) if "\n" in item.text]
+    assert two_line, [item.text for item in plan.items]
+    for item in two_line:
+        first, *rest = item.text.split("\n")
+        assert first.startswith("FE.")
+        assert all("FE" not in line for line in rest), item.text
+
+
+def test_line_block_height_matches_mtext_spacing():
+    """Габарит блока считается с шагом строк MText, иначе двухстрочная подпись «выше» своей рамки."""
+    _width, height = off._text_block("FE.0.2'S\n0.3'W", 1.0, off.default_text_width)
+    assert height == pytest.approx(1.0 + off.TEXT_LINE_SPACING, abs=1e-9)
+
+
+def test_placed_labels_keep_a_clearance_between_them():
+    """Подписи не сходятся вплотную: сравниваются прямоугольники, расширенные на зазор."""
+    # Два разных замера рядом (0.3 и 0.6 ft): одинаковый текст отсекает R14, здесь же
+    # проверяется только зазор между блоками.
+    first = off.Feature("fence", "f1", ((20.0, 0.3), (24.0, 0.3)))
+    second = off.Feature("fence", "f2", ((24.4, 0.6), (28.0, 0.6)))
+    pts = [(20.0, 0.3), (24.0, 0.3), (24.4, 0.6), (28.0, 0.6)]
+    saved_cap = off.MAX_CORNERS_PER_SIDE
+    off.MAX_CORNERS_PER_SIDE = 0  # кэп «один угол на сторону» снят: проверяется только зазор
+    try:
+        plan = off.plan_offsets(
+            LOT, [first, second], survey_pts=pts,
+            survey_notes=[(p, "VINYL FENCE") for p in pts],
+        )
+    finally:
+        off.MAX_CORNERS_PER_SIDE = saved_cap
+    items = _items(plan)
+    assert len(items) >= 2
+    clearance = off.LABEL_CLEARANCE * items[0].height_ft
+    rects = [_rect(item) for item in items]
+    for i, left in enumerate(rects):
+        for right in rects[i + 1:]:
+            assert not off._rects_overlap(
+                off._grow_rect(left, clearance * 0.9),
+                off._grow_rect(right, clearance * 0.9),
+            )
+
+
+def test_house_text_stands_inside_the_building():
+    """Подпись дома — внутри строения у стены, как у Николая, а не снаружи в заборах."""
+    house = ((10.0, 0.5), (34.0, 0.5), (34.0, 26.0), (10.0, 26.0))
+    pts = [(10.0, 0.5), (34.0, 0.5)]
+    plan = off.plan_offsets(
+        LOT, [off.Feature("house", "h", house, closed=True)], survey_pts=pts,
+        survey_notes=[(p, "1 STY FRAME") for p in pts],
+    )
+    assert plan.items
+    assert all(off.point_in_polygon(item.point, house) for item in plan.items), [
+        item.point for item in plan.items
+    ]
+
+    saved = off.HOUSE_TEXT_INSIDE
+    off.HOUSE_TEXT_INSIDE = False
+    try:
+        outside = off.plan_offsets(
+            LOT, [off.Feature("house", "h", house, closed=True)], survey_pts=pts,
+            survey_notes=[(p, "1 STY FRAME") for p in pts],
+        )
+    finally:
+        off.HOUSE_TEXT_INSIDE = saved
+    assert outside.items and not all(
+        off.point_in_polygon(item.point, house) for item in outside.items
+    )

@@ -499,8 +499,13 @@ def plan_parts(plan) -> list[dict]:
     """Части плана программы в том же виде, что и ``nikolai_parts``."""
     out = []
     for item in plan.items:
-        for label, value, direction in _parts(item.text.replace("\n", " ")):
-            kind = _kind_of(label)
+        parts = _parts(item.text.replace("\n", " "))
+        # Значения столбиком идут без префикса («FE.0.2'S» / «0.3'W») — вид объекта
+        # берётся из первой строки, иначе вторая часть выпадала бы из счёта.
+        kinds = [_kind_of(label) for label, _value, _direction in parts]
+        item_kind = next((kind for kind in kinds if kind is not None), None)
+        for label, value, direction in parts:
+            kind = _kind_of(label) or item_kind
             if kind is None:
                 continue
             out.append(

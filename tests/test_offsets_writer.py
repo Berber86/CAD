@@ -177,3 +177,28 @@ def test_report_counts_selection_and_area_bounds(com):
     assert "выделено в AutoCAD объектов 1" in text
     assert "x -5.0…50.0, y -5.0…110.0 ft" in text
     assert "в выделенной области:" in text and "Подписей:" in text
+
+
+def test_two_line_offset_is_written_as_two_texts_with_mtext_spacing(com):
+    """
+    AddText не понимает перевод строки: двухстрочная подпись («FE.0.2'S» / «0.3'W»)
+    пишется отдельными TEXT с шагом ``mtext_line_spacing_factor`` — тем же, что программа
+    отводит под блок при раскладке.
+    """
+    from types import SimpleNamespace
+
+    builder, _app, doc = com()
+    item = SimpleNamespace(
+        text="FE.0.2'S\n0.3'W", point=(10.0, 20.0), height_ft=0.9, rotation_deg=0.0,
+    )
+    created = builder._add_offset_texts(doc.ModelSpace, item, off.OFFSET_LAYER, "Standard", 1.67)
+    assert created == 2
+    texts = [e for e in doc.ModelSpace.created if e.ObjectName == "AcDbText"]
+    assert [e.TextString for e in texts] == ["FE.0.2'S", "0.3'W"]
+    assert not [e.TextString for e in texts if "\n" in e.TextString]
+    ys = [float(e.TextAlignmentPoint[1]) for e in texts]
+    spacing = 1.67 * 0.9
+    assert ys[0] - ys[1] == pytest.approx(spacing, abs=0.01)
+    # Блок стоит по центру своей точки: строки расходятся вверх и вниз поровну.
+    assert (ys[0] + ys[1]) / 2.0 == pytest.approx(20.0, abs=0.01)
+    assert all(float(e.TextAlignmentPoint[0]) == pytest.approx(10.0) for e in texts)

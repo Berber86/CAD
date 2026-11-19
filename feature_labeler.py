@@ -96,13 +96,22 @@ __all__ = [
 #: полный и окончательный список правил). ``null`` в config.json = «по умолчанию».
 DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # --- слои входящего чертежа (шаблоны * и ?, регистр не важен) ----------
+    #: Слои границы участка. Заказчик менял стиль: до 2026-11 граница чертилась линиями
+    #: ``ST-BLDG-LINE`` (см. ``property_side_layers``), теперь — отдельным слоем ``PL``
+    #: (18 Zoe Street, письмо Николая). Наши Шаг 1 и черновик печати рисуют ``PL`` и
+    #: ``PL-PRINT`` — принимаем все три способа наименования, порядок = приоритет.
     "property_line_layers": [
-        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+        "PROPERTY_LINE", "PROPERTY_LINES_APPROX",
+        "PL", "PL-*", "PL_*", "PL *",            # новый стиль заказчика и наш Шаг 1
+        "S-PROP-LINE", "PROP", "M-PROPERTY", "M-TAX-LINE",
     ],
     #: линии, которыми замыкается граница, если в слое участка её не хватает:
     #: фасадная сторона участка обычно начерчена только как красная линия улицы
     "property_closing_layers": ["M-ROW-LINE"],
-    "property_side_layers": ["ST-BLDG-LINE"],
+    #: Старый стиль заказчика: стороны участка начерчены линиями зданий ``ST-BLDG-LINE``
+    #: (дом занимает всю ширину участка), фасад — красной линией улицы. Способ работает,
+    #: когда слоёв границы на чертеже нет вовсе (Ilion, Aspinwall, 6910 15th Ave).
+    "property_side_layers": ["ST-BLDG-LINE", "S-PROP-LINE"],
     "point_label_layers": ["POINT_LABELS", "PNT-X", "PNTS"],
     "fence_layers": ["S-FENCE", "FENCE", "CODE_CREW", "FENCE_*"],
     "fence_layer_exclude": ["*_NOTE"],
@@ -866,11 +875,19 @@ def is_north_arrow_block(name: str, layer: str, cfg: dict[str, Any] | None) -> b
     )
 
 
-def find_north_arrow(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = None) -> "NorthArrow | None":
+def find_north_arrow(
+    snapshot: "DrawingSnapshot",
+    cfg: dict[str, Any] | None = None,
+    *,
+    near: "BaseGeometry | None" = None,
+) -> "NorthArrow | None":
     """
     Стрелка севера среди вставок блоков чертежа (``snapshot.symbols``).
 
-    Блок, найденный по имени, важнее найденного только по слою. Направление —
+    Блок, найденный по имени, важнее найденного только по слою. Если передан ``near``
+    (полигон участка), берётся ближайшая к нему стрелка: в рабочих DWG на листе стоят
+    заготовки с разными поворотами (в 24 Alvine их 12), и первая найденная давала север,
+    который зависел от порядка обхода чертежа. Направление —
     поворот вставки плюс направление севера в самом блоке
     (``north_arrow_block_north_deg``), с учётом зеркальной вставки.
     """
@@ -883,7 +900,11 @@ def find_north_arrow(snapshot: "DrawingSnapshot", cfg: dict[str, Any] | None = N
     found = both or by_name or by_layer
     if not found:
         return None
-    symbol = found[0]
+    symbol = (
+        min(found, key=lambda s: float(near.distance(Point(s.point))))
+        if near is not None
+        else found[0]
+    )
     try:
         own = math.radians(float(fcfg.get("north_arrow_block_north_deg")))
     except (TypeError, ValueError):
@@ -2022,15 +2043,19 @@ SURVEY_LOT_COLOR = 3
 def _frontage_lot(
     sides: list[LineString],
     closers: list[LineString],
-    near: Polygon,
+    near: Polygon | None,
     fcfg: dict[str, Any],
     *,
     layer_label: str,
     note: str,
+    points: Sequence[tuple[float, float]] | None = None,
 ) -> PropertyBoundary | None:
     """
     Замкнутый контур из линий ``sides`` (стороны участка) и фасадных линий ``closers`` (красная
     линия улицы), который касается области ``near`` и примыкает к фасаду. Самый большой из таких.
+
+    ``near`` может быть ``None`` — тогда (Шаг 2 без выделения области) контур проверяется по
+    точкам съёмки ``points``: внутри должно быть снято хотя бы что-то.
     """
     snap_tol = float(fcfg.get("boundary_snap_tolerance_ft") or 0.0)
     gap_tol = float(fcfg.get("boundary_gap_tolerance_ft") or 0.0)
@@ -2039,9 +2064,15 @@ def _frontage_lot(
         min_area=float(fcfg.get("min_property_area_sqft") or 0.0), allow_chain_closure=False,
     )
     street = unary_union(closers).buffer(max(snap_tol, 0.1))
+    probe = [Point(p) for p in (points or [])]
     best: tuple[int, Polygon] | None = None
     for index, poly in enumerate(polygons):
-        if poly.intersection(near).area <= 0.0:
+        if near is not None:
+            if poly.intersection(near).area <= 0.0:
+                continue
+        elif not any(poly.contains(point) for point in probe):
+            # Без выделенной области контур подтверждают точки съёмки: в нём должно быть
+            # снято хотя бы что-то, иначе это может быть контур чужого строения.
             continue
         if poly.exterior.intersection(street).length <= 0.0:
             continue  # участок должен примыкать к красной линии улицы
@@ -2073,11 +2104,14 @@ def _frontage_lot(
     )
 
 
-def _survey_lot_near(
-    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+def _survey_lot(
+    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon | None = None
 ) -> PropertyBoundary | None:
     """
     Участок из зелёных линий (цвет ``SURVEY_LOT_COLOR``) и фасадной линии улицы.
+
+    ``near`` — выделенная область (Шаг 4). Без неё контур проверяется по точкам съёмки —
+    так участок находится и в Шаге 2, где область не выделяют.
     """
     fcfg = feature_settings(cfg)
     green = [
@@ -2095,6 +2129,7 @@ def _survey_lot_near(
         return None
     return _frontage_lot(
         green, closers, near, fcfg,
+        points=[tuple(p.point) for p in snapshot.survey_points],
         layer_label=f"зелёный контур (цвет {SURVEY_LOT_COLOR})",
         note=(
             "участок — зелёный контур чертежа (линии цвета 3), фасад по красной линии улицы "
@@ -2103,13 +2138,15 @@ def _survey_lot_near(
     )
 
 
-def _side_lot_near(
-    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon
+def _side_lot(
+    snapshot: DrawingSnapshot, cfg: dict[str, Any] | None, near: Polygon | None = None
 ) -> PropertyBoundary | None:
     """
     Участок из линий слоя сторон (``property_side_layers``, по умолчанию ST-BLDG-LINE, где
-    Николай ведёт границу без цвета) и фасадной линии улицы. Нужен, когда слоёв границы
-    (``property_line_layers``) на чертеже нет. Контур обязан касаться фасада и области.
+    Николай вёл границу **до смены стиля**) и фасадной линии улицы. Нужен, когда слоёв
+    границы (``property_line_layers``) на чертеже нет или они пусты — так размечены Ilion,
+    Aspinwall и 6910 15th Ave. Контур обязан примыкать к фасаду; без выделенной области
+    он ещё и должен содержать точки съёмки.
     """
     fcfg = feature_settings(cfg)
     side_patterns = _as_patterns(fcfg.get("property_side_layers"))
@@ -2130,6 +2167,7 @@ def _side_lot_near(
         return None
     return _frontage_lot(
         sides, closers, near, fcfg,
+        points=[tuple(p.point) for p in snapshot.survey_points],
         layer_label=f"контур из слоёв {', '.join(side_patterns)} + {', '.join(closing)}",
         note=(
             f"участок замкнут линиями слоёв {', '.join(side_patterns)}, фасад по красной линии "
@@ -2177,10 +2215,9 @@ def find_property_polygon(
 
     layer_list = ", ".join(_as_patterns(fcfg.get("property_line_layers")))
     if not by_rank:
-        if near is not None:
-            fallback = _survey_lot_near(snapshot, cfg, near) or _side_lot_near(snapshot, cfg, near)
-            if fallback is not None:
-                return fallback
+        fallback = _survey_lot(snapshot, cfg, near) or _side_lot(snapshot, cfg, near)
+        if fallback is not None:
+            return fallback
         raise FeatureLabelError(
             f"На чертеже нет линий в слоях границы участка ({layer_list}). "
             "Начертите границу (Шаг 1) или укажите её в AutoCAD вручную."
@@ -2289,12 +2326,11 @@ def find_property_polygon(
             empty = found
     if primary is not None:
         return primary
-    if near is not None:
-        survey = _survey_lot_near(snapshot, cfg, near)
-        if survey is None:
-            survey = _side_lot_near(snapshot, cfg, near)
-        if survey is not None:
-            return survey
+    survey = _survey_lot(snapshot, cfg, near)
+    if survey is None:
+        survey = _side_lot(snapshot, cfg, near)
+    if survey is not None:
+        return survey
     if empty is not None:
         return empty
     raise FeatureLabelError(

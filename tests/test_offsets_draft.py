@@ -107,11 +107,12 @@ def test_object_outside_property_is_skipped_with_reason():
     assert ("OUT", "объект вне участка") in plan.skipped
 
 
-def test_object_on_boundary_gets_no_offset():
+def test_object_on_boundary_gets_online_label_not_a_number():
+    """Объект на самой линии участка подписывается «FE.O/L», числа у него нет (4.24)."""
     on_line = _fence([(40.0, 0.0), (50.0, 0.0)], handle="EDGE")
     plan = off.plan_offsets(RING, [on_line], front=FRONT)
-    assert plan.items == []
-    assert ("EDGE", "стоит на границе") in plan.skipped
+    assert [item.text for item in plan.items] == ["FE.O/L"]
+    assert plan.items[0].value_ft == 0.0
 
 
 def test_unsupported_kind_is_reported_inside_area_only():
@@ -177,9 +178,9 @@ def test_report_text_lists_items_and_skips():
     )
     text = off.plan_report_text(plan, 16)
     assert f"черновик {off.STEP4_VERSION}" in text
-    assert "Подписей: 2 (без выноски: 1, с выноской: 1)" in text
+    assert "Подписей: 3 (без выноски: 1, с выноской: 2)" in text
     assert "10.0'N  (без выноски)" in text
-    assert "E: стоит на границе" in text
+    assert "FE.O/L  (выноска)" in text
 
 
 def test_scale_changes_heights_only_not_values():

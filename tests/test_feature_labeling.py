@@ -400,10 +400,15 @@ def test_shipped_config_mirrors_feature_defaults():
     shipped = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
     section = shipped["feature_labeling"]
     assert section == fl.DEFAULT_FEATURE_CONFIG
-    # Ключи из постановки задачи.
+    # Три способа наименования границы участка: наш Шаг 1 и черновик печати (PL, PL-PRINT),
+    # новый стиль заказчика (PL — письмо Николая о смене SL-BLDG-LINE на PL) и старый
+    # (ST-BLDG-LINE — см. property_side_layers), плюс резервные слои налоговой карты.
     assert section["property_line_layers"] == [
-        "PROPERTY_LINE", "PL", "M-PROPERTY", "M-TAX-LINE", "PROPERTY_LINES_APPROX",
+        "PROPERTY_LINE", "PROPERTY_LINES_APPROX",
+        "PL", "PL-*", "PL_*", "PL *",
+        "S-PROP-LINE", "PROP", "M-PROPERTY", "M-TAX-LINE",
     ]
+    assert section["property_side_layers"] == ["ST-BLDG-LINE", "S-PROP-LINE"]
     assert section["point_label_layers"] == ["POINT_LABELS", "PNT-X", "PNTS"]
     assert section["label_output_layer"] == "D-TOPO-TEXT"
     assert section["point_to_fence_max_ft"] == 3.5
@@ -734,6 +739,22 @@ def north_arrow(rotation_deg, *, name="NA", layer="M-NTH-ARROW", **kwargs):
     return fl.DrawingSymbol(
         layer=layer, name=name, point=(-40.0, 140.0), rotation=math.radians(rotation_deg), **kwargs
     )
+
+
+def test_north_arrow_nearest_the_lot_is_used_when_several_stand_on_the_sheet():
+    # В рабочем DWG бывает несколько заготовок листа: блоки NA повёрнуты по-разному
+    # (в полном 24 Alvine — 12 блоков). Берём стрелку, ближайшую к участку, иначе север
+    # зависит от порядка обхода чертежа.
+    from shapely.geometry import Polygon
+
+    far = north_arrow(0.0, name="NA", layer="0")
+    far.point = (900.0, 900.0)
+    near = north_arrow(270.0, name="NA", layer="0")
+    near.point = (10.0, 10.0)
+    snapshot = fl.DrawingSnapshot(symbols=[far, near])
+    lot = Polygon([(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)])
+    assert fl.find_north_arrow(snapshot, {}).side == "up"  # без near — первый найденный
+    assert fl.find_north_arrow(snapshot, {}, near=lot).side == "right"
 
 
 @pytest.mark.parametrize(
@@ -2052,6 +2073,11 @@ def load_aspinwall():
     return load_field_fixture("aspinwall_field.txt")
 
 
+def load_east64():
+    """Полевой чертёж «1412 East 64th Street, Brooklyn» (узкий рядный участок 25 × 100 ft)."""
+    return load_field_fixture("e64_field.txt")
+
+
 def ilion_features(result, label, kind=None):
     return [
         f for f in result.features
@@ -2091,6 +2117,74 @@ def test_unknown_description_has_no_rule_and_normalization_ignores_punctuation()
     assert fl.translate_description("", rules) is None
     assert fl.normalize_description(" conc-sw ") == "CONC SW"
     assert fl.normalize_description("SPOT GRADE PAV.") == "SPOT GRADE PAV"
+
+
+def _lot_snapshot(side_layer: str, *, with_survey: bool = False) -> fl.DrawingSnapshot:
+    """Участок 60 × 40 ft: три стороны на слое ``side_layer``, фасад — красная линия улицы."""
+    snap = fl.DrawingSnapshot()
+    snap.lines.extend([
+        fl.DrawingLine(side_layer, ((0.0, 0.0), (0.0, 40.0))),
+        fl.DrawingLine(side_layer, ((0.0, 0.0), (60.0, 0.0))),
+        fl.DrawingLine(side_layer, ((60.0, 0.0), (60.0, 40.0))),
+        fl.DrawingLine("M-ROW-LINE", ((0.0, 40.0), (60.0, 40.0))),
+    ])
+    if with_survey:
+        snap.survey_points.extend([
+            fl.SurveyPoint(layer="S-FENCE", number="1", description="WOOD FENCE", point=(5.0, 5.0)),
+            fl.SurveyPoint(layer="S-FENCE", number="2", description="WOOD FENCE", point=(50.0, 30.0)),
+        ])
+    return snap
+
+
+@pytest.mark.parametrize("side_layer", [
+    "PL",          # новый стиль заказчика (письмо Николая, 2026-11)
+    "PL-PRINT",    # наш черновик печати Шага 1
+    "PROPERTY_LINE",
+    "S-PROP-LINE",
+])
+def test_property_line_new_style_layers_are_recognized(side_layer):
+    """Граница участка принимается и в новом стиле, и в наших слоях Шага 1 / черновика."""
+    boundary = fl.find_property_polygon(_lot_snapshot(side_layer), {})
+    assert boundary.area_sqft == pytest.approx(2400.0, abs=1.0)
+    assert boundary.layer == side_layer
+
+
+def test_property_line_old_style_building_lines_need_no_selection():
+    """
+    Старый стиль заказчика: стороны участка начерчены линиями зданий (`ST-BLDG-LINE`),
+    фасад — красной линией. Раньше такой чертёж находился только при выделенной области,
+    теперь — и без неё (контур проверяется по точкам съёмки).
+    """
+    boundary = fl.find_property_polygon(_lot_snapshot("ST-BLDG-LINE", with_survey=True), {})
+    assert boundary.area_sqft == pytest.approx(2400.0, abs=1.0)
+    assert "ST-BLDG-LINE" in boundary.layer
+    # Без точек съёмки и без области контур не подтвердить — понятная ошибка, а не первый попавшийся.
+    with pytest.raises(fl.FeatureLabelError):
+        fl.find_property_polygon(_lot_snapshot("ST-BLDG-LINE"), {})
+
+
+def test_property_line_layer_pattern_does_not_take_planters():
+    """Шаблон `PL *` / `PL-*` не должен ловить PLANTER и другие слои на «PL»."""
+    for name in ("PLANTER", "PLANTERS", "PLNT"):
+        assert not fl.layer_matches(name, fl.DEFAULT_FEATURE_CONFIG["property_line_layers"]), name
+    for name in ("PL", "PL-PRINT", "PL_NEW", "PL PROPERTY"):
+        assert fl.layer_matches(name, fl.DEFAULT_FEATURE_CONFIG["property_line_layers"]), name
+
+
+def test_east_64th_lot_is_the_new_pl_layer_on_a_row_house():
+    """
+    1412 East 64th Street: граница в новом слое ``PL`` (три стороны), фасад — красная линия.
+
+    Участок 25.00' × 100.00' = 2500.0 sq ft (по листу «25.00'» сверху и внизу, «100.00'» по бокам).
+    На этом же чертеже есть ``ST-BLDG-LINE`` — восточная стена дома в 0.3 ft от линии участка;
+    имя ``PL`` должно по-прежнему выигрывать у старого слоя, иначе в контур попадут стены.
+    """
+    snap = load_east64()
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.layer == "PL"
+    assert boundary.vertex_count == 4
+    assert boundary.area_sqft == pytest.approx(2500.0, abs=2.0)
+    assert any("M-ROW-LINE" in note for note in boundary.notes)
 
 
 def test_ilion_lot_is_closed_by_the_street_line():

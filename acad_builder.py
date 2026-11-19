@@ -3841,8 +3841,16 @@ class AcadBuilder:
         points = _geometry_points(feature.geometry)
         if not points:
             return None
+        # Замкнутость берётся из распознавания: если геодезист обвёл здание П-образной
+        # ломаной, замыкающая «стена» не существует и оффсет по ней ставиться не должен.
+        closed = (
+            True
+            if str(getattr(feature.geometry, "geom_type", "")) in ("Polygon", "LinearRing")
+            else False
+        )
         return offsets.Feature(
             kind=kind, handle=f"{feature.layer}/{feature.feature_id}", points=tuple(points),
+            closed=closed,
         )
 
     def build_offsets(
@@ -3898,7 +3906,10 @@ class AcadBuilder:
                     "проверьте, что область выделена внутри участка"
                 )
             recognition = recognize_features(snapshot, boundary, self.cfg, "")
-            north = find_north_arrow(snapshot, self.cfg)
+            # Север — по стрелке, ближайшей к участку: на листе бывает несколько заготовок
+            # с разными поворотами (в 24 Alvine 12 блоков NA), и первая найденная давала
+            # север, зависящий от порядка обхода чертежа.
+            north = find_north_arrow(snapshot, self.cfg, near=boundary.polygon)
             north_deg = float(north.north_deg) if north is not None else 90.0
             features = [
                 item for item in (self._offset_feature(f) for f in recognition.features)
@@ -3913,9 +3924,19 @@ class AcadBuilder:
                 for t in snapshot.texts if not getattr(t, "hidden", False)
             ]
             ring = list(boundary.polygon.exterior.coords)
+            # Точки съёмки — из блоков с описанием угла (R13): метка ставится у снятых вершин.
+            # Описания снятых углов (DESC2) — признак объекта (R13b): «VINYL FENCE» у угла забора.
+            survey_pts = [
+                (float(p.point[0]), float(p.point[1])) for p in snapshot.survey_points
+            ]
+            survey_notes = [
+                ((float(p.point[0]), float(p.point[1])), str(p.description or ""))
+                for p in snapshot.survey_points
+            ]
             plan = offsets.plan_offsets(
                 ring, features, front=front, area=area, scale=scale_value,
-                north_deg=north_deg, texts=texts,
+                north_deg=north_deg, texts=texts, survey_pts=survey_pts,
+                survey_notes=survey_notes,
                 text_width=lambda text, height: feature_text_width(text, height, fcfg),
             )
             result = OffsetRunResult(
@@ -3939,6 +3960,43 @@ class AcadBuilder:
                 self._com_owned = False
                 self._com_thread_id = None
                 _co_uninitialize()
+
+    def _add_offset_texts(
+        self,
+        model_space: Any,
+        item: Any,
+        layer: str,
+        style: str,
+        spacing_factor: float,
+    ) -> int:
+        """
+        Подпись оффсета: однострочная — TEXT, многострочная — MText с ``\\P``.
+
+        Так у Николая: одно значение (``0.4'W``, ``3.5'S``) — ``AcDbText``, столбик
+        (``FE.0.6'S`` / ``FE.1.1'E``, ``BLDG`` / ``2.5'S``) — ``MText``. ``AddText`` не
+        понимает перевод строки, а две отдельные ``AcDbText`` при правке расходятся
+        по строкам. Возвращает число созданных объектов.
+        """
+        lines = [line for line in str(item.text).split("\n") if line.strip()] or [""]
+        height = float(item.height_ft)
+        rotation = math.radians(float(getattr(item, "rotation_deg", 0.0)))
+        if len(lines) == 1:
+            self._add_text(
+                model_space,
+                TextItem(
+                    text=lines[0], point=item.point, rotation=rotation,
+                    kind="offset", height=height,
+                ),
+                height, layer, style,
+            )
+            return 1
+        label = FeatureLabelItem(
+            feature=None, text="\n".join(lines), kind="offset", placement="leader",
+            point=item.point, height=height, rotation=rotation,
+            attachment=AC_ATTACHMENT_MIDDLE_CENTER,
+        )
+        self._add_mtext(model_space, label, layer, style)
+        return 1
 
     def draw_offset_labels(self, app: Any, doc: Any, plan: Any) -> OffsetWriteResult:
         """
@@ -3973,21 +4031,33 @@ class AcadBuilder:
             for item in plan.items:
                 try:
                     if item.style == "text":
-                        self._add_text(
-                            model_space,
-                            TextItem(
-                                text=item.text, point=item.point,
-                                rotation=math.radians(float(getattr(item, "rotation_deg", 0.0))),
-                                kind="offset", height=item.height_ft,
-                            ),
-                            item.height_ft, layer, style,
+                        result.created_texts += self._add_offset_texts(
+                            model_space, item, layer, style,
+                            float(fcfg.get("mtext_line_spacing_factor") or offsets.TEXT_LINE_SPACING),
                         )
-                        result.created_texts += 1
                         continue
+                    # У Николая текст стоит сбоку от выноски и растёт от неё: вставка —
+                    # на ближнем к стрелке краю, привязка 4 (влево-середина) справа от
+                    # объекта и 6 (вправо-середина) слева. Так текст не накрывает arrow.
+                    attach = AC_ATTACHMENT_MIDDLE_CENTER
+                    insert = item.point
+                    leader_points = [item.leader[0], item.leader[1]]
+                    if item.leader:
+                        width = max(
+                            feature_text_width(line, item.height_ft, fcfg)
+                            for line in str(item.text).split("\n")
+                        )
+                        if item.point[0] >= item.leader[0][0]:
+                            attach = AC_ATTACHMENT_MIDDLE_LEFT
+                            insert = (item.point[0] - width / 2.0, item.point[1])
+                        else:
+                            attach = AC_ATTACHMENT_MIDDLE_RIGHT
+                            insert = (item.point[0] + width / 2.0, item.point[1])
+                        leader_points[-1] = insert
                     label = FeatureLabelItem(
                         feature=None, text=item.text, kind="leader", placement="leader",
-                        point=item.point, height=item.height_ft, rotation=0.0,
-                        leader_points=[item.leader[0], item.leader[1]],
+                        point=insert, height=item.height_ft, rotation=0.0,
+                        attachment=attach, leader_points=leader_points,
                     )
                     mtext = self._add_mtext(model_space, label, layer, style)
                     _leader, warning, _attached = self._add_leader(

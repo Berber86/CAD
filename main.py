@@ -170,6 +170,9 @@ from pdf_set import (
 
 APP_TITLE = "Title Survey AI — Legal Description → AutoCAD"
 APP_GEOMETRY = "1440x940"
+#: Окно во время сборки: нужно, чтобы при сбое запуска показать ошибку на экране,
+#: а не оставить пользователя с исчезнувшим приложением (ставится в ``SurveyApp.__init__``).
+_STARTUP_WINDOW: Any = None
 #: Версия программы — из version.py (одна на окно, отчёт Шага 2 и ведомость).
 VERSION = APP_VERSION
 RESULT_PANEL_DEFAULT_WIDTH = 384
@@ -479,7 +482,20 @@ class SurveyApp(ctk.CTk):
         # Окно НЕ показывается, пока не собрано целиком: пока оно скрыто, виджеты
         # создаются и рисуются в памяти без перерисовок на экране — пользователь видит
         # готовое окно один раз, а не «сборку из кусочков» (4.39).
+        self._startup_hidden = True
         self.withdraw()
+        # Второй замок от мельтешения: CustomTkinter на Windows сам дёргает
+        # withdraw/deiconify/update при перекраске заголовка (см. CTk.mainloop),
+        # поэтому на время сборки окно ещё и полностью прозрачное. Прозрачность
+        # снимается в _show_ready — уже после того, как кадр целиком нарисован.
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:  # noqa: BLE001 - платформа без -alpha (Linux без композитора)
+            pass
+        # Если сборка окна упадёт, main() покажет ошибку поверх этого же окна,
+        # а не оставит пользователя с «исчезнувшим» приложением (4.40).
+        global _STARTUP_WINDOW
+        _STARTUP_WINDOW = self
         self.configure(fg_color=THEME["bg_root"])
 
         self.title(f"{APP_TITLE}  v{VERSION} ({APP_STAMP})")
@@ -9528,20 +9544,47 @@ class SurveyApp(ctk.CTk):
 
     def _show_ready(self) -> None:
         """
-        Показывает собранное окно: развёрнутым и с родным заголовком Windows.
+        Показывает собранное окно: развёрнутым, с родным заголовком Windows и без мельтешения.
 
-        Порядок обязателен: ``withdraw`` в начале ``__init__`` → сборка в памяти →
-        ``zoomed`` → ``update_idletasks`` (раскладка считается до показа) → ``deiconify``.
-        Так окно появляется один раз и сразу на весь экран, с верхней панелью и кнопками
-        свернуть/закрыть (``zoomed`` — не полноэкранный режим без рамки), без мельтешения
-        и перестроек размера.
+        Порядок: ``withdraw`` + прозрачность в начале ``__init__`` → сборка в памяти →
+        ``zoomed`` → ``update_idletasks`` (раскладка считается до показа) → ``deiconify`` →
+        ``update`` (кадр дорисовывается, пока окно ещё прозрачное) → снять прозрачность.
+        Так окно появляется один раз, сразу на весь экран и уже собранным; ``zoomed`` —
+        не полноэкранный режим без рамки, поэтому крестик и «свернуть» остаются.
+
+        Отдельно чинится поведение CustomTkinter (4.40): ``CTk.mainloop`` на Windows
+        прячет окно для перекраски заголовка, а показывает обратно только если ``withdraw``
+        НЕ вызывали до первого показа. Мы его вызывали — окно оставалось спрятанным навсегда
+        («появилось и исчезло»). Поэтому флаги ``_window_exists`` /
+        ``_withdraw_called_before_window_exists`` выставляются здесь, до ``mainloop``.
         """
-        self._open_maximized()
         try:
-            self.update_idletasks()
-        except Exception:  # noqa: BLE001 - платформа без обновления раскладки
-            pass
-        self.deiconify()
+            self._open_maximized()
+            try:
+                self.update_idletasks()
+            except Exception:  # noqa: BLE001 - платформа без обновления раскладки
+                pass
+            self.deiconify()
+            try:
+                # Полный проход отрисовки до того, как окно станет видимым: на экран
+                # выходит готовый кадр, а не последовательная сборка виджетов.
+                self.update()
+            except Exception:  # noqa: BLE001 - обновление не критично
+                pass
+        finally:
+            # Снять «невидимость» даже если показ выше упал: иначе приложение
+            # работает, а окна на экране нет.
+            self._startup_hidden = False
+            if hasattr(self, "_window_exists"):
+                self._window_exists = True
+            if hasattr(self, "_withdraw_called_before_window_exists"):
+                self._withdraw_called_before_window_exists = False
+            if hasattr(self, "_iconify_called_before_window_exists"):
+                self._iconify_called_before_window_exists = False
+            try:
+                self.attributes("-alpha", 1.0)
+            except Exception:  # noqa: BLE001 - платформа без -alpha
+                pass
         try:
             self.focus_set()
         except Exception:  # noqa: BLE001 - фокус не критичен
@@ -12446,10 +12489,45 @@ class PdfSetDialog:
             pass
 
 
+def _show_startup_failure(report: str, log_path: Path | None) -> None:
+    """
+    Показывает сбой запуска на экране (4.40).
+
+    Раньше окно при сбое сборки просто исчезало: оно спрятано до ``_show_ready``, а
+    ошибка уходила только в ``tsai_crash.log`` и в консоль. Теперь частично собранное
+    окно показывается, а поверх него — текст ошибки и путь к журналу.
+    """
+    global _STARTUP_WINDOW
+    window = _STARTUP_WINDOW
+    _STARTUP_WINDOW = None
+    where = f"\n\nЖурнал: {log_path}" if log_path is not None else ""
+    text = f"Программа не запустилась. Ошибка при сборке окна:{where}\n\n{report.strip()[-1500:]}"
+    try:
+        if window is not None:
+            show = getattr(window, "_show_ready", None)
+            if callable(show):
+                show()
+    except Exception:  # noqa: BLE001 - окно может быть собрано не до конца
+        pass
+    try:
+        from tkinter import messagebox  # noqa: PLC0415 - импорт по месту, как в остальном окне
+
+        messagebox.showerror(f"{APP_TITLE}: сбой запуска", text)
+    except Exception:  # noqa: BLE001 - без диалога ошибка всё равно напечатана в консоль
+        pass
+    try:
+        if window is not None:
+            window.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> int:
     """Запускает окно; при сбое возвращает ненулевой код и сохраняет диагностику."""
+    global _STARTUP_WINDOW
     try:
         app = SurveyApp()
+        _STARTUP_WINDOW = None  # окно собрано и показано — диагностика больше не нужна
         app.mainloop()
     except Exception:  # noqa: BLE001
         report = traceback.format_exc()
@@ -12464,6 +12542,7 @@ def main() -> int:
             print(f"ОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}", file=sys.stderr)
         else:
             print("Не удалось сохранить журнал ошибки.", file=sys.stderr)
+        _show_startup_failure(report, log_path)
         return 1
     return 0
 

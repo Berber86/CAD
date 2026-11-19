@@ -146,6 +146,27 @@
   `_build_step2_page` (его сразу делает `_refresh_height_label()` из `__init__`; каждый проход —
   это `AcadBuilder` и перечитывание настроек). Тест: `test_plain_copy_matches_deepcopy_and_stays_independent`
   (`tests/test_feature_labeling.py`) — копия равна `deepcopy` и не связана ни с шаблоном, ни с конфигом.
+- **4.40 (проверка 4.39 на Windows: «окно всё так же мерцает виджетами, а потом исчезает ВОВСЕ»)**:
+  исчезало окно из-за самого CustomTkinter. `CTk.mainloop()` на Windows прячет окно для перекраски
+  заголовка (`_windows_set_titlebar_color`), а показывает обратно только если `withdraw()` НЕ вызывали
+  до первого показа (флаги `_window_exists` и `_withdraw_called_before_window_exists` в
+  `customtkinter/windows/ctk_tk.py`). Мы `withdraw()` вызывали — после `mainloop()` окно оставалось
+  спрятанным навсегда. Теперь `_show_ready()` в блоке `finally` ставит `_window_exists = True` и
+  сбрасывает `_withdraw_called_before_window_exists` / `_iconify_called_before_window_exists`,
+  поэтому `mainloop()` окно больше не трогает.
+  От мельтешения — второй замок: на время сборки окно ещё и полностью прозрачное
+  (`attributes("-alpha", 0.0)` сразу после `withdraw()`), а порядок в `_show_ready()`:
+  `zoomed → update_idletasks → deiconify → update()` (кадр дорисовывается, пока окно прозрачное) →
+  `-alpha 1.0`. Снятие прозрачности и флагов CustomTkinter — в `finally`: сбой отрисовки больше не
+  оставляет работающее приложение без окна. Если сборка окна всё же упала, `main()` показывает
+  частично собранное окно и диалог с текстом ошибки и путём к `tsai_crash.log`
+  (`_show_startup_failure`, модульная ссылка `_STARTUP_WINDOW`) — раньше ошибка уходила только в
+  консоль и журнал, а окна не было вовсе.
+  Тесты (`tests/test_gui_smoke.py`; заглушка `_FakeCTkRoot` повторяет поведение настоящего `CTk`
+  дословно): `test_window_stays_visible_after_customtkinter_mainloop`,
+  `test_window_is_invisible_while_assembled_and_revealed_once`,
+  `test_show_ready_reveals_window_even_if_paint_fails`,
+  `test_main_shows_error_dialog_when_startup_fails`.
 - В шапке окна и в отчёте Шага 2 указаны номер версии, дата и время выпуска (местное время, Нью-Джерси).
 - В «Настройках» выбирается стартовая вкладка Шага 1: «📝 Текст» (по умолчанию) или «📄 PDF».
   Выбор действует при следующем запуске; текущая вкладка во время работы не сбрасывается.

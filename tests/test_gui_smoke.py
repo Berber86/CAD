@@ -331,10 +331,79 @@ def _step0_texts(app):
     return [item[1] if isinstance(item, tuple) else item for item in app._step0_lines]
 
 
+class _FakeCTkRoot(_Widget):
+    """
+    Заглушка ``customtkinter.CTk`` с настоящим поведением окна на Windows.
+
+    CustomTkinter помнит, вызывали ли ``withdraw()`` до первого показа окна
+    (``_withdraw_called_before_window_exists``), и в ``update()``/``mainloop()``
+    показывает окно сам только если НЕ вызывали. Кроме того, ``mainloop`` на Windows
+    прячет окно для перекраски заголовка (``_windows_set_titlebar_color``). Именно на
+    этой связке окно в 4.39 «появлялось и исчезало»: заглушка повторяет её дословно,
+    чтобы тест ловил регрессию (источник: customtkinter/windows/ctk_tk.py).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._window_exists = False
+        self._withdraw_called_before_window_exists = False
+        self._iconify_called_before_window_exists = False
+        #: Видно ли окно на экране (withdrawn → False, deiconify → True).
+        self._visible = True
+        self._alpha = 1.0
+
+    def withdraw(self, *args, **kwargs):
+        super().withdraw(*args, **kwargs)
+        if self._window_exists is False:
+            self._withdraw_called_before_window_exists = True
+        self._visible = False
+
+    def deiconify(self, *args, **kwargs):
+        super().deiconify(*args, **kwargs)
+        self._visible = True
+
+    def iconify(self, *args, **kwargs):
+        if self._window_exists is False:
+            self._iconify_called_before_window_exists = True
+        self._visible = False
+
+    def update(self, *args, **kwargs):
+        self._wm_log.append("update")
+        if self._window_exists is False:
+            # как в CTk.update: окно показывается само, только если его не прятали
+            if (
+                not self._withdraw_called_before_window_exists
+                and not self._iconify_called_before_window_exists
+            ):
+                self.deiconify()
+            self._window_exists = True
+        return None
+
+    def mainloop(self, *args, **kwargs):
+        self._wm_log.append("mainloop")
+        if not self._window_exists:
+            # как в CTk.mainloop на Windows: перекраска заголовка прячет окно...
+            self.withdraw()
+            # ...а обратно оно показывается, только если withdraw НЕ звали до показа.
+            if (
+                not self._withdraw_called_before_window_exists
+                and not self._iconify_called_before_window_exists
+            ):
+                self.deiconify()
+            self._window_exists = True
+        return None
+
+    def attributes(self, *args, **kwargs):
+        if len(args) >= 2 and args[0] == "-alpha":
+            self._alpha = float(args[1])
+            self._wm_log.append(f"alpha:{float(args[1]):g}")
+        return super().attributes(*args, **kwargs)
+
+
 def _fake_modules() -> dict[str, types.ModuleType]:
     ctk = types.ModuleType("customtkinter")
+    ctk.CTk = _FakeCTkRoot
     for name in (
-        "CTk",
         "CTkFrame",
         "CTkScrollableFrame",
         "CTkLabel",
@@ -368,6 +437,9 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     messagebox.askokcancel = lambda *args, **kwargs: False
     messagebox.askyesno = lambda *args, **kwargs: False
     messagebox.askyesnocancel = lambda *args, **kwargs: None
+    # Диалог сбоя запуска: main() обязан сказать пользователю, почему окна нет (4.40).
+    messagebox.errors: list[tuple[str, str]] = []
+    messagebox.showerror = lambda title, message, **kwargs: messagebox.errors.append((title, message))
     tkinter.messagebox = messagebox
     return {
         "customtkinter": ctk,
@@ -498,11 +570,104 @@ def test_window_stays_hidden_until_assembled_then_opens_maximized_once(gui):
     app = gui.SurveyApp()
     log = app._wm_log
     assert log[0] == "withdraw", log
-    assert log.count("deiconify") == 1 and log[-1] == "deiconify", log
+    assert log.count("deiconify") == 1, log
     assert "state:zoomed" in log, log
     assert log.index("state:zoomed") < log.index("update_idletasks") < log.index("deiconify"), log
+    # Кадр дорисовывается до того, как окно стало видимым (иначе — «сборка из кусочков»).
+    assert log.index("deiconify") < log.index("update"), log
     # Разворачивание не отложено на после первого кадра (прежний after_idle).
     assert "withdraw" not in log[1:], log
+    assert app._visible is True
+
+
+def test_window_is_invisible_while_assembled_and_revealed_once(gui):
+    """
+    Во время сборки окно не только спрятано, но и прозрачно: CustomTkinter на Windows
+    сам дёргает withdraw/deiconify/update при перекраске заголовка, и одного withdraw
+    не хватает (4.40). Прозрачность снимается последним шагом — после готового кадра.
+    """
+    app = gui.SurveyApp()
+    log = app._wm_log
+    assert log[0] == "withdraw" and log[1] == "alpha:0", log
+    assert log[-1] == "alpha:1", log
+    assert log.count("alpha:0") == 1, log
+    assert app._alpha == 1.0
+    # До показа ни одного deiconify: сначала прозрачность, потом сборка.
+    assert log.index("deiconify") > log.index("alpha:0"), log
+
+
+def test_window_stays_visible_after_customtkinter_mainloop(gui):
+    """
+    Регрессия 4.40: окно появлялось и исчезало ВОВСЕ.
+
+    ``CTk.mainloop`` на Windows прячет окно для перекраски заголовка и показывает
+    обратно только если ``withdraw()`` НЕ вызывали до первого показа. Мы вызывали
+    (окно собирается скрытым), поэтому ``_show_ready`` обязан снять флаги
+    CustomTkinter — иначе после ``mainloop()`` окна на экране нет.
+    """
+    app = gui.SurveyApp()
+    assert app._visible is True and app._alpha == 1.0
+    assert app._window_exists is True
+    assert app._withdraw_called_before_window_exists is False
+    app.mainloop()
+    assert app._visible is True, app._wm_log
+    assert app._alpha == 1.0
+    assert app._wm_log.count("withdraw") == 1, app._wm_log
+
+
+def test_show_ready_reveals_window_even_if_paint_fails(gui, monkeypatch):
+    """Сбой отрисовки не оставляет пользователя с невидимым, но работающим приложением."""
+    app = gui.SurveyApp()
+    app._visible = False
+    app.attributes("-alpha", 0.0)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("paint failed")
+
+    monkeypatch.setattr(app, "update", _boom)
+    app._show_ready()
+    assert app._visible is True
+    assert app._alpha == 1.0
+    assert app._startup_hidden is False
+
+
+def test_main_shows_error_dialog_when_startup_fails(gui, monkeypatch, tmp_path, capsys):
+    """Если сборка окна упала, пользователь видит ошибку, а не исчезнувшее приложение."""
+    import tkinter
+
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path))
+    tkinter.messagebox.errors.clear()
+    shown: list[object] = []
+
+    class BrokenApp(gui.SurveyApp):
+        def _show_ready(self) -> None:
+            shown.append(self)
+            super()._show_ready()
+
+    # Окно «недособрано» до подмены SurveyApp: внутри main() оно уже недоступно,
+    # его возвращает модульная ссылка _STARTUP_WINDOW.
+    broken = BrokenApp()
+    broken._startup_hidden = True
+    broken._visible = False
+    broken.attributes("-alpha", 0.0)
+    shown.clear()  # сборка выше сама звала _show_ready; дальше важен только показ при сбое
+
+    def _raise():
+        gui._STARTUP_WINDOW = broken
+        raise RuntimeError("сборка окна упала")
+
+    monkeypatch.setattr(gui, "SurveyApp", _raise)
+    assert gui.main() == 1
+    assert len(shown) == 1                      # частично собранное окно показано
+    assert shown[0]._visible is True
+    assert (tmp_path / "tsai_crash.log").exists()
+    assert tkinter.messagebox.errors, "нет диалога об ошибке запуска"
+    title, message = tkinter.messagebox.errors[0]
+    assert "сбой запуска" in title
+    assert "сборка окна упала" in message
+    assert str(tmp_path / "tsai_crash.log") in message
+    assert gui._STARTUP_WINDOW is None
+    assert "сборка окна упала" in capsys.readouterr().err
 
 
 def test_main_returns_success_after_mainloop(gui, monkeypatch):

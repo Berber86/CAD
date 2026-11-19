@@ -5128,3 +5128,131 @@ def test_failed_drawing_callout_is_prioritized_in_status(gui):
     second = DrawResult(plan=plan, text_count=0, layers={}, warnings=["не удалось создать пометку автоисправления стороны #1"])
     app._handle_event("scene_drawn", ([("черновик", first), ("основной", second)], ""))
     assert "пометку автоисправления" in app.status_var.get()
+
+
+@pytest.mark.parametrize("mode", ["Локально", "Эконом", "ИИ"])
+def test_doubt_checkbox_is_available_in_all_modes_and_saves(gui, mode):
+    import json
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"ui": {"theme": "lavender"}, "api": {"providers": {"hydra": {"api_key": "keep"}}}}), encoding="utf-8")
+    app = gui.SurveyApp()
+    app._on_run_mode_clicked(mode)
+    assert app.doubt_settings_card._gridded
+    assert app.ask_on_doubt_check.master is app.doubt_settings_card
+    assert app.ask_on_doubt_check._gridded
+    app.ask_on_doubt_var.set(False)
+    app.ask_on_doubt_check.cget("command")()
+    data = json.loads(gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert data["ui"]["theme"] == "lavender"
+    assert data["api"]["providers"]["hydra"]["api_key"] == "keep"
+    assert data["api"]["ask_on_doubt"] is False
+    restarted = gui.SurveyApp()
+    assert restarted.ask_on_doubt_var.get() is False
+    restarted.ask_on_doubt_var.set(True)
+    restarted.ask_on_doubt_check.cget("command")()
+    assert gui.SurveyApp().ask_on_doubt_var.get() is True
+
+
+def test_doubt_checkbox_save_failure_keeps_previous_value_and_file(gui, monkeypatch):
+    app = gui.SurveyApp()
+    gui.LOCAL_CONFIG_PATH.write_text('{broken', encoding="utf-8")
+    app.ask_on_doubt_var.set(False)
+    app.ask_on_doubt_check.cget("command")()
+    assert app.ask_on_doubt_var.get() is True
+    assert "не сохранена" in app.status_var.get()
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == '{broken'
+
+
+def test_ambiguous_109_is_not_changed_and_unchecked_does_not_prompt(gui, monkeypatch):
+    from tkinter import messagebox
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES
+    original = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    changed = original.replace('S 14°39\'40" E, 100.00 feet', 'S 14°39\'40" E, 109.00 feet')
+    assert changed != original
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", changed)
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: pytest.fail("вопросы должны быть выключены"))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 109.0
+    assert app._preview_main_plan.closure.distance == pytest.approx(9.0)
+    assert not app._preview_main_plan.description.segments[0]._auto_corrections
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 1 and drawn[0].description.segments[0].distance_ft == 109.0
+
+
+def test_auto_fix_does_not_open_typo_question_but_independent_risk_can_prompt(gui, monkeypatch):
+    from tkinter import messagebox
+    from test_clear_typo_autofix import RECT
+    text = RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west")
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", text)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].degrees == 31
+    assert app._preview_main_plan.description.segments[0]._auto_corrections
+    # Реальная оставшаяся невязка (0.41 ft) и другие проблемы формы — отдельное сомнение.
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
+    app._start(parse_only=False)
+    assert prompts and "невязка" in prompts[0].lower()
+    assert "Отрисовка отменена" in app.status_var.get()
+
+
+def test_doubt_checkbox_atomic_failure_does_not_damage_other_local_data(gui, monkeypatch):
+    original = '{"ui":{"theme":"blue"}, "api":{"ask_on_doubt": true, "secret":"keep"}}'
+    gui.LOCAL_CONFIG_PATH.write_text(original, encoding="utf-8")
+    app = gui.SurveyApp()
+    def fail(*args):
+        raise OSError("не удалось заменить файл")
+    monkeypatch.setattr(gui.local_settings.os, "replace", fail)
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    assert app.ask_on_doubt_var.get() is True
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == original
+    assert not list(gui.LOCAL_CONFIG_PATH.parent.glob(".setting-*.tmp"))
+    assert "не сохранена" in app.status_var.get()
+
+
+def test_doubt_checkbox_reports_open_question_needs_resolving(gui):
+    app = gui.SurveyApp()
+    app.pending_doubt = {"parse_only": True}
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    assert "Уже открытое сомнение" in app.status_var.get()
+    assert app.pending_doubt is not None
+
+
+def test_checked_ambiguous_109_not_modified_and_warns_before_drawing(gui, monkeypatch):
+    from tkinter import messagebox
+    from llm_parser import ASPENWALL_SAMPLES
+    text = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"].replace(
+        'S 14°39\'40" E, 100.00 feet', 'S 14°39\'40" E, 109.00 feet')
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", text)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app._preview_main_plan.description.segments[0].distance_ft == 109.0
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
+    app._start(parse_only=False)
+    assert len(prompts) == 1 and "невязка" in prompts[0].lower()
+    assert "Отрисовка отменена" in app.status_var.get()

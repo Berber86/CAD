@@ -104,6 +104,7 @@ from conflict_resolver import (
 from feature_labeler import feature_settings
 from version import APP_STAMP, APP_VERSION
 import log_mode
+import local_settings
 import offsets
 import start_source
 import ui_theme
@@ -1254,10 +1255,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=THEME["text_dim"],
             anchor="w",
-        ).grid(row=2, column=0, sticky="w", pady=(4, 4))
+        ).grid(row=3, column=0, sticky="w", pady=(4, 4))
 
         keys_frame = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        keys_frame.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        keys_frame.grid(row=4, column=0, sticky="ew", pady=(2, 6))
         keys_frame.grid_columnconfigure(0, weight=1)
         for col, pid in enumerate(self.provider_ids):
             card = ctk.CTkFrame(
@@ -1318,7 +1319,7 @@ class SurveyApp(ctk.CTk):
             self.provider_key_buttons[pid] = btn
 
         vault_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        vault_row.grid(row=4, column=0, sticky="ew", pady=(10, 4))
+        vault_row.grid(row=5, column=0, sticky="ew", pady=(10, 4))
         vault_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -1394,7 +1395,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        start_card.grid(row=5, column=0, sticky="ew", pady=(10, 4))
+        start_card.grid(row=6, column=0, sticky="ew", pady=(10, 4))
         start_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             start_card,
@@ -1430,7 +1431,7 @@ class SurveyApp(ctk.CTk):
 
         theme_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
                                   border_width=1, border_color=THEME["border_subtle"])
-        theme_card.grid(row=6, column=0, sticky="ew", pady=(4, 10))
+        theme_card.grid(row=7, column=0, sticky="ew", pady=(4, 10))
         theme_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(theme_card, text="ТЕМА ИНТЕРФЕЙСА",
                      font=ctk.CTkFont(size=10, weight="bold"),
@@ -1449,9 +1450,31 @@ class SurveyApp(ctk.CTk):
                      anchor="w", justify="left", wraplength=400).grid(
                          row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
+        # Отдельно от ИИ: эта настройка влияет также на локальный разбор.
+        self.doubt_settings_card = ctk.CTkFrame(
+            drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        self.doubt_settings_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.doubt_settings_card.grid_columnconfigure(0, weight=1)
+        self.ask_on_doubt_check = ctk.CTkCheckBox(
+            self.doubt_settings_card, text="Спрашивать при сомнении",
+            variable=self.ask_on_doubt_var, command=self._on_ask_on_doubt_changed,
+            checkbox_width=18, checkbox_height=18, fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"], font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.ask_on_doubt_check.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(
+            self.doubt_settings_card,
+            text="Включено: спрашивать при оставшихся сомнениях. Выключено: показывать замечания без вопросов. Однозначные автоисправления отмечаются на чертеже.",
+            font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
+            anchor="w", justify="left", wraplength=400,
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        ai_card.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        ai_card.grid(row=2, column=0, sticky="ew", pady=(0, 4))
         ai_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -1492,8 +1515,8 @@ class SurveyApp(ctk.CTk):
             self.llm_policy_row,
             text=(
                 "Независимые запросы идут параллельно. Расхождение откроет панель выбора, "
-                "совпадение — построит участок сразу. Консенсус 2+ проходов защищает цифры "
-                "документа от тихих автоподмен."
+                "совпадение — покажет результат. Автоисправленные значения отмечаются "
+                "в журнале и на основном чертеже."
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
@@ -1501,28 +1524,6 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=430,
         ).grid(row=2, column=0, sticky="w", pady=(0, 6))
-
-        toggles_card = ctk.CTkFrame(
-            self.llm_policy_row,
-            fg_color=THEME["bg_field"],
-            corner_radius=8,
-            border_width=1,
-            border_color=THEME["border_subtle"],
-        )
-        toggles_card.grid(row=3, column=0, sticky="ew", pady=(0, 2))
-        toggles_card.grid_columnconfigure(0, weight=1)
-        self.ask_on_doubt_check = ctk.CTkCheckBox(
-            toggles_card,
-            text="Спрашивать при сомнении — стоп и выбор человека при подозрении на опечатку",
-            variable=self.ask_on_doubt_var,
-            checkbox_width=18,
-            checkbox_height=18,
-            fg_color=THEME["btn_primary"],
-            hover_color=THEME["btn_primary_hover"],
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=THEME["text_main"],
-        )
-        self.ask_on_doubt_check.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 8))
 
         def _slot_card(row_i: int, title: str, hint: str, hint_color: str) -> Any:
             card = ctk.CTkFrame(
@@ -9800,6 +9801,23 @@ class SurveyApp(ctk.CTk):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _on_ask_on_doubt_changed(self) -> None:
+        """Сохраняет режим без записи в конфиг других полей и ключей."""
+        value = bool(self.ask_on_doubt_var.get())
+        previous = bool((self.config_data.get("api") or {}).get("ask_on_doubt", True))
+        try:
+            local_settings.save_value(LOCAL_CONFIG_PATH, "api", "ask_on_doubt", value)
+        except (OSError, ValueError) as exc:
+            self.ask_on_doubt_var.set(previous)
+            self._set_status(f"Настройка сомнений не сохранена: {exc}", warn=True)
+            return
+        self.config_data.setdefault("api", {})["ask_on_doubt"] = value
+        self._refresh_engine_card()
+        text = "Спрашивать при сомнении: " + ("включено" if value else "выключено")
+        if self.pending_doubt is not None:
+            text += ". Уже открытое сомнение нужно закрыть или разобрать источник заново."
+        self._set_status(text)
+
     def _on_start_source_changed(self, _label: str = "") -> None:
         """Настройка «стартовая вкладка»: пишет ui.start_source в config.json.
 
@@ -11321,7 +11339,10 @@ class SurveyApp(ctk.CTk):
             lines.append(f"💬 Ответ/наблюдение ИИ по документу: {outcome.data.anomaly_note}")
 
         lines.append("")
-        lines.append("Автоматическая подмена цифр документа заблокирована. Выберите действие:")
+        if any(getattr(seg, "_auto_corrections", ()) for seg in outcome.data.segments):
+            lines.append("Однозначное автоисправление уже применено; ниже — другие оставшиеся сомнения. Выберите действие:")
+        else:
+            lines.append("Для этого сомнения автоматическая замена не применена. Выберите действие:")
         lines.append(
             "  • «🔬 Ещё раунд LLM с фокусом на зону внимания» — модели прицельно перечитают "
             "именно спорную сторону в документе без давления «подогнать ответ»;"

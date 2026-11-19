@@ -85,3 +85,14 @@ def test_consensus_of_two_llm_passes_blocks_the_fix():
 def test_contour_that_is_already_ok_is_not_touched():
     model, _ = llm_parser.parse_with_regex(RECT, auto_repair_typos=False)
     assert llm_parser._scan_clear_lookalike_typo(model.segments) is None
+
+
+def test_ambiguous_109_and_100_do_not_get_auto_fixed_even_when_not_asking():
+    base = llm_parser.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    changed = base.replace('S 14°39\'40" E, 100.00 feet', 'S 14°39\'40" E, 109.00 feet')
+    for ask in (True, False):
+        outcome = parse_legal_description_full(text=changed, use_llm=False, ask_on_doubt=ask)
+        assert outcome.data.segments[0].distance_ft == 109.0
+        assert outcome.data.segments[2].distance_ft == 100.0
+        assert not any(seg._auto_corrections for seg in outcome.data.segments)
+        assert outcome.check.closure_ft > 8.9

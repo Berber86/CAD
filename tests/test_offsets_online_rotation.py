@@ -1,4 +1,10 @@
-"""Шаг 4, правила из присланного ориентира (4.18): «FE.O/L» для забора на линии и поворот текста вдоль границы."""
+"""
+Шаг 4: «FE.O/L» для объекта на линии участка и поворот текста вдоль границы.
+
+«O/L» включено в 4.24 по четвёртой паре заказчика (378 Mother Gaston): у Николая
+``BLDG`` / ``O/L`` в углу на фронтовой линии, ``FE.O/L`` на Geldner, ``BR.WALL`` / ``O/L``
+на Brooklyn. Поворот текста вдоль границы остался выключенным (``TEXT_FOLLOWS_BOUNDARY``).
+"""
 
 import math
 
@@ -19,9 +25,11 @@ def _house(points, handle="H1"):
     return off.Feature(kind="house", handle=handle, points=tuple(points))
 
 
-def test_online_flag_is_off_because_examples_conflict():
-    assert off.ONLINE_LABELS is False
+def test_online_flag_is_on_after_the_fourth_pair():
+    # 4.24: три чертежа из четырёх дают «O/L» у Николая — правило включено.
+    assert off.ONLINE_LABELS is True
     assert off.ONLINE_FENCE_TEXT == "FE.O/L"
+    assert off.ONLINE_TEXT == "O/L"
 
 
 @pytest.fixture
@@ -29,10 +37,10 @@ def online_on(monkeypatch):
     monkeypatch.setattr(off, "ONLINE_LABELS", True)
 
 
-def test_default_plan_keeps_on_line_fence_unlabelled():
+def test_default_plan_marks_on_line_fence():
     fence = _fence([(0.0, 15.0), (3.0, 15.0), (3.0, 25.0)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
-    assert all(it.text != "FE.O/L" for it in plan.items)
+    assert any(it.text == "FE.O/L" for it in plan.items)
 
 
 def test_fence_vertex_on_lot_line_gets_online_label(online_on):
@@ -52,7 +60,8 @@ def test_online_label_is_a_leader_next_to_the_fence(online_on):
     assert online[0].value_ft == 0.0
 
 
-def test_online_flag_off_gives_no_online_label():
+def test_online_flag_off_gives_no_online_label(monkeypatch):
+    monkeypatch.setattr(off, "ONLINE_LABELS", False)
     fence = _fence([(0.0, 15.0), (3.0, 15.0), (3.0, 25.0)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
     assert all(it.text != "FE.O/L" for it in plan.items)

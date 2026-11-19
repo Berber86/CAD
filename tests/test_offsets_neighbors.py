@@ -177,6 +177,63 @@ def test_two_line_label_repeats_prefix_but_not_the_type_name():
         assert rest and all(line.startswith("FE.") for line in rest), item.text
 
 
+def test_fence_on_the_line_is_marked_online_instead_of_a_number():
+    """
+    Забор, стоящий на самой линии участка, подписывается «FE.O/L», а не числом:
+    Geldner ``FE.O/L`` — забор на контуре, Brooklyn ``BR.WALL`` / ``O/L`` — стена.
+    """
+    fence = off.Feature("fence", "f", ((0.0, 10.0), (0.0, 30.0)))
+    pts = [(0.0, 10.0), (0.0, 30.0)]
+    plan = off.plan_offsets(
+        LOT, [fence], survey_pts=pts,
+        survey_notes=[(p, "VINYL FENCE") for p in pts],
+    )
+    texts = [item.text for item in plan.items]
+    assert "FE.O/L" in texts, texts
+    assert not [text for text in texts if text.startswith("FE.0.")], texts
+
+    saved = off.ONLINE_LABELS
+    off.ONLINE_LABELS = False
+    try:
+        off_plan = off.plan_offsets(
+            LOT, [fence], survey_pts=pts,
+            survey_notes=[(p, "VINYL FENCE") for p in pts],
+        )
+    finally:
+        off.ONLINE_LABELS = saved
+    assert off_plan.items == []
+
+
+def test_house_on_the_street_line_is_marked_online_only_there():
+    """
+    У дома «BLDG» / «O/L» стоит только на фронтовой линии (378 Mother Gaston: в углу на
+    `M-ROW-LINE`), а на боковой линии участка Николай пишет число (``BLDG`` / ``0.2'S``).
+    """
+    front = [((0.0, 0.0), (60.0, 0.0))]
+    house = off.Feature(
+        "house", "h",
+        ((10.0, 0.0), (30.0, 0.0), (30.0, 20.0), (10.0, 20.0)),
+        closed=True,
+    )
+    pts = [(10.0, 0.0), (30.0, 0.0), (30.0, 20.0), (10.0, 20.0)]
+    plan = off.plan_offsets(LOT, [house], front=front, survey_pts=pts)
+    texts = [item.text for item in plan.items]
+    assert "BLDG\nO/L" in texts, texts
+
+    # Дом в 0.2 ft от боковой (западной) линии: там подпись числом, «O/L» не ставится —
+    # в Gaston у такого угла стоит «BLDG» / «0.2'S», а не «O/L».
+    side_house = off.Feature(
+        "house", "h2",
+        ((0.2, 10.0), (20.2, 10.0), (20.2, 30.0), (0.2, 30.0)),
+        closed=True,
+    )
+    side_pts = [(0.2, 10.0), (20.2, 10.0), (20.2, 30.0), (0.2, 30.0)]
+    side_plan = off.plan_offsets(LOT, [side_house], front=front, survey_pts=side_pts)
+    side_texts = [item.text for item in side_plan.items]
+    assert not [text for text in side_texts if "O/L" in text], side_texts
+    assert [text for text in side_texts if "'E" in text], side_texts
+
+
 def test_line_block_height_matches_mtext_spacing():
     """Габарит блока считается с шагом строк MText, иначе двухстрочная подпись «выше» своей рамки."""
     _width, height = off._text_block("FE.0.2'S\n0.3'W", 1.0, off.default_text_width)

@@ -2,8 +2,8 @@
 Шаг 4, правила 4.20 (R11–R14) против настоящих оффсетов Николая на трёх полевых чертежах.
 
 Данные — архивы заказчика ``docs/primer*.zip`` (те же, что в ``test_offsets_alvine_pair.py``):
-пара «до выставления оффсетов» / «после» для 24 Alvine Avenue, 1373 East 55th Street (Brooklyn)
-и 192 Geldner Avenue. Программа видит только файл «до»; эталон — то, что Николай ДОБАВИЛ
+пара «до выставления оффсетов» / «после» для 24 Alvine Avenue, 1373 East 55th Street (Brooklyn),
+192 Geldner Avenue и 378 Mother Gaston Boulevard (Brooklyn). Программа видит только файл «до»; эталон — то, что Николай ДОБАВИЛ
 в файл «после». Оценка — в ``tests/test_field_dump.py``.
 
 Что проверяется:
@@ -40,8 +40,14 @@ from tests.test_field_dump import (
 PRIMER3 = "docs/primer3i.zip"  # 192 Geldner Avenue
 PRIMER2 = "docs/primer2i.zip"  # 1373 East 55th Street, Brooklyn
 PRIMER1 = "docs/primer1i.zip"  # 24 Alvine Avenue
+PRIMER4 = "docs/primer4i.zip"  # 378 Mother Gaston Boulevard, Brooklyn
 
-FILES = {"Geldner": PRIMER3, "Brooklyn": PRIMER2, "Alvine": PRIMER1}
+FILES = {
+    "Geldner": PRIMER3,
+    "Brooklyn": PRIMER2,
+    "Alvine": PRIMER1,
+    "Gaston": PRIMER4,
+}
 
 
 @pytest.fixture(scope="module")
@@ -324,7 +330,7 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
     Правила 4.21 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи: забор 7 → 17 (было 14 в 4.20), дом 4 → 6, лишние у дома 14 → 4.
+    Считаются подписи по четырём парам: забор 9 → 21, дом 7 → 8, лишние у дома 17 → 8.
     Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E)
     и конец длинного прогона до 6 ft (5.2'S).
     """
@@ -335,13 +341,59 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     finally:
         off.EDGE_NORMAL_OFFSETS = saved
     new = _label_totals()
-    assert old["fence"][2] == 7 and new["fence"][2] == 17
-    assert old["house"][2] == 4 and new["house"][2] == 6
-    assert old["house"][3] == 14 and new["house"][3] == 4
+    assert old["fence"][2] == 9 and new["fence"][2] == 21
+    assert old["house"][2] == 7 and new["house"][2] == 8
+    assert old["house"][3] == 17 and new["house"][3] == 8
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
         assert new[kind][3] <= 0.5 * new[kind][0], kind
+
+
+def test_fourth_pair_mother_gaston_scores_by_the_same_rules(results):
+    """
+    378 Mother Gaston (4-я пара заказчика): лист «после» сдвинут на 1440 ft и повёрнут на
+    0.03° относительно «до», поэтому эталон переводится в систему «до» по общим ручкам.
+    Пока перевод шёл в обратную сторону (``_to_before`` применял подобие «до → после»),
+    с этим чертежом сравнивать было нечем: 0 совпадений. После исправления правила
+    находят 4 подписи забора из 6 и 2 подписи дома из 5.
+
+    У дома на этом листе правила ставят 6 подписей при 5 у Николая (лишних 4 — 80% эталона
+    этого файла; суммарно по четырём парам H17 выполняется: 8 из 20). Причина — плотная
+    городская застройка: куски стен и навесы (`ST-OHED`) распознаются как дом, и подпись
+    ложится рядом с чужой вершиной (``2.7'S`` там, где у Николая ``FE.2.2'S``).
+    """
+    file = results["Gaston"]
+    assert len([p for p in file["nikolai_labels"] if p["kind"] == "fence"]) == 6
+    assert len([p for p in file["nikolai_labels"] if p["kind"] == "house"]) == 5
+    for kind, expected in (("fence", 4), ("house", 2)):
+        got = [p for p in file["labels"] if p["kind"] == kind]
+        exp = [p for p in file["nikolai_labels"] if p["kind"] == kind]
+        assert score_labels(got, exp) == expected, kind
+    assert len([p for p in file["labels"] if p["kind"] == "house"]) == 6
+
+
+def test_after_frame_is_translated_back_into_before():
+    """Точка листа «после» переводится в систему «до» обратным подобием, а не прямым."""
+    from tests.test_field_dump import _frame_transform, _to_before
+
+    before, after = load_pair(PRIMER4)
+    transform = _frame_transform(before, after)
+    old = {str(e.get("handle")): e for e in before.get("entities", []) if e.get("handle")}
+    checked = 0
+    for entity in after.get("entities", []):
+        twin = old.get(str(entity.get("handle")))
+        if twin is None or entity.get("type") != twin.get("type"):
+            continue
+        if not entity.get("pt") or not twin.get("pt"):
+            continue
+        moved = _to_before(transform, entity["pt"][:2])
+        assert pytest.approx(moved[0], abs=0.15) == twin["pt"][0]
+        assert pytest.approx(moved[1], abs=0.15) == twin["pt"][1]
+        checked += 1
+        if checked >= 20:
+            break
+    assert checked >= 5
 
 
 def _label_totals() -> dict[str, list[int]]:

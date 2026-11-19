@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.23"
+STEP4_VERSION = "4.24"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -98,14 +98,18 @@ def building_height_ft(
     return default
 
 
+def _vertex_on_segments(vertex: Point, segments: Sequence[tuple[Point, Point]], tol: float) -> bool:
+    """Вершина лежит на одном из отрезков (в пределах допуска)."""
+    if tol <= 0:
+        return False
+    return any(_point_segment_distance(vertex, seg) <= tol for seg in segments)
+
+
 def _vertex_on_ring(vertex: Point, ring: Sequence[Point], tol: float) -> bool:
     """Вершина лежит на контуре участка (в пределах допуска)."""
     if len(ring) < 2 or tol <= 0:
         return False
-    for start, end in zip(ring, list(ring[1:]) + [ring[0]]):
-        if _point_segment_distance(vertex, (start, end)) <= tol:
-            return True
-    return False
+    return _vertex_on_segments(vertex, list(zip(ring, list(ring[1:]) + [ring[0]])), tol)
 
 
 def offset_height_ft(kind: str, scale: float = BASE_SCALE) -> float:
@@ -404,11 +408,15 @@ SECOND_SIDE_FT = 2.0
 #: Забор, у которого вершина стоит на линии участка (до MIN_OFFSET_FT), подписывается «FE.O/L» — «на линии».
 #: За: 192 Geldner, забор слева посередине (вершина в 0.001 ft от границы) — у Николая «FE.O/L».
 #: Против: на Brooklyn (4.10) такая вершина не подписана «O/L», забор подписан по другим вершинам.
-#: Противоречивые эталоны — выключено по умолчанию, как CORNER_LABELS и WALL_OFFSETS.
-#: 4.23: в трёх парах (Geldner, Brooklyn, Alvine) ни одна вершина забора не лежит на контуре
-#: участка — ближайшая 0.05+ ft, поэтому включать нечего; путь в ``_plan_edge_labels`` готов.
-ONLINE_LABELS = False
+#: 4.24 (четвёртая пара, 378 Mother Gaston): включаем. Николай пишет «O/L» там, где объект стоит
+#: на линии: Geldner ``FE.O/L``, Brooklyn ``BR.WALL`` / ``O/L``, Gaston ``BLDG`` / ``O/L`` дважды.
+#: У дома и стены — только на фронтовой линии (`M-ROW-LINE`), у забора — на любом контуре:
+#: на боковых линиях участка Gaston дом подписан числом (``BLDG`` / ``0.2'S``), а не «O/L».
+#: Числовая подпись у такой вершины не ставится: смещения нет.
+ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
+#: Вторая строка подписи «на линии» у дома и стены: ``BLDG`` / ``O/L`` (378 Mother Gaston).
+ONLINE_TEXT = "O/L"
 #: Текст без выноски поворачивается вдоль ближайшей границы (R10). Выключено: на эталонах угол следует за
 #: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
 #: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
@@ -631,6 +639,15 @@ def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
     east = dx * ex + dy * ey
     scores = {"N": north, "S": -north, "E": east, "W": -east}
     return max(scores, key=lambda letter: scores[letter])
+
+
+def online_text(kind: str) -> str:
+    """Подпись объекта, стоящего на линии участка: ``FE.O/L``, ``BLDG`` / ``O/L``, ``WALL`` / ``O/L``."""
+    if kind == "fence":
+        return ONLINE_FENCE_TEXT
+    if kind == "wall":
+        return f"WALL\n{ONLINE_TEXT}"
+    return f"BLDG\n{ONLINE_TEXT}"
 
 
 def offset_prefix(kind: str) -> str:
@@ -1208,6 +1225,7 @@ def plan_offsets(
         if EDGE_NORMAL_OFFSETS and survey_points:
             rows_by_vertex = vertex_offset_rows(
                 feature, edge_sides, max_ft=EDGE_MAX_FT, ring=ring, north_deg=north_deg,
+                keep_online=ONLINE_LABELS,
             )
             if feature.kind == "fence" and FENCE_END_MAX_FT > EDGE_MAX_FT:
                 # Конец длинного прогона забора Николай подписывает и в 5–6 ft от стороны
@@ -1258,6 +1276,9 @@ def plan_offsets(
                 boundary_segs=boundary_segs, lines=lines, known=known, placed=placed,
                 width_of=width_of, dup_radius=dup_radius, text_rects=text_rects,
                 known_in_plan=known_in_plan, exempt=frozenset(crossings),
+                front_segs=tuple(
+                    (tuple(line[0]), tuple(line[-1])) for line in front if len(line) >= 2
+                ),
             )
             continue
         candidates = [
@@ -1410,6 +1431,7 @@ def _plan_edge_labels(
     known_in_plan: list[tuple[str, Point, float]] | None = None,
     exempt: frozenset[Point] = frozenset(),
     height: float | None = None,
+    front_segs: Sequence[tuple[Point, Point]] = (),
 ) -> None:
     """
     Подписи объекта по правилам R11–R13: каждая снятая вершина у границы подписывается по
@@ -1620,36 +1642,61 @@ def _plan_edge_labels(
         plan.items.append(item)
         known.append((item.text, item.point, item.height_ft))
         known_in_plan.append((item.text, vertex, item.height_ft))
-    if ONLINE_LABELS and feature.kind == "fence":
-        # Забор идёт по самой границе: смещения нет, и обычная подпись не появляется.
-        # Николай пишет там «FE.O/L» — тип и признак «на линии».
-        for vertex, rows in cells:
-            # «На линии» — ближайшая сторона участка проходит по самой вершине: смещения нет
-            # вовсе (меньше MIN_OFFSET_FT), а не «маленькое смещение» вроде 0.1'.
-            if not rows or min(row.value_ft for row in rows) > MIN_OFFSET_FT:
-                continue
-            if not _vertex_on_ring(vertex, ring, ONLINE_TOL_FT):
-                continue
-            o_l_text = ONLINE_FENCE_TEXT
-            spot = _place_leader(
-                vertex, vertex, o_l_text, height, width_of, ok_strict, factor
-            ) or _place_leader(
-                vertex, vertex, o_l_text, height, width_of, ok, factor
+    if ONLINE_LABELS:
+        # Объект стоит на самой линии участка: смещения нет, и числовая подпись не появляется.
+        # Николай пишет в таком месте «FE.O/L» у забора, «BLDG» / «O/L» у дома (378 Mother
+        # Gaston, дважды) и «WALL» / «O/L» у стены (Brooklyn). «На линии» — ближайшая сторона
+        # проходит по самой вершине (ближе MIN_OFFSET_FT), а не «маленькое смещение» вроде 0.1'.
+        online: dict[Point, list[EdgeRow]] = {
+            vertex: rows
+            for vertex, rows in cells
+            if rows
+            and min(row.value_ft for row in rows) <= MIN_OFFSET_FT
+            and _vertex_on_ring(vertex, ring, ONLINE_TOL_FT)
+        }
+        if feature.kind != "fence" and front_segs:
+            # У дома и стены «O/L» Николай пишет только на фронтовой линии (улице): в 378
+            # Mother Gaston — в углу на `M-ROW-LINE`, а на боковых линиях участка — число.
+            online = {
+                vertex: rows
+                for vertex, rows in online.items()
+                if _vertex_on_segments(vertex, front_segs, ONLINE_TOL_FT)
+            }
+        if online:
+            # Одна подпись на объект: у Николая на четыре рядом стоящих строения в углу
+            # участка приходится две подписи, а не четыре.
+            vertex = min(online, key=lambda point: cells.index((point, online[point])))
+            o_l_text = online_text(feature.kind)
+            same_near = any(
+                _key(old) == _key(o_l_text) and math.dist(p, vertex) <= dup_radius
+                for old, p, _h in known
             )
-            if spot is None:
-                plan.skipped.append((label, f"«{o_l_text}»: нет места"))
-                continue
-            center, foot = spot
-            plan.items.append(
-                OffsetItem(
-                    kind=feature.kind, value_ft=0.0, direction="", style="leader",
-                    height_ft=height, anchor=vertex, target=vertex, text=o_l_text,
-                    point=center, leader=(vertex, foot), rotation_deg=0.0,
+            spot = None
+            if not same_near:
+                spot = _place_leader(
+                    vertex, vertex, o_l_text, height, width_of, ok_strict, factor
+                ) or _place_leader(
+                    vertex, vertex, o_l_text, height, width_of, ok, factor
                 )
-            )
-            rect = _rect_at(center, *_text_block(o_l_text, height, width_of))
-            placed.append(rect)
-            fresh_rects.append(rect)
+            if spot is None:
+                if not same_near:
+                    plan.skipped.append((label, f"«{o_l_text}»: нет места"))
+            else:
+                center, foot = spot
+                plan.items.append(
+                    OffsetItem(
+                        kind=feature.kind, value_ft=0.0, direction="", style="leader",
+                        height_ft=height, anchor=vertex, target=vertex, text=o_l_text,
+                        point=center, leader=(vertex, foot), rotation_deg=0.0,
+                    )
+                )
+                rect = _rect_at(center, *_text_block(o_l_text, height, width_of))
+                placed.append(rect)
+                fresh_rects.append(rect)
+                known.append((o_l_text, center, height))
+                known_in_plan.append((o_l_text, vertex, height))
+            # Числовые подписи у вершин на линии не ставим: там у Николая только «O/L»
+            # (строка с нулевым замером отсекается основным циклом по value <= 0).
 
     if POST_PART_DEDUPE and PART_DUPLICATE_FT > 0:
         # H32: одиночная подпись не повторяет часть полной подписи того же вида объекта,
@@ -1939,6 +1986,36 @@ def feature_edge_directions(feature: Feature) -> dict[Point, list[tuple[float, f
     return out
 
 
+def _on_line_row(
+    vertex: Point, sides: Sequence[SideLine], edge_dirs: Sequence[Point],
+) -> EdgeRow | None:
+    """Строка «вершина на стороне участка»: замер 0, буква — сторона, на которой она лежит."""
+    if not sides:
+        return None
+    tol = math.cos(math.radians(EDGE_PARALLEL_TOL_DEG))
+    normals = [(-uy, ux) for ux, uy in edge_dirs]
+    best: tuple[int, float, SideLine] | None = None
+    for side in sides:
+        vx, vy = vertex[0] - side.a[0], vertex[1] - side.a[1]
+        signed = vx * side.normal[0] + vy * side.normal[1]
+        if abs(signed) >= MIN_OFFSET_FT:
+            continue
+        own = any(abs(nx * side.normal[0] + ny * side.normal[1]) >= tol for nx, ny in normals)
+        key = (0 if own else 1, abs(signed), side)
+        if best is None or key[:2] < best[:2]:
+            best = key
+    if best is None:
+        return None
+    side = best[2]
+    return EdgeRow(
+        value_ft=0.0, direction=side.letter, foot=vertex, edge_index=0,
+        side_angle_deg=math.degrees(
+            math.atan2(side.b[1] - side.a[1], side.b[0] - side.a[0])
+        ),
+        parallel=bool(best[0] == 0),
+    )
+
+
 def vertex_offset_rows(
     feature: Feature,
     sides: Sequence[SideLine],
@@ -1948,11 +2025,15 @@ def vertex_offset_rows(
     parallel_tol_deg: float | None = None,
     ring: Sequence[Point] = (),
     north_deg: float = 90.0,
+    keep_online: bool = False,
 ) -> dict[Point, list[EdgeRow]]:
     """
     Строки оффсета по каждой вершине объекта (R11, R12): основной замер и вторая строка
-    по другому краю, если он ближе ``second_ft``. Вершины на линии участка (замер меньше
-    ``MIN_OFFSET_FT``) остаются без строки — правило «на линии» выключено (``ONLINE_LABELS``).
+    по другому краю, если он ближе ``second_ft``.
+
+    Вершины на линии участка (замер меньше ``MIN_OFFSET_FT``) по умолчанию остаются без строки.
+    ``keep_online`` (``ONLINE_LABELS``) оставляет их: такие вершины подписываются не числом,
+    а ``FE.O/L`` / ``BLDG`` / ``O/L``.
     """
     if second_ft is None:
         second_ft = SECOND_EDGE_FT
@@ -1962,6 +2043,13 @@ def vertex_offset_rows(
             vertex, sides, edge_dirs=dirs, max_ft=max_ft,
             parallel_tol_deg=parallel_tol_deg, north_deg=north_deg,
         )
+        if keep_online and not rows:
+            # Вершина лежит на стороне участка: ``side_rows`` такие не возвращает вовсе.
+            # Оставляем строку с нулём — по ней ``_plan_edge_labels`` поставит «O/L».
+            row = _on_line_row(vertex, sides, dirs)
+            if row is not None:
+                out[vertex] = [row]
+            continue
         rows = [row for row in rows if row.value_ft >= MIN_OFFSET_FT]
         if not rows:
             continue

@@ -217,7 +217,8 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
 
     Имена файлов в архивах разные: ``...before.dump.json`` / ``...after.dump.json``,
     ``...перед оффсетами...final.dump.json`` / ``...ЗАВЕРШЁННЫЙ...final.dump.json``,
-    ``2) ... — копия.dump.json`` / ``3_ИТОГОВЫЙ_ФАЙЛ....final.dump.json``. Различаем по меткам
+    ``2) ... — копия.dump.json`` / ``3_ИТОГОВЫЙ_ФАЙЛ....final.dump.json`` /
+    ``3_ИТОГ_378_Mother_Gaston...dump.json``. Различаем по меткам
     в имени (``before``/``final``/``перед``), а не по порядку файлов в архиве.
     """
     with zipfile.ZipFile(zip_path) as archive:
@@ -228,7 +229,10 @@ def load_pair(zip_path: str | Path) -> tuple[dict, dict]:
         low = name.lower()
         if "before" in low or "перед_оффсетами" in low or "ручные_подписи" in low:
             before = text
-        elif any(mark in low for mark in ("after", "final", "итоговый", "завершённый", "оффсеты")):
+        elif any(
+            mark in low
+            for mark in ("after", "final", "итог", "завершённый", "оффсеты")
+        ):
             after = text
     if before is None:
         # Brooklyn: файл «до» назван «2) … — копия», «после» — «3_ИТОГОВЫЙ…».
@@ -345,9 +349,17 @@ def _frame_transform(before: dict, after: dict, tol: float = 0.15):
 
 
 def _to_before(transform, point) -> tuple[float, float]:
+    """
+    Точка листа «после» → система «до».
+
+    ``_frame_transform`` подбирает подобие «до → после» (``после = scale·rot·до + shift``),
+    поэтому перевод обратный: ``до = (после − shift)·rot / scale``. Пока направление было
+    прямым, на Brooklyn точка уезжала на 4.1 ft (внутри радиуса 6 ft — ошибка не видна),
+    а на 378 Mother Gaston со сдвигом 1440 ft сравнивать было нечем вовсе.
+    """
     import numpy as np
 
-    mapped = transform["scale"] * transform["rot"] @ np.array(point[:2], float) + transform["shift"]
+    mapped = (np.array(point[:2], float) - transform["shift"]) @ transform["rot"] / transform["scale"]
     return (float(mapped[0]), float(mapped[1]))
 
 
@@ -442,6 +454,10 @@ def plan_labels(plan) -> list[dict]:
     out = []
     for item in plan.items:
         parts = _parts(item.text.replace("\n", " "))
+        if not parts:
+            # Подпись без числа («FE.O/L», «BLDG» / «O/L») — не оффсет: у Николая такие
+            # в подсчёт не входят, и программа их в счёт не берёт.
+            continue
         kinds = {_kind_of(label) for label, _v, _d in parts}
         kind = "fence" if "fence" in kinds else "wall" if "wall" in kinds else "house"
         out.append(

@@ -482,6 +482,29 @@ def gui(monkeypatch, tmp_path):
     # tests/test_local_ocr.py (движок подменён) и отдельный тест окна.
     if hasattr(gui_module, "ocr_pages"):
         monkeypatch.setattr(gui_module.ocr_pages, "available", lambda: False)
+    # Обновление версии: резолвер источника и поиск веток ходят в GitHub API.
+    # В тестах они подменены заглушкой (без сети); тесты канала обновлений
+    # подменяют их сами на синтетический GitHub (см. tests/test_update_channel.py).
+    def _fake_resolve_update_source(source, **kwargs):
+        text = str(source or "").strip()
+        branch = text.rsplit("/", 1)[-1] if text else "main"
+        return gui_module.app_updater.ResolvedSource(
+            zip_url=f"https://codeload.github.com/Berber86/CAD/zip/refs/heads/{branch}",
+            owner="Berber86",
+            repo="CAD",
+            branch=branch,
+            state=gui_module.app_updater.STATE_STABLE,
+            description="заглушка теста",
+        )
+
+    monkeypatch.setattr(
+        gui_module.app_updater, "resolve_update_source", _fake_resolve_update_source,
+    )
+
+    def _no_network_discovery(*args, **kwargs):
+        raise AssertionError("поиск веток не должен ходить в сеть в этом тесте")
+
+    monkeypatch.setattr(gui_module.app_updater, "discover_branch", _no_network_discovery)
     monkeypatch.setattr(
         gui_module.SurveyApp, "_ask_source_role",
         lambda app, source: (
@@ -3795,7 +3818,7 @@ def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
         gui.deed_intake.collect_deeds = saved
     assert collected["neighbours"] == [30]
     assert "соседи: 30" in _step0_texts(app)[0]
-    assert "32" not in _step0_texts(app)[0].split("соседи:")[1]
+    assert "32" not in _step0_texts(app)[0].split("соседи:")[1].split(";")[0]
 
 
 def test_step0_success_enables_handover_to_step1(gui, tmp_path):
@@ -4309,12 +4332,47 @@ def test_update_section_is_the_first_scrollable_settings_entry_not_buried_at_the
     assert app.update_version_button in update_row.winfo_children()
 
 
-def test_update_version_requires_a_source_url_before_running(gui):
+def test_update_version_with_an_empty_source_finds_the_branch_itself(gui, monkeypatch):
+    """
+    4.42: пустое поле источника — не ошибка, а «найдите ветку сами».
+
+    Заказчик меняет агента раз в пару дней, а с ним имя ветки, и каждый раз правил
+    ссылку руками. Теперь поле можно не заполнять вовсе.
+    """
+    from tkinter import messagebox
+
     app = gui.SurveyApp()
     app.update_source_var.set("")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    asked: list[str] = []
+    monkeypatch.setattr(
+        messagebox, "askyesno",
+        lambda title, text, **kw: (asked.append(text) or True),
+    )
+    applied: list[str] = []
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
+        applied.append(source)
+        return gui.app_updater.UpdateResult(zip_url=source, files_written=3, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
     app._start_update_version()
-    assert not app._update_running
-    assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
+    _drain_update(app)
+
+    assert applied, "обновление не запустилось при пустом поле источника"
+    assert applied[0].endswith("/zip/refs/heads/main")
+    assert "сам" in asked[0] and "ветк" in asked[0], asked[0]
+
+
+def _drain_update(app, seconds: float = 5.0) -> None:
+    """Крутит очередь событий окна, пока рабочий поток обновления не закончит."""
+    import time
+
+    end = time.monotonic() + seconds
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
 
 
 def test_update_version_shows_download_percent_backup_and_install_stages(gui, monkeypatch):
@@ -4333,7 +4391,7 @@ def test_update_version_shows_download_percent_backup_and_install_stages(gui, mo
 
     monkeypatch.setattr(app, "_show_update_stage", spy)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         on_stage("download", 0.42, "1.0 из 2.4 МБ")
         on_stage("backup", 1.0, "файлов: 3 из 3")
         on_stage("install", 0.5, "файлов: 4 из 8")
@@ -4364,8 +4422,10 @@ def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypa
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
-        assert source == "https://github.com/Berber86/CAD/tree/main"
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
+        # 4.42: в apply_update уходит уже разобранная ссылка на архив — до неё
+        # источник проверяется резолвером (ветка, состояние «тестовая/стабильная»).
+        assert source == "https://codeload.github.com/Berber86/CAD/zip/refs/heads/main"
         if progress:
             progress("скачиваю архив обновления: https://codeload.github.com/...")
             progress("обновление завершено: заменено файлов — 7")
@@ -4393,7 +4453,7 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         return gui.app_updater.UpdateResult(
             zip_url="https://codeload...",
             files_written=42,
@@ -4422,7 +4482,7 @@ def _finish_update(app, gui, monkeypatch, files=7):
     """Запускает обновление с подменённым архивом и дожидается его конца."""
     import time
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=files, app_dir=str(app_dir))
 
     monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
@@ -4532,7 +4592,7 @@ def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         raise gui.app_updater.UpdateError("сеть недоступна")
 
     monkeypatch.setattr(gui.app_updater, "apply_update", boom)
@@ -4762,3 +4822,31 @@ def test_start_source_setting_opens_chosen_tab_and_saves_choice(gui, tmp_path, m
     app._on_start_source_changed()
     assert app.source_mode_var.get() == "📄 PDF"
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["ui"]["start_source"] == "text"
+
+
+def test_update_developer_checkbox_is_off_and_persists(gui, monkeypatch):
+    app = gui.SurveyApp()
+    saved = []
+    monkeypatch.setattr(gui, "save_config", lambda cfg: saved.append(cfg))
+    assert not app.update_developer_var.get()
+    app.update_developer_var.set(True)
+    app._persist_update_source()
+    assert saved[-1]["update"]["developer_mode"] is True
+    assert saved[-1]["update"]["auto_source_migrated"] is True
+    app.update_developer_var.set(False)
+    app._persist_update_source()
+    assert saved[-1]["update"]["developer_mode"] is False
+
+
+def test_find_branch_disables_update_and_reports_result(gui, monkeypatch):
+    app = gui.SurveyApp()
+    chosen = gui.app_updater.BranchCandidate(name="arena/example", version=(9, 0), version_text="9.0", state="stable")
+    result = gui.app_updater.DiscoveryResult(owner="Berber86", repo="CAD", chosen=chosen, message="Найдена 9.0")
+    monkeypatch.setattr(gui.app_updater, "discover_branch", lambda *a, **kw: result)
+    app._find_update_branch()
+    assert app._update_running
+    assert app.update_version_button.cget("state") == "disabled"
+    _drain_update(app)
+    assert not app._update_running
+    assert "9.0" in app.update_status_label.cget("text")
+    assert app.update_version_button.cget("state") == "normal"

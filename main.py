@@ -639,7 +639,12 @@ class SurveyApp(ctk.CTk):
         self.feature_label_result: FeatureLabelResult | None = None
 
         self.update_source_var = ctk.StringVar(
-            value=str((self.config_data.get("update") or {}).get("source_url") or "")
+            value=app_updater.initial_update_source(self.config_data)
+        )
+        #: «Я разработчик»: разрешает ставить тестовые ветки (branch_state.json).
+        #: По умолчанию выключено — обычный пользователь с тестовой ветки не обновляется.
+        self.update_developer_var = ctk.BooleanVar(
+            value=bool((self.config_data.get("update") or {}).get("developer_mode", False))
         )
         self._update_running = False
         self._step2_report_text = ""
@@ -1154,7 +1159,11 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         ctk.CTkLabel(
             update_row,
-            text="Ссылка GitHub (репозиторий, ветка или .zip), куда падают актуальные пуши",
+            text=(
+                "Источник обновления. Оставьте пустым — программа сама найдёт ветку "
+                "с наибольшей версией (тестовые ветки пропускает). Ссылка нужна, только "
+                "если хотите конкретную ветку, репозиторий или .zip."
+            ),
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1167,7 +1176,7 @@ class SurveyApp(ctk.CTk):
             height=30,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
-            placeholder_text="https://github.com/owner/repo/tree/main",
+            placeholder_text="пусто = найти автоматически (или github.com/owner/repo/tree/branch)",
         )
         self.update_source_entry.grid(row=2, column=0, sticky="ew", padx=(10, 4), pady=(0, 6))
         self.update_version_button = ctk.CTkButton(
@@ -1181,19 +1190,44 @@ class SurveyApp(ctk.CTk):
             command=self._start_update_version,
         )
         self.update_version_button.grid(row=2, column=1, padx=(0, 10), pady=(0, 6), sticky="e")
+        # «Я разработчик» — единственный способ поставить тестовую ветку.
+        self.update_developer_check = ctk.CTkCheckBox(
+            update_row,
+            text="Я разработчик: разрешить тестовые ветки",
+            variable=self.update_developer_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+            command=self._persist_update_source,
+        )
+        self.update_developer_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+        self.update_find_button = ctk.CTkButton(
+            update_row,
+            text="🔍 Найти ветку",
+            width=150,
+            height=28,
+            fg_color=THEME["btn_secondary"],
+            hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._find_update_branch,
+        )
+        self.update_find_button.grid(row=4, column=0, sticky="w", padx=10, pady=(0, 4))
         self.update_status_label = ctk.CTkLabel(
             update_row,
-            text=f"Текущая версия: {APP_VERSION} ({APP_STAMP})",
+            text=self._update_channel_text(),
             anchor="w",
             justify="left",
             wraplength=394,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
         )
-        self.update_status_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+        self.update_status_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
         self.update_progress_bar = ctk.CTkProgressBar(update_row, height=8)
         self.update_progress_bar.set(0)
-        self.update_progress_bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        self.update_progress_bar.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
         self.update_progress_bar.grid_remove()  # показываем только во время обновления
         ctk.CTkLabel(
             update_row,
@@ -1208,7 +1242,7 @@ class SurveyApp(ctk.CTk):
             wraplength=394,
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
 
         # Откат на резервную копию предыдущей версии (на случай критического бага).
         self.rollback_status_label = ctk.CTkLabel(
@@ -1220,7 +1254,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
         )
-        self.rollback_status_label.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.rollback_status_label.grid(row=8, column=0, sticky="w", padx=10, pady=(0, 4))
         self.rollback_button = ctk.CTkButton(
             update_row,
             text="↩ Откатиться на старую версию",
@@ -1231,7 +1265,7 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._start_rollback,
         )
-        self.rollback_button.grid(row=6, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
+        self.rollback_button.grid(row=8, column=1, padx=(0, 10), pady=(0, 4), sticky="e")
         self._refresh_rollback_state()
 
         ctk.CTkLabel(
@@ -5772,38 +5806,73 @@ class SurveyApp(ctk.CTk):
         binder("<Return>", self._persist_update_source, add="+")
 
     def _persist_update_source(self, event: Any = None) -> None:
+        """Пишет в config.json источник обновления и галочку «Я разработчик»."""
         try:
             cfg = copy.deepcopy(self.config_data)
-            cfg.setdefault("update", {})["source_url"] = str(self.update_source_var.get() or "").strip()
+            section = cfg.setdefault("update", {})
+            section["source_url"] = str(self.update_source_var.get() or "").strip()
+            section["developer_mode"] = bool(self.update_developer_var.get())
+            section["auto_source_migrated"] = True
             save_config(cfg)
             self.config_data = cfg
         except Exception as exc:  # noqa: BLE001 - retain UI operation if disk is read-only
-            self._set_status(f"Не удалось сохранить ссылку обновления: {exc}", warn=True)
+            self._set_status(f"Не удалось сохранить настройки обновления: {exc}", warn=True)
+
+    def _update_repo(self) -> str:
+        """Репозиторий для автопоиска ветки: настройка ``update.repo`` или Berber86/CAD."""
+        section = self.config_data.get("update") if isinstance(self.config_data, dict) else None
+        repo = str((section or {}).get("repo") or "").strip()
+        return repo or app_updater.DEFAULT_UPDATE_REPO
+
+    def _update_channel_text(self) -> str:
+        """
+        Строка под полем источника: версия и канал установки (стабильный/тестовый).
+
+        Канал берётся из локального ``branch_state.json`` — он приходит из архива,
+        поэтому показывает, из какой ветки поставлена текущая программа.
+        """
+        head = f"Текущая версия: {APP_VERSION} ({APP_STAMP})"
+        try:
+            state, note, _version = app_updater.local_branch_state(self._update_dir())
+        except Exception:  # noqa: BLE001 - подпись не должна ронять сборку окна
+            return head
+        word = {
+            app_updater.STATE_TEST: "канал: тестовая ветка",
+            app_updater.STATE_STABLE: "канал: стабильная ветка",
+        }.get(state)
+        return f"{head} · {word}" if word else head
 
     def _start_update_version(self) -> None:
-        """Download the configured GitHub archive and forcibly unpack it over this install."""
+        """
+        Скачивает обновление и принудительно разворачивает его в папку программы.
+
+        Источник — поле в настройках; если оно пустое, ветка находится сама:
+        наибольшая ``APP_VERSION`` среди веток репозитория, пропуская помеченные
+        как тестовые (``branch_state.json``), если не включена галочка
+        «Я разработчик». Поиск и скачивание идут в рабочем потоке — окно не виснет.
+        """
         if self._update_running:
             self._set_status("Обновление уже выполняется, дождитесь завершения.", warn=True)
             return
         source = str(self.update_source_var.get() or "").strip()
-        if not source:
-            self._set_status(
-                "Укажите ссылку на GitHub (репозиторий, ветку или .zip) в настройках перед обновлением.",
-                error=True,
-            )
-            return
+        developer = bool(self.update_developer_var.get())
         self._persist_update_source()
         confirm = getattr(self, "_confirm_update_version", None)
         if callable(confirm) and not confirm(source):
             return
         app_dir = self._update_dir()
+        installed = str(APP_VERSION)
+        repo = self._update_repo()
         self._update_running = True
         self.update_version_button.configure(state="disabled", text="⏳ Обновляю…")
+        self.update_find_button.configure(state="disabled")
         self._set_rollback_enabled(False)
-        self.update_status_label.configure(
-            text=f"Скачиваю обновление из {source}…", text_color=THEME["text_dim"],
+        head = (
+            f"Ищу ветку с самой свежей версией в {repo}…"
+            if not source else f"Скачиваю обновление из {source}…"
         )
-        self._set_status(f"Обновление: скачиваю архив из {source}…")
+        self.update_status_label.configure(text=head, text_color=THEME["text_dim"])
+        self._set_status(f"Обновление: {head}")
         self._show_update_stage("download", 0.0, "подключаюсь к GitHub…")
 
         def progress(message: str) -> None:
@@ -5814,13 +5883,107 @@ class SurveyApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                result = app_updater.apply_update(source, app_dir, progress=progress, on_stage=stage)
+                resolved = app_updater.resolve_update_source(
+                    source,
+                    developer_mode=developer,
+                    installed_version=installed,
+                    repo=repo,
+                    progress=progress,
+                )
+            except app_updater.NothingToUpdate as exc:
+                # Не ошибка: просто новее ничего нет.
+                self._post("update_done", ("none", str(exc)))
+                return
+            except Exception as exc:  # noqa: BLE001 - сеть, лимиты GitHub, битый JSON
+                self._post("update_done", ("error", f"{type(exc).__name__}: {exc}"))
+                return
+            where = (
+                f"{resolved.repo_slug}, ветка {resolved.branch}"
+                + (" (тестовая)" if resolved.is_test else "")
+            )
+            self._post("update_progress", f"обновляюсь из {where}…")
+            try:
+                result = app_updater.apply_update(
+                    resolved.zip_url, app_dir, progress=progress, on_stage=stage, developer_mode=developer
+                )
             except Exception as exc:  # noqa: BLE001 - network/zip/filesystem failures
                 self._post("update_done", ("error", f"{type(exc).__name__}: {exc}"))
                 return
             self._post("update_done", ("ok", result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _find_update_branch(self) -> None:
+        """
+        Показывает, какая ветка выбралась бы для обновления, — без скачивания.
+
+        Кэш поиска сбрасывается: кнопка нужна именно чтобы увидеть свежую картину
+        (какие ветки есть, какие из них тестовые, какая версия где лежит).
+        """
+        if self._update_running:
+            self._set_status("Идёт обновление — сначала дождитесь его окончания.", warn=True)
+            return
+        app_updater.clear_discovery_cache()
+        self._update_running = True
+        self.update_version_button.configure(state="disabled")
+        developer = bool(self.update_developer_var.get())
+        installed = str(APP_VERSION)
+        repo = self._update_repo()
+        self._persist_update_source()
+        self.update_find_button.configure(state="disabled", text="⏳ Ищу…")
+        self.update_status_label.configure(
+            text=f"Ищу ветку в {repo} (галочка «Я разработчик»: "
+                 f"{'включена' if developer else 'выключена'})…",
+            text_color=THEME["text_dim"],
+        )
+
+        def progress(message: str) -> None:
+            self._post("update_progress", str(message))
+
+        def worker() -> None:
+            try:
+                owner, name = app_updater.split_repo_slug(repo)
+                found = app_updater.discover_branch(
+                    owner, name,
+                    developer_mode=developer,
+                    installed_version=installed,
+                    progress=progress,
+                )
+            except Exception as exc:  # noqa: BLE001 - сеть/лимит GitHub не роняют окно
+                self._post("update_discovery_done", ("error", f"{type(exc).__name__}: {exc}"))
+                return
+            self._post("update_discovery_done", ("ok", found))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_branch_discovery(self, status: str, payload: Any) -> None:
+        """Итог кнопки «Найти ветку»: что выбрали, что пропустили как тестовое."""
+        self._update_running = False
+        self.update_version_button.configure(state="normal")
+        self.update_find_button.configure(state="normal", text="🔍 Найти ветку")
+        if status != "ok":
+            text = f"Не удалось найти ветку: {payload}"
+            self.update_status_label.configure(text=text, text_color=THEME["err"])
+            self._set_status(text, error=True)
+            return
+        found: app_updater.DiscoveryResult = payload
+        text = found.message or "Ветка не найдена."
+        good = found.chosen is not None and found.is_newer
+        self.update_status_label.configure(
+            text=text, text_color=THEME["ok"] if good else THEME["text_dim"],
+        )
+        self._set_status(f"Поиск ветки: {text}", warn=not good)
+        if found.chosen is not None:
+            self._log_line(
+                f"Канал обновлений: {found.chosen.label()} ({found.repo_slug})",
+                level=log_mode.LEVEL_INFO,
+            )
+        for blocked in found.blocked_test:
+            self._log_line(
+                f"Пропущена тестовая ветка: {blocked.label()}"
+                + (f" — {blocked.note}" if blocked.note else ""),
+                level=log_mode.LEVEL_INFO,
+            )
 
     def _attach_child_window(self, win: Any) -> None:
         """
@@ -5850,23 +6013,38 @@ class SurveyApp(ctk.CTk):
         """Ask for confirmation before overwriting the running installation."""
         from tkinter import messagebox
 
-        return bool(
-            messagebox.askyesno(
-                "Обновить версию",
+        text = str(source or "").strip()
+        if text:
+            what = (
                 "Программа скачает архив по указанной ссылке GitHub и принудительно "
-                f"заменит файлы в текущей папке программы:\n{source}\n\n"
-                "Продолжить?",
+                f"заменит файлы в текущей папке программы:\n{text}"
             )
-        )
+        else:
+            what = (
+                f"Программа сама найдёт в {self._update_repo()} ветку с наибольшей версией "
+                "(тестовые ветки пропускаются) и принудительно заменит файлы в текущей "
+                "папке программы."
+            )
+        if bool(self.update_developer_var.get()):
+            what += "\n\nВключена галочка «Я разработчик»: тестовые ветки тоже рассматриваются."
+        return bool(messagebox.askyesno("Обновить версию", f"{what}\n\nПродолжить?"))
 
     def _finish_update_version(self, status: str, payload: Any) -> None:
         self._update_running = False
         self.update_version_button.configure(state="normal", text="🔄 Обновить версию")
+        self.update_find_button.configure(state="normal", text="🔍 Найти ветку")
         if status == "ok":
             self.update_progress_bar.set(1.0)
         else:
             self.update_progress_bar.set(0)
             self.update_progress_bar.grid_remove()
+        if status == "none":
+            # Новее ничего нет — это не ошибка: пишем спокойно и предлагаем поиск.
+            text = str(payload) or "Обновление не нужно: у вас самая свежая версия."
+            self._refresh_rollback_state()
+            self.update_status_label.configure(text=text, text_color=THEME["text_dim"])
+            self._set_status(text)
+            return
         if status == "ok":
             result: app_updater.UpdateResult = payload
             kept_note = (
@@ -9997,6 +10175,9 @@ class SurveyApp(ctk.CTk):
         elif kind == "update_done":
             status, update_payload = payload
             self._finish_update_version(status, update_payload)
+        elif kind == "update_discovery_done":
+            status, found_payload = payload
+            self._finish_branch_discovery(status, found_payload)
         elif kind == "step0_done":
             status, payload_done = payload
             self._finish_step0(status, payload_done)

@@ -34,8 +34,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+from version import APP_VERSION  # noqa: E402
 from test_field_dump import (  # noqa: E402
-    _lot_polygon, _zip_name, field_plan, load_pair, nikolai_labels, plan_labels, score_labels,
+    _kind_of, _lot_polygon, _parts, _zip_name, field_plan, load_pair, nikolai_labels, plan_labels,
+    score_labels,
 )
 
 ZIP = ROOT / "docs" / "primer5i.zip"
@@ -151,7 +153,21 @@ def label_text(label) -> str:
 def main() -> None:
     before, after = load_pair(str(ZIP))
     data, _ = field_plan(before, after)
-    ours = plan_labels(data["plan"])
+    # Наши подписи вместе с готовым местом вставки: на картинке видно не только «что подписано»,
+    # но и где именно встанет текст и какой длины будет выноска.
+    ours = []
+    for item in data["plan"].items:
+        parts = _parts(item.text.replace("\n", " "))
+        if not parts:
+            continue
+        kinds = {_kind_of(label) for label, _v, _d in parts}
+        ours.append({
+            "kind": "fence" if "fence" in kinds else "wall" if "wall" in kinds else "house",
+            "parts": [(value, direction) for _l, value, direction in parts],
+            "anchor": (float(item.anchor[0]), float(item.anchor[1])),
+            "text": item.text,
+            "item": item,
+        })
     theirs = nikolai_labels(before, after)
     pairs = match_pairs(ours, theirs)
     matched_ours = {i for i, _ in pairs}
@@ -195,7 +211,7 @@ def main() -> None:
             for other in placed
         )
 
-    def place_label(anchor_px, text, colour, font_, *, ring: bool = False):
+    def place_label(anchor_px, text, colour, font_, *, ring: bool = False, lead: bool = True):
         """Плашка с подписью и поводок к точке: перебираем места, пока не встанет свободно."""
         x, y = anchor_px
         tw = draw.textlength(text, font=font_)
@@ -222,9 +238,10 @@ def main() -> None:
             best = candidates[0]
         placed.append(best)
         # поводок от точки до ближайшего края плашки
-        ex = min(max(x, best[0]), best[2])
-        ey = min(max(y, best[1]), best[3])
-        draw.line([(x, y), (ex, ey)], fill=colour, width=2)
+        if lead:
+            ex = min(max(x, best[0]), best[2])
+            ey = min(max(y, best[1]), best[3])
+            draw.line([(x, y), (ex, ey)], fill=colour, width=2)
         fill = (220, 240, 226) if colour == GREEN else "white"
         draw.rounded_rectangle(best, radius=4, fill=fill, outline=colour, width=3)
         draw.text((best[0] + pad, (best[1] + best[3]) / 2), text, font=font_, fill=colour, anchor="lm")
@@ -232,7 +249,12 @@ def main() -> None:
     for index, label in enumerate(ours):
         # Совпавшая с Николаем подпись — зелёная рамка, без пары — синяя.
         colour = GREEN if index in matched_ours else BLUE
-        place_label(px(label["anchor"]), label_text(label), colour, font_bold)
+        item = label["item"]
+        if item.leader:
+            start, end = px(item.leader[0]), px(item.leader[1])
+            draw.line([start, end], fill=colour, width=2)
+            draw.ellipse([start[0] - 3, start[1] - 3, start[0] + 3, start[1] + 3], fill=colour)
+        place_label(px(item.point), item.text.replace("\n", " | "), colour, font_bold, lead=False)
 
     for index, label in enumerate(theirs):
         if index in matched_theirs:
@@ -251,7 +273,7 @@ def main() -> None:
     body = ImageFont.truetype(FONT_PATH, 25)
     small = ImageFont.truetype(FONT_PATH, 23)
     hits = score_labels(ours, theirs)
-    title_text = "18 Zoe Street, Staten Island — 5-я полевая пара, версия 4.27"
+    title_text = f"18 Zoe Street, Staten Island — 5-я полевая пара, версия {APP_VERSION}"
     summary_text = (
         f"граница участка — слой PL: {area:.1f} sq ft (на листе 4,470.0)   ·   "
         f"наших подписей {len(ours)}, совпало с Николаем {hits}, у него всего {len(theirs)}"

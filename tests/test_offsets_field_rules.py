@@ -19,6 +19,9 @@
 * H17: лишних подписей — не больше 50% от подписей Николая того же вида (в сумме по трём файлам).
 """
 
+import math
+import statistics
+
 import pytest
 
 import offsets as off
@@ -581,9 +584,9 @@ def test_line_clearance_flag_keeps_text_off_the_lines():
     """
     `LINE_CLEARANCE_FT` (4.28) — просвет от текста подписи до линий чертежа, в высотах текста.
 
-    У Николая текст оффсета стоит от ближайшей линии на 0.71 (дом) и 1.60 (забор); у нас без правила
-    почти треть подписей прижимается к линиям ближе 0.1 ft. Правило **выключено** (0.0): включение
-    стоит двух подписей на пяти парах (63 → 61, совпадений 35 → 33), — но работает так, как задумано.
+    У Николая текст оффсета стоит от ближайшей линии на 0.71 (дом) и 1.60 (забор); у нас почти
+    треть подписей прижимается к линиям ближе 0.1 ft. Правило **выключено** (0.0): с ним прижатых
+    подписей меньше (19 → 14), но одна подпись перестаёт влезать (63 → 62, совпадений 35 → 34).
     Замер: `docs/step4_spatial_measure.py`.
     """
     assert off.LINE_CLEARANCE_FT == 0.0
@@ -594,9 +597,33 @@ def test_line_clearance_flag_keeps_text_off_the_lines():
         tight_close, tight_total, tight_worst = _touch_stats(paths)
     finally:
         off.LINE_CLEARANCE_FT = 0.0
-    assert loose_close > 20, loose_close
+    assert loose_close > 15, loose_close
     assert tight_close < loose_close
     assert tight_total <= loose_total
     # Ни на одном чертеже подпись не стала стоять ближе к линии, чем без правила.
     for path in paths:
         assert tight_worst[path] >= loose_worst[path] - 1e-9, path
+
+
+def test_leader_length_matches_the_customer():
+    """
+    R15 (4.28): длинная выноска оффсета пробуется первой.
+
+    У Николая длина выноски от острия стрелки до края блока — 2.61 ft по 33 подписям забора
+    (p10 2.06, p90 3.23, max 3.91) и 2.59 по шести подписям дома. Прежняя лестница начиналась с
+    0 ft и давала медиану 2.01: подписи жались к объекту, а слева-справа от них оставались
+    линии. Короткие варианты остались в конце — на тесные места, иначе две подписи на пяти
+    парах перестают влезать (63 → 61). Замер: docs/step4_spatial_measure.py.
+    """
+    assert off.LEADER_DISTANCES_FT[0] >= 2.0
+    assert off.LEADER_DISTANCES_FT[-1] == 0.0 or 0.0 in off.LEADER_DISTANCES_FT
+    lengths = []
+    for path in (PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5):
+        before, after = load_pair(path)
+        data, _ = field_plan(before, after)
+        lengths += [math.dist(item.leader[0], item.leader[1])
+                    for item in data["plan"].items if item.leader]
+    # Медиана у него 2.61; допускаем 2.3–3.3, лишь бы не возвращаться к 2.0.
+    assert 2.3 <= statistics.median(lengths) <= 3.3
+    # У него десятая часть выносок короче 2.06 ft — у нас короткие тоже должны оставаться.
+    assert sum(1 for value in lengths if value < 2.2) / len(lengths) < 0.25

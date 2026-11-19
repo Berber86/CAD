@@ -148,7 +148,7 @@
   "layer_colors": {
     "property_line": 3,
     "boundary_text": 7,
-    "street_row": 5,
+    "street_row": 1,
     "neighbor_lot": 4
   },
   "feature_labeling": {

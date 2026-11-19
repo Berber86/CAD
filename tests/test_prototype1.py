@@ -454,8 +454,9 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
     assert len(space.polylines) == 0
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
-    assert len(prop_lines) == 4
+    assert len(prop_lines) == 2 * (4 - len(result.plan.street_boundary_indices))
     assert result.boundary_line_count == 4
+    assert result.boundary_copy_count == 4
     # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
     assert result.text_count == 8
     texts = {item.TextString for item in space.texts}
@@ -1245,14 +1246,15 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     assert len(space.arcs) == 1
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
-    assert len(prop_lines) == 4
-    assert len(street_lines) == 4
+    assert result.plan.street_boundary_indices == (3, 0)
+    assert len(prop_lines) == 4  # две нефасадные стороны и их копии
+    assert len(street_lines) == 8  # четыре продолжения и два фасада с копиями
     assert space.arcs[0].Layer == "D-TOPO-TEXT"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
     # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
-    assert [w for w in result.warnings if "окно листа" not in w] == []
+    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
@@ -1562,14 +1564,16 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
-    assert len(prop_lines) == 4
+    assert len(prop_lines) == 2 * (4 - len(res_main.plan.street_boundary_indices))
+    assert res_main.boundary_copy_count == 4
     assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
     assert res_main.is_neighbor is False
     assert res_left.is_neighbor is True and res_right.is_neighbor is True
+    assert res_left.boundary_copy_count == res_right.boundary_copy_count == 0
 
     # Соседи не добавляют ни одной линии улицы и создают ровно по 1 тексту в центроиде
-    assert len(street_lines) == main_lines_before - 4
+    assert len(street_lines) == main_lines_before - len(prop_lines)
     assert res_left.text_count == 1
     assert res_right.text_count == 1
     assert len(space.texts) == main_texts_before + 2
@@ -2818,10 +2822,18 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     assert first.plan is main_plan and second.plan is neighbor_plan
     assert first.text_height == main_plan.text_height
     space = app.doc.ModelSpace
-    for layer, edges in (("PL", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+    # В исходном плане и точной копии каждая сторона записана в свой слой.
+    for index, (start, end) in enumerate(main_edges):
+        layer = "M-ROW-LINE" if index in main_plan.street_boundary_indices else "PL"
         lines = [line for line in space.lines if line.Layer == layer]
-        assert len(lines) == len(edges)
-        # Перекрёсток (0, 0) плана в AutoCAD встаёт в окно листа (5000, 5000) — см. config drawing.
-        for line, (start, end) in zip(lines, edges):
-            assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
-            assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])
+        for dx in (0.0, 1000.0):
+            assert any(
+                line.StartPoint == pytest.approx([start[0] + 5000.0 + dx, start[1] + 5000.0, 0])
+                and line.EndPoint == pytest.approx([end[0] + 5000.0 + dx, end[1] + 5000.0, 0])
+                for line in lines
+            )
+    lines = [line for line in space.lines if line.Layer == "NEIGHBOR_LOT"]
+    assert len(lines) == len(neighbor_edges)
+    for line, (start, end) in zip(lines, neighbor_edges):
+        assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
+        assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])

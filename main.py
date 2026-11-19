@@ -243,8 +243,8 @@ def normalize_house_text(value: Any) -> str:
     return "\n".join(line for line in lines if line)
 
 # Premium Dark: чёрно-серые поверхности и нейтральные акценты.
-# Цвета геометрии CAD намеренно оставлены прежними: красный участок, голубые
-# соседи и жёлтые привязки несут смысл и не должны меняться при редизайне.
+# Цвета предпросмотра CAD показывают назначение: зелёный PL, красный фасад,
+# голубые соседи и жёлтые привязки.
 THEME: dict[str, str] = {
     "bg_root": "#0d0d0d",
     "bg_header": "#141414",
@@ -290,9 +290,10 @@ THEME: dict[str, str] = {
     "sky": "#9adcf8",
     "cad_grid": "#132235",
     "cad_grid_minor": "#101c2c",
-    "cad_prop": "#f87171",
+    "cad_prop": "#34d399",
+    "cad_front": "#f87171",
     "cad_neighbor": "#22d3ee",
-    "cad_street": "#475569",
+    "cad_street": "#f87171",
     "cad_street_text": "#7dd3fc",
     "cad_tie": "#fbbf24",
     "cad_hover": "#fde047",
@@ -7376,14 +7377,14 @@ class SurveyApp(ctk.CTk):
             gy_val += grid_step
             grid_guard += 1
 
-        # 1. Пунктирные линии красных линий улиц (M-ROW-LINE) + подписи улиц
+        # 1. Схематические красные линии улиц (M-ROW-LINE) + подписи улиц
         labeled_streets: set[str] = set()
         for pl in plans:
             for idx_rl, rl in enumerate(pl.lines):
                 x1, y1 = to_screen(rl.start)
                 x2, y2 = to_screen(rl.end)
                 canvas.create_line(
-                    x1, y1, x2, y2, fill=THEME["cad_street"], width=1.6, dash=(6, 4)
+                    x1, y1, x2, y2, fill=THEME["cad_street"], width=1.6
                 )
                 street_label = ""
                 if idx_rl == 0 and getattr(pl.description, "main_street", ""):
@@ -7395,7 +7396,7 @@ class SurveyApp(ctk.CTk):
                     mx, my = (x1 + x2) / 2, (y1 + y2) / 2
                     canvas.create_text(
                         mx, my - 8, text=street_label,
-                        fill=THEME["cad_street"], font=("Segoe UI", 9, "bold"),
+                        fill=THEME["cad_street_text"], font=("Segoe UI", 9, "bold"),
                     )
 
         # 2. Перекрёсток улиц (0.0, 0.0): кольцо + перекрестие + подпись
@@ -7464,7 +7465,12 @@ class SurveyApp(ctk.CTk):
                         dash=(5, 3),
                     )
                 is_hovered = self._hovered_seg_idx == idx
-                line_col = THEME["cad_hover"] if is_hovered else seg_color
+                edge_color = (
+                    THEME["cad_front"]
+                    if not focus_plan.is_neighbor and idx - 1 in focus_plan.street_boundary_indices
+                    else seg_color
+                )
+                line_col = THEME["cad_hover"] if is_hovered else edge_color
                 line_w = 3.6 if is_hovered else 2.4
                 canvas.create_line(x1, y1, x2, y2, fill=line_col, width=line_w)
                 # Узловые точки вершин: квадратики WCS (как в CADVIEW), fallback — кружочки
@@ -7476,7 +7482,7 @@ class SurveyApp(ctk.CTk):
                             vx + 3.0,
                             vy + 3.0,
                             fill=THEME["bg_editor"],
-                            outline=seg_color,
+                            outline=edge_color,
                             width=1.4,
                         )
                 else:

@@ -8,7 +8,8 @@ acad_builder.py
 Точка начала обхода (Point of Beginning) помещается в (0, 0).
 
 Отрисовывается:
-  * замкнутая полилиния участка в слое PL;
+  * отдельные линии основного участка: зелёные PL и красные M-ROW-LINE на фронте;
+  * точная копия только границы основного участка на +1000 по X;
   * подпись каждой стороны (румб + длина) вдоль линии, снаружи полигона,
     с поворотом по линии и защитой от «вверх ногами»;
   * название фасадной улицы вдоль фасадной стороны;
@@ -998,6 +999,8 @@ class DrawPlan:
     items: list[TextItem] = field(default_factory=list)
     lines: list[LineItem] = field(default_factory=list)
     boundary_lines: list[LineItem] = field(default_factory=list)
+    #: Индексы сторон, выходящих на улицу (включая вторую улицу углового участка).
+    street_boundary_indices: tuple[int, ...] = ()
     arcs: list[ArcItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -1139,6 +1142,7 @@ class DrawResult:
     handle: str | None = None
     warnings: list[str] = field(default_factory=list)
     boundary_line_count: int = 0
+    boundary_copy_count: int = 0
 
     @property
     def closure(self) -> ClosureError:
@@ -1192,6 +1196,8 @@ class DrawResult:
             self.closure.report(),
             layer_summary,
         ]
+        if self.boundary_copy_count:
+            lines.append(f"Точная копия границы: {self.boundary_copy_count} LINE, сдвиг +1000 по X")
         if self.plan.gap_points is not None:
             g0, g1 = self.plan.gap_points
             lines.append(
@@ -2438,6 +2444,22 @@ class AcadBuilder:
             if self._front_warning:
                 warnings.append(self._front_warning)
 
+        # Те же фасады, что используются при построении улиц. Второй фасад
+        # углового участка также принадлежит M-ROW-LINE, а не зелёному PL.
+        street_indices: list[int] = []
+        if not is_neighbor and front_index is not None:
+            street_indices.append(front_index)
+            cross_idx = getattr(description, "cross_street_side_index", None)
+            is_corner = cross_idx is not None or (
+                description.distance_to_corner_ft is not None
+                and description.distance_to_corner_ft <= 1e-6
+            )
+            if description.cross_street and is_corner:
+                second = (int(cross_idx) if cross_idx is not None and 0 <= int(cross_idx) < len(boundary_lines)
+                          else (front_index - 1) % len(boundary_lines))
+                if second not in street_indices:
+                    street_indices.append(second)
+
         plan_obj = DrawPlan(
             description=description,
             scale=scale,
@@ -2447,6 +2469,7 @@ class AcadBuilder:
             items=items,
             lines=row_lines,
             boundary_lines=boundary_lines,
+            street_boundary_indices=tuple(street_indices),
             arcs=arcs,
             warnings=warnings,
             notes=notes,
@@ -2559,6 +2582,64 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001 - часть свойств может быть недоступна
             pass
         return name
+
+    def _ensure_survey_layer(
+        self, doc: Any, name: str, color: int, warnings: list[str], *,
+        linetype: str | None = None,
+    ) -> str:
+        """Создать недостающий слой; существующие цвет и тип линии не менять.
+
+        Для нового PL используем ACAD_ISO10W100, увиденный в большинстве
+        предоставленных чертежей. Если AutoCAD его не загрузил — предупреждаем.
+        """
+        try:
+            layer = doc.Layers.Item(name)
+            created = False
+        except Exception:  # noqa: BLE001
+            try:
+                layer = _com_retry(doc.Layers.Add, name)
+                created = True
+            except Exception as exc:  # noqa: BLE001
+                raise AcadDrawError(f"Не удалось создать слой {name}: {exc}") from exc
+        try:
+            layer.LayerOn = True
+            layer.Freeze = False
+            layer.Lock = False
+        except Exception:  # noqa: BLE001
+            pass
+        if created:
+            try:
+                layer.color = color
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Не удалось задать цвет нового слоя {name}: {exc}")
+            if linetype:
+                try:
+                    if linetype.lower() != "continuous":
+                        try:
+                            doc.Linetypes.Item(linetype)
+                        except Exception:  # noqa: BLE001
+                            _com_retry(doc.Linetypes.Load, linetype, "acadiso.lin")
+                    layer.Linetype = linetype
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(
+                        f"Не удалось задать тип линии {linetype} для нового слоя {name}: {exc}. "
+                        "Проверьте тип линии в AutoCAD."
+                    )
+        return name
+
+    def _add_survey_line(self, model_space: Any, item: LineItem, layer: str, color: int) -> Any:
+        """Новый отрезок: заданный цвет, а рисунок линии наследуется от слоя."""
+        entity = self._add_line(model_space, item, layer)
+        try:
+            entity.Color = color
+            entity.Linetype = "ByLayer"
+        except Exception as exc:  # noqa: BLE001
+            try:
+                entity.Delete()
+            except Exception:  # noqa: BLE001
+                pass
+            raise AcadDrawError(f"Не удалось задать цвет/тип линии в слое {layer}: {exc}") from exc
+        return entity
 
     def _ensure_text_style(self, doc: Any) -> str:
         style_name = str(self.drawing_cfg.get("text_style") or "BOUNDARY")
@@ -2745,17 +2826,17 @@ class AcadBuilder:
                 text_target_layer = neighbor_layer
                 street_row_layer = neighbor_layer
             else:
-                line_layer = self._ensure_layer(
-                    doc, line_layer_name, int(colors.get("property_line", 3))
+                # Настройки защищены от обновления: новые правила имён и цветов
+                # задаём здесь независимо от старого config.json пользователя.
+                line_layer = self._ensure_survey_layer(
+                    doc, "PL", 3, warnings, linetype="ACAD_ISO10W100"
                 )
                 text_layer = self._ensure_layer(
                     doc, text_layer_name, int(colors.get("boundary_text", 7))
                 )
-                street_row_layer = text_layer
-                if geo.lines:
-                    street_row_layer = self._ensure_layer(
-                        doc, street_row_layer_name, int(colors.get("street_row", 5))
-                    )
+                street_row_layer = self._ensure_survey_layer(
+                    doc, "M-ROW-LINE", 1, warnings, linetype="Continuous"
+                )
                 if line_layer == "0":
                     warnings.append(
                         f"слой {line_layer_name} недоступен — линия нарисована в слое 0"
@@ -2770,14 +2851,54 @@ class AcadBuilder:
             if geo.lines and hasattr(model_space, "AddLine"):
                 for row_line in geo.lines:
                     try:
-                        self._add_line(model_space, row_line, street_row_layer)
+                        if not is_neighbor and not geo.print_draft:
+                            self._add_survey_line(model_space, row_line, street_row_layer, 1)
+                        else:
+                            self._add_line(model_space, row_line, street_row_layer)
                     except Exception as exc:  # noqa: BLE001
                         warnings.append(f"не удалось создать линию улицы ({row_line.kind}): {exc}")
 
             draw_as_lines = bool(drawing.get("property_as_lines", True))
             primary_entity: Any = None
             created_boundary_lines = 0
-            if draw_as_lines and geo.boundary_lines and hasattr(model_space, "AddLine"):
+            copied_boundary_lines = 0
+            if not is_neighbor and not geo.print_draft:
+                # Разные слои в одном контуре требуют отдельных LINE, даже если
+                # в старом config.json была выбрана полилиния.
+                if not geo.boundary_lines or not hasattr(model_space, "AddLine"):
+                    raise AcadDrawError("Не удалось построить границу отдельными линиями PL / M-ROW-LINE.")
+                street_indices = set(geo.street_boundary_indices)
+                if (getattr(geo.description, "front_segment_index", None) is None
+                        and not getattr(geo.description, "front_side", None)):
+                    warnings.append(
+                        "фасад выбран по настройке front_side_index: проверьте красную границу с дорогой"
+                    )
+                if not street_indices:
+                    # Совместимость с планами, созданными до появления этого поля.
+                    index = self._front_side_index(geo.description, geo.vertices, geo.ccw)
+                    if index is None or not 0 <= index < len(geo.boundary_lines):
+                        raise AcadDrawError("Не удалось определить фасадную границу участка.")
+                    street_indices.add(index)
+                for index, b_line in enumerate(geo.boundary_lines):
+                    on_street = index in street_indices
+                    layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                    line_ent = self._add_survey_line(model_space, b_line, layer, color)
+                    created_boundary_lines += 1
+                    if primary_entity is None:
+                        primary_entity = line_ent
+                    # Ровно +1000 единиц WCS по X, без соседей, текста и улиц.
+                    duplicate = dc_replace(
+                        b_line,
+                        start=(b_line.start[0] + 1000.0, b_line.start[1]),
+                        end=(b_line.end[0] + 1000.0, b_line.end[1]),
+                    )
+                    self._add_survey_line(model_space, duplicate, layer, color)
+                    copied_boundary_lines += 1
+                warnings.append(
+                    "Создана вторая граница на +1000 по X: при неоднозначном автопоиске "
+                    "в Шаге 2 укажите исходный участок вручную."
+                )
+            elif draw_as_lines and geo.boundary_lines and hasattr(model_space, "AddLine"):
                 for b_line in geo.boundary_lines:
                     line_ent = self._add_line(model_space, b_line, poly_target_layer)
                     created_boundary_lines += 1
@@ -2851,7 +2972,7 @@ class AcadBuilder:
                     "property_line": poly_target_layer,
                     "boundary_text": text_target_layer,
                 }
-                if geo.lines:
+                if geo.lines or geo.street_boundary_indices:
                     result_layers["street_row"] = street_row_layer
 
             if geo.print_draft:
@@ -2868,6 +2989,7 @@ class AcadBuilder:
                 handle=handle,
                 warnings=warnings,
                 boundary_line_count=created_boundary_lines,
+                boundary_copy_count=copied_boundary_lines,
             )
         finally:
             if self._com_owned:

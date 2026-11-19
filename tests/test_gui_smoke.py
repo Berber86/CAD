@@ -4873,7 +4873,8 @@ def test_premium_theme_readability_and_cad_colors(gui):
     assert _theme_contrast(theme["badge_v1_fg"], theme["badge_v1_bg"]) >= 4.5
     assert _theme_contrast(theme["version_fg"], theme["version_bg"]) >= 4.5
     # Geometry colors identify kinds of objects and should not change with UI skin.
-    assert theme["cad_prop"] == "#f87171"
+    assert theme["cad_prop"] == "#34d399"
+    assert theme["cad_front"] == "#f87171"
     assert theme["cad_neighbor"] == "#22d3ee"
     assert theme["cad_tie"] == "#fbbf24"
 
@@ -4923,3 +4924,14 @@ def test_neutral_customtkinter_defaults_do_not_reintroduce_blue(gui, monkeypatch
         for color in options.values():
             assert color[1:3] == color[3:5] == color[5:7], color
     assert theme["CTkSwitch"]["fg_color"] != theme["CTkSwitch"]["progress_color"]
+
+
+def test_preview_shows_green_property_and_red_front(gui):
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    plan = app._preview_main_plan
+    assert plan is not None and plan.street_boundary_indices
+    colored = [kwargs.get("fill") for kind, _coords, kwargs in app.preview_canvas.items
+               if kind == "line" and kwargs.get("width") == 2.4]
+    assert colored.count(gui.THEME["cad_front"]) == len(plan.street_boundary_indices)
+    assert colored.count(gui.THEME["cad_prop"]) == len(plan.boundary_lines) - len(plan.street_boundary_indices)

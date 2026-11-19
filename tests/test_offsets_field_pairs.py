@@ -18,11 +18,11 @@ DOCS = Path(__file__).resolve().parent.parent / "docs"
 #: имя пары → (частей у Николая, минимум совпавших частей, максимум подписей программы)
 PAIRS = {
     "primer3i.zip": (19, 14, 26),   # 192 Geldner Street (14 после 4.33: угол «F E C»)
-    "primer1i.zip": (12, 9, 16),    # 24 Alvine Avenue (9 после правила 4.31 о метке в каждой строке)
-    "primer2i.zip": (9, 7, 22),     # 1373 East 55th Street, Brooklyn (7 после 4.31)
-    "primer4i.zip": (11, 6, 13),    # 378 Mother Gaston Blvd, Brooklyn (4.30)
-    # 18 Zoe Street, Staten Island — новая пара 4.34/4.35: дом подписывается с предела 7 ft (4.35).
-    "primer5i.zip": (12, 4, 16),
+    "primer1i.zip": (12, 10, 15),   # 24 Alvine Avenue (10 после 4.37: стена дома 7.1 ft)
+    "primer2i.zip": (9, 8, 21),     # 1373 East 55th Street, Brooklyn (8 после 4.37: пятая подпись дома)
+    "primer4i.zip": (11, 6, 14),    # 378 Mother Gaston Blvd, Brooklyn (4.30)
+    # 18 Zoe Street, Staten Island — 4.34/4.35: дом с предела 7 ft; 4.37: точка съёмки 0.6 ft.
+    "primer5i.zip": (12, 5, 17),
     # 1412 East 64th Street, Brooklyn — новая пара 4.36, другой съёмщик (City Borough Land Surveying):
     # участок 25 × 100 ft, фасад дома в 0.57 ft от `M-ROW-LINE`, стены на слое `ST-WALL`.
     "primer7i.zip": (14, 10, 21),

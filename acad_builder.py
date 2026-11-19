@@ -3841,8 +3841,12 @@ class AcadBuilder:
         points = _geometry_points(feature.geometry)
         if not points:
             return None
+        closed = bool(feature.closed) if kind == "house" else False
         return offsets.Feature(
-            kind=kind, handle=f"{feature.layer}/{feature.feature_id}", points=tuple(points),
+            kind=kind,
+            handle=f"{feature.layer}/{feature.feature_id}",
+            points=tuple(points),
+            closed=closed,
         )
 
     def build_offsets(
@@ -3898,7 +3902,7 @@ class AcadBuilder:
                     "проверьте, что область выделена внутри участка"
                 )
             recognition = recognize_features(snapshot, boundary, self.cfg, "")
-            north = find_north_arrow(snapshot, self.cfg)
+            north = find_north_arrow(snapshot, self.cfg, near=boundary.polygon)
             north_deg = float(north.north_deg) if north is not None else 90.0
             features = [
                 item for item in (self._offset_feature(f) for f in recognition.features)

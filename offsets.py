@@ -362,6 +362,45 @@ ONLINE_FENCE_TEXT = "FE.O/L"
 #: Aspinwall: «WALL 0.1'E» — 284.6° (участок 14.6°). Правило «вдоль границы» не подтверждено.
 TEXT_FOLLOWS_BOUNDARY = False
 
+# --------------------------------------------------------------------------- правила 4.20 (H27–H29)
+#: Опорная точка для буквы на диагональной стороне: вектор оффсета, у которого обе составляющие больше
+#: этой доли длины, считается диагональным. Для него буква берётся по осям листа (вверх = N, вправо = E),
+#: а не по повороту стрелки севера. Осевые стороны дают ту же букву при любом севере, поэтому правило
+#: ничего не меняет для них. 4.20: Alvine «FE.1.3'W» и «FE.1.4'E» — при северe 67.563° компас даёт N/S,
+#: оси листа — W/E, как у Николая (2 из 2).
+DIAGONAL_AXIS_LETTERS = True
+#: Доля длины вектора, выше которой составляющая считается существенной (диагональ).
+DIAGONAL_SHARE = 0.25
+#: Подписи в местах, где линия забора пересекает сторону участка (H27). Николай: 192 Geldner
+#: «FE.0.7'E», «FE.1.4'E» (забор идёт вдоль восточной стороны и уходит за южную) и «FE.5.2'S»
+#: (внешний конец того же забора). 3 из 3 на 192 Geldner, 1 из 1 на Alvine (1.8'S).
+CROSSING_LABELS = True
+#: Смещение от точки пересечения до перпендикулярной стороны, при котором ставится подпись, футы.
+CROSSING_MAX_FT = 2.0
+#: Внешний конец пересекающего забора подписывается, если он ушёл за сторону больше этого, футы.
+CROSSING_OUTSIDE_MIN_FT = 0.5
+#: Угол между забором и перпендикулярной стороной, при котором пересечение считается «забором вдоль
+#: стороны», градусы. Без него на Brooklyn появляются чужие «3.6'» и «3.3'» на косых пересечениях.
+CROSSING_PARALLEL_TOL_DEG = 10.0
+#: Углы забора, стоящие у точек съёмки с описанием забора, подписываются отдельно (H28). Николай
+#: подписывает не все заборы, а углы обследованных заборов: VINYL FENCE / WOOD FENCE / C.L.F.
+#: На 192 Geldner это 9 совпадений из 10 против 3 из 10 у правила «одна вершина на забор».
+FENCE_CORNER_LABELS = True
+#: Точка съёмки считается принадлежащей углу забора, если она не дальше этого, футы.
+SURVEY_POINT_FT = 0.35
+#: Слова в описании точки съёмки, по которым угол считается углом забора. «F E C» (fence encroachment)
+#: в список не входит: на 192 Geldner Николай оффсеты у таких точек не ставит (4 из 4).
+FENCE_DESCRIPTION_WORDS = ("FENCE", "FE.", "C.L.F", "CLF")
+#: Угол забора у ворот не подписывается: у Николая на Brooklyn 2 из 2 угла с GATE без оффсета.
+GATE_SKIP_FT = 4.0
+#: Угол забора подписывается, если он не дальше этого от стороны участка, футы.
+CORNER_MAX_FT = 6.0
+#: Часть подписи (значение + буква) не дублируется у того же угла ближе этого расстояния, футы.
+PART_DUPLICATE_FT = 2.0
+#: Вторая сторона у той же вершины ищется и на продолжении стороны (H29), не дальше этого, футы.
+#: Николай: «W.FE. 0.1'E / 1.2'S» (северная сторона продолжена за восточный угол), «C.L.F. 0.6'S / 1.1'E».
+SECOND_SIDE_EXTENSION_FT = 5.0
+
 @dataclass(frozen=True)
 class Feature:
     """Объект, от которого может идти оффсет: дом, забор, стена, заезд."""
@@ -439,6 +478,25 @@ def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
     east = dx * ex + dy * ey
     scores = {"N": north, "S": -north, "E": east, "W": -east}
     return max(scores, key=lambda letter: scores[letter])
+
+
+def offset_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
+    """
+    Буква направления оффсета с учётом диагональных сторон (правило 4.20).
+
+    Для осевых сторон (вектор вдоль оси листа) буква по компасу и по осям листа совпадает. Для
+    диагональной стороны компас даёт N/S, а Николай пишет E/W (Alvine «FE.1.3'W», «FE.1.4'E» при
+    северe 67.563°). Поэтому диагональный вектор получает букву по осям листа: вверх = N, вправо = E.
+    """
+    length = math.hypot(dx, dy)
+    if (
+        DIAGONAL_AXIS_LETTERS
+        and length > 1e-12
+        and abs(dx) > DIAGONAL_SHARE * length
+        and abs(dy) > DIAGONAL_SHARE * length
+    ):
+        return compass_letter(dx, dy, 90.0)
+    return compass_letter(dx, dy, north_deg)
 
 
 def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = False) -> str:
@@ -579,6 +637,15 @@ def _segment_hits_rect(p: Point, q: Point, rect: Rect) -> bool:
 
 def _key(text: str) -> str:
     return re.sub(r"\s+", "", str(text)).upper()
+
+
+def _text_parts(text: str) -> list[tuple[float, str]]:
+    """Части подписи «значение + буква» (``0.4'N``, ``FE.1.2'S``) — для дедупликации по частям."""
+    out: list[tuple[float, str]] = []
+    for line in str(text).replace("\\P", "\n").split("\n"):
+        for match in _PART_RE.finditer(line):
+            out.append((float(match.group("value")), match.group("dir")))
+    return out
 
 
 @dataclass(frozen=True)
@@ -774,16 +841,242 @@ def _boundary_angle_deg(point: Point, segments: Sequence[tuple[Point, Point]]) -
 
 def _feature_candidates(
     ring: Sequence[Point], feature: Feature, front_lines: Sequence[Sequence[Point]],
+    *,
+    survey: Sequence[tuple[Point, str]] = (),
+    gates: Sequence[Point] = (),
+    north_deg: float = 90.0,
 ) -> list[OffsetCandidate]:
     """Кандидаты для объекта: при CORNER_LABELS — углы по параллельным сторонам, иначе ближайшая сторона."""
-    if not CORNER_LABELS or feature.kind not in ("fence", "house", "wall"):
-        return measure_candidates(ring, [feature], front=front_lines)[:]
+    base = measure_candidates(ring, [feature], front=front_lines)
+    if feature.kind not in ("fence", "house", "wall"):
+        return base[:]
+
+    def nearest() -> list[OffsetCandidate]:
+        if not base:
+            return []
+        # Вершина на самой линии не подписывается; если у объекта есть другие вершины, берём их.
+        usable = [c for c in base if c.distance_ft >= MIN_OFFSET_FT] or base
+        return [
+            min(
+                usable,
+                key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft),
+            )
+        ]
+
+    if feature.kind == "fence":
+        # 4.20: углы обследованных заборов вместо одной ближайшей вершины (H28) + пересечения (H27).
+        chosen: list[OffsetCandidate] = []
+        if FENCE_CORNER_LABELS:
+            chosen = _surveyed_fence_corners(ring, feature, survey, gates, north_deg)
+        if not chosen:
+            chosen = nearest()
+        # Вершины на самой линии не подписываются, но нужны для «FE.O/L» (ONLINE_LABELS).
+        chosen = chosen + [c for c in base if c.distance_ft < MIN_OFFSET_FT]
+        if CROSSING_LABELS:
+            for candidate in _crossing_candidates(ring, feature, north_deg, survey, gates):
+                value = round_offset_ft(candidate.distance_ft)
+                duplicate = any(
+                    math.dist(candidate.vertex, other.vertex) < 2.0
+                    and value == round_offset_ft(other.distance_ft)
+                    for other in chosen
+                )
+                if not duplicate:
+                    chosen.append(candidate)
+        return chosen
+
+    if not CORNER_LABELS:
+        return nearest()
     parallel, covered = _parallel_candidates(ring, feature)
-    rest = [
-        c for c in measure_candidates(ring, [feature], front=front_lines)
-        if c.vertex not in covered
-    ]
+    rest = [c for c in base if c.vertex not in covered]
     return parallel + rest
+
+
+def _survey_description(point: Point, survey: Sequence[tuple[Point, str]]) -> str:
+    """Описание точки съёмки в этом месте (ближайшая точка не дальше ``SURVEY_POINT_FT``)."""
+    best: tuple[float, str] | None = None
+    for spot, description in survey:
+        distance = math.dist(point, spot)
+        if distance <= SURVEY_POINT_FT and (best is None or distance < best[0]):
+            best = (distance, description)
+    return str(best[1]) if best else ""
+
+
+def _is_fence_description(description: str) -> bool:
+    text = str(description).upper()
+    return any(word in text for word in FENCE_DESCRIPTION_WORDS)
+
+
+def _segment_angle(a: Point, b: Point) -> float:
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def _angle_diff(a: float, b: float) -> float:
+    diff = abs(a - b) % math.pi
+    return min(diff, math.pi - diff)
+
+
+def _vertex_candidates(
+    ring: Sequence[Point], feature: Feature,
+) -> list[tuple[OffsetCandidate, bool]]:
+    """
+    Для каждой вершины забора — ближайшая сторона участка и признак «соседний отрезок параллелен
+    этой стороне». ``segment`` — номер отрезка объекта (для записи подписи у нужной линии).
+    """
+    out: list[tuple[OffsetCandidate, bool]] = []
+    points = list(feature.points)
+    for index, vertex in enumerate(points):
+        projections = _side_projections(vertex, ring, True)
+        if not projections:
+            continue
+        distance, foot, side = min(projections, key=lambda item: item[0])
+        inside = point_in_polygon(vertex, ring)
+        outside = 0.0 if inside else perpendicular_distance(vertex, ring, closed=True)[0]
+        side_angle = _segment_angle(ring[side], ring[(side + 1) % len(ring)])
+        parallel = False
+        for edge in (index - 1, index):
+            if 0 <= edge < len(points) - 1:
+                a, b = points[edge], points[edge + 1]
+                if math.dist(a, b) > 1e-9 and _angle_diff(_segment_angle(a, b), side_angle) <= math.radians(
+                    PARALLEL_TOL_DEG
+                ):
+                    parallel = True
+        candidate = OffsetCandidate(
+            feature=feature, vertex=vertex, distance_ft=round(distance, 4), foot=foot,
+            inside=inside, outside_ft=round(outside, 4),
+            segment=min(index, max(0, len(points) - 2)),
+        )
+        out.append((candidate, parallel))
+    return out
+
+
+def _surveyed_fence_corners(
+    ring: Sequence[Point], feature: Feature,
+    survey: Sequence[tuple[Point, str]], gates: Sequence[Point], north_deg: float,
+) -> list[OffsetCandidate]:
+    """
+    Углы забора, стоящие у точек съёмки с описанием забора (H28).
+
+    Николай подписывает не все заборы: на 192 Geldner из 10 подписей по правилу «ближайшая вершина»
+    совпали 3, а по этому правилу — 9. Углы у ворот и точки «F E C» (fence encroachment) он пропускает:
+    на Brooklyn 2 из 2 углов с GATE без оффсета. Один и тот же текст на одном заборе не повторяется.
+    """
+    if not survey:
+        return []
+    corners: list[OffsetCandidate] = []
+    seen: set[tuple[float, str]] = set()
+    for candidate, _parallel in sorted(
+        _vertex_candidates(ring, feature),
+        key=lambda item: (round_offset_ft(item[0].distance_ft), not item[0].inside, item[0].distance_ft),
+    ):
+        if candidate.outside_ft > OUTSIDE_MAX_FT:
+            continue
+        value = round_offset_ft(candidate.distance_ft)
+        if value < 0.1 or candidate.distance_ft > CORNER_MAX_FT:
+            continue
+        description = _survey_description(candidate.vertex, survey)
+        if not _is_fence_description(description):
+            continue
+        if any(math.dist(candidate.vertex, gate) <= GATE_SKIP_FT for gate in gates):
+            continue
+        letter = offset_letter(
+            candidate.vertex[0] - candidate.foot[0],
+            candidate.vertex[1] - candidate.foot[1],
+            north_deg,
+        )
+        key = (value, letter)
+        if key in seen:
+            continue
+        seen.add(key)
+        corners.append(candidate)
+    return corners
+
+
+def _crossing_candidates(
+    ring: Sequence[Point], feature: Feature, north_deg: float,
+    survey: Sequence[tuple[Point, str]] = (), gates: Sequence[Point] = (),
+) -> list[OffsetCandidate]:
+    """
+    Подписи в местах, где линия забора пересекает сторону участка (H27).
+
+    Забор, идущий вдоль одной стороны и уходящий за другую, получает подпись в точке пересечения:
+    расстояние до перпендикулярной стороны («FE.0.7'E», «FE.1.4'E» на 192 Geldner). Внешний конец
+    того же забора получает расстояние до пересечённой стороны («FE.5.2'S»). Подпись ставится только
+    если забор идёт вдоль перпендикулярной стороны: косые пересечения на Brooklyn дают чужие «3.6'».
+    """
+    if not CROSSING_LABELS:
+        return []
+    out: list[OffsetCandidate] = []
+    points = list(feature.points)
+    segments = list(zip(ring, list(ring[1:]) + [ring[0]]))
+    for edge, (a, b) in enumerate(zip(points, points[1:])):
+        rx, ry = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(rx, ry)
+        if length < 1e-9:
+            continue
+        for side, (c, d) in enumerate(segments):
+            sx, sy = d[0] - c[0], d[1] - c[1]
+            den = rx * sy - ry * sx
+            if abs(den) < 1e-12:
+                continue
+            wx, wy = c[0] - a[0], c[1] - a[1]
+            t = (wx * sy - wy * sx) / den
+            u = (wx * ry - wy * rx) / den
+            side_length = math.hypot(sx, sy)
+            # Сторона может быть продолжена за угол: забор идёт вдоль восточной стороны и уходит
+            # за южную (192 Geldner «FE.0.7'E»). Пересечение — на продолжении стороны не дальше
+            # ``LINE_EXTENSION_FT``.
+            slack = LINE_EXTENSION_FT / side_length if side_length > 1e-9 else 0.0
+            if not (-1e-9 <= t <= 1.0 + 1e-9 and -slack <= u <= 1.0 + slack):
+                continue
+            point = (a[0] + t * rx, a[1] + t * ry)
+            inside_a = point_in_polygon(a, ring)
+            inside_b = point_in_polygon(b, ring)
+            # Сторона, перпендикулярная пересечённой, вдоль которой идёт забор (забор параллелен ей).
+            best: tuple[float, Point, int] | None = None
+            if not inside_a and not inside_b:
+                for other, (e, f) in enumerate(segments):
+                    if other == side:
+                        continue
+                    if _angle_diff(_segment_angle(a, b), _segment_angle(e, f)) > math.radians(
+                        CROSSING_PARALLEL_TOL_DEG
+                    ):
+                        continue
+                    distance, foot = perpendicular_line_distance(point, [e, f], closed=False)
+                    if distance > CROSSING_MAX_FT:
+                        continue
+                    if best is None or distance < best[0]:
+                        best = (distance, foot, other)
+            if best is not None:
+                distance, foot, _other = best
+                value = round_offset_ft(distance)
+                if value >= 0.1:
+                    out.append(
+                        OffsetCandidate(
+                            feature=feature, vertex=point, distance_ft=round(distance, 4),
+                            foot=foot, inside=False, outside_ft=0.0,
+                            segment=min(edge, max(0, len(points) - 2)),
+                        )
+                    )
+            # Внешний конец пересекающего забора — расстояние до пересечённой стороны.
+            if inside_a != inside_b:
+                outside_end = a if not inside_a else b
+                # Внешний конец подписывается только у обследованного забора: на Brooklyn концы
+                # «O PORCH» и «VINYL FENCE GATE» Николай не подписал (2 из 2), на Alvine «VINYL FENCE»
+                # подписал (3.2'N), на 192 Geldner — 5.2'S.
+                if not _is_fence_description(_survey_description(outside_end, survey)):
+                    continue
+                if any(math.dist(outside_end, gate) <= GATE_SKIP_FT for gate in gates):
+                    continue
+                distance, foot = perpendicular_line_distance(outside_end, [c, d], closed=False)
+                if CROSSING_OUTSIDE_MIN_FT < distance <= OUTSIDE_MAX_FT:
+                    out.append(
+                        OffsetCandidate(
+                            feature=feature, vertex=outside_end, distance_ft=round(distance, 4),
+                            foot=foot, inside=False, outside_ft=round(distance, 4),
+                            segment=min(edge, max(0, len(points) - 2)),
+                        )
+                    )
+    return out
 
 
 def plan_offsets(
@@ -796,6 +1089,8 @@ def plan_offsets(
     north_deg: float = 90.0,
     texts: Sequence[tuple[str, Point, float]] = (),
     text_width: Callable[[str, float], float] | None = None,
+    survey: Sequence[tuple[Point, str]] = (),
+    gates: Sequence[Point] = (),
 ) -> OffsetPlan:
     """
     Шаг 4, черновик 4.5: оффсеты объектов в выбранной области.
@@ -859,10 +1154,10 @@ def plan_offsets(
         if feature.kind == "wall" and not WALL_OFFSETS:
             plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
             continue
-        candidates = [
-            c for c in _feature_candidates(ring, feature, front_lines)
-            if c.outside_ft <= OUTSIDE_MAX_FT
-        ]
+        feature_candidates = _feature_candidates(
+            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg
+        )
+        candidates = [c for c in feature_candidates if c.outside_ft <= OUTSIDE_MAX_FT]
         if not candidates:
             plan.skipped.append((label, "объект вне участка"))
             continue
@@ -882,8 +1177,13 @@ def plan_offsets(
         used: set[tuple] = set()
         rest_seen = False
         # Цели подписи: обычные кандидаты и (для забора на линии) вершина «FE.O/L».
+        # У забора 4.20 candidates уже выбраны по правилам H27/H28 (углы и пересечения) — каждый
+        # кандидат даёт свою подпись. Для дома и стены по-прежнему одна подпись на объект.
+        multi = CORNER_LABELS or (
+            feature.kind == "fence" and (FENCE_CORNER_LABELS or CROSSING_LABELS)
+        )
         targets: list[tuple[OffsetCandidate, bool]] = [
-            (best, False) for best in (candidates if CORNER_LABELS else candidates[:1])
+            (best, False) for best in (candidates if multi else candidates[:1])
         ]
         if ONLINE_LABELS and feature.kind == "fence" and on_line:
             targets.append((on_line[0], True))
@@ -903,7 +1203,7 @@ def plan_offsets(
             # Буква — с какой стороны от границы стоит объект: «FE.0.4'N» — забор севернее линии.
             # Так подписывает заказчик (проверено на Alvine 8 из 8 и Brooklyn 5 из 5).
             vx, vy = best.vertex[0] - best.foot[0], best.vertex[1] - best.foot[1]
-            direction = compass_letter(vx, vy, north_deg)
+            direction = offset_letter(vx, vy, north_deg)
             height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
             text = ONLINE_FENCE_TEXT if is_online else offset_text(feature.kind, value, direction)
             extra: list[tuple[float, str]] = []
@@ -913,23 +1213,35 @@ def plan_offsets(
                 taken = (value, direction)
                 extra = _extra_sides(best.vertex, best.foot, taken, boundaries, north_deg)
             mid = ((best.vertex[0] + best.foot[0]) / 2.0, (best.vertex[1] + best.foot[1]) / 2.0)
-            # Тот же текст рядом с вершиной, серединой выноски или той же стороной объекта — дубль.
-            fpts = list(feature.points)
-            seq_pts = fpts + [fpts[0]] if feature.kind == "house" and len(fpts) >= 3 else fpts
-            if best.segment >= 0:
-                edges = [(seq_pts[best.segment], seq_pts[best.segment + 1])]
-            else:
-                edges = list(zip(seq_pts, seq_pts[1:]))
+
+            # Тот же текст у той же вершины или середины выноски — дубль.
             if any(
-                _key(old) == _key(text) and min(
+                _key(old) == _key(text)
+                and min(
                     math.hypot(p[0] - best.vertex[0], p[1] - best.vertex[1]),
                     math.hypot(p[0] - mid[0], p[1] - mid[1]),
-                    min((_point_segment_distance(p, e) for e in edges), default=math.inf),
                 ) <= dup_radius
                 for old, p, _h in known
             ):
                 plan.skipped.append((label, f"«{text}» уже стоит рядом"))
                 continue
+
+            # Дедупликация по частям, а не по целой строке: в одной выноске бывает две части
+            # («FE.0.1'E / 1.2'S»), и вторая не должна появляться отдельной подписью у того же угла.
+            def part_near(value_ft: float, letter: str) -> bool:
+                for old_text, point, _height in known:
+                    if (value_ft, letter) in _text_parts(old_text) and min(
+                        math.hypot(point[0] - best.vertex[0], point[1] - best.vertex[1]),
+                        math.hypot(point[0] - mid[0], point[1] - mid[1]),
+                    ) <= PART_DUPLICATE_FT:
+                        return True
+                return False
+
+            own = _text_parts(text)
+            if own and all(part_near(value_ft, letter) for value_ft, letter in own):
+                plan.skipped.append((label, f"«{text}» уже стоит рядом"))
+                continue
+            extra = [pair for pair in extra if not part_near(*pair)]
 
             bounds = _area_bounds(area_pts, margin=15.0 * factor)
 
@@ -998,14 +1310,17 @@ def _extra_sides(
     """
     found: list[tuple[float, float, str]] = []
     for line, closed in boundaries:
-        # Только основание внутри стороны: продолжение за углом даёт ложные вторые части.
-        for distance, foot, _index in _side_projections(vertex, line, closed, extension_ft=0.0):
+        # H29: основание может лежать на продолжении стороны за углом (не дальше SECOND_SIDE_EXTENSION_FT).
+        # Пример: «W.FE. 0.1'E / 1.2'S» — северная сторона продолжена за восточный угол участка.
+        for distance, foot, _index in _side_projections(
+            vertex, line, closed, extension_ft=SECOND_SIDE_EXTENSION_FT
+        ):
             if math.dist(foot, best_foot) < 1e-6 or distance > SECOND_SIDE_FT:
                 continue
             value = round_offset_ft(distance)
             if value <= 0.0:
                 continue
-            direction = compass_letter(vertex[0] - foot[0], vertex[1] - foot[1], north_deg)
+            direction = offset_letter(vertex[0] - foot[0], vertex[1] - foot[1], north_deg)
             found.append((distance, value, direction))
     found.sort()
     out: list[tuple[float, str]] = []

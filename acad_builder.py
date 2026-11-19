@@ -3912,11 +3912,16 @@ class AcadBuilder:
                 (str(t.text), tuple(t.point), float(t.height or 0.0))
                 for t in snapshot.texts if not getattr(t, "hidden", False)
             ]
+            # H28: описания точек съёмки («VINYL FENCE», «WOOD FENCE», «C.L.F.») — по ним
+            # подписываются углы обследованных заборов. H29: точки «GATE» — углы у ворот пропускаются.
+            survey = [(tuple(sp.point), str(sp.description)) for sp in snapshot.survey_points]
+            gates = [tuple(t.point) for t in snapshot.texts if "GATE" in str(t.text).upper()]
             ring = list(boundary.polygon.exterior.coords)
             plan = offsets.plan_offsets(
                 ring, features, front=front, area=area, scale=scale_value,
                 north_deg=north_deg, texts=texts,
                 text_width=lambda text, height: feature_text_width(text, height, fcfg),
+                survey=survey, gates=gates,
             )
             result = OffsetRunResult(
                 plan=plan, area=list(area), scale=scale_value, north_deg=north_deg,

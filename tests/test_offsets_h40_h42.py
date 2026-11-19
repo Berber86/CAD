@@ -27,13 +27,22 @@ def test_fence_offset_has_no_leader():
         assert item.text.startswith("FE.")
 
 
-def test_fence_offset_takes_the_type_from_a_nearby_text():
-    # Рядом стоит «C.L.F.» — подпись начинается с этого типа, как у Николая («C.L.F. 0.2'S»).
+def test_fence_offset_does_not_repeat_the_type_text_standing_there():
+    # 4.25: рядом уже стоит «C.L.F.», поэтому пишем общее «FE.» — иначе в 2 ft появляется второй «C.L.F.»
+    # (у Николая тип в подписи стоит там, где он заменил старую надпись; мы чужие надписи не правим).
     texts = [("C.L.F.", (5.0, 12.0), 0.9)]
     plan = off.plan_offsets(LOT, [FENCE], north_deg=90.0, texts=texts)
     texts_out = [item.text for item in plan.items if item.kind == "fence"]
     assert texts_out
-    assert texts_out[0].startswith("C.L.F. "), texts_out[0]
+    assert texts_out[0].startswith("FE."), texts_out[0]
+
+
+def test_type_prefix_can_be_switched_on(monkeypatch):
+    monkeypatch.setattr(off, "TYPE_PREFIX_FT", 6.0)
+    texts = [("C.L.F.", (5.0, 12.0), 0.9)]
+    plan = off.plan_offsets(LOT, [FENCE], north_deg=90.0, texts=texts)
+    texts_out = [item.text for item in plan.items if item.kind == "fence"]
+    assert texts_out and texts_out[0].startswith("C.L.F. "), texts_out[0]
 
 
 def test_fence_offset_keeps_fe_prefix_without_a_nearby_type_text():

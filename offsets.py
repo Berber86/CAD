@@ -370,9 +370,19 @@ FENCE_TEXT_WITHOUT_LEADER = True
 #: Значения в подписи идут столбиком, как у Николая: тип забора строкой, под ним значения
 #: (`C.L.F.` / `0.6'S` / `1.1'E`). Одной строкой блок шире и накрывает соседние подписи.
 FENCE_TEXT_ONE_LINE = False
-#: Если рядом (6 ft) стоит подпись типа забора, подпись начинается с этого типа: `C.L.F. 0.2'S`,
-#: `W.FE. 0.6'E`, `V.FE. 0.7'E` — так у Николая (7 из 13 подписей по заборам на 192 Geldner).
-TYPE_PREFIX_FT = 6.0
+#: Повторять ли тип забора в подписи (`C.L.F. 0.2'S` вместо `FE.0.2'S`).
+#: Выключено по снимкам 4.25: у Николая тип в подписи стоит там, где он **заменил** старую надпись типа
+#: (`C.L.F.` → `C.L.F. 0.6'S 1.1'E`). Мы чужие надписи не правим, поэтому рядом с уже стоящим `C.L.F.`
+#: наш `C.L.F. 0.2'S` — это второй `C.L.F.` в двух футах. Пишем общее `FE.`, как его же
+#: `FE.1.4'E`, `FE.5.2'S`, `FE.0.1'W` на том же чертеже.
+TYPE_PREFIX_FT = 0.0
+#: Подписи одной вершины ближе этого не ставятся. Выключено: у Николая на одном углу стоят ДВЕ подписи
+#: в 1.5 ft друг от друга (`FE.1.7'S` и `C.L.F. 0.2'S` на 192 Geldner), и правило резало верные подписи
+#: (совпадений 13 → 7 на Geldner, 3 → 1 на Brooklyn).
+SAME_CORNER_FT = 0.0
+#: Зазор между подписями при раскладке, в высотах текста: с нулём блоки сходились вплотную и в AutoCAD
+#: накрывали друг друга (шрифт шире нашей оценки).
+LABEL_CLEARANCE = 0.35
 
 # --------------------------------------------------------------------------- правила 4.20 (H27–H29)
 #: Опорная точка для буквы на диагональной стороне: вектор оффсета, у которого обе составляющие больше
@@ -640,6 +650,11 @@ def house_wall_dimensions(
 def default_text_width(text: str, height: float) -> float:
     """Грубая ширина строки, если программа не передала точную (шрифт romans, ~0.6 высоты на знак)."""
     return 0.6 * float(height) * len(text)
+
+
+def _grow_rect(rect: Rect, amount: float) -> Rect:
+    """Прямоугольник с зазором по краям — подписи не должны сходиться вплотную."""
+    return (rect[0] - amount, rect[1] - amount, rect[2] + amount, rect[3] + amount)
 
 
 def _rect_at(center: Point, width: float, height: float) -> Rect:
@@ -1424,6 +1439,14 @@ def plan_offsets(
                 extra = _extra_sides(best.vertex, best.foot, taken, boundaries, north_deg)
             mid = ((best.vertex[0] + best.foot[0]) / 2.0, (best.vertex[1] + best.foot[1]) / 2.0)
 
+            # Одна подпись на вершину/калитку: вторая в трёх футах — уже наложение.
+            if feature.kind == "fence" and any(
+                math.dist(best.vertex, other.anchor) <= SAME_CORNER_FT
+                for other in plan.items
+                if other.kind == "fence"
+            ):
+                plan.skipped.append((label, "у этой вершины подпись уже стоит"))
+                continue
             # Тот же текст у той же вершины или середины выноски — дубль.
             if any(
                 _key(old) == _key(text)
@@ -1455,12 +1478,18 @@ def plan_offsets(
 
             bounds = _area_bounds(area_pts, margin=15.0 * factor)
 
+            clearance = LABEL_CLEARANCE * height
+
             def ok(rect: Rect, center: Point) -> bool:
                 if area_pts is not None and not _rect_inside_polygon(rect, area_pts):
                     return False
                 if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
                     return False
-                if any(_rects_overlap(rect, other) for other in text_rects + placed):
+                wide = _grow_rect(rect, clearance)
+                if any(
+                    _rects_overlap(wide, _grow_rect(other, clearance))
+                    for other in text_rects + placed
+                ):
                     return False
                 return not any(
                     _segment_hits_rect(a, b, rect)

@@ -389,7 +389,15 @@ def test_r14_rules_apply_only_when_the_drawing_has_survey_points():
 
 
 def test_h17_extra_labels_are_within_half_of_nikolai_in_total(results):
-    """Лишних подписей — не больше 50% от подписей Николая, по каждому виду объекта."""
+    """
+    Лишних подписей — не больше 50% от подписей Николая по заборам.
+
+    Дом идёт отдельным порогом 75%: с 4.35 действует золотое правило заказчика №6 («предела
+    расстояния нет, подписывается ближайший объект») — оно добавляет 5 подписей дома без новых
+    совпадений (47 → 47), и наш внутренний H17 оказывается превышен осознанно
+    (`docs/offset_golden_rules.md`, раздел «Что не считается отступлением»).
+    """
+    limits = {"fence": 0.5, "house": 0.75}
     for kind in ("fence", "house"):
         expected = sum(
             1 for file in results.values() for p in file["nikolai_labels"] if p["kind"] == kind
@@ -403,7 +411,7 @@ def test_h17_extra_labels_are_within_half_of_nikolai_in_total(results):
             for file in results.values()
         )
         extra = produced - hits
-        assert extra <= 0.5 * expected, (
+        assert extra <= limits[kind] * expected, (
             f"{kind}: программа поставила {produced} подписей, совпало {hits}, лишних {extra} "
             f"при {expected} у Николая"
         )
@@ -413,9 +421,10 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
     Правила 4.21–4.25 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 16 → 10
+    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 16 → 12
     (было 17 до 4.32: с пределом «подпись не дальше ``TEXT_MAX_FROM_ANCHOR_FT`` от своей вершины»
-    одна лишняя подпись дома ставится выноской у самой вершины и дублирует соседнюю).
+    одна лишняя подпись дома ставится выноской у самой вершины и дублирует соседнюю; стало 12
+    с 4.35 — золотое правило заказчика №6 добавляет подписи дома в глубине участка).
     Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E),
     конец длинного прогона до 6 ft (5.2'S) и второй угол стены с перекосом (4.25, R13d);
     по дому — вторая строка у вершины до 3 ft (4.25, R12) и запасной предел 4 ft для дома,
@@ -431,11 +440,12 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     new = _label_totals()
     assert old["fence"][2] == 9 and new["fence"][2] == 23
     assert old["house"][2] == 7 and new["house"][2] == 11
-    assert old["house"][3] == 16 and new["house"][3] == 10
+    assert old["house"][3] == 16 and new["house"][3] == 12
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
-        assert new[kind][3] <= 0.5 * new[kind][0], kind
+        # Дом — порог 75%: золотое правило заказчика №6 главнее нашего H17 (см. тест H17 выше).
+        assert new[kind][3] <= (0.75 if kind == "house" else 0.5) * new[kind][0], kind
 
 
 def test_fourth_pair_mother_gaston_scores_by_the_same_rules(results):
@@ -549,7 +559,10 @@ def test_fifth_pair_zoe_scores_by_the_same_rules(zoe):
     """
     for kind, (expected, produced, hits) in (
         ("fence", (7, 8, 3)),
-        ("house", (2, 0, 0)),
+        # С 4.35 дом на Zoe подписан по золотому правилу №6 («предела нет»): 2 подписи
+        # (потолок EDGE_FAR_MAX_FT = 10 ft), из них совпала ни одна — наш замер 6.6'S против
+        # его 6.8'S (вопрос про базу замера).
+        ("house", (2, 2, 0)),
     ):
         got = [p for p in zoe["labels"] if p["kind"] == kind]
         exp = [p for p in zoe["nikolai_labels"] if p["kind"] == kind]
@@ -821,20 +834,22 @@ def test_text_is_kept_off_the_lot_sides():
 
 def test_no_distance_limit_rule_is_measured_and_off():
     """
-    R22 (4.33, ответ заказчика 19.11.2026, вопрос 6): предела расстояния нет.
+    R22 (4.33–4.35, ответ заказчика 19.11.2026, вопрос 6): предела расстояния нет.
 
     «Предела нет, однако оффсет даётся на ближайший объект к границе участка... но если расстояние
     до следующих заборов менее 3, то даётся и на следующие заборы тоже». Правило реализовано
     (``EDGE_NEAREST_ONLY``, ``EDGE_NEAR_FT`` = 3.0): объект, ближайший к границе с этой стороны
     среди объектов своего вида, подписывается и дальше общего предела.
 
-    Замер по шести парам: подписей 78 → **83**, совпадений 47 → **47** (ни одного нового),
-    предупреждений 1 → 2, подписей дома 28 → 33 — лишних 19 при 28 подписях Николая, это 68%
-    при пороге H17 50%. Поэтому правило **выключено** и ждёт ответа заказчика: у 18 Zoe наш
-    замер той же стены 6.6 против его 6.8 ft, то есть расходится не расстояние до объекта,
-    а база замера. Замер: `docs/step4_spatial_measure.py`.
+    Замер по шести парам: подписей 78 → **82**, совпадений 47 → **47** (ни одного нового),
+    предупреждений 1 → 1, подписей дома 28 → 32 — лишних 18 при 28 подписях Николая, это 64%
+    при пороге H17 50%. Правило **включено** (4.35): ответ заказчика — золотое правило, а H17 —
+    наша внутренняя метрика; совпадения от правила не падают. Численный потолок «предела нет» —
+    `EDGE_FAR_MAX_FT` = 10 ft: без него программа подписывала стену в 30 ft от стороны. У 18 Zoe
+    наш замер той же стены 6.6 против его 6.8 ft — отдельный вопрос про базу замера.
+    `docs/offset_golden_rules.md`, правило 6. Замер: `docs/step4_spatial_measure.py`.
     """
-    assert off.EDGE_NEAREST_ONLY is False
+    assert off.EDGE_NEAREST_ONLY is True
     assert off.EDGE_NEAR_FT == pytest.approx(3.0)
     paths = [PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5, PRIMER7]
 
@@ -856,14 +871,14 @@ def test_no_distance_limit_rule_is_measured_and_off():
             house_expected += len(house_exp)
         return labels, hits, warnings, house_labels, house_hits, house_expected
 
-    base = totals()
-    off.EDGE_NEAREST_ONLY = True
+    wide = totals()
+    off.EDGE_NEAREST_ONLY = False
     try:
-        wide = totals()
+        base = totals()
     finally:
-        off.EDGE_NEAREST_ONLY = False
+        off.EDGE_NEAREST_ONLY = True
     assert base[:2] == (78, 47), base
-    assert wide[0] > base[0] and wide[1] == base[1]
-    assert wide[2] == base[2] + 1
-    # Лишние подписи дома — выше порога H17, поэтому правило выключено.
+    assert wide[:2] == (82, 47), wide
+    assert wide[2] == base[2]
+    # Лишние подписи дома — выше нашего порога H17; это осознанно: правило заказчика главнее.
     assert (wide[3] - wide[4]) > 0.5 * wide[5]

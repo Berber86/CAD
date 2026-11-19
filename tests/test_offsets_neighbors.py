@@ -50,7 +50,12 @@ def test_crossing_label_needs_both_ends_outside_the_lot():
 def test_long_fence_end_is_labeled_up_to_six_feet_from_the_side():
     """
     H33: конец длинного прогона забора подписывается и в 5.2 ft от стороны (192 Geldner).
-    Короткий 6-футовый выступ с таким же вылетом — нет (Brooklyn).
+
+    С 4.35 действует золотое правило заказчика №6: предела расстояния нет, подписывается
+    **ближайший к границе объект**. Поэтому и короткий выступ в 5.3 ft от стороны теперь
+    подписывается — он единственный объект на этой стороне. Раньше он не подписывался
+    (H33 ограничивал длинным прогоном), это поведение заменено правилом заказчика.
+    См. `docs/offset_golden_rules.md`, правило 6.
     """
     pts = [(10.0, -5.2), (10.0, 40.0)]
     long_fence = off.Feature("fence", "long", tuple(pts))
@@ -62,7 +67,16 @@ def test_long_fence_end_is_labeled_up_to_six_feet_from_the_side():
     short_fence = off.Feature("fence", "short", tuple(spur))
     plan = off.plan_offsets(LOT, [short_fence], survey_pts=spur,
                             survey_notes=[(p, "VINYL FENCE") for p in spur])
-    assert not [item for item in _items(plan) if item.value_ft > off.EDGE_MAX_FT]
+    assert [item for item in _items(plan) if item.value_ft > off.EDGE_MAX_FT]
+    # Второй забор на той же стороне, стоящий дальше 3 ft от границы и не ближайший, не подписывается.
+    behind = [(30.0, -8.0), (30.0, 30.0)]
+    plan = off.plan_offsets(
+        LOT,
+        [off.Feature("fence", "short", tuple(spur)), off.Feature("fence", "behind", tuple(behind))],
+        survey_pts=spur + behind,
+        survey_notes=[(p, "VINYL FENCE") for p in spur + behind],
+    )
+    assert not [item for item in _items(plan) if item.anchor[0] == pytest.approx(30.0)]
 
 
 def test_area_equal_to_lot_keeps_labels_next_to_the_boundary():

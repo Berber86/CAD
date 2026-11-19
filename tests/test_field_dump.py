@@ -663,7 +663,7 @@ def field_plan(before: dict, after: dict):
         scale=16.0,
         north_deg=north_deg(geometry),
         texts=[
-            (str(e.get("text")), tuple(e["pt"][:2]), float(e.get("h") or 0.0))
+            (str(e.get("text")), tuple(e["pt"][:2]), float(e.get("h") or 0.0), float(e.get("rot_deg") or 0.0))
             for e in before.get("entities", [])
             if e.get("type") in {"Text", "MText"} and e.get("pt")
         ],

@@ -3912,7 +3912,7 @@ class AcadBuilder:
                 if str(line.layer).upper() == offsets.FRONT_BOUNDARY_LAYER
             ]
             texts = [
-                (str(t.text), tuple(t.point), float(t.height or 0.0))
+                (str(t.text), tuple(t.point), float(t.height or 0.0), float(getattr(t, "rotation", 0.0) or 0.0) * 180.0 / math.pi)
                 for t in snapshot.texts if not getattr(t, "hidden", False)
             ]
             # H28: описания точек съёмки («VINYL FENCE», «WOOD FENCE», «C.L.F.») — по ним

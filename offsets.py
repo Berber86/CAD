@@ -438,8 +438,11 @@ FENCE_CORNER_LABELS = True
 #: Точка съёмки считается принадлежащей углу забора, если она не дальше этого, футы.
 SURVEY_POINT_FT = 0.35
 #: Слова в описании точки съёмки, по которым угол считается углом забора. «F E C» (fence encroachment)
-#: в список не входит: на 192 Geldner Николай оффсеты у таких точек не ставит (4 из 4).
-FENCE_DESCRIPTION_WORDS = ("FENCE", "FE.", "C.L.F", "CLF")
+#: входит с 4.33: на 192 Geldner точка (4204.4, 5002.0) описана «F E C», и Николай подписал её
+#: `C.L.F. 0.6'S / 1.1'E`. Прежняя запись «он такие точки не подписывает» проверена заново по четырём
+#: парам и оказалась неверной; замер: совпавших частей 36 против 35, лишняя подпись одна — своя же
+#: `FE.0.6'S`, остальные чертежи без изменений. Голое «FEC» и слова CHAIN/VINYL/WOOD ничего не дают.
+FENCE_DESCRIPTION_WORDS = ("FENCE", "FE.", "C.L.F", "CLF", "F E C")
 #: Угол забора у ворот не подписывается: у Николая на Brooklyn 2 из 2 угла с GATE без оффсета.
 GATE_SKIP_FT = 4.0
 #: Угол забора подписывается, если он не дальше этого от стороны участка, футы.
@@ -457,6 +460,11 @@ FENCE_END_MIN_LENGTH_FT = 20.0
 #: Короткая подпись у того же угла, чья часть уже есть в полной («FE.1.2'S» рядом с
 #: «FE.0.1'E / 1.2'S»), не ставится: это одна и та же привязка (H32).
 POST_PART_DEDUPE = True
+#: Второй заход за местом без зазора между подписями (4.33): если со зазором LABEL_CLEARANCE места нет,
+#: подпись ищется вплотную. Минимальный зазор у Николая 0.72–0.84 ft (0.8 высоты), а наша строгая
+#: проверка считает такие места занятыми. Включено: на 1373 East 55th три `FE.0.2'N / 0.3'W` находят
+#: место вплотную к чужим надписям вместо предупреждения «нет свободного места».
+LABEL_RELAXED_RETRY = True
 #: Дом подписывается по стенам, параллельным стороне участка (H34), а не одной ближайшей вершиной.
 HOUSE_WALL_LABELS = True
 #: Наибольшее расстояние от стены дома до границы, которое подписывается, футы.
@@ -904,11 +912,18 @@ def _place_house_text(
 
 def _place_leader(
     anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
-    ok: Callable[[Rect, Point], bool], factor: float,
+    ok: Callable[[Rect, Point], bool], factor: float, rotation_deg: float = 0.0,
 ) -> tuple[Point, Point] | None:
-    """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
+    """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые.
+
+    ``rotation_deg`` — поворот текста, если он встанет без выноски (4.33): место проверяется по
+    повёрнутому габариту, иначе повёрнутая подпись считалась горизонтальной и накрывала чужие надписи.
+    """
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
     width, block_h = _text_block(text, height, width_of)
+    rot = abs(round(float(rotation_deg) % 180.0))
+    if abs(rot - 90.0) <= 5.0:
+        width, block_h = block_h, width
     gap = TEXT_GAP_FACTOR * height
     for distance in LEADER_DISTANCES_FT:
         for angle in LEADER_ANGLES_DEG:
@@ -1435,7 +1450,7 @@ def plan_offsets(
     ``property_pts`` — граница участка (замкнутый контур); ``front`` — линии ``M-ROW-LINE``
     (фронтовая граница, ``M-TAX-LINE`` сюда не передаётся); ``area`` — прямоугольник, который
     указал геодезист (``None`` — весь участок); ``texts`` — уже стоящие подписи ``(текст, точка,
-    высота)``: рядом с тем же текстом оффсет не дублируется, а текст не накрывается.
+    высота[, поворот])``: рядом с тем же текстом оффсет не дублируется, а текст не накрывается.
 
     Для каждого объекта берётся ближайшая к границе вершина внутри участка; значение — до 0.1 ft.
     Дом и сарай — текст без выноски (высота 1.1), забор и стена — выноска (0.9). Текст ставится
@@ -1453,9 +1468,20 @@ def plan_offsets(
     area_pts = [(float(x), float(y)) for x, y in area] if area else None
     front_lines = [[(float(x), float(y)) for x, y in line] for line in front if len(line) >= 2]
 
-    known = [(str(t), (float(p[0]), float(p[1])), float(h) or LABEL_HEIGHT_FT * factor) for t, p, h in texts]
+    # Уже стоящие подписи: ``(текст, точка, высота)`` или ``(текст, точка, высота, поворот)``.
+    # Поворот нужен, чтобы габарит вертикальной надписи («V.FE.», «CHAIN LINK FENCE ATOP CONC. CURB»)
+    # был узким и высоким, а не широким и низким (4.33): без него подпись рядом с вертикальным
+    # текстом проверялась по неверному прямоугольнику и на 1373 East 55th накрывала его.
+    known: list[tuple[str, Point, float]] = []
     # Препятствия для текста: уже стоящие подписи и линии, которые текст не должен пересекать.
-    text_rects = [_rect_at(p, width_of(t, h), h) for t, p, h in known]
+    text_rects: list[Rect] = []
+    for entry in texts:
+        text_value = str(entry[0])
+        point = (float(entry[1][0]), float(entry[1][1]))
+        height = float(entry[2]) or LABEL_HEIGHT_FT * factor
+        rotation = float(entry[3]) if len(entry) > 3 else 0.0
+        known.append((text_value, point, height))
+        text_rects.append(_text_rect(point, text_value, height, width_of, rotation))
     lines: list[tuple[Point, Point]] = []
     for i in range(len(ring)):
         lines.append((ring[i], ring[(i + 1) % len(ring)]))
@@ -1623,14 +1649,18 @@ def plan_offsets(
 
             clearance = LABEL_CLEARANCE * height
 
+            # Второй заход (LABEL_RELAXED_RETRY) ищет место без зазора — вплотную к соседям.
+            relaxed = [False]
+
             def ok(rect: Rect, center: Point) -> bool:
                 if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
                     return False
                 if LABEL_MUST_BE_INSIDE and not point_in_polygon(center, ring):
                     return False
-                wide = _grow_rect(rect, clearance)
+                gap = 0.0 if relaxed[0] else clearance
+                wide = _grow_rect(rect, gap)
                 if any(
-                    _rects_overlap(wide, _grow_rect(other, clearance))
+                    _rects_overlap(wide, _grow_rect(other, gap))
                     for other in text_rects + placed
                 ):
                     return False
@@ -1680,14 +1710,29 @@ def plan_offsets(
                 beside = _place_beside_line(
                     best.vertex, best.foot, line_text, height, width_of, ok, rotation
                 )
+                if beside is None and LABEL_RELAXED_RETRY:
+                    # Второй заход вплотную: у Николая соседние подписи стоят в 0.8 высоты друг от друга.
+                    relaxed[0] = True
+                    beside = _place_beside_line(
+                        best.vertex, best.foot, line_text, height, width_of, ok, rotation
+                    )
+                    if beside is None:
+                        relaxed[0] = False
                 if beside is None:
                     # У самой линии места нет (текст накрыл бы забор) — берём свободное место рядом,
                     # но по-прежнему без выноски: стрелок у Николая нет.
                     spot = _place_leader(
-                        best.vertex, best.foot, line_text, height, width_of, ok, factor
+                        best.vertex, best.foot, line_text, height, width_of, ok, factor, rotation
                     )
+                    if spot is None and LABEL_RELAXED_RETRY:
+                        relaxed[0] = True
+                        spot = _place_leader(
+                            best.vertex, best.foot, line_text, height, width_of, ok, factor, rotation
+                        )
                     if spot is not None:
                         beside = spot[0]
+                    else:
+                        relaxed[0] = False
                 if beside is not None:
                     text = line_text
             if beside is not None:

@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.32"
+STEP4_VERSION = "4.33"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -134,7 +134,8 @@ def clean_text(raw: str) -> str:
 
 
 #: «FE.0.6'N», «WALL 0.1'E», «BLDG 5.2'W», «FE.0.5'W FE.0.9'N» — метка, расстояние в футах, сторона.
-_PART_RE = re.compile(r"(?P<label>[A-Z][A-Z./]*)?\s*(?P<value>\d+\.\d+)'\s*(?P<dir>[NSEW])\b")
+#: Разбор подписи на части: `FE.0.4'N`, `BLDG 2.5'S`, `0.4'NE` (R20 — до двух букв направления).
+_PART_RE = re.compile(r"(?P<label>[A-Z][A-Z./]*)?\s*(?P<value>\d+\.\d+)'\s*(?P<dir>[NSEW]{1,2})\b")
 _DIM_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)'$")
 
 
@@ -447,6 +448,27 @@ ONLINE_TEXT = "O/L"
 #: хотя это вторая ось участка, повёрнутого на 14.6°.
 TEXT_FOLLOWS_BOUNDARY = True
 
+#: R20 (4.33, ответ заказчика 19.11.2026, вопрос 2): буквы направления — переключатель на три
+#: положения. ``"N"`` — одна буква (``0.4'N``); ``"NE"`` — две (``0.4'NE``); ``"AUTO"`` — программа
+#: решает сама: двойная буква, если угол между севером (стрелка на чертеже) и линией дороги
+#: попадает в 22.5…67.5°, иначе одна.
+#:
+#: По умолчанию оставлено ``"N"``: на шести парах у Николая **ни одной** двойной буквы (82 подписи),
+#: а AUTO по этому правилу даёт двойные на 192 Geldner (59.1°), 18 Zoe (46.4°) и 1412 East 64th
+#: (40.1°) — то есть расходится с его же листами. AUTO включается, когда заказчик подтвердит,
+#: что угол считается иначе (например, по настоящей улице, а не по линии `M-ROW-LINE`).
+DIRECTION_LETTERS = "N"
+#: Границы «диагонального» интервала для AUTO, градусы.
+DIRECTION_DIAGONAL_FROM_DEG = 22.5
+DIRECTION_DIAGONAL_TO_DEG = 67.5
+
+#: R21 (4.33, ответ заказчика 2026-11-19): подпись без выноски идёт **вдоль объекта**, который
+#: подписывает (забор, стена дома), а не вдоль стороны участка, до которой мерен замер.
+#: «5. Поворот подписи без выноски. Текст идёт вдоль объекта, который подписывает» — ответ
+#: на вопрос №5 от 19.11.2026. Для прямой стены/забора это то же самое, что вдоль стороны
+#: участка; расходится у дома, стоящего не параллельно границе.
+TEXT_ROTATION_OBJECT = True
+
 
 #: противоположная буква стороны участка (для объекта снаружи)
 _OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
@@ -550,6 +572,25 @@ EDGE_MAX_FT = 3.0
 #: * 1373 East 55th, 192 Geldner, 378 Mother Gaston, 18 Zoe, 1412 East 64th — без изменений;
 #: * 5 и 7 ft дают те же совпадения при +2…+8 подписях, поэтому взят ближний край — 4.0.
 HOUSE_EDGE_MAX_FT = 4.0
+#: R22 (4.33, ответ заказчика 19.11.2026, вопрос 6): **предела расстояния нет** — оффсет даётся
+#: на объект, ближайший к границе участка с этой стороны; остальные объекты с той же стороны
+#: подписываются, только если стоят к границе ближе ``EDGE_NEAR_FT``.
+#: «Предела нет, однако оффсет даётся на ближайший объект к границе участка... но если расстояние
+#: до следующих заборов менее 3, то даётся и на следующие заборы тоже».
+#: Следствия: дом в 6.8 ft от стороны (18 Zoe) подписывается как ближайший, а второй забор в
+#: 5 ft от той же стороны — нет (он не ближе 3 и не ближайший).
+#:
+#: **Пока выключено.** Замер по шести парам: подписи 78 → 83, совпадения 47 → 47 (ни одного
+#: нового), предупреждений 1 → 2, лишних подписей дома 14 → 19 (68% от 28 у Николая, порог H17
+#: 50%). У 18 Zoe дом в 6.8 ft получает нашу `6.6'S` — расходится не расстояние, а база замера
+#: (у него 6.8). Включится, когда заказчик подтвердит базу и правило «ближайший объект».
+EDGE_NEAREST_ONLY = False
+#: R22: остальные объекты с той же стороны подписываются, если ближе этого к границе, футы.
+EDGE_NEAR_FT = 3.0
+#: R22: численный потолок «предела нет» — объект глубже этого от границы не подписывается всё
+#: равно (самый дальний подписанный у заказчика — дом в 6.8 ft, 18 Zoe).
+EDGE_FAR_MAX_FT = 30.0
+
 #: Часть подписи не повторяется отдельной подписью рядом с полной (H32 соседней ветки).
 #: Когда у вершины стоит двухстрочная подпись «0.1'E / 1.2'S», отдельная «1.2'S» в 2 ft от
 #: неё — дубль; на 192 Geldner это снимает 3 из 19 подписей по заборам, не теряя совпадений.
@@ -725,6 +766,46 @@ def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
     east = dx * ex + dy * ey
     scores = {"N": north, "S": -north, "E": east, "W": -east}
     return max(scores, key=lambda letter: scores[letter])
+
+
+def compass_letters(dx: float, dy: float, north_deg: float = 90.0, two: bool = False) -> str:
+    """
+    Буква направления замера — одна (``N``) или две (``NE``), R20.
+
+    Две буквы: первая — север/юг, вторая — восток/запад (ответ заказчика на вопрос 4: «сначала
+    N/S, потом E/W»). Одна — прежняя ``compass_letter``.
+    """
+    if not two:
+        return compass_letter(dx, dy, north_deg)
+    rad = math.radians(north_deg)
+    nx, ny = math.cos(rad), math.sin(rad)
+    ex, ey = ny, -nx  # восток — север, повёрнутый по часовой на 90°
+    north = dx * nx + dy * ny
+    east = dx * ex + dy * ey
+    return ("N" if north >= 0 else "S") + ("E" if east >= 0 else "W")
+
+
+def diagonal_letters(road: Sequence[Sequence[Point]], north_deg: float = 90.0) -> bool:
+    """
+    R20, положение ``AUTO``: двойная буква, если угол между севером и линией дороги в 22.5…67.5°.
+
+    Угол считается по линиям дороги (``M-ROW-LINE``) и берётся наименьший из них: у длинной
+    улицы бывают короткие изломы у перекрёстка, они не должны решать.
+    """
+    if DIRECTION_LETTERS == "NE":
+        return True
+    if DIRECTION_LETTERS != "AUTO":
+        return False
+    best: float | None = None
+    for line in road:
+        for a, b in zip(line, line[1:]):
+            angle = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
+            diff = abs(angle - north_deg % 180.0) % 180.0
+            diff = min(diff, 180.0 - diff)
+            best = diff if best is None else min(best, diff)
+    if best is None:
+        return False
+    return DIRECTION_DIAGONAL_FROM_DEG <= best <= DIRECTION_DIAGONAL_TO_DEG
 
 
 def online_text(kind: str) -> str:
@@ -1353,11 +1434,37 @@ def plan_offsets(
     # R11–R13: замер по нормали своего края (стороны участка), вторая строка по другому краю,
     # метка только у снятых вершин. Список сторон строится один раз на весь план.
     edge_sides: list[SideLine] = side_lines(ring, front_lines, north_deg) if EDGE_NORMAL_OFFSETS else []
+    # R22: по каждой букве стороны — замер самого близкого к границе объекта (ответ заказчика
+    # на вопрос 6). Остальные объекты той же стороны подписываются, только если они ближе
+    # EDGE_NEAR_FT к границе.
+    nearest_by_letter: dict[tuple[str, str], float] = {}
+    if EDGE_NEAREST_ONLY and edge_sides and survey_pts:
+        for other in features:
+            kind_other = getattr(other, "kind", None)
+            if kind_other not in OFFSET_KINDS:
+                continue
+            wide_rows = vertex_offset_rows(
+                other, edge_sides, max_ft=EDGE_FAR_MAX_FT, ring=ring, north_deg=north_deg,
+            )
+            for rows in wide_rows.values():
+                for row in rows:
+                    if row.value_ft <= MIN_OFFSET_FT:
+                        continue
+                    # Ключ — сторона участка и вид объекта: «ближайший забор с этой стороны»
+                    # не должен отменять подпись дома, стоящего дальше (24 Alvine: забор 0.1 ft,
+                    # стена дома 3.5 ft — у Николая есть обе подписи).
+                    key = (row.direction, kind_other)
+                    best_here = nearest_by_letter.get(key)
+                    if best_here is None or row.value_ft < best_here:
+                        nearest_by_letter[key] = row.value_ft
     survey_points = [(float(p[0]), float(p[1])) for p in survey_pts]
     survey_notes_list = [
         ((float(point[0]), float(point[1])), str(description))
         for point, description in survey_notes
     ]
+    # R20: двойная буква (`0.4'NE`) — по переключателю `DIRECTION_LETTERS`; AUTO смотрит на угол
+    # между севером и линией дороги (ответ заказчика 19.11.2026, вопрос 2).
+    two_letters = diagonal_letters(front_lines, north_deg)
     for index, feature in enumerate(features):
         label = feature.handle or f"#{index}"
         in_area = area_pts is None or any(point_in_polygon(p, area_pts) for p in feature.points)
@@ -1425,6 +1532,30 @@ def plan_offsets(
                         feature, edge_sides, max_ft=EDGE_MAX_FT, ring=ring,
                         north_deg=north_deg, keep_online=ONLINE_LABELS,
                     )
+            if EDGE_NEAREST_ONLY and nearest_by_letter:
+                # R22 (ответ заказчика 19.11.2026, вопрос 6): предела нет — объект, который
+                # **ближайший к границе** с этой стороны среди объектов своего вида, подписывается
+                # и дальше общего предела. Остальные объекты той же стороны — только если они
+                # ближе EDGE_NEAR_FT. Добавляем по одной вершине на сторону, чтобы не ломать
+                # кэпы и порядок уже разложенных подписей.
+                wide_rows = vertex_offset_rows(
+                    feature, edge_sides, max_ft=EDGE_FAR_MAX_FT, ring=ring, north_deg=north_deg,
+                )
+                extra_vertices: dict[str, tuple[Point, EdgeRow]] = {}
+                for vertex, rows in wide_rows.items():
+                    if vertex in rows_by_vertex:
+                        continue
+                    for row in rows:
+                        if row.value_ft <= edge_max or row.value_ft < MIN_OFFSET_FT:
+                            continue
+                        limit = nearest_by_letter.get((row.direction, feature.kind))
+                        if limit is None or row.value_ft > limit + 1e-6:
+                            continue
+                        best = extra_vertices.get(row.direction)
+                        if best is None or row.value_ft < best[1].value_ft:
+                            extra_vertices[row.direction] = (vertex, row)
+                for vertex, row in extra_vertices.values():
+                    rows_by_vertex.setdefault(vertex, [row])
             if feature.kind == "fence" and FENCE_END_MAX_FT > EDGE_MAX_FT:
                 # Конец длинного прогона забора Николай подписывает и в 5–6 ft от стороны
                 # (192 Geldner: FE.5.2'S при 5.17 ft). Короткий выступ так не подписывается.
@@ -1452,8 +1583,9 @@ def plan_offsets(
                         vertex: [
                             EdgeRow(
                                 value_ft=value,
-                                direction=compass_letter(
-                                    vertex[0] - foot[0], vertex[1] - foot[1], north_deg
+                                direction=compass_letters(
+                                    vertex[0] - foot[0], vertex[1] - foot[1], north_deg,
+                                    two_letters,
                                 ),
                                 foot=foot,
                                 edge_index=0,
@@ -1503,6 +1635,8 @@ def plan_offsets(
                 ),
                 # R17: у устоя приставки нет — Николай пишет голое число («3.0'E»).
                 bare_number=feature.kind == "wall" and FRONT_WALL_OFFSETS,
+                # R20: одна буква или две — переключатель `DIRECTION_LETTERS`.
+                two_letters=two_letters,
             )
             continue
         candidates = [
@@ -1549,7 +1683,7 @@ def plan_offsets(
             # Буква — с какой стороны от границы стоит объект: «FE.0.4'N» — забор севернее линии.
             # Так подписывает заказчик (проверено на Alvine 8 из 8 и Brooklyn 5 из 5).
             vx, vy = best.vertex[0] - best.foot[0], best.vertex[1] - best.foot[1]
-            direction = compass_letter(vx, vy, north_deg)
+            direction = compass_letters(vx, vy, north_deg, two_letters)
             height = offset_height_ft("house" if feature.kind == "house" else "fence", scale)
             text = ONLINE_FENCE_TEXT if is_online else offset_text(feature.kind, value, direction)
             extra: list[tuple[float, str]] = []
@@ -1557,7 +1691,9 @@ def plan_offsets(
                 boundaries: list[tuple[Sequence[Point], bool]] = [(ring, True)]
                 boundaries += [(line, False) for line in front_lines]
                 taken = (value, direction)
-                extra = _extra_sides(best.vertex, best.foot, taken, boundaries, north_deg)
+                extra = _extra_sides(
+                    best.vertex, best.foot, taken, boundaries, north_deg, two_letters
+                )
             mid = ((best.vertex[0] + best.foot[0]) / 2.0, (best.vertex[1] + best.foot[1]) / 2.0)
             # Тот же текст рядом с вершиной, серединой выноски или той же стороной объекта — дубль.
             fpts = list(feature.points)
@@ -1657,6 +1793,7 @@ def _plan_edge_labels(
     height: float | None = None,
     front_segs: Sequence[tuple[Point, Point]] = (),
     bare_number: bool = False,
+    two_letters: bool = False,
 ) -> None:
     """
     Подписи объекта по правилам R11–R13: каждая снятая вершина у границы подписывается по
@@ -1807,18 +1944,27 @@ def _plan_edge_labels(
         value = round_offset_ft(primary.value_ft)
         if value <= 0.0:
             continue
-        extras = [
-            (round_offset_ft(row.value_ft), row.direction)
-            for row in rows[1:]
+        extra_rows = [
+            row for row in rows[1:]
             if round_offset_ft(row.value_ft) > 0.0
             and (round_offset_ft(row.value_ft), row.direction) != (value, primary.direction)
         ]
+
+        def _letter(row: EdgeRow) -> str:
+            """Буква строки: одна или две — R20 (``DIRECTION_LETTERS``)."""
+            return compass_letters(
+                vertex[0] - row.foot[0], vertex[1] - row.foot[1], north_deg, two_letters
+            )
+
         # У Николая в двухстрочной подписи первой идёт сторона N/S, второй E/W
         # («FE.0.4'N» / «FE.1.3'W», «FE.0.1'S» / «FE.0.5'W»): 4 из 5 случаев.
-        shown_value, shown_direction = value, primary.direction
-        if extras and primary.direction in ("E", "W") and extras[0][1] in ("N", "S"):
-            shown_value, shown_direction = extras[0]
-            extras = [(value, primary.direction)]
+        shown_row, rest_rows = primary, list(extra_rows)
+        if rest_rows and primary.direction in ("E", "W") and rest_rows[0].direction in ("N", "S"):
+            shown_row = rest_rows[0]
+            rest_rows = [primary] + rest_rows[1:]
+        shown_value = round_offset_ft(shown_row.value_ft)
+        shown_direction = _letter(shown_row)
+        extras = [(round_offset_ft(row.value_ft), _letter(row)) for row in rest_rows]
         text = (
             f"{shown_value:.1f}'{shown_direction}" if bare_number
             else offset_text(feature.kind, shown_value, shown_direction)
@@ -1857,6 +2003,9 @@ def _plan_edge_labels(
         # Источник поворота проверен (4.32): ``side`` — 28 из 32 подписей совпали с Николаем
         # (дом 6 из 7), ``object`` (ближайшая к вершине линия) — 27, «всегда горизонтально» — 27.
         rotation = primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0
+        if TEXT_FOLLOWS_BOUNDARY and TEXT_ROTATION_OBJECT:
+            # R21: вдоль объекта, который подписываем (ответ заказчика 19.11.2026, вопрос 5).
+            rotation = _object_edge_angle(feature, vertex, rotation)
         # R16: у дома первым пробуется место снаружи контура участка (HOUSE_TEXT_OUTSIDE).
         # R19: ступени места — сначала с просветом до границы, затем прежние (зазор между
         # подписями, без зазора): подпись, которой не хватило просвета, ставится как раньше.
@@ -2294,6 +2443,26 @@ def feature_edge_directions(feature: Feature) -> dict[Point, list[tuple[float, f
     return out
 
 
+def _object_edge_angle(feature: Feature, vertex: Point, side_angle_deg: float) -> float:
+    """
+    Угол края объекта у вершины, ближайшего по направлению к стороне участка (R21).
+
+    Текст вдоль объекта — это край, который эту сторону и меряет: у забора и у стены дома он
+    совпадает со стороной участка, у наклонного строения — нет. Если направлений у вершины нет,
+    остаётся угол стороны участка.
+    """
+    best: tuple[float, float] | None = None
+    for dx, dy in feature_edge_directions(feature).get(vertex, ()):
+        if math.hypot(dx, dy) < 1e-9:
+            continue
+        angle = math.degrees(math.atan2(dy, dx)) % 180.0
+        diff = abs(angle - side_angle_deg % 180.0)
+        diff = min(diff, 180.0 - diff)
+        if best is None or diff < best[0]:
+            best = (diff, angle)
+    return side_angle_deg if best is None else best[1]
+
+
 def _on_line_row(
     vertex: Point, sides: Sequence[SideLine], edge_dirs: Sequence[Point],
 ) -> EdgeRow | None:
@@ -2520,6 +2689,7 @@ def vertex_describes_object(
 def _extra_sides(
     vertex: Point, best_foot: Point, taken: tuple[float, str],
     boundaries: Sequence[tuple[Sequence[Point], bool]], north_deg: float,
+    two_letters: bool = False,
 ) -> list[tuple[float, str]]:
     """
     Другие стороны участка, к которым та же вершина ближе ``SECOND_SIDE_FT``: заказчик пишет
@@ -2534,7 +2704,9 @@ def _extra_sides(
             value = round_offset_ft(distance)
             if value <= 0.0:
                 continue
-            direction = compass_letter(vertex[0] - foot[0], vertex[1] - foot[1], north_deg)
+            direction = compass_letters(
+                vertex[0] - foot[0], vertex[1] - foot[1], north_deg, two_letters
+            )
             found.append((distance, value, direction))
     found.sort()
     out: list[tuple[float, str]] = []

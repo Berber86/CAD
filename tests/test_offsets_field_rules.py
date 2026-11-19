@@ -817,3 +817,53 @@ def test_text_is_kept_off_the_lot_sides():
     assert statistics.median(off_gaps) >= 0.7
     # Прижатых к границе подписей не становится больше.
     assert sum(1 for gap in off_gaps if gap < 0.05) <= sum(1 for gap in plain_gaps if gap < 0.05)
+
+
+def test_no_distance_limit_rule_is_measured_and_off():
+    """
+    R22 (4.33, ответ заказчика 19.11.2026, вопрос 6): предела расстояния нет.
+
+    «Предела нет, однако оффсет даётся на ближайший объект к границе участка... но если расстояние
+    до следующих заборов менее 3, то даётся и на следующие заборы тоже». Правило реализовано
+    (``EDGE_NEAREST_ONLY``, ``EDGE_NEAR_FT`` = 3.0): объект, ближайший к границе с этой стороны
+    среди объектов своего вида, подписывается и дальше общего предела.
+
+    Замер по шести парам: подписей 78 → **83**, совпадений 47 → **47** (ни одного нового),
+    предупреждений 1 → 2, подписей дома 28 → 33 — лишних 19 при 28 подписях Николая, это 68%
+    при пороге H17 50%. Поэтому правило **выключено** и ждёт ответа заказчика: у 18 Zoe наш
+    замер той же стены 6.6 против его 6.8 ft, то есть расходится не расстояние до объекта,
+    а база замера. Замер: `docs/step4_spatial_measure.py`.
+    """
+    assert off.EDGE_NEAREST_ONLY is False
+    assert off.EDGE_NEAR_FT == pytest.approx(3.0)
+    paths = [PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5, PRIMER7]
+
+    def totals():
+        labels = hits = warnings = 0
+        house_labels = house_hits = house_expected = 0
+        for path in paths:
+            before, after = load_pair(path)
+            data, _ = field_plan(before, after)
+            warnings += len(data["plan"].warnings)
+            got = plan_labels(data["plan"])
+            exp = nikolai_labels(before, after)
+            labels += len(got)
+            hits += score_labels(got, exp)
+            house_got = [p for p in got if p["kind"] == "house"]
+            house_exp = [p for p in exp if p["kind"] == "house"]
+            house_labels += len(house_got)
+            house_hits += score_labels(house_got, house_exp)
+            house_expected += len(house_exp)
+        return labels, hits, warnings, house_labels, house_hits, house_expected
+
+    base = totals()
+    off.EDGE_NEAREST_ONLY = True
+    try:
+        wide = totals()
+    finally:
+        off.EDGE_NEAREST_ONLY = False
+    assert base[:2] == (78, 47), base
+    assert wide[0] > base[0] and wide[1] == base[1]
+    assert wide[2] == base[2] + 1
+    # Лишние подписи дома — выше порога H17, поэтому правило выключено.
+    assert (wide[3] - wide[4]) > 0.5 * wide[5]

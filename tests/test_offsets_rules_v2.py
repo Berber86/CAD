@@ -6,6 +6,8 @@
 - вторая сторона у той же вершины — второй строкой выноски (R4), только внутри самой стороны.
 """
 
+import math
+
 import pytest
 
 import offsets as off
@@ -168,3 +170,59 @@ def test_house_limit_is_a_fallback_not_a_blanket():
     )
     house_items = [item for item in plan.items if item.kind == "house"]
     assert house_items and all(item.value_ft <= off.EDGE_MAX_FT + 1e-6 for item in house_items)
+
+
+def test_direction_letters_switch_has_three_positions():
+    """
+    R20 (4.33, ответ заказчика 19.11.2026, вопрос 2): буквы направления — три положения.
+
+    ``N`` — одна буква, ``NE`` — две, ``AUTO`` — программа решает по углу между севером (стрелка
+    на чертеже) и линией дороги: 22.5…67.5° — двойная, иначе одна.
+
+    По умолчанию стоит ``N``, а не ``AUTO``: на шести парах у Николая **ни одной** двойной буквы
+    (82 подписи), а AUTO по этому правилу даёт 22 двойных подписи и теряет 13 совпадений из 47
+    (192 Geldner 59.1°, 18 Zoe 46.4°, 1412 East 64th 40.1° — по его же листам там одинарные).
+    Замер: `docs/step4_spatial_measure.py`.
+    """
+    assert off.DIRECTION_LETTERS in {"N", "AUTO", "NE"}
+    assert off.DIRECTION_LETTERS == "N"
+    # одна буква — как раньше
+    assert off.compass_letters(0.0, 1.0, 90.0) == "N"
+    assert off.compass_letters(-1.0, -0.5, 90.0) == "W"
+    # две буквы: сначала N/S, потом E/W (вопрос 4)
+    assert off.compass_letters(1.0, 1.0, 90.0, True) == "NE"
+    assert off.compass_letters(-1.0, -1.0, 90.0, True) == "SW"
+    # AUTO: угол между севером и линией дороги
+    road_45 = [[(0.0, 0.0), (10.0, 10.0)]]
+    road_10 = [[(0.0, 0.0), (10.0, 10.0 * math.tan(math.radians(10)))]]
+    saved = off.DIRECTION_LETTERS
+    try:
+        off.DIRECTION_LETTERS = "AUTO"
+        assert off.diagonal_letters(road_45, 90.0)
+        assert not off.diagonal_letters(road_10, 90.0)
+        off.DIRECTION_LETTERS = "NE"
+        assert off.diagonal_letters(road_10, 90.0)
+        off.DIRECTION_LETTERS = "N"
+        assert not off.diagonal_letters(road_45, 90.0)
+    finally:
+        off.DIRECTION_LETTERS = saved
+    # текст с двумя буквами разбирается на часть подписи (дедуп и счёт идут по частям)
+    assert off._part_keys("0.4'NE") == {(0.4, "NE")}
+
+
+def test_text_goes_along_the_object_not_the_lot_side():
+    """
+    R21 (4.33, ответ заказчика 19.11.2026, вопрос 5): подпись без выноски идёт вдоль объекта.
+
+    Для забора и прямой стены это совпадает со стороной участка, поэтому на шести парах правило
+    не меняет ни одной подписи (78 подписей / 47 совпадений до и после). Расходится у строения,
+    стоящего не параллельно границе: тогда текст идёт вдоль стены, а не вдоль стороны участка.
+    """
+    assert off.TEXT_ROTATION_OBJECT is True
+    angle = math.radians(30.0)
+    a = (0.0, 0.0)
+    b = (10.0 * math.cos(angle), 10.0 * math.sin(angle))
+    house = off.Feature(kind="house", handle="H1", points=(a, b, (b[0], b[1] + 10.0), (a[0], 10.0)), closed=True)
+    assert off._object_edge_angle(house, a, 0.0) == pytest.approx(30.0, abs=0.5)
+    fence = off.Feature(kind="fence", handle="F1", points=((0.0, 0.0), (10.0, 0.0)), closed=False)
+    assert off._object_edge_angle(fence, (0.0, 0.0), 0.0) == pytest.approx(0.0, abs=0.1)

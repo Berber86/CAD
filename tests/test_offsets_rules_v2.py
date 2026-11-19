@@ -331,3 +331,81 @@ def test_on_line_text_is_one_line_and_threshold_matches_the_customer():
     assert off.online_text("wall").splitlines() == ["WALL", "O/L"]
     # «оба замера O/L» дают ту же одну строку: второй O/L не дублируется
     assert off.online_text("fence").count("O/L") == 1
+
+
+def test_whole_side_on_the_line_gets_one_line_label():
+    """
+    R25 (золотое правило №10, ответ заказчика 19.11.2026): «если для всей стороны дома — хоть для
+    фронта, хоть для бочины дома — если он по обеим сторонам получается ``O/L``, то в одну строчку».
+
+    Дом стоит западной стеной (50 ft) на линии участка: подпись — одна строка ``BLDG O/L`` простым
+    текстом вдоль стены, без выноски и без числа, как у заказчика (378 Mother Gaston, 1412 East
+    64th). Сняты только внутренние вершины, поэтому угловой подписи ``BLDG`` / ``O/L`` рядом нет и
+    она не глушит сторону. Флаг по умолчанию выключен — правило замерено и не дало улучшения
+    (``test_whole_side_on_the_line_rule_is_measured_and_off``).
+    """
+    house = off.Feature(
+        kind="house", handle="H",
+        points=((0.0, 10.0), (0.0, 60.0), (8.0, 60.0), (8.0, 10.0)),
+    )
+    inner = [(8.0, 60.0), (8.0, 10.0)]
+    saved = off.ONLINE_SIDE_LABELS
+    off.ONLINE_SIDE_LABELS = True
+    try:
+        plan = off.plan_offsets(SQUARE, [house], survey_pts=inner)
+    finally:
+        off.ONLINE_SIDE_LABELS = saved
+    side = [item for item in plan.items if item.online_side]
+    assert [item.text for item in side] == ["BLDG O/L"]
+    item = side[0]
+    assert item.style == "text" and item.leader is None  # простой текст, не выноска
+    assert item.rotation_deg == pytest.approx(90.0, abs=0.01)  # вдоль стены (R21)
+    assert item.point[1] == pytest.approx(35.0, abs=0.5)  # середина стены 10..60
+    assert 0.0 < item.point[0] < 2.0  # внутри участка, в 1–2 ft от линии, как у заказчика
+    # Флаг выключен — той же подписи нет.
+    plain = off.plan_offsets(SQUARE, [house], survey_pts=inner)
+    assert not [item for item in plain.items if item.online_side]
+
+
+def test_side_label_is_not_given_to_boundary_trace_or_fence():
+    """
+    R25, фильтры ``online_side_walls``: контур, обведённый как объект, забор и короткий край
+    стороной здания не считаются.
+
+    В дампах заказчика граница иногда распознана как объект: 1373 Brooklyn «дом» 46.0 × 18.0 ×
+    100.0 ft — все три ребра на трёх линиях участка, 24 Alvine «дом» 174.9 × 45.3 × 153.6 ft —
+    тоже; подписей «в одну строчку» у него там нет. У забора форма однострочная и без R25, и
+    ставит он её в точке пересечения (192 Geldner: ``FE.O/L`` в 2.8 ft от конца пролёта 59.2 ft).
+    """
+    sides = off.side_lines(SQUARE, [], 90.0)
+    assert off.online_side_walls(off.Feature(kind="house", handle="H", points=tuple(SQUARE)), sides) == []
+    fence = off.Feature(kind="fence", handle="F", points=((0.0, 10.0), (0.0, 60.0)))
+    assert off.online_side_walls(fence, sides) == []
+    # Край 15 ft < ONLINE_SIDE_MIN_FT — это угол, у угла форма двухстрочная.
+    short = off.Feature(kind="house", handle="H", points=((0.0, 10.0), (0.0, 25.0), (8.0, 25.0), (8.0, 10.0)))
+    assert off.online_side_walls(short, sides) == []
+    # Здание на линии: одно ребро на линии, остальные внутри участка — самый длинный край на линию.
+    house = off.Feature(kind="house", handle="H", points=((0.0, 10.0), (0.0, 60.0), (8.0, 60.0), (8.0, 10.0)))
+    walls = off.online_side_walls(house, sides)
+    assert len(walls) == 1
+    assert walls[0][0] == ((0.0, 10.0), (0.0, 60.0))
+    assert walls[0][1].letter == "W"
+
+
+def test_label_without_number_is_not_a_part_of_the_neighbouring_label():
+    """
+    Подпись без числа — не «часть» соседней подписи (4.37).
+
+    H32 снимает одиночную подпись, если её части входят в двухстрочную подпись того же объекта
+    в 2 ft рядом. У подписи «на линии» (``FE.O/L``, ``BLDG O/L``) частей нет вовсе, а пустое
+    множество — подмножество любого: без проверки ``own`` такая подпись снималась всегда, когда
+    рядом стоял числовой столбик. Здесь вершина (2.0, 0.02) на линии в 1.0 ft от вершины (1.0, 0.3)
+    с двумя замерами — до 4.37 ``FE.O/L`` исчезала («уже в подписи рядом»).
+    """
+    fence = off.Feature(kind="fence", handle="F", points=((1.0, 0.3), (2.0, 0.02), (60.0, 0.02)))
+    points = [(1.0, 0.3), (2.0, 0.02), (60.0, 0.02)]
+    plan = off.plan_offsets(SQUARE, [fence], survey_pts=points)
+    texts = [item.text for item in plan.items]
+    assert "FE.0.3'N\nFE.1.0'E" in texts
+    assert "FE.O/L" in texts
+    assert off._part_keys("FE.O/L") == set()

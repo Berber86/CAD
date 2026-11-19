@@ -45,6 +45,7 @@ PRIMER2 = "docs/primer2i.zip"  # 1373 East 55th Street, Brooklyn
 PRIMER1 = "docs/primer1i.zip"  # 24 Alvine Avenue
 PRIMER4 = "docs/primer4i.zip"  # 378 Mother Gaston Boulevard, Brooklyn
 PRIMER5 = "docs/primer5i.zip"  # 18 Zoe Street, Staten Island (с PDF-эталоном и PL-слоем)
+PRIMER7 = "docs/primer7i.zip"  # 1412 East 64th Street, Brooklyn (25 × 100 ft, рядный дом)
 
 FILES = {
     "Geldner": PRIMER3,
@@ -552,6 +553,70 @@ def test_fifth_pair_zoe_scores_by_the_same_rules(zoe):
     texts = [p["text"] for p in zoe["labels"] if p["kind"] == "fence"]
     assert "FE.0.5'N" in texts
     assert any("0.4'S" in text and "0.8'N" in text for text in texts)
+
+
+# --------------------------------------- шестая пара: 1412 East 64th Street, Brooklyn
+
+
+@pytest.fixture(scope="module")
+def east64():
+    before, after = load_pair(PRIMER7)
+    data, _nikolai = field_plan(before, after)
+    return {
+        "before": before,
+        "labels": plan_labels(data["plan"]),
+        "nikolai_labels": nikolai_labels(before, after),
+        "ring": data["ring"],
+        "plan": data["plan"],
+    }
+
+
+def test_sixth_pair_east_64th_property_line_is_a_25_by_100_rectangle(east64):
+    """
+    1412 East 64th Street: узкий рядный участок 25.00' × 100.00' (2500 sq ft) — самый узкий в наборе.
+
+    Граница снова в слое ``PL`` (три отрезка: запад, юг, восток), фасад замыкает ``M-ROW-LINE``;
+    площадь контура 2500.0 sq ft совпадает с листом («25.00'» сверху и внизу, «100.00'» по бокам).
+    В отличие от Zoe, здесь у дома есть собственные линии ``ST-BLDG-LINE`` (восточная стена в 0.3 ft
+    от границы) — проверка, что имя ``PL`` по-прежнему выигрывает у старого слоя.
+    """
+    ring = _lot_polygon(east64["before"])
+    assert ring is not None
+    assert ring.area == pytest.approx(2500.0, abs=2.0)
+    lines = [item for item in east64["before"]["entities"]
+             if item.get("type") in {"Line", "Polyline"}]
+    layers = {str(item.get("layer")) for item in lines}
+    assert "PL" in layers and "M-ROW-LINE" in layers
+    assert sum(1 for item in lines if str(item.get("layer")) == "PL") == 3
+
+
+def test_sixth_pair_east_64th_scores_by_the_same_rules(east64):
+    """
+    Первый замер шестой пары (правила под неё не подбирались): забор 8 эталон / 7 наших / 7 совпало,
+    дом 6 / 5 / 1.
+
+    Забор почти весь сходится: `FE.0.2'N`, `FE.0.8'S`, `FE.1.0'S`, `FE.0.9'N`, `FE.1.7'N`,
+    `FE.1.2'N` (у нас `FE.1.3'N` — 0.1 ft, в допуске) и `FE.0.2'N`; его `FE.0.1'S` у фасада у нас
+    нет (забор фасада меряется к красной линии, а не к боковой стороне). Дом — снова слабое место:
+    совпала одна `0.2'S` (у нас `0.3'S`, 0.1 ft), лишние `0.1'N|1.3'W`, `0.1'S`, `0.1'N`, `3.0'S`
+    (он `3.2'S`), и нет обеих его `3.0'E` у фасада.
+
+    Новое для набора: (1) он пишет подпись дома **снаружи** участка (под задней линией, над
+    описанием соседа `BLDG 0.1'W`), а у нас `_place_house_text` держит текст внутри; (2) у фасада
+    стоят две `3.0'E` — замер от красной линии до стены/тротуара, которых в «до» нет объектом;
+    (3) `0.3'S` против `0.2'S` — расстояние по геометрии ровно 0.300 ft, то есть расходится не
+    округление, а предмет замера (у него — стена соседа `C.L.F.`, у нас — восточная сторона).
+    """
+    for kind, (expected, produced, hits) in (
+        ("fence", (8, 7, 7)),
+        ("house", (6, 5, 1)),
+    ):
+        got = [p for p in east64["labels"] if p["kind"] == kind]
+        exp = [p for p in east64["nikolai_labels"] if p["kind"] == kind]
+        assert (len(exp), len(got), score_labels(got, exp)) == (expected, produced, hits), kind
+    texts = [p["text"] for p in east64["labels"] if p["kind"] == "fence"]
+    for text in ("FE.1.0'S", "FE.1.7'N", "FE.0.2'N"):
+        assert any(text in line for line in texts), text
 
 
 def _touch_stats(paths):

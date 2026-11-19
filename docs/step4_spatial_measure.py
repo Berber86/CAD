@@ -40,6 +40,7 @@ PAIRS = {
     "Alvine": "docs/primer1i.zip",
     "Gaston": "docs/primer4i.zip",
     "Zoe": "docs/primer5i.zip",
+    "East 64th": "docs/primer7i.zip",
 }
 
 PROPERTY = {"PL", "PROP", "M-PROPERTY", "M-TAX-LINE", "S-PROP-LINE", "M-ROW-LINE"}

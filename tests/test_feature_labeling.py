@@ -2073,6 +2073,11 @@ def load_aspinwall():
     return load_field_fixture("aspinwall_field.txt")
 
 
+def load_east64():
+    """Полевой чертёж «1412 East 64th Street, Brooklyn» (узкий рядный участок 25 × 100 ft)."""
+    return load_field_fixture("e64_field.txt")
+
+
 def ilion_features(result, label, kind=None):
     return [
         f for f in result.features
@@ -2164,6 +2169,22 @@ def test_property_line_layer_pattern_does_not_take_planters():
         assert not fl.layer_matches(name, fl.DEFAULT_FEATURE_CONFIG["property_line_layers"]), name
     for name in ("PL", "PL-PRINT", "PL_NEW", "PL PROPERTY"):
         assert fl.layer_matches(name, fl.DEFAULT_FEATURE_CONFIG["property_line_layers"]), name
+
+
+def test_east_64th_lot_is_the_new_pl_layer_on_a_row_house():
+    """
+    1412 East 64th Street: граница в новом слое ``PL`` (три стороны), фасад — красная линия.
+
+    Участок 25.00' × 100.00' = 2500.0 sq ft (по листу «25.00'» сверху и внизу, «100.00'» по бокам).
+    На этом же чертеже есть ``ST-BLDG-LINE`` — восточная стена дома в 0.3 ft от линии участка;
+    имя ``PL`` должно по-прежнему выигрывать у старого слоя, иначе в контур попадут стены.
+    """
+    snap = load_east64()
+    boundary = fl.find_property_polygon(snap, {})
+    assert boundary.layer == "PL"
+    assert boundary.vertex_count == 4
+    assert boundary.area_sqft == pytest.approx(2500.0, abs=2.0)
+    assert any("M-ROW-LINE" in note for note in boundary.notes)
 
 
 def test_ilion_lot_is_closed_by_the_street_line():

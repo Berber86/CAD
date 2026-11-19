@@ -3156,7 +3156,7 @@ class SurveyApp(ctk.CTk):
         fast_row.grid(row=1, column=0, sticky="w", pady=(4, 0))
         ctk.CTkCheckBox(
             fast_row,
-            text="быстрая работа (меньше проверок экрана), пауза",
+            text="быстрая работа (без промежуточного OCR), пауза",
             variable=self.step0_fast_mode_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
@@ -3176,6 +3176,12 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
+        ctk.CTkLabel(
+            checks, text="Быстрый режим не проверяет каждый экран: действия могут не сработать; "
+            "CAPTCHA может остаться незамеченной. Проверяйте адрес, Block и Lot.",
+            text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=410,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -3397,8 +3403,13 @@ class SurveyApp(ctk.CTk):
         self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
         self.step0_run_button.configure(state="disabled")
         self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
-            f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; один Vision-запрос получит только карту."
+            f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; Vision получит обрезку карты и адрес текстом."
         ))]
+        if self.step0_fast_mode_var.get():
+            self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                f"Быстрый режим: пауза {fast_pause:g} с вместо промежуточных OCR-проверок. "
+                "CAPTCHA или неверная подсказка могут остаться незамеченными — проверьте результат."
+            )))
         self._render_step0_log()
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
         worker = threading.Thread(
@@ -3479,7 +3490,7 @@ class SurveyApp(ctk.CTk):
         )
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
-        self._step0_log(f"Vision получал только карту: {result.map_image}")
+        self._step0_log(f"Vision получил обрезку карты: {result.map_image}; адрес передан текстом.")
         self._set_status(
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
             "проверьте соседей и затем нажмите «Собрать описания».",

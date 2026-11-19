@@ -1,12 +1,13 @@
 """Address lookup on NYC Property Information Portal for Step 0.
 
-The automation is intentionally fail-closed: it only drives a visible window owned
-by a supported browser and never follows a challenge page. RapidOCR reads Block,
+The automation drives a visible supported browser. Challenge pages detected by OCR
+or the browser title stop it; fast mode intentionally skips intermediate screen checks. RapidOCR reads Block,
 Lot and Borough locally. Vision receives a cropped tax-map image only, for the two
 neighbour-lot labels.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 import tempfile
@@ -86,7 +87,7 @@ def _normalise(text: str) -> str:
     return "".join(char for char in str(text or "").lower() if char.isalnum())
 
 
-# Пауза между проверками экрана (OCR всего окна). В «быстрой работе» проверок меньше.
+# Обычный режим проверяет экран; быстрый режим ждёт между действиями без промежуточного OCR.
 SCREEN_CHECK_PAUSE_SEC = 0.6
 FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
 #: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
@@ -154,6 +155,49 @@ def _screen_ocr_top_left_quarter(image_path: str | Path) -> list[ScreenText]:
         raise PortalLookupError(f"Не удалось проверить верхнюю левую часть браузера: {exc}") from exc
 
 
+# Область управления слева; координаты результатов переводятся обратно к окну.
+_FORM_REGION = (0.0, 0.0, 0.65, 0.80)
+
+
+def _screen_ocr_region(image_path: str | Path, region: tuple[float, float, float, float]) -> list[ScreenText]:
+    from PIL import Image
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    x0, y0, x1, y1 = (round(region[0] * width), round(region[1] * height),
+                       round(region[2] * width), round(region[3] * height))
+    if x1 <= x0 or y1 <= y0:
+        raise PortalLookupError("Окно браузера слишком мало для распознавания.")
+    with tempfile.TemporaryDirectory(prefix="tsai_pip_region_") as directory:
+        path = Path(directory) / "region.png"
+        image.crop((x0, y0, x1, y1)).save(path)
+        rows = _screen_ocr(path)
+    return [ScreenText(row.text, (row.box[0] + x0, row.box[1] + y0,
+                                  row.box[2] + x0, row.box[3] + y0), row.confidence)
+            for row in rows]
+
+
+def _reject_challenge(rows: Sequence[ScreenText]) -> None:
+    if _challenge_visible(rows):
+        raise PortalLookupError("На портале обнаружена проверка человека/CAPTCHA; работа остановлена.")
+
+
+def _initial_screen(handle: int) -> list[ScreenText]:
+    """Сначала лёгкое чтение; полное нужно только если область не дала результата."""
+    with tempfile.TemporaryDirectory(prefix="tsai_pip_start_") as directory:
+        path = Path(directory) / "screen.png"
+        _save_window_capture(handle, path)
+        rows = _screen_ocr_top_left_quarter(path)
+        _reject_challenge(rows)
+        if any(_contains(rows, marker) for marker in ("Select", "Find Another Property", "Enter an Address")):
+            return rows
+        rows = _screen_ocr(path)
+        _reject_challenge(rows)
+        if any(_contains(rows, marker) for marker in ("Select", "Find Another Property", "Enter an Address")):
+            return rows
+    raise PortalLookupError("Не удалось подтвердить страницу NYC Portal и найти форму поиска.")
+
+
 def _portal_window() -> browser_save.BrowserWindow:
     windows = [
         window for window in browser_save.list_windows()
@@ -212,6 +256,8 @@ def _focus(handle: int) -> None:
         raise PortalLookupError(
             "Фокус больше не на выбранном поддерживаемом браузере; клавиатуру не трогаю."
         )
+    if browser_save.looks_like_cloudflare_page(window.title):
+        raise PortalLookupError("Браузер показывает проверку человека/CAPTCHA; работа остановлена.")
     # foreground_is_acceptable() also allows an open <select> dropdown/autocomplete
     # popup owned by the same browser process to stay focused: forcing the parent
     # tab back to the foreground here would close that popup immediately.
@@ -248,25 +294,32 @@ def _wait_screen(
     timeout: float,
     description: str,
     pause: float = SCREEN_CHECK_PAUSE_SEC,
+    region: tuple[float, float, float, float] | None = None,
 ) -> list[ScreenText]:
-    """Ждёт, пока экран не удовлетворит ``predicate``; между проверками — ``pause`` секунд."""
+    """Ожидание без повторного OCR идентичного снимка; область с полным fallback."""
     deadline = time.monotonic() + timeout
     latest: list[ScreenText] = []
+    previous_hash: bytes | None = None
     while True:
         _focus(handle)
         with tempfile.TemporaryDirectory(prefix="tsai_pip_ocr_") as directory:
             path = Path(directory) / "screen.png"
             _save_window_capture(handle, path)
-            latest = _screen_ocr(path)
-        if _challenge_visible(latest):
-            raise PortalLookupError(
-                "На портале отображается проверка человека/CAPTCHA. Остановился, не нажимал и не отправлял снимок в ИИ."
-            )
-        if predicate(latest):
-            return latest
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+            digest = hashlib.sha256(path.read_bytes()).digest()
+            if digest != previous_hash:
+                latest = _screen_ocr_region(path, region) if region else _screen_ocr(path)
+                previous_hash = digest
+            _reject_challenge(latest)
+            if predicate(latest):
+                return latest
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if region:
+                    latest = _screen_ocr(path)
+                    _reject_challenge(latest)
+                    if predicate(latest):
+                        return latest
+                break
         time.sleep(min(pause, remaining))
     raise PortalLookupError(f"Не дождался {description} на NYC Portal.")
 
@@ -290,21 +343,49 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
         raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
 
 
-def _wait_after_address_input(handle: int, delay: float = 3.0) -> None:
-    """Wait a fixed interval for autocomplete, without requiring OCR to see a suggestion.
+_ADDRESS_SUFFIXES = {"st": "street", "str": "street", "ave": "avenue", "av": "avenue",
+                     "rd": "road", "blvd": "boulevard", "dr": "drive", "ln": "lane",
+                     "pl": "place", "ct": "court", "pkwy": "parkway"}
 
-    Take one local screenshot after the delay solely to avoid sending keyboard input to a
-    human-verification/CAPTCHA screen. Whether an address suggestion is visible is not
-    checked; after this guard the caller selects the first result with Down and Enter.
-    """
-    time.sleep(delay)
+
+def _address_tokens(text: str) -> list[str]:
+    return [_ADDRESS_SUFFIXES.get(token, token) for token in re.findall(r"[a-z0-9]+", text.lower())]
+
+
+def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText]) -> ScreenText | None:
+    label = next((r for r in address_rows if "enter an address" in r.text.lower()), None)
+    if label is None:
+        return None
+    x0, y0, x1, y1 = label.box
+    # Исключаем само поле и числа на карте справа: подсказка находится под полем.
+    min_y = y1 + max(24, (y1 - y0) * 2) + 15
+    max_x = x0 + max(120, (x1 - x0) // 2)
+    candidates = [row for row in rows if row.box[1] >= min_y and x0 - 10 <= row.box[0] <= max_x
+                  and re.match(r"^\s*\d", row.text)]
+    return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
+
+
+def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText]) -> None:
+    """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
+    rows = _wait_screen(handle, lambda items: _first_suggestion(items, address_rows) is not None,
+                        timeout=8, description="подсказку адреса", region=_FORM_REGION)
+    suggestion = _first_suggestion(rows, address_rows)
+    expected = _address_tokens(address)
+    actual = _address_tokens(suggestion.text if suggestion else "")
+    if not expected or actual[:len(expected)] != expected:
+        raise PortalLookupError("Первая подсказка адреса не совпадает с запросом; проверьте ввод и повторите.")
+
+
+def _type_focused_address(handle: int, address: str) -> None:
+    """Быстрый путь: Tab уже перевёл фокус в поле; промежуточного OCR нет."""
     _focus(handle)
-    with tempfile.TemporaryDirectory(prefix="tsai_pip_after_input_") as directory:
-        path = Path(directory) / "screen.png"
-        _save_window_capture(handle, path)
-        rows = _screen_ocr(path)
-    if _challenge_visible(rows):
-        raise PortalLookupError("Портал показал проверку/CAPTCHA; остановился без взаимодействия.")
+    if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
+        raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
+
+
+def _fast_wait(handle: int, pause: float) -> None:
+    time.sleep(pause)
+    _focus(handle)  # в том числе проверка заголовка на видимую по нему CAPTCHA
 
 
 def _label_text(rows: Sequence[ScreenText], label: str) -> str | None:
@@ -384,17 +465,23 @@ def _drive_portal(
     """
     Use the current browser window to select an address and retain a map-only crop.
 
-    ``fast_mode`` — «быстрая работа»: между проверками экрана пауза ``fast_pause_sec``
-    (по умолчанию 5 с, пользователь выбирает от 1 до 5) вместо 0.6 с, то есть OCR всего окна
-    запускается заметно реже.
+    В быстром режиме фиксированные паузы заменяют промежуточный OCR; финальная
+    проверка и чтение идентификаторов обязательны. Риск несработавшего действия выше.
     """
-    pause = fast_pause_sec if fast_mode else SCREEN_CHECK_PAUSE_SEC
-
     def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
-             timeout: float, description: str) -> list[ScreenText]:
-        return _wait_screen(
-            handle, predicate, timeout=timeout, description=description, pause=pause,
-        )
+             timeout: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION) -> list[ScreenText]:
+        if fast_mode:
+            _fast_wait(handle, fast_pause_sec)
+            with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
+                path = Path(directory) / "screen.png"
+                _save_window_capture(handle, path)
+                rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
+            _reject_challenge(rows)
+            if not predicate(rows):
+                raise PortalLookupError(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
+            return rows
+        return _wait_screen(handle, predicate, timeout=timeout, description=description,
+                            pause=SCREEN_CHECK_PAUSE_SEC, region=region)
 
     if not browser_save.available():
         raise PortalLookupError("Автоматизация окна доступна только в Windows.")
@@ -439,30 +526,7 @@ def _drive_portal(
             description="страницу NYC Property Information Portal",
         )
     else:
-        with tempfile.TemporaryDirectory(prefix="tsai_pip_start_") as directory:
-            path = Path(directory) / "screen.png"
-            _save_window_capture(window.handle, path)
-            # Before hovering/clicking the Select control, cheaply confirm we are
-            # already on the portal (and not a CAPTCHA) by OCR-ing only the upper
-            # left quarter of the screen; this avoids the cost of a full-page OCR
-            # for the common failure cases (challenge page, wrong tab/page).
-            quick_rows = _screen_ocr_top_left_quarter(path)
-            if _challenge_visible(quick_rows) or browser_save.looks_like_cloudflare_page(window.title):
-                raise PortalLookupError(
-                    "На портале отображается проверка человека/CAPTCHA. "
-                    "Остановился, не нажимал и не отправлял снимок в ИИ."
-                )
-            if not any(
-                _contains(quick_rows, marker)
-                for marker in ("Select", "Find Another Property", "Enter an Address")
-            ):
-                raise PortalLookupError(
-                    "По верхней левой четверти экрана не удалось подтвердить страницу NYC Portal; "
-                    "ничего не нажимал. Разверните страницу портала и повторите."
-                )
-            # Confirmed we are on the portal: OCR the full page to get accurate
-            # coordinates for the Select control and any other on-screen text.
-            rows = _screen_ocr(path)
+        rows = _initial_screen(window.handle)
 
     if _contains(rows, "Find Another Property"):
         _click_text(window.handle, rows, "Find Another Property")
@@ -481,12 +545,15 @@ def _drive_portal(
             # attachment). Sending arrow keys before it is actually open is exactly
             # how the menu was observed opening and instantly doing nothing: the
             # Down/Down/Down/Enter presses landed before anything was listening for them.
-            # Confirm the option list is visible (its "Address" row appears) before
-            # driving it with the keyboard, instead of guessing with a fixed delay.
-            rows = wait(
-                window.handle, lambda screen: _has_exact_text(screen, "Address"),
-                timeout=5, description="открывшийся список Select",
-            )
+            # В обычном режиме ждём пункт списка; в быстром пользователь выбрал
+            # риск и фиксированную паузу вместо промежуточной проверки.
+            if fast_mode:
+                _fast_wait(window.handle, fast_pause_sec)
+            else:
+                rows = wait(
+                    window.handle, lambda screen: _has_exact_text(screen, "Address"),
+                    timeout=5, description="открывшийся список Select",
+                )
         _key(window.handle, browser_save.VK_DOWN)
         time.sleep(0.2)
         _key(window.handle, browser_save.VK_DOWN)
@@ -494,13 +561,16 @@ def _drive_portal(
         _key(window.handle, browser_save.VK_DOWN)
         time.sleep(0.2)
         _key(window.handle, browser_save.VK_RETURN)
-        rows = wait(
-            window.handle, lambda screen: _contains(screen, "Enter an Address"),
-            timeout=8, description="поля Address",
-        )
+        if fast_mode:
+            _fast_wait(window.handle, fast_pause_sec)
+        else:
+            rows = wait(
+                window.handle, lambda screen: _contains(screen, "Enter an Address"),
+                timeout=8, description="поля Address",
+            )
         # Confirming "Address" with the keyboard (not a mouse click) leaves DOM
         # focus sitting on the <select> itself even though the page has already
-        # swapped to the address-entry view (just confirmed above by OCR). A
+        # swapped to the address-entry view (confirmed by OCR in normal mode). A
         # click computed from the OCR'd label position was landing outside the
         # input — the swap can still be settling at that instant — so advance
         # focus the same way a user tabbing through the form would: Tab moves
@@ -510,8 +580,14 @@ def _drive_portal(
 
     if progress:
         progress("ввожу адрес в NYC Portal и жду совпадающую подсказку")
-    _type_into_address(window.handle, address, rows)
-    _wait_after_address_input(window.handle)
+    if fast_mode and not _contains(rows, "Enter an Address"):
+        _type_focused_address(window.handle, address)
+    else:
+        _type_into_address(window.handle, address, rows)
+    if fast_mode:
+        _fast_wait(window.handle, fast_pause_sec)
+    else:
+        _wait_after_address_input(window.handle, address, rows)
     _key(window.handle, browser_save.VK_DOWN)
     time.sleep(0.2)
     _key(window.handle, browser_save.VK_RETURN)
@@ -523,7 +599,7 @@ def _drive_portal(
             and _contains(screen, "Borough")
         ),
         timeout=30,
-        description="карточку объекта с Borough, Block и Lot",
+        description="карточку объекта с Borough, Block и Lot", region=None,
     )
     block, lot, borough = _extract_portal_details(rows)
     # Retain a map-only image: neither the saved crop nor the Vision request includes
@@ -613,7 +689,7 @@ def lookup_parcel(
         borough_text = capture.borough or "район не распознан"
         progress(
             f"локальный OCR прочитал Borough: {borough_text}, Block: {capture.block}, Lot: {capture.lot}; "
-            "передаю в Vision только обрезку tax map"
+            "передаю в Vision обрезку tax map и адрес текстом"
         )
     urls, _notes = render_image_files_base64(
         [capture.map_image], max_side_px=1800, enhance_scan=False, output_format="jpeg",

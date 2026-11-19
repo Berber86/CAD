@@ -251,11 +251,55 @@ def test_r13c_cap_per_side_does_not_merge_far_apart_corners():
     rows = off.vertex_offset_rows(fence, sides, max_ft=3.0, ring=ring)
     plan = off.plan_offsets(ring, [fence], survey_pts=[vertex for vertex in rows])
     assert sorted(item.text for item in plan.items) == ["FE.0.2'N", "FE.0.9'N"]
-    # Те же два угла в 5 ft друг от друга — один угол, вторая метка не ставится.
-    close = off.Feature("fence", "F", ((20.0, 0.2), (25.0, 0.9)))
+    # Те же два угла в 5 ft друг от друга при ОДНОМ замере — один угол, вторая метка
+    # не ставится (перекос, R13d, сюда не относится: замеры равны).
+    close = off.Feature("fence", "F", ((20.0, 0.2), (25.0, 0.2)))
     rows = off.vertex_offset_rows(close, sides, max_ft=3.0, ring=ring)
     plan = off.plan_offsets(ring, [close], survey_pts=[vertex for vertex in rows])
     assert [item.text for item in plan.items] == ["FE.0.2'N"]
+
+
+def test_r13d_second_corner_of_the_same_side_is_labelled_when_the_wall_is_skewed():
+    """R13d: второй угол стороны подписывается, если замер другой (стена идёт с перекосом)."""
+    ring = [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]
+    sides = off.side_lines(ring, [], 90.0)
+    # Два угла южной стороны в 5 ft друг от друга: 0.2 и 0.9 — у Николая (Gaston) так
+    # подписаны оба конца стены, идущей вдоль границы с перекосом.
+    skewed = off.Feature("fence", "F", ((20.0, 0.2), (20.0, 0.9), (25.0, 0.9)))
+    rows = off.vertex_offset_rows(skewed, sides, max_ft=3.0, ring=ring)
+    plan = off.plan_offsets(ring, [skewed], survey_pts=[vertex for vertex in rows])
+    assert sorted(item.text for item in plan.items) == ["FE.0.2'N", "FE.0.9'N"]
+    # Флаг в ноль — второй угол стороны не ставится, остаётся ближайший.
+    saved = off.SKEW_PAIR_FT
+    off.SKEW_PAIR_FT = 0.0
+    try:
+        plan = off.plan_offsets(ring, [skewed], survey_pts=[vertex for vertex in rows])
+    finally:
+        off.SKEW_PAIR_FT = saved
+    assert [item.text for item in plan.items] == ["FE.0.2'N"]
+
+
+def test_r13d_mother_gaston_skewed_fence_corner_is_found(results):
+    """На 378 Mother Gaston перекос даёт вторую подпись забора: `FE.2.2'S` у южного конца."""
+    texts = [item["text"] for item in results["Gaston"]["labels"] if item["kind"] == "fence"]
+    assert "FE.2.2'S" in texts
+    saved = off.SKEW_PAIR_FT
+    off.SKEW_PAIR_FT = 0.0
+    try:
+        data, _nikolai = field_plan(*load_pair(PRIMER4))
+    finally:
+        off.SKEW_PAIR_FT = saved
+    assert "FE.2.2'S" not in [p["text"] for p in plan_labels(data["plan"]) if p["kind"] == "fence"]
+
+
+def test_r12_second_row_up_to_three_feet_is_kept():
+    """R12: вторая строка у вершины пишется и на 3.0 ft — Brooklyn, угол дома `2.1'N` и `3.0'W`."""
+    ring = [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]
+    sides = off.side_lines(ring, [], 90.0)
+    feature = off.Feature("house", "H", ((3.0, 2.1), (20.0, 2.1), (20.0, 20.0)))
+    rows = off.vertex_offset_rows(feature, sides, max_ft=5.0, second_ft=off.SECOND_EDGE_FT, ring=ring)
+    assert [round(row.value_ft, 1) for row in rows[(3.0, 2.1)]] == [2.1, 3.0]
+    assert off.SECOND_EDGE_FT == 3.0
 
 
 def test_r14_two_ends_of_one_short_fence_are_one_offset():
@@ -284,10 +328,11 @@ def test_r14_two_objects_meeting_at_the_same_lot_corner_share_one_label():
 def test_r14_per_side_cap_keeps_the_closest_corner():
     ring = [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]
     sides = off.side_lines(ring, [], 90.0)
-    # Три угла вдоль западной стороны на разном удалении; на сторону — не больше одного.
+    # Три угла вдоль западной стороны на разном удалении с ОДНИМ замером (0.5) — на сторону
+    # не больше одного угла: перекос (R13d) здесь не срабатывает, замеры равны.
     fence = off.Feature(
         "fence", "F",
-        ((0.9, 2.0), (0.2, 12.0), (0.7, 22.0)),
+        ((0.5, 2.0), (0.5, 12.0), (0.5, 22.0)),
     )
     rows = off.vertex_offset_rows(fence, sides, max_ft=3.0, ring=ring)
     plan = off.plan_offsets(ring, [fence], survey_pts=[vertex for vertex in rows])
@@ -328,11 +373,12 @@ def test_h17_extra_labels_are_within_half_of_nikolai_in_total(results):
 
 def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
-    Правила 4.21 находят больше подписей Николая, чем прежний замер до ближайшей границы.
+    Правила 4.21–4.25 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи по четырём парам: забор 9 → 21, дом 7 → 8, лишние у дома 17 → 8.
-    Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E)
-    и конец длинного прогона до 6 ft (5.2'S).
+    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 9, лишние у дома 17 → 7.
+    Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E),
+    конец длинного прогона до 6 ft (5.2'S) и второй угол стены с перекосом (4.25, R13d);
+    по дому — вторая строка у вершины до 3 ft (4.25, R12).
     """
     saved = off.EDGE_NORMAL_OFFSETS
     off.EDGE_NORMAL_OFFSETS = False
@@ -341,9 +387,9 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     finally:
         off.EDGE_NORMAL_OFFSETS = saved
     new = _label_totals()
-    assert old["fence"][2] == 9 and new["fence"][2] == 21
-    assert old["house"][2] == 7 and new["house"][2] == 8
-    assert old["house"][3] == 17 and new["house"][3] == 8
+    assert old["fence"][2] == 9 and new["fence"][2] == 23
+    assert old["house"][2] == 7 and new["house"][2] == 9
+    assert old["house"][3] == 17 and new["house"][3] == 7
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
@@ -356,17 +402,18 @@ def test_fourth_pair_mother_gaston_scores_by_the_same_rules(results):
     0.03° относительно «до», поэтому эталон переводится в систему «до» по общим ручкам.
     Пока перевод шёл в обратную сторону (``_to_before`` применял подобие «до → после»),
     с этим чертежом сравнивать было нечем: 0 совпадений. После исправления правила
-    находят 4 подписи забора из 6 и 2 подписи дома из 5.
+    находят 5 подписей забора из 6 (пятая — ``FE.2.2'S``, второй угол стены с перекосом, 4.25)
+    и 2 подписи дома из 5.
 
     У дома на этом листе правила ставят 6 подписей при 5 у Николая (лишних 4 — 80% эталона
-    этого файла; суммарно по четырём парам H17 выполняется: 8 из 20). Причина — плотная
+    этого файла; суммарно по четырём парам H17 выполняется: 7 из 20). Причина — плотная
     городская застройка: куски стен и навесы (`ST-OHED`) распознаются как дом, и подпись
-    ложится рядом с чужой вершиной (``2.7'S`` там, где у Николая ``FE.2.2'S``).
+    ложится рядом с чужой вершиной.
     """
     file = results["Gaston"]
     assert len([p for p in file["nikolai_labels"] if p["kind"] == "fence"]) == 6
     assert len([p for p in file["nikolai_labels"] if p["kind"] == "house"]) == 5
-    for kind, expected in (("fence", 4), ("house", 2)):
+    for kind, expected in (("fence", 5), ("house", 2)):
         got = [p for p in file["labels"] if p["kind"] == kind]
         exp = [p for p in file["nikolai_labels"] if p["kind"] == kind]
         assert score_labels(got, exp) == expected, kind

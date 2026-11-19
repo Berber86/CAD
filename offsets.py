@@ -355,7 +355,7 @@ SECOND_SIDE_FT = 2.0
 #: За: 192 Geldner, забор слева посередине (вершина в 0.001 ft от границы) — у Николая «FE.O/L».
 #: Против: на Brooklyn (4.10) такая вершина не подписана «O/L», забор подписан по другим вершинам.
 #: Противоречивые эталоны — выключено по умолчанию, как CORNER_LABELS и WALL_OFFSETS.
-ONLINE_LABELS = False
+ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
 #: Текст без выноски поворачивается вдоль ближайшей границы (R10). Выключено: на эталонах угол следует за
 #: ориентацией участка, а не за стороной. Ilion: «FE.0.1'E» — 90.4°, «FE.1.3'E» — 0.4° (участок 0.4°).
@@ -421,6 +421,11 @@ HOUSE_WALLS_PER_SIDE = 2
 HOUSE_MAX_LABELS = 4
 #: Текст оффсета дома ставится у середины стены, как у Николая, а не у её конца (H35).
 HOUSE_TEXT_AT_WALL_MIDDLE = True
+#: Текст оффсета дома ставится внутри строения у стены, как у Николая, а не между стеной и границей (H38).
+HOUSE_TEXT_INSIDE = True
+#: Текст оффсета дома поворачивается вдоль границы: 0° у горизонтальной, 90° у вертикальной (H37).
+#: Николай: 4.9'N — 90° при вертикальной восточной границе, 3.2'S и 3.5'S — 0° при южной (3 из 3).
+HOUSE_TEXT_FOLLOWS_BOUNDARY = True
 #: Вторая сторона у той же вершины ищется и на продолжении стороны (H29), не дальше этого, футы.
 #: Николай: «W.FE. 0.1'E / 1.2'S» (северная сторона продолжена за восточный угол), «C.L.F. 0.6'S / 1.1'E».
 SECOND_SIDE_EXTENSION_FT = 5.0
@@ -725,6 +730,57 @@ def _place_beside_line(
             center = (mid[0] + sign * px * d, mid[1] + sign * py * d)
             rect = _rect_at(center, width, height)
             if ok(rect, center) and not _segment_hits_rect(anchor, target, rect):
+                return center
+    return None
+
+
+def _place_house_text(
+    polygon: Sequence[Point], anchor: Point, target: Point, text: str, height: float,
+    width_of: Callable[[str, float], float], ok: Callable[[Rect, Point], bool],
+) -> Point | None:
+    """
+    Текст без выноски внутри строения у стены (H38). Николай ставит его вплотную к стене изнутри и
+    сдвигает вдоль стены, чтобы не накрыть крупную надпись здания («1 STY FRAME», «FRAME GARAGE»).
+    """
+    if len(polygon) < 3:
+        return None
+    dx, dy = anchor[0] - target[0], anchor[1] - target[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    inward = (dx / length, dy / length)
+    # Стена, на которой стоит anchor: ближайший отрезок контура.
+    a = b = None
+    best = math.inf
+    seq = list(polygon) + [polygon[0]]
+    for p, q in zip(seq, seq[1:]):
+        d = _point_segment_distance(anchor, (p, q))
+        if d < best:
+            best, a, b = d, p, q
+    if a is None or b is None:
+        return None
+    width = width_of(text, height)
+    gap = TEXT_GAP_FACTOR * height
+    for offset in (0.8, 1.2, 1.8, 2.5, 3.2, 4.0):
+        distance = height / 2.0 + gap * offset
+        for share in (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9):
+            wall_point = (
+                a[0] + (b[0] - a[0]) * share,
+                a[1] + (b[1] - a[1]) * share,
+            )
+            center = (
+                wall_point[0] + inward[0] * distance,
+                wall_point[1] + inward[1] * distance,
+            )
+            if not point_in_polygon(center, polygon):
+                continue
+            rect = _rect_at(center, width, height)
+            corners = [
+                (rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])
+            ]
+            if not all(point_in_polygon(corner, polygon) for corner in corners):
+                continue
+            if ok(rect, center):
                 return center
     return None
 
@@ -1373,9 +1429,26 @@ def plan_offsets(
             item: OffsetItem | None = None
             beside = None
             if feature.kind == "house":
-                beside = _place_beside_line(
-                    best.vertex, best.foot, text, height, width_of, ok
-                )
+                beside = None
+                if HOUSE_TEXT_INSIDE:
+                    beside = _place_house_text(
+                        feature.points, best.vertex, best.foot, text, height, width_of, ok
+                    )
+                if beside is None:
+                    beside = _place_beside_line(
+                        best.vertex, best.foot, text, height, width_of, ok
+                    )
+                # У середины стены места может не быть — пробуем у исходного угла (текст без выноски,
+                # как у Николая), и только потом выноску.
+                if beside is None and best.anchor_override is not None:
+                    corner = best.anchor_override
+                    corner_foot = (
+                        corner[0] + best.foot[0] - best.vertex[0],
+                        corner[1] + best.foot[1] - best.vertex[1],
+                    )
+                    beside = _place_beside_line(
+                        corner, corner_foot, text, height, width_of, ok
+                    )
             if beside is not None:
                 rect = _rect_at(beside, width_of(text, height), height)
                 item = OffsetItem(
@@ -1383,7 +1456,10 @@ def plan_offsets(
                     height_ft=height, anchor=best.anchor_override or best.vertex, target=best.foot, text=text,
                     point=beside, leader=None,
                     rotation_deg=(
-                        _boundary_angle_deg(best.foot, boundary_segs) if TEXT_FOLLOWS_BOUNDARY else 0.0
+                        _boundary_angle_deg(best.foot, boundary_segs)
+                        if TEXT_FOLLOWS_BOUNDARY
+                        or (feature.kind == "house" and HOUSE_TEXT_FOLLOWS_BOUNDARY)
+                        else 0.0
                     ),
                 )
             else:

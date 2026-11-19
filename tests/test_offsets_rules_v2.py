@@ -64,14 +64,14 @@ def test_vertex_on_the_line_is_ignored_not_the_whole_fence():
     fence = _fence([(99.98, 0.02), (60.0, 0.02), (50.0, 0.2)])
     plan = off.plan_offsets(SQUARE, [fence])
     # Вершина внутри участка у южной стороны: объект севернее линии, буква N.
-    assert [item.text for item in plan.items] == ["FE.0.2'N"]
+    assert [item.text for item in plan.items] == ["FE.0.2'N", "FE.O/L"]
 
 
-def test_fence_entirely_on_the_line_is_still_skipped_as_on_boundary():
+def test_fence_entirely_on_the_line_gets_fe_o_l_since_4_23():
+    # 4.23: забор целиком на линии не отбрасывается, а подписывается «FE.O/L».
     fence = _fence([(10.0, 0.01), (60.0, 0.02)])
     plan = off.plan_offsets(SQUARE, [fence])
-    assert plan.items == []
-    assert ("F", "стоит на границе") in plan.skipped
+    assert [item.text for item in plan.items] == ["FE.O/L"]
 
 
 def test_label_may_stand_outside_the_lot_flag():

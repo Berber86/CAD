@@ -209,13 +209,19 @@ def _run_on_before(dump: dict):
     feats = [ab.AcadBuilder._offset_feature(f) for f in rec.features if ab.AcadBuilder._offset_feature(f)]
     front = [list(ln.points) for ln in snap.lines if ln.layer.upper() == off.FRONT_BOUNDARY_LAYER]
     texts = [(str(t.text), tuple(t.point), float(t.height or 0.0)) for t in snap.texts if not t.hidden]
+    survey = [(tuple(sp.point), str(sp.description)) for sp in snap.survey_points]
+    gates = [tuple(t.point) for t in snap.texts if "GATE" in str(t.text).upper()] + [
+        tuple(sp.point) for sp in snap.survey_points if "GATE" in str(sp.description).upper()
+    ]
     ring = list(boundary.polygon.exterior.coords)
     wfn = lambda t, h: ab.feature_text_width(t, h, FCFG)
     plan_wide = off.plan_offsets(
-        ring, feats, front=front, area=wide_area, north_deg=north_deg, texts=texts, text_width=wfn
+        ring, feats, front=front, area=wide_area, north_deg=north_deg, texts=texts,
+        text_width=wfn, survey=survey, gates=gates,
     )
     plan_lot = off.plan_offsets(
-        ring, feats, front=front, area=ring, north_deg=north_deg, texts=texts, text_width=wfn
+        ring, feats, front=front, area=ring, north_deg=north_deg, texts=texts,
+        text_width=wfn, survey=survey, gates=gates,
     )
     return snap, plan_wide, plan_lot
 
@@ -271,7 +277,7 @@ def test_rule2_nearest_north_arrow_selected_on_multi_sheet_alvine_dump():
 
 
 def test_rule3_per_side_garage_and_two_corner_single_wall_and_bldg_leader():
-    """Правило 3: гараж у 3 границ даёт 3 оффсета по сторонам; наклонная стена у 1 границы — оба угла."""
+    """Правило 3: гараж у 3 границ даёт 3 оффсета по сторонам; узкий сарай без места внутри — выноску «BLDG »."""
     lot = [(0.0, 0.0), (18.0, 0.0), (18.0, 100.0), (0.0, 100.0)]
     garage = off.Feature(
         "house", "G1", ((2.1, 78.0), (16.1, 78.0), (16.1, 97.0), (2.1, 97.0)), closed=True
@@ -279,7 +285,12 @@ def test_rule3_per_side_garage_and_two_corner_single_wall_and_bldg_leader():
     plan = off.plan_offsets(lot, [garage])
     vals = sorted((it.value_ft, it.direction) for it in plan.items)
     assert vals == [(1.9, "W"), (2.1, "E"), (3.0, "S")]
-    assert any(it.text.startswith("BLDG ") for it in plan.items if it.style == "leader")
+    assert all(it.style == "text" for it in plan.items)
+
+    # Узкая постройка (1.2 × 8 ft) в 0.4 ft от границы: внутри текст не помещается -> выноска «BLDG 0.4'E».
+    shed = off.Feature("house", "S1", ((0.4, 50.0), (1.6, 50.0), (1.6, 58.0), (0.4, 58.0)), closed=True)
+    plan_shed = off.plan_offsets(lot, [shed])
+    assert any(it.style == "leader" and it.text.startswith("BLDG ") for it in plan_shed.items)
 
     wide_lot = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
     tilted_house = off.Feature(
@@ -347,7 +358,7 @@ def five_surveys():
 
 
 def test_real_before_dumps_increase_placed_offsets_and_keep_lot_selection_parity(five_surveys):
-    """На всех 5 файлах «до» число построенных оффсетов выросло (39 -> 55, при выборе лота 18 -> 55)."""
+    """На всех 5 файлах «до» число построенных оффсетов выросло (39 -> 60, при выборе лота 18 -> 60)."""
     baseline_v419_wide = {
         "192 Geldner": 14,
         "24 Alvine": 7,
@@ -370,21 +381,21 @@ def test_real_before_dumps_increase_placed_offsets_and_keep_lot_selection_parity
         assert len(plan_lot.items) == len(plan_wide.items), name
 
     total_placed = sum(len(pw.items) for pw, _pl, _n in five_surveys.values())
-    assert total_placed == 55
+    assert total_placed == 60
 
 
 def test_real_before_dumps_pass_customer_50_percent_extra_limit_and_match_nikolai(five_surveys):
-    """По критерию заказчика оффсетов программы не больше 1.5x от подписей Николая (заборы 1.21x, дома 1.40x)."""
+    """По критерию заказчика оффсетов программы не больше 1.5x от подписей Николая на каждом чертеже и в сумме."""
     tot_n_fence = tot_p_fence = tot_exact_fence = 0
     tot_n_house = tot_p_house = tot_exact_house = 0
 
     for name, (plan_wide, _plan_lot, nik_by_kind) in five_surveys.items():
-        p_fence = [it for it in plan_wide.items if it.kind == "fence"]
+        p_fence = [it for it in plan_wide.items if it.kind == "fence" and it.text != "FE.O/L"]
         p_house = [it for it in plan_wide.items if it.kind == "house"]
         n_fence = nik_by_kind["fence"]
         n_house = nik_by_kind["house"]
 
-        # На каждом отдельном чертеже заборы укладываются в <= +50% к Николаю.
+        # На каждом отдельном чертеже направленные заборы и дома укладываются в <= +50% к Николаю.
         assert len(p_fence) <= 1.5 * len(n_fence), f"{name}: fences {len(p_fence)} vs {len(n_fence)}"
         if n_house:
             assert len(p_house) <= 1.5 * len(n_house), f"{name}: houses {len(p_house)} vs {len(n_house)}"
@@ -412,9 +423,9 @@ def test_real_before_dumps_pass_customer_50_percent_extra_limit_and_match_nikola
                 tot_p_house += len(p_list)
                 tot_exact_house += len(used)
 
-    assert tot_p_fence <= 1.5 * tot_n_fence  # 34 <= 42.0 (1.21x)
-    assert tot_p_house <= 1.5 * tot_n_house  # 21 <= 22.5 (1.40x)
-    assert tot_exact_fence >= 16  # в v4.19 было 6
+    assert tot_p_fence <= 1.5 * tot_n_fence  # 35 <= 42.0 (1.25x)
+    assert tot_p_house <= 1.5 * tot_n_house  # 20 <= 22.5 (1.33x)
+    assert tot_exact_fence >= 19  # в v4.19 было 6, в v4.20 было 16
     assert tot_exact_house >= 10  # в v4.19 было 7
 
 

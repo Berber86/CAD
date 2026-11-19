@@ -3916,11 +3916,23 @@ class AcadBuilder:
                 (str(t.text), tuple(t.point), float(t.height or 0.0))
                 for t in snapshot.texts if not getattr(t, "hidden", False)
             ]
+            survey = [
+                (tuple(sp.point), str(sp.description))
+                for sp in getattr(snapshot, "survey_points", ())
+            ]
+            gates = [
+                tuple(t.point) for t in snapshot.texts if "GATE" in str(t.text).upper()
+            ] + [
+                tuple(sp.point)
+                for sp in getattr(snapshot, "survey_points", ())
+                if "GATE" in str(sp.description).upper()
+            ]
             ring = list(boundary.polygon.exterior.coords)
             plan = offsets.plan_offsets(
                 ring, features, front=front, area=area, scale=scale_value,
                 north_deg=north_deg, texts=texts,
                 text_width=lambda text, height: feature_text_width(text, height, fcfg),
+                survey=survey, gates=gates,
             )
             result = OffsetRunResult(
                 plan=plan, area=list(area), scale=scale_value, north_deg=north_deg,
@@ -3976,6 +3988,16 @@ class AcadBuilder:
         try:
             for item in plan.items:
                 try:
+                    if item.style == "text" and "\n" in item.text:
+                        label = FeatureLabelItem(
+                            feature=None, text=item.text, kind="text", placement="beside",
+                            point=item.point, height=item.height_ft,
+                            rotation=math.radians(float(getattr(item, "rotation_deg", 0.0))),
+                        )
+                        result.created_texts += self._add_feature_texts(
+                            model_space, label, layer, style, fcfg
+                        )
+                        continue
                     if item.style == "text":
                         self._add_text(
                             model_space,

@@ -19,8 +19,9 @@ def _house(points, handle="H1"):
     return off.Feature(kind="house", handle=handle, points=tuple(points))
 
 
-def test_online_flag_is_off_because_examples_conflict():
-    assert off.ONLINE_LABELS is False
+def test_online_flag_is_on_by_default_since_4_21():
+    # В 5 из 6 эталонов Николая забор на границе получает выноску «FE.O/L».
+    assert off.ONLINE_LABELS is True
     assert off.ONLINE_FENCE_TEXT == "FE.O/L"
 
 
@@ -29,10 +30,10 @@ def online_on(monkeypatch):
     monkeypatch.setattr(off, "ONLINE_LABELS", True)
 
 
-def test_default_plan_keeps_on_line_fence_unlabelled():
+def test_default_plan_gives_on_line_fence_online_label():
     fence = _fence([(0.0, 15.0), (3.0, 15.0), (3.0, 25.0)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
-    assert all(it.text != "FE.O/L" for it in plan.items)
+    assert any(it.text == "FE.O/L" and it.style == "leader" for it in plan.items)
 
 
 def test_fence_vertex_on_lot_line_gets_online_label(online_on):
@@ -52,7 +53,8 @@ def test_online_label_is_a_leader_next_to_the_fence(online_on):
     assert online[0].value_ft == 0.0
 
 
-def test_online_flag_off_gives_no_online_label():
+def test_online_flag_off_gives_no_online_label(monkeypatch):
+    monkeypatch.setattr(off, "ONLINE_LABELS", False)
     fence = _fence([(0.0, 15.0), (3.0, 15.0), (3.0, 25.0)])
     plan = off.plan_offsets(LOT, [fence], north_deg=90.0)
     assert all(it.text != "FE.O/L" for it in plan.items)
@@ -72,11 +74,15 @@ def rotation_on(monkeypatch):
     monkeypatch.setattr(off, "TEXT_FOLLOWS_BOUNDARY", True)
 
 
-def test_rotation_is_off_by_default():
+def test_house_rotation_follows_boundary_by_default_while_global_flag_stays_off(monkeypatch):
     assert off.TEXT_FOLLOWS_BOUNDARY is False
+    assert off.HOUSE_TEXT_FOLLOWS_BOUNDARY is True
     house = _house([(6.0, 10.0), (14.0, 10.0), (14.0, 30.0), (6.0, 30.0)])
     plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
-    assert all(it.rotation_deg == 0.0 for it in plan.items)
+    assert all(math.isclose(abs(it.rotation_deg), 90.0, abs_tol=0.01) for it in plan.items)
+    monkeypatch.setattr(off, "HOUSE_TEXT_FOLLOWS_BOUNDARY", False)
+    plan_off = off.plan_offsets(LOT40, [house], north_deg=90.0)
+    assert all(it.rotation_deg == 0.0 for it in plan_off.items)
 
 
 def test_house_text_is_parallel_to_its_boundary(rotation_on):

@@ -60,18 +60,20 @@ def test_tie_after_rounding_prefers_vertex_inside_lot():
 
 def test_vertex_on_the_line_is_ignored_not_the_whole_fence():
     # Вершина (99.98, 0.02) лежит на линии (0.02 < MIN_OFFSET), вершина (50, 0.2) — 0.2 ft внутри.
-    # Раньше забор целиком отбрасывался как «стоит на границе»; теперь подписывается по второй вершине.
+    # Забор подписывается по внутренней вершине «FE.0.2'N» и получает «FE.O/L» на участке по линии.
     fence = _fence([(99.98, 0.02), (60.0, 0.02), (50.0, 0.2)])
     plan = off.plan_offsets(SQUARE, [fence])
-    # Вершина внутри участка у южной стороны: объект севернее линии, буква N.
-    assert [item.text for item in plan.items] == ["FE.0.2'N"]
+    assert [item.text for item in plan.items] == ["FE.0.2'N", "FE.O/L"]
 
 
-def test_fence_entirely_on_the_line_is_still_skipped_as_on_boundary():
+def test_fence_entirely_on_the_line_gets_fe_o_l_unless_disabled(monkeypatch):
     fence = _fence([(10.0, 0.01), (60.0, 0.02)])
-    plan = off.plan_offsets(SQUARE, [fence])
-    assert plan.items == []
-    assert ("F", "стоит на границе") in plan.skipped
+    plan_on = off.plan_offsets(SQUARE, [fence])
+    assert [it.text for it in plan_on.items] == ["FE.O/L"]
+    monkeypatch.setattr(off, "ONLINE_LABELS", False)
+    plan_off = off.plan_offsets(SQUARE, [fence])
+    assert plan_off.items == []
+    assert ("F", "стоит на границе") in plan_off.skipped
 
 
 def test_label_may_stand_outside_the_lot_flag():

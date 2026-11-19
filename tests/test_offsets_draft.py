@@ -107,8 +107,17 @@ def test_object_outside_property_is_skipped_with_reason():
     assert ("OUT", "объект вне участка") in plan.skipped
 
 
-def test_object_on_boundary_gets_no_offset():
+def test_object_on_boundary_gets_no_offset(monkeypatch):
+    # Дом, стоящий по границе, оффсета не получает; забор по границе даёт «FE.O/L» при ONLINE_LABELS=True
+    # и пропускается как «стоит на границе» при ONLINE_LABELS=False.
+    house_on_line = off.Feature("house", "H_EDGE", ((40.0, 0.0), (50.0, 0.0), (50.0, 0.02), (40.0, 0.02)))
+    plan_h = off.plan_offsets(RING, [house_on_line], front=FRONT)
+    assert plan_h.items == []
+    assert ("H_EDGE", "стоит на границе") in plan_h.skipped
+
     on_line = _fence([(40.0, 0.0), (50.0, 0.0)], handle="EDGE")
+    assert [i.text for i in off.plan_offsets(RING, [on_line], front=FRONT).items] == ["FE.O/L"]
+    monkeypatch.setattr(off, "ONLINE_LABELS", False)
     plan = off.plan_offsets(RING, [on_line], front=FRONT)
     assert plan.items == []
     assert ("EDGE", "стоит на границе") in plan.skipped
@@ -170,9 +179,10 @@ def test_closing_point_in_ring_is_ignored():
 
 
 def test_report_text_lists_items_and_skips():
+    edge_house = off.Feature("house", "E", ((40.0, 0.0), (50.0, 0.0), (50.0, 0.02), (40.0, 0.02)))
     plan = off.plan_offsets(
         RING,
-        [_house(), _fence([(60.0, 5.0), (60.0, 20.0)]), _fence([(40.0, 0.0), (50.0, 0.0)], handle="E")],
+        [_house(), _fence([(60.0, 5.0), (60.0, 20.0)]), edge_house],
         front=FRONT,
     )
     text = off.plan_report_text(plan, 16)

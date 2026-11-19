@@ -1,4 +1,4 @@
-"""Шаг 4, 4.26: что взято из ветки соседа (север у участка, замкнутость дома) и что отклонено."""
+"""Шаг 4, 4.26–4.28: что взято из параллельных веток (север у участка, замкнутость дома)."""
 
 from __future__ import annotations
 
@@ -26,30 +26,24 @@ def test_open_house_contour_is_not_closed() -> None:
     assert "3.0'N" in _texts(off.Feature(kind="house", handle="H", points=points))
 
 
-def test_gate_end_at_house_wall_is_skipped_only_when_rule_is_on(monkeypatch) -> None:
-    """Внутренний конец калитки у стены дома: правило соседа работает, но по умолчанию выключено.
+def test_house_deeper_than_six_feet_is_not_labelled() -> None:
+    """Дом без стены ближе 6 ft не подписывается: у Николая самая дальняя подпись дома — 4.9 ft.
 
-    На наших трёх парах оно ничего не срезает, а на Brooklyn добавляет лишнюю подпись
-    (fence 4/3/2 → 5/3/3), поэтому включено только как опция для чертежей с калитками у стен.
+    До 4.28 в этом случае подпись всё равно ставилась по ближайшей вершине на любом расстоянии —
+    оттуда и брались «12.2'E» и «13.1'S» на Geldner и Alvine.
     """
-    house = off.Feature(kind="house", handle="H", points=((0.0, 6.0), (10.0, 6.0), (10.0, 16.0), (0.0, 16.0)))
-    fence = off.Feature(
-        kind="fence",
-        handle="F",
-        points=((0.6, 0.6), (3.0, 0.6), (3.0, 6.2)),
-        closed=False,
+    deep = off.Feature(
+        kind="house",
+        handle="H",
+        points=((15.0, 14.0), (30.0, 14.0), (30.0, 30.0), (15.0, 30.0)),
+        closed=True,
     )
-    survey = [((3.0, 0.6), "WOOD FENCE"), ((3.0, 6.2), "WOOD FENCE")]
-
-    def texts() -> list[str]:
-        return [
-            item.text
-            for item in off.plan_offsets(LOT, [fence, house], north_deg=90.0, survey=survey).items
-        ]
-
-    assert off.GATE_AT_WALL_MIN_FT == 0.0  # по умолчанию выключено
-    default = texts()
-    monkeypatch.setattr(off, "GATE_AT_WALL_MIN_FT", 1.2)
-    assert texts() != default  # правило включено — вершина у стены дома отброшена
-    assert off.FENCE_SAME_SIDE_SEP_FT == 0.0 and off.FENCE_DIFF_SIDE_SEP_FT == 0.0
-    assert off.FENCE_SIMPLIFY_DEG == 0.0
+    plan = off.plan_offsets(LOT, [deep], north_deg=90.0)
+    assert plan.items == []
+    close = off.Feature(
+        kind="house",
+        handle="H",
+        points=((15.0, 5.0), (30.0, 5.0), (30.0, 30.0), (15.0, 30.0)),
+        closed=True,
+    )
+    assert [item.text for item in off.plan_offsets(LOT, [close], north_deg=90.0).items] == ["5.0'N"]

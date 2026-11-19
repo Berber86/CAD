@@ -3179,14 +3179,14 @@ def test_step4_run_reports_error_and_result(gui):
 
     plan = off.plan_offsets(
         [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)],
-        [off.Feature("house", "H1", ((20.0, 10.0), (40.0, 10.0), (40.0, 30.0), (20.0, 30.0)))],
+        [off.Feature("house", "H1", ((20.0, 5.0), (40.0, 5.0), (40.0, 30.0), (20.0, 30.0)))],
         front=[[(0.0, 0.0), (100.0, 0.0)]],
     )
     run = OffsetRunResult(plan=plan, area=[], scale=16.0, north_deg=90.0,
                           front_lines=1, feature_count=1, dry_run=True)
     app._handle_offsets_result(run, "")
     text = app.step4_report_box.get("1.0", "end")
-    assert "Подписей: 1" in text and "10.0'N" in text
+    assert "Подписей: 1" in text and "5.0'N" in text
     assert "Режим расчёта: чертёж не изменён." in text
     assert app.status_var.get() == "Шаг 4: оффсетов 1 (чертёж не изменён)"
 

@@ -15,7 +15,7 @@ RING = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
 FRONT = [[(0.0, 0.0), (100.0, 0.0)]]
 
 
-def _house(x0=20.0, y0=10.0, x1=40.0, y1=30.0, handle="H1"):
+def _house(x0=20.0, y0=5.0, x1=40.0, y1=30.0, handle="H1"):
     return off.Feature("house", handle, ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
 
 
@@ -62,13 +62,13 @@ def test_offset_text_forms_match_customer_examples():
 
 def test_house_gets_text_without_leader_at_house_height():
     plan = off.plan_offsets(RING, [_house()], front=FRONT, scale=16)
-    assert [i.text for i in plan.items] == ["10.0'N"]
+    assert [i.text for i in plan.items] == ["5.0'N"]
     item = plan.items[0]
     assert item.style == "text"
     assert item.leader is None
     assert item.height_ft == pytest.approx(1.1)
-    assert item.anchor == (20.0, 10.0)
-    assert item.target == pytest.approx((20.0, 0.0))
+    assert item.anchor == (20.0, 5.0)  # вершина стены, от которой мерили
+    assert item.target == pytest.approx((30.0, 0.0))  # H35: середина стены
     assert _inside_ring(item.point)
 
 
@@ -122,7 +122,7 @@ def test_unsupported_kind_is_reported_inside_area_only():
 
 
 def test_same_text_nearby_is_not_duplicated():
-    existing = [("10.0'N", (22.0, 5.0), 1.1)]
+    existing = [("5.0'N", (22.0, 5.0), 1.1)]
     plan = off.plan_offsets(RING, [_house()], front=FRONT, texts=existing)
     assert plan.items == []
     assert any("уже стоит рядом" in reason for _, reason in plan.skipped)
@@ -167,7 +167,7 @@ def test_small_polygon_is_refused_with_warning():
 def test_closing_point_in_ring_is_ignored():
     closed = RING + [RING[0]]
     plan = off.plan_offsets(closed, [_house()], front=FRONT)
-    assert [i.text for i in plan.items] == ["10.0'N"]
+    assert [i.text for i in plan.items] == ["5.0'N"]
 
 
 def test_report_text_lists_items_and_skips():
@@ -179,11 +179,11 @@ def test_report_text_lists_items_and_skips():
     text = off.plan_report_text(plan, 16)
     assert f"черновик {off.STEP4_VERSION}" in text
     assert "Подписей: 3 (без выноски: 3, с выноской: 0)" in text
-    assert "10.0'N  (без выноски)" in text
+    assert "5.0'N  (без выноски)" in text
     assert "FE.O/L  (без выноски)" in text
 
 
 def test_scale_changes_heights_only_not_values():
     small = off.plan_offsets(RING, [_house()], front=FRONT, scale=20)
-    assert small.items[0].text == "10.0'N"
+    assert small.items[0].text == "5.0'N"
     assert small.items[0].height_ft == pytest.approx(1.375)

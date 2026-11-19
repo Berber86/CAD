@@ -99,8 +99,8 @@ def test_house_text_is_parallel_to_its_boundary(rotation_on):
 
 
 def test_house_text_near_horizontal_boundary_is_horizontal(rotation_on):
-    # Дом в 10 ft от нижней (горизонтальной) границы: текст 0°.
-    house = _house([(10.0, 10.0), (12.0, 10.0), (12.0, 30.0), (10.0, 30.0)])
+    # Дом в 5 ft от нижней (горизонтальной) границы: текст 0°.
+    house = _house([(10.0, 5.0), (22.0, 5.0), (22.0, 30.0), (10.0, 30.0)])
     plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
     text_items = [it for it in plan.items if it.style == "text"]
     assert text_items

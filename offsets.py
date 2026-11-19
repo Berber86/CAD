@@ -381,29 +381,12 @@ FENCE_TEXT_ONE_LINE = False
 #: наш `C.L.F. 0.2'S` — это второй `C.L.F.` в двух футах. Пишем общее `FE.`, как его же
 #: `FE.1.4'E`, `FE.5.2'S`, `FE.0.1'W` на том же чертеже.
 TYPE_PREFIX_FT = 0.0
-#: Вершина забора у стены дома — внутренний конец калитки, а не оффсет: не подписывается, если она
-#: дальше этого от границы участка, футы (H25, 6910/East 55th: `FE.7.9'E`, `FE.2.5'S` — мусор).
-GATE_AT_WALL_MIN_FT = 0.0
-#: …и ближе этого к стене дома, футы. По нашим трём парам правило ничего не срезает, а на Brooklyn
-#: добавляет лишнюю подпись (4/3/2 → 5/3/3), поэтому по умолчанию выключено; у соседа проверено на
-#: 6910 15th Ave и East 55th, которых в нашей выборке нет.
-GATE_AT_WALL_FT = 0.5
-#: Изгиб забора не больше этого — не вершина (H25 соседа). Выключено: упрощение ломаной сдвигает
-#: индексы вершин и добавляет подписи (Geldner 8 → 9 лишних, Alvine 2 → 3, Brooklyn 2 → 3).
-FENCE_SIMPLIFY_DEG = 0.0
-#: Две подписи одного забора ближе этого вдоль одной стороны не ставятся, футы (H25 соседа).
-#: На наших трёх парах шаг снимает одну верную подпись на Geldner (13 → 12 совпадений) и не убирает
-#: лишние, поэтому по умолчанию выключено; включается, если у заказчика появятся многосторонние заборы.
-FENCE_SAME_SIDE_SEP_FT = 0.0
-#: …и ближе этого на разных сторонах участка, футы.
-FENCE_DIFF_SIDE_SEP_FT = 0.0
-#: Не больше стольких подписей забора на одну сторону участка (0 — без предела). Углы, разнесённые
-#: вдоль стороны дальше ``SIDE_CAP_SPACING_FT``, считаются разными сторонами: на Brooklyn забор идёт
-#: вдоль запада 100 ft, и Николай подписал оба его конца.
-#: На наших трёх парах предел снимает верную подпись на Geldner (13 → 12 совпадений) и лишние не
-#: убирает, поэтому по умолчанию выключен; у соседа правило проверено на его парах.
-FENCE_SIDE_CAP = 0
-SIDE_CAP_SPACING_FT = 30.0
+#: Дом дальше этого от линии не подписывается вовсе (та же граница, что у стен дома, H34), футы.
+#: Самая дальняя подпись Николая по дому — 4.9 ft (192 Geldner). Раньше «дом без параллельной стены»
+#: всё равно получал подпись по ближайшей вершине на любом расстоянии — это и были наши лишние
+#: «12.2'E», «13.1'S», «14.1'S» в глубине участка. Со правилом: 45 → 41 подпись на трёх парах
+#: при тех же 31 совпадении.
+KIND_MAX_FT = 6.0
 #: Подписи одной вершины ближе этого не ставятся. Выключено: у Николая на одном углу стоят ДВЕ подписи
 #: в 1.5 ft друг от друга (`FE.1.7'S` и `C.L.F. 0.2'S` на 192 Geldner), и правило резало верные подписи
 #: (совпадений 13 → 7 на Geldner, 3 → 1 на Brooklyn).
@@ -1024,41 +1007,14 @@ def _boundary_angle_deg(point: Point, segments: Sequence[tuple[Point, Point]]) -
     return round(angle, 2)
 
 
-def _simplify_polyline(points: Sequence[Point], *, tol_deg: float = 5.0) -> list[Point]:
-    """Убирает промежуточные почти коллинеарные точки забора: изгиб до 5° — не вершина для подписи."""
-    pts = [(float(x), float(y)) for x, y in points]
-    if len(pts) <= 2:
-        return pts
-    sin_tol = math.sin(math.radians(tol_deg))
-    out = [pts[0]]
-    for i in range(1, len(pts) - 1):
-        a, b, c = out[-1], pts[i], pts[i + 1]
-        v1 = (b[0] - a[0], b[1] - a[1])
-        v2 = (c[0] - b[0], c[1] - b[1])
-        l1, l2 = math.hypot(*v1), math.hypot(*v2)
-        if l1 < 1e-6 or l2 < 1e-6:
-            continue
-        cross = abs(v1[0] * v2[1] - v1[1] * v2[0]) / (l1 * l2)
-        dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
-        if dot > 0.0 and cross <= sin_tol:
-            continue
-        out.append(b)
-    out.append(pts[-1])
-    return out
-
-
 def _feature_candidates(
     ring: Sequence[Point], feature: Feature, front_lines: Sequence[Sequence[Point]],
     *,
     survey: Sequence[tuple[Point, str]] = (),
     gates: Sequence[Point] = (),
     north_deg: float = 90.0,
-    house_edges: Sequence[tuple[Point, Point]] = (),
 ) -> list[OffsetCandidate]:
     """Кандидаты для объекта: при CORNER_LABELS — углы по параллельным сторонам, иначе ближайшая сторона."""
-    if FENCE_SIMPLIFY_DEG and feature.kind == "fence" and len(feature.points) > 2:
-        # Почти прямые изгибы (≤ 5°) — не вершины: без них на длинном прогоне появляются лишние подписи.
-        feature = replace(feature, points=tuple(_simplify_polyline(feature.points, tol_deg=FENCE_SIMPLIFY_DEG)))
     base = measure_candidates(ring, [feature], front=front_lines)
     if feature.kind not in ("fence", "house", "wall"):
         return base[:]
@@ -1079,9 +1035,7 @@ def _feature_candidates(
         # 4.20: углы обследованных заборов вместо одной ближайшей вершины (H28) + пересечения (H27).
         chosen: list[OffsetCandidate] = []
         if FENCE_CORNER_LABELS:
-            chosen = _surveyed_fence_corners(
-                ring, feature, survey, gates, north_deg, house_edges
-            )
+            chosen = _surveyed_fence_corners(ring, feature, survey, gates, north_deg)
         if not chosen:
             chosen = nearest()
         # Вершины на самой линии не подписываются, но нужны для «FE.O/L» (ONLINE_LABELS).
@@ -1151,6 +1105,10 @@ def _feature_candidates(
                     )
                 chosen = moved
             return chosen
+        # Ни одной стены в пределах HOUSE_WALL_MAX_FT: дом в глубине участка не подписывается.
+        # Раньше в этом случае подпись всё равно ставилась по ближайшей вершине на любом расстоянии —
+        # оттуда и брались «12.2'E», «13.1'S», «14.1'S» на Geldner и Alvine.
+        return []
 
     if not CORNER_LABELS:
         return nearest()
@@ -1217,21 +1175,9 @@ def _vertex_candidates(
     return out
 
 
-def _touches_building_away_from_lot(
-    point: Point, ring: Sequence[Point], house_edges: Sequence[tuple[Point, Point]],
-) -> bool:
-    """Вершина забора стоит у стены дома и далеко от границы — это конец калитки, а не оффсет."""
-    if not house_edges or GATE_AT_WALL_MIN_FT <= 0.0:
-        return False
-    if perpendicular_distance(point, ring, closed=True)[0] < GATE_AT_WALL_MIN_FT:
-        return False
-    return any(_point_segment_distance(point, edge) <= GATE_AT_WALL_FT for edge in house_edges)
-
-
 def _surveyed_fence_corners(
     ring: Sequence[Point], feature: Feature,
     survey: Sequence[tuple[Point, str]], gates: Sequence[Point], north_deg: float,
-    house_edges: Sequence[tuple[Point, Point]] = (),
 ) -> list[OffsetCandidate]:
     """
     Углы забора, стоящие у точек съёмки с описанием забора (H28).
@@ -1247,9 +1193,6 @@ def _surveyed_fence_corners(
     points = list(feature.points)
     for index, (candidate, _parallel) in enumerate(_vertex_candidates(ring, feature)):
         if candidate.outside_ft > CORNER_MAX_FT:
-            continue
-        # Внутренний конец калитки у стены дома (H25) — не оффсет.
-        if _touches_building_away_from_lot(candidate.vertex, ring, house_edges):
             continue
         value = round_offset_ft(candidate.distance_ft)
         if value < 0.1 or candidate.distance_ft > CORNER_MAX_FT:
@@ -1299,36 +1242,7 @@ def _surveyed_fence_corners(
     corners.sort(
         key=lambda c: (round_offset_ft(c.distance_ft), not c.inside, c.distance_ft)
     )
-    if FENCE_SIDE_CAP:
-        # Не больше ``FENCE_SIDE_CAP`` подписей на одну букву стороны (R13c соседа).
-        per_letter: dict[str, list[OffsetCandidate]] = {}
-        capped: list[OffsetCandidate] = []
-        for candidate in corners:
-            letter = offset_letter(
-                candidate.vertex[0] - candidate.foot[0],
-                candidate.vertex[1] - candidate.foot[1],
-                north_deg,
-            )
-            same = per_letter.setdefault(letter, [])
-            if len(same) >= FENCE_SIDE_CAP and all(
-                math.dist(candidate.vertex, other.vertex) < SIDE_CAP_SPACING_FT for other in same
-            ):
-                continue
-            same.append(candidate)
-            capped.append(candidate)
-        corners = capped
-    # Шаг между подписями одного забора (H25 соседа): вдоль одной стороны 22 ft, на разных сторонах 12 ft.
-    spaced: list[OffsetCandidate] = []
-    for candidate in corners:
-        separation = (
-            FENCE_SAME_SIDE_SEP_FT
-            if any(candidate.segment == other.segment for other in spaced)
-            else FENCE_DIFF_SIDE_SEP_FT
-        )
-        if any(math.dist(candidate.vertex, other.vertex) < separation for other in spaced):
-            continue
-        spaced.append(candidate)
-    return spaced
+    return corners
 
 
 def _crossing_candidates(
@@ -1475,16 +1389,6 @@ def plan_offsets(
             seq = pts + [pts[0]] if closed else pts
             lines += list(zip(seq, seq[1:]))
 
-    # Стены домов: по ним отсекаются внутренние концы калиток (H25).
-    house_edges: list[tuple[Point, Point]] = []
-    for house in features:
-        if house.kind != "house" or len(house.points) < 2:
-            continue
-        hpts = list(house.points)
-        hclosed = house.closed if house.closed is not None else len(hpts) >= 3
-        hseq = hpts + [hpts[0]] if hclosed else hpts
-        house_edges += list(zip(hseq, hseq[1:]))
-
     # Границы, к которым меряются оффсеты: контур участка и фронт. По ним задаётся угол текста (R10).
     boundary_segs: list[tuple[Point, Point]] = list(zip(ring, ring[1:] + ring[:1]))
     for line in front_lines:
@@ -1517,12 +1421,16 @@ def plan_offsets(
             plan.skipped.append((label, "стена: у заказчика подписывается размером, не оффсетом"))
             continue
         feature_candidates = _feature_candidates(
-            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg,
-            house_edges=house_edges,
+            ring, feature, front_lines, survey=survey, gates=gates, north_deg=north_deg
         )
         candidates = [c for c in feature_candidates if c.outside_ft <= c.allowed_outside_ft]
         if not candidates:
-            plan.skipped.append((label, "объект вне участка"))
+            if feature.kind == "house":
+                plan.skipped.append(
+                    (label, f"дом в глубине участка: нет стены ближе {HOUSE_WALL_MAX_FT:g} ft")
+                )
+            else:
+                plan.skipped.append((label, "объект вне участка"))
             continue
         # Вершины, которые лежат на самой линии участка, не подписываются, но не отменяют остальные вершины
         # объекта: в Brooklyn заборы с такой вершиной подписаны по другим вершинам (FE.0.2'N, FE.0.1'S).

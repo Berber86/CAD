@@ -2744,8 +2744,7 @@ class AcadBuilder:
     ) -> str:
         """Создать недостающий слой; существующие цвет и тип линии не менять.
 
-        Для нового PL используем ACAD_ISO10W100, увиденный в большинстве
-        предоставленных чертежей. Если AutoCAD его не загрузил — предупреждаем.
+        Для новых слоёв задаём тип, не меняя тип существующих слоёв DWG.
         """
         try:
             layer = doc.Layers.Item(name)
@@ -2782,12 +2781,14 @@ class AcadBuilder:
                     )
         return name
 
-    def _add_survey_line(self, model_space: Any, item: LineItem, layer: str, color: int) -> Any:
-        """Новый отрезок: заданный цвет, а рисунок линии наследуется от слоя."""
+    def _add_survey_line(
+        self, model_space: Any, item: LineItem, layer: str, color: int, *, linetype: str = "ByLayer",
+    ) -> Any:
+        """Новый отрезок: заданный цвет и выбранный тип линии без изменения слоя."""
         entity = self._add_line(model_space, item, layer)
         try:
             entity.Color = color
-            entity.Linetype = "ByLayer"
+            entity.Linetype = linetype
         except Exception as exc:  # noqa: BLE001
             try:
                 entity.Delete()
@@ -3018,7 +3019,7 @@ class AcadBuilder:
                 # Настройки защищены от обновления: новые правила имён и цветов
                 # задаём здесь независимо от старого config.json пользователя.
                 line_layer = self._ensure_survey_layer(
-                    doc, "PL", 3, warnings, linetype="ACAD_ISO10W100"
+                    doc, "PL", 3, warnings, linetype="Continuous"
                 )
                 text_layer = self._ensure_layer(
                     doc, text_layer_name, int(colors.get("boundary_text", 7))
@@ -3070,7 +3071,11 @@ class AcadBuilder:
                 for index, b_line in enumerate(geo.boundary_lines):
                     on_street = index in street_indices
                     layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
-                    line_ent = self._add_survey_line(model_space, b_line, layer, color)
+                    # PL должен быть сплошным даже если существующий слой пунктирный.
+                    line_ent = self._add_survey_line(
+                        model_space, b_line, layer, color,
+                        linetype="ByLayer" if on_street else "Continuous",
+                    )
                     created_boundary_lines += 1
                     if primary_entity is None:
                         primary_entity = line_ent

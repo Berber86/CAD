@@ -289,7 +289,7 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
             assert len(matches) == 1
             assert matches[0].Layer == ("M-ROW-LINE" if is_front else "PL")
             assert matches[0].Color == (1 if is_front else 3)
-            assert matches[0].Linetype == "ByLayer"
+            assert matches[0].Linetype == ("ByLayer" if is_front else "Continuous")
     assert len(doc.ModelSpace.texts) == len(plan.items) + len(draft.items)
     assert len(doc.ModelSpace.arcs) == 2 * len(plan.arcs)
 
@@ -324,27 +324,38 @@ def test_copy_preserves_open_gap_without_forced_closure(fake_autocad):
     assert sum(_matches_line(obj, short.start, short.end, 1000) for obj in doc.ModelSpace.lines) == 1
 
 
-def test_new_pl_layer_loads_reference_linetype_and_missing_type_is_visible(fake_autocad):
+def test_new_pl_layer_is_continuous_without_loading_a_dashed_linetype(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     builder, doc = fake_autocad(plan)
-    class Linetypes:
-        def __init__(self):
-            self.loaded = []
-        def Item(self, name):
-            if not self.loaded:
-                raise KeyError(name)
-            return name
-        def Load(self, name, filename):
-            self.loaded.append((name, filename))
-    doc.Linetypes = Linetypes()
+    # Нет коллекции Linetypes — Continuous встроен в AutoCAD, загрузка не нужна.
     result = builder.draw_plan(plan)
-    assert doc.Linetypes.loaded == [("ACAD_ISO10W100", "acadiso.lin")]
-    assert doc.Layers.Item("PL").Linetype == "ACAD_ISO10W100"
+    assert doc.Layers.Item("PL").Linetype == "Continuous"
     assert not any("Не удалось задать тип линии" in w for w in result.warnings)
+    for index, edge in enumerate(plan.boundary_lines):
+        if index not in plan.street_boundary_indices:
+            line, = [entity for entity in doc.ModelSpace.lines if _matches_line(entity, edge.start, edge.end)]
+            assert line.Linetype == "Continuous" and line.Color == 3
 
-    builder2, doc2 = fake_autocad(plan)
-    result2 = builder2.draw_plan(plan)  # Нет коллекции типов линий.
-    assert any("ACAD_ISO10W100" in w and "Проверьте" in w for w in result2.warnings)
+
+def test_continuous_assignment_failure_reports_error_and_deletes_partial_line(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    deleted = []
+    class FailedLine:
+        Layer = "0"
+        Color = 0
+        @property
+        def Linetype(self):
+            return "ByLayer"
+        @Linetype.setter
+        def Linetype(self, value):
+            raise RuntimeError("linetype refused")
+        def Delete(self):
+            deleted.append(True)
+    doc.ModelSpace.AddLine = lambda *args: FailedLine()
+    with pytest.raises(module.AcadDrawError, match="linetype refused"):
+        builder._add_survey_line(doc.ModelSpace, plan.boundary_lines[0], "PL", 3, linetype="Continuous")
+    assert deleted == [True]
 
 
 def test_step4_area_selects_original_or_copy_after_step1(fake_autocad):

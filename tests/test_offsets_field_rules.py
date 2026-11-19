@@ -413,7 +413,9 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
     Правила 4.21–4.25 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 17 → 10.
+    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 16 → 10
+    (было 17 до 4.32: с пределом «подпись не дальше ``TEXT_MAX_FROM_ANCHOR_FT`` от своей вершины»
+    одна лишняя подпись дома ставится выноской у самой вершины и дублирует соседнюю).
     Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E),
     конец длинного прогона до 6 ft (5.2'S) и второй угол стены с перекосом (4.25, R13d);
     по дому — вторая строка у вершины до 3 ft (4.25, R12) и запасной предел 4 ft для дома,
@@ -429,7 +431,7 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     new = _label_totals()
     assert old["fence"][2] == 9 and new["fence"][2] == 23
     assert old["house"][2] == 7 and new["house"][2] == 11
-    assert old["house"][3] == 17 and new["house"][3] == 10
+    assert old["house"][3] == 16 and new["house"][3] == 10
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
@@ -726,3 +728,92 @@ def test_leader_length_matches_the_customer():
     assert 2.3 <= statistics.median(lengths) <= 3.3
     # У него десятая часть выносок короче 2.06 ft — у нас короткие тоже должны оставаться.
     assert sum(1 for value in lengths if value < 2.2) / len(lengths) < 0.25
+
+
+def _anchor_spread(paths):
+    """Наибольшее расстояние от центра подписи до её вершины (футы) и число подписей, по чертежам."""
+    worst, counts = {}, {}
+    for path in paths:
+        before, after = load_pair(path)
+        data, _ = field_plan(before, after)
+        items = data["plan"].items
+        worst[path] = max((math.dist(item.point, item.anchor) for item in items), default=0.0)
+        counts[path] = len(items)
+    return worst, counts
+
+
+def test_label_stays_near_its_vertex():
+    """
+    R19 (4.32): подпись оффсета не уходит далеко от своей вершины.
+
+    Николай ставит подпись у замкнутой точки съёмки: центр блока — 4.7 ft от вершины
+    (медиана по шести парам, p90 5.3), а если рядом места нет, он рисует выноску, а не ищет
+    место в другом конце строения. У нас без правила подпись дома гуляла вдоль стены внутрь
+    строения: на 1412 East 64th — `0.1'N|1.3'W` в **29.6 ft** от своего угла (у него там
+    `BLDG 0.1'W` у самой вершины), на 24 Alvine — `2.5'S` в 12.3, на 192 Geldner — 8.6,
+    на 378 Mother Gaston — 8.2 ft. Предел ``TEXT_MAX_FROM_ANCHOR_FT`` = 6 ft: подписи на шести
+    парах те же (78), совпадения те же (47), предупреждение одно — дальняя подпись просто
+    ставится выноской. Замер: `docs/step4_spatial_measure.py`.
+    """
+    assert off.TEXT_MAX_FROM_ANCHOR_FT == pytest.approx(6.0)
+    paths = [PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5, PRIMER7]
+    near, counts = _anchor_spread(paths)
+    saved = off.TEXT_MAX_FROM_ANCHOR_FT
+    try:
+        off.TEXT_MAX_FROM_ANCHOR_FT = 0.0
+        far, far_counts = _anchor_spread(paths)
+    finally:
+        off.TEXT_MAX_FROM_ANCHOR_FT = saved
+    # Без правила подпись уезжала на 8–30 ft; самая дальняя — East 64th.
+    assert far[PRIMER7] > 20.0, far[PRIMER7]
+    assert far[PRIMER3] > 8.0 and far[PRIMER1] > 10.0
+    for path in paths:
+        assert near[path] <= 6.5, (path, near[path])
+        assert near[path] <= far[path] + 1e-9, path
+        assert counts[path] == far_counts[path], path
+
+
+def _lot_gaps(paths):
+    """Просвет от блока подписи до ближайшей стороны участка (футы), по всем подписям."""
+    from shapely.geometry import box
+    gaps = []
+    for path in paths:
+        before, after = load_pair(path)
+        polygon = _lot_polygon(before)
+        data, _ = field_plan(before, after)
+        for item in data["plan"].items:
+            width, height = off._text_block(item.text, item.height_ft, off.default_text_width)
+            x, y = item.point
+            gaps.append(box(x - width / 2, y - height / 2, x + width / 2, y + height / 2)
+                        .distance(polygon.exterior))
+    return gaps
+
+
+def test_text_is_kept_off_the_lot_sides():
+    """
+    R19 (4.32): просвет до сторон участка — первая ступень раскладки, с откатом.
+
+    По скриншотам Николая с 1412 East 64th его текст стоит от границы на 0.6–0.8 ft: конец
+    выноски — у самого края блока, а сам блок отведён от линии. У нас пять подписей из 78
+    прижимались к границе ближе 0.05 ft (Zoe `FE.5.2'N` — 0.04, Geldner `FE.5.2'S` — 0.02).
+    Жёсткое требование не годилось (`LINE_CLEARANCE_FT`: 78 → 77 подписей, 1 → 4 предупреждения),
+    поэтому просвет ``TEXT_LOT_GAP_FT`` = 0.6 — **первая ступень с откатом**: подпись, которой
+    просвета не хватило, ставится как раньше. Итог шести пар: подписи 78 и совпадения 47 —
+    как без правила, медиана просвета 0.65 → 0.78 ft (у Николая 0.63–0.79).
+    Замер: `docs/step4_spatial_measure.py`.
+    """
+    assert off.TEXT_LOT_GAP_FT > 0.0
+    paths = [PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5, PRIMER7]
+    off_gaps = _lot_gaps(paths)
+    saved = off.TEXT_LOT_GAP_FT
+    try:
+        off.TEXT_LOT_GAP_FT = 0.0
+        plain_gaps = _lot_gaps(paths)
+    finally:
+        off.TEXT_LOT_GAP_FT = saved
+    assert len(off_gaps) == len(plain_gaps)
+    # Подписи не теряются: у всех, кому просвет не достался, остаётся прежнее место.
+    assert statistics.median(off_gaps) > statistics.median(plain_gaps) + 0.05
+    assert statistics.median(off_gaps) >= 0.7
+    # Прижатых к границе подписей не становится больше.
+    assert sum(1 for gap in off_gaps if gap < 0.05) <= sum(1 for gap in plain_gaps if gap < 0.05)

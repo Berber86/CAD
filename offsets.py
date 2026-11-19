@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.31"
+STEP4_VERSION = "4.32"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -593,6 +593,22 @@ LABEL_CLEARANCE = 0.35
 #: Замер: docs/step4_spatial_measure.py.
 LINE_CLEARANCE_FT = 0.0
 
+#: R19 (4.32): просвет от блока подписи до **сторон участка**, который пробуется первым, футы.
+#: По скриншотам Николая с 1412 East 64th его текст стоит от границы на 0.6–0.8 ft: конец
+#: выноски — у самого края текста, а сам текст отведён. У нас 5 подписей из 78 прижимались
+#: к границе ближе 0.05 ft. Жёсткое требование не годилось (``LINE_CLEARANCE_FT``: −1 подпись,
+#: 1 → 4 предупреждения), поэтому просвет — **первая ступень с откатом**: подпись, которой
+#: просвета не хватило, ставится как раньше. Итог шести пар: подписи 78, совпадения 47,
+#: предупреждение 1 — как без правила; прижатых 5 → 4, медиана просвета 0.65 → 0.78 ft.
+#: Замер: docs/step4_spatial_measure.py.
+TEXT_LOT_GAP_FT = 0.6
+
+#: R19: текст оффсета не может уезжать далеко от своей вершины, футы: у Николая подпись стоит
+#: у замкнутой точки съёмки (медиана 4.7 ft до центра блока, p90 5.3) — если рядом места нет,
+#: он ставит выноску, а не ищет место в другом конце строения. У нас без этого правила подпись
+#: дома уходила внутрь строения на 8–30 ft от своего угла (1412 East 64th: 29.6 ft).
+TEXT_MAX_FROM_ANCHOR_FT = 6.0
+
 #: Если со зазором места нет вовсе — пробуем ещё раз без зазора. Иначе подпись не ставится
 #: там, где Николай её поставил, потеснив соседние: у него минимальный зазор между
 #: подписями 0.72–0.84 ft (0.8 высоты), и такие места строгая проверка считала занятыми.
@@ -988,6 +1004,8 @@ def _place_beside_line(
         # 3. Между объектом и границей — в последнюю очередь, места там почти нет.
         candidates.append((mid[0] - ux * extent_along * 0.5, mid[1] - uy * extent_along * 0.5))
         for center in candidates:
+            if TEXT_MAX_FROM_ANCHOR_FT > 0 and math.dist(center, anchor) > TEXT_MAX_FROM_ANCHOR_FT:
+                continue
             rect = _rect_at(center, width, block_height)
             if ok(rect, center) and not _segment_hits_rect(anchor, target, rect):
                 return center
@@ -1033,6 +1051,9 @@ def _place_house_text(
             wall_point = (a[0] + (b[0] - a[0]) * share, a[1] + (b[1] - a[1]) * share)
             center = (wall_point[0] + inward[0] * depth, wall_point[1] + inward[1] * depth)
             if not point_in_polygon(center, polygon):
+                continue
+            # R19: подпись остаётся у своей вершины; иначе — выноска (дальше её не уводим).
+            if TEXT_MAX_FROM_ANCHOR_FT > 0 and math.dist(center, anchor) > TEXT_MAX_FROM_ANCHOR_FT:
                 continue
             rect = _rect_at(center, width, block_h)
             corners = (
@@ -1659,7 +1680,10 @@ def _plan_edge_labels(
     # в чертеже слипались (4.25 соседней ветки).
     clearance = LABEL_CLEARANCE * height
 
-    def makes_ok(gap: float) -> Callable[[Rect, Point], bool]:
+    # R19: стороны участка — для первой ступени, которая требует просвет до границы.
+    lot_edges = _segments(list(ring) + [ring[0]], closed=False) if len(ring) >= 3 else []
+
+    def makes_ok(gap: float, lot_gap: float = 0.0) -> Callable[[Rect, Point], bool]:
         def ok(rect: Rect, center: Point) -> bool:
             if area_pts is not None and not _rect_near_polygon(rect, area_pts, AREA_EDGE_TOL_FT):
                 # Подпись у самой линии участка может чуть выходить за выделенную полилинию:
@@ -1674,14 +1698,24 @@ def _plan_edge_labels(
             ):
                 return False
             near = _grow_rect(rect, LINE_CLEARANCE_FT * height) if LINE_CLEARANCE_FT else rect
-            return not any(
+            if any(
                 _segment_hits_rect(a, b, near)
                 for a, b in lines
                 if bounds is None or _segment_in_bounds(a, b, bounds)
-            )
+            ):
+                return False
+            # R19: первая ступень — текст отведён от сторон участка (у Николая 0.6–0.8 ft).
+            if lot_gap and any(
+                _segment_hits_rect(a, b, _grow_rect(rect, lot_gap)) for a, b in lot_edges
+            ):
+                return False
+            return True
 
         return ok
 
+    # R19: первая ступень — с просветом до границы участка, затем прежние (зазор между подписями,
+    # без зазора).
+    ok_lot = makes_ok(clearance, TEXT_LOT_GAP_FT) if TEXT_LOT_GAP_FT else None
     ok_strict = makes_ok(clearance)
     # Второй заход без зазора: у Николая подписи местами стоят в 0.7–0.8 высоты друг от
     # друга, и со строгим зазором такие места считались занятыми (Geldner: FE.0.4'N).
@@ -1697,6 +1731,7 @@ def _plan_edge_labels(
 
         return ok_outside
 
+    ok_out_lot = makes_outside(ok_lot) if ok_lot is not None else None
     ok_out_strict, ok_out = makes_outside(ok_strict), makes_outside(ok)
 
     cells = sorted(rows_by_vertex.items(), key=lambda cell: cell[1][0].value_ft)
@@ -1819,18 +1854,37 @@ def _plan_edge_labels(
         )
         # R10: подпись без выноски идёт вдоль своей линии (у Николая 0° и 90°); с выноской —
         # всегда горизонтально, поэтому поворот считается только для текста.
+        # Источник поворота проверен (4.32): ``side`` — 28 из 32 подписей совпали с Николаем
+        # (дом 6 из 7), ``object`` (ближайшая к вершине линия) — 27, «всегда горизонтально» — 27.
         rotation = primary.side_angle_deg if TEXT_FOLLOWS_BOUNDARY else 0.0
         # R16: у дома первым пробуется место снаружи контура участка (HOUSE_TEXT_OUTSIDE).
-        strict_here = ok_out_strict if feature.kind == "house" else ok_strict
-        relaxed_here = ok_out if feature.kind == "house" else ok
+        # R19: ступени места — сначала с просветом до границы, затем прежние (зазор между
+        # подписями, без зазора): подпись, которой не хватило просвета, ставится как раньше.
+        outside_first = feature.kind == "house" and HOUSE_TEXT_OUTSIDE
+        tiers = [
+            test
+            for test in (
+                ok_out_lot if outside_first else ok_lot,
+                ok_out_strict if outside_first else ok_strict,
+                ok_out if outside_first else ok,
+            )
+            if test is not None
+        ]
+
+        def first_spot(placer) -> Point | None:
+            for test in tiers:
+                spot = placer(test)
+                if spot is not None:
+                    return spot
+            return None
+
+        contour = feature_contour(feature)[0] if feature.kind == "house" else ()
         if feature.kind == "house" and HOUSE_TEXT_INSIDE:
             # Дом — текст внутри строения у стены; снаружи мешают заборы и чужие надписи.
-            beside = _place_house_text(
-                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, strict_here, rotation,
-            ) or _place_house_text(
-                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, relaxed_here, rotation,
+            beside = first_spot(
+                lambda test: _place_house_text(
+                    contour, vertex, primary.foot, label_text, height, width_of, test, rotation
+                )
             )
         if beside is None and (
             feature.kind == "house" or (
@@ -1839,24 +1893,27 @@ def _plan_edge_labels(
         ):
             # У Николая подпись забора — обычный текст у самой линии, без стрелки.
             # Выноска остаётся последним средством: она и давала «частокол» на чертеже.
-            beside = _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, strict_here, rotation
-            ) or _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, relaxed_here, rotation
+            beside = first_spot(
+                lambda test: _place_beside_line(
+                    vertex, primary.foot, label_text, height, width_of, test, rotation
+                )
             )
         if beside is None and feature.kind == "house" and HOUSE_TEXT_OUTSIDE:
             # Снаружи места не нашлось — второй заход по-старому: внутри строения, потом сбоку.
-            beside = _place_house_text(
-                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, ok_strict, rotation,
-            ) or _place_house_text(
-                feature_contour(feature)[0], vertex, primary.foot, label_text, height,
-                width_of, ok, rotation,
-            ) or _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, ok_strict, rotation
-            ) or _place_beside_line(
-                vertex, primary.foot, label_text, height, width_of, ok, rotation
-            )
+            inside_tiers = [test for test in (ok_lot, ok_strict, ok) if test is not None]
+            for test in inside_tiers:
+                beside = _place_house_text(
+                    contour, vertex, primary.foot, label_text, height, width_of, test, rotation
+                )
+                if beside is not None:
+                    break
+            if beside is None:
+                for test in inside_tiers:
+                    beside = _place_beside_line(
+                        vertex, primary.foot, label_text, height, width_of, test, rotation
+                    )
+                    if beside is not None:
+                        break
         if beside is not None:
             item = OffsetItem(
                 kind=feature.kind, value_ft=value, direction=direction_shown, style="text",
@@ -1870,10 +1927,10 @@ def _plan_edge_labels(
             rect = _rect_at(beside, rect_w, rect_h)
         else:
             leader_text = label_text
-            spot = _place_leader(
-                vertex, primary.foot, leader_text, height, width_of, ok_strict, factor
-            ) or _place_leader(
-                vertex, primary.foot, leader_text, height, width_of, ok, factor
+            spot = first_spot(
+                lambda test: _place_leader(
+                    vertex, primary.foot, leader_text, height, width_of, test, factor
+                )
             )
             if spot is None:
                 plan.warnings.append(

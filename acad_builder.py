@@ -1076,6 +1076,7 @@ def make_print_draft(
 
     Сдвигается участок, а при наличии привязки перекрёсток черновика переносится
     вдоль неё так, чтобы конец остался на участке, а длина стала 40 футов.
+    Для угловых участков правила 40 и 100 ft не применяются (ответ Николая).
     Старые настройки смещения и длины не отменяют это правило заказчика.
     """
     sx, sy = 1000.0, 0.0
@@ -1084,8 +1085,22 @@ def make_print_draft(
     config = copy.deepcopy(builder_cfg if builder_cfg is not None else load_config())
     layout_builder = AcadBuilder(config)
     source_lines = list(plan.lines)
-    tie = next((ln for ln in source_lines if ln.kind == "main-street-row-tie"), None)
-    if tie is None and plan.description.cross_street and float(plan.description.distance_to_corner_ft or 0) > 1e-6:
+    distance = float(plan.description.distance_to_corner_ft or 0.0)
+    is_corner = (
+        plan.description.cross_street_side_index is not None
+        or len(plan.street_boundary_indices) > 1
+        or (bool(plan.description.cross_street) and distance <= 1e-6)
+    )
+    original_tie = next((ln for ln in source_lines if ln.kind == "main-street-row-tie"), None)
+    if is_corner and (distance > 1e-6 or original_tie is not None):
+        warnings.append(
+            "черновик: участок определён как угловой, но есть привязка до перекрёстка; "
+            "правила 40 и 100 ft не применены — сверьте исходные данные"
+        )
+    # Даже если в противоречивых данных оказалась привязка, не меняем геометрию
+    # углового участка и не превращаем пересекаемую улицу в отрезок 100 ft.
+    tie = None if is_corner else original_tie
+    if not is_corner and tie is None and plan.description.cross_street and distance > 1e-6:
         # В старом config продолжения улиц могли быть выключены. Для черновика
         # строим их отдельно, не меняя исходный план и пользовательские настройки.
         normalized_pob = compute_pob_point(plan.description)
@@ -1108,7 +1123,7 @@ def make_print_draft(
         tie = next((ln for ln in source_lines if ln.kind == "main-street-row-tie"), None)
     corner_dx, corner_dy = sx, sy
     if tie is None:
-        if float(plan.description.distance_to_corner_ft or 0.0) > 1e-6:
+        if not is_corner and distance > 1e-6:
             warnings.append("черновик: линии до перекрёстка в плане нет — привязка 40 ft не построена")
     else:
         rx, ry = tie.end[0] - tie.start[0], tie.end[1] - tie.start[1]

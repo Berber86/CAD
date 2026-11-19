@@ -604,3 +604,39 @@ def test_unassignable_print_style_is_not_silently_reported_as_success(fake_autoc
     assert result.text_count == 0
     assert made and all(item.deleted for item in made)
     assert any("cannot set style" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize("marker", ["cross_index", "two_frontages"])
+def test_corner_rules_never_apply_to_conflicting_tie_or_street_geometry(marker):
+    # Даже противоречивые входные данные не должны запускать правила 40/100
+    # для участка, отмеченного как угловой; источник остаётся нетронутым.
+    from dataclasses import replace
+    plan = _plan("lot72_render_e600.txt")
+    if marker == "cross_index":
+        plan.description = plan.description.model_copy(update={"cross_street_side_index": 1})
+    else:
+        plan = replace(plan, street_boundary_indices=(plan.street_boundary_indices[0], 1))
+    tie_original = _tie(plan)
+    assert math.dist(tie_original.start, tie_original.end) == pytest.approx(241)
+    source_lines = [(line.kind, line.start, line.end) for line in plan.lines]
+    draft = make_print_draft(plan, {})
+    assert [(line.kind, line.start, line.end) for line in plan.lines] == source_lines
+    assert len(draft.lines) == len(plan.lines)
+    for before, after in zip(plan.lines, draft.lines):
+        assert after.kind == before.kind
+        assert after.start == pytest.approx((before.start[0] + 1000, before.start[1]))
+        assert after.end == pytest.approx((before.end[0] + 1000, before.end[1]))
+    assert math.dist(_tie(draft).start, _tie(draft).end) == pytest.approx(241)
+    assert any("угловой" in w and "не применены" in w for w in draft.warnings)
+    for before, after in zip(plan.boundary_lines, draft.boundary_lines):
+        assert after.start == pytest.approx((before.start[0] + 1000, before.start[1]))
+        assert after.end == pytest.approx((before.end[0] + 1000, before.end[1]))
+
+
+def test_corner_with_inconsistent_distance_does_not_create_tie():
+    plan = _plan("lot51_commencing_corner.txt")
+    plan.description = plan.description.model_copy(update={"distance_to_corner_ft": 241.0})
+    draft = make_print_draft(plan, {})
+    assert not any(line.kind == "main-street-row-tie" for line in draft.lines)
+    assert not any("привязка 40 ft не построена" in w for w in draft.warnings)
+    assert any("угловой" in w and "сверьте" in w for w in draft.warnings)

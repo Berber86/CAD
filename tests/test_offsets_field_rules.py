@@ -549,3 +549,54 @@ def test_fifth_pair_zoe_scores_by_the_same_rules(zoe):
     texts = [p["text"] for p in zoe["labels"] if p["kind"] == "fence"]
     assert "FE.0.5'N" in texts
     assert any("0.4'S" in text and "0.8'N" in text for text in texts)
+
+
+def _touch_stats(paths):
+    """Сколько подписей стоит ближе 0.1 ft к линии чертежа и насколько близко самая тесная."""
+    from shapely.geometry import LineString, box
+
+    close = total = 0
+    worst = {}
+    for path in paths:
+        before, after = load_pair(path)
+        lines = [
+            LineString([tuple(p[:2]) for p in entity["pts"]])
+            for entity in before["entities"]
+            if entity.get("type") in {"Line", "Polyline"} and len(entity.get("pts") or []) > 1
+        ]
+        data, _ = field_plan(before, after)
+        margins = []
+        for item in data["plan"].items:
+            width, height = off._text_block(item.text, item.height_ft, off.default_text_width)
+            x, y = item.point
+            rect = box(x - width / 2, y - height / 2, x + width / 2, y + height / 2)
+            margins.append(min(rect.distance(line) for line in lines))
+        total += len(margins)
+        close += sum(1 for margin in margins if margin < 0.1)
+        worst[path] = min(margins)
+    return close, total, worst
+
+
+def test_line_clearance_flag_keeps_text_off_the_lines():
+    """
+    `LINE_CLEARANCE_FT` (4.28) — просвет от текста подписи до линий чертежа, в высотах текста.
+
+    У Николая текст оффсета стоит от ближайшей линии на 0.71 (дом) и 1.60 (забор); у нас без правила
+    почти треть подписей прижимается к линиям ближе 0.1 ft. Правило **выключено** (0.0): включение
+    стоит двух подписей на пяти парах (63 → 61, совпадений 35 → 33), — но работает так, как задумано.
+    Замер: `docs/step4_spatial_measure.py`.
+    """
+    assert off.LINE_CLEARANCE_FT == 0.0
+    paths = [PRIMER1, PRIMER2, PRIMER3, PRIMER4, PRIMER5]
+    loose_close, loose_total, loose_worst = _touch_stats(paths)
+    try:
+        off.LINE_CLEARANCE_FT = 0.5
+        tight_close, tight_total, tight_worst = _touch_stats(paths)
+    finally:
+        off.LINE_CLEARANCE_FT = 0.0
+    assert loose_close > 20, loose_close
+    assert tight_close < loose_close
+    assert tight_total <= loose_total
+    # Ни на одном чертеже подпись не стала стоять ближе к линии, чем без правила.
+    for path in paths:
+        assert tight_worst[path] >= loose_worst[path] - 1e-9, path

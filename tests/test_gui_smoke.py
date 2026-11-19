@@ -2113,6 +2113,7 @@ def test_neighbor_batch_honors_multipass_and_skips_disagreements(gui, tmp_path, 
         return types.SimpleNamespace(
             agreed=kwargs["pdf_path"] == paths[0], pass_outcomes=[out, out],
             selected_outcome=out, discrepancy_report=lambda: "различие румба",
+            obvious_geometry_choice=lambda: None,
         )
     monkeypatch.setattr(gui, "run_multipass_consensus", fake_consensus)
     app._start(parse_only=True)
@@ -5256,3 +5257,103 @@ def test_checked_ambiguous_109_not_modified_and_warns_before_drawing(gui, monkey
     app._start(parse_only=False)
     assert len(prompts) == 1 and "невязка" in prompts[0].lower()
     assert "Отрисовка отменена" in app.status_var.get()
+
+
+@pytest.mark.parametrize("ask,good_provider", [(True, "hydra"), (False, "openrouter")])
+def test_obvious_two_pass_choice_runs_without_conflict_and_remains_visible(gui, monkeypatch, ask, good_provider):
+    import llm_parser as lp
+    from acad_builder import DrawResult
+    from tkinter import messagebox
+    sample = lp.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    clean, _ = lp.parse_with_regex(sample, auto_repair_typos=False)
+    bad = clean.model_copy(deep=True)
+    bad.segments[0].distance_ft = 140
+    def extract(text, cfg, api_key=None, progress=None, *, provider=None, model=None, **kwargs):
+        data = clean if provider == good_provider else bad
+        usage = lp.TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5, provider=provider, model=model)
+        return data.model_copy(deep=True), "structured-outputs", usage
+    monkeypatch.setattr(lp, "_extract_with_llm", extract)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("key")
+    app.provider_key_vars["openrouter"].set("key")
+    app.select_passes(2)
+    app.select_provider("Hydra AI")
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    app.use_llm_var.set(True)
+    app.ask_on_doubt_var.set(ask)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is None and app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 100
+    assert app._last_consensus_label is None
+    assert "автоматически выбран" in app.log_text()
+    assert "не консенсус" in app.log_text()
+    assert "140.00" in app.log_text()
+    assert app._session_llm_calls == 2
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: pytest.fail("нет риска — вопрос не нужен"))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _, plan: drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={}))
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert drawn and drawn[-1].description.segments[0].distance_ft == 100
+
+
+def test_conflict_retry_auto_selects_when_disagreement_becomes_obvious(gui, monkeypatch):
+    import llm_parser as lp
+    sample = lp.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    clean, _ = lp.parse_with_regex(sample, auto_repair_typos=False)
+    different_tie = clean.model_copy(update={"distance_to_corner_ft": 425.0}, deep=True)
+    bad = clean.model_copy(deep=True)
+    bad.segments[0].distance_ft = 140
+    def extract(text, cfg, api_key=None, progress=None, *, provider=None, model=None, focus_instruction=None, **kwargs):
+        selected = clean if provider == "hydra" else (bad if focus_instruction else different_tie)
+        return selected.model_copy(deep=True), "structured-outputs", lp.TokenUsage(provider=provider, model=model, total_tokens=1)
+    monkeypatch.setattr(lp, "_extract_with_llm", extract)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("key")
+    app.provider_key_vars["openrouter"].set("key")
+    app.select_passes(2)
+    app.select_provider("Hydra AI")
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    app.use_llm_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is not None
+    app.retry_conflict_resolution()
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 100
+    assert "автоматически выбран" in app.log_text()
+    assert app._session_llm_calls == 4
+
+
+def test_neighbor_batch_can_select_obvious_pass_and_preserves_warning(gui, monkeypatch, tmp_path):
+    from test_obvious_consensus_choice import outcomes, consensus
+    sample = tmp_path / "neighbor.txt"
+    sample.write_text("text", encoding="utf-8")
+    monkeypatch.setattr(gui, "run_multipass_consensus", lambda **kwargs: consensus(outcomes()))
+    app = gui.SurveyApp()
+    cfg = {"api": {"consensus": {"passes": 2}}}
+    events = []
+    result, counted = app._parse_neighbor_file(sample, cfg, "hydra", "model", "key", "", True, False, None, lambda _: None, lambda *event: events.append(event))
+    assert counted and events[0][0] == "round_usages"
+    assert result.data.segments[0].distance_ft == 100
+    assert any("автоматически выбран" in w for w in result.warnings)
+
+
+def test_retry_finalization_still_asks_for_independent_risky_geometry(gui, monkeypatch):
+    from test_clear_typo_autofix import RECT
+    from llm_parser import parse_legal_description_full
+    outcome = parse_legal_description_full(text=RECT, use_llm=False)
+    events = []
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_worker_poster", lambda: lambda *event: events.append(event))
+    app._finalize_worker_outcome(outcome, cfg={"api": {"ask_on_doubt": True}}, scale=20,
+                                 parse_only=False, is_neighbor=False)
+    assert events[0][0] == "doubt"
+    assert events[0][1]["plan"].closure.distance > 0.08

@@ -10648,6 +10648,9 @@ class SurveyApp(ctk.CTk):
             )
             post("round_usages", [out.usage for out in consensus.pass_outcomes])
             if not consensus.agreed:
+                automatic = consensus.obvious_geometry_choice()
+                if automatic is not None:
+                    return automatic, True
                 retry_hint = (
                     "Откройте только этот PDF или фото в роли «Соседний участок»"
                     if fpath.suffix.lower() == ".pdf" or is_image_file(fpath)
@@ -11125,7 +11128,8 @@ class SurveyApp(ctk.CTk):
                     progress=lambda message: post("progress", message),
                 )
                 post("valid_secret", key_secret)
-                if not consensus.agreed:
+                automatic = consensus.obvious_geometry_choice() if not consensus.agreed else None
+                if not consensus.agreed and automatic is None:
                     post("consensus_label", None)
                     post(
                         "conflict",
@@ -11140,8 +11144,8 @@ class SurveyApp(ctk.CTk):
                     )
                     post("done", None)
                     return
-                outcome = consensus.selected_outcome
-                post("consensus_label", f"{len(consensus.pass_outcomes)}/{len(consensus.pass_outcomes)}")
+                outcome = automatic if automatic is not None else consensus.selected_outcome
+                post("consensus_label", None if automatic is not None else f"{len(consensus.pass_outcomes)}/{len(consensus.pass_outcomes)}")
                 round_usages: list[TokenUsage | None] = [
                     o.usage for o in consensus.pass_outcomes
                 ]
@@ -11612,7 +11616,8 @@ class SurveyApp(ctk.CTk):
                 return
             post("valid_secret", key_secret)
             if isinstance(res, ConsensusResult):
-                if not res.agreed:
+                automatic = res.obvious_geometry_choice() if not res.agreed else None
+                if not res.agreed and automatic is None:
                     post(
                         "conflict",
                         {
@@ -11626,7 +11631,7 @@ class SurveyApp(ctk.CTk):
                     )
                     post("done", None)
                     return
-                new_outcome = res.selected_outcome
+                new_outcome = automatic if automatic is not None else res.selected_outcome
                 round_usages: list[TokenUsage | None] = [
                     o.usage for o in res.pass_outcomes
                 ]
@@ -11985,7 +11990,8 @@ class SurveyApp(ctk.CTk):
             )
             if not self._worker_is_current():
                 return
-            if not new_consensus.agreed:
+            automatic = new_consensus.obvious_geometry_choice() if not new_consensus.agreed else None
+            if not new_consensus.agreed and automatic is None:
                 updated_ctx = dict(ctx)
                 updated_ctx["consensus"] = new_consensus
                 post("conflict", updated_ctx)
@@ -11993,8 +11999,9 @@ class SurveyApp(ctk.CTk):
                 return
 
             round_usages = [o.usage for o in new_consensus.pass_outcomes]
-            post("progress", "✓ Модели сошлись во мнении! Завершаю построение…")
-            outcome = new_consensus.selected_outcome
+            post("progress", "Выбран проход с явным преимуществом по замыканию…" if automatic is not None
+                 else "✓ Модели сошлись во мнении! Завершаю построение…")
+            outcome = automatic if automatic is not None else new_consensus.selected_outcome
             self._finalize_worker_outcome(
                 outcome,
                 cfg=cfg,
@@ -12076,7 +12083,12 @@ class SurveyApp(ctk.CTk):
             if (
                 not user_confirmed
                 and bool(cfg.get("api", {}).get("ask_on_doubt", True))
-                and bool(outcome.typo_suspicions)
+                and (bool(outcome.typo_suspicions) or (
+                    not parse_only and (
+                        (plan.suspicion is not None and plan.suspicion.is_suspicious)
+                        or plan.closure.distance > 0.08
+                    )
+                ))
             ):
                 post(
                     "doubt",

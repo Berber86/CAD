@@ -6356,6 +6356,50 @@ class ConsensusResult:
         )
         return "\n".join(lines)
 
+    def obvious_geometry_choice(self) -> ParseOutcome | None:
+        """Выбирает один из двух проходов только при резком различии замыкания.
+
+        Замыкание не подтверждает чтение документа. Поэтому остальные поля и
+        метаданные сторон обязаны совпадать, а вычисленные румбы запрещены.
+        При любом другом расхождении возвращается обычный конфликт.
+        """
+        if self.agreed or len(self.pass_outcomes) != 2 or not self.discrepancies:
+            return None
+        if any(not re.fullmatch(r"segments\[\d+\]\.(?:bearing|distance_ft)", d.field_id)
+               for d in self.discrepancies):
+            return None
+        a, b = (o.data for o in self.pass_outcomes)
+        if len(a.segments) != len(b.segments) or len(a.segments) < 3:
+            return None
+        if a.model_dump(exclude={"segments"}) != b.model_dump(exclude={"segments"}):
+            return None
+        geometry_fields = {"ns", "ew", "degrees", "minutes", "seconds", "distance_ft", "bearing_label"}
+        for sa, sb in zip(a.segments, b.segments):
+            if not sa.has_bearing or not sb.has_bearing or sa.bearing_solved or sb.bearing_solved:
+                return None
+            if sa.model_dump(exclude=geometry_fields) != sb.model_dump(exclude=geometry_fields):
+                return None
+        traces = [_trace_closure_and_validity(o.data.segments) for o in self.pass_outcomes]
+        if any(not math.isfinite(err) for err, _ in traces):
+            return None
+        good = [i for i, (err, valid) in enumerate(traces) if valid and err <= 0.015]
+        if len(good) != 1:
+            return None
+        index = good[0]
+        if traces[1 - index][0] < 1.0:
+            return None
+        note = (
+            f"⚠ Проходы ИИ разошлись: автоматически выбран {self.pass_label(index + 1)} "
+            f"по замыканию {traces[index][0]:.4f} ft; другой проход: "
+            f"{traces[1 - index][0]:.4f} ft. Это не консенсус и не доказательство "
+            "правильного чтения — сверьте спорные значения с документом."
+        )
+        outcome = self.resolve_with_pass(index + 1, reason=note)
+        details = "Расхождения проходов: " + "; ".join(
+            d.summary(self.pass_labels_map()) for d in self.discrepancies
+        )
+        return dataclasses.replace(outcome, warnings=[*outcome.warnings, details])
+
     def resolve_with_pass(self, pass_index: int, *, reason: str = "") -> ParseOutcome:
         """Формирует итоговый ParseOutcome на базе выбранного человеком прохода."""
         idx0 = pass_index - 1

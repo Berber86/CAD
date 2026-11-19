@@ -10880,17 +10880,19 @@ class SurveyApp(ctk.CTk):
         self.progress.start()
         # Черновик для печати — отдельным планом, первым: итоговым результатом остаётся основной участок.
         draw_plans = (self._print_draft_plans() + plans) if not neighbors_only else plans
-        self._set_status(f"Рисую рассчитанную схему в AutoCAD: {len(plans)} уч. Без повторного разбора и запроса к ИИ…")
+        self._set_status(
+            f"Рисую рассчитанную схему в AutoCAD: {len(plans)} уч."
+            + (" Черновик для печати включён." if len(draw_plans) > len(plans) else "")
+            + " Без повторного разбора и запроса к ИИ…"
+        )
         self._start_background(self._draw_scene_worker, args=(draw_plans, cfg))
 
     def _print_draft_plans(self) -> list[tuple[str, DrawPlan]]:
-        """Черновик для печати из основного участка: без соседей, на +1000 по X, отдельные слои."""
+        """Черновик для печати из основного участка: без соседей, на +1000 по X."""
         main = self._preview_main_plan
         if main is None or main.is_neighbor:
             return []
         print_cfg = dict((self.config_data or {}).get("print_draft") or {})
-        if not print_cfg.get("enabled", False):
-            return []
         label = self._plan_source_labels.get(id(main), "текст")
         return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg))]
 

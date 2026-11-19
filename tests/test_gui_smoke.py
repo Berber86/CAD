@@ -461,9 +461,7 @@ def gui(monkeypatch, tmp_path):
     # sample config while preserving its real defaults for every smoke test.
     import llm_parser
     config_path = tmp_path / "config.json"
-    # Черновик для печати — отдельный план при «Начертить». Подсчёты отрисовки в этих тестах
-    # относятся к основной схеме, поэтому черновик выключен; его проверяет
-    # test_print_draft_is_added_only_for_main_lot_when_enabled ниже и tests/test_print_draft.py.
+    # Старое локальное значение не должно препятствовать черновику в выделенных тестах.
     import json as _json  # noqa: PLC0415
     _cfg_data = _json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
     _cfg_data.setdefault("print_draft", {})["enabled"] = False
@@ -474,6 +472,11 @@ def gui(monkeypatch, tmp_path):
         monkeypatch.setattr(module, "CONFIG_PATH", config_path)
         monkeypatch.setattr(module, "LOCAL_CONFIG_PATH", local_config_path)
         monkeypatch.setattr(module, "ENV_PATH", env_path)
+
+    # Остальные smoke-тесты проверяют основную сцену; реальные сборку и запуск
+    # черновика проверяем отдельно, восстанавливая метод в соответствующих тестах.
+    gui_module._real_print_draft_plans = gui_module.SurveyApp._print_draft_plans
+    monkeypatch.setattr(gui_module.SurveyApp, "_print_draft_plans", lambda self: [])
 
     # В старых тестах выбор роли эмулируется текстовым переключателем; тесты
     # самого диалога и независимости ролей задают явный ответ отдельно.
@@ -4776,8 +4779,8 @@ def test_log_mode_switch_saves_to_config_and_keeps_other_keys(gui):
     assert json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))["ui"]["log_mode"] == "simple"
 
 
-def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
-    """«Начертить» добавляет черновик для печати только к основному участку и только при enabled."""
+def test_print_draft_is_always_added_only_for_main_lot(gui):
+    """«Начертить» добавляет черновик для печати только к основному участку, даже при старой настройке enabled=false."""
     from types import SimpleNamespace
 
     from llm_parser import ASPENWALL_SAMPLES, load_config, parse_with_regex
@@ -4785,7 +4788,6 @@ def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
     main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
     main_plan = gui.AcadBuilder(load_config()).plan(main_desc, scale=10, is_neighbor=False)
     print_cfg = dict(load_config().get("print_draft") or {})
-    assert print_cfg, "в config.json должна быть секция print_draft"
 
     def owner(plan, enabled):
         cfg = {"print_draft": {**print_cfg, "enabled": enabled}}
@@ -4793,13 +4795,13 @@ def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
             _preview_main_plan=plan, config_data=cfg, _plan_source_labels={id(plan): "тест"},
         )
 
-    drafts = gui.SurveyApp._print_draft_plans(owner(main_plan, True))
+    drafts = gui._real_print_draft_plans(owner(main_plan, True))
     assert len(drafts) == 1
     name, draft = drafts[0]
     assert name.startswith("Черновик для печати") and draft.print_draft is True
     assert draft.is_neighbor is False
-    assert gui.SurveyApp._print_draft_plans(owner(main_plan, False)) == []
-    assert gui.SurveyApp._print_draft_plans(owner(None, True)) == []
+    assert len(gui._real_print_draft_plans(owner(main_plan, False))) == 1
+    assert gui._real_print_draft_plans(owner(None, True)) == []
 
 
 
@@ -4935,3 +4937,33 @@ def test_preview_shows_green_property_and_red_front(gui):
                if kind == "line" and kwargs.get("width") == 2.4]
     assert colored.count(gui.THEME["cad_front"]) == len(plan.street_boundary_indices)
     assert colored.count(gui.THEME["cad_prop"]) == len(plan.boundary_lines) - len(plan.street_boundary_indices)
+
+
+def test_actual_draw_scene_adds_one_draft_not_neighbor_copies(gui, monkeypatch):
+    from tkinter import messagebox
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES, parse_with_regex
+
+    monkeypatch.setattr(gui.SurveyApp, "_print_draft_plans", gui._real_print_draft_plans)
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    neighbor = gui.AcadBuilder(app.config_data).plan(desc, scale=10, is_neighbor=True)
+    app._preview_neighbor_plans.append(neighbor)
+    app.config_data["print_draft"] = {"enabled": False, "shift_ft": [22, 9], "tie_length_ft": 9}
+    drawn = []
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 3
+    draft, main, other = drawn
+    assert draft.print_draft and not draft.is_neighbor
+    assert main is app._preview_main_plan and other is neighbor
+    for edge, copy in zip(main.boundary_lines, draft.boundary_lines):
+        assert copy.start == pytest.approx((edge.start[0] + 1000, edge.start[1]))
+        assert copy.end == pytest.approx((edge.end[0] + 1000, edge.end[1]))
+    app._on_close()

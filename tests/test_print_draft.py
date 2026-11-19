@@ -2,7 +2,7 @@
 
 Правила (docs/customer_rules.md, раздел «Черновик для печати»):
   * перекрёсток улиц в AutoCAD — (5000, 5000); основной участок строится от него;
-  * черновик строится на +1000 по X и лежит на отдельных слоях;
+  * контур черновика строится на +1000 по X в тех же слоях PL и M-ROW-LINE;
   * линия от перекрёстка до фасада в черновике — 40 ft (физический размер; описание не меняется);
   * в черновике только контур участка, красные линии улиц и подпись пересекающей улицы.
 
@@ -80,12 +80,15 @@ def test_draft_contains_only_lot_streets_and_cross_street_label():
     assert not any(item.kind == "cross-street-distance" for item in draft.items)
 
 
-def test_draft_is_shifted_one_thousand_east_of_the_intersection():
+def test_draft_lot_is_shifted_one_thousand_and_tie_is_40():
     plan = _plan("lot72_render_e600.txt")
     draft = make_print_draft(plan, _cfg()["print_draft"])
     tie = next(ln for ln in draft.lines if ln.kind == "main-street-row-tie")
-    assert tie.start[0] == pytest.approx(1000.0, abs=1e-6)
-    assert tie.start[1] == pytest.approx(0.0, abs=1e-6)
+    assert tie.end == pytest.approx((_tie(plan).end[0] + 1000, _tie(plan).end[1]))
+    assert math.dist(tie.start, tie.end) == pytest.approx(40.0)
+    assert all(new.start == pytest.approx((old.start[0] + 1000, old.start[1]))
+               and new.end == pytest.approx((old.end[0] + 1000, old.end[1]))
+               for old, new in zip(plan.boundary_lines, draft.boundary_lines))
 
 
 def test_corner_lot_draft_has_no_tie_and_no_warning():
@@ -223,41 +226,21 @@ def test_main_lot_is_drawn_at_the_intersection_and_draft_next_to_it(fake_autocad
     builder, doc = fake_autocad(plan)
     main_result = builder.draw_plan(plan)
     main_lines = [ln for ln in doc.ModelSpace.lines if ln.Layer == "PL"]
-    assert len(main_lines) == 2 * (len(plan.boundary_lines) - len(plan.street_boundary_indices))
-    assert main_result.boundary_copy_count == len(plan.boundary_lines)
-    # Перекрёсток (0, 0) плана стоит в (5000, 5000): линия до перекрёстка начинается там.
+    assert len(main_lines) == len(plan.boundary_lines) - len(plan.street_boundary_indices)
+    assert main_result.boundary_line_count == len(plan.boundary_lines)
     tie = next(ln for ln in doc.ModelSpace.lines if ln.Layer == "M-ROW-LINE")
-    assert tie.StartPoint[0] == pytest.approx(5000.0, abs=1e-6)
-    assert tie.StartPoint[1] == pytest.approx(5000.0, abs=1e-6)
-    # Участок LOT 72 лежит юго-западнее перекрёстка: часть координат меньше 5000, и это названо
-    # в предупреждении, а не молча обрезается (см. docs/customer_rules.md, «Открыто»).
-    assert min(ln.StartPoint[0] for ln in main_lines) < 5000.0
-    assert any("окно листа" in w for w in main_result.warnings)
-
-    builder2, doc2 = fake_autocad(draft)
-    result = builder2.draw_plan(draft)
-    assert set(result.layers) == {"print_property_line", "print_boundary_text", "print_street_row"}
-    assert result.layers["print_property_line"] == "PL-PRINT"
-    assert result.layers["print_street_row"] == "M-ROW-LINE-PRINT"
-    assert result.layers["print_property_line"] != "PL"
-
-    layers = doc2.Layers._items
-    assert layers["M-ROW-LINE-PRINT"].color == 1  # красные линии улиц
-    assert layers["PL-PRINT"].color == 7
-
-    draft_lines = doc2.ModelSpace.lines
-    print_lines = [ln for ln in draft_lines if ln.Layer == "PL-PRINT"]
-    street_lines = [ln for ln in draft_lines if ln.Layer == "M-ROW-LINE-PRINT"]
-    assert len(print_lines) == 4
-    assert street_lines, "улицы черновика должны быть нарисованы"
-    # Черновик на +1000 по X относительно перекрёстка (5000, 5000) → (6000, 5000).
-    tie_draft = next(
-        ln for ln in street_lines
-        if ln.StartPoint[0] == pytest.approx(6000.0, abs=1e-6) and ln.StartPoint[1] == pytest.approx(5000.0, abs=1e-6)
-    )
-    assert math.dist(tie_draft.StartPoint, tie_draft.EndPoint) == pytest.approx(40.0, abs=1e-6)
-    assert len(doc2.ModelSpace.texts) == 1
-    assert "CARLTON" in doc2.ModelSpace.texts[0].TextString
+    assert tie.StartPoint[:2] == pytest.approx(ORIGIN)
+    result = builder.draw_plan(draft)
+    assert result.layers["print_property_line"] == "PL"
+    assert result.layers["print_street_row"] == "M-ROW-LINE"
+    draft_tie = next(ln for ln in doc.ModelSpace.lines
+                     if _matches_line(ln, _tie(plan).start, _tie(plan).end))
+    assert math.dist(draft_tie.StartPoint, draft_tie.EndPoint) == pytest.approx(241.0)
+    expected = _tie(draft)
+    actual = [ln for ln in doc.ModelSpace.lines if _matches_line(ln, expected.start, expected.end)]
+    assert len(actual) == 1 and math.dist(actual[0].StartPoint, actual[0].EndPoint) == pytest.approx(40.0)
+    assert len(doc.ModelSpace.texts) == len(plan.items) + 1
+    assert "CARLTON" in doc.ModelSpace.texts[-1].TextString
 
 
 def _matches_line(entity, start, end, dx=0.0):
@@ -279,7 +262,7 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
     row.color, row.Linetype = 5, "EXISTING-ROAD-TYPE"
     result = builder.draw_plan(plan)
     assert result.boundary_line_count == len(plan.boundary_lines)
-    assert result.boundary_copy_count == len(plan.boundary_lines)
+    builder.draw_plan(make_print_draft(plan, {}))
     assert len(doc.ModelSpace.polylines) == 0
     assert (pl.color, pl.Linetype) == (6, "EXISTING-PL-TYPE")
     assert (row.color, row.Linetype) == (5, "EXISTING-ROAD-TYPE")
@@ -292,9 +275,9 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
             assert matches[0].Layer == ("M-ROW-LINE" if is_front else "PL")
             assert matches[0].Color == (1 if is_front else 3)
             assert matches[0].Linetype == "ByLayer"
-    assert len(doc.ModelSpace.texts) == len(plan.items)  # надписи не копируются
-    assert len(doc.ModelSpace.arcs) == len(plan.arcs)
-    assert "сдвиг +1000" in result.summary()
+    assert len(doc.ModelSpace.texts) == len(plan.items) + 1  # только название пересекающей улицы
+    assert len(doc.ModelSpace.arcs) == 2 * len(plan.arcs)
+
 
 
 def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
@@ -302,6 +285,7 @@ def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
     assert len(plan.street_boundary_indices) == 2
     builder, doc = fake_autocad(plan)
     builder.draw_plan(plan)
+    builder.draw_plan(make_print_draft(plan, {}))
     for index in plan.street_boundary_indices:
         edge = plan.boundary_lines[index]
         for dx in (0.0, 1000.0):
@@ -320,7 +304,7 @@ def test_copy_preserves_open_gap_without_forced_closure(fake_autocad):
     plan.gap_points = (line.end, plan.boundary_lines[0].end)
     builder, doc = fake_autocad(plan)
     result = builder.draw_plan(plan)
-    assert result.boundary_copy_count == len(plan.boundary_lines)
+    builder.draw_plan(make_print_draft(plan, {}))
     short = plan.boundary_lines[0]
     assert sum(_matches_line(obj, short.start, short.end, 1000) for obj in doc.ModelSpace.lines) == 1
 
@@ -354,6 +338,7 @@ def test_step4_area_selects_original_or_copy_after_step1(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     builder, doc = fake_autocad(plan)
     builder.draw_plan(plan)
+    builder.draw_plan(make_print_draft(plan, {}))
     lines = [DrawingLine(obj.Layer, (tuple(obj.StartPoint[:2]), tuple(obj.EndPoint[:2])))
              for obj in doc.ModelSpace.lines]
     snapshot = DrawingSnapshot(lines=lines)
@@ -375,6 +360,7 @@ def test_corner_frontages_are_usable_for_step4_on_each_copy(fake_autocad):
     plan = _plan("lot51_commencing_corner.txt")
     builder, doc = fake_autocad(plan)
     builder.draw_plan(plan)
+    builder.draw_plan(make_print_draft(plan, {}))
     snap = DrawingSnapshot(lines=[
         DrawingLine(obj.Layer, (tuple(obj.StartPoint[:2]), tuple(obj.EndPoint[:2])))
         for obj in doc.ModelSpace.lines
@@ -383,3 +369,52 @@ def test_corner_frontages_are_usable_for_step4_on_each_copy(fake_autocad):
     for dx in (0, 1000):
         found = find_property_polygon(snap, builder.cfg, near=box(x+dx-1, y-1, x+dx+1, y+1))
         assert found.area_sqft == pytest.approx(plan.area_sqft, rel=1e-5)
+
+
+def test_legacy_draft_settings_cannot_move_copy_or_change_tie():
+    plan = translate_plan(_plan("lot72_render_e600.txt"), 17, -23)
+    cfg = {"enabled": False, "shift_ft": [42, 3], "tie_length_ft": 25}
+    draft = make_print_draft(plan, cfg)
+    for original, copy in zip(plan.boundary_lines, draft.boundary_lines):
+        assert copy.start == pytest.approx((original.start[0] + 1000, original.start[1]))
+        assert copy.end == pytest.approx((original.end[0] + 1000, original.end[1]))
+    tie = _tie(draft)
+    assert tie.end == pytest.approx((_tie(plan).end[0] + 1000, _tie(plan).end[1]))
+    assert math.dist(tie.start, tie.end) == pytest.approx(40)
+    for original, copy in zip(plan.lines, draft.lines):
+        if original.kind.startswith("cross-street-row"):
+            dx = tie.start[0] - _tie(plan).start[0]
+            dy = tie.start[1] - _tie(plan).start[1]
+            assert copy.start == pytest.approx((original.start[0] + dx, original.start[1] + dy))
+            assert copy.end == pytest.approx((original.end[0] + dx, original.end[1] + dy))
+    item = next(i for i in plan.items if i.kind == "cross-street")
+    assert draft.items[0].point == pytest.approx((item.point[0] + dx, item.point[1] + dy))
+
+
+def test_full_scene_has_one_draft_for_our_lot_and_no_neighbor_copy(fake_autocad):
+    from llm_parser import ASPENWALL_SAMPLES, parse_with_regex
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    neighbor_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    neighbor = builder.plan(neighbor_desc, scale=16, is_neighbor=True)
+    builder.draw_plan(make_print_draft(plan, {"enabled": False}))
+    builder.draw_plan(plan)
+    builder.draw_plan(neighbor)
+    for edge in plan.boundary_lines:
+        for dx in (0, 1000):
+            assert sum(_matches_line(o, edge.start, edge.end, dx) for o in doc.ModelSpace.lines) == 1
+    for edge in neighbor.boundary_lines:
+        assert sum(o.Layer == "NEIGHBOR_LOT" and _matches_line(o, edge.start, edge.end)
+                   for o in doc.ModelSpace.lines) == 1
+        assert not any(o.Layer == "NEIGHBOR_LOT" and _matches_line(o, edge.start, edge.end, 1000)
+                       for o in doc.ModelSpace.lines)
+
+
+def test_missing_draft_tie_is_reported_in_draw_result(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    plan.lines = [line for line in plan.lines if line.kind != "main-street-row-tie"]
+    draft = make_print_draft(plan, {})
+    builder, _doc = fake_autocad(plan)
+    result = builder.draw_plan(draft)
+    assert any("привязка 40 ft не построена" in w for w in result.warnings)
+    assert result.summary().count("привязка 40 ft не построена") == 1

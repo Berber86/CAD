@@ -121,24 +121,7 @@
       8000.0
     ]
   },
-  "print_draft": {
-    "enabled": true,
-    "shift_ft": [
-      1000.0,
-      0.0
-    ],
-    "tie_length_ft": 40.0,
-    "layers": {
-      "property_line": "PL-PRINT",
-      "boundary_text": "D-TOPO-TEXT-PRINT",
-      "street_row": "M-ROW-LINE-PRINT"
-    },
-    "layer_colors": {
-      "property_line": 7,
-      "boundary_text": 7,
-      "street_row": 1
-    }
-  },
+  "print_draft": {},
   "layers": {
     "property_line": "PL",
     "boundary_text": "D-TOPO-TEXT",

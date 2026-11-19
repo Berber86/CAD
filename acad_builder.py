@@ -9,7 +9,7 @@ acad_builder.py
 
 Отрисовывается:
   * отдельные линии основного участка: зелёные PL и красные M-ROW-LINE на фронте;
-  * точная копия только границы основного участка на +1000 по X;
+  * при запуске из GUI — единственный черновик с точной копией границы на +1000 по X;
   * подпись каждой стороны (румб + длина) вдоль линии, снаружи полигона,
     с поворотом по линии и защитой от «вверх ногами»;
   * название фасадной улицы вдоль фасадной стороны;
@@ -1056,48 +1056,34 @@ def translate_plan_in_place(plan: DrawPlan, dx: float, dy: float) -> None:
 
 
 def make_print_draft(plan: DrawPlan, print_cfg: dict[str, Any]) -> DrawPlan:
-    """План черновика для печати: только наш участок, его улицы и подпись пересекающей улицы.
+    """Единственный печатный черновик: точный контур +1000 по X и привязка 40 ft.
 
-    Координаты возвращаются относительно перекрёстка (0, 0) с учётом сдвига черновика
-    (``shift_ft``, по умолчанию +1000 по X). Окно листа добавляет ``sheet_origin_ft`` в draw_plan.
-
-    Правило длины: линия от перекрёстка до ближайшей точки фасада (``main-street-row-tie``)
-    рисуется ровно ``tie_length_ft`` (40 ft). Меняется только физический размер на чертеже:
-    описание (legal description), размеры сторон и подписи расстояний в данных не меняются.
-    Чтобы линия не отрывалась от участка, весь участок переносится вдоль этой линии —
-    его форма остаётся прежней. Улицы у перекрёстка (``cross-street-row``) и подпись
-    пересекающей улицы остаются на месте перекрёстка.
+    Сдвигается участок, а при наличии привязки перекрёсток черновика переносится
+    вдоль неё так, чтобы конец остался на участке, а длина стала 40 футов.
+    Старые настройки смещения и длины не отменяют это правило заказчика.
     """
-    tie_len = float(print_cfg.get("tie_length_ft", 40.0))
-    shift = print_cfg.get("shift_ft", [1000.0, 0.0])
-    sx, sy = float(shift[0]), float(shift[1])
+    sx, sy = 1000.0, 0.0
+    tie_len = 40.0
     warnings: list[str] = []
-
     tie = next((ln for ln in plan.lines if ln.kind == "main-street-row-tie"), None)
+    corner_dx, corner_dy = sx, sy
     if tie is None:
-        cx, cy = 0.0, 0.0
-        dxl, dyl = 0.0, 0.0
         if float(plan.description.distance_to_corner_ft or 0.0) > 1e-6:
-            # У углового участка линии до перекрёстка по описанию нет — предупреждать не о чем.
-            warnings.append(
-                "черновик: линии до перекрёстка в плане нет — участок нарисован без правки длины 40 ft"
-            )
+            warnings.append("черновик: линии до перекрёстка в плане нет — привязка 40 ft не построена")
     else:
-        cx, cy = tie.start
-        rx, ry = tie.end[0] - cx, tie.end[1] - cy
-        rlen = math.hypot(rx, ry)
-        if rlen < 1e-9:
-            dxl, dyl = 0.0, 0.0
-            warnings.append("черновик: линия до перекрёстка нулевой длины — правка 40 ft не применена")
+        rx, ry = tie.end[0] - tie.start[0], tie.end[1] - tie.start[1]
+        length = math.hypot(rx, ry)
+        if length < 1e-9:
+            warnings.append("черновик: линия до перекрёстка нулевой длины — привязка 40 ft не построена")
         else:
-            dxl = rx / rlen * tie_len - rx
-            dyl = ry / rlen * tie_len - ry
+            corner_dx += rx - rx / length * tie_len
+            corner_dy += ry - ry / length * tie_len
 
     def corner_pt(p: tuple[float, float]) -> tuple[float, float]:
-        return (p[0] - cx + sx, p[1] - cy + sy)
+        return (p[0] + corner_dx, p[1] + corner_dy)
 
     def lot_pt(p: tuple[float, float]) -> tuple[float, float]:
-        return (p[0] - cx + dxl + sx, p[1] - cy + dyl + sy)
+        return (p[0] + sx, p[1] + sy)
 
     items = [
         dc_replace(item, point=corner_pt(item.point))
@@ -1107,8 +1093,8 @@ def make_print_draft(plan: DrawPlan, print_cfg: dict[str, Any]) -> DrawPlan:
     lines: list[LineItem] = []
     for ln in plan.lines:
         if ln.kind == "main-street-row-tie":
-            lines.append(dc_replace(ln, start=corner_pt((cx, cy)), end=lot_pt(ln.end)))
-        elif ln.kind == "cross-street-row":
+            lines.append(dc_replace(ln, start=corner_pt(ln.start), end=lot_pt(ln.end)))
+        elif ln.kind.startswith("cross-street-row"):
             lines.append(dc_replace(ln, start=corner_pt(ln.start), end=corner_pt(ln.end)))
         else:
             lines.append(dc_replace(ln, start=lot_pt(ln.start), end=lot_pt(ln.end)))
@@ -1142,7 +1128,6 @@ class DrawResult:
     handle: str | None = None
     warnings: list[str] = field(default_factory=list)
     boundary_line_count: int = 0
-    boundary_copy_count: int = 0
 
     @property
     def closure(self) -> ClosureError:
@@ -1196,8 +1181,6 @@ class DrawResult:
             self.closure.report(),
             layer_summary,
         ]
-        if self.boundary_copy_count:
-            lines.append(f"Точная копия границы: {self.boundary_copy_count} LINE, сдвиг +1000 по X")
         if self.plan.gap_points is not None:
             g0, g1 = self.plan.gap_points
             lines.append(
@@ -1206,7 +1189,7 @@ class DrawResult:
             )
         for info_note in self.plan.notes:
             lines.append(f"• {info_note}")
-        for warning in list(self.plan.warnings) + list(self.warnings):
+        for warning in dict.fromkeys(list(self.plan.warnings) + list(self.warnings)):
             lines.append(f"! {warning}")
         return "\n".join(lines)
 
@@ -1523,18 +1506,6 @@ class AcadBuilder:
         """Окно листа по одной оси, в футах: 5000 … 8000."""
         raw = self.drawing_cfg.get("sheet_window_ft", [5000.0, 8000.0])
         return float(raw[0]), float(raw[1])
-
-    def print_draft_cfg(self) -> dict[str, Any]:
-        return dict(self.cfg.get("print_draft") or {})
-
-    def print_layer_names(self) -> dict[str, str]:
-        """Слои черновика — отдельные от реальной границы участка."""
-        layers = self.print_draft_cfg().get("layers", {})
-        return {
-            "property_line": str(layers.get("property_line") or "PL-PRINT"),
-            "boundary_text": str(layers.get("boundary_text") or "D-TOPO-TEXT-PRINT"),
-            "street_row": str(layers.get("street_row") or "M-ROW-LINE-PRINT"),
-        }
 
     def layer_names(self) -> tuple[str, str]:
         layers = self.cfg.get("layers", {})
@@ -2756,7 +2727,9 @@ class AcadBuilder:
 
     def draw_plan(self, plan: DrawPlan) -> DrawResult:
         """Рисует готовый план без повторного расчёта его геометрии."""
-        warnings: list[str] = []
+        # Ошибки расчёта привязки черновика должны попасть не только в лог
+        # плана, но и в итоговое предупреждение GUI об отрисовке.
+        warnings = [w for w in plan.warnings if w.startswith("черновик:")] if plan.print_draft else []
         is_neighbor = plan.is_neighbor
 
         drawing = self.drawing_cfg
@@ -2802,19 +2775,7 @@ class AcadBuilder:
 
             style = self._ensure_text_style(doc)
 
-            if geo.print_draft:
-                draft_names = self.print_layer_names()
-                draft_colors = self.print_draft_cfg().get("layer_colors", {})
-                poly_target_layer = self._ensure_layer(
-                    doc, draft_names["property_line"], int(draft_colors.get("property_line", 7))
-                )
-                text_target_layer = self._ensure_layer(
-                    doc, draft_names["boundary_text"], int(draft_colors.get("boundary_text", 7))
-                )
-                street_row_layer = self._ensure_layer(
-                    doc, draft_names["street_row"], int(draft_colors.get("street_row", 1))
-                )
-            elif is_neighbor:
+            if is_neighbor:
                 neighbor_layer = self._ensure_layer(
                     doc, neighbor_layer_name, int(colors.get("neighbor_lot", 4))
                 )
@@ -2851,7 +2812,7 @@ class AcadBuilder:
             if geo.lines and hasattr(model_space, "AddLine"):
                 for row_line in geo.lines:
                     try:
-                        if not is_neighbor and not geo.print_draft:
+                        if not is_neighbor:
                             self._add_survey_line(model_space, row_line, street_row_layer, 1)
                         else:
                             self._add_line(model_space, row_line, street_row_layer)
@@ -2861,8 +2822,7 @@ class AcadBuilder:
             draw_as_lines = bool(drawing.get("property_as_lines", True))
             primary_entity: Any = None
             created_boundary_lines = 0
-            copied_boundary_lines = 0
-            if not is_neighbor and not geo.print_draft:
+            if not is_neighbor:
                 # Разные слои в одном контуре требуют отдельных LINE, даже если
                 # в старом config.json была выбрана полилиния.
                 if not geo.boundary_lines or not hasattr(model_space, "AddLine"):
@@ -2886,18 +2846,11 @@ class AcadBuilder:
                     created_boundary_lines += 1
                     if primary_entity is None:
                         primary_entity = line_ent
-                    # Ровно +1000 единиц WCS по X, без соседей, текста и улиц.
-                    duplicate = dc_replace(
-                        b_line,
-                        start=(b_line.start[0] + 1000.0, b_line.start[1]),
-                        end=(b_line.end[0] + 1000.0, b_line.end[1]),
+                if geo.print_draft:
+                    warnings.append(
+                        "Черновик на +1000 по X: при неоднозначном автопоиске "
+                        "в Шаге 2 укажите исходный участок вручную."
                     )
-                    self._add_survey_line(model_space, duplicate, layer, color)
-                    copied_boundary_lines += 1
-                warnings.append(
-                    "Создана вторая граница на +1000 по X: при неоднозначном автопоиске "
-                    "в Шаге 2 укажите исходный участок вручную."
-                )
             elif draw_as_lines and geo.boundary_lines and hasattr(model_space, "AddLine"):
                 for b_line in geo.boundary_lines:
                     line_ent = self._add_line(model_space, b_line, poly_target_layer)
@@ -2989,7 +2942,6 @@ class AcadBuilder:
                 handle=handle,
                 warnings=warnings,
                 boundary_line_count=created_boundary_lines,
-                boundary_copy_count=copied_boundary_lines,
             )
         finally:
             if self._com_owned:

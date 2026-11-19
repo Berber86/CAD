@@ -454,9 +454,8 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
     assert len(space.polylines) == 0
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
-    assert len(prop_lines) == 2 * (4 - len(result.plan.street_boundary_indices))
+    assert len(prop_lines) == (4 - len(result.plan.street_boundary_indices))
     assert result.boundary_line_count == 4
-    assert result.boundary_copy_count == 4
     # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
     assert result.text_count == 8
     texts = {item.TextString for item in space.texts}
@@ -1247,8 +1246,8 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert result.plan.street_boundary_indices == (3, 0)
-    assert len(prop_lines) == 4  # две нефасадные стороны и их копии
-    assert len(street_lines) == 8  # четыре продолжения и два фасада с копиями
+    assert len(prop_lines) == 2  # две нефасадные стороны
+    assert len(street_lines) == 6  # четыре продолжения и два фасада
     assert space.arcs[0].Layer == "D-TOPO-TEXT"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
@@ -1564,13 +1563,11 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
-    assert len(prop_lines) == 2 * (4 - len(res_main.plan.street_boundary_indices))
-    assert res_main.boundary_copy_count == 4
+    assert len(prop_lines) == (4 - len(res_main.plan.street_boundary_indices))
     assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
     assert res_main.is_neighbor is False
     assert res_left.is_neighbor is True and res_right.is_neighbor is True
-    assert res_left.boundary_copy_count == res_right.boundary_copy_count == 0
 
     # Соседи не добавляют ни одной линии улицы и создают ровно по 1 тексту в центроиде
     assert len(street_lines) == main_lines_before - len(prop_lines)
@@ -2826,7 +2823,7 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     for index, (start, end) in enumerate(main_edges):
         layer = "M-ROW-LINE" if index in main_plan.street_boundary_indices else "PL"
         lines = [line for line in space.lines if line.Layer == layer]
-        for dx in (0.0, 1000.0):
+        for dx in (0.0,):
             assert any(
                 line.StartPoint == pytest.approx([start[0] + 5000.0 + dx, start[1] + 5000.0, 0])
                 and line.EndPoint == pytest.approx([end[0] + 5000.0 + dx, end[1] + 5000.0, 0])

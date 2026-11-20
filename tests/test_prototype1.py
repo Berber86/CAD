@@ -467,7 +467,7 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     assert result.closure.distance < 1e-6
     assert app.zoomed is True
     # подписи создаются в слое текста и с выравниванием MiddleCenter
-    assert {item.Layer for item in space.texts} == {"D-TOPO-TEXT"}
+    assert {item.Layer for item in space.texts} == {"M-TAX-DIM"}
     assert {item.Alignment for item in space.texts} == {10}
 
 
@@ -874,7 +874,7 @@ def test_config_matches_shipped_file():
     assert shipped["drawing"]["base_scale"] == 16.0
     assert shipped["drawing"]["base_text_height"] == 0.9
     assert shipped["layers"]["property_line"] == "PL"
-    assert shipped["layers"]["boundary_text"] == "D-TOPO-TEXT"
+    assert shipped["layers"]["boundary_text"] == "M-TAX-DIM"
 
 
 def test_scale_menu_helpers():
@@ -1243,12 +1243,12 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     assert result.plan.street_boundary_indices == (3, 0)
     assert len(prop_lines) == 2  # две нефасадные стороны
     assert len(street_lines) == 6  # четыре продолжения и два фасада
-    assert space.arcs[0].Layer == "D-TOPO-TEXT"
+    assert space.arcs[0].Layer == "M-TAX-DIM"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
     # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
-    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w] == []
+    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w and "Стиль LETTER" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
@@ -1459,7 +1459,7 @@ def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monke
     builder._app, builder._doc = app, app.doc
     builder.draw(desc, scale=16.0)
     assert app.doc.ActiveSpace == 1
-    style = app.doc.TextStyles.Item("BOUNDARY")
+    style = app.doc.TextStyles.Item("LETTER")
     assert getattr(style, "fontFile", None) == "romans.shx"
     assert getattr(style, "Height", None) == 0.0
 
@@ -1527,7 +1527,7 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     """
     Совместная отрисовка основного участка (420') и двух соседей (365' и 475')
     в один активный ModelSpace AutoCAD:
-      * основной участок — слой PL + D-TOPO-TEXT + M-ROW-LINE;
+      * основной участок — слой PL + M-TAX-DIM + M-ROW-LINE;
       * соседи — замкнутая полилиния в слое NEIGHBOR_LOT (acCyan = 4), БЕЗ подписей
         сторон/углов/улиц, только 1 компактная метка внутри центроида полигона.
     """

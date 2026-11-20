@@ -266,7 +266,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "layers": {
         "property_line": "PL",
-        "boundary_text": "D-TOPO-TEXT",
+        "boundary_text": "M-TAX-DIM",
         "street_row": "M-ROW-LINE",
         "neighbor_lot": "NEIGHBOR_LOT",
     },

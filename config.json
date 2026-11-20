@@ -124,7 +124,7 @@
   "print_draft": {},
   "layers": {
     "property_line": "PL",
-    "boundary_text": "D-TOPO-TEXT",
+    "boundary_text": "M-TAX-DIM",
     "street_row": "M-ROW-LINE",
     "neighbor_lot": "NEIGHBOR_LOT"
   },
@@ -814,7 +814,8 @@
     ],
     "obstacle_layer_exclude": [],
     "text_obstacle_layers": [
-      "BOUNDARY_TEXT*"
+      "BOUNDARY_TEXT*",
+      "M-TAX-DIM"
     ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,

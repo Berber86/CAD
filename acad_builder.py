@@ -969,7 +969,7 @@ def build_side_lines(
             if use_control:
                 clean_note = clean_note.replace("°", "%%d")
             note_h = text_height * 0.82
-            wrapped = ([clean_note] if re.match(r"^PARALLEL\s+(?:WITH|TO)\b", clean_note, re.IGNORECASE)
+            wrapped = ([clean_note] if re.search(r"\bPARALLEL\s+(?:WITH|TO)\b", clean_note, re.IGNORECASE)
                        else _wrap_course_note(clean_note, note_h, side_length, cfg))
             return [*wrapped, distance], False
         return [distance], False
@@ -1201,7 +1201,7 @@ def make_print_draft(
         if side_match and "-note" in item.kind:
             index = int(side_match.group(1)) - 1
             is_side_dimension = (bool(plan.description.segments[index].has_bearing)
-                                 and not re.match(r"^PARALLEL\s+(?:WITH|TO)\b", item.text, re.IGNORECASE))
+                                 and not re.search(r"\bPARALLEL\s+(?:WITH|TO)\b", item.text, re.IGNORECASE))
         height = 4.0 if is_street else (2.0 if is_side_dimension else 1.6)
         items.append(dc_replace(item, point=point, height=height))
 
@@ -1691,7 +1691,7 @@ class AcadBuilder:
         layers = self.cfg.get("layers", {})
         return (
             str(layers.get("property_line", "PL")),
-            str(layers.get("boundary_text", "D-TOPO-TEXT")),
+            "M-TAX-DIM",  # Правило Шага 1 действует и при старом config.local.json.
         )
 
     @staticmethod
@@ -1850,7 +1850,7 @@ class AcadBuilder:
 
             has_bearing = bool(getattr(segment, "has_bearing", True))
             explicit_note = str(getattr(display_segment, "course_note", None) or "").strip()
-            if has_bearing and re.match(r"^PARALLEL\s+(?:WITH|TO)\b", explicit_note, re.IGNORECASE):
+            if has_bearing and re.search(r"\bPARALLEL\s+(?:WITH|TO)\b", explicit_note, re.IGNORECASE):
                 # Preserve the printed bearing as a separate line above the length;
                 # the explicit parallel note remains below the length when read.
                 parallel_note = re.sub(r"\bPART\s+OF\s+THE\s+DISTANCE\s+THROUGH\s+(?:A\s+|THE\s+)?PARTY[\s-]+WALL\b", "", explicit_note, flags=re.IGNORECASE)
@@ -1906,7 +1906,7 @@ class AcadBuilder:
                         )
                     dist_off = offset + (len(ordered_notes) - 1) * note_gap + line_gap
                     side_band_extra[index] = dist_off - offset
-                    if re.match(r"^PARALLEL\s+(?:WITH|TO)\b", note_lines[0], re.IGNORECASE) and up_dot_n < 0:
+                    if re.search(r"\bPARALLEL\s+(?:WITH|TO)\b", note_lines[0], re.IGNORECASE) and up_dot_n < 0:
                         # Lower in reading coordinates, regardless of which side of the lot.
                         dist_off = offset
                         for pos in range(len(items) - len(ordered_notes), len(items)):
@@ -2886,11 +2886,9 @@ class AcadBuilder:
         except Exception:  # noqa: BLE001
             return "Standard"
 
-    def _ensure_draft_text_style(self, doc: Any, name: str, font: str, warnings: list[str]) -> str:
-        """Не меняем существующий стиль заказчика; если отсутствует — создаём.
-
-        О невозможности создать стиль сообщаем явно, не выдавая запасной стиль за нужный.
-        """
+    def _ensure_boundary_text_style(self, doc: Any, warnings: list[str]) -> str:
+        """Use the drawing's LETTER unchanged; create a clearly reported fallback if absent."""
+        name = "LETTER"
         try:
             styles = doc.TextStyles
             try:
@@ -2898,18 +2896,16 @@ class AcadBuilder:
                 return name
             except Exception:  # noqa: BLE001
                 style = _com_retry(styles.Add, name)
-            if font == "romans.shx":
-                style.fontFile = font
+            try:
+                style.fontFile = "romans.shx"
+                style.Height = 0.0
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Создан стиль LETTER, но шрифт/высоту не удалось настроить: {exc}; проверьте стиль в AutoCAD")
             else:
-                try:
-                    style.SetFont("Times New Roman", False, False, 0, 0)
-                except Exception:  # noqa: BLE001
-                    style.fontFile = font
-            style.Height = 0.0
+                warnings.append("Стиль LETTER отсутствовал и создан с запасным шрифтом romans.shx; проверьте его по шаблону заказчика")
             return name
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"черновик: не удалось создать текстовый стиль {name}: {exc}; проверьте шрифт в AutoCAD")
-            return "Standard"
+            raise AcadDrawError(f"Не удалось получить или создать стиль LETTER: {exc}") from exc
 
     # -- создание объектов --------------------------------------------------
     def _add_polyline(
@@ -2964,20 +2960,26 @@ class AcadBuilder:
             model_space.AddText, item.text, _variant_point(item.point), height
         )
         try:
-            text.StyleName = style
+            try:
+                text.StyleName = style
+            except Exception:  # noqa: BLE001
+                if strict_style:
+                    raise
             if strict_style:
                 # Назначение стиля в AutoCAD может сбрасывать высоту объекта.
                 text.Height = height
                 if str(text.StyleName).casefold() != style.casefold() or abs(float(text.Height) - height) > 1e-6:
                     raise ValueError("AutoCAD не сохранил стиль или высоту")
+            text.Layer = layer
+            if strict_style and str(text.Layer).casefold() != layer.casefold():
+                raise ValueError("AutoCAD не сохранил слой текста")
         except Exception:  # noqa: BLE001
             if strict_style:
                 try:
                     text.Delete()
                 except Exception:  # noqa: BLE001
                     pass
-                raise
-        text.Layer = layer
+            raise
         # Сначала выравнивание, затем точка выравнивания — иначе ACAD сбросит её.
         text.Alignment = AC_ALIGNMENT_MIDDLE_CENTER
         text.TextAlignmentPoint = _variant_point(item.point)
@@ -3052,14 +3054,7 @@ class AcadBuilder:
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 
-            if geo.print_draft:
-                draft_street_style = self._ensure_draft_text_style(
-                    doc, "MtXpl_Times_New_Roma", "times.ttf", warnings
-                )
-                style = self._ensure_draft_text_style(doc, "Romans", "romans.shx", warnings)
-            else:
-                style = self._ensure_text_style(doc)
-                draft_street_style = style
+            style = self._ensure_boundary_text_style(doc, warnings)
 
             if is_neighbor:
                 neighbor_layer = self._ensure_layer(
@@ -3078,8 +3073,8 @@ class AcadBuilder:
                 line_layer = self._ensure_survey_layer(
                     doc, "PL", 3, warnings, linetype="Continuous"
                 )
-                text_layer = self._ensure_layer(
-                    doc, text_layer_name, int(colors.get("boundary_text", 7))
+                text_layer = self._ensure_survey_layer(
+                    doc, text_layer_name, int(colors.get("boundary_text", 7)), warnings
                 )
                 street_row_layer = self._ensure_survey_layer(
                     doc, "M-ROW-LINE", 1, warnings, linetype="Continuous"
@@ -3173,12 +3168,9 @@ class AcadBuilder:
             created = 0
             for item in geo.items:
                 try:
-                    item_style = draft_street_style if geo.print_draft and item.kind in {
-                        "main-street", "cross-street"
-                    } else style
                     self._add_text(
-                        model_space, item, geo.text_height, text_target_layer, item_style,
-                        strict_style=geo.print_draft,
+                        model_space, item, geo.text_height, text_target_layer, style,
+                        strict_style=True,
                     )
                     created += 1
                 except Exception as exc:  # noqa: BLE001

@@ -3911,3 +3911,26 @@ def test_fence_on_wall_duplicate_check_knows_abbreviations_both_ways():
         assert fl.labels_similar(existing, label, synonyms), (existing, label)
     assert not fl.labels_similar("VINYL FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL", synonyms)
     assert not fl.labels_similar("C.L.F. ATOP CONC. WALL", "C.L.F.", synonyms)
+
+
+def test_step1_tax_text_is_obstacle_even_with_old_settings():
+    from feature_labeler import LayerClassifier, feature_settings
+    from llm_parser import load_config
+    cfg = dict(feature_settings(load_config()))
+    cfg["text_obstacle_layers"] = ["BOUNDARY_TEXT*"]
+    classifier = LayerClassifier(cfg)
+    assert classifier.is_text_obstacle("M-TAX-DIM")
+    assert classifier.is_text_obstacle("BOUNDARY_TEXT_AI")
+    assert not classifier.is_field_note("M-TAX-DIM")
+
+
+def test_step2_avoids_actual_tax_boundary_text_with_old_config():
+    cfg = {"feature_labeling": {"text_obstacle_layers": ["BOUNDARY_TEXT*"]}}
+    baseline = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE, cfg=cfg)
+    shed = item_for(baseline, "SUBJECT_SHED_OUTLINE")
+    snap = build_stafford_scene()
+    snap.texts.append(DrawingText("M-TAX-DIM", "N 56°36'12\" W", shed.point, height=1.0))
+    changed = make_plan(snap, house=STAFFORD_HOUSE, cfg=cfg)
+    moved = item_for(changed, "SUBJECT_SHED_OUTLINE")
+    assert moved.point != pytest.approx(shed.point)
+    assert not moved.box.intersects(ab._existing_text_box(snap.texts[-1], 1.0, {}))

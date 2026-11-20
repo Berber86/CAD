@@ -519,46 +519,41 @@ def test_ambiguous_party_wall_is_not_guessed():
     assert any("PARTY WALL" in warning for warning in warnings)
 
 
-def test_print_draft_fonts_heights_and_existing_styles_are_not_modified(fake_autocad):
+def test_print_draft_letter_heights_and_existing_style_are_not_modified(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     draft = make_print_draft(plan, {})
     builder, doc = fake_autocad(plan)
-    styles = doc.TextStyles
-    street_style = styles.Add("MtXpl_Times_New_Roma")
-    street_style.fontFile, street_style.Height = "customer.ttf", 0
-    roman_style = styles.Add("Romans")
-    roman_style.fontFile, roman_style.Height = "customer.shx", 0
-    builder.draw_plan(draft)
-    assert (street_style.fontFile, street_style.Height) == ("customer.ttf", 0)
-    assert (roman_style.fontFile, roman_style.Height) == ("customer.shx", 0)
+    style = doc.TextStyles.Add("LETTER")
+    style.fontFile, style.Height = "customer.shx", 0
+    result = builder.draw_plan(draft)
+    assert (style.fontFile, style.Height) == ("customer.shx", 0)
+    assert result.layers["print_boundary_text"] == "M-TAX-DIM"
     assert len(doc.ModelSpace.texts) == len(draft.items)
     for spec, entity in zip(draft.items, doc.ModelSpace.texts):
         assert entity.Height == spec.height
+        assert entity.StyleName == "LETTER" and entity.Layer == "M-TAX-DIM"
         if spec.kind in {"main-street", "cross-street"}:
-            assert entity.StyleName == "MtXpl_Times_New_Roma" and entity.Height == 4
+            assert entity.Height == 4
+        elif spec.kind.startswith("side-"):
+            assert entity.Height == 2
         else:
-            assert entity.StyleName == "Romans"
-            if spec.kind.startswith("side-"):
-                assert entity.Height == 2
-            else:
-                assert entity.Height == 1.6
+            assert entity.Height == 1.6
 
 
-def test_new_styles_and_missing_style_error_are_reported(fake_autocad):
+def test_new_style_and_missing_style_error_are_reported(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
-    draft = make_print_draft(plan, {})
     builder, doc = fake_autocad(plan)
-    builder.draw_plan(draft)
-    assert doc.TextStyles.Item("Romans").fontFile == "romans.shx"
-    assert doc.TextStyles.Item("MtXpl_Times_New_Roma").font[0] == "Times New Roman"
+    result = builder.draw_plan(make_print_draft(plan, {}))
+    assert doc.TextStyles.Item("LETTER").fontFile == "romans.shx"
+    assert any("LETTER" in w and "запасным" in w for w in result.warnings)
     builder2, doc2 = fake_autocad(plan)
     class BrokenStyles:
         def Item(self, name): raise KeyError(name)
         def Add(self, name): raise RuntimeError("style unavailable")
     doc2.TextStyles = BrokenStyles()
-    result = builder2.draw_plan(draft)
-    assert any("MtXpl_Times_New_Roma" in w for w in result.warnings)
-    assert any("Romans" in w for w in result.warnings)
+    with pytest.raises(module.AcadDrawError, match="LETTER"):
+        builder2.draw_plan(make_print_draft(plan, {}))
+    assert not doc2.ModelSpace.texts and not doc2.ModelSpace.lines
 
 
 def test_ai_party_wall_is_restored_from_matching_local_parse(monkeypatch):
@@ -578,7 +573,7 @@ def test_missing_tie_distance_and_street_name_styles_do_not_change_main(fake_aut
     assert [(i.text, i.kind, i.height) for i in plan.items] == original_items
     builder, doc = fake_autocad(plan)
     result = builder.draw_plan(plan)
-    assert all(t.StyleName == "BOUNDARY" for t in doc.ModelSpace.texts)
+    assert all(t.StyleName == "LETTER" and t.Layer == "M-TAX-DIM" for t in doc.ModelSpace.texts)
     assert "MtXpl_Times_New_Roma" not in doc.TextStyles._items
     assert len(doc.ModelSpace.texts) == result.text_count
     assert any(i.kind == "cross-street-distance" and i.text == "241.00'" for i in draft.items)
@@ -595,7 +590,8 @@ def test_relative_course_notes_are_other_text_not_bearings():
     assert all(i.height == 2.0 for i in dimensions)
 
 
-def test_unassignable_print_style_is_not_silently_reported_as_success(fake_autocad):
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_unassignable_style_is_not_silently_reported_as_success(fake_autocad, is_draft):
     class RejectStyle(_Entity):
         @property
         def StyleName(self): return "Standard"
@@ -611,7 +607,7 @@ def test_unassignable_print_style_is_not_silently_reported_as_success(fake_autoc
         made.append(item)
         return item
     doc.ModelSpace.AddText = add_text
-    result = builder.draw_plan(draft)
+    result = builder.draw_plan(draft if is_draft else plan)
     assert result.text_count == 0
     assert made and all(item.deleted for item in made)
     assert any("cannot set style" in warning for warning in result.warnings)
@@ -651,3 +647,46 @@ def test_corner_with_inconsistent_distance_does_not_create_tie():
     assert not any(line.kind == "main-street-row-tie" for line in draft.lines)
     assert not any("привязка 40 ft не построена" in w for w in draft.warnings)
     assert any("угловой" in w and "сверьте" in w for w in draft.warnings)
+
+
+def test_old_settings_do_not_override_boundary_layer_or_style(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    builder.cfg["layers"]["boundary_text"] = "OLD-BOUNDARY"
+    builder.cfg["drawing"]["text_style"] = "OLD-STYLE"
+    style = doc.TextStyles.Add("LETTER")
+    style.fontFile = "customer-letter.shx"
+    for scene in (plan, make_print_draft(plan, {})):
+        before = len(doc.ModelSpace.texts)
+        result = builder.draw_plan(scene)
+        created = doc.ModelSpace.texts[before:]
+        assert len(created) == len(scene.items) == result.text_count
+        assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "LETTER" for t in created)
+        assert result.layers["print_boundary_text" if scene.print_draft else "boundary_text"] == "M-TAX-DIM"
+    assert style.fontFile == "customer-letter.shx"
+
+
+def test_missing_tax_layer_fails_without_creating_wrong_layer_text(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    orig_add = doc.Layers.Add
+    def reject_tax(name):
+        if name == "M-TAX-DIM":
+            raise RuntimeError("layer unavailable")
+        return orig_add(name)
+    doc.Layers.Add = reject_tax
+    with pytest.raises(module.AcadDrawError, match="M-TAX-DIM"):
+        builder.draw_plan(plan)
+    assert not doc.ModelSpace.texts and not doc.ModelSpace.lines
+
+
+def test_existing_tax_layer_color_and_existing_text_are_not_changed(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    tax = doc.Layers.Add("M-TAX-DIM")
+    tax.color = 42
+    old = _Entity(Layer="D-TOPO-TEXT", StyleName="OLD", TextString="OTHER DRAWING")
+    doc.ModelSpace.texts.append(old)
+    builder.draw_plan(plan)
+    assert tax.color == 42
+    assert (old.Layer, old.StyleName, old.TextString) == ("D-TOPO-TEXT", "OLD", "OTHER DRAWING")

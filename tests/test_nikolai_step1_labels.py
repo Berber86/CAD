@@ -131,3 +131,19 @@ def test_printed_bearings_and_explicit_parallel_notes_are_both_retained():
         if scene.print_draft:
             assert bearing.height == length.height == 2
             assert note.height == 1.6
+
+
+@pytest.mark.parametrize("bearing", [False, True])
+@pytest.mark.parametrize("note", ["PARALLEL WITH FIFTH AVENUE", "northerly parallel with 56 Street", "parallel to 21 St"])
+def test_parallel_note_never_wraps_even_on_short_line(bearing, note):
+    desc = make_description()
+    segments = list(desc.segments)
+    segments[1] = segments[1].model_copy(update={"has_bearing": bearing, "course_note": note})
+    desc = desc.model_copy(update={"segments": segments})
+    plan = ab.AcadBuilder(lp.load_config()).plan(desc)
+    for scene in (plan, ab.make_print_draft(plan, {})):
+        dim = next(i for i in scene.items if i.kind == "side-2")
+        notes = [i for i in scene.items if i.kind.startswith("side-2-note")]
+        assert len(notes) == 1
+        assert notes[0].text == street_names.ordinal_street_numbers(note.upper())
+        assert reading_height(dim) > reading_height(notes[0])

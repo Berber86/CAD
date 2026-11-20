@@ -44,6 +44,10 @@ Progress = Callable[[str], None]
 class PortalLookupError(RuntimeError):
     """The portal lookup could not safely reach a usable parcel details page."""
 
+class _ScreenNotFound(PortalLookupError):
+    """Проверенная область экрана не содержит ожидаемое состояние."""
+
+
 class _InitialScreenNotFound(PortalLookupError):
     """Исходная форма не найдена, можно повторить снимок после паузы."""
 
@@ -220,8 +224,8 @@ def _reject_challenge(rows: Sequence[ScreenText]) -> None:
         raise PortalLookupError("На портале обнаружена проверка человека/CAPTCHA; работа остановлена.")
 
 
-def _initial_screen(handle: int) -> list[ScreenText]:
-    """Сначала лёгкое чтение; полное нужно только если область не дала результата."""
+def _initial_screen(handle: int, *, address_region: tuple[float, float, float, float] | None = None) -> list[ScreenText]:
+    """Все резервные чтения делаются с одного снимка без дополнительных опросов."""
     with tempfile.TemporaryDirectory(prefix="tsai_pip_start_") as directory:
         path = Path(directory) / "screen.png"
         _save_window_capture(handle, path)
@@ -229,6 +233,12 @@ def _initial_screen(handle: int) -> list[ScreenText]:
         _reject_challenge(rows)
         if any(_contains(rows, marker) for marker in ("Select", "Find Another Property", "Enter an Address")):
             return rows
+        if address_region is not None:
+            rows = _screen_ocr_region(path, address_region)
+            _reject_challenge(rows)
+            # Из узкой области можно подтвердить только саму метку адреса.
+            if _contains(rows, "Enter an Address"):
+                return rows
         rows = _screen_ocr(path)
         _reject_challenge(rows)
         if any(_contains(rows, marker) for marker in ("Select", "Find Another Property", "Enter an Address")):
@@ -334,6 +344,7 @@ def _wait_screen(
     retry_delay: float = RELIABLE_RETRY_DELAY,
     region: tuple[float, float, float, float] | None = None,
     ready: Callable[[], None] | None = None,
+    on_region_fallback: Callable[[], None] | None = None,
 ) -> list[ScreenText]:
     """После паузы один снимок, затем максимум один повтор; никаких частых циклов."""
     latest: list[ScreenText] = []
@@ -358,8 +369,10 @@ def _wait_screen(
                 latest = _screen_ocr(path)  # тот же снимок; на случай сместившейся формы
                 _reject_challenge(latest)
                 if predicate(latest):
+                    if on_region_fallback is not None:
+                        on_region_fallback()
                     return latest
-    raise PortalLookupError(f"Не дождался {description} на NYC Portal после двух проверок.")
+    raise _ScreenNotFound(f"Не дождался {description} на NYC Portal после двух проверок.")
 
 
 def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
@@ -514,7 +527,8 @@ def _drive_portal(
     проверка и чтение идентификаторов обязательны. Риск несработавшего действия выше.
     """
     def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
-             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION) -> list[ScreenText]:
+             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION,
+             on_region_fallback: Callable[[], None] | None = None) -> list[ScreenText]:
         if fast_mode:
             _fast_wait(handle, fast_pause_sec)
             _await_ocr(warmup)
@@ -524,10 +538,10 @@ def _drive_portal(
                 rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
             _reject_challenge(rows)
             if not predicate(rows):
-                raise PortalLookupError(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
+                raise _ScreenNotFound(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
             return rows
         return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
-                            ready=lambda: _await_ocr(warmup))
+                            ready=lambda: _await_ocr(warmup), on_region_fallback=on_region_fallback)
 
     if optimal_mode and fast_mode:
         raise PortalLookupError("Выберите только один режим поиска: оптимальный или быстрый.")
@@ -555,17 +569,26 @@ def _drive_portal(
     # Кэш — только подсказка для OCR, никогда не используется для слепого клика.
     bounds = browser_save.window_bounds(window.handle)
     size = (bounds[2] - bounds[0], bounds[3] - bounds[1]) if bounds else None
-    layout = portal_layout_cache.load(window.executable, size) if optimal_mode and not fast_mode and size else None
-    use_optimal = optimal_mode and not fast_mode and layout is not None
+    layout = portal_layout_cache.load(window.executable, size) if (optimal_mode or fast_mode) and size else None
+    use_optimal = optimal_mode and layout is not None
+    guard_layout = use_optimal
     if optimal_mode and progress:
         progress("оптимальный режим: использую сохранённую область OCR; клики проверяются по текущему экрану"
                  if use_optimal else "для этого окна нет подходящих координат — выполняю надёжный поиск")
 
     def check_layout_size() -> None:
-        if use_optimal:
+        if guard_layout:
             current = browser_save.window_bounds(window.handle)
             if not current or (current[2] - current[0], current[3] - current[1]) != size:
                 raise PortalLookupError("Размер окна изменился во время поиска; повторите поиск заново.")
+
+    def fall_back_to_reliable() -> None:
+        nonlocal use_optimal
+        if use_optimal:
+            check_layout_size()
+            use_optimal = False
+            if progress:
+                progress("сохранённая область формы не подошла — оставшиеся действия выполняю по надёжному сценарию")
 
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
@@ -601,7 +624,14 @@ def _drive_portal(
             time.sleep(RELIABLE_INITIAL_DELAY)
         _await_ocr(warmup)
         try:
-            rows = _initial_screen(window.handle)
+            if fast_mode and layout is not None:
+                guard_layout = True
+                check_layout_size()
+                if progress:
+                    progress("быстрый режим: при необходимости область исходной формы возьму из общего кэша")
+                rows = _initial_screen(window.handle, address_region=portal_layout_cache.label_region(layout, size))
+            else:
+                rows = _initial_screen(window.handle)
         except _InitialScreenNotFound:
             if fast_mode:
                 raise
@@ -656,6 +686,7 @@ def _drive_portal(
                 window.handle, lambda screen: _contains(screen, "Enter an Address"),
                 delay=OPTIMAL_ADDRESS_DELAY if use_optimal else RELIABLE_ADDRESS_DELAY, description="поля Address",
                 region=portal_layout_cache.label_region(layout, size) if use_optimal else _FORM_REGION,
+                on_region_fallback=fall_back_to_reliable if use_optimal else None,
             )
         # Confirming "Address" with the keyboard (not a mouse click) leaves DOM
         # focus sitting on the <select> itself even though the page has already
@@ -670,7 +701,8 @@ def _drive_portal(
     check_layout_size()
     address_label = next((row for row in rows if "enter an address" in row.text.lower()), None)
     if progress:
-        progress("ввожу адрес в NYC Portal и жду совпадающую подсказку")
+        progress("ввожу адрес: первая подсказка не проверяется" if fast_mode else
+                 "ввожу адрес в NYC Portal и жду совпадающую подсказку")
     if fast_mode and not _contains(rows, "Enter an Address"):
         _type_focused_address(window.handle, address)
     else:
@@ -684,63 +716,92 @@ def _drive_portal(
     _key(window.handle, browser_save.VK_DOWN)
     time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
     _key(window.handle, browser_save.VK_RETURN)
-    rows = wait(
-        window.handle,
-        lambda screen: (
-            _contains(screen, "Find Another Property")
-            and _contains(screen, "Block") and _contains(screen, "Lot")
-            and _contains(screen, "Borough")
-        ),
-        delay=OPTIMAL_CARD_DELAY if use_optimal else RELIABLE_CARD_DELAY,
-        description="карточку объекта с Borough, Block и Lot", region=None,
-    )
+
+    def card_ready(screen: Sequence[ScreenText]) -> bool:
+        return all(_contains(screen, text) for text in ("Find Another Property", "Block", "Lot", "Borough"))
+
+    def fast_card_retry() -> list[ScreenText]:
+        # Только после неудачи: один отложенный снимок, без повторного ввода/кликов.
+        if progress:
+            progress("быстрая проверка карточки не удалась — один повтор после паузы; подсказка адреса остаётся непроверенной")
+        time.sleep(RELIABLE_RETRY_DELAY)
+        _focus(window.handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_retry_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(window.handle, path)
+            retry = _screen_ocr(path)
+        _reject_challenge(retry)
+        if not card_ready(retry):
+            raise _ScreenNotFound("Карточка не готова после повторной проверки. Увеличьте паузу или выберите надёжный режим.")
+        return retry
+
+    retried_fast_card = False
+    try:
+        rows = wait(
+            window.handle, card_ready,
+            delay=OPTIMAL_CARD_DELAY if use_optimal else RELIABLE_CARD_DELAY,
+            description="карточку объекта с Borough, Block и Lot", region=None,
+        )
+    except _ScreenNotFound:
+        if not fast_mode:
+            raise
+        rows = fast_card_retry()
+        retried_fast_card = True
     try:
         block, lot, borough = _extract_portal_details(rows)
         if not borough:
             raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
     except PortalLookupError:
         if fast_mode:
-            raise
-        if progress:
-            progress("Block/Lot не прочитаны — повторно проверяю область карточки")
-        time.sleep(RELIABLE_RETRY_DELAY)
-        _focus(window.handle)
-        with tempfile.TemporaryDirectory(prefix="tsai_pip_bbl_retry_") as directory:
-            path = Path(directory) / "screen.png"
-            _save_window_capture(window.handle, path)
-            retry_rows = _screen_ocr_region(path, (0.0, 0.0, 0.65, 1.0))
-            _reject_challenge(retry_rows)
-            try:
-                block, lot, borough = _extract_portal_details(retry_rows)
-                if not borough:
-                    raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-            except PortalLookupError:
-                # Форма могла сместиться: ещё одно чтение того же снимка, не новый снимок.
-                retry_rows = _screen_ocr(path)
+            if retried_fast_card:
+                raise
+            rows = fast_card_retry()
+            block, lot, borough = _extract_portal_details(rows)
+            if not borough:
+                raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+        else:
+            if progress:
+                progress("Block/Lot не прочитаны — повторно проверяю область карточки")
+            time.sleep(RELIABLE_RETRY_DELAY)
+            _focus(window.handle)
+            with tempfile.TemporaryDirectory(prefix="tsai_pip_bbl_retry_") as directory:
+                path = Path(directory) / "screen.png"
+                _save_window_capture(window.handle, path)
+                retry_rows = _screen_ocr_region(path, (0.0, 0.0, 0.65, 1.0))
                 _reject_challenge(retry_rows)
-                block, lot, borough = _extract_portal_details(retry_rows)
-                if not borough:
-                    raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-        # Полный предыдущий OCR сохраняет координаты для безопасной обрезки карты.
-        rows = [*rows, *retry_rows]
+                try:
+                    block, lot, borough = _extract_portal_details(retry_rows)
+                    if not borough:
+                        raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+                except PortalLookupError:
+                    # Форма могла сместиться: ещё одно чтение того же снимка, не новый снимок.
+                    retry_rows = _screen_ocr(path)
+                    _reject_challenge(retry_rows)
+                    block, lot, borough = _extract_portal_details(retry_rows)
+                    if not borough:
+                        raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+            # Полный предыдущий OCR сохраняет координаты для безопасной обрезки карты.
+            rows = [*rows, *retry_rows]
     # Retain a map-only image: neither the saved crop nor the Vision request includes
     # the address, Block/Lot pane, owner or building details on the page's left side.
+    check_layout_size()
     if fast_mode:
         _zoom_out_map_pane(window.handle, fast_pause_sec)
     else:
         _zoom_out_map_pane(window.handle)
+    check_layout_size()
     with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
         full_capture = Path(directory) / "portal_full.png"
         _save_window_capture(window.handle, full_capture)
         _crop_tax_map(full_capture, rows, map_path)
-    # Обновляем координаты только после успешного надёжного поиска, а не в быстром
+    # Обновляем координаты только после успешного поиска с проверкой подсказки, а не в быстром
     # или по непроверенным предположениям. Никаких адресов/снимков в JSON нет.
     final_bounds = browser_save.window_bounds(window.handle)
     final_size = (final_bounds[2] - final_bounds[0], final_bounds[3] - final_bounds[1]) if final_bounds else None
-    if not fast_mode and not use_optimal and address_label and size and final_size == size:
+    if not fast_mode and address_label and size and final_size == size:
         saved = portal_layout_cache.save(window.executable, size, address_label.box)
         if progress:
-            progress("координаты формы сохранены для оптимального режима" if saved else
+            progress("проверенные координаты формы сохранены для оптимального и быстрого режимов" if saved else
                      "координаты формы сохранить не удалось; поиск завершён")
     return PortalCapture(block, lot, borough, map_path)
 

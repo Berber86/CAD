@@ -758,6 +758,7 @@ def test_fast_card_missing_data_stops_without_guess_or_vision(tmp_path, monkeypa
     monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_: None)
     monkeypatch.setattr(nyc_portal, "_key", lambda *_: None)
     screens = iter([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+                    [nyc_portal.ScreenText("loading", (20, 200, 120, 220))],
                     [nyc_portal.ScreenText("loading", (20, 200, 120, 220))]])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _: next(screens))
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("не отправлять карту при отсутствии Block/Lot"))
@@ -1105,6 +1106,7 @@ def test_optimised_never_selects_mismatching_first_suggestion(tmp_path, monkeypa
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert keys.count(nyc_portal.browser_save.VK_RETURN) == 1  # only menu, never select address
     assert not (tmp_path / "map.png").exists()
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == (20, 160, 250, 180)
 
 
 def test_optimal_stops_if_window_size_changes_before_address_typing(tmp_path, monkeypatch):
@@ -1178,8 +1180,112 @@ def test_fast_card_missing_borough_stops_before_map_or_vision(tmp_path, monkeypa
     q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
     card = _optimal_card()
     card[1] = nyc_portal.ScreenText("Borough", (20, 260, 180, 280))
-    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))], card])
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))], card, card])
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("Vision до чтения Borough недопустим"))
     with pytest.raises(nyc_portal.PortalLookupError, match="Borough"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", fast_mode=True)
-    assert len(captures) == 2 and not list(tmp_path.glob("TAX_MAP_*"))
+    assert len(captures) == 3 and not list(tmp_path.glob("TAX_MAP_*"))
+
+
+def test_optimised_updates_verified_cache_then_fast_uses_it_without_teaching(tmp_path, monkeypatch):
+    q, clicks, _, _, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    old_box = (20, 160, 250, 180)
+    new_box = (40, 165, 260, 185)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old_box)
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Enter an Address", (40, 85, 260, 105))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (40, 260, 200, 280))], _optimal_card()])
+    nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "optimal.png", optimal_mode=True)
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == new_box
+    initial_data = nyc_portal.portal_layout_cache.cache_path().read_bytes()
+    scans.clear(); captures.clear(); clicks.clear()
+    # OCR current text in the cache-derived crop (y0 = 85), never a blind cached click.
+    q.extend([[], [nyc_portal.ScreenText("Enter an Address", (42, 82, 262, 102))], _optimal_card()])
+    logs = []
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "fast.png", logs.append, fast_mode=True)
+    assert result.block == "5712" and scans[:2] == [(500, 400), (360, 200)]
+    assert clicks == [("87 Stafford Ave", (42, 167, 262, 187))]
+    assert len(captures) == 3  # начальная форма, финальная карточка, карта
+    assert any("общего кэша" in line for line in logs)
+    assert nyc_portal.portal_layout_cache.cache_path().read_bytes() == initial_data
+
+
+def test_fast_cache_miss_rechecks_full_initial_form_on_same_screenshot(tmp_path, monkeypatch):
+    q, clicks, _, _, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
+    monkeypatch.setattr(nyc_portal, "_type_focused_address", lambda _, a: clicks.append(("typed", a)))
+    # Select from the cached *partial* region must not be trusted: look at the usual quarter.
+    q.extend([[], [nyc_portal.ScreenText("Select", (20, 20, 80, 40))],
+              [nyc_portal.ScreenText("Select", (20, 100, 80, 130))], _optimal_card()])
+    nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True)
+    assert scans == [(500, 400), (350, 200), (1000, 800), (1000, 800)]
+    assert len(captures) == 3 and clicks == ["Select", ("typed", "87 Stafford Ave")]
+
+
+def test_stale_optimal_region_switches_remaining_actions_to_reliable_and_refreshes_cache(tmp_path, monkeypatch):
+    q, _, _, waits, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    old = (20, 160, 250, 180)
+    new = (100, 400, 400, 420)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old)
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
+              [nyc_portal.ScreenText("Enter an Address", new)],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card()])
+    logs = []
+    nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
+    assert any("оставшиеся действия" in line and "надёжному" in line for line in logs)
+    assert waits[-3:] == [2.0, .2, 3.0]  # longer reliable waits for suggestion and card
+    assert len(captures) == 6
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == new
+
+
+@pytest.mark.parametrize("first", ["not_loaded", "unreadable"])
+def test_fast_card_failure_uses_one_reliable_retry_without_retyping(tmp_path, monkeypatch, first):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    initial = [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))]
+    bad_card = ([nyc_portal.ScreenText("loading", (10, 100, 100, 120))] if first == "not_loaded"
+                else [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+                      nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+                      nyc_portal.ScreenText("Block", (20, 300, 150, 330)),
+                      nyc_portal.ScreenText("Lot", (300, 300, 400, 330))])
+    q.extend([initial, bad_card, _optimal_card()])
+    logs = []
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, fast_mode=True, fast_pause_sec=1.5)
+    assert (result.block, result.lot) == ("5712", "70")
+    assert len(captures) == 4 and scans == [(500, 400), (1000, 800), (1000, 800)]
+    assert clicks == [("87 Stafford Ave", initial[0].box)]
+    assert keys == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
+    assert waits == [1.5, .05, 1.5, 2.0]
+    assert any("остаётся непроверенной" in line for line in logs)
+    assert not nyc_portal.portal_layout_cache.cache_path().exists()
+
+
+def test_fast_card_detected_challenge_never_retries_or_sends_vision(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("verify you are human", (20, 160, 250, 180))]])
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("CAPTCHA"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", fast_mode=True)
+    assert len(captures) == 2
+
+
+def test_fast_retry_challenge_stops_immediately_without_more_captures(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("loading", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("captcha", (20, 160, 250, 180))]])
+    with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True)
+    assert len(captures) == 3 and not (tmp_path / "map.png").exists()
+
+
+def test_stale_optimal_cache_does_not_cause_blind_click_if_no_field(tmp_path, monkeypatch):
+    q, clicks, keys, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    old = (20, 160, 250, 180)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old)
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [], []])
+    with pytest.raises(nyc_portal.PortalLookupError, match="поля Address"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
+    assert clicks == ["Select"]  # no click in an unverified address field
+    assert len(captures) == 3 and keys.count(nyc_portal.browser_save.VK_RETURN) == 1
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == old

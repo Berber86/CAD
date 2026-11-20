@@ -3483,7 +3483,12 @@ class SurveyApp(ctk.CTk):
         self._worker_context.generation = self._generation
 
         def progress(line: str) -> None:
-            self._post("step0_progress", self._step0_timestamp(line))
+            important = line.startswith((
+                "для этого окна нет подходящих координат",
+                "сохранённая область формы не подошла",
+                "быстрая проверка карточки не удалась",
+            ))
+            self._post("step0_portal_notice" if important else "step0_progress", self._step0_timestamp(line))
 
         try:
             result = nyc_portal.lookup_parcel(
@@ -10260,11 +10265,12 @@ class SurveyApp(ctk.CTk):
                     f"Не удалось разобрать файлы соседей ({len(verify_errors)} ошиб.): {verify_errors[0]}",
                     error=True,
                 )
-        elif kind == "step0_progress":
+        elif kind in {"step0_progress", "step0_portal_notice"}:
             text = str(payload)
             if not (text.startswith("[") and len(text) >= 10 and text[9] == "]"):
                 text = self._step0_timestamp(text)
-            self._step0_lines.append((log_mode.LEVEL_INFO, text))
+            level = log_mode.LEVEL_KEY if kind == "step0_portal_notice" else log_mode.LEVEL_INFO
+            self._step0_lines.append((level, text))
             self._render_step0_log()
         elif kind == "step0_portal_done":
             status, portal_result = payload

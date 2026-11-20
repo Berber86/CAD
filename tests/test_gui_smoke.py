@@ -5576,3 +5576,20 @@ def test_step0_controls_are_scrollable_and_contain_mode_selector(gui):
     while parent is not None and parent is not app.step0_controls_panel:
         parent = parent.master
     assert parent is app.step0_controls_panel
+
+
+@pytest.mark.parametrize("message", [
+    "для этого окна нет подходящих координат — выполняю надёжный поиск",
+    "сохранённая область формы не подошла — оставшиеся действия выполняю по надёжному сценарию",
+    "быстрая проверка карточки не удалась — один повтор после паузы; подсказка адреса остаётся непроверенной",
+])
+def test_portal_automatic_fallback_is_visible_in_simple_log(gui, monkeypatch, tmp_path, message):
+    app = gui.SurveyApp()
+    assert app._log_mode() == gui.log_mode.SIMPLE
+    def fake_lookup(*args, **kwargs):
+        kwargs["progress"](message)
+        raise RuntimeError("тест")
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "")
+    app._drain_events()
+    assert message in app.step0_report_box.get("1.0", "end")

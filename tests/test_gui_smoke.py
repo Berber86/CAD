@@ -5605,3 +5605,68 @@ def test_step0_vision_card_fallback_is_labeled_and_counts_two_requests(gui, tmp_
     assert app._session_llm_calls == 2 and app._session_prompt_tokens == 30
     assert any("Vision по карточке" in line for line in _step0_texts(app))
     assert "проверьте" in app.status_var.get().lower()
+
+
+def test_probability_window_saves_questions_and_displays_parallel_results(gui, monkeypatch, tmp_path):
+    import time
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    settings = tmp_path / 'probability-settings.json'
+    monkeypatch.setattr(dp, 'settings_path', lambda: settings)
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'sample.pdf'),))
+    calls = []
+    monkeypatch.setattr(dp, 'prepare_documents', lambda files, mode: calls.append((files, mode)) or [{'file': 'sample.pdf', 'page': 1, 'content': 'text'}])
+    monkeypatch.setattr(dp, 'run_both', lambda url, key, pages, mode, questions: [
+        {'model': model, 'seconds': .5, 'entries': [{'question': questions[0]['text'], 'answer': {'type': 'noul', 'value': .8}}], 'usage': [{'input_tokens': 5}], 'request_seconds': [.4]} for model in dp.MODELS])
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('hydra-key')
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    assert len(window.rows) == len(dp.DEFAULT_QUESTIONS)
+    window.add_files()
+    window.start()
+    for _ in range(100):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert calls and 'jev-1.14' in window.result.get('1.0', 'end')
+    assert 'solar-decide' in window.result.get('1.0', 'end')
+    assert 'sample.pdf' not in settings.read_text(encoding='utf8')
+    assert 'hydra-key' not in settings.read_text(encoding='utf8')
+    window.mode.set('Изображение (эксперимент)')
+    window.rows[0]['text'].delete(0, 'end')
+    window.rows[0]['text'].insert(0, 'updated question')
+    window.close()
+    chat.open_probability()
+    assert chat._probability.rows[0]['text'].get() == 'updated question'
+    assert chat._probability.mode.get() == 'Изображение (эксперимент)'
+    assert not chat._probability.files
+    app._on_close()
+    assert chat._probability is None
+
+
+def test_probability_never_uses_another_provider_key(gui, monkeypatch, tmp_path):
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'questions.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'doc.pdf'),))
+    monkeypatch.setenv('OPENAI_API_KEY', 'other-provider-secret')
+    monkeypatch.delenv('HYDRA_API_KEY', raising=False)
+    monkeypatch.setattr(ui.lp, 'load_dotenv_dict', lambda: {})
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('')
+    app.select_provider('OpenRouter')
+    app.provider_key_vars['openrouter'].set('other-provider-secret')
+    app._open_developer_chat()
+    app._developer_chat.open_probability()
+    window = app._developer_chat._probability
+    window.add_files()
+    window.start()
+    assert not window.inflight
+    assert 'ключ Hydra' in window.status.get()
+    app._on_close()

@@ -71,6 +71,7 @@ class DeveloperChat:
         self._lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue()
         self.last_reply = ""
+        self._probability = None
         self.window = win = ctk.CTkToplevel(app)
         win.title("Разработчик — чат с нейросетями")
         win.geometry("850x700")
@@ -115,11 +116,20 @@ class DeveloperChat:
         ctk.CTkButton(buttons, text="Копировать ответ", command=self.copy_reply,
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left", padx=(0, 8))
         ctk.CTkButton(buttons, text="Очистить", command=self.clear,
+                      fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(buttons, text="Режим вероятностей", command=self.open_probability,
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left")
         self.status = ctk.StringVar(value="Готово. Для новой строки нажмите Enter.")
         ctk.CTkLabel(win, textvariable=self.status, text_color=theme["text_dim"],
                      wraplength=800, justify="left").grid(row=6, column=0, sticky="w", padx=18, pady=(0, 12))
         app.after(120, self._poll)
+
+    def open_probability(self) -> None:
+        if self._probability is not None and not self._probability.closed:
+            self._probability.win.lift()
+            return
+        from developer_probability_ui import ProbabilityWindow
+        self._probability = ProbabilityWindow(self)
 
     def _on_provider(self, label: str) -> None:
         self._models[self._provider_id] = str(self.model_var.get() or "").strip()
@@ -220,6 +230,8 @@ class DeveloperChat:
         self.status.set("Последний ответ скопирован в буфер обмена.")
 
     def close(self) -> None:
+        if self._probability is not None and not self._probability.closed:
+            self._probability.close()
         with self._lock:
             self._closed = True
             while not self._queue.empty():

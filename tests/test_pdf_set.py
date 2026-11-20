@@ -649,6 +649,9 @@ def test_file_lot_numbers_stay_with_each_plan_and_cached_result(gui, tmp_path, m
     dialog.submit()
     _wait(app)
     assert app._preview_main_plan.description._source_lot_number == "28"
+    assert next(i.text for i in app._preview_main_plan.items if i.kind == "main-lot-label") == "LOT 28"
+    canvas_text = [item[2].get("text", "") for item in app.preview_canvas.items if item[0] == "text"]
+    assert "LOT 28" in canvas_text and "LOT 45" in canvas_text
     assert app._neighbor_plan_sources[paths[1]].items[0].text == "LOT 45"
     assert app._neighbor_plan_sources[paths[2]].items[0].text == "LOT 30"
     assert app._neighbor_plan_sources[paths[1]].description.lot_number == "26"
@@ -661,6 +664,9 @@ def test_file_lot_numbers_stay_with_each_plan_and_cached_result(gui, tmp_path, m
     dialog.submit()
     _wait(app)
     assert app._preview_main_plan.description._source_lot_number == "45"
+    assert next(i.text for i in app._preview_main_plan.items if i.kind == "main-lot-label") == "LOT 45"
+    inspector = app._build_inspector_report(app._preview_main_plan)
+    assert "Lot 45" in inspector and "из имени файла 45; в документе 26" in inspector
     assert app._neighbor_plan_sources[paths[0]].items[0].text == "LOT 28"
     assert app._neighbor_plan_sources[paths[2]].items[0].text == "LOT 30"
     app._on_close()

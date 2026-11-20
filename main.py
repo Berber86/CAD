@@ -7089,17 +7089,22 @@ class SurveyApp(ctk.CTk):
         role = "СОСЕДНИЙ УЧАСТОК (NEIGHBOR_LOT)" if plan.is_neighbor else "ОСНОВНОЙ УЧАСТОК (PL)"
         lines: list[str] = [f"▸ {role}"]
 
-        if desc.block_number or desc.lot_number or desc.borough_or_city:
+        lot_number = lot_identity.effective_number(desc)
+        if desc.block_number or lot_number or desc.borough_or_city:
             meta = " ".join(
                 p
                 for p in (
                     f"Block {desc.block_number}" if desc.block_number else "",
-                    f"Lot {desc.lot_number}" if desc.lot_number else "",
+                    f"Lot {lot_number}" if lot_number else "",
                     f"({desc.borough_or_city})" if desc.borough_or_city else "",
                 )
                 if p
             )
             lines.append(f"  Кадастр:   {meta}")
+        file_number = lot_identity.source_number(desc)
+        if file_number:
+            document_number = desc.lot_number or "не указан"
+            lines.append(f"  Номер лота: из имени файла {file_number}; в документе {document_number}")
 
         street_main = desc.main_street or "—"
         if desc.main_street_note:
@@ -7468,6 +7473,12 @@ class SurveyApp(ctk.CTk):
         # 4. Основной участок (PL, контур + узлы + подсветка наведения + POB + GAP)
         focus_plan = self._preview_main_plan or self._last_active_plan
         if focus_plan is not None:
+            if not focus_plan.is_neighbor:
+                lot_label = next((item for item in focus_plan.items if item.kind == "main-lot-label"), None)
+                if lot_label is not None:
+                    cx, cy = to_screen(lot_label.point)
+                    canvas.create_text(cx, cy, text=lot_label.text, fill=THEME["cad_prop"],
+                                       font=("Segoe UI", 8, "bold"))
             if math.hypot(focus_plan.pob[0], focus_plan.pob[1]) > 1e-3:
                 px0, py0 = to_screen(focus_plan.pob)
                 canvas.create_line(
@@ -12280,12 +12291,13 @@ class SurveyApp(ctk.CTk):
             f"периметр {data.perimeter_ft:,.2f} ft",
             f"Фасад: {street_part}",
         ]
-        if data.block_number or data.lot_number:
+        lot_number = lot_identity.effective_number(data)
+        if data.block_number or lot_number:
             bl = " ".join(
                 p
                 for p in (
                     f"Block {data.block_number}" if data.block_number else "",
-                    f"Lot {data.lot_number}" if data.lot_number else "",
+                    f"Lot {lot_number}" if lot_number else "",
                 )
                 if p
             )

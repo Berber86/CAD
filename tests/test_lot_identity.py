@@ -77,3 +77,31 @@ def test_both_advisor_requests_explicitly_identify_each_lot_and_source():
         assert "DISAGREEMENT" in request and "not proof" in request.lower()
     assert labels["L1"] is main and labels["L2"] is neighbor
     assert advisor_cache_key([main, neighbor]) != advisor_cache_key([main, replace(neighbor, name="LOT 31.pdf")])
+
+
+@pytest.mark.parametrize("filename,deed,expected,warning", [
+    ("OUR 32 NEW.pdf", None, "LOT 32", None),
+    ("OUR 32 NEW.pdf", "32", "LOT 32", None),
+    ("OUR 32 NEW.pdf", "26", "LOT 32", "не совпадает"),
+    ("plain.pdf", "26", "LOT 26", None),
+    ("plain.pdf", None, "LOT ?", "не найден"),
+])
+def test_our_lot_label_main_and_print_draft(filename, deed, expected, warning):
+    from acad_builder import make_print_draft, point_in_polygon
+
+    desc = li.bind_filename(sample().model_copy(update={"lot_number": deed}), filename)
+    builder = AcadBuilder(lp.load_config())
+    plan = builder.plan(desc)
+    draft = make_print_draft(plan, {}, builder_cfg=lp.load_config())
+    label = next(item for item in plan.items if item.kind == "main-lot-label")
+    draft_label = next(item for item in draft.items if item.kind == "main-lot-label")
+    assert label.text == draft_label.text == expected
+    assert point_in_polygon(label.point, plan.vertices)
+    assert draft_label.point == pytest.approx((label.point[0] + 1000, label.point[1]))
+    assert desc.lot_number == deed
+    if warning:
+        assert any(warning in w for w in plan.warnings)
+        assert any(warning in w for w in draft.warnings)
+    else:
+        assert not any("номер лота" in w for w in plan.warnings)
+    assert [s.distance_ft for s in plan.description.segments] == [s.distance_ft for s in desc.segments]

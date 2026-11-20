@@ -1206,6 +1206,13 @@ def make_print_draft(
         height = 4.0 if is_street else (2.0 if is_side_dimension else 1.6)
         items.append(dc_replace(item, point=point, height=height))
 
+    # Номер нашего участка на черновике повторяет основной план; геометрия не меняется.
+    lot_label = next((item for item in plan.items if item.kind == "main-lot-label"), None)
+    if lot_label is not None:
+        draft_label = layout_builder._neighbor_label_item(plan.description, plan.vertices, 1.6, front_index)
+        items.append(dc_replace(draft_label, kind="main-lot-label", point=lot_pt(draft_label.point)))
+        warnings.extend(w for w in plan.warnings if "номер лота" in w.lower())
+
     # Отдельная строка у той стороны, к которой относится отметка в описании.
     for index, segment in enumerate(plan.description.segments):
         described_wall = bool(getattr(segment, "party_wall", False)) or bool(
@@ -2458,7 +2465,7 @@ class AcadBuilder:
         front_index: int | None,
         neighbor_label: str | None = None,
     ) -> TextItem:
-        """Компактная подпись соседнего участка строго в его геометрическом центроиде."""
+        """Компактная подпись лота в геометрическом центроиде; используется и для основного участка."""
         cfg = self.drawing_cfg
         if neighbor_label and str(neighbor_label).strip():
             label = str(neighbor_label).strip()
@@ -2534,8 +2541,9 @@ class AcadBuilder:
                 f"номер лота из имени файла ({lot_identity.source_number(description)}) "
                 f"не совпадает с номером в документе ({description.lot_number}) — сверьте"
             )
-        if is_neighbor and not lot_identity.effective_number(description) and not neighbor_label:
-            warnings.append("номер лота соседа не найден в имени файла или документе — подпись LOT ?; сверьте")
+        if not lot_identity.effective_number(description) and not (is_neighbor and neighbor_label):
+            role = "соседа" if is_neighbor else "основного участка"
+            warnings.append(f"номер лота {role} не найден в имени файла или документе — подпись LOT ?; сверьте")
         for index, segment in enumerate(description.segments):
             if segment.distance_source and not format_feet_inches_source(segment.distance_source, segment.distance_ft):
                 warnings.append(f"сторона #{index + 1}: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
@@ -2650,6 +2658,8 @@ class AcadBuilder:
                 boundary_lines=boundary_lines,
             )
             items.extend(street_texts)
+            lot_label = self._neighbor_label_item(description, vertices, height, front_index)
+            items.append(dc_replace(lot_label, kind="main-lot-label"))
             if self._front_warning:
                 warnings.append(self._front_warning)
 

@@ -456,9 +456,10 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     assert len(prop_lines) == (4 - len(result.plan.street_boundary_indices))
     assert result.boundary_line_count == 4
-    # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
-    assert result.text_count == 8
+    # 4 стороны, улицы, привязка и номер нашего лота.
+    assert result.text_count == 9
     texts = {item.TextString for item in space.texts}
+    assert "LOT ?" in texts
     assert "MAIN  STREET" in texts  # два пробела между словами названия улицы
     assert "(XX' WIDE)" in texts  # ширины в описании нет — место для ручного заполнения
     assert "OAK  AVENUE" in texts
@@ -1248,7 +1249,7 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
     # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
-    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w and "Стиль LETTER" not in w] == []
+    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w and "Стиль LETTER" not in w and "номер лота" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():

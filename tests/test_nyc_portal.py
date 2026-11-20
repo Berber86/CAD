@@ -516,6 +516,9 @@ def test_map_is_captured_only_after_the_redraw_wait_following_the_wheel(monkeypa
     assert wheel == [("cursor", 750, 400), ("wheel", -120)]
     assert clock.sleeps == [0.1, nyc_portal.MAP_REDRAW_WAIT_SEC]
     assert nyc_portal.MAP_REDRAW_WAIT_SEC == pytest.approx(3.8)
+    clock.sleeps.clear()
+    nyc_portal._zoom_out_map_pane(1, 1.5)
+    assert clock.sleeps == [0.1, 1.5]  # пользовательская пауза быстрого режима
 
 
 def test_lookup_parcel_passes_fast_mode_to_the_portal_driver(monkeypatch, tmp_path):
@@ -648,7 +651,7 @@ def test_fast_driver_skips_intermediate_ocr_and_uses_pauses(start, tmp_path, mon
     monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _: (0, 0, 1000, 800))
-    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda _: None)
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *_: None)
     sleeps, clicks, keys, typed, sizes = [], [], [], [], []
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(nyc_portal, "_click_text", lambda _, rows, text: clicks.append(text) or rows[0])
@@ -706,7 +709,7 @@ def test_fast_new_tab_waits_then_uses_only_two_required_ocr_calls(tmp_path, monk
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _: True)
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _: (0, 0, 1000, 800))
-    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda _: None)
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *_: None)
     monkeypatch.setattr(nyc_portal, "_click_text", lambda _, rows, text: rows[0])
     monkeypatch.setattr(nyc_portal, "_key", lambda *args: None)
     monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _, path: _write_portal_screen(Path(path)))
@@ -1147,3 +1150,36 @@ def test_lookup_passes_optimised_flag_to_driver(tmp_path, monkeypatch):
     with pytest.raises(nyc_portal.PortalLookupError, match="стоп"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", optimal_mode=True)
     assert received["optimal_mode"] is True and received["fast_mode"] is False
+
+
+def test_fast_uses_configured_pause_for_map_redraw_and_short_key_delays(tmp_path, monkeypatch):
+    q, _, keys, waits, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    zooms = []
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *args: zooms.append(args))
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _: True)
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], _optimal_card()])
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True, fast_pause_sec=1.5)
+    assert (result.block, result.lot) == ("5712", "70")
+    assert zooms == [(42, 1.5)]
+    assert len(captures) == 3  # начальная форма, карточка, итоговая карта
+    assert waits == [1.5, .05, .05, .05, 1.5, .05, 1.5, .05, 1.5]
+    assert len(keys) == 7
+
+
+@pytest.mark.parametrize("pause", [0, 0.5, 5.1, -1, float("nan"), "bad"])
+def test_fast_rejects_invalid_pause_before_touching_browser(tmp_path, monkeypatch, pause):
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: pytest.fail("не трогать браузер"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="от 1 до 5"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True, fast_pause_sec=pause)
+
+
+def test_fast_card_missing_borough_stops_before_map_or_vision(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    card = _optimal_card()
+    card[1] = nyc_portal.ScreenText("Borough", (20, 260, 180, 280))
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))], card])
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("Vision до чтения Borough недопустим"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="Borough"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", fast_mode=True)
+    assert len(captures) == 2 and not list(tmp_path.glob("TAX_MAP_*"))

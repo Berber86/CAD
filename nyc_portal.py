@@ -108,7 +108,8 @@ OPTIMAL_ADDRESS_DELAY = 1.0
 OPTIMAL_SUGGESTION_DELAY = 1.2
 OPTIMAL_CARD_DELAY = 2.0
 FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
-#: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
+FAST_KEY_DELAY_SEC = 0.05  # только пауза между клавишами, не ожидание реакции сайта
+#: Пределы паузы «быстрой работы», которую выбирает пользователь в поле на Шаге 0.
 FAST_PAUSE_MIN_SEC = 1.0
 FAST_PAUSE_MAX_SEC = 5.0
 
@@ -127,7 +128,7 @@ def parse_fast_pause(text: object) -> float | None:
     if not FAST_PAUSE_MIN_SEC <= value <= FAST_PAUSE_MAX_SEC:
         return None
     return value
-# После прокрутки колёсиком карта перерисовывается не сразу: снимок делаем через 0.8 с + 3 с.
+# В обычных режимах после прокрутки карта перерисовывается не сразу: ждём 3,8 с.
 MAP_REDRAW_WAIT_SEC = 0.8 + 3.0
 
 
@@ -530,6 +531,11 @@ def _drive_portal(
 
     if optimal_mode and fast_mode:
         raise PortalLookupError("Выберите только один режим поиска: оптимальный или быстрый.")
+    if fast_mode:
+        valid_pause = parse_fast_pause(fast_pause_sec)
+        if valid_pause is None:
+            raise PortalLookupError("Пауза быстрой работы должна быть от 1 до 5 секунд.")
+        fast_pause_sec = valid_pause
     if not browser_save.available():
         raise PortalLookupError("Автоматизация окна доступна только в Windows.")
     # OCR availability is checked before touching the browser, not midway through typing.
@@ -637,11 +643,11 @@ def _drive_portal(
                     delay=RELIABLE_MENU_DELAY, description="открывшийся список Select",
                 )
         _key(window.handle, browser_save.VK_DOWN)
-        time.sleep(0.2)
+        time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
         _key(window.handle, browser_save.VK_DOWN)
-        time.sleep(0.2)
+        time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
         _key(window.handle, browser_save.VK_DOWN)
-        time.sleep(0.2)
+        time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
         _key(window.handle, browser_save.VK_RETURN)
         if fast_mode:
             _fast_wait(window.handle, fast_pause_sec)
@@ -659,7 +665,7 @@ def _drive_portal(
         # focus the same way a user tabbing through the form would: Tab moves
         # off the Select and onto the address input field right next to it.
         _key(window.handle, browser_save.VK_TAB)
-        time.sleep(0.2)
+        time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
 
     check_layout_size()
     address_label = next((row for row in rows if "enter an address" in row.text.lower()), None)
@@ -676,7 +682,7 @@ def _drive_portal(
                                   first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
     check_layout_size()
     _key(window.handle, browser_save.VK_DOWN)
-    time.sleep(0.2)
+    time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
     _key(window.handle, browser_save.VK_RETURN)
     rows = wait(
         window.handle,
@@ -690,7 +696,7 @@ def _drive_portal(
     )
     try:
         block, lot, borough = _extract_portal_details(rows)
-        if not fast_mode and not borough:
+        if not borough:
             raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
     except PortalLookupError:
         if fast_mode:
@@ -719,7 +725,10 @@ def _drive_portal(
         rows = [*rows, *retry_rows]
     # Retain a map-only image: neither the saved crop nor the Vision request includes
     # the address, Block/Lot pane, owner or building details on the page's left side.
-    _zoom_out_map_pane(window.handle)
+    if fast_mode:
+        _zoom_out_map_pane(window.handle, fast_pause_sec)
+    else:
+        _zoom_out_map_pane(window.handle)
     with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
         full_capture = Path(directory) / "portal_full.png"
         _save_window_capture(window.handle, full_capture)
@@ -736,7 +745,7 @@ def _drive_portal(
     return PortalCapture(block, lot, borough, map_path)
 
 
-def _zoom_out_map_pane(handle: int) -> None:
+def _zoom_out_map_pane(handle: int, redraw_wait_sec: float = MAP_REDRAW_WAIT_SEC) -> None:
     """Move cursor to the right half (map pane) and scroll down one tick to zoom out."""
     if sys.platform != "win32":
         return
@@ -755,7 +764,7 @@ def _zoom_out_map_pane(handle: int) -> None:
         user32.SetCursorPos(int(x), int(y))
         time.sleep(0.1)
         user32.mouse_event(0x0800, 0, 0, -120, 0)  # MOUSEEVENTF_WHEEL, -120 = 1 tick back
-        time.sleep(MAP_REDRAW_WAIT_SEC)  # карта перерисовывается; снимок делается после этого
+        time.sleep(redraw_wait_sec)  # карта перерисовывается; снимок делается после этого
     except Exception:  # noqa: BLE001 - best-effort zoom out
         pass
 

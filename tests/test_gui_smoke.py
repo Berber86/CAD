@@ -5491,3 +5491,88 @@ def test_step0_rejects_simultaneous_optimal_and_fast_flags(gui, monkeypatch):
     monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lambda *a, **kw: pytest.fail("search must not start"))
     app._start_step0_portal_lookup()
     assert "выберите один режим" in app.status_var.get().lower()
+
+
+@pytest.mark.parametrize("mode,fast,optimal", [
+    ("Надёжный", False, False),
+    ("Оптимальный", False, True),
+    ("Быстрый", True, False),
+])
+def test_step0_visible_mode_selector_routes_each_search_mode(gui, monkeypatch, tmp_path, mode, fast, optimal):
+    app = gui.SurveyApp()
+    switch = app.step0_portal_mode_switch
+    assert switch.cget("values") == ["Надёжный", "Оптимальный", "Быстрый"]
+    assert app.step0_portal_mode_var.get() == "Надёжный"
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_folder_var.set(str(tmp_path))
+    app.step0_fast_pause_var.set("2,5")
+    monkeypatch.setattr(app, "_build_runtime_config", lambda: ({"api": {}}, "hydra", "vision", "key", ""))
+    monkeypatch.setattr(gui, "resolve_api_target", lambda *args, **kwargs: {"api_key": "key"})
+    received = []
+    def lookup(*args, **kwargs):
+        received.append(kwargs)
+        raise RuntimeError("тестовая остановка")
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lookup)
+    class InlineThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+    monkeypatch.setattr(gui.threading, "Thread", InlineThread)
+    # Те же операции, которые CTkSegmentedButton выполняет при нажатии.
+    app.step0_portal_mode_var.set(mode)
+    switch.cget("command")(mode)
+    app._start_step0_portal_lookup()
+    assert len(received) == 1
+    assert received[0]["fast_mode"] is fast
+    assert received[0].get("optimal_mode", False) is optimal
+    assert received[0]["fast_pause_sec"] == (2.5 if fast else 5.0)
+    assert app.step0_fast_mode_var.get() is fast  # также управляет ожиданием PDF
+    assert app.step0_optimal_mode_var.get() is optimal
+
+
+def test_step0_selector_can_switch_back_and_forth_between_all_three_modes(gui):
+    app = gui.SurveyApp()
+    switch = app.step0_portal_mode_switch
+    command = switch.cget("command")
+    for mode, fast, optimal in [("Быстрый", True, False), ("Оптимальный", False, True),
+                                ("Надёжный", False, False), ("Быстрый", True, False),
+                                ("Надёжный", False, False)]:
+        app.step0_portal_mode_var.set(mode)
+        command(mode)
+        assert switch.get() == mode
+        assert app.step0_fast_mode_var.get() is fast
+        assert app.step0_optimal_mode_var.get() is optimal
+
+
+@pytest.mark.parametrize("mode,ready,stable", [
+    ("Надёжный", 4.0, 1.0), ("Оптимальный", 4.0, 1.0), ("Быстрый", 2.5, 0.0),
+])
+def test_mode_selector_preserves_pdf_wait_behaviour(gui, monkeypatch, tmp_path, mode, ready, stable):
+    app = gui.SurveyApp()
+    app.step0_portal_mode_var.set(mode)
+    app.step0_portal_mode_switch.cget("command")(mode)
+    app.step0_fast_pause_var.set("2.5")
+    _fill_step0(app, folder=tmp_path)
+    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
+    options = []
+    monkeypatch.setattr(gui.browser_save, "auto_save_hook", lambda folder, **kw: options.append(kw))
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", lambda **kw: gui.deed_intake.IntakeOutcome(folder=kw["folder"]))
+    class InlineThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+    monkeypatch.setattr(gui.threading, "Thread", InlineThread)
+    app._start_step0_intake()
+    assert len(options) == 1
+    assert options[0]["ready_delay"] == ready and options[0]["stable_for"] == stable
+
+
+def test_step0_controls_are_scrollable_and_contain_mode_selector(gui):
+    app = gui.SurveyApp()
+    assert type(app.step0_controls_panel).__name__ == "CTkScrollableFrame"
+    parent = app.step0_portal_mode_switch
+    while parent is not None and parent is not app.step0_controls_panel:
+        parent = parent.master
+    assert parent is app.step0_controls_panel

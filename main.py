@@ -207,6 +207,10 @@ STEP_TAB_OFFSETS = "Шаг 4. Оффсеты"
 STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
 #: Роль файла, который человек докачал сам: наш участок или сосед.
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
+STEP0_PORTAL_RELIABLE = "Надёжный"
+STEP0_PORTAL_OPTIMAL = "Оптимальный"
+STEP0_PORTAL_FAST = "Быстрый"
+STEP0_PORTAL_MODES = (STEP0_PORTAL_RELIABLE, STEP0_PORTAL_OPTIMAL, STEP0_PORTAL_FAST)
 STEP0_EMPTY_REPORT = (
     "Отчёт появится после сбора.\n\n"
     "1. Введите адрес и нажмите «Найти по адресу + анализ только карты»: портал откроется "
@@ -593,7 +597,8 @@ class SurveyApp(ctk.CTk):
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
         self.step0_fast_mode_var = ctk.BooleanVar(value=False)
         self.step0_optimal_mode_var = ctk.BooleanVar(value=False)
-        #: Пауза «быстрой работы» в секундах, от 1 до 5 (поле рядом с галочкой).
+        self.step0_portal_mode_var = ctk.StringVar(value=STEP0_PORTAL_RELIABLE)
+        #: Пауза «быстрой работы» в секундах, от 1 до 5.
         self.step0_fast_pause_var = ctk.StringVar(value=str(int(nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC)))
         self.step0_ocr_dpi_var = ctk.StringVar(
             value=str((self.config_data.get("ocr") or {}).get("dpi", ocr_pages.DEFAULT_DPI))
@@ -3048,16 +3053,17 @@ class SurveyApp(ctk.CTk):
         page.grid_rowconfigure(0, weight=1)
         self.step0_page = page
 
-        panel = ctk.CTkFrame(
+        # На небольшом экране весь набор кнопок Шага 0 остаётся доступен прокруткой.
+        panel = ctk.CTkScrollableFrame(
             page,
-            width=470,
+            width=440,
             fg_color=THEME["bg_card"],
             corner_radius=10,
             border_width=1,
             border_color=THEME["border_card"],
         )
-        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
-        panel.grid_propagate(False)
+        self.step0_controls_panel = panel
+        panel.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=(4, 12))
         panel.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -3144,6 +3150,7 @@ class SurveyApp(ctk.CTk):
               self.step0_neighbours_var, "например: 68, 72")
         checks = ctk.CTkFrame(panel, fg_color="transparent")
         checks.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 4))
+        checks.grid_columnconfigure(0, weight=1)
         ctk.CTkCheckBox(
             checks,
             text="докачать старый документ соседей (если межа соседа спорная)",
@@ -3153,17 +3160,23 @@ class SurveyApp(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
-        fast_row = ctk.CTkFrame(checks, fg_color="transparent")
-        fast_row.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ctk.CTkCheckBox(
-            fast_row,
-            text="быстрая работа (без промежуточного OCR), пауза",
-            variable=self.step0_fast_mode_var,
-            command=self._step0_fast_mode_changed,
+        ctk.CTkLabel(
+            checks, text="Режим поиска на портале", text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=11, weight="bold"), anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 2))
+        self.step0_portal_mode_switch = ctk.CTkSegmentedButton(
+            checks, values=list(STEP0_PORTAL_MODES), variable=self.step0_portal_mode_var,
+            command=self._step0_portal_mode_changed, height=30,
+            fg_color=THEME["bg_editor"], unselected_color=THEME["bg_editor"],
+            selected_color=THEME["btn_primary"], selected_hover_color=THEME["btn_primary_hover"],
             font=ctk.CTkFont(size=11),
+        )
+        self.step0_portal_mode_switch.grid(row=2, column=0, sticky="ew")
+        fast_row = ctk.CTkFrame(checks, fg_color="transparent")
+        fast_row.grid(row=3, column=0, sticky="w", pady=(5, 0))
+        ctk.CTkLabel(
+            fast_row, text="Пауза быстрого режима:", font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
-            checkbox_width=18,
-            checkbox_height=18,
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkEntry(
             fast_row,
@@ -3178,18 +3191,12 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
-        ctk.CTkCheckBox(
-            checks, text="оптимальный поиск адреса (проверенные координаты OCR)",
-            variable=self.step0_optimal_mode_var, command=self._step0_optimal_mode_changed,
-            font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
-            checkbox_width=18, checkbox_height=18,
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
         ctk.CTkLabel(
-            checks, text="Без галочек — надёжный поиск. Оптимальный проверяет адрес и карточку; "
-            "быстрый пропускает промежуточные проверки. Проверяйте Block и Lot.",
+            checks, text="Быстрый режим пропускает проверки адресной подсказки; проверьте адрес, "
+            "Borough, Block и Lot. Он также меняет ожидания при сохранении PDF.",
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
-        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -3356,18 +3363,27 @@ class SurveyApp(ctk.CTk):
         if chosen:
             self.step0_folder_var.set(str(chosen))
 
+    def _step0_portal_mode_changed(self, selected: str) -> None:
+        """Сегмент управляет и поиском, и прежним быстрым ожиданием PDF."""
+        if selected not in STEP0_PORTAL_MODES:
+            return
+        self.step0_portal_mode_var.set(selected)
+        self.step0_fast_mode_var.set(selected == STEP0_PORTAL_FAST)
+        self.step0_optimal_mode_var.set(selected == STEP0_PORTAL_OPTIMAL)
+
     def _step0_fast_mode_changed(self) -> None:
-        if self.step0_fast_mode_var.get():
-            self.step0_optimal_mode_var.set(False)
+        # Совместимость внутренних вызовов/тестов со старой галочкой.
+        self._step0_portal_mode_changed(STEP0_PORTAL_FAST if self.step0_fast_mode_var.get()
+                                        else STEP0_PORTAL_RELIABLE)
 
     def _step0_optimal_mode_changed(self) -> None:
-        if self.step0_optimal_mode_var.get():
-            self.step0_fast_mode_var.set(False)
+        self._step0_portal_mode_changed(STEP0_PORTAL_OPTIMAL if self.step0_optimal_mode_var.get()
+                                        else STEP0_PORTAL_RELIABLE)
 
     def _step0_fast_pause_value(self) -> float | None:
         """
-        Пауза «быстрой работы» из поля. Без галочки значение не используется — возвращаем 5 с.
-        Если галочка стоит, а число неверное, выводит сообщение и возвращает None: запуск не начинаем.
+        Пауза «быстрой работы» из поля. В других режимах значение не используется — возвращаем 5 с.
+        Если выбран быстрый режим, а число неверное, выводит сообщение и возвращает None: запуск не начинаем.
         """
         if not self.step0_fast_mode_var.get():
             return nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC

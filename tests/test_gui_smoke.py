@@ -5593,3 +5593,15 @@ def test_portal_automatic_fallback_is_visible_in_simple_log(gui, monkeypatch, tm
     app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "")
     app._drain_events()
     assert message in app.step0_report_box.get("1.0", "end")
+
+
+def test_step0_vision_card_fallback_is_labeled_and_counts_two_requests(gui, tmp_path):
+    app = gui.SurveyApp()
+    usage = gui.TokenUsage(prompt_tokens=20, completion_tokens=5, total_tokens=25, available=True)
+    details = gui.TokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12, available=True)
+    result = gui.nyc_portal.ParcelLookup("5712", "70", "Staten Island", "68", "72", "high", "",
+                                         tmp_path / "map.png", usage, "vision", details)
+    app._finish_step0_portal_lookup("ok", result)
+    assert app._session_llm_calls == 2 and app._session_prompt_tokens == 30
+    assert any("Vision по карточке" in line for line in _step0_texts(app))
+    assert "проверьте" in app.status_var.get().lower()

@@ -213,9 +213,9 @@ STEP0_PORTAL_FAST = "Быстрый"
 STEP0_PORTAL_MODES = (STEP0_PORTAL_RELIABLE, STEP0_PORTAL_OPTIMAL, STEP0_PORTAL_FAST)
 STEP0_EMPTY_REPORT = (
     "Отчёт появится после сбора.\n\n"
-    "1. Введите адрес и нажмите «Найти по адресу + анализ только карты»: портал откроется "
-    "в текущем окне Chrome/Edge; локальный OCR прочитает Borough, Block и Lot, а Vision получит "
-    "только обрезку tax map для поиска соседей.\n"
+    "1. Введите адрес и нажмите «Найти по адресу + анализ карты». OCR прочитает карточку; "
+    "при неудаче надёжный режим может один раз отправить левую половину снимка карточки в Vision "
+    "(включая видимые личные данные). Vision также получит карту и адрес текстом для поиска соседей.\n"
     "2. Проверьте Block, Lot и соседей слева/справа; поля можно исправить вручную. "
     "Каждый сосед получает роль «сосед» и файл, например LOT 30 NEW.pdf. "
     "Если портал/ИИ недоступен, значения можно ввести самостоятельно.\n"
@@ -3080,8 +3080,9 @@ class SurveyApp(ctk.CTk):
                 "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
                 "документ (старый Deed), сосед — только свежий. "
                 "Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf. "
-                "Block/Lot и Borough читает локальный OCR; выбранной Vision-модели отправляется "
-                "только обрезка карты для поиска двух соседних лотов."
+                "Block/Lot и Borough читает локальный OCR. Vision получает карту и адрес; "
+                "при неудаче OCR надёжный режим может отправить левую половину карточки, "
+                "включая видимые персональные данные, для одного дополнительного запроса."
             ),
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
@@ -3118,7 +3119,7 @@ class SurveyApp(ctk.CTk):
               "87 Stafford Ave")
         field(1, "Borough (район Нью-Йорка)", self.step0_borough_var, "Staten Island")
         self.step0_portal_button = ctk.CTkButton(
-            fields, text="🌐 Найти по адресу + анализ только карты", height=32,
+            fields, text="🌐 Найти по адресу + анализ карты", height=32,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._start_step0_portal_lookup,
@@ -3438,7 +3439,8 @@ class SurveyApp(ctk.CTk):
         self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
         self.step0_run_button.configure(state="disabled")
         self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
-            f"Ищу {address!r} в текущем окне NYC Portal. Block/Lot/Borough читает OCR; Vision получит обрезку карты и адрес текстом."
+            f"Ищу {address!r}: OCR читает Block/Lot/Borough; Vision получает карту и адрес. "
+            "При неудаче OCR в надёжном сценарии Vision получит левую половину карточки, включая видимые личные данные."
         ))]
         if self.step0_fast_mode_var.get():
             self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
@@ -3487,6 +3489,7 @@ class SurveyApp(ctk.CTk):
                 "для этого окна нет подходящих координат",
                 "сохранённая область формы не подошла",
                 "быстрая проверка карточки не удалась",
+                "локальный OCR не прочитал карточку",
             ))
             self._post("step0_portal_notice" if important else "step0_progress", self._step0_timestamp(line))
 
@@ -3515,7 +3518,7 @@ class SurveyApp(ctk.CTk):
             self.attributes("-topmost", self._step0_portal_restore_topmost)
             self._step0_portal_restore_topmost = None
         self.step0_portal_button.configure(
-            state="normal", text="🌐 Найти по адресу + анализ только карты",
+            state="normal", text="🌐 Найти по адресу + анализ карты",
         )
         self.step0_run_button.configure(state="normal")
         try:
@@ -3531,10 +3534,11 @@ class SurveyApp(ctk.CTk):
         self.step0_block_var.set(result.block)
         self.step0_lot_var.set(result.lot)
         self.step0_neighbours_var.set(", ".join(result.neighbours))
-        self._record_round_usages([result.usage])
+        self._record_round_usages([result.details_usage, result.usage])
+        details_label = "Vision по карточке" if result.details_source == "vision" else "Локальный OCR"
         self._step0_log(
-            f"Локальный OCR: Borough {result.borough or 'не распознан'}, "
-            f"Block {result.block}, Lot {result.lot}. Vision только по карте: "
+            f"{details_label}: Borough {result.borough or 'не распознан'}, "
+            f"Block {result.block}, Lot {result.lot}. Vision по карте: "
             f"соседи слева/справа {result.left_neighbour or '—'} / "
             f"{result.right_neighbour or '—'}; уверенность: {result.confidence}.",
             level=log_mode.LEVEL_KEY,
@@ -3544,8 +3548,8 @@ class SurveyApp(ctk.CTk):
         self._step0_log(f"Vision получил обрезку карты: {result.map_image}; адрес передан текстом.")
         self._set_status(
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
-            "проверьте соседей и затем нажмите «Собрать описания».",
-            warn=result.confidence.lower() in {"low", "низкая"},
+            "проверьте Borough, Block, Lot и соседей, затем нажмите «Собрать описания».",
+            warn=result.details_source == "vision" or result.confidence.lower() in {"low", "низкая"},
             key=True,
         )
 

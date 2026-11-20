@@ -145,6 +145,9 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
          nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
     ])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: next(ocr_calls))
 
@@ -161,7 +164,7 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert clicks == [(42, "Select"), (42, "87 Stafford Ave")]
-    assert waits == [1.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]
+    assert waits == [1.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 5.0, 0.2, 6.0]
     assert keys == [
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
@@ -237,6 +240,9 @@ def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypat
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
          nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
     ])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: next(ocr_calls))
 
@@ -254,7 +260,7 @@ def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypat
     assert capture_result.map_image.is_file()
     assert typed == [nyc_portal.PORTAL_URL]
     assert new_tabs == [1]  # портал открыт в новой вкладке
-    assert waits == [0.6, 3.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]  # 0.6 — ждём переключения на новую вкладку
+    assert waits == [0.6, 5.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 5.0, 0.2, 6.0]  # 0.6 — ждём переключения на новую вкладку
     assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
     assert key_events[-2:] == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
 
@@ -318,6 +324,9 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
          nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))],
     ])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: next(screens))
 
@@ -332,7 +341,7 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
     assert result.block == "5712" and result.lot == "70"
     assert result.map_image.is_file()
     assert clicks == []
-    assert waits == [1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]
+    assert waits == [1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 5.0, 0.2, 6.0]
     assert keys[:5] == [
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
@@ -816,7 +825,7 @@ def test_ready_callback_waits_only_after_first_browser_pause(monkeypatch):
     assert ready_at == [3] and len(seen) == 1
 
 
-def test_reliable_retries_unreadable_bbl_in_card_region_and_keeps_full_crop_anchors(tmp_path, monkeypatch):
+def test_reliable_reads_card_left_from_final_capture_and_keeps_map_crop_anchors(tmp_path, monkeypatch):
     from PIL import Image
     window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
     monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
@@ -847,12 +856,12 @@ def test_reliable_retries_unreadable_bbl_in_card_region_and_keeps_full_crop_anch
     monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
     result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
     assert (result.block, result.lot) == ("5712", "70")
-    assert sizes == [(500, 400), (650, 640), (1000, 800), (650, 800)]
-    assert sleeps == [1.0, 2.0, .2, 3.0, 2.0]
+    assert sizes == [(500, 400), (650, 640), (1000, 800), (500, 800)]
+    assert sleeps == [1.0, 5.0, .2, 6.0]
     assert Image.open(result.map_image).getpixel((0, 0)) == (0, 0, 255)
 
 
-def test_reliable_unreadable_bbl_does_not_send_vision(tmp_path, monkeypatch):
+def test_reliable_unreadable_bbl_asks_vision_once_and_stops_if_unusable(tmp_path, monkeypatch):
     window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
     monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
     monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
@@ -876,9 +885,15 @@ def test_reliable_unreadable_bbl_does_not_send_vision(tmp_path, monkeypatch):
          nyc_portal.ScreenText("Lot", (300, 300, 400, 330))],
     ])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _: next(screens))
-    monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("Vision без Block/Lot недопустим"))
-    with pytest.raises(nyc_portal.PortalLookupError, match="не смог прочитать"):
+    calls = []
+    def ask(*args, **kw):
+        calls.append((args, kw))
+        return {"block": None, "lot": None, "borough": None}, nyc_portal.TokenUsage()
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", ask)
+    with pytest.raises(nyc_portal.PortalLookupError, match="не смог уверенно прочитать"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="test")
+
+    assert len(calls) == 1 and calls[0][1]["single_request"] is True
 
 
 def test_driver_prewarms_ocr_in_parallel_with_browser_preparation(tmp_path, monkeypatch):
@@ -922,7 +937,7 @@ def test_driver_prewarms_ocr_in_parallel_with_browser_preparation(tmp_path, monk
     assert len(errors) == 1 and "тестовая остановка" in str(errors[0])
 
 
-def test_reliable_missing_borough_uses_full_retry_without_extra_capture(tmp_path, monkeypatch):
+def test_reliable_missing_borough_uses_vision_on_same_left_half(tmp_path, monkeypatch):
     from PIL import Image
     window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
     monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
@@ -957,10 +972,16 @@ def test_reliable_missing_borough_uses_full_retry_without_extra_capture(tmp_path
         sizes.append(Image.open(path).size)
         return next(screens)
     monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
-    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    seen = []
+    def fallback(path):
+        seen.append((Image.open(path).size, len(captures)))
+        return "5712", "70", "Staten Island"
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", details_vision=fallback)
     assert (result.block, result.lot, result.borough) == ("5712", "70", "Staten Island")
-    assert sizes[-2:] == [(650, 800), (1000, 800)]
-    assert len(captures) == 5  # форма, подсказка, карточка, повтор, итоговая карта
+    assert sizes[-1] == (500, 800)
+    assert seen == [((500, 800), 4)]
+    assert result.details_source == "vision"
+    assert len(captures) == 4  # форма, подсказка, карточка, финальная карта/карточка
 
 
 def test_reliable_suggestion_rechecks_wrong_first_suggestion_before_selecting(monkeypatch):
@@ -978,7 +999,7 @@ def test_reliable_suggestion_rechecks_wrong_first_suggestion_before_selecting(mo
     screens = iter([wrong, correct])
     monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda *_: next(screens))
     nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
-    assert len(captures) == 2 and clock.sleeps == [2.0, 2.0]
+    assert len(captures) == 2 and clock.sleeps == [5.0, 2.0]
 
 
 def test_reliable_initial_screen_failure_retries_once_but_challenge_does_not(tmp_path, monkeypatch):
@@ -1048,7 +1069,7 @@ def test_reliable_teaches_cache_then_optimal_uses_smaller_ocr_and_verifies_sugge
     label = nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))
     suggestion = nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
-              [nyc_portal.ScreenText("Address", (20, 130, 80, 150))], [label], [suggestion], _optimal_card()])
+              [nyc_portal.ScreenText("Address", (20, 130, 80, 150))], [label], [suggestion], _optimal_card(), _optimal_card()])
     reliable = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "one.png")
     assert reliable.block == "5712"
     assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == label.box
@@ -1073,7 +1094,7 @@ def test_optimised_stale_layout_falls_back_to_full_same_snapshot(tmp_path, monke
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
               [nyc_portal.ScreenText("Enter an Address", (100, 400, 400, 420))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
     result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert result.block == "5712" and ("87 Stafford Ave", (100, 400, 400, 420)) in clicks
     assert scans[:3] == [(500, 400), (350, 200), (1000, 800)]
@@ -1087,7 +1108,7 @@ def test_optimal_missing_or_other_browser_cache_runs_reliable_and_learns(tmp_pat
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
               [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], _optimal_card(), _optimal_card()])
     logs = []
     nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
     assert len(captures) == 6 and scans[1] == (650, 640)
@@ -1229,11 +1250,11 @@ def test_stale_optimal_region_switches_remaining_actions_to_reliable_and_refresh
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old)
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
               [nyc_portal.ScreenText("Enter an Address", new)],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
     logs = []
     nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
     assert any("оставшиеся действия" in line and "надёжному" in line for line in logs)
-    assert waits[-3:] == [2.0, .2, 3.0]  # longer reliable waits for suggestion and card
+    assert waits[-3:] == [5.0, .2, 6.0]  # longer reliable waits for suggestion and card
     assert len(captures) == 6
     assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == new
 
@@ -1289,3 +1310,149 @@ def test_stale_optimal_cache_does_not_cause_blind_click_if_no_field(tmp_path, mo
     assert clicks == ["Select"]  # no click in an unverified address field
     assert len(captures) == 3 and keys.count(nyc_portal.browser_save.VK_RETURN) == 1
     assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == old
+
+
+def test_reliable_final_snapshot_saves_right_first_then_reads_left_locally(tmp_path, monkeypatch):
+    from PIL import Image
+    q, _, _, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    map_path = tmp_path / "map.png"
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
+              [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+               nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+               nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))]])
+    original = nyc_portal._screen_ocr
+    def scan(path):
+        if Path(path).name == "card_left.png":
+            assert map_path.exists()  # карта уже выделена из того же кадра
+            assert Image.open(path).size == (500, 800)
+            assert Image.open(path).getpixel((10, 100)) == (255, 0, 0)
+            assert Image.open(map_path).getpixel((0, 0)) == (0, 0, 255)
+        return original(path)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", scan)
+    result = nyc_portal._drive_portal("87 Stafford Ave", map_path,
+                                      details_vision=lambda _: pytest.fail("OCR справился"))
+    assert result.details_source == "ocr" and (result.block, result.lot) == ("5712", "70")
+    assert len(captures) == 4 and scans == [(500, 400), (650, 640), (1000, 800), (500, 800)]
+    assert waits == [1., 5., .2, 6.]
+
+
+def test_reliable_vision_fallback_sends_only_left_once_and_separately_sends_map(tmp_path, monkeypatch):
+    from PIL import Image
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
+              [nyc_portal.ScreenText("Block", (20, 300, 150, 330))]])
+    images, calls = [], []
+    def encode(paths, **kwargs):
+        path = Path(paths[0])
+        with Image.open(path) as image:
+            images.append((path.name, image.size, image.getpixel((0, min(100, image.height - 1)))))
+        if path.name == "card_left.png":
+            assert list(tmp_path.glob("TAX_MAP_*")), "сначала сохраняется карта"
+        return ["data:image/jpeg;base64,AA=="], []
+    def ask(system, user_text, cfg, **kw):
+        calls.append((system, user_text, cfg, kw))
+        if len(calls) == 1:
+            return {"borough": "Staten Island", "block": "5,712", "lot": "70"}, nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72"}, nyc_portal.TokenUsage(prompt_tokens=20, total_tokens=20)
+    monkeypatch.setattr(nyc_portal, "render_image_files_base64", encode)
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", ask)
+    logs = []
+    result = nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={"api": {"max_retries": 8}},
+                                       provider="hydra", model="vision", progress=logs.append)
+    assert (result.borough, result.block, result.lot, result.details_source) == ("Staten Island", "5712", "70", "vision")
+    assert result.details_usage.prompt_tokens == 10 and result.usage.prompt_tokens == 20
+    assert len(calls) == 2 and len(captures) == 4
+    assert all(call[2]["api"]["max_retries"] == 0 and call[3]["attempts"] == 1 and call[3]["single_request"] for call in calls)
+    assert images[0] == ("card_left.png", (500, 800), (255, 0, 0))
+    assert images[1][0].startswith("TAX_MAP_") and images[1][2] == (0, 0, 255)
+    assert "87 Stafford" not in calls[0][1] and "87 Stafford" in calls[1][1]
+    assert any("персональные данные" in line for line in logs)
+    assert not list(tmp_path.rglob("card_left.png"))
+
+
+@pytest.mark.parametrize("data", [
+    {"borough": "Staten Island", "block": None, "lot": "70"},
+    {"borough": "Queens", "block": "5712", "lot": "7?"},
+    {"borough": "unknown", "block": "5712", "lot": "70"},
+    {"borough": "Staten Island", "block": "57x12", "lot": "70"},
+])
+def test_vision_details_rejects_unclear_or_non_numeric_values(data):
+    with pytest.raises(nyc_portal.PortalLookupError):
+        nyc_portal._parse_vision_details(data)
+
+
+def test_reliable_card_ocr_exception_uses_vision_once(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))]])
+    original = nyc_portal._screen_ocr
+    def ocr(path):
+        if Path(path).name == "card_left.png":
+            raise RuntimeError("OCR failure")
+        return original(path)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    calls = []
+    def fallback(path):
+        calls.append(path)
+        return "5712", "70", "Staten Island"
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", details_vision=fallback)
+    assert result.details_source == "vision" and len(calls) == 1 and len(captures) == 4
+
+
+def test_reliable_detected_challenge_on_left_never_calls_vision(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
+              [nyc_portal.ScreenText("captcha", (20, 200, 150, 220))]])
+    with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png",
+                                 details_vision=lambda _: pytest.fail("CAPTCHA не отправлять"))
+    assert len(captures) == 4
+
+
+def test_unrecognized_local_borough_requests_vision(tmp_path, monkeypatch):
+    q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
+              [nyc_portal.ScreenText("Borough Sttaten lsIand", (20, 260, 180, 280)),
+               nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+               nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))]])
+    calls = []
+    def read(path):
+        calls.append(path)
+        return "5712", "70", "Staten Island"
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", details_vision=read)
+    assert result.details_source == "vision" and len(calls) == 1
+
+
+def test_reliable_failed_vision_request_not_retried_or_followed_by_map_request(tmp_path, monkeypatch):
+    q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))], []])
+    calls = []
+    monkeypatch.setattr(nyc_portal, "render_image_files_base64", lambda *a, **kw: (["image"], []))
+    def fail(*args, **kw):
+        calls.append(kw)
+        raise RuntimeError("провайдер не ответил")
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", fail)
+    with pytest.raises(RuntimeError, match="не ответил"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y")
+    assert len(calls) == 1 and calls[0]["single_request"] and calls[0]["attempts"] == 1
+
+
+def test_reliable_without_confirmed_card_does_not_send_screenshot(tmp_path, monkeypatch):
+    q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], [], []])
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("страница не подтверждена"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="карточку объекта"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y")
+    assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))

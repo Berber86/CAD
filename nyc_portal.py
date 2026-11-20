@@ -1,9 +1,9 @@
 """Address lookup on NYC Property Information Portal for Step 0.
 
 The automation drives a visible supported browser. Challenge pages detected by OCR
-or the browser title stop it; fast mode intentionally skips intermediate screen checks. RapidOCR reads Block,
-Lot and Borough locally. Vision receives a cropped tax-map image only, for the two
-neighbour-lot labels.
+or the browser title stop it; fast mode intentionally skips intermediate screen checks.
+RapidOCR reads Borough, Block and Lot; reliable mode can send the card's left half to
+Vision once if local OCR fails. A separate Vision request reads map neighbour labels.
 """
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ class PortalCapture:
     lot: str
     borough: str | None
     map_image: Path
+    details_source: str = "ocr"
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,8 @@ class ParcelLookup:
     notes: str
     map_image: Path
     usage: TokenUsage
+    details_source: str = "ocr"
+    details_usage: TokenUsage | None = None
 
     @property
     def neighbours(self) -> list[str]:
@@ -99,13 +102,14 @@ def _normalise(text: str) -> str:
 
 # Обычный режим проверяет экран; быстрый режим ждёт между действиями без промежуточного OCR.
 # Надёжный режим: одно чтение после действия и максимум один повтор.
-RELIABLE_PORTAL_DELAY = 3.0
+RELIABLE_PORTAL_DELAY = 5.0
+OPTIMAL_PORTAL_DELAY = 3.0
 RELIABLE_INITIAL_DELAY = 1.0
 RELIABLE_FORM_DELAY = 1.5
 RELIABLE_MENU_DELAY = 1.0
 RELIABLE_ADDRESS_DELAY = 1.5
-RELIABLE_SUGGESTION_DELAY = 2.0
-RELIABLE_CARD_DELAY = 3.0
+RELIABLE_SUGGESTION_DELAY = 5.0
+RELIABLE_CARD_DELAY = 6.0
 RELIABLE_RETRY_DELAY = 2.0
 OPTIMAL_MENU_DELAY = 0.7
 OPTIMAL_ADDRESS_DELAY = 1.0
@@ -484,7 +488,8 @@ def _extract_portal_details(rows: Sequence[ScreenText]) -> tuple[str, str, str |
     return block, lot, borough
 
 
-def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: str | Path) -> Path:
+def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: str | Path, *,
+                  min_left_fraction: float = 0.40) -> Path:
     """Retain/send only the map pane; exclude the address and property-details panel."""
     from PIL import Image
 
@@ -494,14 +499,14 @@ def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: s
         raise PortalLookupError(f"Не удалось открыть снимок карты: {exc}") from exc
     width, height = image.size
     # The DOF page uses a left details pane and a right map pane. OCR anchors on
-    # Borough/Block/Lot ensure the crop starts beyond the details text even if the
-    # responsive divider moves slightly; the 40% fallback matches the desktop portal.
+    # Borough/Block/Lot move the crop beyond recognized details when the pane shifts;
+    # callers can demand a minimum right-half crop in the reliable scenario.
     metadata_right = 0
     label_re = re.compile(r"\b(?:Borough|Block|Lot)\b", re.IGNORECASE)
     for row in rows:
         if row.box[0] < width * 0.65 and label_re.search(row.text):
             metadata_right = max(metadata_right, row.box[2])
-    map_left = max(round(width * 0.40), metadata_right + 12)
+    map_left = max(round(width * min_left_fraction), metadata_right + 12)
     if width - map_left < max(280, round(width * 0.28)):
         raise PortalLookupError(
             "Карта слишком узкая для Vision. Разверните окно браузера на весь экран и повторите поиск."
@@ -519,6 +524,7 @@ def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: s
 def _drive_portal(
     address: str, map_path: Path, progress: Progress | None = None, *, fast_mode: bool = False,
     fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC, optimal_mode: bool = False,
+    details_vision: Callable[[Path], tuple[str, str, str]] | None = None,
 ) -> PortalCapture:
     """
     Use the current browser window to select an address and retain a map-only crop.
@@ -616,7 +622,7 @@ def _drive_portal(
         rows = wait(
             window.handle,
             lambda screen: _contains(screen, "Select") or _contains(screen, "Find Another Property"),
-            delay=RELIABLE_PORTAL_DELAY,
+            delay=OPTIMAL_PORTAL_DELAY if use_optimal else RELIABLE_PORTAL_DELAY,
             description="страницу NYC Property Information Portal",
         )
     else:
@@ -718,6 +724,9 @@ def _drive_portal(
     _key(window.handle, browser_save.VK_RETURN)
 
     def card_ready(screen: Sequence[ScreenText]) -> bool:
+        if not fast_mode and not use_optimal:
+            # Метка карточки подтверждает её наличие, даже если OCR не прочитал числа.
+            return _contains(screen, "Find Another Property")
         return all(_contains(screen, text) for text in ("Find Another Property", "Block", "Lot", "Borough"))
 
     def fast_card_retry() -> list[ScreenText]:
@@ -747,53 +756,92 @@ def _drive_portal(
             raise
         rows = fast_card_retry()
         retried_fast_card = True
-    try:
-        block, lot, borough = _extract_portal_details(rows)
-        if not borough:
-            raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-    except PortalLookupError:
-        if fast_mode:
-            if retried_fast_card:
-                raise
-            rows = fast_card_retry()
+    details_source = "ocr"
+    if not fast_mode and not use_optimal:
+        # Сначала один финальный снимок после уменьшения карты: правая часть — карта,
+        # левая часть того же снимка — OCR карточки (и, только при неудаче, Vision).
+        check_layout_size()
+        _zoom_out_map_pane(window.handle)
+        check_layout_size()
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
+            full_capture = Path(directory) / "portal_full.png"
+            left_capture = Path(directory) / "card_left.png"
+            _save_window_capture(window.handle, full_capture)
+            _crop_tax_map(full_capture, rows, map_path, min_left_fraction=0.5)
+            from PIL import Image  # noqa: PLC0415
+            with Image.open(full_capture) as image:
+                width, height = image.size
+                image.crop((0, 0, width // 2, height)).convert("RGB").save(left_capture, format="PNG")
+            try:
+                details_rows = _screen_ocr(left_capture)
+            except Exception as exc:  # noqa: BLE001 - локальный OCR сломался; допустим один Vision fallback
+                details_rows = None
+                ocr_error = str(exc)
+            else:
+                _reject_challenge(details_rows)
+                ocr_error = ""
+            try:
+                if details_rows is None:
+                    raise PortalLookupError(f"Локальный OCR не смог прочитать карточку: {ocr_error}")
+                block, lot, borough = _extract_portal_details(details_rows)
+                if borough not in BOROUGH_NAMES:
+                    raise PortalLookupError("Локальный OCR не смог уверенно прочитать Borough на карточке.")
+            except PortalLookupError as exc:
+                if details_vision is None:
+                    raise PortalLookupError(f"{exc} Не настроена помощь Vision для карточки.") from exc
+                _focus(window.handle)  # не отправлять карточку при обнаруженной CAPTCHA
+                if progress:
+                    progress("локальный OCR не прочитал карточку: один запрос Vision с левой половиной снимка (возможны персональные данные)")
+                block, lot, borough = details_vision(left_capture)
+                details_source = "vision"
+    else:
+        try:
             block, lot, borough = _extract_portal_details(rows)
             if not borough:
                 raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-        else:
-            if progress:
-                progress("Block/Lot не прочитаны — повторно проверяю область карточки")
-            time.sleep(RELIABLE_RETRY_DELAY)
-            _focus(window.handle)
-            with tempfile.TemporaryDirectory(prefix="tsai_pip_bbl_retry_") as directory:
-                path = Path(directory) / "screen.png"
-                _save_window_capture(window.handle, path)
-                retry_rows = _screen_ocr_region(path, (0.0, 0.0, 0.65, 1.0))
-                _reject_challenge(retry_rows)
-                try:
-                    block, lot, borough = _extract_portal_details(retry_rows)
-                    if not borough:
-                        raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-                except PortalLookupError:
-                    # Форма могла сместиться: ещё одно чтение того же снимка, не новый снимок.
-                    retry_rows = _screen_ocr(path)
+        except PortalLookupError:
+            if fast_mode:
+                if retried_fast_card:
+                    raise
+                rows = fast_card_retry()
+                block, lot, borough = _extract_portal_details(rows)
+                if not borough:
+                    raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+            else:
+                if progress:
+                    progress("Block/Lot не прочитаны — повторно проверяю область карточки")
+                time.sleep(RELIABLE_RETRY_DELAY)
+                _focus(window.handle)
+                with tempfile.TemporaryDirectory(prefix="tsai_pip_bbl_retry_") as directory:
+                    path = Path(directory) / "screen.png"
+                    _save_window_capture(window.handle, path)
+                    retry_rows = _screen_ocr_region(path, (0.0, 0.0, 0.65, 1.0))
                     _reject_challenge(retry_rows)
-                    block, lot, borough = _extract_portal_details(retry_rows)
-                    if not borough:
-                        raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
-            # Полный предыдущий OCR сохраняет координаты для безопасной обрезки карты.
-            rows = [*rows, *retry_rows]
-    # Retain a map-only image: neither the saved crop nor the Vision request includes
-    # the address, Block/Lot pane, owner or building details on the page's left side.
-    check_layout_size()
-    if fast_mode:
-        _zoom_out_map_pane(window.handle, fast_pause_sec)
-    else:
-        _zoom_out_map_pane(window.handle)
-    check_layout_size()
-    with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
-        full_capture = Path(directory) / "portal_full.png"
-        _save_window_capture(window.handle, full_capture)
-        _crop_tax_map(full_capture, rows, map_path)
+                    try:
+                        block, lot, borough = _extract_portal_details(retry_rows)
+                        if not borough:
+                            raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+                    except PortalLookupError:
+                        # Форма могла сместиться: ещё одно чтение того же снимка, не новый снимок.
+                        retry_rows = _screen_ocr(path)
+                        _reject_challenge(retry_rows)
+                        block, lot, borough = _extract_portal_details(retry_rows)
+                        if not borough:
+                            raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+                # Полный предыдущий OCR сохраняет координаты для безопасной обрезки карты.
+                rows = [*rows, *retry_rows]
+        # Retain a map-only image: neither the saved crop nor the Vision request includes
+        # the address, Block/Lot pane, owner or building details on the page's left side.
+        check_layout_size()
+        if fast_mode:
+            _zoom_out_map_pane(window.handle, fast_pause_sec)
+        else:
+            _zoom_out_map_pane(window.handle)
+        check_layout_size()
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_final_") as directory:
+            full_capture = Path(directory) / "portal_full.png"
+            _save_window_capture(window.handle, full_capture)
+            _crop_tax_map(full_capture, rows, map_path)
     # Обновляем координаты только после успешного поиска с проверкой подсказки, а не в быстром
     # или по непроверенным предположениям. Никаких адресов/снимков в JSON нет.
     final_bounds = browser_save.window_bounds(window.handle)
@@ -803,7 +851,7 @@ def _drive_portal(
         if progress:
             progress("проверенные координаты формы сохранены для оптимального и быстрого режимов" if saved else
                      "координаты формы сохранить не удалось; поиск завершён")
-    return PortalCapture(block, lot, borough, map_path)
+    return PortalCapture(block, lot, borough, map_path, details_source)
 
 
 def _zoom_out_map_pane(handle: int, redraw_wait_sec: float = MAP_REDRAW_WAIT_SEC) -> None:
@@ -857,6 +905,25 @@ Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, con
 Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If the map is rotated or labels/boundaries are unclear, return null for uncertain neighbours and explain briefly in notes. confidence is low, medium, or high. Never guess. Do not include markdown."""
 
 
+DETAILS_VISION_PROMPT = """Read ONLY the visible property details on this NYC Portal card image.
+Return JSON with keys borough, block, lot. Extract the exact values shown beside those labels.
+Use borough's full name; block and lot must contain digits only (ignore grouping commas).
+If any value is missing or unclear, return null for it. Do not guess, use map labels,
+calculate, or infer values from an address. No markdown."""
+
+
+def _parse_vision_details(data: dict[str, Any]) -> tuple[str, str, str]:
+    if not isinstance(data, dict):
+        raise PortalLookupError("Vision не вернул данные карточки в формате JSON.")
+    block = _integer_or_none(data.get("block"), "Block")
+    lot = _integer_or_none(data.get("lot"), "Lot")
+    raw_borough = data.get("borough")
+    borough = next((name for name in BOROUGH_NAMES if _normalise(name) == _normalise(raw_borough or "")), None)
+    if not block or not lot or not borough:
+        raise PortalLookupError("Vision не смог уверенно прочитать Borough, Block и Lot; проверьте карточку вручную.")
+    return block, lot, borough
+
+
 def lookup_parcel(
     address: str,
     screenshot_folder: str | Path,
@@ -871,28 +938,45 @@ def lookup_parcel(
     fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
     optimal_mode: bool = False,
 ) -> ParcelLookup:
-    """Navigate the portal, read BBL locally, then ask Vision only about map neighbours."""
+    """Read BBL locally (or one card Vision fallback), then ask Vision about map neighbours."""
     clean_address = str(address or "").strip()
     if not clean_address:
         raise PortalLookupError("Введите адрес перед поиском.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     map_path = Path(screenshot_folder) / f"TAX_MAP_{stamp}.jpg"
+    request_cfg = dict(cfg)
+    request_cfg["api"] = dict(cfg.get("api") or {})
+    request_cfg["api"]["max_retries"] = 0
+    details_usages: list[TokenUsage] = []
+
+    def read_details_vision(left_image: Path) -> tuple[str, str, str]:
+        urls, _notes = render_image_files_base64(
+            [left_image], max_side_px=1800, enhance_scan=False, output_format="jpeg",
+        )
+        response, used = ask_llm_json(
+            DETAILS_VISION_PROMPT, "Read Borough, Block and Lot from the attached card image.",
+            request_cfg, image_data_urls=urls, api_key=api_key, provider=provider, model=model,
+            key_secret=key_secret, progress=progress, task_label="NYC Portal: Borough, Block, Lot",
+            attempts=1, single_request=True,
+        )
+        details_usages.append(used)
+        return _parse_vision_details(response)
+
     driver_options = {"fast_mode": fast_mode, "fast_pause_sec": fast_pause_sec}
     if optimal_mode:
         driver_options["optimal_mode"] = True
+    if not fast_mode:
+        driver_options["details_vision"] = read_details_vision
     capture = _drive_portal(clean_address, map_path, progress, **driver_options)
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(
-            f"локальный OCR прочитал Borough: {borough_text}, Block: {capture.block}, Lot: {capture.lot}; "
+            f"{'Vision по карточке' if capture.details_source == 'vision' else 'локальный OCR'} прочитал Borough: {borough_text}, Block: {capture.block}, Lot: {capture.lot}; "
             "передаю в Vision обрезку tax map и адрес текстом"
         )
     urls, _notes = render_image_files_base64(
         [capture.map_image], max_side_px=1800, enhance_scan=False, output_format="jpeg",
     )
-    request_cfg = dict(cfg)
-    request_cfg["api"] = dict(cfg.get("api") or {})
-    request_cfg["api"]["max_retries"] = 0
     response, usage = ask_llm_json(
         VISION_SYSTEM_PROMPT,
         (
@@ -914,5 +998,6 @@ def lookup_parcel(
     left, right, confidence, notes = parse_neighbour_result(response)
     return ParcelLookup(
         capture.block, capture.lot, capture.borough, left, right,
-        confidence, notes, capture.map_image, usage,
+        confidence, notes, capture.map_image, usage, capture.details_source,
+        details_usages[0] if details_usages else None,
     )

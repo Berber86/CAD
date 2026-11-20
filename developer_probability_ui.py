@@ -42,7 +42,8 @@ class ProbabilityWindow:
         ctk.CTkLabel(win, text="Документ и вопросы отправляются в Hydra обеим моделям; запросы платные. "
                      "Графический режим экспериментальный, поддержка Hydra не подтверждена. "
                      "Имена файлов также передаются. Вопросы и настройки сохраняются локально без шифрования; "
-                     "документы и ответы не сохраняются.", wraplength=1050,
+                     "документы и ответы не сохраняются. Полные ответы Hydra выводятся без маскирования: "
+                     "они могут содержать документ, изображение или ключи!", wraplength=1050,
                      justify="left", text_color=theme["text_dim"]).grid(row=1, column=0, sticky="w", padx=14, pady=5)
         bar = ctk.CTkFrame(win, fg_color="transparent")
         bar.grid(row=2, column=0, sticky="ew", padx=14, pady=4)
@@ -71,6 +72,8 @@ class ProbabilityWindow:
         bottom.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 10))
         self.run_button = ctk.CTkButton(bottom, text="Проверить обе модели", command=self.start)
         self.run_button.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(bottom, text="Копировать всё", width=130, command=self.copy_result,
+                      fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left", padx=(0, 10))
         self.status = ctk.StringVar(value="Выберите файлы. Пустой диапазон PDF означает все страницы; пример: 1-3,5.")
         ctk.CTkLabel(bottom, textvariable=self.status, wraplength=800, justify="left", text_color=theme["text_dim"]).pack(side="left")
         self.app.after(120, self._poll)
@@ -144,6 +147,15 @@ class ProbabilityWindow:
         self.result.delete("1.0", "end")
         self.result.insert("end", text)
         self.result.configure(state="disabled")
+
+    def copy_result(self) -> None:
+        text = str(self.result.get("1.0", "end-1c") or "")
+        if not text:
+            self.status.set("Пока нет результата для копирования.")
+            return
+        self.app.clipboard_clear()
+        self.app.clipboard_append(text)
+        self.status.set("Результат скопирован целиком, включая полные ответы провайдера.")
 
     def start(self) -> None:
         if self.closed or self.inflight:
@@ -221,6 +233,13 @@ class ProbabilityWindow:
                         lines.append("Ошибка: " + model["error"])
                     lines.append("Время запросов, с: " + ", ".join(f"{t:.2f}" for t in model["request_seconds"]))
                     lines.append("Использование API по запросам: " + (json.dumps(model["usage"], ensure_ascii=False) if any(model["usage"]) else "не сообщено"))
+                    for number, raw in enumerate(model.get("provider_responses", []), 1):
+                        lines.append(f"\nПолный ответ провайдера № {number} · HTTP {raw['status']} · без маскирования")
+                        lines.append(f"Протокол: {raw.get('http_version', 'не указан')} · {raw.get('reason', '')}")
+                        lines.append("Заголовки:")
+                        lines.extend(f"{name}: {value}" for name, value in raw["headers"])
+                        lines.append(f"Тело ({raw['encoding']}):")
+                        lines.append(raw["body"])
                 self._write_result("\n".join(lines))
                 self.status.set("Готово. Сравните ответы и время; ответы и документы не сохраняются.")
         self.app.after(120, self._poll)

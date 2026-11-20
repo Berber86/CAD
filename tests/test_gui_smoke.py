@@ -5697,3 +5697,32 @@ def test_probability_window_displays_redacted_hydra_diagnostic(gui, monkeypatch,
     assert 'body.assets' in text and 'лишнее или неподдерживаемое поле' in text
     assert all(secret not in text for secret in ('PRIVATE_TEXT', 'SECRET_IMAGE', 'SECRET_KEY'))
     app._on_close()
+
+
+def test_probability_window_displays_full_unredacted_responses(gui, monkeypatch, tmp_path):
+    import developer_probability as dp
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    body = '{\n "input": "PRIVATE_DOCUMENT", "image": "IMAGE_BASE64", "key": "MOCK_KEY"\n}'
+    result = [{'model': 'jev-1.14', 'seconds': .4, 'entries': [], 'usage': [], 'request_seconds': [.4],
+               'error': 'HTTP 422', 'provider_responses': [{'status': 422, 'headers': [('X-Trace', 'PRIVATE_HEADER')], 'body': body, 'encoding': 'текст'}]},
+              {'model': 'solar-decide', 'seconds': .5, 'entries': [], 'usage': [], 'request_seconds': [.5],
+               'provider_responses': [{'status': 200, 'headers': [], 'body': 'FULL_SUCCESS', 'encoding': 'текст'}]}]
+    window.inflight = True
+    window.events.put((.1, result, None))
+    window._poll()
+    text = window.result.get('1.0', 'end')
+    assert 'Полный ответ провайдера № 1 · HTTP 422' in text
+    assert body in text and 'PRIVATE_HEADER' in text and 'FULL_SUCCESS' in text
+    assert 'без маскирования' in text
+    window.copy_result()
+    assert app._clipboard == text
+    assert 'скопирован целиком' in window.status.get()
+    window.close()
+    stored = (tmp_path / 'settings.json').read_text(encoding='utf8')
+    assert all(secret not in stored for secret in ('PRIVATE_DOCUMENT', 'IMAGE_BASE64', 'MOCK_KEY', 'PRIVATE_HEADER'))
+    app._on_close()

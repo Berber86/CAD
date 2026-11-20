@@ -1,8 +1,9 @@
 """Privacy-preserving summaries of Hydra System One validation errors.
 
 Server responses may echo the full request (including credentials, document text
-or image data). Never display arbitrary server text, input, context or headers.
-Only a fixed vocabulary of field names and known error categories is emitted.
+or image data). This module's summary emits only a fixed vocabulary of field
+names and categories; the UI separately shows the complete response by explicit
+user request, without writing it to disk.
 """
 from __future__ import annotations
 

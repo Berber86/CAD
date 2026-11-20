@@ -212,6 +212,41 @@ def make_state(pages: list[dict[str, Any]], mode: str) -> tuple[dict[str, Any], 
     return state, assets
 
 
+class SystemOneResponse(dict):
+    """Parsed successful response with the original HTTP response attached."""
+
+    def __init__(self, data: dict[str, Any], response: httpx.Response) -> None:
+        super().__init__(data)
+        self.http_response = response
+
+
+class InvalidSystemOneResponse(ValueError):
+    """A successful HTTP status with an invalid System One response body."""
+
+    def __init__(self, message: str, response: httpx.Response) -> None:
+        super().__init__(message)
+        self.http_response = response
+
+
+def _capture_provider_response(response: httpx.Response) -> dict[str, Any]:
+    """Capture the complete HTTP status, headers and body for the user's window.
+
+    This intentionally does not filter sensitive content: the user explicitly
+    requested complete provider responses. It must never write to disk or logs.
+    Binary/non-decodable bodies are represented losslessly as hex.
+    """
+    try:
+        body = response.content.decode(response.encoding or "utf-8", errors="strict")
+        encoding = "текст"
+    except (UnicodeError, LookupError):
+        body = response.content.hex()
+        encoding = "hex (байты ответа)"
+    headers = [(name.decode("latin-1"), value.decode("latin-1"))
+               for name, value in response.headers.raw]
+    return {"status": response.status_code, "http_version": response.http_version,
+            "reason": response.reason_phrase, "headers": headers, "body": body, "encoding": encoding}
+
+
 def post_systemone(base_url: str, api_key: str, model: str, state: dict[str, Any], assets: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
     if not api_key:
         raise ValueError("Не настроен ключ Hydra")
@@ -227,10 +262,13 @@ def post_systemone(base_url: str, api_key: str, model: str, state: dict[str, Any
         raise ValueError("Запрос слишком велик; выберите меньше страниц")
     response = httpx.post(base_url.rstrip("/") + "/systemone", content=body, headers=headers, timeout=120.0, follow_redirects=False)
     response.raise_for_status()
-    data = response.json()
+    try:
+        data = response.json()
+    except (ValueError, RecursionError) as exc:
+        raise InvalidSystemOneResponse("API вернул некорректный JSON", response) from exc
     if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
-        raise ValueError("API не вернул ответы System One")
-    return data
+        raise InvalidSystemOneResponse("API не вернул ответы System One", response)
+    return SystemOneResponse(data, response)
 
 
 def normalize_answer(answer: Any, question: dict[str, Any]) -> dict[str, Any]:
@@ -299,6 +337,7 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
     entries: list[dict[str, Any]] = []
     usages: list[dict[str, Any]] = []
     timings: list[float] = []
+    provider_responses: list[dict[str, Any]] = []
     request_context: tuple[list[dict[str, Any]], int] | None = None
     try:
         normal = build_questions(questions)
@@ -312,8 +351,16 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
             started = time.monotonic()
             try:
                 response = send(base_url, api_key, model, state, assets, qs)
+            except httpx.HTTPStatusError as exc:
+                provider_responses.append(_capture_provider_response(exc.response))
+                raise
+            except InvalidSystemOneResponse as exc:
+                provider_responses.append(_capture_provider_response(exc.http_response))
+                raise
             finally:
                 timings.append(time.monotonic() - started)
+            if isinstance(response, SystemOneResponse):
+                provider_responses.append(_capture_provider_response(response.http_response))
             usages.append(_usage(response))
             return response["answers"]
         if normal:
@@ -373,14 +420,14 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
                     raise ValueError("Модель не смогла определить разные первую и последнюю страницы среди групп")
                 found = [aa, bb]
             entries.append({"question": q["text"], "answer": {"type": "pages", "first": min(found) if found else None, "last": max(found) if found else None, "details": details}})
-        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings}
+        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "provider_responses": provider_responses}
     except Exception as exc:  # preserve independent results and redact network details
         message = _safe_error(exc)
         if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 422 and mode == "visual" and request_context:
             selected, count = request_context
             message += " " + systemone_diagnostics.describe_visual_inputs(
                 [page["content"] for page in selected], count)
-        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "error": message}
+        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "error": message, "provider_responses": provider_responses}
 
 
 def run_both(base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=post_systemone) -> list[dict[str, Any]]:

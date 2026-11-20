@@ -53,6 +53,7 @@ from acad_builder import (
     verify_with_neighbors,
 )
 from llm_parser import LegalDescription, Segment, bearing_label
+import lot_identity
 from street_names import share_street_aliases, with_shared_aliases
 from pdf_set import CLOSURE_LIMIT_FT
 
@@ -481,6 +482,8 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
         elif change.target == "side":
             node["distance_ft"] = change.distance_ft
     updated = LegalDescription.model_validate(data)
+    updated._source_lot_number = description._source_lot_number
+    updated._source_lot_filename = description._source_lot_filename
     # model_dump не содержит приватного происхождения автоправок: переносим его
     # по индексам, не приписывая пользовательским правкам статус автоматических.
     for old, new in zip(description.segments, updated.segments):
@@ -1342,6 +1345,7 @@ def _lot_block(
     plan = scene.plan(lot, extra)
     raw = lot.description
     lines = [f"[{label}] {'OUR LOT' if lot.is_main else 'NEIGHBOUR LOT'} — file \"{lot.name}\""]
+    lines.append("  " + lot_identity.context(lot.description, lot.name))
     if desc is None:
         lines.append("  (the lot could not be built)")
         return "\n".join(lines)
@@ -1426,7 +1430,8 @@ def build_advisor_request(
             image_range = (len(images) + 1, len(images) + len(lot.images))
             images.extend(lot.images)
         blocks.append(_lot_block(scene, lot, label, scene.virtual, image_range, text_limit))
-    parts = ["LOTS (the data already includes Python's verified findings):", "\n\n".join(blocks)]
+    parts = ["LOTS (the data already includes Python's verified findings):", "\n\n".join(blocks),
+             "Lot numbers from filenames are identifiers, not proof of ownership, adjacency, geometry or document content; verify conflicts."]
     if chosen:
         parts.append("PYTHON'S VERIFIED FINDINGS (already included above, do not repeat them):")
         parts.append("\n".join(
@@ -1817,7 +1822,7 @@ def _advisor_proposals(
 def advisor_cache_key(lots: Sequence[LotInput]) -> str:
     """Ключ разбора набора: пока файлы разобраны так же, советник заново не запрашивается."""
     payload = [
-        [lot.key, lot.is_main, lot.description.model_dump(mode="json")]
+        [lot.key, lot.name, lot.is_main, lot_identity.source_number(lot.description, lot.name), lot.description.model_dump(mode="json")]
         for lot in sorted(lots, key=lambda lot: lot.key)
     ]
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -2014,10 +2019,11 @@ def build_join_request(
 ) -> str:
     """Текст запроса для режима карты: координаты углов и сторон каждого участка."""
     parts = [
-        "Lots: " + ", ".join(f"{label} = {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»"
+        "Lots: " + ", ".join(f"{label} = {'our lot' if lot.is_main else 'neighbour'} «{lot.name}» ({lot_identity.context(lot.description, lot.name)})"
                              for label, lot in labels.items()) + ".",
         "Only L1 (our lot) may be joined to a neighbour; joins between two neighbours are not asked for.",
         "Image 1 is the sketch of the figures as the program places them now.",
+        "Filename lot identifiers are not proof of adjacency, geometry, or the document's lot number; verify disagreements.",
     ]
     for label, lot in labels.items():
         base = scene.virtual.get(lot.key, ())
@@ -2027,7 +2033,8 @@ def build_join_request(
             parts.append(f"{label}: the figure does not build.")
             continue
         n = len(plan.vertices)
-        head = [f"{label} — {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»"]
+        head = [f"{label} — {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»",
+                lot_identity.context(lot.description, lot.name)]
         if desc.cross_street:
             head.append(f"tie: {desc.distance_to_corner_ft:.2f} ft from the corner of {desc.cross_street}")
         head.append(f"closure error {plan.closure.distance:.3f} ft")
@@ -2166,7 +2173,9 @@ def _join_sketch_url(scene: _Scene, lots: Sequence[LotInput]) -> str | None:
     for label, lot in ((f"L{i}", lot) for i, lot in enumerate(sorted(lots, key=lambda lot: not lot.is_main), 1)):
         plan = scene.plan(lot, scene.virtual.get(lot.key, ()))
         if plan is not None:
-            figures.append((label, lot.name, lot.is_main, list(plan.vertices)))
+            number = lot_identity.effective_number(lot.description, lot.name)
+            figure_name = f"LOT {number} · {lot.name}" if number else lot.name
+            figures.append((label, figure_name, lot.is_main, list(plan.vertices)))
     if not figures:
         return None
     try:

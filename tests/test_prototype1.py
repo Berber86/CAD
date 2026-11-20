@@ -1572,8 +1572,8 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
 
     neighbor_texts = space.texts[-2:]
     assert [t.TextString for t in neighbor_texts] == [
-        "NEIGHBOR (365')",
-        "NEIGHBOR (475')",
+        "LOT 26",
+        "LOT 30",
     ]
     assert {t.Layer for t in neighbor_texts} == {"NEIGHBOR_LOT"}
     assert point_in_polygon(res_left.plan.items[0].point, res_left.vertices) is True

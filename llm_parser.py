@@ -1328,6 +1328,9 @@ class LegalDescription(BaseModel):
     """Результат разбора документа целиком (Schedule A / Deed / Survey PDF)."""
 
     model_config = ConfigDict(extra="forbid")
+    # Метаинформация об источнике, не поле LLM-схемы и не часть deed.
+    _source_lot_number: str | None = PrivateAttr(default=None)
+    _source_lot_filename: str | None = PrivateAttr(default=None)
 
     main_street: str = Field(
         description="Улица, на которую выходит фасад участка (fronting ...)"

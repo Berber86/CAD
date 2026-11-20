@@ -634,3 +634,33 @@ def test_vision_receives_exactly_the_chosen_scan_pages(tmp_path):
         None, source["pdf_path"], cfg, use_llm=True, pdf_pages=source["pdf_pages"],
     )
     assert len(images) == 1
+
+
+def test_file_lot_numbers_stay_with_each_plan_and_cached_result(gui, tmp_path, monkeypatch):
+    import lot_identity
+
+    samples = _samples()
+    paths = [tmp_path / "OUR 28 NEW.pdf", tmp_path / "LOT 45 NEW.pdf", tmp_path / "LOT 30 OLD.pdf"]
+    for path, key in zip(paths, [MAIN, LEFT, RIGHT]):
+        _write_test_pdf(path, [samples[key]])
+    app = gui.SurveyApp()
+    dialog = _open_set(app, monkeypatch, *paths)
+    dialog.rows[0]["radio"].select()
+    dialog.submit()
+    _wait(app)
+    assert app._preview_main_plan.description._source_lot_number == "28"
+    assert app._neighbor_plan_sources[paths[1]].items[0].text == "LOT 45"
+    assert app._neighbor_plan_sources[paths[2]].items[0].text == "LOT 30"
+    assert app._neighbor_plan_sources[paths[1]].description.lot_number == "26"
+    assert any("не совпадает" in w for w in app._neighbor_plan_sources[paths[1]].warnings)
+    assert [lot_identity.source_number(item.outcome.data) for item in app.pdf_set] == ["28", "45", "30"]
+    # Changing the role rebuilds from cached reading without reassigning identities.
+    app._edit_pdf_set()
+    dialog = app._pdf_set_dialog
+    dialog.rows[1]["radio"].select()
+    dialog.submit()
+    _wait(app)
+    assert app._preview_main_plan.description._source_lot_number == "45"
+    assert app._neighbor_plan_sources[paths[0]].items[0].text == "LOT 28"
+    assert app._neighbor_plan_sources[paths[2]].items[0].text == "LOT 30"
+    app._on_close()

@@ -1318,7 +1318,7 @@ def test_gui_studio_ux_drawer_preview_canvas_and_inspector(gui, monkeypatch, tmp
     ]
     assert "(0,0)" in canvas_texts
     assert "POB" in canvas_texts
-    assert "СОСЕД" in canvas_texts
+    assert "LOT 26" in canvas_texts
     assert "#1" in canvas_texts and "#4" in canvas_texts
 
     # Участок с открытым гэпом рисует маркер GAP на схеме и подсвечивает невязку янтарным цветом
@@ -2756,7 +2756,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
 
     left = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
     right = ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"]
-    path = tmp_path / "single-neighbor.pdf"
+    path = tmp_path / "LOT 77 NEW.pdf"
     _write_test_pdf(path, [left, right])
     app = gui.SurveyApp()
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
@@ -2770,6 +2770,9 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     assert app._preview_main_plan is main_plan
     assert len(app._preview_neighbor_plans) == 1
     assert app._preview_neighbor_plans[0].description.distance_to_corner_ft == pytest.approx(475.0)
+    assert app._preview_neighbor_plans[0].items[0].text == "LOT 77"
+    assert app._preview_neighbor_plans[0].description.lot_number == "30"
+    assert any("не совпадает" in warning for warning in app._preview_neighbor_plans[0].warnings)
     assert list(app._neighbor_plan_sources) == [path]
     assert app._neighbor_parsed_pages[path] == "2" and path not in app._pending_neighbor_pdfs
 
@@ -2809,6 +2812,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     _wait_for_gui_worker(app)
     assert app.pending_conflict is None and app._preview_main_plan is main_plan
     assert len(app._preview_neighbor_plans) == 1 and app._preview_neighbor_plans[0].is_neighbor
+    assert app._preview_neighbor_plans[0].items[0].text == "LOT 77"
     assert app._neighbor_parsed_pages[path] == "2" and path not in app._pending_neighbor_pdfs
     draws.clear()
     app._start(parse_only=False)
@@ -5896,4 +5900,26 @@ def test_probability_pdf_quality_used_in_visual_request_and_saved(gui, monkeypat
     assert captured[0][0]['content'] == expected[0]['content']
     assert 'до 400 px' in window.result.get('1.0', 'end')
     assert dp.load_settings()['pdf_image_side'] == 400
+    app._on_close()
+
+
+def test_direct_batch_neighbor_files_keep_independent_lot_numbers(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    first, second = tmp_path / "LOT 45 NEW.txt", tmp_path / "LOT 46 NEW.txt"
+    first.write_text(sample, encoding="utf-8")
+    second.write_text(sample, encoding="utf-8")
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app.use_llm_var.set(False)
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(first), str(second)))
+    app._load_neighbor_files()
+    _wait_for_gui_worker(app)
+    assert set(app._neighbor_plan_sources) == {first, second}
+    assert app._neighbor_plan_sources[first].items[0].text == "LOT 45"
+    assert app._neighbor_plan_sources[second].items[0].text == "LOT 46"
+    assert app._neighbor_plan_sources[first].pob == app._neighbor_plan_sources[second].pob
+    assert all(app._neighbor_plan_sources[path].description.lot_number == "26" for path in (first, second))
     app._on_close()

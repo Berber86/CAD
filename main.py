@@ -67,6 +67,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
 import app_updater
+import lot_identity
 from neighbour_slide import slide_off_overlap
 
 #: Как найден сдвиг соседа — для журнала развода.
@@ -7459,7 +7460,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 ncx,
                 ncy,
-                text="СОСЕД",
+                text=next((item.text for item in nb_plan.items if item.kind == "neighbor-label"), "LOT ?"),
                 fill=THEME["cad_neighbor"],
                 font=("Segoe UI", 8, "bold"),
             )
@@ -8729,6 +8730,7 @@ class SurveyApp(ctk.CTk):
                         if job.use_llm or getattr(outcome, "source", "") == "llm":
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
+                result.outcome = lot_identity.bind_outcome(result.outcome, job.path)
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
                 # Итог чтения легального описания — в журнал уровнем «ключ»: виден и в упрощённом режиме.
                 post(
@@ -10787,6 +10789,7 @@ class SurveyApp(ctk.CTk):
                     return
                 if use_llm or is_image_file(fpath):
                     post("valid_secret", key_secret)
+                outcome = lot_identity.bind_outcome(outcome, fpath)
                 nb_plan = builder.plan(outcome.data, scale=scale, is_neighbor=True)
                 plans_done.append((fpath, outcome, nb_plan, pre_counted))
             except Exception as exc:  # noqa: BLE001
@@ -10836,6 +10839,7 @@ class SurveyApp(ctk.CTk):
 
                 # Пакет не должен обходить защиту от рискованной геометрии:
                 # такие файлы нужно проверить отдельно, а не рисовать автоматически.
+                outcome = lot_identity.bind_outcome(outcome, fpath)
                 plan = builder.plan(outcome.data, scale=scale, is_neighbor=True)
                 if bool(cfg.get("api", {}).get("ask_on_doubt", True)) and (
                     outcome.typo_suspicions
@@ -11259,6 +11263,7 @@ class SurveyApp(ctk.CTk):
 
             if not self._worker_is_current():
                 return
+            outcome = lot_identity.bind_outcome(outcome, self._running_source_path)
             builder = AcadBuilder(cfg)
             plan = builder.plan(
                 outcome.data, scale=scale, is_neighbor=is_neighbor
@@ -11723,6 +11728,7 @@ class SurveyApp(ctk.CTk):
                 round_usages = []
                 pre_counted = False
 
+            new_outcome = lot_identity.bind_outcome(new_outcome, self._running_source_path)
             new_plan = AcadBuilder(cfg).plan(
                 new_outcome.data, scale=scale, is_neighbor=is_neighbor
             )
@@ -12106,6 +12112,7 @@ class SurveyApp(ctk.CTk):
         pre_counted: bool = True,
     ) -> None:
         parse_only = bool(ctx["parse_only"])
+        outcome = lot_identity.bind_outcome(outcome, self._running_source_path)
         if parse_only:
             self._apply_parsed(outcome, already_counted=pre_counted)
             self._set_status(self._parsed_summary(outcome))
@@ -12160,6 +12167,7 @@ class SurveyApp(ctk.CTk):
     ) -> None:
         post = self._worker_poster()
         try:
+            outcome = lot_identity.bind_outcome(outcome, self._running_source_path)
             builder = AcadBuilder(cfg)
             plan = builder.plan(outcome.data, scale=scale, is_neighbor=is_neighbor)
             if (

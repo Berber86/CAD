@@ -37,6 +37,7 @@ from llm_parser import LegalDescription, Segment, format_feet_inches_source, loa
 import offsets
 import drawing_warnings
 import street_names
+import lot_identity
 
 # feature_labeler импортируется первым: при отсутствии shapely он выдаёт
 # понятное сообщение об установке зависимостей.
@@ -2462,18 +2463,7 @@ class AcadBuilder:
         if neighbor_label and str(neighbor_label).strip():
             label = str(neighbor_label).strip()
         else:
-            dist = float(description.distance_to_corner_ft or 0.0)
-            if dist > 1e-6:
-                d_str = (
-                    f"{int(round(dist))}'"
-                    if abs(dist - round(dist)) < 1e-3
-                    else format_distance(dist)
-                )
-                label = f"NEIGHBOR ({d_str})"
-            elif description.cross_street:
-                label = "NEIGHBOR (CORNER)"
-            else:
-                label = "NEIGHBOR"
+            label = f"LOT {lot_identity.effective_number(description) or '?'}"
 
         center = polygon_centroid(vertices)
         count = len(vertices)
@@ -2539,6 +2529,13 @@ class AcadBuilder:
         raw_vertices = raw_traverse[:-1]
         warnings: list[str] = []
         notes: list[str] = []
+        if lot_identity.conflict(description):
+            warnings.append(
+                f"номер лота из имени файла ({lot_identity.source_number(description)}) "
+                f"не совпадает с номером в документе ({description.lot_number}) — сверьте"
+            )
+        if is_neighbor and not lot_identity.effective_number(description) and not neighbor_label:
+            warnings.append("номер лота соседа не найден в имени файла или документе — подпись LOT ?; сверьте")
         for index, segment in enumerate(description.segments):
             if segment.distance_source and not format_feet_inches_source(segment.distance_source, segment.distance_ft):
                 warnings.append(f"сторона #{index + 1}: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
@@ -3010,7 +3007,8 @@ class AcadBuilder:
         """Рисует готовый план без повторного расчёта его геометрии."""
         # Ошибки расчёта привязки черновика должны попасть не только в лог
         # плана, но и в итоговое предупреждение GUI об отрисовке.
-        warnings = [w for w in plan.warnings if w.startswith("черновик:")] if plan.print_draft else []
+        warnings = [w for w in plan.warnings if (plan.print_draft and w.startswith("черновик:"))
+                    or "номер лота" in w.lower()]
         is_neighbor = plan.is_neighbor
 
         drawing = self.drawing_cfg
@@ -5229,8 +5227,9 @@ def _open_gap_length(plan: DrawPlan) -> float:
 def _neighbor_display_title(plan: DrawPlan, idx: int) -> str:
     d = plan.description
     parts: list[str] = []
-    if d.lot_number:
-        parts.append(f"Lot {d.lot_number}")
+    number = lot_identity.effective_number(d)
+    if number:
+        parts.append(f"Lot {number}")
     if d.block_number:
         parts.append(f"Block {d.block_number}")
     if d.main_street:

@@ -27,8 +27,10 @@ class ProbabilityWindow:
         self.events: queue.Queue = queue.Queue()
         self.files: list[tuple[str, Any]] = []
         self.rows: list[dict[str, Any]] = []
+        self.preview = None
         ctk, theme = self.ctk, self.theme
         settings = dp.load_settings()
+        self.pdf_image_side = settings["pdf_image_side"]
         self.win = win = ctk.CTkToplevel(self.app)
         win.title("Разработчик — вероятности System One")
         win.geometry("1120x850")
@@ -54,14 +56,23 @@ class ProbabilityWindow:
         actions = ctk.CTkFrame(bar, fg_color="transparent")
         actions.pack(side="top", fill="x")
         self.provider = ctk.StringVar(value=next((k for k, v in PROVIDERS.items() if v == settings["provider"]), list(PROVIDERS)[0]))
-        ctk.CTkOptionMenu(choices, values=list(PROVIDERS), variable=self.provider, command=lambda _: self._save(), width=210).pack(side="left", padx=(0, 8))
+        ctk.CTkOptionMenu(choices, values=list(PROVIDERS), variable=self.provider, command=lambda _: self._provider_changed(), width=210).pack(side="left", padx=(0, 8))
         self.mode = ctk.StringVar(value=next((k for k, v in MODES.items() if v == settings["mode"]), list(MODES)[0]))
-        ctk.CTkOptionMenu(choices, values=list(MODES), variable=self.mode, command=lambda _: self._save()).pack(side="left", padx=(0, 8))
+        ctk.CTkOptionMenu(choices, values=list(MODES), variable=self.mode, command=lambda _: self._mode_changed()).pack(side="left", padx=(0, 8))
         ctk.CTkButton(actions, text="Добавить PDF / JPG / PNG", command=self.add_files).pack(side="left", padx=(0, 8))
         ctk.CTkButton(actions, text="Добавить вопрос", command=lambda: self.add_question({"type": "noul", "text": ""}),
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left", padx=(0, 8))
         ctk.CTkButton(actions, text="Назад в чат", command=self.close,
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left")
+        quality = ctk.CTkFrame(bar, fg_color="transparent")
+        quality.pack(side="top", fill="x", pady=(5, 0))
+        self.quality_label = ctk.StringVar(value=f"Качество PDF: {self.pdf_image_side} px (длинная сторона)")
+        ctk.CTkLabel(quality, textvariable=self.quality_label, width=250, anchor="w").pack(side="left")
+        self.quality_slider = ctk.CTkSlider(quality, from_=dp.PDF_IMAGE_MIN_SIDE, to=dp.PDF_IMAGE_MAX_SIDE,
+                                           number_of_steps=92, width=220, command=self._quality_changed)
+        self.quality_slider.pack(side="left", padx=6)
+        self.quality_slider.set(self.pdf_image_side)
+        ctk.CTkLabel(quality, text="Только PDF · PNG без JPEG-сжатия", text_color=theme["text_dim"]).pack(side="left", padx=4)
         body = ctk.CTkScrollableFrame(win, fg_color="transparent")
         body.grid(row=3, column=0, sticky="nsew", padx=14, pady=4)
         body.grid_columnconfigure(0, weight=1)
@@ -98,10 +109,45 @@ class ProbabilityWindow:
             pages = self.ctk.CTkEntry(frame, placeholder_text="Страницы PDF: все или 1-3,5", width=220)
             pages.pack(side="left", padx=5)
             self.files.append((path, pages))
+            pages.bind("<KeyRelease>", lambda _e, entry=pages: self._file_pages_changed(entry))
+            if Path(path).suffix.lower() == ".pdf":
+                self.ctk.CTkButton(frame, text="Просмотр", width=95, command=lambda p=path, e=pages: self.open_preview(p, e)).pack(side="left", padx=5)
             def remove(f=frame, entry=pages):
                 self.files[:] = [(p, e) for p, e in self.files if e is not entry]
+                if self.preview is not None and self.preview.pages_entry is entry:
+                    self.preview.close()
                 f.destroy()
             self.ctk.CTkButton(frame, text="×", width=35, command=remove).pack(side="left")
+
+    def selected_provider(self) -> str:
+        return PROVIDERS.get(str(self.provider.get()), "hydra")
+
+    def _provider_changed(self) -> None:
+        self._save()
+        if self.preview is not None:
+            self.preview.invalidate()
+
+    def _mode_changed(self) -> None:
+        self._save()
+        if self.preview is not None:
+            self.preview.invalidate()
+
+    def _quality_changed(self, value: float) -> None:
+        self.pdf_image_side = dp.valid_pdf_image_side(round(value))
+        self.quality_label.set(f"Качество PDF: {self.pdf_image_side} px (длинная сторона)")
+        self._save()
+        if self.preview is not None:
+            self.preview.invalidate()
+
+    def _file_pages_changed(self, entry: Any) -> None:
+        if self.preview is not None and self.preview.pages_entry is entry:
+            self.preview.invalidate()
+
+    def open_preview(self, filename: str, pages_entry: Any) -> None:
+        from developer_probability_preview import PdfImagePreview
+        if self.preview is not None:
+            self.preview.close()
+        self.preview = PdfImagePreview(self, filename, pages_entry)
 
     def add_question(self, question: dict[str, Any], save: bool = True) -> None:
         ctk = self.ctk
@@ -143,7 +189,7 @@ class ProbabilityWindow:
 
     def _save(self) -> bool:
         try:
-            dp.save_settings({"mode": MODES.get(str(self.mode.get()), "ocr"), "provider": PROVIDERS.get(str(self.provider.get()), "hydra"), "questions": self._questions()})
+            dp.save_settings({"mode": MODES.get(str(self.mode.get()), "ocr"), "provider": self.selected_provider(), "pdf_image_side": self.pdf_image_side, "questions": self._questions()})
             return True
         except (OSError, ValueError):
             if hasattr(self, "status"):
@@ -171,7 +217,8 @@ class ProbabilityWindow:
         questions = [q for q in self._questions() if q["active"]]
         files = [(p, str(e.get()).strip()) for p, e in self.files]
         mode = MODES.get(str(self.mode.get()), "ocr")
-        provider = PROVIDERS.get(str(self.provider.get()), "hydra")
+        provider = self.selected_provider()
+        pdf_image_side = self.pdf_image_side
         provider_name = "RouterAI" if provider == "routerai" else "Hydra"
         try:
             dp.build_questions(questions)
@@ -203,11 +250,16 @@ class ProbabilityWindow:
         def work() -> None:
             try:
                 start = time.monotonic()
-                pages = dp.prepare_documents(files, mode) if provider == "hydra" else dp.prepare_documents(files, mode, provider=provider)
+                prepare_kwargs = {}
+                if provider != "hydra":
+                    prepare_kwargs["provider"] = provider
+                if mode == "visual" and pdf_image_side != dp.PDF_IMAGE_MAX_SIDE:
+                    prepare_kwargs["pdf_image_side"] = pdf_image_side
+                pages = dp.prepare_documents(files, mode, **prepare_kwargs)
                 prepare_time = time.monotonic() - start
                 result = (dp.run_both(target["base_url"], target["api_key"], pages, mode, questions) if provider == "hydra" else
                           dp.run_both(target["base_url"], target["api_key"], pages, mode, questions, provider=provider))
-                event = (prepare_time, result, None)
+                event = (prepare_time, result, None, pdf_image_side if mode == "visual" else None)
             except Exception as exc:  # No raw exception, paths or secrets in GUI
                 event = (0, None, dp._safe_error(exc, provider))
             self.events.put(event)
@@ -216,8 +268,12 @@ class ProbabilityWindow:
     def _poll(self) -> None:
         if self.closed:
             return
+        if self.preview is not None:
+            self.preview.poll()
         try:
-            preparation, result, error = self.events.get_nowait()
+            event = self.events.get_nowait()
+            preparation, result, error = event[:3]
+            result_image_side = event[3] if len(event) > 3 else None
         except queue.Empty:
             pass
         else:
@@ -227,6 +283,8 @@ class ProbabilityWindow:
                 self.status.set(error)
             else:
                 lines = [f"Подготовка документа: {preparation:.2f} с", "Результаты моделей — оценки, не доказательство. Первая и последняя страница не означают непрерывный диапазон."]
+                if result_image_side is not None:
+                    lines.append(f"Качество изображений PDF: длинная сторона до {result_image_side} px (до белых полей).")
                 for model in result:
                     lines.append(f"\n{model['model']} · {model['seconds']:.2f} с")
                     for item in model["entries"]:
@@ -258,6 +316,8 @@ class ProbabilityWindow:
     def close(self) -> None:
         self._save()
         self.closed = True
+        if self.preview is not None:
+            self.preview.close()
         self.win.destroy()
         if getattr(self.chat, "_probability", None) is self:
             self.chat._probability = None

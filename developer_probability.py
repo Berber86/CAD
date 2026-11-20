@@ -23,6 +23,8 @@ import systemone_diagnostics
 MODELS = ("jev-1.14", "solar-decide")
 ROUTERAI_MODELS = ("typesafe/jev-1.14", "microsoft/microsoft-decision-1.1")
 ROUTERAI_IMAGE_LIMIT = 8
+PDF_IMAGE_MIN_SIDE = 96
+PDF_IMAGE_MAX_SIDE = 1568
 MAX_OPTIONS = 26  # conservative Solar limit; reserve two options for absence/multiple
 PAGE_GROUP = MAX_OPTIONS - 2
 MAX_QUESTIONS = 32
@@ -48,15 +50,25 @@ def settings_path() -> Path:
     return Path.home() / ".cache" / "titlesurveyai" / "developer_probability.json"
 
 
+def valid_pdf_image_side(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not PDF_IMAGE_MIN_SIDE <= value <= PDF_IMAGE_MAX_SIDE:
+        raise ValueError(f"Качество PDF: длинная сторона от {PDF_IMAGE_MIN_SIDE} до {PDF_IMAGE_MAX_SIDE} пикселей")
+    return value
+
+
 def load_settings(path: Path | None = None) -> dict[str, Any]:
     try:
         value = json.loads((path or settings_path()).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("questions"), list):
             raise ValueError("bad settings")
         questions = [q for q in value["questions"] if isinstance(q, dict) and q.get("type") in ("noul", "score", "pages")]
-        return {"mode": value.get("mode") if value.get("mode") in ("ocr", "visual") else "ocr", "provider": value.get("provider") if value.get("provider") in ("hydra", "routerai") else "hydra", "questions": questions}
+        try:
+            pdf_image_side = valid_pdf_image_side(value.get("pdf_image_side", PDF_IMAGE_MAX_SIDE))
+        except ValueError:
+            pdf_image_side = PDF_IMAGE_MAX_SIDE
+        return {"mode": value.get("mode") if value.get("mode") in ("ocr", "visual") else "ocr", "provider": value.get("provider") if value.get("provider") in ("hydra", "routerai") else "hydra", "pdf_image_side": pdf_image_side, "questions": questions}
     except (OSError, ValueError, TypeError):
-        return {"mode": "ocr", "provider": "hydra", "questions": [dict(q) for q in DEFAULT_QUESTIONS]}
+        return {"mode": "ocr", "provider": "hydra", "pdf_image_side": PDF_IMAGE_MAX_SIDE, "questions": [dict(q) for q in DEFAULT_QUESTIONS]}
 
 
 def save_settings(settings: dict[str, Any], path: Path | None = None) -> None:
@@ -65,7 +77,7 @@ def save_settings(settings: dict[str, Any], path: Path | None = None) -> None:
     # Whitelist only question and settings fields; never write document paths/results/keys.
     questions = [{k: q[k] for k in ("type", "text", "low", "high", "levels", "active") if k in q}
                  for q in settings.get("questions", []) if isinstance(q, dict)]
-    payload = {"mode": settings.get("mode", "ocr"), "provider": settings.get("provider") if settings.get("provider") in ("hydra", "routerai") else "hydra", "questions": questions}
+    payload = {"mode": settings.get("mode", "ocr"), "provider": settings.get("provider") if settings.get("provider") in ("hydra", "routerai") else "hydra", "pdf_image_side": valid_pdf_image_side(settings.get("pdf_image_side", PDF_IMAGE_MAX_SIDE)), "questions": questions}
     fd, tmp = tempfile.mkstemp(prefix=".developer-probability-", suffix=".tmp", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -123,10 +135,10 @@ def build_questions(questions: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     return result
 
 
-def _to_png(image: Any, *, min_side: int = 1) -> bytes:
+def _to_png(image: Any, *, min_side: int = 1, max_side: int = PDF_IMAGE_MAX_SIDE) -> bytes:
     from PIL import ImageOps
     image = ImageOps.exif_transpose(image).convert("RGB")
-    image.thumbnail((1568, 1568))
+    image.thumbnail((max_side, max_side))
     if min(image.size) < min_side:
         from PIL import Image
         padded = Image.new("RGB", (max(min_side, image.width), max(min_side, image.height)), "white")
@@ -154,10 +166,11 @@ def _ocr(image: Any) -> str:
     return ocr_pages.restore_word_breaks(text)
 
 
-def prepare_documents(files: list[tuple[str, str]], mode: str, *, provider: str = "hydra") -> list[dict[str, Any]]:
+def prepare_documents(files: list[tuple[str, str]], mode: str, *, provider: str = "hydra", pdf_image_side: int = PDF_IMAGE_MAX_SIDE) -> list[dict[str, Any]]:
     """Page records with only in-memory text or PNG bytes, never both."""
     if not files or mode not in ("ocr", "visual"):
         raise ValueError("Выберите файл и режим обработки")
+    valid_pdf_image_side(pdf_image_side)
     from PIL import Image
     import pymupdf
     pages: list[dict[str, Any]] = []
@@ -186,7 +199,7 @@ def prepare_documents(files: list[tuple[str, str]], mode: str, *, provider: str 
                             scanned = _ocr(image)
                             value = (native + "\n[OCR]\n" + scanned) if native else scanned
                         else:
-                            value = _to_png(image, min_side=280 if provider == "routerai" else 1)
+                            value = _to_png(image, min_side=280 if provider == "routerai" else 1, max_side=pdf_image_side)
                     pages.append({"file": path.name, "page": page_no, "content": value})
         elif suffix in (".jpg", ".jpeg", ".png"):
             if spec.strip():

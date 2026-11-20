@@ -134,6 +134,9 @@ class _Widget:
     def after(self, *args, **kwargs):
         return None
 
+    def after_cancel(self, *args, **kwargs):
+        return None
+
     def after_idle(self, *args, **kwargs):
         return None
 
@@ -312,6 +315,16 @@ class _FakeCanvas(_Widget):
     def bind(self, event_name, callback):
         self._bindings[event_name] = callback
 
+    def xview(self, *args):
+        return None
+
+    def yview(self, *args):
+        return None
+
+    def create_image(self, *coords, **kwargs):
+        self.items.append(("image", coords, dict(kwargs)))
+        return len(self.items)
+
     def create_line(self, *coords, **kwargs):
         self.items.append(("line", coords, dict(kwargs)))
         return len(self.items)
@@ -416,6 +429,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
         "CTkCheckBox",
         "CTkTextbox",
         "CTkProgressBar",
+        "CTkSlider",
         "CTkSwitch",
         "CTkToplevel",
     ):
@@ -428,6 +442,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
     tkinter = types.ModuleType("tkinter")
     tkinter.Canvas = _FakeCanvas
+    tkinter.Scrollbar = type("Scrollbar", (_Widget,), {})
     tkinter.Menu = _FakeMenu
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
@@ -5768,4 +5783,117 @@ def test_probability_routerai_uses_its_own_key_and_models(gui, monkeypatch, tmp_
     chat.open_probability()
     assert chat._probability.provider.get() == 'RouterAI · Jev + Microsoft'
     assert 'router-secret' not in (tmp_path / 'settings.json').read_text(encoding='utf8')
+    app._on_close()
+
+
+def test_probability_pdf_preview_quality_navigation_and_submission(gui, monkeypatch, tmp_path):
+    import time
+    import pymupdf
+    import developer_probability as dp
+    from tkinter import filedialog
+    import PIL
+
+    pdf_path = tmp_path / 'quality.pdf'
+    doc = pymupdf.open()
+    for text in ('page 1', 'page 2', 'page 3'):
+        doc.new_page().insert_text((50, 70), text)
+    doc.save(pdf_path)
+    doc.close()
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(pdf_path),))
+    monkeypatch.setattr(PIL, 'ImageTk', types.SimpleNamespace(PhotoImage=lambda image, master: image), raising=False)
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.mode.set('Изображение (эксперимент)')
+    window.add_files()
+    entry = window.files[0][1]
+    entry.insert(0, '1,3')
+    window._quality_changed(400)
+    window.open_preview(str(pdf_path), entry)
+    preview = window.preview
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.page_number == 1 and preview.image is not None
+    assert '400 px' in preview.info.get() and 'API не вызывается' in preview.info.get()
+    assert preview.image.size == (283, 400)
+    preview.step(1)
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.page_number == 3
+    preview.change_zoom(1)
+    assert preview.zoom == 200 and 'масштаб 200%' in preview.label.get()
+    window._quality_changed(160)
+    assert preview.image is None
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.image.size == (280, 280)
+    window.mode.set('Локальный OCR / текст')
+    window._mode_changed()
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert 'отправится текст' in preview.info.get()
+    window.close()
+    assert preview.closed and window.preview is None
+    chat.open_probability()
+    assert chat._probability.pdf_image_side == 160
+    app._on_close()
+
+
+def test_probability_pdf_quality_used_in_visual_request_and_saved(gui, monkeypatch, tmp_path):
+    import time
+    import pymupdf
+    import developer_probability as dp
+    from tkinter import filedialog
+
+    pdf_path = tmp_path / 'request.pdf'
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 70), 'Property line')
+    doc.save(pdf_path)
+    doc.close()
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(pdf_path),))
+    captured = []
+    def both(url, key, pages, mode, questions, **kw):
+        captured.append(pages)
+        return [{'model': model, 'seconds': 0.1, 'entries': [], 'usage': [], 'request_seconds': []} for model in dp.ROUTERAI_MODELS]
+    monkeypatch.setattr(dp, 'run_both', both)
+    app = gui.SurveyApp()
+    app.provider_key_vars['routerai'].set('router-key')
+    app._open_developer_chat()
+    app._developer_chat.open_probability()
+    window = app._developer_chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.mode.set('Изображение (эксперимент)')
+    window.add_files()
+    window._quality_changed(400)
+    window.start()
+    for _ in range(200):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert captured
+    expected = dp.prepare_documents([(str(pdf_path), '1')], 'visual', provider='routerai', pdf_image_side=400)
+    assert captured[0][0]['content'] == expected[0]['content']
+    assert 'до 400 px' in window.result.get('1.0', 'end')
+    assert dp.load_settings()['pdf_image_side'] == 400
     app._on_close()

@@ -86,7 +86,7 @@ def test_both_advisor_requests_explicitly_identify_each_lot_and_source():
     ("plain.pdf", "26", "LOT 26", None),
     ("plain.pdf", None, "LOT ?", "не найден"),
 ])
-def test_our_lot_label_main_and_print_draft(filename, deed, expected, warning):
+def test_our_lot_label_main_but_not_print_draft(filename, deed, expected, warning):
     from acad_builder import make_print_draft, point_in_polygon
 
     desc = li.bind_filename(sample().model_copy(update={"lot_number": deed}), filename)
@@ -94,14 +94,13 @@ def test_our_lot_label_main_and_print_draft(filename, deed, expected, warning):
     plan = builder.plan(desc)
     draft = make_print_draft(plan, {}, builder_cfg=lp.load_config())
     label = next(item for item in plan.items if item.kind == "main-lot-label")
-    draft_label = next(item for item in draft.items if item.kind == "main-lot-label")
-    assert label.text == draft_label.text == expected
+    assert label.text == expected
+    assert not any(item.kind == "main-lot-label" for item in draft.items)
+    assert not any(item.text == expected for item in draft.items)
     assert point_in_polygon(label.point, plan.vertices)
-    assert draft_label.point == pytest.approx((label.point[0] + 1000, label.point[1]))
     assert desc.lot_number == deed
     if warning:
         assert any(warning in w for w in plan.warnings)
-        assert any(warning in w for w in draft.warnings)
     else:
         assert not any("номер лота" in w for w in plan.warnings)
     assert [s.distance_ft for s in plan.description.segments] == [s.distance_ft for s in desc.segments]

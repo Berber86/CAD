@@ -1206,13 +1206,6 @@ def make_print_draft(
         height = 4.0 if is_street else (2.0 if is_side_dimension else 1.6)
         items.append(dc_replace(item, point=point, height=height))
 
-    # Номер нашего участка на черновике повторяет основной план; геометрия не меняется.
-    lot_label = next((item for item in plan.items if item.kind == "main-lot-label"), None)
-    if lot_label is not None:
-        draft_label = layout_builder._neighbor_label_item(plan.description, plan.vertices, 1.6, front_index)
-        items.append(dc_replace(draft_label, kind="main-lot-label", point=lot_pt(draft_label.point)))
-        warnings.extend(w for w in plan.warnings if "номер лота" in w.lower())
-
     # Отдельная строка у той стороны, к которой относится отметка в описании.
     for index, segment in enumerate(plan.description.segments):
         described_wall = bool(getattr(segment, "party_wall", False)) or bool(

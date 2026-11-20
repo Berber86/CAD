@@ -692,7 +692,7 @@ def test_existing_tax_layer_color_and_existing_text_are_not_changed(fake_autocad
     assert (old.Layer, old.StyleName, old.TextString) == ("D-TOPO-TEXT", "OLD", "OTHER DRAWING")
 
 
-def test_our_file_lot_label_is_drawn_on_main_and_draft_with_warning(fake_autocad):
+def test_our_file_lot_label_is_only_drawn_on_main_with_warning(fake_autocad):
     import lot_identity
 
     desc = lot_identity.bind_filename(_model("lot72_render_e600.txt").model_copy(update={"lot_number": "72"}), "OUR 32 NEW.pdf")
@@ -700,9 +700,12 @@ def test_our_file_lot_label_is_drawn_on_main_and_draft_with_warning(fake_autocad
     plan = builder.plan(desc)
     draft = make_print_draft(plan, {}, builder_cfg=_cfg())
     builder, doc = fake_autocad(plan)
-    results = [builder.draw_plan(plan), builder.draw_plan(draft)]
-    labels = [text for text in doc.ModelSpace.texts if text.TextString == "LOT 32"]
-    assert len(labels) == 2
-    assert all(label.Layer == "M-TAX-DIM" and label.StyleName == "LETTER" for label in labels)
+    main_result = builder.draw_plan(plan)
+    before_draft = len(doc.ModelSpace.texts)
+    builder.draw_plan(draft)
+    main_labels = [text for text in doc.ModelSpace.texts[:before_draft] if text.TextString == "LOT 32"]
+    assert len(main_labels) == 1
+    assert main_labels[0].Layer == "M-TAX-DIM" and main_labels[0].StyleName == "LETTER"
+    assert not any(text.TextString == "LOT 32" for text in doc.ModelSpace.texts[before_draft:])
     assert desc.lot_number != "32"
-    assert all(any("не совпадает" in warning for warning in result.warnings) for result in results)
+    assert any("не совпадает" in warning for warning in main_result.warnings)

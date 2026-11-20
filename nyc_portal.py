@@ -21,6 +21,7 @@ from typing import Any, Callable, Sequence
 
 import browser_save
 import ocr_pages
+import portal_layout_cache
 from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
@@ -102,6 +103,10 @@ RELIABLE_ADDRESS_DELAY = 1.5
 RELIABLE_SUGGESTION_DELAY = 2.0
 RELIABLE_CARD_DELAY = 3.0
 RELIABLE_RETRY_DELAY = 2.0
+OPTIMAL_MENU_DELAY = 0.7
+OPTIMAL_ADDRESS_DELAY = 1.0
+OPTIMAL_SUGGESTION_DELAY = 1.2
+OPTIMAL_CARD_DELAY = 2.0
 FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
 #: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
 FAST_PAUSE_MIN_SEC = 1.0
@@ -397,7 +402,8 @@ def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenT
     return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
 
 
-def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText]) -> None:
+def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText], *,
+                              first_delay: float = RELIABLE_SUGGESTION_DELAY) -> None:
     """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
     expected = _address_tokens(address)
     def matches(items: Sequence[ScreenText]) -> bool:
@@ -406,7 +412,7 @@ def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[
         return bool(expected) and actual[:len(expected)] == expected
 
     rows = _wait_screen(handle, matches,
-                        first_delay=RELIABLE_SUGGESTION_DELAY, description="совпадающую первую подсказку адреса",
+                        first_delay=first_delay, description="совпадающую первую подсказку адреса",
                         region=_FORM_REGION)
     suggestion = _first_suggestion(rows, address_rows)
     actual = _address_tokens(suggestion.text if suggestion else "")
@@ -498,7 +504,7 @@ def _crop_tax_map(source: str | Path, rows: Sequence[ScreenText], destination: s
 
 def _drive_portal(
     address: str, map_path: Path, progress: Progress | None = None, *, fast_mode: bool = False,
-    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
+    fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC, optimal_mode: bool = False,
 ) -> PortalCapture:
     """
     Use the current browser window to select an address and retain a map-only crop.
@@ -522,6 +528,8 @@ def _drive_portal(
         return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
                             ready=lambda: _await_ocr(warmup))
 
+    if optimal_mode and fast_mode:
+        raise PortalLookupError("Выберите только один режим поиска: оптимальный или быстрый.")
     if not browser_save.available():
         raise PortalLookupError("Автоматизация окна доступна только в Windows.")
     # OCR availability is checked before touching the browser, not midway through typing.
@@ -538,6 +546,21 @@ def _drive_portal(
     if callable(maximize) and not maximize(window.handle):
         raise PortalLookupError("Не удалось развернуть окно поддерживаемого браузера на весь экран.")
     _focus(window.handle)
+    # Кэш — только подсказка для OCR, никогда не используется для слепого клика.
+    bounds = browser_save.window_bounds(window.handle)
+    size = (bounds[2] - bounds[0], bounds[3] - bounds[1]) if bounds else None
+    layout = portal_layout_cache.load(window.executable, size) if optimal_mode and not fast_mode and size else None
+    use_optimal = optimal_mode and not fast_mode and layout is not None
+    if optimal_mode and progress:
+        progress("оптимальный режим: использую сохранённую область OCR; клики проверяются по текущему экрану"
+                 if use_optimal else "для этого окна нет подходящих координат — выполняю надёжный поиск")
+
+    def check_layout_size() -> None:
+        if use_optimal:
+            current = browser_save.window_bounds(window.handle)
+            if not current or (current[2] - current[0], current[3] - current[1]) != size:
+                raise PortalLookupError("Размер окна изменился во время поиска; повторите поиск заново.")
+
     if not any(mark in window.title.lower() for mark in PORTAL_URL_MARKS):
         if progress:
             progress("открываю NYC Property Information Portal в НОВОЙ вкладке; текущие вкладки не трогаю")
@@ -581,6 +604,7 @@ def _drive_portal(
             rows = _initial_screen(window.handle)
 
     if _contains(rows, "Find Another Property"):
+        check_layout_size()
         _click_text(window.handle, rows, "Find Another Property")
         rows = wait(
             window.handle, lambda screen: _contains(screen, "Select"),
@@ -592,6 +616,7 @@ def _drive_portal(
         # reached after 3 Down presses from the default selection (confirmed in the
         # field — the list has one more leading entry than it visually appears to).
         if not _has_exact_text(rows, "Address"):
+            check_layout_size()
             _click_text(window.handle, rows, "Select")
             # The click opens the dropdown asynchronously (render/animation, listener
             # attachment). Sending arrow keys before it is actually open is exactly
@@ -601,6 +626,11 @@ def _drive_portal(
             # риск и фиксированную паузу вместо промежуточной проверки.
             if fast_mode:
                 _fast_wait(window.handle, fast_pause_sec)
+            elif use_optimal:
+                # Координаты не являются доказательством открытого меню: после выбора
+                # обязательно проверяем появление метки поля до ввода адреса.
+                _fast_wait(window.handle, OPTIMAL_MENU_DELAY)
+                check_layout_size()
             else:
                 rows = wait(
                     window.handle, lambda screen: _has_exact_text(screen, "Address"),
@@ -618,7 +648,8 @@ def _drive_portal(
         else:
             rows = wait(
                 window.handle, lambda screen: _contains(screen, "Enter an Address"),
-                delay=RELIABLE_ADDRESS_DELAY, description="поля Address",
+                delay=OPTIMAL_ADDRESS_DELAY if use_optimal else RELIABLE_ADDRESS_DELAY, description="поля Address",
+                region=portal_layout_cache.label_region(layout, size) if use_optimal else _FORM_REGION,
             )
         # Confirming "Address" with the keyboard (not a mouse click) leaves DOM
         # focus sitting on the <select> itself even though the page has already
@@ -630,6 +661,8 @@ def _drive_portal(
         _key(window.handle, browser_save.VK_TAB)
         time.sleep(0.2)
 
+    check_layout_size()
+    address_label = next((row for row in rows if "enter an address" in row.text.lower()), None)
     if progress:
         progress("ввожу адрес в NYC Portal и жду совпадающую подсказку")
     if fast_mode and not _contains(rows, "Enter an Address"):
@@ -639,7 +672,9 @@ def _drive_portal(
     if fast_mode:
         _fast_wait(window.handle, fast_pause_sec)
     else:
-        _wait_after_address_input(window.handle, address, rows)
+        _wait_after_address_input(window.handle, address, rows,
+                                  first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+    check_layout_size()
     _key(window.handle, browser_save.VK_DOWN)
     time.sleep(0.2)
     _key(window.handle, browser_save.VK_RETURN)
@@ -650,7 +685,7 @@ def _drive_portal(
             and _contains(screen, "Block") and _contains(screen, "Lot")
             and _contains(screen, "Borough")
         ),
-        delay=RELIABLE_CARD_DELAY,
+        delay=OPTIMAL_CARD_DELAY if use_optimal else RELIABLE_CARD_DELAY,
         description="карточку объекта с Borough, Block и Lot", region=None,
     )
     try:
@@ -689,6 +724,15 @@ def _drive_portal(
         full_capture = Path(directory) / "portal_full.png"
         _save_window_capture(window.handle, full_capture)
         _crop_tax_map(full_capture, rows, map_path)
+    # Обновляем координаты только после успешного надёжного поиска, а не в быстром
+    # или по непроверенным предположениям. Никаких адресов/снимков в JSON нет.
+    final_bounds = browser_save.window_bounds(window.handle)
+    final_size = (final_bounds[2] - final_bounds[0], final_bounds[3] - final_bounds[1]) if final_bounds else None
+    if not fast_mode and not use_optimal and address_label and size and final_size == size:
+        saved = portal_layout_cache.save(window.executable, size, address_label.box)
+        if progress:
+            progress("координаты формы сохранены для оптимального режима" if saved else
+                     "координаты формы сохранить не удалось; поиск завершён")
     return PortalCapture(block, lot, borough, map_path)
 
 
@@ -755,6 +799,7 @@ def lookup_parcel(
     progress: Progress | None = None,
     fast_mode: bool = False,
     fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
+    optimal_mode: bool = False,
 ) -> ParcelLookup:
     """Navigate the portal, read BBL locally, then ask Vision only about map neighbours."""
     clean_address = str(address or "").strip()
@@ -762,9 +807,10 @@ def lookup_parcel(
         raise PortalLookupError("Введите адрес перед поиском.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     map_path = Path(screenshot_folder) / f"TAX_MAP_{stamp}.jpg"
-    capture = _drive_portal(
-        clean_address, map_path, progress, fast_mode=fast_mode, fast_pause_sec=fast_pause_sec,
-    )
+    driver_options = {"fast_mode": fast_mode, "fast_pause_sec": fast_pause_sec}
+    if optimal_mode:
+        driver_options["optimal_mode"] = True
+    capture = _drive_portal(clean_address, map_path, progress, **driver_options)
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(

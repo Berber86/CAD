@@ -11,9 +11,10 @@ _real_start_ocr_warmup = nyc_portal._start_ocr_warmup
 
 
 @pytest.fixture(autouse=True)
-def _stub_ocr_warmup(monkeypatch):
+def _stub_ocr_warmup(monkeypatch, tmp_path):
     # Эти тесты подменяют OCR и не загружают настоящую необязательную модель.
     from concurrent.futures import Future
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
     ready = Future()
     ready.set_result(object())
     monkeypatch.setattr(nyc_portal, "_start_ocr_warmup", lambda: ready)
@@ -1002,3 +1003,147 @@ def test_reliable_initial_screen_failure_retries_once_but_challenge_does_not(tmp
     with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
     assert len(calls) == 1 and waits == [1.0]
+
+
+def _optimal_setup(monkeypatch, tmp_path):
+    from PIL import Image
+    window = nyc_portal.browser_save.BrowserWindow(42, "Property Information Portal - Chrome", "chrome.exe")
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *_: None)
+    clicks, keys, waits, captures, scans = [], [], [], [], []
+    monkeypatch.setattr(nyc_portal, "_click_text", lambda _, rows, text: clicks.append(text) or rows[0])
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda _, address, rows: clicks.append((address, rows[0].box)))
+    monkeypatch.setattr(nyc_portal, "_key", lambda _, vk: keys.append(vk))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda n: waits.append(n))
+    def capture(_, path):
+        captures.append(True)
+        _write_portal_screen(Path(path))
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+    queue = []
+    def ocr(path):
+        scans.append(Image.open(path).size)
+        return queue.pop(0)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    return queue, clicks, keys, waits, captures, scans
+
+
+def _optimal_card():
+    return [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+            nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+            nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+            nyc_portal.ScreenText("Lot 70", (300, 300, 400, 330))]
+
+
+def test_reliable_teaches_cache_then_optimal_uses_smaller_ocr_and_verifies_suggestion(tmp_path, monkeypatch):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    label = nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))
+    suggestion = nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Address", (20, 130, 80, 150))], [label], [suggestion], _optimal_card()])
+    reliable = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "one.png")
+    assert reliable.block == "5712"
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == label.box
+    assert len(captures) == 6  # five checks and final map
+    clicks.clear(); keys.clear(); waits.clear(); captures.clear(); scans.clear()
+    # The address label is offset into the cached crop whose origin is (0, 80).
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Enter an Address", (20, 80, 250, 100))],
+              [suggestion], _optimal_card()])
+    logs = []
+    optimal = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "two.png", logs.append, optimal_mode=True)
+    assert (optimal.block, optimal.lot, optimal.borough) == ("5712", "70", "Staten Island")
+    assert clicks == ["Select", ("87 Stafford Ave", label.box)]
+    assert scans == [(500, 400), (350, 200), (650, 640), (1000, 800)]
+    assert len(captures) == 5 and waits == [1., .7, .2, .2, .2, 1., .2, 1.2, .2, 2.]
+    assert any("использую сохранённую" in msg for msg in logs)
+    assert not q
+
+
+def test_optimised_stale_layout_falls_back_to_full_same_snapshot(tmp_path, monkeypatch):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
+              [nyc_portal.ScreenText("Enter an Address", (100, 400, 400, 420))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card()])
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
+    assert result.block == "5712" and ("87 Stafford Ave", (100, 400, 400, 420)) in clicks
+    assert scans[:3] == [(500, 400), (350, 200), (1000, 800)]
+    assert len(captures) == 6  # one retry, full OCR reuses it
+    assert not q
+
+
+def test_optimal_missing_or_other_browser_cache_runs_reliable_and_learns(tmp_path, monkeypatch):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    assert nyc_portal.portal_layout_cache.save("msedge.exe", (1000, 800), (20, 160, 250, 180))
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
+              [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], _optimal_card()])
+    logs = []
+    nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
+    assert len(captures) == 6 and scans[1] == (650, 640)
+    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == (20, 160, 250, 180)
+    assert any("надёжный поиск" in line for line in logs)
+
+
+def test_optimised_never_selects_mismatching_first_suggestion(tmp_path, monkeypatch):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
+    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270)),
+             nyc_portal.ScreenText("87 Stafford Avenue", (20, 300, 200, 320))]
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Enter an Address", (20, 80, 250, 100))], wrong, wrong])
+    with pytest.raises(nyc_portal.PortalLookupError, match="первую подсказку"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
+    assert keys.count(nyc_portal.browser_save.VK_RETURN) == 1  # only menu, never select address
+    assert not (tmp_path / "map.png").exists()
+
+
+def test_optimal_stops_if_window_size_changes_before_address_typing(tmp_path, monkeypatch):
+    q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
+    assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
+    bounds = iter([(0, 0, 1000, 800), (0, 0, 1000, 800), (0, 0, 1000, 800), (0, 0, 1100, 800)])
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _: next(bounds))
+    q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+              [nyc_portal.ScreenText("Enter an Address", (20, 80, 250, 100))]])
+    with pytest.raises(nyc_portal.PortalLookupError, match="Размер окна изменился"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
+    assert all(not isinstance(c, tuple) for c in clicks)
+
+
+def test_modes_cannot_both_be_enabled_before_touching_browser(tmp_path, monkeypatch):
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: pytest.fail("browser touched"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="только один режим"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True, fast_mode=True)
+
+
+def test_no_coordinate_learning_after_failed_suggestion(tmp_path, monkeypatch):
+    q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
+    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))]
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))], wrong, wrong])
+    with pytest.raises(nyc_portal.PortalLookupError):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    assert not nyc_portal.portal_layout_cache.cache_path().exists()
+
+
+def test_fast_mode_never_teaches_cache(tmp_path, monkeypatch):
+    q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
+    q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))], _optimal_card()])
+    nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True)
+    assert not nyc_portal.portal_layout_cache.cache_path().exists()
+
+
+def test_lookup_passes_optimised_flag_to_driver(tmp_path, monkeypatch):
+    received = {}
+    def drive(address, map_path, progress=None, **options):
+        received.update(options)
+        raise nyc_portal.PortalLookupError("стоп")
+    monkeypatch.setattr(nyc_portal, "_drive_portal", drive)
+    with pytest.raises(nyc_portal.PortalLookupError, match="стоп"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", optimal_mode=True)
+    assert received["optimal_mode"] is True and received["fast_mode"] is False

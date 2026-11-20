@@ -592,6 +592,7 @@ class SurveyApp(ctk.CTk):
         self.step0_folder_var = ctk.StringVar(value="")
         self.step0_old_neighbour_var = ctk.BooleanVar(value=False)
         self.step0_fast_mode_var = ctk.BooleanVar(value=False)
+        self.step0_optimal_mode_var = ctk.BooleanVar(value=False)
         #: Пауза «быстрой работы» в секундах, от 1 до 5 (поле рядом с галочкой).
         self.step0_fast_pause_var = ctk.StringVar(value=str(int(nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC)))
         self.step0_ocr_dpi_var = ctk.StringVar(
@@ -3158,6 +3159,7 @@ class SurveyApp(ctk.CTk):
             fast_row,
             text="быстрая работа (без промежуточного OCR), пауза",
             variable=self.step0_fast_mode_var,
+            command=self._step0_fast_mode_changed,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             checkbox_width=18,
@@ -3176,12 +3178,18 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
+        ctk.CTkCheckBox(
+            checks, text="оптимальный поиск адреса (проверенные координаты OCR)",
+            variable=self.step0_optimal_mode_var, command=self._step0_optimal_mode_changed,
+            font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
+            checkbox_width=18, checkbox_height=18,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
         ctk.CTkLabel(
-            checks, text="Без галочки — надёжный режим: проверки после пауз и ограниченные повторы. "
-            "Быстрый режим пропускает проверки; проверяйте адрес, Block и Lot.",
+            checks, text="Без галочек — надёжный поиск. Оптимальный проверяет адрес и карточку; "
+            "быстрый пропускает промежуточные проверки. Проверяйте Block и Lot.",
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -3348,6 +3356,14 @@ class SurveyApp(ctk.CTk):
         if chosen:
             self.step0_folder_var.set(str(chosen))
 
+    def _step0_fast_mode_changed(self) -> None:
+        if self.step0_fast_mode_var.get():
+            self.step0_optimal_mode_var.set(False)
+
+    def _step0_optimal_mode_changed(self) -> None:
+        if self.step0_optimal_mode_var.get():
+            self.step0_fast_mode_var.set(False)
+
     def _step0_fast_pause_value(self) -> float | None:
         """
         Пауза «быстрой работы» из поля. Без галочки значение не используется — возвращаем 5 с.
@@ -3375,6 +3391,9 @@ class SurveyApp(ctk.CTk):
         address = str(self.step0_address_var.get() or "").strip()
         if not address:
             self._set_status("Шаг 0: сначала введите адрес (номер дома и улицу).", error=True)
+            return
+        if self.step0_fast_mode_var.get() and self.step0_optimal_mode_var.get():
+            self._set_status("Шаг 0: выберите один режим поиска — оптимальный или быстрый.", error=True)
             return
         fast_pause = self._step0_fast_pause_value()
         if fast_pause is None:
@@ -3410,6 +3429,10 @@ class SurveyApp(ctk.CTk):
                 f"Быстрый режим: пауза {fast_pause:g} с вместо промежуточных OCR-проверок. "
                 "CAPTCHA или неверная подсказка могут остаться незамеченными — проверьте результат."
             )))
+        elif self.step0_optimal_mode_var.get():
+            self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                "Оптимальный режим: координаты ускоряют OCR; при отсутствии координат используется надёжный поиск."
+            )))
         else:
             self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
                 "Надёжный режим: OCR готовится заранее; проверка после паузы, "
@@ -3421,7 +3444,7 @@ class SurveyApp(ctk.CTk):
             target=self._step0_portal_worker,
             args=(
                 address, folder, cfg, provider, model, target["api_key"], key_secret,
-                bool(self.step0_fast_mode_var.get()), fast_pause,
+                bool(self.step0_fast_mode_var.get()), fast_pause, bool(self.step0_optimal_mode_var.get()),
             ),
             daemon=True,
         )
@@ -3438,6 +3461,7 @@ class SurveyApp(ctk.CTk):
         key_secret: str,
         fast_mode: bool = False,
         fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
+        optimal_mode: bool = False,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
         self._worker_context.generation = self._generation
@@ -3457,6 +3481,7 @@ class SurveyApp(ctk.CTk):
                 progress=progress,
                 fast_mode=fast_mode,
                 fast_pause_sec=fast_pause,
+                **({"optimal_mode": True} if optimal_mode else {}),
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
             self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))

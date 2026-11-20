@@ -5455,3 +5455,39 @@ def test_developer_chat_close_or_clear_discards_inflight_answer(gui, monkeypatch
     assert page._queue.empty() and not fresh.transcript.get("1.0", "end")
     assert not fresh._inflight
     app._on_close()
+
+
+def test_step0_optimal_and_fast_choices_are_exclusive(gui):
+    app = gui.SurveyApp()
+    assert not app.step0_fast_mode_var.get() and not app.step0_optimal_mode_var.get()
+    app.step0_optimal_mode_var.set(True)
+    app._step0_optimal_mode_changed()
+    assert app.step0_optimal_mode_var.get() and not app.step0_fast_mode_var.get()
+    app.step0_fast_mode_var.set(True)
+    app._step0_fast_mode_changed()
+    assert app.step0_fast_mode_var.get() and not app.step0_optimal_mode_var.get()
+    app.step0_optimal_mode_var.set(True)
+    app._step0_optimal_mode_changed()
+    assert app.step0_optimal_mode_var.get() and not app.step0_fast_mode_var.get()
+
+
+def test_step0_portal_worker_passes_optimal_mode(gui, monkeypatch, tmp_path):
+    import nyc_portal as portal_module
+    app = gui.SurveyApp()
+    received = {}
+    def fake_lookup(address, folder, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("стоп")
+    monkeypatch.setattr(portal_module, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", False, 5, True)
+    assert received.get("optimal_mode") is True and received.get("fast_mode") is False
+
+
+def test_step0_rejects_simultaneous_optimal_and_fast_flags(gui, monkeypatch):
+    app = gui.SurveyApp()
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_optimal_mode_var.set(True)
+    app.step0_fast_mode_var.set(True)
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lambda *a, **kw: pytest.fail("search must not start"))
+    app._start_step0_portal_lookup()
+    assert "выберите один режим" in app.status_var.get().lower()

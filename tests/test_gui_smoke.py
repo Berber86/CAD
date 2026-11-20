@@ -5670,3 +5670,30 @@ def test_probability_never_uses_another_provider_key(gui, monkeypatch, tmp_path)
     assert not window.inflight
     assert 'ключ Hydra' in window.status.get()
     app._on_close()
+
+
+def test_probability_window_displays_redacted_hydra_diagnostic(gui, monkeypatch, tmp_path):
+    import httpx
+    import developer_probability as dp
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    request = httpx.Request('POST', 'https://api.hydraai.ru/v1/systemone')
+    response = httpx.Response(422, request=request, json={'detail': [
+        {'type': 'extra_forbidden', 'loc': ['body', 'assets'], 'msg': 'PRIVATE_TEXT', 'input': 'SECRET_IMAGE'}]})
+    error = dp._safe_error(httpx.HTTPStatusError('SECRET_KEY', request=request, response=response))
+    result = [
+        {'model': 'jev-1.14', 'seconds': .4, 'entries': [], 'usage': [], 'request_seconds': [.4], 'error': error},
+        {'model': 'solar-decide', 'seconds': .5, 'entries': [], 'usage': [], 'request_seconds': [.5], 'error': error},
+    ]
+    window.inflight = True
+    window.events.put((.1, result, None))
+    window._poll()
+    text = window.result.get('1.0', 'end')
+    assert text.count('HTTP 422') == 2
+    assert 'body.assets' in text and 'лишнее или неподдерживаемое поле' in text
+    assert all(secret not in text for secret in ('PRIVATE_TEXT', 'SECRET_IMAGE', 'SECRET_KEY'))
+    app._on_close()

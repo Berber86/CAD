@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import systemone_diagnostics
 
 MODELS = ("jev-1.14", "solar-decide")
 MAX_OPTIONS = 26  # conservative Solar limit; reserve two options for absence/multiple
@@ -265,7 +266,11 @@ def normalize_answer(answer: Any, question: dict[str, Any]) -> dict[str, Any]:
 
 def _safe_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"Hydra вернула HTTP {exc.response.status_code}. Если выбран графический режим, он может не поддерживаться; OCR не подставлен."
+        status = exc.response.status_code
+        message = f"Hydra вернула HTTP {status}."
+        if status == 422:
+            message += " " + systemone_diagnostics.summarize_validation_error(exc.response)
+        return message + " Если выбран графический режим, он может не поддерживаться; OCR не подставлен."
     if isinstance(exc, httpx.TimeoutException):
         return "Превышено время ожидания Hydra."
     if isinstance(exc, httpx.HTTPError):
@@ -294,12 +299,15 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
     entries: list[dict[str, Any]] = []
     usages: list[dict[str, Any]] = []
     timings: list[float] = []
+    request_context: tuple[list[dict[str, Any]], int] | None = None
     try:
         normal = build_questions(questions)
         page_questions = [(i, q) for i, q in enumerate(questions) if q["type"] == "pages"]
         if page_questions and (len({p['file'] for p in pages}) != 1 or any(p['page'] is None for p in pages)):
             raise ValueError("Поиск страницы доступен только для одного PDF")
         def request(selected: list[dict[str, Any]], qs: dict[str, Any]) -> dict[str, Any]:
+            nonlocal request_context
+            request_context = (selected, len(qs))
             state, assets = make_state(selected, mode)
             started = time.monotonic()
             try:
@@ -367,7 +375,12 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
             entries.append({"question": q["text"], "answer": {"type": "pages", "first": min(found) if found else None, "last": max(found) if found else None, "details": details}})
         return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings}
     except Exception as exc:  # preserve independent results and redact network details
-        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "error": _safe_error(exc)}
+        message = _safe_error(exc)
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 422 and mode == "visual" and request_context:
+            selected, count = request_context
+            message += " " + systemone_diagnostics.describe_visual_inputs(
+                [page["content"] for page in selected], count)
+        return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "error": message}
 
 
 def run_both(base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=post_systemone) -> list[dict[str, Any]]:

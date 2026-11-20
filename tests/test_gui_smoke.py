@@ -5726,3 +5726,46 @@ def test_probability_window_displays_full_unredacted_responses(gui, monkeypatch,
     stored = (tmp_path / 'settings.json').read_text(encoding='utf8')
     assert all(secret not in stored for secret in ('PRIVATE_DOCUMENT', 'IMAGE_BASE64', 'MOCK_KEY', 'PRIVATE_HEADER'))
     app._on_close()
+
+
+def test_probability_routerai_uses_its_own_key_and_models(gui, monkeypatch, tmp_path):
+    import time
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'doc.pdf'),))
+    calls = []
+    monkeypatch.setattr(dp, 'prepare_documents', lambda files, mode, **kw: calls.append(('prepare', mode, kw)) or [{'file': 'doc.pdf', 'page': 1, 'content': 'text'}])
+    def both(url, key, pages, mode, questions, **kw):
+        calls.append(('run', url, key, kw))
+        return [{'model': m, 'seconds': .1, 'entries': [], 'usage': [], 'request_seconds': []} for m in dp.ROUTERAI_MODELS]
+    monkeypatch.setattr(dp, 'run_both', both)
+    monkeypatch.delenv('ROUTERAI_API_KEY', raising=False)
+    monkeypatch.setattr(ui.lp, 'load_dotenv_dict', lambda: {})
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('hydra-secret')
+    app.provider_key_vars['routerai'].set('')
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.add_files()
+    window.start()
+    assert not window.inflight and 'ключ RouterAI' in window.status.get()
+    app.provider_key_vars['routerai'].set('router-secret')
+    window.start()
+    for _ in range(100):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert calls[0] == ('prepare', 'ocr', {'provider': 'routerai'})
+    assert calls[1][0] == 'run' and calls[1][2] == 'router-secret' and calls[1][3] == {'provider': 'routerai'}
+    assert 'microsoft/microsoft-decision-1.1' in window.result.get('1.0', 'end')
+    window.close()
+    chat.open_probability()
+    assert chat._probability.provider.get() == 'RouterAI · Jev + Microsoft'
+    assert 'router-secret' not in (tmp_path / 'settings.json').read_text(encoding='utf8')
+    app._on_close()

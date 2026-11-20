@@ -21,6 +21,8 @@ import httpx
 import systemone_diagnostics
 
 MODELS = ("jev-1.14", "solar-decide")
+ROUTERAI_MODELS = ("typesafe/jev-1.14", "microsoft/microsoft-decision-1.1")
+ROUTERAI_IMAGE_LIMIT = 8
 MAX_OPTIONS = 26  # conservative Solar limit; reserve two options for absence/multiple
 PAGE_GROUP = MAX_OPTIONS - 2
 MAX_QUESTIONS = 32
@@ -52,9 +54,9 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
         if not isinstance(value, dict) or not isinstance(value.get("questions"), list):
             raise ValueError("bad settings")
         questions = [q for q in value["questions"] if isinstance(q, dict) and q.get("type") in ("noul", "score", "pages")]
-        return {"mode": value.get("mode") if value.get("mode") in ("ocr", "visual") else "ocr", "questions": questions}
+        return {"mode": value.get("mode") if value.get("mode") in ("ocr", "visual") else "ocr", "provider": value.get("provider") if value.get("provider") in ("hydra", "routerai") else "hydra", "questions": questions}
     except (OSError, ValueError, TypeError):
-        return {"mode": "ocr", "questions": [dict(q) for q in DEFAULT_QUESTIONS]}
+        return {"mode": "ocr", "provider": "hydra", "questions": [dict(q) for q in DEFAULT_QUESTIONS]}
 
 
 def save_settings(settings: dict[str, Any], path: Path | None = None) -> None:
@@ -63,7 +65,7 @@ def save_settings(settings: dict[str, Any], path: Path | None = None) -> None:
     # Whitelist only question and settings fields; never write document paths/results/keys.
     questions = [{k: q[k] for k in ("type", "text", "low", "high", "levels", "active") if k in q}
                  for q in settings.get("questions", []) if isinstance(q, dict)]
-    payload = {"mode": settings.get("mode", "ocr"), "questions": questions}
+    payload = {"mode": settings.get("mode", "ocr"), "provider": settings.get("provider") if settings.get("provider") in ("hydra", "routerai") else "hydra", "questions": questions}
     fd, tmp = tempfile.mkstemp(prefix=".developer-probability-", suffix=".tmp", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -121,10 +123,15 @@ def build_questions(questions: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     return result
 
 
-def _to_png(image: Any) -> bytes:
+def _to_png(image: Any, *, min_side: int = 1) -> bytes:
     from PIL import ImageOps
     image = ImageOps.exif_transpose(image).convert("RGB")
     image.thumbnail((1568, 1568))
+    if min(image.size) < min_side:
+        from PIL import Image
+        padded = Image.new("RGB", (max(min_side, image.width), max(min_side, image.height)), "white")
+        padded.paste(image, ((padded.width - image.width) // 2, (padded.height - image.height) // 2))
+        image = padded
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     data = buf.getvalue()
@@ -147,7 +154,7 @@ def _ocr(image: Any) -> str:
     return ocr_pages.restore_word_breaks(text)
 
 
-def prepare_documents(files: list[tuple[str, str]], mode: str) -> list[dict[str, Any]]:
+def prepare_documents(files: list[tuple[str, str]], mode: str, *, provider: str = "hydra") -> list[dict[str, Any]]:
     """Page records with only in-memory text or PNG bytes, never both."""
     if not files or mode not in ("ocr", "visual"):
         raise ValueError("Выберите файл и режим обработки")
@@ -179,13 +186,13 @@ def prepare_documents(files: list[tuple[str, str]], mode: str) -> list[dict[str,
                             scanned = _ocr(image)
                             value = (native + "\n[OCR]\n" + scanned) if native else scanned
                         else:
-                            value = _to_png(image)
+                            value = _to_png(image, min_side=280 if provider == "routerai" else 1)
                     pages.append({"file": path.name, "page": page_no, "content": value})
         elif suffix in (".jpg", ".jpeg", ".png"):
             if spec.strip():
                 raise ValueError("Номера страниц можно задавать только для PDF")
             with Image.open(path) as image:
-                value = _ocr(image) if mode == "ocr" else _to_png(image)
+                value = _ocr(image) if mode == "ocr" else _to_png(image, min_side=280 if provider == "routerai" else 1)
             pages.append({"file": path.name, "page": None, "content": value})
         else:
             raise ValueError("Поддерживаются PDF, JPG и PNG")
@@ -271,6 +278,51 @@ def post_systemone(base_url: str, api_key: str, model: str, state: dict[str, Any
     return SystemOneResponse(data, response)
 
 
+def post_routerai(base_url: str, api_key: str, model: str, state: dict[str, Any], assets: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
+    """RouterAI Decisions uses inline image parts in state, not TypeSafe assets."""
+    if not api_key:
+        raise ValueError("Не настроен ключ RouterAI")
+    if not base_url.startswith("https://"):
+        raise ValueError("Для RouterAI требуется HTTPS-адрес API")
+    if assets:
+        if len(assets) > ROUTERAI_IMAGE_LIMIT:
+            raise ValueError("RouterAI: не более 8 изображений в одном запросе")
+        parts: list[dict[str, Any]] = []
+        used: set[str] = set()
+        # make_state interleaves the description and the matching asset reference.
+        for value in state.values():
+            if isinstance(value, str) and value in assets:
+                asset = assets[value]
+                if asset.get("type") != "image" or asset.get("format") != "png" or not isinstance(asset.get("data_base64"), str):
+                    raise ValueError("Некорректное изображение для RouterAI")
+                parts.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + asset["data_base64"]}})
+                used.add(value)
+            elif isinstance(value, str):
+                parts.append({"type": "text", "text": value})
+            else:
+                raise ValueError("Некорректное состояние изображения для RouterAI")
+        if used != set(assets):
+            raise ValueError("Изображение не связано со страницей")
+        request_state: Any = parts
+    else:
+        request_state = state
+    payload = {"model": model, "state": request_state, "questions": questions}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(body) > MAX_PAYLOAD_BYTES:
+        raise ValueError("Запрос слишком велик; выберите меньше страниц")
+    response = httpx.post(base_url.rstrip("/") + "/decisions", content=body,
+                          headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                          timeout=120.0, follow_redirects=False)
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except (ValueError, RecursionError) as exc:
+        raise InvalidSystemOneResponse("API вернул некорректный JSON", response) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
+        raise InvalidSystemOneResponse("API не вернул ответы Decisions", response)
+    return SystemOneResponse(data, response)
+
+
 def normalize_answer(answer: Any, question: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(answer, dict) or answer.get("type") != question["type"]:
         raise ValueError("API вернул ответ неправильного типа")
@@ -302,17 +354,18 @@ def normalize_answer(answer: Any, question: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _safe_error(exc: Exception) -> str:
+def _safe_error(exc: Exception, provider: str = "hydra") -> str:
+    name = "RouterAI" if provider == "routerai" else "Hydra"
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        message = f"Hydra вернула HTTP {status}."
+        message = f"{name} вернула HTTP {status}."
         if status == 422:
             message += " " + systemone_diagnostics.summarize_validation_error(exc.response)
         return message + " Если выбран графический режим, он может не поддерживаться; OCR не подставлен."
     if isinstance(exc, httpx.TimeoutException):
-        return "Превышено время ожидания Hydra."
+        return f"Превышено время ожидания {name}."
     if isinstance(exc, httpx.HTTPError):
-        return "Ошибка соединения с Hydra."
+        return f"Ошибка соединения с {name}."
     if isinstance(exc, ValueError):
         return str(exc)
     try:
@@ -321,7 +374,7 @@ def _safe_error(exc: Exception) -> str:
             return "Локальный OCR недоступен или не смог распознать документ. Проверьте установку requirements-ocr.txt."
     except ImportError:
         pass
-    return "Не удалось обработать запрос. Проверьте файл, OCR и настройки Hydra."
+    return f"Не удалось обработать запрос. Проверьте файл, OCR и настройки {name}."
 
 
 def _usage(data: dict[str, Any]) -> dict[str, Any]:
@@ -331,7 +384,7 @@ def _usage(data: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in usage.items() if isinstance(k, str) and not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)}
 
 
-def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=post_systemone) -> dict[str, Any]:
+def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=post_systemone, *, provider: str = "hydra") -> dict[str, Any]:
     """One model, independently; errors never replace the other model's output."""
     start = time.monotonic()
     entries: list[dict[str, Any]] = []
@@ -346,6 +399,8 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
             raise ValueError("Поиск страницы доступен только для одного PDF")
         def request(selected: list[dict[str, Any]], qs: dict[str, Any]) -> dict[str, Any]:
             nonlocal request_context
+            if provider == "routerai" and mode == "visual" and len(selected) > ROUTERAI_IMAGE_LIMIT:
+                raise ValueError("RouterAI: обычные вопросы требуют не более 8 изображений; выберите до 8 страниц или оставьте только поиск страниц")
             request_context = (selected, len(qs))
             state, assets = make_state(selected, mode)
             started = time.monotonic()
@@ -374,8 +429,9 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
             found: list[int] = []
             details: list[dict[str, Any]] = []
             groups_with_data = 0
-            for offset in range(0, len(pages), PAGE_GROUP):
-                group = pages[offset:offset + PAGE_GROUP]
+            group_size = ROUTERAI_IMAGE_LIMIT if provider == "routerai" and mode == "visual" else PAGE_GROUP
+            for offset in range(0, len(pages), group_size):
+                group = pages[offset:offset + group_size]
                 criteria = {f"p{p['page']}": f"Page {p['page']} contains the relevant data and no other page in this group does" for p in group}
                 criteria.update({"none": "No page in this group contains the relevant data", "multiple": "More than one page in this group contains the relevant data"})
                 choice_q = {"type": "choice", "instructions": q["text"], "criteria": criteria}
@@ -402,27 +458,37 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
                 elif selected != "none":
                     found.append(int(selected[1:]))
             if groups_with_data > 1:
-                # Resolve global first/last among the candidates from each group;
-                # send only candidate pages, not an oversized full document again.
+                # Reduce candidate boundaries in groups, respecting the image limit.
                 candidates = sorted(set(found))
-                candidate_pages = [p for p in pages if p["page"] in candidates]
-                criteria = {f"p{number}": f"Page {number}" for number in candidates}
-                criteria["none"] = "No relevant data or cannot identify a page"
-                first = {"type": "choice", "instructions": q["text"] + " Identify the FIRST page among the candidate pages containing the requested data.", "criteria": criteria}
-                last = {"type": "choice", "instructions": q["text"] + " Identify the LAST page among the candidate pages containing the requested data.", "criteria": criteria}
-                raw = request(candidate_pages, {"first": first, "last": last})
-                a = normalize_answer(raw.get("first"), first); b = normalize_answer(raw.get("last"), last)
-                details.append({"candidate_pages": candidates, "first": a, "last": b})
-                if a["choice"] == "none" or b["choice"] == "none":
-                    raise ValueError("Не удалось определить первую и последнюю страницы среди групп")
-                aa, bb = int(a["choice"][1:]), int(b["choice"][1:])
-                if aa >= bb:
-                    raise ValueError("Модель не смогла определить разные первую и последнюю страницы среди групп")
-                found = [aa, bb]
+                first_pass = True
+                while len(candidates) > 2 or first_pass:
+                    first_pass = False
+                    next_candidates: list[int] = []
+                    for offset in range(0, len(candidates), group_size):
+                        batch = candidates[offset:offset + group_size]
+                        if len(batch) == 1:
+                            next_candidates.extend(batch)
+                            continue
+                        candidate_pages = [p for p in pages if p["page"] in batch]
+                        criteria = {f"p{number}": f"Page {number}" for number in batch}
+                        criteria["none"] = "No relevant data or cannot identify a page"
+                        first = {"type": "choice", "instructions": q["text"] + " Identify the FIRST page among the candidate pages containing the requested data.", "criteria": criteria}
+                        last = {"type": "choice", "instructions": q["text"] + " Identify the LAST page among the candidate pages containing the requested data.", "criteria": criteria}
+                        raw = request(candidate_pages, {"first": first, "last": last})
+                        a = normalize_answer(raw.get("first"), first); b = normalize_answer(raw.get("last"), last)
+                        details.append({"candidate_pages": batch, "first": a, "last": b})
+                        if a["choice"] == "none" or b["choice"] == "none":
+                            raise ValueError("Не удалось определить первую и последнюю страницы среди групп")
+                        aa, bb = int(a["choice"][1:]), int(b["choice"][1:])
+                        if aa >= bb:
+                            raise ValueError("Модель не смогла определить разные первую и последнюю страницы среди групп")
+                        next_candidates.extend((aa, bb))
+                    candidates = sorted(set(next_candidates))
+                found = candidates
             entries.append({"question": q["text"], "answer": {"type": "pages", "first": min(found) if found else None, "last": max(found) if found else None, "details": details}})
         return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "provider_responses": provider_responses}
     except Exception as exc:  # preserve independent results and redact network details
-        message = _safe_error(exc)
+        message = _safe_error(exc, provider)
         if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 422 and mode == "visual" and request_context:
             selected, count = request_context
             message += " " + systemone_diagnostics.describe_visual_inputs(
@@ -430,7 +496,11 @@ def run_model(model: str, base_url: str, api_key: str, pages: list[dict[str, Any
         return {"model": model, "seconds": time.monotonic() - start, "entries": entries, "usage": usages, "request_seconds": timings, "error": message, "provider_responses": provider_responses}
 
 
-def run_both(base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=post_systemone) -> list[dict[str, Any]]:
+def run_both(base_url: str, api_key: str, pages: list[dict[str, Any]], mode: str, questions: list[dict[str, Any]], send=None, *, provider: str = "hydra") -> list[dict[str, Any]]:
+    if provider not in ("hydra", "routerai"):
+        raise ValueError("Неизвестный провайдер вероятностей")
+    models = MODELS if provider == "hydra" else ROUTERAI_MODELS
+    transport = send or (post_systemone if provider == "hydra" else post_routerai)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(run_model, model, base_url, api_key, pages, mode, questions, send) for model in MODELS]
+        futures = [pool.submit(run_model, model, base_url, api_key, pages, mode, questions, transport, provider=provider) for model in models]
         return [f.result() for f in futures]

@@ -15,6 +15,7 @@ import llm_parser as lp
 TYPES = {"Да / нет": "noul", "Шкала": "score", "Поиск страницы": "pages"}
 LABELS = {value: key for key, value in TYPES.items()}
 MODES = {"Локальный OCR / текст": "ocr", "Изображение (эксперимент)": "visual"}
+PROVIDERS = {"Hydra · Jev + Solar": "hydra", "RouterAI · Jev + Microsoft": "routerai"}
 
 
 class ProbabilityWindow:
@@ -38,21 +39,28 @@ class ProbabilityWindow:
         win.protocol("WM_DELETE_WINDOW", self.close)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(3, weight=1)
-        ctk.CTkLabel(win, text="Проверка документа · Jev + Solar", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
-        ctk.CTkLabel(win, text="Документ и вопросы отправляются в Hydra обеим моделям; запросы платные. "
-                     "Графический режим экспериментальный, поддержка Hydra не подтверждена. "
+        ctk.CTkLabel(win, text="Проверка документа · вероятности", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
+        ctk.CTkLabel(win, text="Документ, имена файлов и вопросы отправляются выбранному провайдеру и обеим моделям; запросы платные. "
+                     "Hydra: формат assets отклонён (422); графический режим не подтверждён. "
+                     "RouterAI: не более 8 изображений в одном запросе. "
                      "Имена файлов также передаются. Вопросы и настройки сохраняются локально без шифрования; "
-                     "документы и ответы не сохраняются. Полные ответы Hydra выводятся без маскирования: "
+                     "документы и ответы не сохраняются. Полные ответы провайдера выводятся без маскирования: "
                      "они могут содержать документ, изображение или ключи!", wraplength=1050,
                      justify="left", text_color=theme["text_dim"]).grid(row=1, column=0, sticky="w", padx=14, pady=5)
         bar = ctk.CTkFrame(win, fg_color="transparent")
         bar.grid(row=2, column=0, sticky="ew", padx=14, pady=4)
+        choices = ctk.CTkFrame(bar, fg_color="transparent")
+        choices.pack(side="top", fill="x", pady=(0, 4))
+        actions = ctk.CTkFrame(bar, fg_color="transparent")
+        actions.pack(side="top", fill="x")
+        self.provider = ctk.StringVar(value=next((k for k, v in PROVIDERS.items() if v == settings["provider"]), list(PROVIDERS)[0]))
+        ctk.CTkOptionMenu(choices, values=list(PROVIDERS), variable=self.provider, command=lambda _: self._save(), width=210).pack(side="left", padx=(0, 8))
         self.mode = ctk.StringVar(value=next((k for k, v in MODES.items() if v == settings["mode"]), list(MODES)[0]))
-        ctk.CTkOptionMenu(bar, values=list(MODES), variable=self.mode, command=lambda _: self._save()).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(bar, text="Добавить PDF / JPG / PNG", command=self.add_files).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(bar, text="Добавить вопрос", command=lambda: self.add_question({"type": "noul", "text": ""}),
+        ctk.CTkOptionMenu(choices, values=list(MODES), variable=self.mode, command=lambda _: self._save()).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Добавить PDF / JPG / PNG", command=self.add_files).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Добавить вопрос", command=lambda: self.add_question({"type": "noul", "text": ""}),
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(bar, text="Назад в чат", command=self.close,
+        ctk.CTkButton(actions, text="Назад в чат", command=self.close,
                       fg_color=theme["btn_secondary"], hover_color=theme["btn_secondary_hover"]).pack(side="left")
         body = ctk.CTkScrollableFrame(win, fg_color="transparent")
         body.grid(row=3, column=0, sticky="nsew", padx=14, pady=4)
@@ -135,7 +143,7 @@ class ProbabilityWindow:
 
     def _save(self) -> bool:
         try:
-            dp.save_settings({"mode": MODES.get(str(self.mode.get()), "ocr"), "questions": self._questions()})
+            dp.save_settings({"mode": MODES.get(str(self.mode.get()), "ocr"), "provider": PROVIDERS.get(str(self.provider.get()), "hydra"), "questions": self._questions()})
             return True
         except (OSError, ValueError):
             if hasattr(self, "status"):
@@ -163,6 +171,8 @@ class ProbabilityWindow:
         questions = [q for q in self._questions() if q["active"]]
         files = [(p, str(e.get()).strip()) for p, e in self.files]
         mode = MODES.get(str(self.mode.get()), "ocr")
+        provider = PROVIDERS.get(str(self.provider.get()), "hydra")
+        provider_name = "RouterAI" if provider == "routerai" else "Hydra"
         try:
             dp.build_questions(questions)
             if not files:
@@ -170,19 +180,19 @@ class ProbabilityWindow:
             if any(q["type"] == "pages" for q in questions) and (len(files) != 1 or Path(files[0][0]).suffix.lower() != ".pdf"):
                 raise ValueError("Поиск страницы работает только для одного PDF; отключите вопросы поиска страницы для нескольких файлов")
             cfg, active_pid, _, _, secret = self.app._build_runtime_config()
-            if active_pid != "hydra":
+            if active_pid != provider:
                 cfg["api"]["api_key"] = ""
-            key = lp.clean_provider_key("hydra", self.app.provider_key_vars["hydra"].get()) or None
-            provider_cfg = cfg["api"]["providers"]["hydra"]
+            key = lp.clean_provider_key(provider, self.app.provider_key_vars[provider].get()) or None
+            provider_cfg = cfg["api"]["providers"][provider]
             env_name = str(provider_cfg.get("env_key") or "").strip()
-            hydra_key = key or provider_cfg.get("api_key") or (os.environ.get(env_name) if env_name else None) or (lp.load_dotenv_dict().get(env_name) if env_name else None)
-            if not hydra_key:
-                raise ValueError("Не настроен ключ Hydra")
-            target = lp.resolve_api_target(cfg, provider="hydra", model="jev-1.14", api_key=hydra_key, key_secret=secret)
+            chosen_key = key or provider_cfg.get("api_key") or (os.environ.get(env_name) if env_name else None) or (lp.load_dotenv_dict().get(env_name) if env_name else None)
+            if not chosen_key:
+                raise ValueError(f"Не настроен ключ {provider_name}")
+            target = lp.resolve_api_target(cfg, provider=provider, model=dp.MODELS[0] if provider == "hydra" else dp.ROUTERAI_MODELS[0], api_key=chosen_key, key_secret=secret)
             if not target["api_key"]:
-                raise ValueError("Не настроен ключ Hydra")
+                raise ValueError(f"Не настроен ключ {provider_name}")
         except (ValueError, lp.LLMParseError, lp.KeyProtectionError) as exc:
-            self.status.set(str(exc) if isinstance(exc, ValueError) else "Проверьте ключ Hydra и PIN в настройках.")
+            self.status.set(str(exc) if isinstance(exc, ValueError) else f"Проверьте ключ {provider_name} и PIN в настройках.")
             return
         if not self._save():
             return
@@ -193,12 +203,13 @@ class ProbabilityWindow:
         def work() -> None:
             try:
                 start = time.monotonic()
-                pages = dp.prepare_documents(files, mode)
+                pages = dp.prepare_documents(files, mode) if provider == "hydra" else dp.prepare_documents(files, mode, provider=provider)
                 prepare_time = time.monotonic() - start
-                result = dp.run_both(target["base_url"], target["api_key"], pages, mode, questions)
+                result = (dp.run_both(target["base_url"], target["api_key"], pages, mode, questions) if provider == "hydra" else
+                          dp.run_both(target["base_url"], target["api_key"], pages, mode, questions, provider=provider))
                 event = (prepare_time, result, None)
             except Exception as exc:  # No raw exception, paths or secrets in GUI
-                event = (0, None, dp._safe_error(exc))
+                event = (0, None, dp._safe_error(exc, provider))
             self.events.put(event)
         threading.Thread(target=work, daemon=True).start()
 

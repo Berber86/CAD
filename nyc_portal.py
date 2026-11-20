@@ -11,7 +11,9 @@ import hashlib
 import re
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +42,9 @@ Progress = Callable[[str], None]
 
 class PortalLookupError(RuntimeError):
     """The portal lookup could not safely reach a usable parcel details page."""
+
+class _InitialScreenNotFound(PortalLookupError):
+    """Исходная форма не найдена, можно повторить снимок после паузы."""
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,15 @@ def _normalise(text: str) -> str:
 
 
 # Обычный режим проверяет экран; быстрый режим ждёт между действиями без промежуточного OCR.
-SCREEN_CHECK_PAUSE_SEC = 0.6
+# Надёжный режим: одно чтение после действия и максимум один повтор.
+RELIABLE_PORTAL_DELAY = 3.0
+RELIABLE_INITIAL_DELAY = 1.0
+RELIABLE_FORM_DELAY = 1.5
+RELIABLE_MENU_DELAY = 1.0
+RELIABLE_ADDRESS_DELAY = 1.5
+RELIABLE_SUGGESTION_DELAY = 2.0
+RELIABLE_CARD_DELAY = 3.0
+RELIABLE_RETRY_DELAY = 2.0
 FAST_SCREEN_CHECK_PAUSE_SEC = 5.0
 #: Пределы паузы «быстрой работы», которую выбирает пользователь рядом с галочкой.
 FAST_PAUSE_MIN_SEC = 1.0
@@ -113,10 +126,29 @@ def parse_fast_pause(text: object) -> float | None:
 MAP_REDRAW_WAIT_SEC = 0.8 + 3.0
 
 
+def _start_ocr_warmup() -> Future:
+    """Создаём локальную модель в фоне, параллельно с подготовкой браузера."""
+    future: Future = Future()
+    def load() -> None:
+        try:
+            future.set_result(ocr_pages._engine_or_raise())
+        except Exception as exc:  # noqa: BLE001 - показываем при первой проверке
+            future.set_exception(exc)
+    threading.Thread(target=load, name="step0-ocr-warmup", daemon=True).start()
+    return future
+
+
+def _await_ocr(warmup: Future) -> None:
+    try:
+        warmup.result()
+    except Exception as exc:  # noqa: BLE001 - ошибка инициализации видна пользователю
+        raise PortalLookupError(f"Не удалось подготовить локальный OCR: {exc}") from exc
+
+
 def _screen_ocr(image_path: str | Path) -> list[ScreenText]:
     """OCR an on-disk screenshot using the same optional local RapidOCR engine."""
     engine = ocr_pages._engine_or_raise()  # one shared, lazily loaded local model
-    result = engine(str(image_path))
+    result = ocr_pages.run_engine(engine, str(image_path))
     if isinstance(result, tuple):
         result = result[0]
     rows: list[ScreenText] = []
@@ -195,7 +227,7 @@ def _initial_screen(handle: int) -> list[ScreenText]:
         _reject_challenge(rows)
         if any(_contains(rows, marker) for marker in ("Select", "Find Another Property", "Enter an Address")):
             return rows
-    raise PortalLookupError("Не удалось подтвердить страницу NYC Portal и найти форму поиска.")
+    raise _InitialScreenNotFound("Не удалось подтвердить страницу NYC Portal и найти форму поиска.")
 
 
 def _portal_window() -> browser_save.BrowserWindow:
@@ -291,16 +323,20 @@ def _wait_screen(
     handle: int,
     predicate: Callable[[Sequence[ScreenText]], bool],
     *,
-    timeout: float,
     description: str,
-    pause: float = SCREEN_CHECK_PAUSE_SEC,
+    first_delay: float,
+    retry_delay: float = RELIABLE_RETRY_DELAY,
     region: tuple[float, float, float, float] | None = None,
+    ready: Callable[[], None] | None = None,
 ) -> list[ScreenText]:
-    """Ожидание без повторного OCR идентичного снимка; область с полным fallback."""
-    deadline = time.monotonic() + timeout
+    """После паузы один снимок, затем максимум один повтор; никаких частых циклов."""
     latest: list[ScreenText] = []
     previous_hash: bytes | None = None
-    while True:
+    for attempt, delay in enumerate((first_delay, retry_delay)):
+        time.sleep(delay)
+        if ready is not None:
+            ready()
+            ready = None
         _focus(handle)
         with tempfile.TemporaryDirectory(prefix="tsai_pip_ocr_") as directory:
             path = Path(directory) / "screen.png"
@@ -312,16 +348,12 @@ def _wait_screen(
             _reject_challenge(latest)
             if predicate(latest):
                 return latest
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if region:
-                    latest = _screen_ocr(path)
-                    _reject_challenge(latest)
-                    if predicate(latest):
-                        return latest
-                break
-        time.sleep(min(pause, remaining))
-    raise PortalLookupError(f"Не дождался {description} на NYC Portal.")
+            if attempt == 1 and region:
+                latest = _screen_ocr(path)  # тот же снимок; на случай сместившейся формы
+                _reject_challenge(latest)
+                if predicate(latest):
+                    return latest
+    raise PortalLookupError(f"Не дождался {description} на NYC Portal после двух проверок.")
 
 
 def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
@@ -367,10 +399,16 @@ def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenT
 
 def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText]) -> None:
     """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
-    rows = _wait_screen(handle, lambda items: _first_suggestion(items, address_rows) is not None,
-                        timeout=8, description="подсказку адреса", region=_FORM_REGION)
-    suggestion = _first_suggestion(rows, address_rows)
     expected = _address_tokens(address)
+    def matches(items: Sequence[ScreenText]) -> bool:
+        suggestion = _first_suggestion(items, address_rows)
+        actual = _address_tokens(suggestion.text if suggestion else "")
+        return bool(expected) and actual[:len(expected)] == expected
+
+    rows = _wait_screen(handle, matches,
+                        first_delay=RELIABLE_SUGGESTION_DELAY, description="совпадающую первую подсказку адреса",
+                        region=_FORM_REGION)
+    suggestion = _first_suggestion(rows, address_rows)
     actual = _address_tokens(suggestion.text if suggestion else "")
     if not expected or actual[:len(expected)] != expected:
         raise PortalLookupError("Первая подсказка адреса не совпадает с запросом; проверьте ввод и повторите.")
@@ -469,9 +507,10 @@ def _drive_portal(
     проверка и чтение идентификаторов обязательны. Риск несработавшего действия выше.
     """
     def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
-             timeout: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION) -> list[ScreenText]:
+             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION) -> list[ScreenText]:
         if fast_mode:
             _fast_wait(handle, fast_pause_sec)
+            _await_ocr(warmup)
             with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
                 path = Path(directory) / "screen.png"
                 _save_window_capture(handle, path)
@@ -480,8 +519,8 @@ def _drive_portal(
             if not predicate(rows):
                 raise PortalLookupError(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
             return rows
-        return _wait_screen(handle, predicate, timeout=timeout, description=description,
-                            pause=SCREEN_CHECK_PAUSE_SEC, region=region)
+        return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
+                            ready=lambda: _await_ocr(warmup))
 
     if not browser_save.available():
         raise PortalLookupError("Автоматизация окна доступна только в Windows.")
@@ -490,6 +529,9 @@ def _drive_portal(
         raise PortalLookupError(
             "Для управления полями сайта нужен локальный OCR. Установите requirements-ocr.txt и повторите."
         )
+    warmup = _start_ocr_warmup()
+    if progress:
+        progress("заранее готовлю локальный OCR параллельно с открытием портала")
     window = _portal_window()
     _focus(window.handle)
     maximize = getattr(browser_save, "maximize_browser_window", None)
@@ -522,17 +564,27 @@ def _drive_portal(
         rows = wait(
             window.handle,
             lambda screen: _contains(screen, "Select") or _contains(screen, "Find Another Property"),
-            timeout=45,
+            delay=RELIABLE_PORTAL_DELAY,
             description="страницу NYC Property Information Portal",
         )
     else:
-        rows = _initial_screen(window.handle)
+        if not fast_mode:
+            time.sleep(RELIABLE_INITIAL_DELAY)
+        _await_ocr(warmup)
+        try:
+            rows = _initial_screen(window.handle)
+        except _InitialScreenNotFound:
+            if fast_mode:
+                raise
+            time.sleep(RELIABLE_RETRY_DELAY)
+            _focus(window.handle)
+            rows = _initial_screen(window.handle)
 
     if _contains(rows, "Find Another Property"):
         _click_text(window.handle, rows, "Find Another Property")
         rows = wait(
             window.handle, lambda screen: _contains(screen, "Select"),
-            timeout=12, description="форму поиска адреса",
+            delay=RELIABLE_FORM_DELAY, description="форму поиска адреса",
         )
 
     if not _contains(rows, "Enter an Address"):
@@ -552,7 +604,7 @@ def _drive_portal(
             else:
                 rows = wait(
                     window.handle, lambda screen: _has_exact_text(screen, "Address"),
-                    timeout=5, description="открывшийся список Select",
+                    delay=RELIABLE_MENU_DELAY, description="открывшийся список Select",
                 )
         _key(window.handle, browser_save.VK_DOWN)
         time.sleep(0.2)
@@ -566,7 +618,7 @@ def _drive_portal(
         else:
             rows = wait(
                 window.handle, lambda screen: _contains(screen, "Enter an Address"),
-                timeout=8, description="поля Address",
+                delay=RELIABLE_ADDRESS_DELAY, description="поля Address",
             )
         # Confirming "Address" with the keyboard (not a mouse click) leaves DOM
         # focus sitting on the <select> itself even though the page has already
@@ -598,10 +650,38 @@ def _drive_portal(
             and _contains(screen, "Block") and _contains(screen, "Lot")
             and _contains(screen, "Borough")
         ),
-        timeout=30,
+        delay=RELIABLE_CARD_DELAY,
         description="карточку объекта с Borough, Block и Lot", region=None,
     )
-    block, lot, borough = _extract_portal_details(rows)
+    try:
+        block, lot, borough = _extract_portal_details(rows)
+        if not fast_mode and not borough:
+            raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+    except PortalLookupError:
+        if fast_mode:
+            raise
+        if progress:
+            progress("Block/Lot не прочитаны — повторно проверяю область карточки")
+        time.sleep(RELIABLE_RETRY_DELAY)
+        _focus(window.handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_bbl_retry_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(window.handle, path)
+            retry_rows = _screen_ocr_region(path, (0.0, 0.0, 0.65, 1.0))
+            _reject_challenge(retry_rows)
+            try:
+                block, lot, borough = _extract_portal_details(retry_rows)
+                if not borough:
+                    raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+            except PortalLookupError:
+                # Форма могла сместиться: ещё одно чтение того же снимка, не новый снимок.
+                retry_rows = _screen_ocr(path)
+                _reject_challenge(retry_rows)
+                block, lot, borough = _extract_portal_details(retry_rows)
+                if not borough:
+                    raise PortalLookupError("Локальный OCR не смог прочитать Borough на карточке.")
+        # Полный предыдущий OCR сохраняет координаты для безопасной обрезки карты.
+        rows = [*rows, *retry_rows]
     # Retain a map-only image: neither the saved crop nor the Vision request includes
     # the address, Block/Lot pane, owner or building details on the page's left side.
     _zoom_out_map_pane(window.handle)

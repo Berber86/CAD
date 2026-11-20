@@ -24,6 +24,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -63,6 +64,8 @@ class OcrUnavailable(OcrError):
 
 
 _engine: Any = None
+_engine_init_lock = threading.Lock()
+_engine_inference_lock = threading.Lock()
 _engine_error = ""
 _available: bool | None = None
 
@@ -104,23 +107,30 @@ def cache_dir() -> Path:
 
 
 def _engine_or_raise() -> Any:
-    """Движок создаётся один раз: загрузка моделей занимает секунды."""
+    """Движок создаётся один раз, даже при параллельной предварительной загрузке."""
     global _engine
     if _engine is not None:
         return _engine
-    if not available():
-        raise OcrUnavailable(
-            "локальный OCR не установлен: " + unavailable_reason()
-        )
-    try:  # noqa: PLC0415 - тяжёлый импорт только по требованию
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception as exc:  # noqa: BLE001
-        raise OcrUnavailable(f"локальный OCR не запускается: {exc}") from exc
-    try:
-        _engine = RapidOCR()
-    except Exception as exc:  # noqa: BLE001 - нет модели, не хватило памяти и т. п.
-        raise OcrUnavailable(f"локальный OCR не запускается: {exc}") from exc
-    return _engine
+    with _engine_init_lock:
+        if _engine is not None:
+            return _engine
+        if not available():
+            raise OcrUnavailable("локальный OCR не установлен: " + unavailable_reason())
+        try:  # noqa: PLC0415 - тяжёлый импорт только по требованию
+            from rapidocr_onnxruntime import RapidOCR
+        except Exception as exc:  # noqa: BLE001
+            raise OcrUnavailable(f"локальный OCR не запускается: {exc}") from exc
+        try:
+            _engine = RapidOCR()
+        except Exception as exc:  # noqa: BLE001
+            raise OcrUnavailable(f"локальный OCR не запускается: {exc}") from exc
+        return _engine
+
+
+def run_engine(engine: Any, image: str) -> Any:
+    """Общий движок нельзя одновременно использовать из поиска и OCR документов."""
+    with _engine_inference_lock:
+        return engine(image)
 
 
 def _cache_key(path: Path, first: int, last: int, dpi: int, tile: int = 1, exact: bool = False) -> str:
@@ -647,7 +657,7 @@ def ocr_pdf_pages(
                 page_parts: list[str] = []
                 for image in images:
                     try:
-                        result, _elapsed = engine(str(image))
+                        result, _elapsed = run_engine(engine, str(image))
                     except Exception as exc:  # noqa: BLE001
                         raise OcrError(f"страница {page_no} не распознана: {exc}") from exc
                     text = _lines_to_text(result)

@@ -7,6 +7,18 @@ import pytest
 import nyc_portal
 
 
+_real_start_ocr_warmup = nyc_portal._start_ocr_warmup
+
+
+@pytest.fixture(autouse=True)
+def _stub_ocr_warmup(monkeypatch):
+    # Эти тесты подменяют OCR и не загружают настоящую необязательную модель.
+    from concurrent.futures import Future
+    ready = Future()
+    ready.set_result(object())
+    monkeypatch.setattr(nyc_portal, "_start_ocr_warmup", lambda: ready)
+
+
 def _write_portal_screen(path):
     from PIL import Image, ImageDraw
 
@@ -148,7 +160,7 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
     assert capture_result.borough == "Staten Island"
     assert capture_result.map_image.is_file()
     assert clicks == [(42, "Select"), (42, "87 Stafford Ave")]
-    assert waits == [0.2, 0.2, 0.2, 0.2, 0.2]
+    assert waits == [1.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]
     assert keys == [
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
@@ -241,7 +253,7 @@ def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypat
     assert capture_result.map_image.is_file()
     assert typed == [nyc_portal.PORTAL_URL]
     assert new_tabs == [1]  # портал открыт в новой вкладке
-    assert waits == [0.6, 0.2, 0.2, 0.2, 0.2, 0.2]  # 0.6 — ждём переключения на новую вкладку
+    assert waits == [0.6, 3.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]  # 0.6 — ждём переключения на новую вкладку
     assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
     assert key_events[-2:] == [nyc_portal.browser_save.VK_DOWN, nyc_portal.browser_save.VK_RETURN]
 
@@ -319,7 +331,7 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
     assert result.block == "5712" and result.lot == "70"
     assert result.map_image.is_file()
     assert clicks == []
-    assert waits == [0.2, 0.2, 0.2, 0.2, 0.2]
+    assert waits == [1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 2.0, 0.2, 3.0]
     assert keys[:5] == [
         nyc_portal.browser_save.VK_DOWN,
         nyc_portal.browser_save.VK_DOWN,
@@ -453,37 +465,28 @@ def _wait_setup(monkeypatch, screens):
     return clock, seen
 
 
-def test_fast_mode_waits_five_seconds_between_screen_checks(monkeypatch):
+def test_reliable_wait_takes_one_snapshot_after_initial_delay(monkeypatch):
     select = [nyc_portal.ScreenText("Select", (20, 100, 80, 130))]
-    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
-    clock, seen = _wait_setup(monkeypatch, [empty, empty, select])
-
-    rows = nyc_portal._wait_screen(
-        1, lambda screen: any(r.text == "Select" for r in screen),
-        timeout=60, description="страницу", pause=nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
-    )
+    clock, seen = _wait_setup(monkeypatch, [select])
+    rows = nyc_portal._wait_screen(1, lambda screen: bool(screen), description="страницу", first_delay=1.5)
     assert rows == select
-    assert len(seen) == 3
-    assert clock.sleeps == [5.0, 5.0]
+    assert len(seen) == 1 and clock.sleeps == [1.5]
 
 
-def test_default_wait_keeps_the_fast_short_polling(monkeypatch):
+def test_reliable_wait_retries_only_once_after_two_seconds(monkeypatch):
     empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
-    clock, seen = _wait_setup(monkeypatch, [empty])
-    with pytest.raises(nyc_portal.PortalLookupError, match="Не дождался"):
-        nyc_portal._wait_screen(1, lambda _s: False, timeout=1.5, description="страницу")
-    # Проверки при t=0, 0.6, 1.2 и у дедлайна t=1.5: последняя пауза укорочена до остатка.
-    assert len(seen) == 4
-    assert clock.sleeps == [0.6, 0.6, pytest.approx(0.3)]
+    select = [nyc_portal.ScreenText("Select", (20, 100, 80, 130))]
+    clock, seen = _wait_setup(monkeypatch, [empty, select])
+    rows = nyc_portal._wait_screen(1, lambda screen: screen[0].text == "Select", description="форму", first_delay=1)
+    assert rows == select
+    assert len(seen) == 2 and clock.sleeps == [1, 2.0]
 
 
-def test_wait_screen_makes_a_final_check_exactly_at_the_deadline(monkeypatch):
-    empty = [nyc_portal.ScreenText("loading", (20, 100, 80, 130))]
-    clock, seen = _wait_setup(monkeypatch, [empty])
-    with pytest.raises(nyc_portal.PortalLookupError):
-        nyc_portal._wait_screen(1, lambda _s: False, timeout=5, description="окно", pause=5.0)
-    assert len(seen) == 2  # при t=0 и при t=5, а не только при t=0
-    assert clock.sleeps == [5.0]
+def test_reliable_wait_stops_after_two_failed_checks(monkeypatch):
+    clock, seen = _wait_setup(monkeypatch, [[]])
+    with pytest.raises(nyc_portal.PortalLookupError, match="двух проверок"):
+        nyc_portal._wait_screen(1, lambda _s: False, description="окно", first_delay=3)
+    assert len(seen) == 2 and clock.sleeps == [3, 2.0]
 
 
 def test_map_is_captured_only_after_the_redraw_wait_following_the_wheel(monkeypatch):
@@ -578,8 +581,8 @@ def test_same_unchanged_screenshot_does_not_repeat_ocr(monkeypatch):
     monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _: scans.append(True) or [])
     with pytest.raises(nyc_portal.PortalLookupError):
-        nyc_portal._wait_screen(1, lambda r: False, timeout=1.5, description="экран")
-    assert len(captures) == 4 and len(scans) == 1
+        nyc_portal._wait_screen(1, lambda r: False, first_delay=1.5, description="экран")
+    assert len(captures) == 2 and len(scans) == 1
 
 
 def test_region_ocr_offsets_boxes_to_window_coordinates(tmp_path, monkeypatch):
@@ -733,7 +736,7 @@ def test_region_wait_uses_full_fallback_once_at_timeout(monkeypatch):
     regions, full = [], []
     monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda *a: regions.append(True) or [])
     monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _: full.append(True) or [nyc_portal.ScreenText("Select", (750, 100, 800, 130))])
-    result = nyc_portal._wait_screen(42, lambda rows: nyc_portal._contains(rows, "Select"), timeout=1.2,
+    result = nyc_portal._wait_screen(42, lambda rows: nyc_portal._contains(rows, "Select"), first_delay=1.2,
                                      description="форму", region=nyc_portal._FORM_REGION)
     assert nyc_portal._contains(result, "Select")
     assert len(regions) == 1 and len(full) == 1
@@ -764,3 +767,238 @@ def test_address_suggestion_ignores_map_numbers_to_the_right():
     suggestion = nyc_portal.ScreenText("87 Stafford Ave", (20, 260, 180, 280))
     assert nyc_portal._first_suggestion([number_on_map, suggestion], label) == suggestion
     assert nyc_portal._first_suggestion([number_on_map], label) is None
+
+
+def test_warmup_initializes_in_background_and_shares_result(monkeypatch):
+    import threading
+    started, release = threading.Event(), threading.Event()
+    engine = object()
+    def load():
+        started.set()
+        assert release.wait(2)
+        return engine
+    monkeypatch.setattr(nyc_portal.ocr_pages, "_engine_or_raise", load)
+    future = _real_start_ocr_warmup()
+    try:
+        assert started.wait(1)
+        assert not future.done()
+    finally:
+        release.set()
+    assert future.result(timeout=2) is engine
+
+
+def test_ocr_warmup_failure_reported_before_first_screenshot(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    future = Future()
+    future.set_exception(nyc_portal.ocr_pages.OcrUnavailable("ошибка модели"))
+    monkeypatch.setattr(nyc_portal, "_start_ocr_warmup", lambda: future)
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: nyc_portal.browser_save.BrowserWindow(
+        42, "Property Information Portal - Chrome", "chrome.exe"))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda *_: pytest.fail("не снимать до готовности OCR"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="подготовить локальный OCR"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+
+
+def test_ready_callback_waits_only_after_first_browser_pause(monkeypatch):
+    clock, seen = _wait_setup(monkeypatch, [[nyc_portal.ScreenText("Select", (0, 0, 10, 10))]])
+    ready_at = []
+    nyc_portal._wait_screen(42, lambda rows: bool(rows), description="форму", first_delay=3,
+                            ready=lambda: ready_at.append(clock.now))
+    assert ready_at == [3] and len(seen) == 1
+
+
+def test_reliable_retries_unreadable_bbl_in_card_region_and_keeps_full_crop_anchors(tmp_path, monkeypatch):
+    from PIL import Image
+    window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_key", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _, path: _write_portal_screen(Path(path)))
+    sleeps, sizes = [], []
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda n: sleeps.append(n))
+    screens = iter([
+        [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+         nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block", (20, 300, 70, 320)),
+         nyc_portal.ScreenText("Lot", (300, 300, 390, 320))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 320)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 320))],
+    ])
+    def ocr(path):
+        sizes.append(Image.open(path).size)
+        return next(screens)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    assert (result.block, result.lot) == ("5712", "70")
+    assert sizes == [(500, 400), (650, 640), (1000, 800), (650, 800)]
+    assert sleeps == [1.0, 2.0, .2, 3.0, 2.0]
+    assert Image.open(result.map_image).getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_reliable_unreadable_bbl_does_not_send_vision(tmp_path, monkeypatch):
+    window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_key", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _, path: _write_portal_screen(Path(path)))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
+    screens = iter([
+        [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+         nyc_portal.ScreenText("Borough", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Block", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Block", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot", (300, 300, 400, 330))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _: next(screens))
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("Vision без Block/Lot недопустим"))
+    with pytest.raises(nyc_portal.PortalLookupError, match="не смог прочитать"):
+        nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="test")
+
+
+def test_driver_prewarms_ocr_in_parallel_with_browser_preparation(tmp_path, monkeypatch):
+    import threading
+    started, release, browser_seen, reached_capture = (threading.Event() for _ in range(4))
+    def load():
+        started.set()
+        if not release.wait(2):
+            raise RuntimeError("OCR warmup was never released")
+        return object()
+    monkeypatch.setattr(nyc_portal.ocr_pages, "_engine_or_raise", load)
+    monkeypatch.setattr(nyc_portal, "_start_ocr_warmup", _real_start_ocr_warmup)
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    def browser():
+        browser_seen.set()
+        return nyc_portal.browser_save.BrowserWindow(42, "Property Information Portal - Chrome", "chrome.exe")
+    monkeypatch.setattr(nyc_portal, "_portal_window", browser)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
+    def capture(_):
+        reached_capture.set()
+        raise nyc_portal.PortalLookupError("тестовая остановка")
+    monkeypatch.setattr(nyc_portal, "_initial_screen", capture)
+    errors = []
+    def run():
+        try:
+            nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+        except Exception as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert started.wait(1) and browser_seen.wait(1)
+        assert not reached_capture.is_set()  # настройки браузера шли параллельно загрузке
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive() and reached_capture.is_set()
+    assert len(errors) == 1 and "тестовая остановка" in str(errors[0])
+
+
+def test_reliable_missing_borough_uses_full_retry_without_extra_capture(tmp_path, monkeypatch):
+    from PIL import Image
+    window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_key", lambda *_: None)
+    monkeypatch.setattr(nyc_portal, "_zoom_out_map_pane", lambda *_: None)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
+    captures = []
+    def capture(_, path):
+        captures.append(True)
+        _write_portal_screen(Path(path))
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+    sizes = []
+    screens = iter([
+        [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
+        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+         nyc_portal.ScreenText("Borough", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 320)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 320))],
+        [nyc_portal.ScreenText("Block 5712", (20, 300, 150, 320)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 320))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 320)),
+         nyc_portal.ScreenText("Lot 70", (300, 300, 400, 320))],
+    ])
+    def ocr(path):
+        sizes.append(Image.open(path).size)
+        return next(screens)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", ocr)
+    result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    assert (result.block, result.lot, result.borough) == ("5712", "70", "Staten Island")
+    assert sizes[-2:] == [(650, 800), (1000, 800)]
+    assert len(captures) == 5  # форма, подсказка, карточка, повтор, итоговая карта
+
+
+def test_reliable_suggestion_rechecks_wrong_first_suggestion_before_selecting(monkeypatch):
+    label = [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))]
+    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))]
+    correct = [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))]
+    clock = _FakeClock()
+    monkeypatch.setattr(nyc_portal, "time", clock)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    captures = []
+    def capture(_, path):
+        captures.append(True)
+        Path(path).write_bytes(str(len(captures)).encode())
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+    screens = iter([wrong, correct])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda *_: next(screens))
+    nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
+    assert len(captures) == 2 and clock.sleeps == [2.0, 2.0]
+
+
+def test_reliable_initial_screen_failure_retries_once_but_challenge_does_not(tmp_path, monkeypatch):
+    window = nyc_portal.browser_save.BrowserWindow(handle=42, title="Property Information Portal - Chrome", executable="chrome.exe")
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _: True)
+    waits = []
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda n: waits.append(n))
+    calls = []
+    def missing(_):
+        calls.append(True)
+        raise nyc_portal._InitialScreenNotFound("нет формы")
+    monkeypatch.setattr(nyc_portal, "_initial_screen", missing)
+    with pytest.raises(nyc_portal.PortalLookupError, match="нет формы"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    assert len(calls) == 2 and waits == [1.0, 2.0]
+    calls.clear()
+    waits.clear()
+    def challenge(_):
+        calls.append(True)
+        raise nyc_portal.PortalLookupError("CAPTCHA")
+    monkeypatch.setattr(nyc_portal, "_initial_screen", challenge)
+    with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
+        nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
+    assert len(calls) == 1 and waits == [1.0]

@@ -3177,8 +3177,8 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
         ctk.CTkLabel(
-            checks, text="Быстрый режим не проверяет каждый экран: действия могут не сработать; "
-            "CAPTCHA может остаться незамеченной. Проверяйте адрес, Block и Lot.",
+            checks, text="Без галочки — надёжный режим: проверки после пауз и ограниченные повторы. "
+            "Быстрый режим пропускает проверки; проверяйте адрес, Block и Lot.",
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
         ).grid(row=2, column=0, sticky="w", pady=(4, 0))
@@ -3409,6 +3409,11 @@ class SurveyApp(ctk.CTk):
             self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
                 f"Быстрый режим: пауза {fast_pause:g} с вместо промежуточных OCR-проверок. "
                 "CAPTCHA или неверная подсказка могут остаться незамеченными — проверьте результат."
+            )))
+        else:
+            self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                "Надёжный режим: OCR готовится заранее; проверка после паузы, "
+                "при неудаче один повтор без частых снимков."
             )))
         self._render_step0_log()
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")

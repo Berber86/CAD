@@ -416,3 +416,52 @@ def test_street_name_split_by_a_dot_or_dash_is_joined():
     assert "Carlton Boulevard" in ocr_pages.restore_word_breaks("Carlton-Boulevard; running")
     # Обычная фраза со строчным словом не склеивается.
     assert "the end. Street was" in ocr_pages.restore_word_breaks("the end. Street was")
+
+
+def test_engine_initializes_once_for_parallel_prewarm_and_regular_ocr(monkeypatch):
+    import threading
+    import time
+    import types
+    import sys
+    calls = []
+    engine = object()
+    def construct():
+        calls.append(True)
+        time.sleep(.03)
+        return engine
+    monkeypatch.setattr(ocr_pages, "_engine", None)
+    monkeypatch.setattr(ocr_pages, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", types.SimpleNamespace(RapidOCR=construct))
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(ocr_pages._engine_or_raise())) for _ in range(4)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=2)
+    assert len(results) == 4 and all(result is engine for result in results)
+    assert len(calls) == 1
+
+
+def test_shared_engine_calls_are_serialized():
+    import threading
+    active, maximum = 0, 0
+    guard = threading.Lock()
+    entered = threading.Event()
+    release = threading.Event()
+    def engine(_):
+        nonlocal active, maximum
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+        entered.set()
+        release.wait(1)
+        with guard:
+            active -= 1
+        return "ok"
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(ocr_pages.run_engine(engine, "image"))) for _ in range(3)]
+    try:
+        for thread in threads: thread.start()
+        assert entered.wait(1)
+    finally:
+        release.set()
+        for thread in threads: thread.join(timeout=2)
+    assert maximum == 1 and results == ["ok"] * 3

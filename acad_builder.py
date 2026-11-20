@@ -802,9 +802,26 @@ def estimate_text_width(text: str, text_height: float, cfg: dict[str, Any]) -> f
     return width
 
 
-def segment_distance_label(segment: Segment) -> str:
+def description_uses_feet_inches(description: LegalDescription) -> bool:
+    """Use mixed-format display only when a current source actually contains inches."""
+    return any(format_feet_inches_source(s.distance_source, s.distance_ft)
+               for s in description.segments) or bool(format_feet_inches_source(
+                   description.distance_to_corner_source, description.distance_to_corner_ft or 0.0))
+
+
+def display_distance(distance: float, source: str | None = None, *, feet_inches: bool = False) -> str:
+    original = format_feet_inches_source(source, distance)
+    if original:
+        return original
+    # A stale source is intentionally not presented as a verified feet/inches value.
+    if feet_inches and not source and float(distance).is_integer():
+        return f"{int(distance)}'-0\""
+    return format_distance(distance)
+
+
+def segment_distance_label(segment: Segment, *, feet_inches: bool = False) -> str:
     """Печатные футы и дюймы сохраняем, если они соответствуют текущему размеру."""
-    return format_feet_inches_source(segment.distance_source, segment.distance_ft) or format_distance(segment.distance_ft)
+    return display_distance(segment.distance_ft, segment.distance_source, feet_inches=feet_inches)
 
 
 def build_side_label(
@@ -812,6 +829,7 @@ def build_side_label(
     text_height: float,
     side_length: float,
     cfg: dict[str, Any],
+    *, feet_inches: bool = False,
 ) -> tuple[str, bool]:
     """
     Подпись стороны в одну строку: румб + пробелы (для длинных сторон) + длина.
@@ -824,7 +842,7 @@ def build_side_label(
     """
     use_control = bool(cfg.get("degrees_as_control_code", True))
     bearing = format_bearing(segment, use_control_code=use_control)
-    distance = segment_distance_label(segment)
+    distance = segment_distance_label(segment, feet_inches=feet_inches)
     threshold = float(cfg.get("long_side_threshold_ft", 40.0))
     if side_length <= threshold:
         return f"{bearing} {distance}", False
@@ -923,6 +941,7 @@ def build_side_lines(
     text_height: float,
     side_length: float,
     cfg: dict[str, Any],
+    *, feet_inches: bool = False,
 ) -> tuple[list[str], bool]:
     """
     Формирует логические строки подписи стороны:
@@ -933,7 +952,7 @@ def build_side_lines(
       * для обычных/длинных сторон — 1 строка из ``build_side_label`` (с растяжкой > 40 ft).
     """
     use_control = bool(cfg.get("degrees_as_control_code", True))
-    distance = segment_distance_label(segment)
+    distance = segment_distance_label(segment, feet_inches=feet_inches)
     if not getattr(segment, "has_bearing", True):
         note = getattr(segment, "course_note", None)
         if note:
@@ -946,14 +965,16 @@ def build_side_lines(
             clean_note = re.sub(r"\s+", " ", clean_note).strip(" ,;:-").upper()
             if not clean_note:
                 return [distance], False
+            clean_note = street_names.ordinal_street_numbers(clean_note)
             if use_control:
                 clean_note = clean_note.replace("°", "%%d")
             note_h = text_height * 0.82
-            wrapped = _wrap_course_note(clean_note, note_h, side_length, cfg)
+            wrapped = ([clean_note] if re.match(r"^PARALLEL\s+(?:WITH|TO)\b", clean_note, re.IGNORECASE)
+                       else _wrap_course_note(clean_note, note_h, side_length, cfg))
             return [*wrapped, distance], False
         return [distance], False
 
-    single_line, stretched = build_side_label(segment, text_height, side_length, cfg)
+    single_line, stretched = build_side_label(segment, text_height, side_length, cfg, feet_inches=feet_inches)
     if stretched:
         return [single_line], True
 
@@ -1179,7 +1200,8 @@ def make_print_draft(
         is_side_dimension = bool(side_match)
         if side_match and "-note" in item.kind:
             index = int(side_match.group(1)) - 1
-            is_side_dimension = bool(plan.description.segments[index].has_bearing)
+            is_side_dimension = (bool(plan.description.segments[index].has_bearing)
+                                 and not re.match(r"^PARALLEL\s+(?:WITH|TO)\b", item.text, re.IGNORECASE))
         height = 4.0 if is_street else (2.0 if is_side_dimension else 1.6)
         items.append(dc_replace(item, point=point, height=height))
 
@@ -1799,6 +1821,7 @@ class AcadBuilder:
         arcs: list[ArcItem] = []
         side_band_extra: dict[int, float] = {}
         count = len(points)
+        feet_inches = description_uses_feet_inches(description)
 
         for index, segment in enumerate(segments):
             if boundary_lines is not None and index < len(boundary_lines):
@@ -1812,7 +1835,13 @@ class AcadBuilder:
                 warnings.append(f"сторона #{index + 1}: нулевая длина — пропущена")
                 continue
 
-            lines, _ = build_side_lines(segment, text_height, length, cfg)
+            display_segment = segment
+            if index == front_index and not segment.has_bearing and segment.course_note:
+                # Only remove the frontage's along-the-street phrase; retain other notes.
+                note = re.sub(r"\balong\s+[^,;]+", "", segment.course_note,
+                              flags=re.IGNORECASE).strip(" ,;:-")
+                display_segment = segment.model_copy(update={"course_note": note or None})
+            lines, _ = build_side_lines(display_segment, text_height, length, cfg, feet_inches=feet_inches)
             angle = math.atan2(end[1] - start[1], end[0] - start[0])
             rot = text_rotation(angle)
             up_x, up_y = -math.sin(rot), math.cos(rot)
@@ -1820,7 +1849,28 @@ class AcadBuilder:
             midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
 
             has_bearing = bool(getattr(segment, "has_bearing", True))
-            if not has_bearing:
+            explicit_note = str(getattr(display_segment, "course_note", None) or "").strip()
+            if has_bearing and re.match(r"^PARALLEL\s+(?:WITH|TO)\b", explicit_note, re.IGNORECASE):
+                # Preserve the printed bearing as a separate line above the length;
+                # the explicit parallel note remains below the length when read.
+                parallel_note = re.sub(r"\bPART\s+OF\s+THE\s+DISTANCE\s+THROUGH\s+(?:A\s+|THE\s+)?PARTY[\s-]+WALL\b", "", explicit_note, flags=re.IGNORECASE)
+                if segment.party_wall:
+                    parallel_note = re.sub(r"\bPARTY[\s-]+WALL\b", "", parallel_note, flags=re.IGNORECASE)
+                parallel_note = street_names.ordinal_street_numbers(" ".join(parallel_note.upper().split()).strip(" ,;:-"))
+                rows = [format_bearing(segment, use_control_code=use_control),
+                        segment_distance_label(segment, feet_inches=feet_inches), parallel_note]
+                heights = [text_height, text_height, round(text_height * 0.82, 4)]
+                max_line_width = max(estimate_text_width(t, h, cfg) for t, h in zip(rows, heights))
+                if max_line_width > length:
+                    warnings.append(f"подпись стороны #{index + 1} (≈{max_line_width:.1f} ед.) длиннее самой "
+                                    f"стороны ({length:.1f} ft) — уменьшите масштаб/высоту текста")
+                for row_index, (text, height, suffix) in enumerate(zip(rows, heights, ("-bearing", "", "-note"))):
+                    row_offset = offset + (2 - row_index if up_dot_n >= 0 else row_index) * line_gap
+                    items.append(TextItem(text=text, point=(midpoint[0] + nx * row_offset,
+                                                            midpoint[1] + ny * row_offset),
+                                          rotation=rot, kind=f"side-{index + 1}{suffix}", height=height))
+                side_band_extra[index] = 2 * line_gap
+            elif not has_bearing:
                 # Эталон NYC Survey без компасных румбов (Queens / Brooklyn):
                 # ремарка (PARALLEL WITH / AT RIGHT ANGLES) — мелким кеглем ближе к границе,
                 # длина (26.32', 90.00', 90.17', 20.72') — крупнее снаружи ремарки.
@@ -1856,6 +1906,13 @@ class AcadBuilder:
                         )
                     dist_off = offset + (len(ordered_notes) - 1) * note_gap + line_gap
                     side_band_extra[index] = dist_off - offset
+                    if re.match(r"^PARALLEL\s+(?:WITH|TO)\b", note_lines[0], re.IGNORECASE) and up_dot_n < 0:
+                        # Lower in reading coordinates, regardless of which side of the lot.
+                        dist_off = offset
+                        for pos in range(len(items) - len(ordered_notes), len(items)):
+                            item = items[pos]
+                            items[pos] = dc_replace(item, point=(item.point[0] + nx * line_gap,
+                                                                  item.point[1] + ny * line_gap))
                 else:
                     dist_off = offset
                     side_band_extra[index] = 0.0
@@ -2285,8 +2342,8 @@ class AcadBuilder:
             dist_label = (
                 str(tie_note).upper()
                 if tie_note
-                else (format_feet_inches_source(description.distance_to_corner_source, dist_val)
-                      or format_distance(dist_val))
+                else display_distance(dist_val, description.distance_to_corner_source,
+                                      feet_inches=description_uses_feet_inches(description))
             )
             dist_width = estimate_text_width(dist_label, text_height, cfg)
 
@@ -3131,7 +3188,8 @@ class AcadBuilder:
             # Временные пометки действий программы: только основной участок,
             # независимо от того, через какой сценарий GUI был рассчитан план.
             try:
-                callouts, callout_warnings = drawing_warnings.plan_callouts(geo, segment_distance_label)
+                callouts, callout_warnings = drawing_warnings.plan_callouts(geo, lambda seg: segment_distance_label(
+                    seg, feet_inches=description_uses_feet_inches(geo.description)))
                 warnings.extend(callout_warnings)
                 if callouts:
                     warning_layer = self._ensure_survey_layer(doc, drawing_warnings.LAYER, 7, warnings)

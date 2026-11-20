@@ -866,7 +866,7 @@ _VULGAR_FRACTIONS: dict[str, str] = {
 }
 
 _FEET_INCHES_STR_RE = re.compile(
-    r"(?P<ft>\d+(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:-\s*|and\s+)?"
+    r"(?P<ft>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:-\s*|and\s+)?"
     r"(?:"
     r"(?P<in>\d+(?:\.\d+)?)(?:[\s-]+(?P<fnum>\d+)\s*/\s*(?P<fden>\d+))?"
     r"|(?P<pnum>\d+)\s*/\s*(?P<pden>\d+)"
@@ -883,7 +883,7 @@ def _replace_vulgar_fractions(text: str) -> str:
 
 
 def _feet_inches_match_to_ft(fi: re.Match[str]) -> float:
-    feet = float(fi.group("ft"))
+    feet = float(fi.group("ft").replace(",", ""))
     inches = float(fi.group("in")) if fi.group("in") is not None else 0.0
     if fi.group("fnum") and fi.group("fden") and float(fi.group("fden")) > 0:
         inches += float(fi.group("fnum")) / float(fi.group("fden"))
@@ -3194,7 +3194,8 @@ def legal_to_step0_text(data: "LegalDescription") -> str | None:
         source = format_feet_inches_source(seg.distance_source, seg.distance_ft)
         dimension = source if source else f"{float(seg.distance_ft):.2f} feet"
         wall = " through a party wall" if seg.party_wall else ""
-        parts.append(f"{lead} {bearing(seg)}{wall} {dimension}{ending}")
+        note = (f" {seg.course_note}," if re.match(r"^PARALLEL WITH\b", seg.course_note or "", re.IGNORECASE) else "")
+        parts.append(f"{lead} {bearing(seg)}{note}{wall} {dimension}{ending}")
     return " ".join(parts)
 
 
@@ -3402,7 +3403,7 @@ def format_feet_inches_source(source: str | None, distance: float) -> str | None
         inches += f" {fi.group('fnum')}/{fi.group('fden')}"
     elif fi.group("pnum"):
         inches = f"{fi.group('pnum')}/{fi.group('pden')}"
-    return f"{feet}' {inches.strip()}\""
+    return f"{feet}'-{inches.strip()}\""
 
 
 def _corner_feet_inches_source(preamble: str, lot_body: str, distance: float | None) -> str | None:
@@ -3904,13 +3905,15 @@ def _segments_from_regex(
     for idx, clause in enumerate(clauses):
         end = clauses[idx + 1].start() if idx + 1 < len(clauses) else len(text)
         content = text[clause.end():end]
-        if not re.search(r"\bparty[\s-]+wall\b", content, re.IGNORECASE):
-            continue
         candidates = [seg for pos, seg in placed if clause.end() <= pos < end]
-        if len(candidates) == 1:
-            candidates[0]["party_wall"] = True
-        else:
-            warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
+        relative_note = _extract_course_note(content)
+        if len(candidates) == 1 and relative_note and relative_note.startswith("PARALLEL WITH "):
+            candidates[0]["course_note"] = relative_note
+        if re.search(r"\bparty[\s-]+wall\b", content, re.IGNORECASE):
+            if len(candidates) == 1:
+                candidates[0]["party_wall"] = True
+            else:
+                warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
     if re.search(r"\bparty[\s-]+wall\b", text, re.IGNORECASE) and not any(
         seg.get("party_wall") for _, seg in placed
     ) and not any("PARTY WALL" in warning for warning in warnings):
@@ -4276,7 +4279,7 @@ def _extract_streets(
     if distance_to_corner is None:
         distance_match = re.search(
             r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
-            r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
+            r"(?:\s*(?:-\s*|and\s+)?(?P<inch>(?:\d+(?:\.\d+)?(?:[\s-]+\d+\s*/\s*\d+)?|\d+\s*/\s*\d+))\s*(?:inches|inch|in|\"))?\s*"
             # «U.S. Standard (75.00 feet Deed)» между числом и направлением
             r"(?:\s*U\.?\s*S\.?\s*(?:Standard|Survey)\.?)?"
             r"(?:\s*\([^()]{0,40}\))?"
@@ -4291,8 +4294,12 @@ def _extract_streets(
         if distance_match:
             feet_val = float(distance_match.group("num").replace(",", ""))
             inch_raw = distance_match.groupdict().get("inch")
-            inch_val = float(inch_raw) / 12.0 if inch_raw else 0.0
-            distance_to_corner = feet_val + inch_val
+            feet_inches = _FEET_INCHES_STR_RE.match(text, distance_match.start()) if inch_raw else None
+            if feet_inches and not any(feet_inches.group(name) and int(feet_inches.group(name)) == 0
+                                       for name in ("fden", "pden")):
+                distance_to_corner = _feet_inches_match_to_ft(feet_inches)
+            else:
+                distance_to_corner = feet_val
         elif preamble:
             tie_dists = list(_DISTANCE_RE.finditer(preamble))
             if tie_dists:

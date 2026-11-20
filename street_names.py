@@ -257,9 +257,29 @@ def former_line(former: str | None) -> str | None:
     return f"(FORMERLY {street_text(former)})"
 
 
+def ordinal_street_numbers(text: str) -> str:
+    """Normalize numeric street ordinals without treating a separate St as a suffix."""
+    def suffix(number: str) -> str:
+        value = int(number)
+        if 11 <= value % 100 <= 13:
+            return "th"
+        return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+
+    # An attached ordinal is unambiguous; do not touch decimals or address ranges.
+    text = re.sub(r"(?<![\w.\-])(\d+)(?:st|nd|rd|th)\b",
+                  lambda m: m.group(1) + suffix(m.group(1)), text, flags=re.IGNORECASE)
+    # Add a suffix only when a standalone number directly names a street.
+    return re.sub(
+        r"(?<![\w.\-])(\d+)(?=\s+(?:street|st\.?|avenue|ave\.?|road|rd\.?|"
+        r"drive|dr\.?|boulevard|blvd\.?|lane|ln\.?|place|pl\.?|court|ct\.?|"
+        r"terrace|ter\.?|way)\b)",
+        lambda m: m.group(1) + suffix(m.group(1)), text, flags=re.IGNORECASE,
+    )
+
+
 def street_text(name: str | None) -> str:
-    """Название улицы для чертежа: верхний регистр, между словами два пробела."""
-    return "  ".join(str(name or "").upper().split())
+    """Название улицы: верхний регистр, строчные ordinal и два пробела."""
+    return "  ".join(ordinal_street_numbers(str(name or "").upper()).split())
 
 
 def _alias_items(description: Any) -> list[str]:

@@ -1049,14 +1049,9 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # На сторонах без румбов нет искусственных DMS-румбов вроде «N 90%%d00' E»
     assert by_kind["side-1"].text == "90.17'"
     assert by_kind["side-2"].text == "26.32'"
-    # Короткая верхняя ремарка перенесена в 2 строки под длиной 26.32' (как в эталоне PDF)
-    assert by_kind["side-2-note-2"].text == "PARALLEL WITH"
-    assert by_kind["side-2-note"].text == "QUEENS MIDTOWN EXPRESSWAY"
-    assert (
-        by_kind["side-2"].point[1]
-        > by_kind["side-2-note-2"].point[1]
-        > by_kind["side-2-note"].point[1]
-    )
+    # Длина выше единой строки PARALLEL WITH при чтении.
+    assert by_kind["side-2-note"].text == "PARALLEL WITH QUEENS MIDTOWN EXPRESSWAY"
+    assert by_kind["side-2"].point[1] > by_kind["side-2-note"].point[1]
     # Справа ремарка ближе к границе, а размер 90.00' — правее ремарки
     assert by_kind["side-3"].text == "90.00'"
     assert by_kind["side-3-note"].text == "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY"
@@ -1070,7 +1065,7 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
     assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
-    assert by_kind["cross-street"].text == "63RD  STREET"
+    assert by_kind["cross-street"].text == "63rd  STREET"
     assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
     assert "cross-street-distance" not in by_kind
 

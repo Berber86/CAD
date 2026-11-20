@@ -55,18 +55,18 @@ def test_feet_and_inches_round_trip_with_original_side_geometry():
     draft = make_print_draft(plan, {})
     for p in (plan, draft):
         by_kind = {item.kind: item.text for item in p.items}
-        assert by_kind["side-1"] == "13' 8\""
-        assert by_kind["side-2"] == "25' 10\""
+        assert by_kind["side-1"] == "13'-8\""
+        assert by_kind["side-2"] == "25'-10\""
     assert math.dist(plan.boundary_lines[0].start, plan.boundary_lines[0].end) == pytest.approx(13 + 8/12)
     cached = parser.legal_to_step0_text(desc)
     again, _ = parser.parse_with_regex(cached)
-    assert [s.distance_source for s in again.segments] == ["13' 8\"", "25' 10\"", "13' 8\"", "25' 10\""]
+    assert [s.distance_source for s in again.segments] == ["13'-8\"", "25'-10\"", "13'-8\"", "25'-10\""]
 
 
 @pytest.mark.parametrize("source,dist,expected", [
-    ("25'-6 1/2\"", 25+6.5/12, "25' 6 1/2\""),
-    ("14 feet 1/4 inches", 14+.25/12, "14' 1/4\""),
-    ("12'-3.5\"", 12+3.5/12, "12' 3.5\""),
+    ("25'-6 1/2\"", 25+6.5/12, "25'-6 1/2\""),
+    ("14 feet 1/4 inches", 14+.25/12, "14'-1/4\""),
+    ("12'-3.5\"", 12+3.5/12, "12'-3.5\""),
 ])
 def test_fractional_inches_are_not_converted_to_decimal_feet(source, dist, expected):
     assert parser.format_feet_inches_source(source, dist) == expected
@@ -85,8 +85,8 @@ def test_changed_size_never_prints_stale_source_measure():
     assert segment_distance_label(seg) == "15.00'"
     changed = desc.model_copy(update={"segments": [seg, *desc.segments[1:]]})
     assert any("футы/дюймы" in w and "сторона #1" in w for w in AcadBuilder(config()).plan(changed).warnings)
-    assert segment_distance_label(parser._flip_segment_direction(desc.segments[0])) == "13' 8\""
-    assert segment_distance_label(parser._mutate_segment_bearing(desc.segments[0])) == "13' 8\""
+    assert segment_distance_label(parser._flip_segment_direction(desc.segments[0])) == "13'-8\""
+    assert segment_distance_label(parser._mutate_segment_bearing(desc.segments[0])) == "13'-8\""
 
 
 def test_cross_street_former_does_not_leak_to_main_and_is_on_both_plans():
@@ -136,7 +136,7 @@ def test_ai_missed_inches_are_restored_when_courses_match(monkeypatch):
     monkeypatch.setattr(parser, "accepted_without_ai", lambda check: False)
     out = parser.parse_legal_description_full(text=text, cfg=config(), use_llm=True, ask_on_doubt=False)
     assert out.source == "llm"
-    assert [segment_distance_label(s) for s in out.data.segments] == ["13' 8\"", "25' 10\"", "13' 8\"", "25' 10\""]
+    assert [segment_distance_label(s) for s in out.data.segments] == ["13'-8\"", "25'-10\"", "13'-8\"", "25'-10\""]
 
 
 def test_tie_dimension_keeps_feet_and_inches_on_original_and_draft():
@@ -147,8 +147,8 @@ def test_tie_dimension_keeps_feet_and_inches_on_original_and_draft():
     assert desc.distance_to_corner_source == "420 feet 8 inches"
     plan = AcadBuilder(config()).plan(desc, scale=16)
     draft = make_print_draft(plan, {})
-    assert next(i.text for i in plan.items if i.kind == "cross-street-distance") == "420' 8\""
-    assert next(i.text for i in draft.items if i.kind == "cross-street-distance") == "420' 8\""
+    assert next(i.text for i in plan.items if i.kind == "cross-street-distance") == "420'-8\""
+    assert next(i.text for i in draft.items if i.kind == "cross-street-distance") == "420'-8\""
     assert math.dist(*[(next(l for l in draft.lines if l.kind == "main-street-row-tie")).start,
                        (next(l for l in draft.lines if l.kind == "main-street-row-tie")).end]) == pytest.approx(40)
     changed = desc.model_copy(update={"distance_to_corner_ft": 425})
@@ -157,7 +157,7 @@ def test_tie_dimension_keeps_feet_and_inches_on_original_and_draft():
     cached = parser.legal_to_step0_text(desc)
     after, _ = parser.parse_with_regex(cached)
     assert after.distance_to_corner_ft == pytest.approx(desc.distance_to_corner_ft)
-    assert after.distance_to_corner_source == "420' 8\""
+    assert after.distance_to_corner_source == "420'-8\""
 
 
 def test_cache_preserves_both_former_streets_and_party_wall():
@@ -178,6 +178,6 @@ def test_last_commencing_tie_keeps_feet_and_inches():
     assert desc.distance_to_corner_ft == pytest.approx(208 + 2/12)
     assert desc.distance_to_corner_source == "208 feet 2 inches"
     plan = AcadBuilder(config()).plan(desc, scale=16)
-    assert next(item.text for item in plan.items if item.kind == "cross-street-distance") == "208' 2\""
+    assert next(item.text for item in plan.items if item.kind == "cross-street-distance") == "208'-2\""
     draft = make_print_draft(plan, {})
-    assert next(item.text for item in draft.items if item.kind == "cross-street-distance") == "208' 2\""
+    assert next(item.text for item in draft.items if item.kind == "cross-street-distance") == "208'-2\""

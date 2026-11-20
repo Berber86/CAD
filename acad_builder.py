@@ -2532,7 +2532,7 @@ class AcadBuilder:
         if lot_identity.conflict(description):
             warnings.append(
                 f"номер лота из имени файла ({lot_identity.source_number(description)}) "
-                f"не совпадает с номером в документе ({description.lot_number}) — сверьте"
+                f"не совпадает с номером в результате разбора ({description.lot_number}) — сверьте"
             )
         if not lot_identity.effective_number(description) and not (is_neighbor and neighbor_label):
             role = "соседа" if is_neighbor else "основного участка"

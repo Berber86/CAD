@@ -5923,3 +5923,26 @@ def test_direct_batch_neighbor_files_keep_independent_lot_numbers(gui, tmp_path,
     assert app._neighbor_plan_sources[first].pob == app._neighbor_plan_sources[second].pob
     assert all(app._neighbor_plan_sources[path].description.lot_number == "26" for path in (first, second))
     app._on_close()
+
+
+def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    app = gui.SurveyApp()
+    _fill_step0(app, neighbours="30, 40", folder=tmp_path)
+    app.step0_address_var.set("Example address")
+    app.step0_borough_var.set("Queens")
+    portal = SimpleNamespace(block="6323", lot="32", borough="Queens", neighbours=["30"], details_source="vision")
+    app._step0_lookup_snapshot = ("Example address", portal)
+    seen = {}
+    def collect(**kwargs):
+        seen.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert seen["borough"] == "Queens"
+    assert seen["identity_by_lot"]["32"]["block"][0]["source"] == "portal"
+    assert seen["identity_by_lot"]["30"]["lot"][0]["method"] == "vision map (unverified)"
+    assert seen["identity_by_lot"]["40"]["lot"][0]["source"] == "manual"
+    app._on_close()

@@ -173,6 +173,8 @@ def collect_deeds(
     *,
     block: int | str,
     lot: int | str,
+    borough: str = "",
+    identity_by_lot: dict[str, dict] | None = None,
     neighbours: Sequence[int] | str = (),
     folder: str | Path | None = None,
     base_url: str = rcclerk.BASE_URL,
@@ -264,6 +266,7 @@ def collect_deeds(
             check_stop()
             outcome_item = _collect_one(
                 block_no=block_no, lot_value=lot_value, role=role, row=row, tag=tag,
+                borough=borough, identity=(identity_by_lot or {}).get(str(lot_value)),
                 target_dir=target_dir, base_url=base_url,
                 download=download, find_pages=find_pages, ocr_dpi=ocr_dpi,
                 say=say, missing=outcome.missing,
@@ -288,6 +291,8 @@ def _collect_one(
     block_no: int,
     lot_value: int,
     role: str,
+    borough: str = "",
+    identity: dict | None = None,
     row: rcclerk.DeedRow,
     tag: str,
     target_dir: Path,
@@ -350,7 +355,7 @@ def _collect_one(
             notes.append(f"тип на сайте: {row.doc_type}")
         record = deed_store.store_pdf(
             target_dir, saved,
-            role=role, lot=lot_value, tag=tag, block=block_no,
+            role=role, lot=lot_value, tag=tag, block=block_no, borough=borough, identity=identity,
             doc_type=row.kind, doc_date=row.doc_date,
             endorsement_id=row.endorsement_id,
             source_url=rcclerk.document_pdf_url(row.endorsement_id, base=base_url),
@@ -374,7 +379,7 @@ def build_folder_for(address: str, *, parent: str | Path | None = None) -> Path:
 
 def copy_manual_pdf(
     folder: str | Path, source: str | Path, *, role: str, lot: int | str, tag: str = "NEW",
-    block: int | str = "", notes: Iterable[str] = (),
+    block: int | str = "", borough: str = "", identity: dict | None = None, notes: Iterable[str] = (),
 ) -> deed_store.StoredDeed:
     """
     Файл, скачанный руками (ступень 3 лестницы): назвать и положить по схеме.
@@ -383,14 +388,14 @@ def copy_manual_pdf(
     паспорт делает программа, чтобы папка описаний оставалась одинаковой.
     """
     return deed_store.store_pdf(
-        folder, source, role=role, lot=lot, tag=tag, block=block,
+        folder, source, role=role, lot=lot, tag=tag, block=block, borough=borough, identity=identity,
         notes=[*notes, "файл скачан вручную"],
     )
 
 
 def adopt_downloads(
     folder: str | Path, *, role: str, lot: int | str, tag: str = "NEW",
-    block: int | str = "", downloads: str | Path | None = None,
+    block: int | str = "", borough: str = "", identity: dict | None = None, downloads: str | Path | None = None,
 ) -> deed_store.StoredDeed | None:
     """
     Забрать из «Загрузок» самый свежий PDF и положить его по схеме.
@@ -405,6 +410,6 @@ def adopt_downloads(
     if source is None:
         return None
     return copy_manual_pdf(
-        target, source, role=role, lot=lot, tag=tag, block=block,
+        target, source, role=role, lot=lot, tag=tag, block=block, borough=borough, identity=identity,
         notes=[f"взято из загрузок: {source.name}"],
     )

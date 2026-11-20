@@ -484,6 +484,8 @@ def apply_changes(description: LegalDescription, changes: Sequence[Change]) -> L
     updated = LegalDescription.model_validate(data)
     updated._source_lot_number = description._source_lot_number
     updated._source_lot_filename = description._source_lot_filename
+    updated._source_identity = copy.deepcopy(description._source_identity)
+    updated._source_file_sha256 = description._source_file_sha256
     # model_dump не содержит приватного происхождения автоправок: переносим его
     # по индексам, не приписывая пользовательским правкам статус автоматических.
     for old, new in zip(description.segments, updated.segments):
@@ -1346,6 +1348,9 @@ def _lot_block(
     raw = lot.description
     lines = [f"[{label}] {'OUR LOT' if lot.is_main else 'NEIGHBOUR LOT'} — file \"{lot.name}\""]
     lines.append("  " + lot_identity.context(lot.description, lot.name))
+    if lot.description._source_identity:
+        lines.append(f"  current file: {lot.name}; SHA-256: {lot.description._source_file_sha256 or 'unknown'}")
+        lines.append("  identity observations (unverified): " + json.dumps(lot.description._source_identity, ensure_ascii=False))
     if desc is None:
         lines.append("  (the lot could not be built)")
         return "\n".join(lines)
@@ -1431,7 +1436,7 @@ def build_advisor_request(
             images.extend(lot.images)
         blocks.append(_lot_block(scene, lot, label, scene.virtual, image_range, text_limit))
     parts = ["LOTS (the data already includes Python's verified findings):", "\n\n".join(blocks),
-             "Lot numbers from filenames are identifiers, not proof of ownership, adjacency, geometry or document content; verify conflicts."]
+             "Identity observations are unverified and may be historical; compare file and SHA-256 before relying on them. Filename identifiers are not proof of ownership, adjacency, geometry or document content; verify conflicts."]
     if chosen:
         parts.append("PYTHON'S VERIFIED FINDINGS (already included above, do not repeat them):")
         parts.append("\n".join(
@@ -1822,7 +1827,7 @@ def _advisor_proposals(
 def advisor_cache_key(lots: Sequence[LotInput]) -> str:
     """Ключ разбора набора: пока файлы разобраны так же, советник заново не запрашивается."""
     payload = [
-        [lot.key, lot.name, lot.is_main, lot_identity.source_number(lot.description, lot.name), lot.description.model_dump(mode="json")]
+        [lot.key, lot.name, lot.is_main, lot_identity.source_number(lot.description, lot.name), lot.description._source_identity, lot.description._source_file_sha256, lot.description.model_dump(mode="json")]
         for lot in sorted(lots, key=lambda lot: lot.key)
     ]
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -2023,7 +2028,7 @@ def build_join_request(
                              for label, lot in labels.items()) + ".",
         "Only L1 (our lot) may be joined to a neighbour; joins between two neighbours are not asked for.",
         "Image 1 is the sketch of the figures as the program places them now.",
-        "Filename lot identifiers are not proof of adjacency, geometry, or the document's lot number; verify disagreements.",
+        "Identity observations are unverified and may be historical; compare file and SHA-256. Filename lot identifiers are not proof of adjacency, geometry, or the document's lot number; verify disagreements.",
     ]
     for label, lot in labels.items():
         base = scene.virtual.get(lot.key, ())
@@ -2035,6 +2040,9 @@ def build_join_request(
         n = len(plan.vertices)
         head = [f"{label} — {'our lot' if lot.is_main else 'neighbour'} «{lot.name}»",
                 lot_identity.context(lot.description, lot.name)]
+        if lot.description._source_identity:
+            head.append(f"current file: {lot.name}; SHA-256: {lot.description._source_file_sha256 or 'unknown'}")
+            head.append("identity observations (unverified): " + json.dumps(lot.description._source_identity, ensure_ascii=False))
         if desc.cross_street:
             head.append(f"tie: {desc.distance_to_corner_ft:.2f} ft from the corner of {desc.cross_street}")
         head.append(f"closure error {plan.closure.distance:.3f} ft")

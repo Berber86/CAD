@@ -1331,6 +1331,8 @@ class LegalDescription(BaseModel):
     # Метаинформация об источнике, не поле LLM-схемы и не часть deed.
     _source_lot_number: str | None = PrivateAttr(default=None)
     _source_lot_filename: str | None = PrivateAttr(default=None)
+    _source_identity: dict[str, list[dict[str, str]]] = PrivateAttr(default_factory=dict)
+    _source_file_sha256: str = PrivateAttr(default="")
 
     main_street: str = Field(
         description="Улица, на которую выходит фасад участка (fronting ...)"

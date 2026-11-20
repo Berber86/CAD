@@ -72,8 +72,8 @@ def test_both_advisor_requests_explicitly_identify_each_lot_and_source():
     advice, _, labels = build_advisor_request(scene, [], ["overlap"], None)
     join = build_join_request(scene, [], ["overlap"], labels)
     for request in (advice, join):
-        assert "lot identifier from filename: 32; lot from document: unknown" in request
-        assert "lot identifier from filename: 30; lot from document: 31" in request
+        assert "lot identifier from filename: 32; lot from parser result: unknown" in request
+        assert "lot identifier from filename: 30; lot from parser result: 31" in request
         assert "DISAGREEMENT" in request and "not proof" in request.lower()
     assert labels["L1"] is main and labels["L2"] is neighbor
     assert advisor_cache_key([main, neighbor]) != advisor_cache_key([main, replace(neighbor, name="LOT 31.pdf")])

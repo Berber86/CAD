@@ -456,3 +456,34 @@ def test_old_deed_and_fresh_mortgage_flow_saves_mortgage_as_new_and_deed_as_old(
     assert records["OUR 32 NEW.pdf"].endorsement_id == "111333"
     assert records["OUR 32 NEW.pdf"].doc_type == "MORTGAGE"
     assert records["OUR 32 OLD.pdf"].endorsement_id == str(OUR_OLD)
+
+
+def test_portal_values_are_kept_per_file_and_survive_step1_read(tmp_path):
+    from types import SimpleNamespace
+    import file_metadata
+    import lot_identity
+    from llm_parser import ParseOutcome, parse_with_regex, ASPENWALL_SAMPLES
+
+    portal = SimpleNamespace(block=str(BLOCK), lot=str(LOT), borough="Staten Island",
+                             neighbours=[str(NEIGHBOUR)], details_source="vision")
+    identities = file_metadata.intake_observations(BLOCK, LOT, "Staten Island", [NEIGHBOUR],
+                                                     "Example address", ("Example address", portal))
+    result = _collect(tmp_path, borough="Staten Island", neighbours=[NEIGHBOUR], identity_by_lot=identities)
+    records = {r.file: r for r in deed_store.read_records(result.folder)}
+    ours, neighbor = records["OUR 32 NEW.pdf"], records["LOT 30 NEW.pdf"]
+    assert ours.borough == neighbor.borough == "Staten Island"
+    assert any(e["source"] == "portal" and e["method"] == "vision" for e in ours.identity["block"])
+    assert any(e["value"] == "32" and e["source"] == "portal" for e in ours.identity["lot"])
+    assert any(e["value"] == "30" and "vision map" in e["method"] for e in neighbor.identity["lot"] if e["source"] == "portal")
+    assert all(e["value"] != "32" for e in neighbor.identity["lot"])
+    # Step 1 parses the trimmed copy; it updates the original passport and manifest.
+    model, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    model = model.model_copy(update={"block_number": "1234", "borough_or_city": "Queens"})
+    bound = lot_identity.bind_outcome(ParseOutcome(data=model, source="llm-vision"), result.folder / neighbor.trimmed)
+    passport = json.loads((result.folder / neighbor.sidecar_name()).read_text(encoding="utf-8"))
+    assert passport["identity"] == bound.data._source_identity
+    assert any(e["value"] == "1234" and e["source"] == "ai" for e in passport["identity"]["block"])
+    assert any(e["value"] == str(BLOCK) and e["source"] == "portal" for e in passport["identity"]["block"])
+    assert any(e["value"] == "Queens" and e["source"] == "ai" for e in passport["identity"]["borough"])
+    manifest = deed_store.read_manifest(result.folder)
+    assert next(item for item in manifest["items"] if item["file"] == neighbor.file)["identity"] == passport["identity"]

@@ -44,6 +44,12 @@ def bind_outcome(outcome: Any, path: Any) -> Any:
         return outcome
     result = copy.copy(outcome)
     result.data = bind_filename(outcome.data, path)
+    try:
+        import file_metadata
+        result.data._source_identity = file_metadata.record_outcome(path, result)
+    except (OSError, ValueError) as exc:
+        result.warnings = list(getattr(outcome, "warnings", []) or [])
+        result.warnings.append(f"не удалось сохранить паспорт {path}: {exc}")
     return result
 
 
@@ -64,7 +70,7 @@ def conflict(description: Any, fallback_filename: Any = None) -> bool:
 def context(description: Any, filename: Any = None) -> str:
     file_lot = source_number(description, filename)
     deed_lot = str(getattr(description, "lot_number", "") or "").strip() or None
-    line = f"lot identifier from filename: {file_lot or 'unknown'}; lot from document: {deed_lot or 'unknown'}"
+    line = f"lot identifier from filename: {file_lot or 'unknown'}; lot from parser result: {deed_lot or 'unknown'}"
     if conflict(description, filename):
         line += "; DISAGREEMENT: verify both sources; do not treat filename as proof"
     return line

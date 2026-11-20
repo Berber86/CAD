@@ -68,6 +68,7 @@ except ImportError:  # pragma: no cover
 
 import app_updater
 import lot_identity
+import file_metadata
 from neighbour_slide import slide_off_overlap
 
 #: Как найден сдвиг соседа — для журнала развода.
@@ -609,6 +610,8 @@ class SurveyApp(ctk.CTk):
         self._step0_lines: list[tuple[str, str]] = []
         self._step0_portal_running = False
         self._step0_portal_restore_topmost: bool | None = None
+        self._step0_lookup_snapshot: tuple[str, Any] | None = None
+        self._step0_lookup_address = ""
         self._step0_running = False
         self._step0_outcome: deed_intake.IntakeOutcome | None = None
         self._step0_stop = threading.Event()
@@ -3436,6 +3439,8 @@ class SurveyApp(ctk.CTk):
         if self._step0_portal_restore_topmost:
             # The CAD window must not cover the browser while we capture its screen.
             self.attributes("-topmost", False)
+        self._step0_lookup_snapshot = None
+        self._step0_lookup_address = address
         self._step0_portal_running = True
         self.step0_portal_button.configure(state="disabled", text="⏳ Ищу адрес…")
         self.step0_run_button.configure(state="disabled")
@@ -3531,6 +3536,7 @@ class SurveyApp(ctk.CTk):
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
         result = payload
+        self._step0_lookup_snapshot = (self._step0_lookup_address, result)
         self.step0_borough_var.set(result.borough or "")
         self.step0_block_var.set(result.block)
         self.step0_lot_var.set(result.lot)
@@ -3619,12 +3625,16 @@ class SurveyApp(ctk.CTk):
             self._step0_lines.append((log_mode.LEVEL_ERROR, self._step0_timestamp(dpi_save_error)))
         self._render_step0_log()
         self._set_status("Шаг 0: собираю описания участка…")
+        borough = str(self.step0_borough_var.get() or "").strip()
+        identities = file_metadata.intake_observations(
+            block, lot, borough, neighbours, str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
+        )
         worker = threading.Thread(
             target=self._step0_worker,
             args=(
                 block, lot, neighbours, folder,
                 bool(self.step0_old_neighbour_var.get()), ocr_dpi,
-                bool(self.step0_fast_mode_var.get()), fast_pause,
+                bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
             ),
             daemon=True,
         )
@@ -3640,6 +3650,8 @@ class SurveyApp(ctk.CTk):
         ocr_dpi: int = ocr_pages.DEFAULT_DPI,
         fast_mode: bool = False,
         fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
+        borough: str = "",
+        identities: dict[str, dict] | None = None,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         self._worker_context.generation = self._generation
@@ -3668,6 +3680,8 @@ class SurveyApp(ctk.CTk):
             outcome = deed_intake.collect_deeds(
                 block=block,
                 lot=lot,
+                borough=borough,
+                identity_by_lot=identities,
                 neighbours=neighbours,
                 folder=folder,
                 with_old_for_neighbour=with_old,
@@ -3762,10 +3776,22 @@ class SurveyApp(ctk.CTk):
             self._set_status("Шаг 0: впишите номер лота для скачанного файла.", error=True)
             return
         folder = self._step0_folder()
+        block_text = str(self.step0_block_var.get() or "").strip()
+        borough = str(self.step0_borough_var.get() or "").strip()
+        identity = None
+        try:
+            selected_lot = int(str(self.step0_lot_var.get() or "").strip())
+            values = file_metadata.intake_observations(
+                int(block_text), selected_lot, borough, [lot] if lot != selected_lot else [],
+                str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
+            )
+            identity = values.get(str(lot))
+        except ValueError:
+            pass
         try:
             record = deed_intake.adopt_downloads(
                 folder, role=role, lot=lot, tag=rcclerk.NEW_TAG,
-                block=str(self.step0_block_var.get() or "").strip(),
+                block=block_text, borough=borough, identity=identity,
             )
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Шаг 0: файл не принят — {exc}", error=True)
@@ -7104,7 +7130,20 @@ class SurveyApp(ctk.CTk):
         file_number = lot_identity.source_number(desc)
         if file_number:
             document_number = desc.lot_number or "не указан"
-            lines.append(f"  Номер лота: из имени файла {file_number}; в документе {document_number}")
+            lines.append(f"  Номер лота: из имени файла {file_number}; в результате разбора {document_number}")
+
+        if desc._source_identity:
+            labels = {"filename": "имя файла", "portal": "портал", "pdf": "PDF", "ai": "ИИ",
+                      "manual": "вручную", "file": "файл", "unknown": "источник неизвестен"}
+            for field, title in (("block", "Block"), ("lot", "Lot"), ("borough", "Район")):
+                entries = desc._source_identity.get(field, [])
+                for entry in entries:
+                    source = labels.get(entry.get("source", ""), entry.get("source", "?"))
+                    method = f", {entry['method']}" if entry.get("method") else ""
+                    stale = (entry.get("file") == desc._source_lot_filename and entry.get("sha256")
+                             and desc._source_file_sha256 and entry["sha256"] != desc._source_file_sha256)
+                    note = "предыдущая версия файла; сверить" if stale else "сверить"
+                    lines.append(f"  {title}: {entry.get('value', '?')} — {source}{method} ({note})")
 
         street_main = desc.main_street or "—"
         if desc.main_street_note:
@@ -8701,6 +8740,8 @@ class SurveyApp(ctk.CTk):
                             best.issues.append("Требуется ручная проверка/ввод текста для этого лота")
                         result.ocr = True
                         outcome, pre_counted, issues = best.outcome, best.pre_counted, best.issues
+                        if getattr(outcome, "source", "") == "regex":
+                            outcome._identity_input_method = "cache" if best is cache_candidate else "ocr"
                     else:
                         post(
                             "progress",
@@ -8742,6 +8783,10 @@ class SurveyApp(ctk.CTk):
                             post("valid_secret", key_secret)
                     result.outcome, result.pre_counted, result.issues = outcome, pre_counted, list(issues)
                 result.outcome = lot_identity.bind_outcome(result.outcome, job.path)
+                for warning in result.outcome.warnings:
+                    if warning.startswith("не удалось сохранить паспорт") and warning not in result.issues:
+                        result.issues.append(warning)
+                        post("progress", f"[{idx}/{total}] {warning}")
                 # Принятые правки по данным соседей входят в построение, разбор не меняют.
                 # Итог чтения легального описания — в журнал уровнем «ключ»: виден и в упрощённом режиме.
                 post(

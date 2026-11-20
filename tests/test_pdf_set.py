@@ -666,7 +666,23 @@ def test_file_lot_numbers_stay_with_each_plan_and_cached_result(gui, tmp_path, m
     assert app._preview_main_plan.description._source_lot_number == "45"
     assert next(i.text for i in app._preview_main_plan.items if i.kind == "main-lot-label") == "LOT 45"
     inspector = app._build_inspector_report(app._preview_main_plan)
-    assert "Lot 45" in inspector and "из имени файла 45; в документе 26" in inspector
+    assert "Lot 45" in inspector and "из имени файла 45; в результате разбора 26" in inspector
     assert app._neighbor_plan_sources[paths[0]].items[0].text == "LOT 28"
     assert app._neighbor_plan_sources[paths[2]].items[0].text == "LOT 30"
+    app._on_close()
+
+
+def test_passport_collision_is_reported_without_losing_the_plan(gui, tmp_path, monkeypatch):
+    path = tmp_path / "OUR 28 NEW.pdf"
+    _write_test_pdf(path, [_samples()[MAIN]])
+    passport = path.with_suffix(".json")
+    passport.write_text('{"other": true}', encoding="utf-8")
+    app = gui.SurveyApp()
+    dialog = _open_set(app, monkeypatch, path)
+    dialog.rows[0]["radio"].select()
+    dialog.submit()
+    _wait(app)
+    assert app._preview_main_plan is not None
+    assert any("не удалось сохранить паспорт" in warning for warning in app._preview_main_plan.warnings)
+    assert passport.read_text(encoding="utf-8") == '{"other": true}'
     app._on_close()

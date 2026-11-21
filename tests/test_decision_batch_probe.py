@@ -109,3 +109,65 @@ def test_missing_key_rejects_without_network(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(dp, "post_routerai", lambda *a: pytest.fail("no network"))
     assert batch.main([str(path), "--live"]) == 2
     assert "No requests sent" in capsys.readouterr().err
+
+
+def normalized_choices(count, pairs):
+    values = {"count": count}
+    for n, (first, last) in enumerate(pairs, 1):
+        values[f"description_{n}_first"] = first
+        values[f"description_{n}_last"] = last
+    return {k: {"status": "ok", "value": v} for k, v in values.items()}
+
+
+@pytest.mark.parametrize("count,pairs,expected", [
+    ("one", [("p1", "p4"), ("none", "none"), ("p3", "p3")],
+     "description_3_exceeds_count"),
+    ("two", [("p2", "p3"), ("p2", "p3"), ("none", "p3")],
+     "description_3_none_conflicts_with_page"),
+    ("one", [("p1", "none"), ("none", "none"), ("none", "none")],
+     "description_1_none_conflicts_with_page"),
+    ("two", [("none", "p1"), ("p1", "p2"), ("none", "none")],
+     "description_1_missing_despite_count"),
+    ("one", [("p3", "p1"), ("none", "none"), ("none", "none")],
+     "description_1_reversed_page_range"),
+    ("two", [("p3", "p3"), ("p1", "p2"), ("none", "none")],
+     "description_2_starts_before_description_1"),
+])
+def test_reports_actual_model_contradictions_and_impossible_ranges(count, pairs, expected):
+    check = batch.check_consistency(normalized_choices(count, pairs))
+    assert check["status"] == "inconsistent" and expected in check["issues"]
+
+
+def test_no_conflict_is_not_claim_of_factual_accuracy():
+    # Both descriptions start on page 1: possible, even if in the labelled
+    # fixture the first actually ends on page 1 rather than page 2.
+    answers = normalized_choices("three", [("p1", "p2"), ("p1", "p2"), ("p3", "p3")])
+    assert batch.check_consistency(answers) == {"status": "no_conflict_detected", "issues": []}
+
+
+def test_unknown_and_partial_values_do_not_fabricate_absence():
+    answers = normalized_choices("uncertain", [("uncertain", "uncertain"), ("none", "none"), ("none", "none")])
+    assert batch.check_consistency(answers) == {"status": "unknown", "issues": []}
+    del answers["description_2_last"]
+    assert batch.check_consistency(answers) == {"status": "unknown", "issues": []}
+
+
+def test_count_four_plus_does_not_require_or_invent_fourth_location():
+    answers = normalized_choices("four_plus", [("p1", "p1"), ("p1", "p2"), ("p3", "p3")])
+    assert batch.check_consistency(answers) == {"status": "no_conflict_detected", "issues": []}
+    answers["description_2_first"]["value"] = "none"
+    assert "description_2_missing_despite_count" in batch.check_consistency(answers)["issues"]
+
+
+def test_probe_reports_logical_conflicts_without_discarding_valid_answers():
+    pages = [{"page": n, "file": "demo.pdf", "content": b"png"} for n in (1, 2, 3)]
+    def send(base, key, model, state, assets, qs):
+        answers = answer_for(qs)
+        answers["description_3_first"] = {"type": "choice", "choice": "none"}
+        answers["description_3_last"] = {"type": "choice", "choice": "p3"}
+        return {"answers": answers}
+    result = batch.probe_model(pages, "model", "key", send=send)
+    assert result["status"] == "ok"  # format only, intentionally not changed
+    assert result["consistency"]["status"] == "inconsistent"
+    assert "description_3_none_conflicts_with_page" in result["consistency"]["issues"]
+    assert result["answers"]["description_3_last"]["value"] == "p3"

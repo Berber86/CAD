@@ -60,6 +60,45 @@ def questions_for(pages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return qs
 
 
+def check_consistency(answers: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Flag logical conflicts, not factual errors; keep all raw normalized choices.
+
+    Unknown/partial answers remain unknown; a clean result cannot establish
+    that the identified descriptions or page ranges actually match the PDF.
+    """
+    def value(key: str) -> Any:
+        entry = answers.get(key, {})
+        return entry.get("value") if entry.get("status") == "ok" else None
+
+    count_value = value("count")
+    known_counts = {"zero": 0, "one": 1, "two": 2, "three": 3, "four_plus": 4}
+    count = known_counts.get(count_value)
+    unknown = count is None
+    issues = []
+    previous_start: tuple[int, int] | None = None
+    for n in (1, 2, 3):
+        first, last = value(f"description_{n}_first"), value(f"description_{n}_last")
+        if first in (None, "uncertain") or last in (None, "uncertain"):
+            unknown = True
+        first_page = int(first[1:]) if isinstance(first, str) and first.startswith("p") and first[1:].isdigit() else None
+        last_page = int(last[1:]) if isinstance(last, str) and last.startswith("p") and last[1:].isdigit() else None
+        if (first == "none" and last_page is not None) or (last == "none" and first_page is not None):
+            issues.append(f"description_{n}_none_conflicts_with_page")
+        if count is not None:
+            if n <= count and (first == "none" or last == "none"):
+                issues.append(f"description_{n}_missing_despite_count")
+            if n > count and (first_page is not None or last_page is not None):
+                issues.append(f"description_{n}_exceeds_count")
+        if first_page is not None and last_page is not None and first_page > last_page:
+            issues.append(f"description_{n}_reversed_page_range")
+        if first_page is not None:
+            if previous_start and first_page < previous_start[1]:
+                issues.append(f"description_{n}_starts_before_description_{previous_start[0]}")
+            previous_start = (n, first_page)
+    return {"status": "inconsistent" if issues else "unknown" if unknown else "no_conflict_detected",
+            "issues": issues}
+
+
 def probe_model(pages: list[dict[str, Any]], model: str, api_key: str,
                 send: Callable[..., Any] = dp.post_routerai) -> dict[str, Any]:
     questions = questions_for(pages)
@@ -80,7 +119,7 @@ def probe_model(pages: list[dict[str, Any]], model: str, api_key: str,
             except (ValueError, KeyError, TypeError):
                 normalized[key] = {"status": "error", "value": None}
         result.update(status="ok" if all(a["status"] == "ok" for a in normalized.values()) else "partial",
-                      answers=normalized)
+                      answers=normalized, consistency=check_consistency(normalized))
     except httpx.HTTPStatusError as exc:
         result.update(error_kind="http_error", http_status=exc.response.status_code)
     except httpx.TimeoutException:

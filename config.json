@@ -998,5 +998,11 @@
   },
   "deed_intake": {
     "comment": "Шаг 0: в Windows Ctrl+S отправляется однократно только окну поддерживаемого браузера после загрузки PDF, не во время Cloudflare"
+  },
+  "telemetry": {
+    "enabled": true,
+    "url": "https://hggwxxpnkibhvnvwnenw.supabase.co",
+    "anon_key": "sb_publishable_SVmGaA-_7Kgi5NebtereUA_6hzrfFhj",
+    "comment": "Журналы программы → разработчик (Supabase). anon_key публичный, доступен каждому пользователю; RLS разрешает только INSERT. Выключить можно переключателем «Журналы разработчику» в шапке или telemetry.enabled=false."
   }
 }

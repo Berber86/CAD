@@ -108,6 +108,7 @@ from version import APP_STAMP, APP_VERSION
 import log_mode
 import local_settings
 import developer_chat
+import telemetry as app_telemetry
 import offsets
 import start_source
 import ui_theme
@@ -508,6 +509,14 @@ class SurveyApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.config_data: dict[str, Any] = config_data
+        # Телеметрия: отправка журналов разработчику (Supabase). Не блокирует UI,
+        # не роняет программу; выключить можно переключателем в шапке.
+        self._telemetry: app_telemetry.TelemetryClient | None = None
+        try:
+            self._telemetry = app_telemetry.get_client(app_version=APP_VERSION)
+            self._telemetry.start()
+        except Exception:  # noqa: BLE001 - телеметрия никогда не должна ломать запуск
+            self._telemetry = None
         self.pdf_path: Path | None = None
         self.neighbor_pdf_paths: list[Path] = []
         self._pending_neighbor_pdfs: set[Path] = set()
@@ -991,6 +1000,21 @@ class SurveyApp(ctk.CTk):
             width=36,
             command=self._apply_log_mode,
         ).grid(row=0, column=4, sticky="e", padx=(12, 0))
+
+        try:
+            _tel_cfg = app_telemetry.load_telemetry_config()
+            _tel_enabled = bool(_tel_cfg.enabled)
+        except Exception:  # noqa: BLE001
+            _tel_enabled = True
+        self.telemetry_enabled_var = ctk.BooleanVar(value=_tel_enabled)
+        ctk.CTkSwitch(
+            header_tools,
+            text="Журналы разработчику",
+            variable=self.telemetry_enabled_var,
+            font=ctk.CTkFont(size=11),
+            width=36,
+            command=self._on_telemetry_enabled_changed,
+        ).grid(row=0, column=5, sticky="e", padx=(12, 0))
 
         # 1. Глобальные вкладки шагов: «Шаг 1. Граница участка» | «Шаг 2. Автоподписание»
         self._build_step_tab_bar()
@@ -3350,6 +3374,16 @@ class SurveyApp(ctk.CTk):
     def _step0_log(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         self._step0_lines.append((level, self._step0_timestamp(message)))
         self._render_step0_log()
+        try:
+            tel = getattr(self, "_telemetry", None)
+            if tel is not None and tel.active:
+                tel.log(message, level=level, category="step0")
+            elif tel is None:
+                app_telemetry.get_client(app_version=APP_VERSION).log(
+                    message, level=level, category="step0"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _render_step0_log(self) -> None:
         visible = log_mode.filter_entries(self._step0_lines, self._log_mode())
@@ -7747,6 +7781,12 @@ class SurveyApp(ctk.CTk):
         if page is not None:
             page.close()
         self._persist_ai_preferences(report_error=False)
+        # Сообщаем телеметрии о чистом выходе (фоновая отправка, не блокируем UI).
+        try:
+            tel = getattr(self, "_telemetry", None) or app_telemetry.get_client()
+            tel.session_end(clean=True)
+        except Exception:  # noqa: BLE001
+            pass
         self._closing = True
         self._generation += 1
         try:
@@ -10002,6 +10042,31 @@ class SurveyApp(ctk.CTk):
         if content:
             self._set_step2_report(content)
 
+    def _on_telemetry_enabled_changed(self) -> None:
+        """Переключатель «Журналы разработчику»: пишет telemetry.enabled в config.local.json."""
+        enabled = bool(self.telemetry_enabled_var.get())
+        try:
+            local_settings.save_value(LOCAL_CONFIG_PATH, "telemetry", "enabled", enabled)
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Настройка телеметрии не сохранена: {exc}", warn=True)
+            return
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("telemetry", {})["enabled"] = enabled
+        # Обновляем живой клиент (если он уже создан).
+        try:
+            client = getattr(self, "_telemetry", None)
+            if client is not None:
+                client.set_enabled(enabled)
+            else:
+                # Клиент мог не создаться из-за отсутствия ключей ранее.
+                self._telemetry = app_telemetry.get_client(app_version=APP_VERSION)
+                self._telemetry.reload_config()
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_status(
+            "Журналы разработчику: " + ("включены" if enabled else "выключены") + " (применяется сразу)",
+        )
+
     def _log_line(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         if not hasattr(self, "_log"):
             self._log = []
@@ -10010,6 +10075,17 @@ class SurveyApp(ctk.CTk):
         del self._log[:-400]
         if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
             self._refresh_log_view()
+        # Дублируем журнал разработчику (фоново, не блокируя UI).
+        try:
+            tel = getattr(self, "_telemetry", None)
+            if tel is not None and tel.active:
+                tel.log(message, level=level)
+            elif tel is None:
+                # Ленивая инициализация, если старт упал до создания клиента.
+                maybe = app_telemetry.get_client(app_version=APP_VERSION)
+                maybe.log(message, level=level)
+        except Exception:  # noqa: BLE001 - телеметрия не должна ломать журнал
+            pass
 
     def _set_status(
         self, message: str, error: bool = False, *, warn: bool = False, key: bool = False,
@@ -12945,6 +13021,18 @@ def main() -> int:
             print(f"ОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}", file=sys.stderr)
         else:
             print("Не удалось сохранить журнал ошибки.", file=sys.stderr)
+        # Пытаемся отправить крэш разработчику (best effort, не больше 1.5с).
+        try:
+            crash_c = app_telemetry.get_client(app_version=APP_VERSION)
+            # Последние 2000 символов — redact всё равно обрежет и вырежет секреты.
+            crash_c.log(f"Крэш при запуске: {report[-2000:]}", level=app_telemetry.LEVEL_ERROR, category="crash")
+            # Быстрая синхронная попытка дослать крэш до показа диалога.
+            try:
+                crash_c.flush(timeout_sec=1.5)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
         # Консоль могла быть спрятана показом окна: возвращаем её, чтобы текст ошибки
         # и вопрос run.bat об откате были видны (4.41).
         try:

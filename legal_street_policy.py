@@ -1,13 +1,13 @@
-"""Shared instructions for reading NYC street names in legal descriptions."""
+"""Shared instructions for reading and correcting street names."""
 
 NYC_STREET_INSTRUCTION = (
-    'The work is in New York City: Staten Island, Brooklyn, Manhattan, Queens, and the Bronx. '
-    'Determine the borough from the supplied legal description if it is stated; do not invent one. '
-    'Street names can contain typos or inconsistent spellings. Compare repeated mentions and any '
-    'street-reference evidence actually supplied with the request, in the correct borough. '
-    'If a current authoritative street reference is actually provided and it unambiguously confirms '
-    'the correct name at the relevant location, use that confirmed spelling. Otherwise preserve the '
-    'readable name as printed, even if it looks like a typo; do not pretend to have consulted a '
-    'directory or the internet, and do not invent a correction from memory or from another borough. '
-    'Do not change the legal boundary calls, distances, bearings, or historical street names.'
+    'The work concerns New York City legal descriptions. Street names may contain typos or inconsistent '
+    'spellings. Use the supplied descriptions and context to decide whether a street name needs correction; '
+    'correct it when sufficiently confident. Do not claim to have consulted a directory or the internet '
+    'unless that source was actually supplied. For every main and cross street, return the original name '
+    'exactly as read in main_street or cross_street, and return a corrected name separately in '
+    'main_street_corrected or cross_street_corrected only when you change the spelling. When no correction '
+    'is made, return null for the corrected field. Never replace or omit the original name when correcting. '
+    'If the original cannot be read, do not invent it. Do not alter legal boundary calls, measurements, '
+    'bearings, or historical street names to make a correction.'
 )

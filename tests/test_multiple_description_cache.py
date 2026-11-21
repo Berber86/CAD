@@ -210,7 +210,38 @@ def test_old_known_prompt_only_restored_offline_not_as_current_parse(tmp_path):
     pdf.write_bytes(b'original')
     ctx = context(pdf)
     ctx['instruction_sha256'] = '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'
+    ctx['response_format'] = 'multiple-legal-descriptions-v3'
+    ctx['description_schema_sha256'] = '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc'
     cache.save_result(pdf, ctx, parse(), portal_lot=None)
     found = cache.load_latest_offline(pdf)
     assert found is not None and found[1]['instruction_sha256'] == ctx['instruction_sha256']
     assert cache.load_result(pdf, context(pdf)) is None
+
+
+@pytest.mark.parametrize('old_prompt', [
+    '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769',
+    '1e05287cfcb562ac81cae64b7e3c95c82047ed850424fe38a920533297de0502',
+])
+def test_historic_v3_without_new_fields_and_pair_validation(tmp_path, old_prompt):
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    ctx = context(pdf)
+    ctx.update(response_format='multiple-legal-descriptions-v3', instruction_sha256=old_prompt,
+               description_schema_sha256='5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc')
+    cache.save_result(pdf, ctx, parse(), portal_lot=None)
+    path = cache.diagnostics_path(pdf)
+    body = json.loads(path.read_text(encoding='utf-8'))
+    for item in body['runs'][-1]['items']:
+        item['data'].pop('main_street_corrected', None)
+        item['data'].pop('cross_street_corrected', None)
+    path.write_text(json.dumps(body), encoding='utf-8')
+    restored = cache.load_latest_offline(pdf)
+    assert restored is not None and restored[0].items[0].data.main_street_corrected is None
+    assert cache.load_result(pdf, context(pdf)) is None
+    # A known prompt paired with a different schema is not a known history.
+    ctx['description_schema_sha256'] = '0' * 64
+    cache.save_result(pdf, ctx, parse(), portal_lot=None)
+    body = json.loads(path.read_text(encoding='utf-8'))
+    body['runs'] = body['runs'][-1:]
+    path.write_text(json.dumps(body), encoding='utf-8')
+    assert cache.load_latest_offline(pdf) is None

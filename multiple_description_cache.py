@@ -267,19 +267,25 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
     schema_hash = hashlib.sha256(json.dumps(
         LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
         separators=(',', ':')).encode('utf-8')).hexdigest()
-    # Only offline historical restore may use the known 4.80.3–4.80.6 prompt.
-    # Normal parse cache matching always requires the exact current prompt.
-    compatible_prompts = {hashlib.sha256(system_instruction().encode('utf-8')).hexdigest(),
-                          '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'}
+    # Historic snapshots are allowed only by the explicit offline command.
+    # Pair the known prompt and schema hashes; the ordinary cache still checks
+    # the exact current context and cannot silently masquerade as a new parse.
+    current_prompt = hashlib.sha256(system_instruction().encode('utf-8')).hexdigest()
+    compatible = {(SCHEMA_VERSION, current_prompt, schema_hash),
+                  ('multiple-legal-descriptions-v3',
+                   '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769',
+                   '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc'),
+                  ('multiple-legal-descriptions-v3',
+                   '1e05287cfcb562ac81cae64b7e3c95c82047ed850424fe38a920533297de0502',
+                   '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc')}
     for run in reversed(history['runs']):
         if not isinstance(run, dict) or not isinstance(run.get('context'), dict):
             continue
         ctx = run['context']
         if (ctx.get('pdf_sha256') != digest or ctx.get('filename_lot') != lot_identity.lot_from_filename(path)
-                or ctx.get('response_format') != SCHEMA_VERSION
-                or ctx.get('instruction_sha256') not in compatible_prompts
+                or (ctx.get('response_format'), ctx.get('instruction_sha256'),
+                    ctx.get('description_schema_sha256')) not in compatible
                 or ctx.get('comparison_instruction_sha256') != hashlib.sha256(COMPARISON_INSTRUCTION.encode('utf-8')).hexdigest()
-                or ctx.get('description_schema_sha256') != schema_hash
                 or not isinstance(ctx.get('provider'), str) or not ctx['provider']
                 or not isinstance(ctx.get('model'), str) or not ctx['model']):
             continue

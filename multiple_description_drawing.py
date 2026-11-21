@@ -100,6 +100,8 @@ class DescriptionSource:
     is_main: bool
     item: DescriptionItem
     anchor: Anchor | None = None
+    display_main: str | None = None
+    display_cross: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,8 +249,9 @@ def _remove_exact_shared_streets(plans: list[DrawPlan]) -> list[DrawPlan]:
     assigned to the same main/cross street family.
     """
     previous_lines: list[LineItem] = []
-    seen_texts: set[tuple[str, str]] = set()
+    seen_texts: dict[tuple[str, str], tuple[int, int]] = {}
     output: list[DrawPlan] = []
+    placed_street_labels: list[TextItem] = []
     for plan in plans:
         lines = []
         for line in plan.lines:
@@ -259,10 +262,44 @@ def _remove_exact_shared_streets(plans: list[DrawPlan]) -> list[DrawPlan]:
         for text in plan.items:
             if text.kind in {'main-street', 'cross-street', 'main-street-former', 'cross-street-former',
                              'main-street-note', 'main-street-note-extra'}:
-                key = (text.kind, ' '.join(text.text.upper().split()))
+                key = (text.kind, text.text)
                 if key in seen_texts:
+                    plan_index, text_index = seen_texts[key]
+                    previous = texts[text_index] if plan_index == len(output) else output[plan_index].items[text_index]
+                    deleted = previous.correction_deleted
+                    if text.correction_deleted and text.correction_deleted != deleted:
+                        deleted = '/'.join(filter(None, (deleted, text.correction_deleted)))
+                    merged = replace(previous, correction_indices=tuple(sorted(set(
+                        previous.correction_indices + text.correction_indices))), correction_deleted=deleted)
+                    if plan_index == len(output):
+                        texts[text_index] = merged
+                    else:
+                        output[plan_index].items[text_index] = merged
                     continue
-                seen_texts.add(key)
+                if text.kind in {'main-street', 'cross-street'}:
+                    # Different corrected spellings may share the same corner.
+                    # Offset the later label along its normal rather than paint
+                    # two strings on top of each other; no geometry is changed.
+                    h = float(text.height or plan.text_height)
+                    ux, uy = math.cos(text.rotation), math.sin(text.rotation)
+                    nx, ny = -uy, ux
+                    for _ in range(len(placed_street_labels) + 1):
+                        conflicts = []
+                        for other in placed_street_labels:
+                            if other.kind != text.kind:
+                                continue
+                            dx, dy = text.point[0] - other.point[0], text.point[1] - other.point[1]
+                            other_h = float(other.height or plan.text_height)
+                            half_width = (estimate_text_width(text.text, h, {}) +
+                                          estimate_text_width(other.text, other_h, {})) / 2
+                            if abs(dx * ux + dy * uy) < half_width and abs(dx * nx + dy * ny) < (h + other_h):
+                                conflicts.append(other_h)
+                        if not conflicts:
+                            break
+                        step = h + max(conflicts)
+                        text = replace(text, point=(text.point[0] + nx * step, text.point[1] + ny * step))
+                    placed_street_labels.append(text)
+                seen_texts[key] = (len(output), len(texts))
             texts.append(text)
         output.append(replace(plan, lines=lines, items=texts))
     return output
@@ -345,6 +382,18 @@ def _decorate_exact_anchored(builder: AcadBuilder, plan: DrawPlan, source: Descr
         return plan
     plan = _decorate_exact_unlocated(builder, plan, source.item)
     if plan.is_neighbor:
+        front = desc.front_segment_index
+        if (isinstance(front, int) and not isinstance(front, bool)
+                and 0 <= front < len(plan.boundary_lines)
+                and (desc.main_street_corrected or desc.cross_street_corrected)):
+            points = [edge.start for edge in plan.boundary_lines]
+            try:
+                street_items, _ = builder._street_items(desc, points, plan.text_height, plan.ccw, [],
+                                                         front_index=front, boundary_lines=plan.boundary_lines)
+                corrected = [t for t in street_items if t.correction_indices or t.correction_deleted]
+                return replace(plan, items=plan.items + corrected)
+            except Exception:
+                pass
         return plan
     front = desc.front_segment_index
     if not isinstance(front, int) or isinstance(front, bool) or not 0 <= front < len(plan.boundary_lines):
@@ -436,9 +485,20 @@ def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, sc
             # its input lacks an established tie. An isolated parcel must not
             # carry that invented street geometry or its associated labels.
             plan = _decorate_exact_unlocated(builder, plan, source.item)
-            frontage = _unlocated_frontage_items(builder, plan, source.item) if source.is_main else []
+            frontage = _unlocated_frontage_items(builder, plan, source.item) if (
+                source.is_main or source.item.data.main_street_corrected) else []
+            if not source.is_main:
+                frontage = [t for t in frontage if t.correction_indices or t.correction_deleted]
             plan = replace(plan, lines=[], items=[t for t in plan.items
                             if 'street' not in t.kind and t.kind != 'cross-street-distance'] + frontage)
+        # Shared uncorrected labels are scene presentation only; the parsed
+        # original and any AI corrections remain attached to their own source.
+        overrides = {'main-street': source.display_main, 'cross-street': source.display_cross}
+        import street_names
+        plan = replace(plan, items=[
+            replace(t, text=street_names.street_text(overrides[t.kind]))
+            if t.kind in overrides and overrides[t.kind] is not None else t
+            for t in plan.items])
         prepared.append(PlannedDescription(Path(source.source), source.is_main, index, plan,
                                            anchor.group if anchor else None, anchor is not None,
                                            reason if anchor is not None else (reason or 'unresolved_position')))
@@ -485,9 +545,14 @@ def draft_row_group(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> Draft
                 e.diagnostic == 'exact_sides_fallback' and len(e.plan.boundary_lines) >= 3
                 and e.plan.closure.distance <= ROUNDING_GAP_LIMIT_FT)) for e in ours)):
         return DraftSceneResult((), 'unsupported_scene')
-    streets = {(' '.join(str(e.plan.description.main_street or '').upper().split()),
-                ' '.join(str(e.plan.description.cross_street or '').upper().split())) for e in ours}
-    if len(streets) != 1 or not all(next(iter(streets))):
+    import street_names
+    first_desc = ours[0].plan.description
+    first_streets = (first_desc.main_street_corrected or first_desc.main_street,
+                     first_desc.cross_street_corrected or first_desc.cross_street)
+    if not all(first_streets) or any(
+            not street_names.scene_street_match(first_streets[0], e.plan.description.main_street_corrected or e.plan.description.main_street)
+            or not street_names.scene_street_match(first_streets[1], e.plan.description.cross_street_corrected or e.plan.description.cross_street)
+            for e in ours[1:]):
         return DraftSceneResult((), 'inconsistent_streets')
     if any(e.plan.description.cross_street_side_index is not None
            or len(e.plan.street_boundary_indices) > 1
@@ -605,7 +670,7 @@ def make_scene_print_drafts(scene: SceneResult, *, builder_cfg: dict[str, Any]) 
                     continue
                 if text.kind.startswith('side-'):
                     text = replace(text, text=re.sub(r' {2,}', ' ', text.text))
-                texts.append(text)
+                texts.append(replace(text, correction_indices=(), correction_deleted=''))
             by_index[entry.description_index] = replace(draft, items=texts,
                                                         lines=[] if key[0] == 'unknown' else draft.lines,
                                                         print_draft=True)

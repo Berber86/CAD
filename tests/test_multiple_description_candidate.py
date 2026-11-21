@@ -94,7 +94,7 @@ def test_street_names_one_letter_with_type_direction_and_number_guards():
         assert not street_names.scene_street_match(a, b)
 
 
-def test_cross_pdf_our_neighbor_requires_same_borough_and_geometry(fake_autocad):
+def test_cross_pdf_our_neighbor_does_not_require_borough_but_requires_geometry(fake_autocad):
     src = sources()
     def in_borough(source, borough, path, role):
         data = source.item.data.model_copy(deep=True, update={'borough_or_city': borough})
@@ -110,8 +110,8 @@ def test_cross_pdf_our_neighbor_requires_same_borough_and_geometry(fake_autocad)
     assert all(e.placement_known for e in scene.plans)
     assert next(t.text for t in scene.plans[1].plan.items if t.kind == 'neighbor-label') == 'LOT 5'
     assert second.item.data.cross_street == 'Lindbergh Avenue'
-    assert candidate.auto_place_rows((first, in_borough(src[1], 'Queens', 'LOT 5.pdf', False)))[1] == 0
-    assert candidate.auto_place_rows((first, in_borough(src[1], None, 'LOT 5.pdf', False)))[1] == 0
+    assert candidate.auto_place_rows((first, in_borough(src[1], 'Queens', 'LOT 5.pdf', False)))[1] == 1
+    assert candidate.auto_place_rows((first, in_borough(src[1], None, 'LOT 5.pdf', False)))[1] == 1
     changed = copy.deepcopy(second.item.data)
     changed.cross_street = 'Park Avenue'
     assert candidate.auto_place_rows((first, record('LOT 5.pdf', False, drawing.DescriptionItem(changed, True))))[1] == 0
@@ -180,8 +180,7 @@ def test_multiple_unique_pairs_keep_separate_groups_and_roles():
             model = source.item.data.model_copy(deep=True, update={'borough_or_city': borough})
             records.append(record(f'{prefix}_{index}.pdf', index == 0, drawing.DescriptionItem(model, True)))
     result, count = candidate.auto_place_rows(records)
-    assert count == 2
-    assert result[0].anchor.group == result[1].anchor.group
-    assert result[2].anchor.group == result[3].anchor.group
-    assert result[0].anchor.group != result[2].anchor.group
+    # Borough no longer disambiguates duplicate geometrically identical pairs.
+    assert count == 0
+    assert all(s.anchor is None for s in result)
     assert [s.is_main for s in result] == [True, False, True, False]

@@ -375,6 +375,8 @@ def test_explicit_cache_restore_is_offline_and_automatically_positions_supported
                                   filename_lot='6', search_complete=True, image_limit=50)
     # Actual 4.80.3–4.80.6 prompt hash, as in the user's saved cache.
     context['instruction_sha256'] = '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'
+    context['response_format'] = 'multiple-legal-descriptions-v3'
+    context['description_schema_sha256'] = '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc'
     cache.save_result(pdf, context, parse_result, portal_lot=None)
     original_bytes = cache.diagnostics_path(pdf).read_bytes()
     app, calls = setup_app(gui, monkeypatch, tmp_path)

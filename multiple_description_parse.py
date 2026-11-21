@@ -24,7 +24,7 @@ from legal_street_policy import NYC_STREET_INSTRUCTION
 MAX_IMAGES = 50
 MAX_PARSE_CALLS = 4
 MAX_ORDINARY_FAILURES = 3
-SCHEMA_VERSION = "multiple-legal-descriptions-v3"
+SCHEMA_VERSION = "multiple-legal-descriptions-v4"
 INSTRUCTION = (
     "Read all supplied whole PDF pages. Return every separate land boundary "
     "description as a separate item in document order, including repeated "

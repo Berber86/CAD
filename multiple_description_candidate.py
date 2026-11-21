@@ -1,13 +1,12 @@
 """Evidence-based row matching scoped to a scene, never a street registry.
 
 A one-letter name difference is considered only along with matching geometry,
-locality and a unique pair. It is not evidence of an officially correct spelling.
+and a unique pair. It is not evidence of an officially correct spelling.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import re
 from pathlib import Path
 from typing import Sequence
 
@@ -36,19 +35,6 @@ class RowProposal:
     tie_label: str
 
 
-def _borough(raw: str | None) -> str | None:
-    value = str(raw or '').upper()
-    patterns = {
-        'STATEN ISLAND': r'\b(?:STATEN ISLAND|RICHMOND COUNTY)\b',
-        'BROOKLYN': r'\b(?:BROOKLYN|KINGS COUNTY)\b',
-        'QUEENS': r'\bQUEENS\b',
-        'MANHATTAN': r'\b(?:MANHATTAN|NEW YORK COUNTY)\b',
-        'BRONX': r'\bBRONX\b',
-    }
-    found = [name for name, pattern in patterns.items() if re.search(pattern, value)]
-    return found[0] if len(found) == 1 else None
-
-
 def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
     """Find one simple supported pair; caller must reject ambiguous pairings."""
     if len(sources) != 2:
@@ -68,12 +54,10 @@ def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
         pts = build_polygon_points(desc.segments)
         if math.dist(pts[0], pts[-1]) > ROUNDING_GAP_LIMIT_FT:
             return None
-    if (not street_names.scene_street_match(descs[0].main_street, descs[1].main_street)
-            or not street_names.scene_street_match(descs[0].cross_street, descs[1].cross_street)):
-        return None
-    boroughs = [_borough(d.borough_or_city) for d in descs]
-    if (all(boroughs) and boroughs[0] != boroughs[1]) or (
-            Path(a.source) != Path(b.source) and (not all(boroughs) or boroughs[0] != boroughs[1])):
+    if (not street_names.scene_street_match(descs[0].main_street_corrected or descs[0].main_street,
+                                            descs[1].main_street_corrected or descs[1].main_street)
+            or not street_names.scene_street_match(descs[0].cross_street_corrected or descs[0].cross_street,
+                                                   descs[1].cross_street_corrected or descs[1].cross_street)):
         return None
     near_index, far_index = sorted((0, 1), key=lambda i: descs[i].distance_to_corner_ft)
     near, far = descs[near_index], descs[far_index]
@@ -139,10 +123,13 @@ def accept_row(sources: Sequence[DescriptionSource], proposal: RowProposal) -> t
                _make_tie_segment_like(desc.segments[-1], distance_ft=desc.distance_to_corner_ft, flip_180=True))
         # Use the nearer description's printed label within this scene only;
         # neither spelling is claimed to have been verified as official.
-        placed = desc.model_copy(update={'corner_to_pob_bearing': tie, 'cross_street': cross,
-                                         'main_street': near.main_street})
+        placed = desc.model_copy(update={'corner_to_pob_bearing': tie})
+        # A common label is only presentation, never a change to parsed data.
+        # Corrections from separate descriptions stay independently visible.
+        common_main = None if any(s.item.data.main_street_corrected for s in sources) else near.main_street
+        common_cross = None if any(s.item.data.cross_street_corrected for s in sources) else cross
         output.append(DescriptionSource(source.source, source.is_main, DescriptionItem(placed, True),
-                                        Anchor(group, compute_pob_point(placed))))
+                                        Anchor(group, compute_pob_point(placed)), common_main, common_cross))
     return tuple(output)
 
 

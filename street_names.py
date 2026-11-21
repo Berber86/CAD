@@ -386,3 +386,31 @@ def scene_street_match(first: str | None, second: str | None) -> bool:
     if index == len(left) - 1 or x in _DIRECTIONS or y in _DIRECTIONS:
         return False
     return _one_letter_difference(x, y)
+
+
+def correction_marks(original: str | None, corrected: str | None) -> tuple[str, tuple[int, ...], str]:
+    """Display spelling, changed character indices and deleted source characters.
+
+    Compare after the same display formatting, ignoring case and spacing, so
+    ordinal typography and doubled spaces aren't mistaken for AI corrections.
+    """
+    from difflib import SequenceMatcher
+    display = street_text(corrected or original)
+    if not original or not corrected:
+        return display, (), ''
+    old = street_text(original)
+    old_chars = [(i, c) for i, c in enumerate(old) if not c.isspace()]
+    new_chars = [(i, c) for i, c in enumerate(display) if not c.isspace()]
+    matcher = SequenceMatcher(None, [c.casefold() for _, c in old_chars],
+                              [c.casefold() for _, c in new_chars], autojunk=False)
+    changed: list[int] = []
+    deleted: list[str] = []
+    for tag, a, b, c, d in matcher.get_opcodes():
+        if tag in ('replace', 'insert'):
+            changed.extend(i for i, _ in new_chars[c:d])
+        if tag == 'delete':
+            deleted.extend(ch for _, ch in old_chars[a:b])
+        elif tag == 'replace' and b - a > d - c:
+            # A replacement can consume more characters than it produces.
+            deleted.extend(ch for _, ch in old_chars[a + (d - c):b])
+    return display, tuple(changed), ''.join(deleted)

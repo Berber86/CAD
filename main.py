@@ -7553,7 +7553,12 @@ class SurveyApp(ctk.CTk):
                     continue
                 x, y = screen(text.point)
                 text_color = THEME["cad_street_text"] if "street" in kind else color
-                canvas.create_text(x, y, text=text.text, fill=text_color, font=("Segoe UI", 8, "bold"))
+                preview_text = text.text
+                if not plan.print_draft and (text.correction_indices or text.correction_deleted):
+                    text_color = "red"
+                    if text.correction_deleted:
+                        preview_text += " [-" + text.correction_deleted + "]"
+                canvas.create_text(x, y, text=preview_text, fill=text_color, font=("Segoe UI", 8, "bold"))
 
     def _redraw_preview_canvas(self) -> None:
         canvas = self.preview_canvas
@@ -7696,16 +7701,22 @@ class SurveyApp(ctk.CTk):
                     x1, y1, x2, y2, fill=THEME["cad_street"], width=1.6
                 )
                 street_label = ""
-                if idx_rl == 0 and getattr(pl.description, "main_street", ""):
-                    street_label = str(pl.description.main_street).strip()
-                elif idx_rl == 1 and getattr(pl.description, "cross_street", ""):
-                    street_label = str(pl.description.cross_street).strip()
+                label_color = THEME["cad_street_text"]
+                name_kind = 'main_street' if idx_rl == 0 else 'cross_street' if idx_rl == 1 else None
+                if name_kind and getattr(pl.description, name_kind, None):
+                    import street_names
+                    street_label, marks, deleted = street_names.correction_marks(
+                        getattr(pl.description, name_kind), getattr(pl.description, name_kind + '_corrected', None))
+                    if not pl.print_draft and (marks or deleted):
+                        label_color = 'red'
+                        if deleted:
+                            street_label += ' [-' + deleted + ']'
                 if street_label and street_label.lower() not in labeled_streets:
                     labeled_streets.add(street_label.lower())
                     mx, my = (x1 + x2) / 2, (y1 + y2) / 2
                     canvas.create_text(
                         mx, my - 8, text=street_label,
-                        fill=THEME["cad_street_text"], font=("Segoe UI", 9, "bold"),
+                        fill=label_color, font=("Segoe UI", 9, "bold"),
                     )
 
         # 2. Перекрёсток улиц (0.0, 0.0): кольцо + перекрестие + подпись
@@ -7856,12 +7867,18 @@ class SurveyApp(ctk.CTk):
                 )
 
             if focus_plan.description.main_street:
+                import street_names
+                title, marks, deleted = street_names.correction_marks(
+                    focus_plan.description.main_street, focus_plan.description.main_street_corrected)
+                marked = not focus_plan.print_draft and bool(marks or deleted)
+                if marked and deleted:
+                    title += ' [-' + deleted + ']'
                 canvas.create_text(
                     10,
                     10,
-                    text=focus_plan.description.main_street.upper(),
+                    text=title,
                     anchor="nw",
-                    fill=THEME["cad_street_text"],
+                    fill="red" if marked else THEME["cad_street_text"],
                     font=("Segoe UI", 9, "bold"),
                 )
 

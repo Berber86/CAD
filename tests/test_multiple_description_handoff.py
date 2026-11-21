@@ -108,3 +108,14 @@ def test_expected_jobs_prevent_applying_a_result_to_changed_roles_or_sources(tmp
         handoff.build_handoff(result, expected_jobs=(replace(jobs[0], is_main=False), jobs[1]))
     with pytest.raises(handoff.InvalidHandoff, match='stale document jobs'):
         handoff.build_handoff(result, expected_jobs=jobs[:1])
+
+
+def test_handoff_rejects_plan_with_changed_recorded_side(tmp_path):
+    result = batch(tmp_path)
+    first = result.scene.plans[0]
+    plan = first.plan
+    bad_line = replace(plan.boundary_lines[0], end=(plan.boundary_lines[0].end[0] + 3, plan.boundary_lines[0].end[1]))
+    bad_plan = replace(plan, boundary_lines=[bad_line, *plan.boundary_lines[1:]])
+    scene = drawing.SceneResult((replace(first, plan=bad_plan),) + result.scene.plans[1:], ())
+    with pytest.raises(handoff.InvalidHandoff, match='plan sides mismatch'):
+        handoff.build_handoff(replace(result, scene=scene))

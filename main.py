@@ -644,6 +644,8 @@ class SurveyApp(ctk.CTk):
         # Накопленная сцена для живого CAD-предпросмотра: основной участок + соседи
         self._preview_main_plan: DrawPlan | None = None
         self._preview_neighbor_plans: list[DrawPlan] = []
+        # Separate multi-result scene: no one-plan-per-file replacement.
+        self._multi_scene_handoff: Any | None = None
         # Файлы соседей остаются разными участками даже при одинаковой точке POB.
         self._neighbor_plan_sources: dict[Path, DrawPlan] = {}
         # Подписи источников и исходы принадлежат самим планам, а не текущему полю ввода.
@@ -4966,6 +4968,10 @@ class SurveyApp(ctk.CTk):
 
     def _scene_plans(self) -> list[tuple[str, DrawPlan]]:
         """Только актуальные фигуры, которые сейчас показаны на схеме."""
+        multi = self._multi_scene_handoff
+        if multi is not None:
+            return [(f"{'Сосед' if d.plan.is_neighbor else 'Основной участок'}: {d.source.name} · #{d.ordinal}", d.plan)
+                    for d in multi.drawable]
         plans: list[tuple[str, DrawPlan]] = []
         if self._preview_main_plan is not None:
             name = self._plan_source_labels.get(id(self._preview_main_plan), "текст")
@@ -5087,6 +5093,9 @@ class SurveyApp(ctk.CTk):
 
     def _clear_neighbors_scene(self) -> None:
         """Убирает всех соседей со сцены предпросмотра и из вкладки «Соседи»."""
+        if self._multi_scene_handoff is not None:
+            self._clear_multi_scene_neighbors()
+            return
         active_was_neighbor = any(p is self._last_active_plan for p in self._preview_neighbor_plans)
         for plan in self._preview_neighbor_plans:
             self._plan_outcomes.pop(id(plan), None)
@@ -6599,6 +6608,10 @@ class SurveyApp(ctk.CTk):
         Сосед переносится жёстко: форма, длины и румбы не меняются, меняется только положение на
         схеме; описание (legal description) не меняется.
         """
+        if self._multi_scene_handoff is not None:
+            # Legacy auto-slide invents adjacency. It is not valid for multi
+            # sources, especially independently placed descriptions.
+            return
         main = self._preview_main_plan
         neighbours = list(self._preview_neighbor_plans)
         if main is None or not neighbours:
@@ -6825,7 +6838,9 @@ class SurveyApp(ctk.CTk):
             )
 
     def _recompute_neighbor_verification(self) -> NeighborVerificationReport | None:
-        if self._preview_main_plan is None or not self._preview_neighbor_plans:
+        if self._multi_scene_handoff is not None:
+            self._neighbor_report = None
+        elif self._preview_main_plan is None or not self._preview_neighbor_plans:
             self._neighbor_report = None
         else:
             self._neighbor_report = verify_with_neighbors(
@@ -7021,6 +7036,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=2)
 
     def _clear_preview_scene(self) -> None:
+        self._multi_scene_handoff = None
         self._preview_main_plan = None
         self._slide_undo = []
         self._pdf_set_main_plan = None
@@ -7059,11 +7075,103 @@ class SurveyApp(ctk.CTk):
         self._refresh_stepper()
         self._render_empty_inspector()
 
+    def _install_multi_scene(self, handoff: Any) -> None:
+        """Install a prevalidated developer handoff without dropping duplicate plans.
+
+        This preview hook is deliberately not the PDF worker yet. Until the
+        worker and full draw pipeline are integrated, readiness stays false.
+        Never use legacy one-plan-per-file replacement or geometry verification.
+        """
+        from multiple_description_handoff import InvalidHandoff, SceneHandoff
+        if not legal_page_search.enabled(self.config_data):
+            raise InvalidHandoff("multi-description mode disabled")
+        if not isinstance(handoff, SceneHandoff):
+            raise InvalidHandoff("invalid scene handoff")
+        expected = tuple((item.path, bool(item.is_main)) for item in self.pdf_set)
+        actual = tuple((doc.source, doc.is_main) for doc in handoff.documents)
+        if actual != expected:
+            raise InvalidHandoff("stale scene documents")
+        for doc in handoff.documents:
+            if doc.pdf_sha256 is None:
+                continue  # failed-to-open file has no result to publish
+            try:
+                digest = file_metadata._digest(doc.source)
+            except OSError as exc:
+                raise InvalidHandoff("source unavailable") from exc
+            if digest != doc.pdf_sha256:
+                raise InvalidHandoff("source changed")
+        self._multi_scene_handoff = handoff
+        drawable = handoff.drawable
+        main = [d for d in drawable if not d.plan.is_neighbor]
+        neighbors = [d for d in drawable if d.plan.is_neighbor]
+        self._preview_main_plan = main[0].plan if main else None
+        self._pdf_set_main_plan = self._preview_main_plan
+        self._preview_neighbor_plans = [d.plan for d in neighbors]
+        self._neighbor_plan_sources = {}
+        self._pdf_set_scene_neighbors = set()
+        self._plan_source_labels.clear()
+        self._plan_outcomes.clear()
+        for d in drawable:
+            self._plan_source_labels[id(d.plan)] = f"{d.source.name} · #{d.ordinal}"
+            self._plan_outcomes[id(d.plan)] = d.outcome
+            if d.plan.is_neighbor:
+                self._neighbor_plan_sources.setdefault(d.source, d.plan)
+                self._pdf_set_scene_neighbors.add(d.source)
+        for item, doc in zip(self.pdf_set, handoff.documents):
+            item.multi_outcomes = [d.outcome for d in doc.descriptions]
+            item.outcome = item.multi_outcomes[0] if item.multi_outcomes else None
+            item.parsed_key = item.parse_key() if item.outcome is not None else None
+            item.on_scene = any(d.plan is not None for d in doc.descriptions)
+            item.error = ""
+            item.issues = []
+        self._neighbor_report = None
+        self._slide_undo = []
+        self._last_active_plan = self._preview_main_plan or (neighbors[0].plan if neighbors else None)
+        self._last_suspicion_report = None
+        self._ready_source_signature = None
+        self._input_incomplete = True
+        self.preview_mode_var.set("📐 Схема CAD")
+        self.preview_mode_switch.set("📐 Схема CAD")
+        self._redraw_preview_canvas()
+
+    def _clear_multi_scene_neighbors(self) -> None:
+        from multiple_description_drawing import SceneResult
+        multi = self._multi_scene_handoff
+        if multi is None:
+            return
+        ours = tuple(dataclasses.replace(doc, descriptions=tuple(
+            dataclasses.replace(d, file_index=index) for d in doc.descriptions))
+            for index, doc in enumerate(doc for doc in multi.documents if doc.is_main))
+        our_paths = {doc.source for doc in ours}
+        scene = SceneResult(tuple(p for p in multi.scene.plans if p.is_main),
+                            tuple(f for f in multi.scene.failures if f.source in our_paths))
+        # Validate before changing the current list so a replaced/missing PDF
+        # cannot leave the scene and its source list out of sync.
+        from multiple_description_handoff import InvalidHandoff
+        for doc in ours:
+            if doc.pdf_sha256 is not None:
+                try:
+                    digest = file_metadata._digest(doc.source)
+                except OSError as exc:
+                    raise InvalidHandoff("source unavailable") from exc
+                if digest != doc.pdf_sha256:
+                    raise InvalidHandoff("source changed")
+        self.pdf_set = [item for item in self.pdf_set if item.is_main]
+        self._install_multi_scene(dataclasses.replace(multi, documents=ours, scene=scene))
+        self._pending_neighbor_files.clear()
+        self._neighbor_report = None
+        self._refresh_neighbors_list()
+        self._refresh_pdf_selection_ui()
+        self._refresh_parse_actions()
+
     def _record_plan_for_preview(
         self, plan: DrawPlan, *, warnings: list[str] | None = None,
         source: Path | None = None, source_label: str | None = None,
         outcome: ParseOutcome | None = None,
     ) -> None:
+        if self._multi_scene_handoff is not None:
+            # Legacy single-plan actions cannot safely edit a multi scene.
+            self._clear_preview_scene()
         self._last_active_plan = plan
         self._last_suspicion_report = plan.suspicion
         if plan.is_neighbor:
@@ -7334,6 +7442,42 @@ class SurveyApp(ctk.CTk):
                 return step
         return 2000.0
 
+    def _draw_multi_preview_canvas(self, canvas: Any, width: int, height: int) -> None:
+        """Draw exactly the planned chains, without a guessed origin or tie."""
+        plans = [entry.plan for entry in self._multi_scene_handoff.drawable]
+        points = [pt for plan in plans for edge in plan.boundary_lines for pt in (edge.start, edge.end)]
+        if not points:
+            self._last_world_transform = None
+            return
+        xs, ys = zip(*points)
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        sx, sy = max(max(xs) - min(xs), 10.0), max(max(ys) - min(ys), 10.0)
+        zoom = max(0.6, min(10.0, float(self._canvas_zoom or 1.0)))
+        scale = min(max((width - 68) / sx, 0.05), max((height - 68) / sy, 0.05)) * zoom
+        self._last_world_transform = (cx, cy, scale, width, height)
+        def screen(point: tuple[float, float]) -> tuple[float, float]:
+            return (width * .5 + self._canvas_pan_x + (point[0] - cx) * scale,
+                    height * .5 + self._canvas_pan_y - (point[1] - cy) * scale)
+        for plan in plans:
+            for line in plan.lines:
+                x1, y1 = screen(line.start)
+                x2, y2 = screen(line.end)
+                canvas.create_line(x1, y1, x2, y2, fill=THEME["cad_street"], width=1.6)
+            color = THEME["cad_neighbor"] if plan.is_neighbor else THEME["cad_prop"]
+            for line in plan.boundary_lines:
+                x1, y1 = screen(line.start)
+                x2, y2 = screen(line.end)
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
+            for text in plan.items:
+                kind = str(text.kind)
+                if not (kind in {"main-lot-label", "neighbor-label", "main-street", "cross-street",
+                                 "main-street-former", "cross-street-former", "cross-street-distance"}
+                        or kind.startswith(("side-", "party-wall-"))):
+                    continue
+                x, y = screen(text.point)
+                text_color = THEME["cad_street_text"] if "street" in kind else color
+                canvas.create_text(x, y, text=text.text, fill=text_color, font=("Segoe UI", 8, "bold"))
+
     def _redraw_preview_canvas(self) -> None:
         canvas = self.preview_canvas
         if canvas is None:
@@ -7351,6 +7495,9 @@ class SurveyApp(ctk.CTk):
             self._draw_source_visual_on_canvas(canvas, w, h)
             return
 
+        if self._multi_scene_handoff is not None:
+            self._draw_multi_preview_canvas(canvas, w, h)
+            return
         plans: list[DrawPlan] = []
         if self._preview_main_plan is not None:
             plans.append(self._preview_main_plan)
@@ -11051,6 +11198,10 @@ class SurveyApp(ctk.CTk):
 
     def _print_draft_plans(self) -> list[tuple[str, DrawPlan]]:
         """Черновик для печати из основного участка: без соседей, на +1000 по X."""
+        if getattr(self, "_multi_scene_handoff", None) is not None:
+            from multiple_description_drawing import make_scene_print_drafts
+            result = make_scene_print_drafts(self._multi_scene_handoff.scene, builder_cfg=self.config_data)
+            return [(f"Черновик для печати: #{index}", plan) for index, plan in enumerate(result.plans, 1)]
         main = self._preview_main_plan
         if main is None or main.is_neighbor:
             return []

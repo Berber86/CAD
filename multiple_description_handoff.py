@@ -13,7 +13,7 @@ from typing import Sequence
 
 from acad_builder import DrawPlan
 from llm_parser import ParseOutcome
-from multiple_description_drawing import PlannedDescription, SceneResult
+from multiple_description_drawing import PlannedDescription, SceneResult, _shape_matches
 from multiple_description_runtime import BatchResult, FileJob
 
 
@@ -39,6 +39,7 @@ class DocumentView:
     source: Path
     is_main: bool
     status: str
+    pdf_sha256: str | None
     cached: bool
     complete: bool
     descriptions: tuple[DescriptionView, ...]
@@ -102,6 +103,8 @@ def build_handoff(batch: BatchResult, *, expected_jobs: Sequence[FileJob] | None
         file = batch.files[parsed[index][0]]
         if entry.source != file.job.path or entry.is_main != file.job.is_main or entry.plan.is_neighbor == entry.is_main:
             raise InvalidHandoff('plan source or role mismatch')
+        if not _shape_matches(entry.plan, parsed[index][2]):
+            raise InvalidHandoff('plan sides mismatch')
         plans[index] = entry
     for failure in batch.scene.failures:
         index = failure.description_index
@@ -131,6 +134,10 @@ def build_handoff(batch: BatchResult, *, expected_jobs: Sequence[FileJob] | None
         # with no candidates is not proof that the PDF has no descriptions.
         # A failed or missing result is never a confirmed absence of descriptions.
         complete = bool((parse is not None and parse.complete) or file.status == 'no_candidates')
-        docs.append(DocumentView(file.job.path, file.job.is_main, file.status,
+        digest = result.search.get('pdf_sha256') if result else None
+        if result is not None and (not isinstance(digest, str) or len(digest) != 64
+                                   or any(c not in '0123456789abcdef' for c in digest)):
+            raise InvalidHandoff('invalid document digest')
+        docs.append(DocumentView(file.job.path, file.job.is_main, file.status, digest,
                                  bool(result and result.cached), complete, tuple(descriptions[index])))
     return SceneHandoff(tuple(docs), batch.scene)

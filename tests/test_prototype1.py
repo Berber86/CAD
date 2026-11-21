@@ -1062,7 +1062,7 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     assert by_kind["angle-1"].text == '93%%d33\'29.5"'
     assert point_in_polygon(by_kind["angle-1"].point, plan.vertices) is True
     assert len(plan.arcs) == 1
-    assert len(plan.lines) == 4  # продолжения красных линий обеих улиц
+    assert len(plan.lines) == 2  # продолжения только с дальних концов уличных сторон
     # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
     assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
@@ -1243,7 +1243,7 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
     assert result.plan.street_boundary_indices == (3, 0)
     assert len(prop_lines) == 2  # две нефасадные стороны
-    assert len(street_lines) == 6  # четыре продолжения и два фасада
+    assert len(street_lines) == 4  # два дальних продолжения и два фасада
     assert space.arcs[0].Layer == "M-TAX-DIM"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True

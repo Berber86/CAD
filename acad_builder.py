@@ -2270,8 +2270,11 @@ class AcadBuilder:
                 if cross_idx is not None and 0 <= int(cross_idx) < count
                 else (front_index - 1) % count
             )
-            c_start = points[side_idx]
-            c_end = points[(side_idx + 1) % count]
+            if boundary_lines is not None and side_idx < len(boundary_lines):
+                c_start, c_end = boundary_lines[side_idx].start, boundary_lines[side_idx].end
+            else:
+                c_start = points[side_idx]
+                c_end = points[(side_idx + 1) % count]
             cnx, cny, c_len = self._outward_normal(c_start, c_end, ccw)
             if c_len > 1e-9:
                 c_angle = math.atan2(c_end[1] - c_start[1], c_end[0] - c_start[0])
@@ -2297,37 +2300,36 @@ class AcadBuilder:
                     ))
                 if draw_ext:
                     f_ext = max(12.0 * text_height, min(20.0 * text_height, 0.35 * length))
-                    row_lines.append(
-                        LineItem(
+                    # У соседних уличных сторон общий конец — угол участка.
+                    # Не продлеваем ни одну сторону через этот угол; дальние
+                    # продолжения оставляем. Настоящие румбы и углы не меняем.
+                    front_end_is_corner = (front_index + 1) % count == side_idx
+                    front_start_is_corner = (side_idx + 1) % count == front_index
+                    if not front_start_is_corner:
+                        row_lines.append(LineItem(
                             start=(start[0] - ux * f_ext, start[1] - uy * f_ext),
-                            end=start,
-                            kind="main-street-row-1",
-                        )
-                    )
-                    row_lines.append(
-                        LineItem(
-                            start=end,
-                            end=(end[0] + ux * f_ext, end[1] + uy * f_ext),
+                            end=start, kind="main-street-row-1",
+                        ))
+                    if not front_end_is_corner:
+                        row_lines.append(LineItem(
+                            start=end, end=(end[0] + ux * f_ext, end[1] + uy * f_ext),
                             kind="main-street-row-2",
-                        )
-                    )
+                        ))
                     cux = (c_end[0] - c_start[0]) / c_len
                     cuy = (c_end[1] - c_start[1]) / c_len
                     c_ext = max(12.0 * text_height, min(20.0 * text_height, 0.22 * c_len))
-                    row_lines.append(
-                        LineItem(
+                    if not front_end_is_corner:
+                        row_lines.append(LineItem(
                             start=(c_start[0] - cux * c_ext, c_start[1] - cuy * c_ext),
-                            end=c_start,
-                            kind="cross-street-row-1",
-                        )
-                    )
-                    row_lines.append(
-                        LineItem(
-                            start=c_end,
-                            end=(c_end[0] + cux * c_ext, c_end[1] + cuy * c_ext),
+                            end=c_start, kind="cross-street-row-1",
+                        ))
+                    if not front_start_is_corner:
+                        row_lines.append(LineItem(
+                            start=c_end, end=(c_end[0] + cux * c_ext, c_end[1] + cuy * c_ext),
                             kind="cross-street-row-2",
-                        )
-                    )
+                        ))
+                    if not front_start_is_corner and not front_end_is_corner:
+                        warnings.append("уличные стороны не соседние — общий угол не определён, сверьте исходные данные")
                 return items, row_lines
 
         # Рядовой участок: привязка вдоль фасадной улицы от реального перекрёстка (0.0, 0.0)
@@ -2437,13 +2439,11 @@ class AcadBuilder:
             )
             row_lines.append(
                 LineItem(
-                    start=(
+                    # От перекрёстка только в сторону блока: не пересекать tie.
+                    start=corner_pt,
+                    end=(
                         corner_pt[0] - nx * (4.5 * text_height),
                         corner_pt[1] - ny * (4.5 * text_height),
-                    ),
-                    end=(
-                        corner_pt[0] + nx * (street_offset + 5.0 * text_height),
-                        corner_pt[1] + ny * (street_offset + 5.0 * text_height),
                     ),
                     kind="cross-street-row",
                 )

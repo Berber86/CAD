@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
                           'pdf_pages': total, 'covered_pages': covered, 'uncovered_pages': total - covered,
                           'batch_pages': groups, 'initial_requests_without_cache_or_render_errors': len(groups),
                           'max_attempts_per_batch': 6,
-                          'message': 'No requests sent. Live mode requires the developer switch and may incur charges.'}, indent=2))
+                          'message': 'No requests sent. Live mode requires the developer switch or explicit --isolated-test and may incur charges.'}, indent=2))
         return 0
     if args.isolated_test:
         cfg = copy.deepcopy(cfg)

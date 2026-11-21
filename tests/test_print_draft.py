@@ -709,3 +709,38 @@ def test_our_file_lot_label_is_only_drawn_on_main_with_warning(fake_autocad):
     assert not any(text.TextString == "LOT 32" for text in doc.ModelSpace.texts[before_draft:])
     assert desc.lot_number != "32"
     assert any("не совпадает" in warning for warning in main_result.warnings)
+
+
+def test_draw_compacts_printed_bearing_using_cad_measurements_only_in_draft(fake_autocad):
+    import re
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, {})
+    builder, doc = fake_autocad(plan)
+    original_add = doc.ModelSpace.AddText
+
+    def add_measured(text, point, height):
+        entity = original_add(text, point, height)
+        def get_bbox():
+            assert entity.Rotation == 0
+            value = re.sub(r"%%d", "°", entity.TextString, flags=re.IGNORECASE)
+            width = sum(2.0 if char == " " else 1.2 for char in value)
+            return ((0, 0, 0), (width, 2, 0))
+        entity.GetBoundingBox = get_bbox
+        entity.Update = lambda: None
+        return entity
+
+    doc.ModelSpace.AddText = add_measured
+    main_result = builder.draw_plan(plan)
+    main_text = [entity.TextString for entity in doc.ModelSpace.texts]
+    before = len(doc.ModelSpace.texts)
+    draft_result = builder.draw_plan(draft)
+    entities = doc.ModelSpace.texts[before:]
+    assert [e.TextString for e in doc.ModelSpace.texts[:before]] == main_text
+    assert len(entities) == len(draft.items) == draft_result.text_count
+    idx = next(i for i, item in enumerate(draft.items) if item.kind == "side-1")
+    item, entity = draft.items[idx], entities[idx]
+    assert len(entity.TextString) < len(item.text)
+    assert re.sub(r" +", " ", entity.TextString) == re.sub(r" +", " ", item.text)
+    assert entity.Height == 2 and entity.StyleName == "LETTER" and entity.Layer == "M-TAX-DIM"
+    assert entity.Rotation == pytest.approx(item.rotation)
+    assert not any("не удалось измерить" in warning for warning in draft_result.warnings)

@@ -1107,6 +1107,12 @@ def make_print_draft(
     warnings: list[str] = []
     config = copy.deepcopy(builder_cfg if builder_cfg is not None else load_config())
     layout_builder = AcadBuilder(config)
+    # Черновик: меньше искусственных пробелов между румбом и расстоянием.
+    # Не увеличиваем заполнение, если пользователь уже задал меньшее значение.
+    draft_drawing = layout_builder.drawing_cfg
+    draft_drawing["max_label_fill_ratio"] = min(
+        float(draft_drawing.get("max_label_fill_ratio", 0.85)), 0.65
+    )
     source_lines = list(plan.lines)
     distance = float(plan.description.distance_to_corner_ft or 0.0)
     is_corner = (
@@ -2986,6 +2992,77 @@ class AcadBuilder:
         text.Rotation = item.rotation
         return text
 
+    def _fit_print_bearing_text(
+        self, entity: Any, item: TextItem, segment: Segment, side_length: float,
+        *, feet_inches: bool,
+    ) -> str | None:
+        """Compact only the bearing/distance gap using the actual CAD text bounds.
+
+        The entity is new, centred and styled already. Rotate temporarily to zero
+        to measure text width rather than the WCS bounding box of a rotated label.
+        Never change a character within the bearing or distance, the text height,
+        the style, the boundary geometry, or the main drawing.
+        """
+        bearing = format_bearing(segment, use_control_code=bool(self.drawing_cfg.get("degrees_as_control_code", True)))
+        distance = segment_distance_label(segment, feet_inches=feet_inches)
+        text = item.text
+        if not text.startswith(bearing) or not text.endswith(distance):
+            return None  # e.g. separate distance row or a note, not a combined label
+        middle = text[len(bearing):len(text) - len(distance)]
+        if not middle or middle.strip() or side_length <= 0:
+            return None
+        old_rotation = item.rotation
+        failure = None
+        try:
+            entity.Rotation = 0.0
+            if abs(float(entity.Rotation)) > 1e-8:
+                raise ValueError("text rotation not applied")
+
+            def measure(spaces: int) -> float:
+                candidate = bearing + " " * spaces + distance
+                entity.TextString = candidate
+                if str(entity.TextString) != candidate:
+                    raise ValueError("text update not applied")
+                if hasattr(entity, "Update"):
+                    entity.Update()
+                bbox = self._entity_bbox(entity)
+                width = bbox[2] - bbox[0] if bbox is not None else 0.0
+                if not math.isfinite(width) or width <= 0:
+                    raise ValueError("text bounds unavailable")
+                return width
+
+            limit = side_length * 0.8  # 10% от длины стороны с каждого края
+            count = len(middle)
+            if measure(count) > limit:
+                # Минимум один пробел нужен, чтобы румб и расстояние не слились.
+                if count == 1 or measure(1) > limit:
+                    entity.TextString = bearing + " " + distance
+                    failure = "даже с одним пробелом не помещается с отступом 10%"
+                else:
+                    low, high = 1, count - 1
+                    while low < high:
+                        mid = (low + high + 1) // 2
+                        if measure(mid) <= limit:
+                            low = mid
+                        else:
+                            high = mid - 1
+                    measure(low)
+        except Exception:  # noqa: BLE001 - остаётся безопасная предварительная оценка
+            try:
+                entity.TextString = item.text
+            except Exception:  # noqa: BLE001
+                pass
+            failure = "не удалось измерить ширину текста в AutoCAD; проверьте отступы"
+        finally:
+            try:
+                entity.Rotation = old_rotation
+                entity.TextAlignmentPoint = _variant_point(item.point)
+                if abs(float(entity.Rotation) - old_rotation) > 1e-8:
+                    raise ValueError("text rotation not restored")
+            except Exception:  # noqa: BLE001
+                failure = "не удалось восстановить положение подписи; проверьте её в AutoCAD"
+        return failure
+
     # -- главный вход -------------------------------------------------------
     def draw(
         self,
@@ -3169,11 +3246,25 @@ class AcadBuilder:
             created = 0
             for item in geo.items:
                 try:
-                    self._add_text(
+                    entity = self._add_text(
                         model_space, item, geo.text_height, text_target_layer, style,
                         strict_style=True,
                     )
                     created += 1
+                    # Только однострочные bearing + расстояние печатного черновика.
+                    match = re.fullmatch(r"side-(\d+)", item.kind) if geo.print_draft else None
+                    if match:
+                        index = int(match.group(1)) - 1
+                        if 0 <= index < min(len(geo.description.segments), len(geo.boundary_lines)):
+                            segment = geo.description.segments[index]
+                            if segment.has_bearing:
+                                edge = geo.boundary_lines[index]
+                                message = self._fit_print_bearing_text(
+                                    entity, item, segment, math.dist(edge.start, edge.end),
+                                    feet_inches=description_uses_feet_inches(geo.description),
+                                )
+                                if message:
+                                    warnings.append(f"черновик: подпись стороны #{index + 1}: {message}")
                 except Exception as exc:  # noqa: BLE001
                     warnings.append(f"не удалось создать текст «{item.text}»: {exc}")
 

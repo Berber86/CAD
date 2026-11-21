@@ -3951,6 +3951,9 @@ def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
     assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
     trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
     assert trimmed.name_pages == (2, 2)
+    assert trimmed.is_main
+    assert next(item for item in items if item.path.name == "LOT 30 NEW.pdf").is_main is False
+    assert app._pdf_set_dialog.main_var.get() == str(items.index(trimmed))
 
 
 def test_step0_handover_without_files_explains_itself(gui, tmp_path):

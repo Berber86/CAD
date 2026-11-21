@@ -57,7 +57,7 @@ def submit(app, gui, tmp_path):
     make_pdf(neighbor, 2)
     items, errors = app._make_pdf_set_items([our, neighbor])
     assert not errors
-    items[0].is_main = True
+    assert [entry.is_main for entry in items] == [True, False]
     app._submit_pdf_set(items, scene_mode='update', fresh=True)
     smoke._wait_for_gui_worker(app)
     return our, neighbor

@@ -3942,7 +3942,7 @@ class SurveyApp(ctk.CTk):
         items, errors = self._make_pdf_set_items(paths)
         if our_new_paths:
             for item in items:
-                item.is_main = item.path in our_new_paths
+                item.is_main = item.path in our_new_paths or lot_identity.has_our_prefix(item.path)
         for error in errors:
             self._step0_log(f"Файл не открылся для Шага 1: {error}", level=log_mode.LEVEL_ERROR)
             self._log_line(f"! Шаг 0 → Шаг 1: {error}")
@@ -8511,13 +8511,16 @@ class SurveyApp(ctk.CTk):
             try:
                 item = make_item(path, vision_max_pages=limit, ocr_available=ocr_ok)
                 if self._multi_pdf_enabled():
-                    # Trust the explicit document passport role, not its lot
-                    # number or a guess based on the geometry or file name.
+                    # Preserve explicit passport roles; an OUR filename below
+                    # also identifies an initially selected main document.
                     try:
                         _, passport = file_metadata._passport(path)
                         item.is_main = str(passport.get("role") or "").lower() == "our"
                     except (OSError, ValueError):
                         pass
+                # An OUR filename is an explicit role convention, independently
+                # of a passport, a portal lookup, a number or parsed geometry.
+                item.is_main = item.is_main or lot_identity.has_our_prefix(path)
                 items.append(item)
             except Exception as exc:  # noqa: BLE001 - один плохой файл не срывает выбор
                 errors.append(f"{path.name}: {exc}")
@@ -12989,6 +12992,7 @@ class PdfSetDialog:
         self.ask_scene = bool(fresh and app._scene_plans())
         self.vision_limit = int(app.config_data.get("api", {}).get("vision_max_pages") or 8)
         mains = [index for index, item in enumerate(self.items) if item.is_main]
+        self.legacy_multi_roles = not self.multi_mode and len(mains) > 1
         if mains:
             initial = str(mains[0])
         elif not fresh:
@@ -13003,6 +13007,9 @@ class PdfSetDialog:
         self._build()
         if notes:
             self._show_message("Не открыты: " + "; ".join(notes), error=True)
+        elif self.legacy_multi_roles:
+            self._show_message("Несколько файлов отмечены как наши. Обычный режим поддерживает один наш документ; "
+                               "для нескольких включите режим всех описаний.", error=False)
 
     # ---- окно ----
     def _build(self) -> None:
@@ -13051,7 +13058,7 @@ class PdfSetDialog:
             font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
         )
         self.no_main_radio.grid(row=0, column=0, sticky="w")
-        if self.multi_mode:
+        if self.multi_mode or self.legacy_multi_roles:
             self.no_main_radio.grid_remove()
 
         self.scene_frame = ctk.CTkFrame(
@@ -13143,11 +13150,20 @@ class PdfSetDialog:
         )
         frame.grid(row=index, column=0, sticky="ew", padx=6, pady=4)
         frame.grid_columnconfigure(1, weight=1)
-        radio = ctk.CTkRadioButton(
-            frame, text="Наш", width=64, variable=self.main_var, value=str(index),
-            command=self._refresh_notes, font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=THEME["text_main"],
-        )
+        role_var = None
+        if self.legacy_multi_roles:
+            role_var = ctk.BooleanVar(value=bool(item.is_main))
+            radio = ctk.CTkCheckBox(
+                frame, text="Наш", width=64, variable=role_var,
+                command=lambda i=index: self._multi_role_clicked(i),
+                font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_main"],
+            )
+        else:
+            radio = ctk.CTkRadioButton(
+                frame, text="Наш", width=64, variable=self.main_var, value=str(index),
+                command=self._refresh_notes, font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=THEME["text_main"],
+            )
         radio.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=(10, 2))
         name = ctk.CTkLabel(
             frame, text=item.path.name, font=ctk.CTkFont(size=13, weight="bold"),
@@ -13204,7 +13220,7 @@ class PdfSetDialog:
             for event in ("<KeyRelease>", "<FocusOut>"):
                 entry.bind(event, lambda _event, i=index: self.pages_edited(i))
         return {
-            "frame": frame, "radio": radio, "name": name, "first": first_var, "last": last_var,
+            "frame": frame, "radio": radio, "role_var": role_var, "name": name, "first": first_var, "last": last_var,
             "first_entry": first_entry, "last_entry": last_entry, "mode_var": mode_var,
             "mode": mode, "remove": remove, "note": note, "error": "",
             "default_pages": (item.first_page, item.last_page),
@@ -13337,7 +13353,9 @@ class PdfSetDialog:
     def remove(self, index: int) -> None:
         if not 0 <= index < len(self.items):
             return
-        if self.multi_mode:
+        if self.multi_mode or self.legacy_multi_roles:
+            if not self.multi_mode:
+                self._pull_pages()
             self._pull_multi_roles()
             self.items.pop(index)
             self._rebuild_rows()
@@ -13368,13 +13386,29 @@ class PdfSetDialog:
             self._pull_multi_roles()
         else:
             self._pull_pages()
+            if self.legacy_multi_roles:
+                self._pull_multi_roles()
+            else:
+                choice = str(self.main_var.get() or "")
+                for index, item in enumerate(self.items):
+                    item.is_main = choice == str(index)
         new_items, errors = self.app._make_pdf_set_items(
             chosen, existing=[item.path for item in self.items],
         )
         self.items.extend(new_items)
+        if not self.multi_mode and not self.legacy_multi_roles:
+            mains = [index for index, item in enumerate(self.items) if item.is_main]
+            if len(mains) > 1:
+                self.legacy_multi_roles = True
+                self.no_main_radio.grid_remove()
+            elif mains:
+                self.main_var.set(str(mains[0]))
         self._rebuild_rows()
         if errors:
             self._show_message("Не открыты: " + "; ".join(errors), error=True)
+        elif self.legacy_multi_roles and sum(item.is_main for item in self.items) > 1:
+            self._show_message("Несколько файлов отмечены как наши. Обычный режим поддерживает один наш документ; "
+                               "для нескольких включите режим всех описаний.", error=False)
         else:
             self._clear_message()
 
@@ -13456,6 +13490,8 @@ class PdfSetDialog:
             self._pull_multi_roles()
         else:
             self._pull_pages()
+            if self.legacy_multi_roles:
+                self._pull_multi_roles()
         problems = [
             f"{self.items[index].path.name}: {row['error']}"
             for index, row in enumerate(self.rows) if row["error"]
@@ -13463,7 +13499,9 @@ class PdfSetDialog:
         if not self.items:
             problems.append("в наборе нет файлов — добавьте PDF")
         choice = str(self.main_var.get() or "")
-        if not self.multi_mode and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
+        if self.legacy_multi_roles and sum(item.is_main for item in self.items) > 1:
+            problems.append("обычный режим поддерживает только один наш документ; выберите один или включите режим всех описаний")
+        if not self.multi_mode and not self.legacy_multi_roles and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
             problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
         scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
         if self.multi_mode and scene_mode == "add" and not self.app._multi_scene_can_add():
@@ -13473,7 +13511,7 @@ class PdfSetDialog:
         if problems:
             self._show_message("Исправьте: " + "; ".join(problems) + ".", error=True)
             return
-        if not self.multi_mode:
+        if not self.multi_mode and not self.legacy_multi_roles:
             for index, item in enumerate(self.items):
                 item.is_main = choice == str(index)
         items = list(self.items)

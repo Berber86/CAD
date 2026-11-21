@@ -708,7 +708,7 @@ def test_multi_document_roles_are_independent_and_survive_list_edits(gui, tmp_pa
     assert [item.is_main for item in captured[0][0]] == [True, True]
 
 
-def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path, monkeypatch):
+def test_multi_roles_from_prefix_and_passport_are_editable(gui, tmp_path, monkeypatch):
     import json
     app = gui.SurveyApp()
     app.multi_pdf_mode_var.set(True)
@@ -719,7 +719,7 @@ def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path,
     first.with_suffix('.json').write_text(json.dumps({'file': first.name, 'role': 'our'}))
     second.with_suffix('.json').write_text(json.dumps({'file': second.name, 'role': 'neighbour'}))
     dialog = _open_set(app, monkeypatch, first, second, named_our)
-    assert [row['role_var'].get() for row in dialog.rows] == [True, False, False]
+    assert [row['role_var'].get() for row in dialog.rows] == [True, False, True]
     dialog.rows[0]['role_var'].set(False)
     dialog.rows[2]['role_var'].set(True)
     captured = []
@@ -743,3 +743,92 @@ def test_multi_start_dispatches_only_new_worker_and_is_not_ready_yet(gui, tmp_pa
     assert app._busy and len(app.pdf_set) == 1
     assert app._ready_source_signature is None and app._input_incomplete
     assert len(starts) == 1 and starts[0][0].__name__ == '_multi_pdf_worker'
+
+
+def test_our_filename_sets_roles_for_every_multi_document_without_passport(gui, tmp_path, monkeypatch):
+    import json
+    app = gui.SurveyApp()
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
+    names = ('our 06.pdf', 'OUR_7 NEW.pdf', 'LOT 8.pdf', 'ourhouse.pdf', 'not OUR 9.pdf')
+    paths = [tmp_path / name for name in names]
+    for path in paths:
+        _write_test_pdf(path, [FILLER])
+    # A filename explicitly marked OUR wins even if an old passport says neighbour.
+    paths[1].with_suffix('.json').write_text(json.dumps({'file': paths[1].name, 'role': 'neighbour'}))
+    dialog = _open_set(app, monkeypatch, *paths)
+    assert [row['role_var'].get() for row in dialog.rows] == [True, True, False, False, False]
+    # An explicit user edit is respected, including after list rebuild.
+    dialog.rows[0]['role_var'].set(False)
+    dialog.remove(3)
+    assert [row['role_var'].get() for row in dialog.rows] == [False, True, False, False]
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
+    dialog.submit()
+    assert [item.is_main for item in captured[0]] == [False, True, False, False]
+
+
+def test_legacy_default_selects_our_regardless_of_position_and_stays_editable(gui, tmp_path, monkeypatch):
+    paths = [tmp_path / 'LOT 1.pdf', tmp_path / 'our 06.pdf']
+    for path in paths:
+        _write_test_pdf(path, [FILLER])
+    app = gui.SurveyApp()
+    dialog = _open_set(app, monkeypatch, *paths)
+    assert dialog.main_var.get() == '1'
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
+    dialog.rows[0]['radio'].select()
+    dialog.submit()
+    assert [item.is_main for item in captured[0]] == [True, False]
+
+
+def test_legacy_multiple_ours_remain_marked_and_cannot_silently_be_neighbors(gui, tmp_path, monkeypatch):
+    paths = [tmp_path / x for x in ('OUR 6 NEW.pdf', 'OUR 7 NEW.pdf', 'LOT 8.pdf')]
+    for path in paths:
+        _write_test_pdf(path, [FILLER])
+    app = gui.SurveyApp()
+    dialog = _open_set(app, monkeypatch, *paths)
+    assert dialog.legacy_multi_roles
+    assert [row['role_var'].get() for row in dialog.rows] == [True, True, False]
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
+    dialog.submit()
+    assert not captured and not dialog.closed
+    assert 'только один наш документ' in dialog.message.cget('text')
+    dialog.rows[1]['role_var'].set(False)
+    dialog.submit()
+    assert [item.is_main for item in captured[0]] == [True, False, False]
+
+
+def test_adding_our_preserves_user_selection_and_auto_marks_new_file(gui, tmp_path, monkeypatch):
+    first, second, third = [tmp_path / x for x in ('LOT 1.pdf', 'OUR 2.pdf', 'our_3.pdf')]
+    for path in (first, second, third):
+        _write_test_pdf(path, [FILLER])
+    app = gui.SurveyApp()
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
+    dialog = _open_set(app, monkeypatch, first, second)
+    dialog.rows[0]['role_var'].set(True)
+    dialog.rows[1]['role_var'].set(False)
+    _pick(monkeypatch, third)
+    dialog.add_files()
+    assert [row['role_var'].get() for row in dialog.rows] == [True, False, True]
+
+
+def test_adding_second_our_in_legacy_switches_to_independent_roles_without_loss(gui, tmp_path, monkeypatch):
+    paths = [tmp_path / x for x in ('OUR 1.pdf', 'LOT 2.pdf', 'OUR 3.pdf')]
+    for path in paths:
+        _write_test_pdf(path, [FILLER])
+    app = gui.SurveyApp()
+    dialog = _open_set(app, monkeypatch, *paths[:2])
+    assert dialog.main_var.get() == '0'
+    _pick(monkeypatch, paths[2])
+    dialog.add_files()
+    assert dialog.legacy_multi_roles
+    assert [row['role_var'].get() for row in dialog.rows] == [True, False, True]
+    dialog.remove(2)
+    assert [row['role_var'].get() for row in dialog.rows] == [True, False]
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
+    dialog.submit()
+    assert [i.is_main for i in captured[0]] == [True, False]

@@ -686,3 +686,56 @@ def test_passport_collision_is_reported_without_losing_the_plan(gui, tmp_path, m
     assert any("не удалось сохранить паспорт" in warning for warning in app._preview_main_plan.warnings)
     assert passport.read_text(encoding="utf-8") == '{"other": true}'
     app._on_close()
+
+
+def test_multi_document_roles_are_independent_and_survive_list_edits(gui, tmp_path, monkeypatch):
+    """The experimental UI selects document roles, never individual descriptions."""
+    main, left, right = _three_lots(tmp_path)
+    app = gui.SurveyApp()
+    app.config_data['multiple_description_search']['enabled'] = True  # test process only
+    dialog = _open_set(app, monkeypatch, main, left, right)
+    assert dialog.multi_mode
+    assert not dialog.no_main_radio._gridded
+    assert all(not row['role_var'].get() for row in dialog.rows)
+    dialog.rows[0]['role_var'].set(True)
+    dialog.rows[1]['role_var'].set(True)
+    dialog.remove(2)  # rebuild must not collapse the two selections into one
+    assert [row['role_var'].get() for row in dialog.rows] == [True, True]
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append((items, kw)))
+    dialog.submit()
+    assert [item.is_main for item in captured[0][0]] == [True, True]
+
+
+def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path, monkeypatch):
+    import json
+    app = gui.SurveyApp()
+    app.config_data['multiple_description_search']['enabled'] = True
+    first, second, named_our = (tmp_path / name for name in ('lot-a.pdf', 'lot-b.pdf', 'OUR 77.pdf'))
+    for path in (first, second, named_our):
+        _write_test_pdf(path, [FILLER])
+    first.with_suffix('.json').write_text(json.dumps({'file': first.name, 'role': 'our'}))
+    second.with_suffix('.json').write_text(json.dumps({'file': second.name, 'role': 'neighbour'}))
+    dialog = _open_set(app, monkeypatch, first, second, named_our)
+    assert [row['role_var'].get() for row in dialog.rows] == [True, False, False]
+    dialog.rows[0]['role_var'].set(False)
+    dialog.rows[2]['role_var'].set(True)
+    captured = []
+    monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
+    dialog.submit()
+    assert [item.is_main for item in captured[0]] == [False, False, True]
+
+
+def test_incomplete_multi_integration_never_runs_legacy_parser_or_draws(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    app.config_data['multiple_description_search']['enabled'] = True
+    path = tmp_path / 'OUR 6.pdf'
+    _write_test_pdf(path, [_samples()[MAIN]])
+    dialog = _open_set(app, monkeypatch, path)
+    dialog.rows[0]['role_var'].set(True)
+    monkeypatch.setattr(app, '_pdf_set_worker', lambda *a, **k: pytest.fail('legacy parser ran'))
+    monkeypatch.setattr(app, '_start_background', lambda *a, **k: pytest.fail('unexpected job'))
+    dialog.submit()
+    assert not app._busy and len(app.pdf_set) == 1
+    assert app._ready_source_signature is None and app._input_incomplete
+    assert 'ещё не подключён' in app.status_var.get()

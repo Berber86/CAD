@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover
 import app_updater
 import lot_identity
 import file_metadata
+import legal_page_search
 from neighbour_slide import slide_off_overlap
 
 #: Как найден сдвиг соседа — для журнала развода.
@@ -3872,16 +3873,21 @@ class SurveyApp(ctk.CTk):
 
         paths: list[Path] = []
         our_new_paths: set[Path] = set()
+        multi = legal_page_search.enabled(self.config_data)
         for item in items_meta:
             role = str(item.get("role") or "").lower()
             tag = str(item.get("tag") or "NEW").upper()
-            if role == "our" and tag == "OLD":
+            if not multi and role == "our" and tag == "OLD":
                 continue
             full_name = str(item.get("file") or "").strip()
             trimmed_name = str(item.get("trimmed") or "").strip()
             trimmed_path = folder / trimmed_name if trimmed_name else None
             full_path = folder / full_name if full_name else None
-            if trimmed_path is not None and trimmed_path.is_file():
+            if multi and full_path is not None and full_path.is_file():
+                # The page search needs the complete original, not the old
+                # one-lot excerpt; each source document is processed once.
+                chosen = full_path
+            elif trimmed_path is not None and trimmed_path.is_file():
                 chosen = trimmed_path
             elif full_path is not None and full_path.is_file():
                 chosen = full_path
@@ -3895,7 +3901,7 @@ class SurveyApp(ctk.CTk):
                 continue
             if chosen not in paths:
                 paths.append(chosen)
-            if role == "our" and tag == "NEW":
+            if role == "our" and (multi or tag == "NEW"):
                 our_new_paths.add(chosen)
 
         if not paths:
@@ -8262,9 +8268,16 @@ class SurveyApp(ctk.CTk):
             if path in known:
                 continue
             try:
-                items.append(
-                    make_item(path, vision_max_pages=limit, ocr_available=ocr_ok)
-                )
+                item = make_item(path, vision_max_pages=limit, ocr_available=ocr_ok)
+                if legal_page_search.enabled(self.config_data):
+                    # Trust the explicit document passport role, not its lot
+                    # number or a guess based on the geometry or file name.
+                    try:
+                        _, passport = file_metadata._passport(path)
+                        item.is_main = str(passport.get("role") or "").lower() == "our"
+                    except (OSError, ValueError):
+                        pass
+                items.append(item)
             except Exception as exc:  # noqa: BLE001 - один плохой файл не срывает выбор
                 errors.append(f"{path.name}: {exc}")
         return items, errors
@@ -8337,9 +8350,11 @@ class SurveyApp(ctk.CTk):
             pass
         self._on_source_mode_changed()
         paid = sum(1 for item in items if item.use_llm)
+        multi = legal_page_search.enabled(self.config_data)
         self.pdf_label.configure(
-            text=f"Набор PDF: {len(items)} файл. (ИИ: {paid}, локально: {len(items) - paid})",
-            text_color=THEME["warn"] if paid else THEME["ok"],
+            text=(f"Набор PDF: {len(items)} файл. (ИИ)" if multi else
+                  f"Набор PDF: {len(items)} файл. (ИИ: {paid}, локально: {len(items) - paid})"),
+            text_color=THEME["warn"] if paid or multi else THEME["ok"],
         )
         self._start_pdf_set()
 
@@ -8353,6 +8368,13 @@ class SurveyApp(ctk.CTk):
         даже если ответ для этого разбора уже есть или набор разобран локально.
         """
         if self._busy or not self.pdf_set:
+            return
+        if legal_page_search.enabled(self.config_data):
+            # Until the experimental multi-result scene is fully wired, never
+            # silently fall back to the old one-description-per-file parser.
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            self._set_status("Многоконтурный разбор ещё не подключён.")
             return
         if self.pending_conflict is not None or self.pending_doubt is not None:
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
@@ -12436,6 +12458,7 @@ class PdfSetDialog:
         self.items = list(items)
         self.fresh = fresh
         self.closed = False
+        self.multi_mode = legal_page_search.enabled(app.config_data)
         # Новый набор при непустой схеме: заменить её или добавить — спрашиваем каждый раз.
         self.ask_scene = bool(fresh and app._scene_plans())
         self.vision_limit = int(app.config_data.get("api", {}).get("vision_max_pages") or 8)
@@ -12473,12 +12496,15 @@ class PdfSetDialog:
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            head, text="Отметьте наш участок — остальные файлы будут соседями",
+            head, text=("Отметьте наши документы — остальные файлы будут соседями" if self.multi_mode
+                        else "Отметьте наш участок — остальные файлы будут соседями"),
             font=ctk.CTkFont(size=15, weight="bold"), text_color=THEME["text_main"], anchor="w",
         ).grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(
             head,
             text=(
+                "Поиск описаний охватывает первые 200 страниц PDF; каждое описание сохраняет роль документа."
+                if self.multi_mode else
                 "В разбор идут только указанные страницы — оставьте те, где описаны границы. "
                 "Страницы из имени файла (…_p17 или …_p2_5) подставлены сами, их можно править."
             ),
@@ -12499,6 +12525,8 @@ class PdfSetDialog:
             font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
         )
         self.no_main_radio.grid(row=0, column=0, sticky="w")
+        if self.multi_mode:
+            self.no_main_radio.grid_remove()
 
         self.scene_frame = ctk.CTkFrame(
             foot, fg_color=THEME["bg_field"], corner_radius=8,
@@ -12579,6 +12607,8 @@ class PdfSetDialog:
         self._refresh_submit_text()
 
     def _build_row(self, index: int, item: PdfSetItem) -> dict[str, Any]:
+        if self.multi_mode:
+            return self._build_multi_row(index, item)
         frame = ctk.CTkFrame(
             self.list_frame, fg_color=THEME["bg_field"], corner_radius=8,
             border_width=1, border_color=THEME["border_subtle"],
@@ -12651,6 +12681,34 @@ class PdfSetDialog:
             "mode": mode, "remove": remove, "note": note, "error": "",
             "default_pages": (item.first_page, item.last_page),
         }
+
+    def _build_multi_row(self, index: int, item: PdfSetItem) -> dict[str, Any]:
+        """Independent document roles; search and page selection are automatic."""
+        frame = ctk.CTkFrame(self.list_frame, fg_color=THEME["bg_field"], corner_radius=8,
+                             border_width=1, border_color=THEME["border_subtle"])
+        frame.grid(row=index, column=0, sticky="ew", padx=6, pady=4)
+        frame.grid_columnconfigure(1, weight=1)
+        role_var = ctk.BooleanVar(value=bool(item.is_main))
+        checkbox = ctk.CTkCheckBox(frame, text="Наш", width=64, variable=role_var,
+                                   command=lambda i=index: self._multi_role_clicked(i),
+                                   font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_main"])
+        checkbox.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=10)
+        name = ctk.CTkLabel(frame, text=item.path.name, font=ctk.CTkFont(size=13, weight="bold"),
+                            text_color=THEME["text_main"], anchor="w", justify="left", wraplength=500)
+        name.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=10)
+        remove = ctk.CTkButton(frame, text="✕", width=30, height=28, fg_color=THEME["btn_secondary"],
+                               hover_color=THEME["btn_secondary_hover"], command=lambda i=index: self.remove(i))
+        remove.grid(row=0, column=2, padx=(0, 10), pady=10)
+        note = ctk.CTkLabel(frame, text="Поиск описаний по страницам PDF · ИИ",
+                            font=ctk.CTkFont(size=11), text_color=THEME["text_muted"], anchor="w")
+        note.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 9))
+        return {"frame": frame, "radio": checkbox, "role_var": role_var, "name": name,
+                "remove": remove, "note": note, "error": ""}
+
+    def _multi_role_clicked(self, index: int) -> None:
+        if 0 <= index < len(self.rows):
+            self.items[index].is_main = bool(self.rows[index]["role_var"].get())
+            self._clear_message()
 
     # ---- правка строк ----
     def pages_edited(self, index: int) -> None:
@@ -12751,6 +12809,12 @@ class PdfSetDialog:
     def remove(self, index: int) -> None:
         if not 0 <= index < len(self.items):
             return
+        if self.multi_mode:
+            self._pull_multi_roles()
+            self.items.pop(index)
+            self._rebuild_rows()
+            self._clear_message()
+            return
         choice = str(self.main_var.get() or "")
         self._pull_pages()
         main_item = self.items[int(choice)] if choice.isdigit() and int(choice) < len(self.items) else None
@@ -12772,7 +12836,10 @@ class PdfSetDialog:
         chosen = [Path(p) for p in (paths or ()) if str(p).strip()]
         if not chosen:
             return
-        self._pull_pages()
+        if self.multi_mode:
+            self._pull_multi_roles()
+        else:
+            self._pull_pages()
         new_items, errors = self.app._make_pdf_set_items(
             chosen, existing=[item.path for item in self.items],
         )
@@ -12783,6 +12850,10 @@ class PdfSetDialog:
         else:
             self._clear_message()
 
+    def _pull_multi_roles(self) -> None:
+        for index, row in enumerate(self.rows):
+            self.items[index].is_main = bool(row["role_var"].get())
+
     def _pull_pages(self) -> None:
         """Переносит корректные значения полей в файлы перед перестройкой списка."""
         for index in range(len(self.rows)):
@@ -12791,6 +12862,8 @@ class PdfSetDialog:
     # ---- подписи ----
     def _row_note(self, index: int) -> tuple[str, str]:
         row, item = self.rows[index], self.items[index]
+        if self.multi_mode:
+            return "Поиск описаний по страницам PDF · ИИ", THEME["text_muted"]
         if row["error"]:
             return f"⚠ Страницы: {row['error']}", THEME["err"]
         pages = format_pages(item.first_page, item.last_page)
@@ -12832,6 +12905,9 @@ class PdfSetDialog:
         self._clear_message()
 
     def _refresh_submit_text(self) -> None:
+        if self.multi_mode:
+            self.submit_button.configure(text="▶ Отправить на разбор · ИИ")
+            return
         paid = sum(1 for item in self.items if item.use_llm and not item.has_fresh_result())
         suffix = f" · ИИ: {paid} файл." if paid else " · бесплатно"
         self.submit_button.configure(text=f"▶ Отправить на разбор{suffix}")
@@ -12848,7 +12924,10 @@ class PdfSetDialog:
         """Проверяет список и отправляет весь набор на разбор."""
         if self.closed:
             return
-        self._pull_pages()
+        if self.multi_mode:
+            self._pull_multi_roles()
+        else:
+            self._pull_pages()
         problems = [
             f"{self.items[index].path.name}: {row['error']}"
             for index, row in enumerate(self.rows) if row["error"]
@@ -12856,7 +12935,7 @@ class PdfSetDialog:
         if not self.items:
             problems.append("в наборе нет файлов — добавьте PDF")
         choice = str(self.main_var.get() or "")
-        if self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
+        if not self.multi_mode and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
             problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
         scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
         if self.ask_scene and scene_mode not in {"replace", "add"}:
@@ -12864,8 +12943,9 @@ class PdfSetDialog:
         if problems:
             self._show_message("Исправьте: " + "; ".join(problems) + ".", error=True)
             return
-        for index, item in enumerate(self.items):
-            item.is_main = choice == str(index)
+        if not self.multi_mode:
+            for index, item in enumerate(self.items):
+                item.is_main = choice == str(index)
         items = list(self.items)
         self.close()
         self.app._submit_pdf_set(items, scene_mode=scene_mode, fresh=self.fresh)

@@ -5946,3 +5946,24 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     assert seen["identity_by_lot"]["30"]["lot"][0]["method"] == "vision map (unverified)"
     assert seen["identity_by_lot"]["40"]["lot"][0]["source"] == "manual"
     app._on_close()
+
+
+def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
+    app = gui.SurveyApp()
+    app.config_data['multiple_description_search']['enabled'] = True  # isolated test only
+    folder = tmp_path / '01_описания'
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-new.pdf'), role='our', lot=32,
+                             tag='NEW', block=6323, pages='2',
+                             trimmed_source=_step0_pdf(tmp_path / 'trimmed.pdf'))
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-old.pdf'), role='our', lot=32,
+                             tag='OLD', block=6323)
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'neighbour.pdf'), role='neighbour',
+                             lot=30, tag='NEW', block=6323)
+    _fill_step0(app, folder=folder, neighbours='30')
+    app._step0_to_step1()
+    dialog = app._pdf_set_dialog
+    assert dialog is not None and dialog.multi_mode
+    assert {item.path.name: item.is_main for item in dialog.items} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+    assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}

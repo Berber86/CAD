@@ -68,3 +68,77 @@ def test_mock_live_uses_copy_and_cleans_all_diagnostics(tmp_path, monkeypatch, c
     assert used_paths and not used_paths[0].exists()
     assert list(tmp_path.iterdir()) == [source]
     assert cfg['multiple_description_search']['enabled'] is False
+
+
+def test_diagnostic_dry_run_validates_page_list_without_network(tmp_path, monkeypatch, capsys):
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 5)
+    monkeypatch.setattr(tool.common, 'load_provider_key', lambda *a: (_ for _ in ()).throw(AssertionError('key')))
+    assert tool.main([str(pdf), '--diagnose-pages', '2,3']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['pages'] == [2, 3] and report['search_requests'] == 0
+    assert report['maximum_parse_requests'] == 1
+    for bad in ('0,2', '2,2', '3,2', '1,6', '2-3', ''):
+        assert tool.main([str(pdf), '--diagnose-pages', bad, '--live']) == 2
+        assert 'No requests sent' in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [pdf]
+
+
+def test_mock_single_diagnostic_sends_once_without_search_and_masks_errors(tmp_path, monkeypatch, capsys):
+    import contextlib
+    from test_multiple_description_runtime import config
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 5)
+    cfg = config()
+    monkeypatch.setattr(tool.lp, 'load_config', lambda: cfg)
+    keys = []
+    monkeypatch.setattr(tool.common, 'load_provider_key', lambda provider: keys.append(provider) or 'secret')
+    target = tool.runtime.ResolvedTarget('hydra', 'grok-4.7', 'https://example.test', 'secret', 10)
+    monkeypatch.setattr(tool.runtime, 'provider_target', lambda *a, **k: target)
+    calls = []
+    class ApiError(Exception):
+        status_code = 429
+    @contextlib.contextmanager
+    def callbacks(*args):
+        def send(images, context):
+            calls.append(([p.number for p in images], context))
+            raise ApiError('SECRET body')
+        yield send, lambda *a: (_ for _ in ()).throw(AssertionError('comparison'))
+    monkeypatch.setattr(tool.runtime, 'open_runtime_callbacks', callbacks)
+    monkeypatch.setattr(tool.runtime, 'run_batch', lambda *a, **k: (_ for _ in ()).throw(AssertionError('search')))
+    assert tool.main([str(pdf), '--diagnose-pages', '2,3', '--live']) == 1
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result['failure_kind'] == 'http_429' and result['search_requests'] == 0
+    assert result['max_parse_requests'] == 1 and result['elapsed_seconds'] >= 0
+    assert keys == ['hydra'] and len(calls) == 1 and calls[0][0] == [2, 3]
+    assert 'SECRET' not in captured.out + captured.err and 'secret' not in captured.out + captured.err
+    assert list(tmp_path.iterdir()) == [pdf]
+
+
+def test_mock_single_diagnostic_success_uses_existing_parser_only_once(tmp_path, monkeypatch, capsys):
+    import contextlib
+    from test_multiple_description_runtime import config, described
+    from test_multiple_description_parse import answer
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 5)
+    cfg = config()
+    monkeypatch.setattr(tool.lp, 'load_config', lambda: cfg)
+    monkeypatch.setattr(tool.common, 'load_provider_key', lambda provider: 'test-key')
+    target = tool.runtime.ResolvedTarget('hydra', 'grok-4.7', 'https://example.test', 'test-key', 10)
+    monkeypatch.setattr(tool.runtime, 'provider_target', lambda *a, **k: target)
+    calls = []
+    @contextlib.contextmanager
+    def callbacks(*args):
+        def send(images, context):
+            calls.append([p.number for p in images])
+            return answer([described('5', 55), described('6', 100)])
+        yield send, None
+    monkeypatch.setattr(tool.runtime, 'open_runtime_callbacks', callbacks)
+    assert tool.main([str(pdf), '--diagnose-pages', '2,3', '--live']) == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report['status'] == 'response_received' and report['description_count'] == 2
+    assert [d['lot_from_description'] for d in report['descriptions']] == ['5', '6']
+    assert calls == [[2, 3]] and report['search_requests'] == 0
+    assert list(tmp_path.iterdir()) == [pdf]

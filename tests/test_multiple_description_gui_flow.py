@@ -278,3 +278,23 @@ def test_new_session_never_enables_experiment_from_persisted_flag(gui, monkeypat
     app = gui.SurveyApp()
     assert not app._multi_pdf_enabled() and not app.multi_pdf_mode_var.get()
     assert app.config_data['multiple_description_search']['enabled'] is True
+
+
+def test_parse_http_status_and_timing_appear_in_visible_log_without_response_body(gui, tmp_path, monkeypatch):
+    class Error(Exception):
+        status_code = 429
+    def fail(*a):
+        raise Error('SECRET provider response')
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=fail)
+    our = tmp_path / 'OUR 6.pdf'
+    make_pdf(our, 2)
+    items, _ = app._make_pdf_set_items([our])
+    items[0].is_main = True
+    app._submit_pdf_set(items, scene_mode='update', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 3
+    assert 'HTTP 429' in app._log_view_text()
+    assert 'SECRET' not in app.log_text()
+    data = json.loads((tmp_path / (our.name + '.multi-parse.json')).read_text())
+    attempts = data['runs'][-1]['attempts']
+    assert len(attempts) == 3 and all(a['failure_kind'] == 'http_429' and a['elapsed_seconds'] >= 0 for a in attempts)

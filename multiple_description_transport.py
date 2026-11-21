@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
+from multiple_description_errors import ProviderResponseError
 from multiple_description_parse import (Attempt, COMPARISON_INSTRUCTION, ImageSizeRejected, PageImage,
                                         system_instruction)
 
@@ -26,12 +27,12 @@ def _content(completion: Any) -> str:
     try:
         message = completion.choices[0].message
         if getattr(message, 'refusal', None):
-            raise ValueError('provider refusal')
+            raise ProviderResponseError('provider_refusal')
         content = message.content
     except (AttributeError, IndexError, TypeError) as exc:
-        raise ValueError('invalid provider response') from exc
+        raise ProviderResponseError('invalid_provider_response') from exc
     if not isinstance(content, str) or not content:
-        raise ValueError('empty provider response')
+        raise ProviderResponseError('empty_response')
     return content
 
 
@@ -42,7 +43,7 @@ def _call(client: Any, model: str, messages: list[dict[str, Any]]) -> str:
         # Only a clear HTTP 413 establishes a request-size rejection; generic
         # 400/timeout/network failures must not cause automatic reduction.
         if getattr(exc, 'status_code', None) == 413:
-            raise ImageSizeRejected() from exc
+            raise ImageSizeRejected(status_code=413) from exc
         raise
     return _content(completion)
 

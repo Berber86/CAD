@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from multiple_description_cancel import check
 from multiple_description_progress import emit, page_list, waiting
+from multiple_description_errors import classify_exception, describe_failure
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import re
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from llm_parser import LegalDescription, Segment
@@ -64,9 +66,10 @@ class ParseDisabled(RuntimeError):
 class ImageSizeRejected(Exception):
     """The provider explicitly rejected request size, not a general failure."""
 
-    def __init__(self, limit: int | None = None):
+    def __init__(self, limit: int | None = None, *, status_code: int | None = None):
         super().__init__("request size rejected")
         self.limit = limit
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,8 @@ class Attempt:
     complete: bool
     valid_response: bool
     issue: str | None
+    failure_kind: str | None = None
+    elapsed_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -328,12 +333,16 @@ def parse_pages(
         calls += 1
         emit(progress, f"Разбор: запрос {calls}, страницы {page_list([p.number for p in current])}; ожидаем ответ.")
         check(current_job)
+        started = time.monotonic()
         try:
             with waiting(progress):
                 response = send(tuple(current), context)
         except ImageSizeRejected as exc:
-            emit(progress, "Разбор: провайдер отклонил размер запроса.")
-            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "size_rejected"))
+            elapsed = round(time.monotonic() - started, 2)
+            kind = classify_exception(exc)
+            kind = kind if kind.startswith('http_') else 'size_rejected'
+            emit(progress, f"Разбор: провайдер отклонил размер запроса, {elapsed:.1f} с.")
+            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "size_rejected", kind, elapsed))
             if reduced or len(current) <= 1:
                 error = "size_rejected"
                 break
@@ -348,14 +357,17 @@ def parse_pages(
             reduced = True
             error = "size_rejected"
             continue
-        except Exception:  # do not persist provider messages, keys or response bodies
-            emit(progress, "Разбор: запрос не выполнен; подробности ответа не записываются.")
-            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed"))
+        except Exception as exc:  # never persist provider messages, keys or response bodies
+            elapsed = round(time.monotonic() - started, 2)
+            kind = classify_exception(exc)
+            emit(progress, f"Разбор: запрос не выполнен ({describe_failure(kind)}), {elapsed:.1f} с.")
+            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed", kind, elapsed))
             ordinary_failures += 1
             error = "request_failed"
             continue
         check(current_job)
         attempt = read_response(response, [p.number for p in current])
+        attempt = replace(attempt, elapsed_seconds=round(time.monotonic() - started, 2))
         attempts.append(attempt)
         issues = {"invalid_json": "некорректный JSON", "invalid_envelope": "неверная структура ответа",
                   "invalid_item": "повреждено описание", "no_usable_result": "нет пригодных сторон",

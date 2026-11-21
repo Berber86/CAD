@@ -157,3 +157,17 @@ def test_comparison_failure_is_recorded_without_exception_details(tmp_path):
     assert run['context']['provider'] == 'hydra' and run['context']['model'] == 'grok-4.7'
     assert run['selected_attempt'] == 0 and 'secret-response' not in content
     assert cache.load_result(pdf, context(pdf)) is not None
+
+
+def test_failed_attempt_history_has_only_safe_category_and_timing(tmp_path):
+    pdf = tmp_path / 'test.pdf'
+    pdf.write_bytes(b'pdf')
+    def fail(*a):
+        raise TimeoutError('SECRET response')
+    result = md.parse_pages(ON, pages(2), image_limit=10, filename_lot='6', portal_lot=None,
+                            search_complete=True, send=fail)
+    cache.save_result(pdf, context(pdf), result, portal_lot=None)
+    text = cache.diagnostics_path(pdf).read_text()
+    attempts = json.loads(text)['runs'][-1]['attempts']
+    assert all(a['failure_kind'] == 'timeout' and a['elapsed_seconds'] >= 0 for a in attempts)
+    assert 'SECRET' not in text

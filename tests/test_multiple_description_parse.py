@@ -338,3 +338,22 @@ def test_comparison_diagnostics_are_sanitized_and_describe_attempts(choice, stat
     assert result.comparison.attempt_indices == (0, 1, 2)
     assert result.comparison.pages == (() if choice is None else (1, 2))
     assert 'secret' not in repr(result.comparison)
+
+
+def test_failure_diagnostics_include_safe_status_and_elapsed_without_provider_message():
+    class ProviderError(Exception):
+        status_code = 429
+    messages = []
+    def send(*a):
+        raise ProviderError('SECRET TOKEN AND DOCUMENT')
+    result = call(send, progress=messages.append)
+    assert len(result.attempts) == 3
+    assert all(a.issue == 'request_failed' and a.failure_kind == 'http_429' and
+               isinstance(a.elapsed_seconds, float) and a.elapsed_seconds >= 0 for a in result.attempts)
+    assert 'HTTP 429' in ' '.join(messages)
+    assert 'SECRET' not in repr(result) + ' '.join(messages)
+
+
+def test_size_rejection_does_not_invent_http_status():
+    result = call(lambda *a: (_ for _ in ()).throw(md.ImageSizeRejected()), n=2)
+    assert all(a.failure_kind == 'size_rejected' for a in result.attempts)

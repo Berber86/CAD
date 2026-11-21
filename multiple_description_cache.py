@@ -156,7 +156,8 @@ def save_result(pdf: str | Path, context: Mapping[str, Any], result: ParseResult
     if file_metadata._digest(Path(pdf)) != context.get('pdf_sha256'):
         raise CacheError("PDF changed during parsing; result not saved.")
     attempts = [{"pages": list(a.pages), "item_count": len(a.items), "complete": a.complete,
-                 "valid_response": a.valid_response, "issue": a.issue} for a in result.attempts]
+                 "valid_response": a.valid_response, "issue": a.issue,
+                 "failure_kind": a.failure_kind, "elapsed_seconds": a.elapsed_seconds} for a in result.attempts]
     # Failure is recorded for diagnostics but never used as a cache hit.
     cacheable = result.selected_attempt is not None and (bool(result.items) or result.complete)
     run = {"created_at": datetime.now(timezone.utc).isoformat(), "fingerprint": identity,

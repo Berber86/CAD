@@ -67,3 +67,22 @@ def test_selector_rejects_invalid_selection(raw):
     with pytest.raises((ValueError, json.JSONDecodeError)):
         selector(pages(1), [md.read_response(answer([item(), {}]), [1])])
     assert len(client.requests) == 1
+
+
+def test_transport_status_code_and_response_categories_are_preserved_safely():
+    from multiple_description_errors import ProviderResponseError, classify_exception
+    class Error(Exception):
+        status_code = 413
+    with pytest.raises(md.ImageSizeRejected) as rejection:
+        transport.make_sender(FakeClient(Error('secret')), 'test')(pages(1), {})
+    assert classify_exception(rejection.value) == 'http_413'
+    client = FakeClient('')
+    with pytest.raises(ProviderResponseError) as empty:
+        transport.make_sender(client, 'test')(pages(1), {})
+    assert classify_exception(empty.value) == 'empty_response'
+    client.chat.completions.create = lambda **k: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='', refusal='private refusal'))])
+    with pytest.raises(ProviderResponseError) as refused:
+        transport.make_sender(client, 'test')(pages(1), {})
+    assert classify_exception(refused.value) == 'provider_refusal'
+    assert 'private refusal' not in str(refused.value)

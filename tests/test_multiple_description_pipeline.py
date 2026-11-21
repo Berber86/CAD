@@ -151,3 +151,21 @@ def test_invalid_reserve_cannot_implicitly_enable_or_guess_limit():
         pipeline.configured_vision_fallback({'multiple_description_search': {'vision_fallback':
                                              {'provider': 'hydra', 'model': 'grok-4.7', 'image_limit': True}}})
     assert pipeline.configured_vision_fallback({}) is None
+
+
+def test_explicit_force_reparses_with_current_portal_without_repeating_search(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 2)
+    calls, searches = [], []
+    def send(imgs, ctx):
+        calls.append(dict(ctx))
+        return answer([item('5')])
+    def search(base, key, model, state, assets, qs):
+        searches.append(1)
+        return searcher(base, key, model, state, assets, qs)
+    args = dict(search_api_key='key', provider='hydra', model='grok-4.7', image_limit=10,
+                search_send=search, send=send)
+    pipeline.parse_pdf(pdf, ON, portal_lot='7', **args)
+    pipeline.parse_pdf(pdf, ON, portal_lot='8', force_parse=True, **args)
+    assert [x['portal_lot'] for x in calls] == ['7', '8']
+    assert len(searches) == 1

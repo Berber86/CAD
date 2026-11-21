@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping
 import httpx
 import developer_probability as dp
 import file_metadata
+from multiple_description_cancel import check
 
 PRIMARY = "microsoft/microsoft-decision-1.1"
 FALLBACK = "typesafe/jev-1.14"
@@ -175,7 +176,8 @@ def _request(pages: list[dict[str, Any]], questions: dict[str, Any], model: str,
 
 def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: str,
                base_url: str = BASE_URL, image_side: int = dp.PDF_IMAGE_MAX_SIDE,
-               send: Callable[..., Any] | None = None) -> dict[str, Any]:
+               send: Callable[..., Any] | None = None,
+               current: Callable[[], bool] = lambda: True) -> dict[str, Any]:
     """Evaluate up to 200 pages and save a diagnostic sidecar; never build geometry.
 
     Do not call from the live workflow yet. An unknown page with an available
@@ -183,6 +185,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     """
     if not enabled(config):
         raise SearchDisabled("Developer page search is disabled.")
+    check(current)
     if not api_key:
         raise SearchError("RouterAI key is unavailable; no requests sent.")
     dp.valid_pdf_image_side(image_side)
@@ -209,6 +212,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     rendered: dict[int, dict[str, Any]] = {}
     render_errors = []
     for n in range(1, covered + 1):
+        check(current)
         try:
             page = dp.prepare_documents([(str(path), str(n))], "visual", provider=PROVIDER,
                                         pdf_image_side=image_side)
@@ -223,6 +227,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     attempts: list[dict[str, Any]] = []
     results = []
     for group in groups:
+        check(current)
         available = [n for n in group if n in rendered]
         pending = list(available)
         observed: dict[int, dict[str, Any]] = {}
@@ -230,6 +235,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
 
         def attempt(numbers: list[int], model: str, include_count: bool) -> None:
             nonlocal count_result
+            check(current)
             pages = [rendered[n] for n in numbers]
             questions = questions_for(numbers, count=include_count)
             fp = _fingerprint(digest, pages, questions, model, image_side, base_url)
@@ -240,6 +246,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                 error, seconds, source, usage = None, 0.0, "cache", None
             else:
                 answers, error, seconds, usage = _request(pages, questions, model, api_key, base_url, send)
+                check(current)
                 source = "network"
             attempts.append({"batch_pages": group, "pages": numbers, "model": model,
                              "fingerprint": fp, "source": source, "seconds": seconds, "usage": usage,
@@ -283,6 +290,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                 pending = [n for n in pending if n not in observed]
         results.append({"pages": group, "count": count_result,
                         "observations": {str(n): observed.get(n) for n in group}})
+    check(current)
     page_results = []
     for n in range(1, covered + 1):
         obs = [b["observations"][str(n)] for b in results if n in b["pages"]]

@@ -6,6 +6,8 @@ The existing one-description parser remains unchanged.
 """
 from __future__ import annotations
 
+from multiple_description_cancel import check
+
 from dataclasses import dataclass
 import json
 import math
@@ -18,7 +20,7 @@ from pydantic import model_validator
 MAX_IMAGES = 50
 MAX_PARSE_CALLS = 4
 MAX_ORDINARY_FAILURES = 3
-SCHEMA_VERSION = "multiple-legal-descriptions-v1"
+SCHEMA_VERSION = "multiple-legal-descriptions-v2"
 INSTRUCTION = (
     "Read all supplied whole PDF pages. Return every separate land boundary "
     "description as a separate item in document order, including repeated "
@@ -98,6 +100,12 @@ def _validated_segment(raw: Any) -> Segment:
 
 def _validated_description(model: type[LegalDescription], raw: Any) -> LegalDescription:
     description = model.model_validate(raw)
+    # The legacy model derives a tie from the traverse when none was supplied.
+    # In this workflow such an inferred value is not a confirmed intersection:
+    # never turn that default into an apparent relative position or cache it as
+    # if the AI explicitly returned the tie.
+    if isinstance(raw, dict) and raw.get("corner_to_pob_bearing") is None:
+        description.corner_to_pob_bearing = None
     if not math.isfinite(description.distance_to_corner_ft):
         raise ValueError("non-finite tie distance")
     if description.corner_to_pob_bearing is not None:
@@ -236,6 +244,7 @@ def parse_pages(
     candidate_pages: Sequence[int] | None = None,
     send: Callable[[Sequence[PageImage], Mapping[str, str | None]], str],
     choose: Callable[[Sequence[PageImage], Sequence[Attempt]], int] | None = None,
+    current_job: Callable[[], bool] = lambda: True,
 ) -> ParseResult:
     """Run a single document's experimental parsing policy.
 
@@ -247,6 +256,7 @@ def parse_pages(
     section = config.get("multiple_description_search") if isinstance(config, Mapping) else None
     if not isinstance(section, Mapping) or section.get("enabled") is not True:
         raise ParseDisabled("Developer multiple-description switch is disabled.")
+    check(current_job)
     if isinstance(image_limit, bool) or not isinstance(image_limit, int) or image_limit < 1:
         raise ValueError("image_limit must be a positive integer")
     if not isinstance(search_complete, bool):
@@ -273,6 +283,7 @@ def parse_pages(
     calls = 0
     error: str | None = None
     while calls < MAX_PARSE_CALLS and ordinary_failures < MAX_ORDINARY_FAILURES:
+        check(current_job)
         calls += 1
         try:
             response = send(tuple(current), context)
@@ -297,6 +308,7 @@ def parse_pages(
             ordinary_failures += 1
             error = "request_failed"
             continue
+        check(current_job)
         attempt = read_response(response, [p.number for p in current])
         attempts.append(attempt)
         if attempt.valid_response:
@@ -308,6 +320,7 @@ def parse_pages(
         ordinary_failures += 1
         error = attempt.issue
 
+    check(current_job)
     # Keep one attempt, never concatenate attempts or deduplicate within one.
     viable = [i for i, attempt in enumerate(attempts) if attempt.items]
     if not viable:
@@ -328,6 +341,7 @@ def parse_pages(
                     selection = "comparison"
             except Exception:
                 pass
+        check(current_job)
         if chosen is None:
             chosen = max(tied, key=lambda i: _closure_score(attempts[i]))
             selection = "closure_fallback"

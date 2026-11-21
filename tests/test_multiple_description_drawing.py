@@ -271,3 +271,35 @@ def test_common_draft_can_be_drawn_as_one_scene_with_fake_autocad(fake_autocad):
             if tuple(line.StartPoint[:2]) == pytest.approx((expected.start[0] + 5000, expected.start[1] + 5000))
             and tuple(line.EndPoint[:2]) == pytest.approx((expected.end[0] + 5000, expected.end[1] + 5000))]
     assert len(ties) == 1 and math.dist(ties[0].StartPoint, ties[0].EndPoint) == pytest.approx(40)
+
+
+def test_scene_print_draft_keeps_unlocated_and_partial_parts_without_numbers():
+    builder = ab.AcadBuilder(llm_parser.load_config())
+    entries = [record('OUR 6.pdf', True, full()), record('OUR 6.pdf', True, partial(1)),
+               record('LOT 5.pdf', False, full())]
+    scene = drawing.plan_scene(builder, entries)
+    draft = drawing.make_scene_print_drafts(scene, builder_cfg=builder.cfg)
+    assert len(draft.plans) == 2
+    assert all(p.print_draft and not p.is_neighbor for p in draft.plans)
+    assert draft.plans[1].open_traverse
+    for orig, printed in zip([x.plan for x in scene.plans[:2]], draft.plans):
+        assert not any(t.kind in {'main-lot-label', 'neighbor-label'} for t in printed.items)
+        assert not printed.lines  # unknown placement must not acquire a fake intersection
+        for edge, copied in zip(orig.boundary_lines, printed.boundary_lines):
+            assert copied.start == pytest.approx((edge.start[0] + 1000, edge.start[1]))
+            assert _vector(copied) == pytest.approx(_vector(edge))
+
+
+def test_scene_print_common_row_group_has_single_intersection():
+    from pathlib import Path
+    model, _ = llm_parser.parse_with_regex(Path('tests/data/lot72_render_e600.txt').read_text(encoding='utf-8'),
+                                   auto_repair_typos=False)
+    other = model.model_copy(deep=True, update={'distance_to_corner_ft': model.distance_to_corner_ft + 40})
+    cfg = llm_parser.load_config()
+    builder = ab.AcadBuilder(cfg)
+    scene = drawing.plan_scene(builder, [record('OUR 6.pdf', True, parse.DescriptionItem(m, True),
+                                              'x', ab.compute_pob_point(m)) for m in (model, other)])
+    draft = drawing.make_scene_print_drafts(scene, builder_cfg=cfg)
+    assert len(draft.plans) == 2 and draft.diagnostic is None
+    ties = [l for p in draft.plans for l in p.lines if l.kind == 'main-street-row-tie']
+    assert len(ties) == 1 and math.dist(ties[0].start, ties[0].end) == pytest.approx(40)

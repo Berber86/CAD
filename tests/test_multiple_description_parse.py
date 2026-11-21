@@ -268,3 +268,23 @@ def test_nonfinite_side_never_produces_nonfinite_geometry():
     assert len(result.items) == 1 and not result.items[0].complete
     assert len(result.items[0].data.segments) == 1
     assert all(math.isfinite(x) for x in result.items[0].data.segments[0].vector)
+
+
+def test_legacy_inferred_tie_is_not_passed_off_as_explicit_model_output():
+    value = item('5')
+    value['data']['distance_to_corner_ft'] = 55.42
+    value['data']['cross_street'] = 'Cross Street'
+    result = call(lambda *a: answer([value]))
+    assert result.items[0].data.distance_to_corner_ft == pytest.approx(55.42)
+    assert result.items[0].data.corner_to_pob_bearing is None
+
+
+def test_explicit_tie_from_model_is_preserved():
+    value = item('5')
+    value['data']['distance_to_corner_ft'] = 55.42
+    value['data']['cross_street'] = 'Cross Street'
+    value['data']['corner_to_pob_bearing'] = dict(ns='N', degrees=90, minutes=0, seconds=0,
+                                                  ew='E', distance_ft=55.42)
+    result = call(lambda *a: answer([value]))
+    assert result.items[0].data.corner_to_pob_bearing is not None
+    assert result.items[0].data.corner_to_pob_bearing.distance_ft == pytest.approx(55.42)

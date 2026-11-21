@@ -121,7 +121,7 @@ def record_portal_observation(pdf: str | Path, pdf_sha256: str, lot: str | None)
 
 def record_failure(pdf: str | Path, pdf_sha256: str, *, reason: str, pages: Sequence[int]) -> None:
     """Record a sanitized failure when no parser request can be formed."""
-    if reason not in {"images_unavailable"}:
+    if reason not in {"images_unavailable", "processing_failed", "runtime_unavailable", "metadata_unavailable"}:
         raise ValueError("unsupported diagnostic failure")
     if file_metadata._digest(Path(pdf)) != pdf_sha256:
         raise CacheError("PDF changed; failure not saved.")

@@ -357,3 +357,58 @@ def draft_row_group(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> Draft
                                                         (shared_corner[1] + end[1]) / 2 + ny * 3.8)))
         output.append(replace(draft, items=label_items, lines=[]))
     return DraftSceneResult(tuple(output), None)
+
+
+def make_scene_print_drafts(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> DraftSceneResult:
+    """Build one composite draft from all our plans, never from neighbours.
+
+    Known row groups use the 40-foot helper when it is applicable. Corner,
+    unlocated or incomplete groups keep their physical geometry, do not invent
+    an intersection, and retain a developer-only reason when a row group could
+    not be resolved. Every part is shifted by the same 1000 feet.
+    """
+    from acad_builder import make_print_draft, translate_plan
+    import re
+    ours = [entry for entry in scene.plans if entry.is_main]
+    if not ours:
+        return DraftSceneResult((), None)
+    groups: OrderedDict[tuple[str, Any], list[PlannedDescription]] = OrderedDict()
+    for entry in ours:
+        key = ('known', entry.group) if entry.placement_known else ('unknown', entry.description_index)
+        groups.setdefault(key, []).append(entry)
+    by_index: dict[int, DrawPlan] = {}
+    notes: list[str] = []
+    for key, entries in groups.items():
+        if key[0] == 'known' and len(entries) >= 2:
+            group_scene = SceneResult(tuple(entries), ())
+            result = draft_row_group(group_scene, builder_cfg=builder_cfg)
+            if result.diagnostic is None:
+                by_index.update((entry.description_index, plan) for entry, plan in zip(entries, result.plans))
+                continue
+            notes.append(result.diagnostic or 'draft_group_unavailable')
+        if key[0] == 'known' and len(entries) == 1 and not entries[0].plan.open_traverse:
+            try:
+                draft = make_print_draft(entries[0].plan, {}, builder_cfg=builder_cfg)
+                by_index[entries[0].description_index] = draft
+                continue
+            except Exception:
+                notes.append('draft_planning_failed')
+        for entry in entries:
+            # When a common intersection cannot be established, translate the
+            # exact known geometry; do not invent a 40-foot tie. One common
+            # shift preserves each group's mutual position.
+            draft = translate_plan(entry.plan, 1000.0, 0.0)
+            texts = []
+            for text in draft.items:
+                if text.kind in {'main-lot-label', 'neighbor-label'}:
+                    continue
+                if key[0] == 'unknown' and not (text.kind.startswith('side-') or text.kind.startswith('party-wall-')):
+                    continue
+                if text.kind.startswith('side-'):
+                    text = replace(text, text=re.sub(r' {2,}', ' ', text.text))
+                texts.append(text)
+            by_index[entry.description_index] = replace(draft, items=texts,
+                                                        lines=[] if key[0] == 'unknown' else draft.lines,
+                                                        print_draft=True)
+    return DraftSceneResult(tuple(by_index[e.description_index] for e in ours),
+                            ';'.join(dict.fromkeys(notes)) or None)

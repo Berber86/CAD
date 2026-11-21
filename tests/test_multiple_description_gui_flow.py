@@ -19,7 +19,8 @@ gui = smoke.gui
 
 def setup_app(gui, monkeypatch, tmp_path, *, parse=None, search=None):
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True  # isolated in-memory fixture only
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     target = runtime.ResolvedTarget('hydra', 'grok-4.7', 'https://example.test', 'fake', 10, 'yes')
     router = runtime.ResolvedTarget('routerai', 'decision', 'https://routerai.test/api/v1', 'fake-router')
     calls = {'parse': 0, 'search': 0, 'targets': []}
@@ -216,3 +217,64 @@ def test_add_rejects_stale_or_unrelated_scene_without_losing_it(gui, tmp_path, m
     items, _ = app._make_pdf_set_items([third])
     app._submit_pdf_set(items, scene_mode='add', fresh=True)
     assert not app._busy and app._scene_plans() == before and calls['parse'] == 2
+
+
+def test_switch_is_session_only_and_clears_old_pdf_scene_without_requests(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    submit(app, gui, tmp_path)
+    original = (calls['parse'], calls['search'])
+    assert app._multi_pdf_enabled() and not app.config_data['multiple_description_search']['enabled']
+    app.multi_pdf_mode_var.set(False)
+    app._on_multi_pdf_mode_changed()
+    assert not app._multi_pdf_enabled() and app._multi_scene_handoff is None
+    assert not app._scene_plans() and len(app.pdf_set) == 2
+    assert all(not i.multi_outcomes and i.outcome is None and i.parsed_key is None for i in app.pdf_set)
+    assert (calls['parse'], calls['search']) == original
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
+    saved = []
+    monkeypatch.setattr(gui, 'save_config', lambda config: saved.append(config.copy()))
+    assert app._persist_ai_preferences()
+    assert saved and not saved[0]['multiple_description_search']['enabled']
+    assert app._multi_pdf_enabled() and (calls['parse'], calls['search']) == original
+    assert 'ИИ' in app.parse_button.cget('text') and 'бесплатно' not in app.parse_button.cget('text')
+    app._busy = True
+    app.multi_pdf_mode_var.set(False)
+    app._on_multi_pdf_mode_changed()
+    assert app._multi_pdf_enabled() and app.multi_pdf_mode_var.get()
+    app._busy = False
+
+
+def test_inflight_parse_reports_progress_in_simple_journal(gui, tmp_path, monkeypatch):
+    started, resume = threading.Event(), threading.Event()
+    def parse(images, context):
+        started.set()
+        assert resume.wait(5)
+        return answer([described('6', 55)])
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=parse)
+    path = tmp_path / 'OUR 6.pdf'
+    make_pdf(path, 2)
+    items, errors = app._make_pdf_set_items([path])
+    assert not errors
+    items[0].is_main = True
+    app._submit_pdf_set(items, scene_mode='update', fresh=True)
+    try:
+        assert started.wait(5)
+        app._drain_events()
+        visible = app._log_view_text()
+        assert 'Поиск: запрос' in visible and 'Разбор: запрос' in visible
+        assert 'ожидаем ответ' in visible.lower()
+    finally:
+        resume.set()
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 1 and 'описаний 1' in app.log_text()
+
+
+def test_new_session_never_enables_experiment_from_persisted_flag(gui, monkeypatch):
+    import copy
+    cfg = gui.load_config()
+    cfg['multiple_description_search']['enabled'] = True
+    monkeypatch.setattr(gui, 'load_config', lambda: copy.deepcopy(cfg))
+    app = gui.SurveyApp()
+    assert not app._multi_pdf_enabled() and not app.multi_pdf_mode_var.get()
+    assert app.config_data['multiple_description_search']['enabled'] is True

@@ -5954,7 +5954,8 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
 
 def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True  # isolated test only
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     folder = tmp_path / '01_описания'
     gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-new.pdf'), role='our', lot=32,
                              tag='NEW', block=6323, pages='2',

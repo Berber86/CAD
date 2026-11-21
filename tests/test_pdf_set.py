@@ -692,7 +692,8 @@ def test_multi_document_roles_are_independent_and_survive_list_edits(gui, tmp_pa
     """The experimental UI selects document roles, never individual descriptions."""
     main, left, right = _three_lots(tmp_path)
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True  # test process only
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     dialog = _open_set(app, monkeypatch, main, left, right)
     assert dialog.multi_mode
     assert not dialog.no_main_radio._gridded
@@ -710,7 +711,8 @@ def test_multi_document_roles_are_independent_and_survive_list_edits(gui, tmp_pa
 def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path, monkeypatch):
     import json
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     first, second, named_our = (tmp_path / name for name in ('lot-a.pdf', 'lot-b.pdf', 'OUR 77.pdf'))
     for path in (first, second, named_our):
         _write_test_pdf(path, [FILLER])
@@ -728,7 +730,8 @@ def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path,
 
 def test_multi_start_dispatches_only_new_worker_and_is_not_ready_yet(gui, tmp_path, monkeypatch):
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     path = tmp_path / 'OUR 6.pdf'
     _write_test_pdf(path, [_samples()[MAIN]])
     dialog = _open_set(app, monkeypatch, path)

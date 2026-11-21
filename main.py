@@ -561,6 +561,10 @@ class SurveyApp(ctk.CTk):
         self._visual_cursor: int = 0
         self._tk_photo_ref: Any | None = None
         self.pdf_pages_var = ctk.StringVar(value="")
+        # Session-only control: saving the other settings must not silently
+        # enable paid experimental PDF analysis for future launches.
+        self._multi_pdf_active = False  # explicit opt-in again after each restart
+        self.multi_pdf_mode_var = ctk.BooleanVar(value=self._multi_pdf_active)
         self.enhance_scan_var = ctk.BooleanVar(
             value=bool(self.config_data["api"].get("vision_enhance_scans", True))
         )
@@ -1912,6 +1916,19 @@ class SurveyApp(ctk.CTk):
         )
         self.pdf_set_report_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.pdf_set_buttons.grid_remove()
+
+        self.multi_pdf_mode_switch = ctk.CTkSwitch(
+            self.pdf_mode_card, text="Тест: все описания в PDF",
+            variable=self.multi_pdf_mode_var, command=self._on_multi_pdf_mode_changed,
+            font=ctk.CTkFont(size=12, weight="bold"), text_color=THEME["text_main"],
+        )
+        self.multi_pdf_mode_switch.grid(row=6, column=0, sticky="w", pady=(12, 0))
+        ctk.CTkLabel(
+            self.pdf_mode_card,
+            text="Экспериментальный режим: поиск и разбор через ИИ, возможны платные запросы. "
+                 "Только для этой сессии; результаты требуют проверки.",
+            font=ctk.CTkFont(size=11), text_color=THEME["warn"], anchor="w", justify="left", wraplength=320,
+        ).grid(row=7, column=0, sticky="ew", pady=(4, 0))
 
         # Пустой режим «📷 Фото» тоже должен позволять выбрать первый файл.
         self.photo_empty_card = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -3875,7 +3892,7 @@ class SurveyApp(ctk.CTk):
 
         paths: list[Path] = []
         our_new_paths: set[Path] = set()
-        multi = legal_page_search.enabled(self.config_data)
+        multi = self._multi_pdf_enabled()
         for item in items_meta:
             role = str(item.get("role") or "").lower()
             tag = str(item.get("tag") or "NEW").upper()
@@ -4872,6 +4889,35 @@ class SurveyApp(ctk.CTk):
         self._refresh_visual_bar()
         self._refresh_parse_actions()
 
+    def _multi_pdf_enabled(self) -> bool:
+        return bool(self._multi_pdf_active)
+
+    def _on_multi_pdf_mode_changed(self) -> None:
+        """Change the PDF workflow in memory without mixing existing results."""
+        old = self._multi_pdf_enabled()
+        new = bool(self.multi_pdf_mode_var.get())
+        if (self._busy or getattr(self, "_source_role_dialog", None) is not None
+                or self.pending_conflict is not None or self.pending_doubt is not None):
+            self.multi_pdf_mode_var.set(old)
+            return
+        if new == old:
+            return
+        self._multi_pdf_active = new
+        if self.pdf_set or self._multi_scene_handoff is not None:
+            self._clear_preview_scene()
+            for item in self.pdf_set:
+                item.outcome = None
+                item.multi_outcomes = []
+                item.parsed_key = None
+                item.issues = []
+                item.error = ""
+                item.fixes = []
+            self._refresh_pdf_selection_ui()
+            self._refresh_parse_actions()
+            self._redraw_preview_canvas()
+        label = "тест всех описаний (ИИ, возможны платные запросы)" if new else "обычный"
+        self._set_status(f"Режим PDF: {label}. Для обработки выберите PDF или запустите разбор заново.", key=True)
+
     def _current_source_mode(self) -> str:
         return str(self.source_mode_var.get() or "📝 Текст")
 
@@ -4886,7 +4932,9 @@ class SurveyApp(ctk.CTk):
             # В наборе способ разбора выбран у каждого файла отдельно.
             paid = sum(1 for item in self.pdf_set if item.use_llm)
             economy_files = sum(1 for item in self.pdf_set if item.economy and not item.use_llm)
-            if paid:
+            if self._multi_pdf_enabled():
+                cost = "эксперимент: ИИ, возможна оплата"
+            elif paid:
                 cost = f"ИИ: {paid} файл., платно"
             elif economy_files:
                 cost = f"эконом: {economy_files} файл., ИИ только при проблемах"
@@ -4898,7 +4946,8 @@ class SurveyApp(ctk.CTk):
                 hover_color=THEME["btn_primary_hover"],
             )
             self.regex_link_button.configure(
-                text="☰ Изменить набор: роли, страницы, способ разбора",
+                text=("☰ Изменить набор: роли документов" if self._multi_pdf_enabled() else
+                      "☰ Изменить набор: роли, страницы, способ разбора"),
                 command=self._edit_pdf_set,
                 state="disabled" if self._busy else "normal",
             )
@@ -7084,7 +7133,7 @@ class SurveyApp(ctk.CTk):
         installation alone must never make a stale result drawable.
         """
         from multiple_description_handoff import InvalidHandoff, SceneHandoff
-        if not legal_page_search.enabled(self.config_data):
+        if not self._multi_pdf_enabled():
             raise InvalidHandoff("multi-description mode disabled")
         if not isinstance(handoff, SceneHandoff):
             raise InvalidHandoff("invalid scene handoff")
@@ -7967,7 +8016,7 @@ class SurveyApp(ctk.CTk):
             pages = str(self.pdf_pages_var.get() or "").strip()
             if self.pdf_set:
                 # В наборе страницы и способ разбора заданы по каждому файлу.
-                return (mode, "set", set_signature(self.pdf_set), self._visual_source_revision)
+                return (mode, "set", set_signature(self.pdf_set), self._visual_source_revision, self._multi_pdf_enabled())
             if self.neighbor_pdf_paths:
                 return (mode, "neighbor", tuple(self.neighbor_pdf_paths), pages, self._visual_source_revision)
             if self.pdf_path is not None:
@@ -8437,7 +8486,7 @@ class SurveyApp(ctk.CTk):
                 continue
             try:
                 item = make_item(path, vision_max_pages=limit, ocr_available=ocr_ok)
-                if legal_page_search.enabled(self.config_data):
+                if self._multi_pdf_enabled():
                     # Trust the explicit document passport role, not its lot
                     # number or a guess based on the geometry or file name.
                     try:
@@ -8485,7 +8534,7 @@ class SurveyApp(ctk.CTk):
         """
         if self._busy or not items:
             return
-        if legal_page_search.enabled(self.config_data) and scene_mode == "add":
+        if self._multi_pdf_enabled() and scene_mode == "add":
             if not self._multi_scene_can_add():
                 # A single-lot/stale scene has no reusable multi-result context.
                 return
@@ -8524,7 +8573,7 @@ class SurveyApp(ctk.CTk):
             pass
         self._on_source_mode_changed()
         paid = sum(1 for item in items if item.use_llm)
-        multi = legal_page_search.enabled(self.config_data)
+        multi = self._multi_pdf_enabled()
         self.pdf_label.configure(
             text=(f"Набор PDF: {len(items)} файл. (ИИ)" if multi else
                   f"Набор PDF: {len(items)} файл. (ИИ: {paid}, локально: {len(items) - paid})"),
@@ -8543,7 +8592,7 @@ class SurveyApp(ctk.CTk):
         """
         if self._busy or not self.pdf_set:
             return
-        if legal_page_search.enabled(self.config_data):
+        if self._multi_pdf_enabled():
             self._start_multi_pdf_set(force=force)
             return
         if self.pending_conflict is not None or self.pending_doubt is not None:
@@ -8617,6 +8666,7 @@ class SurveyApp(ctk.CTk):
             return
         cfg, provider, model, key, secret = self._build_runtime_config()
         cfg["multiple_description_search"] = copy.deepcopy(self.config_data["multiple_description_search"])
+        cfg["multiple_description_search"]["enabled"] = True  # this run only
         jobs = tuple(FileJob(item.path, item.is_main) for item in self.pdf_set)
         signature = self._source_signature(mode="📄 PDF")
         self._running_source_signature = signature
@@ -8632,7 +8682,7 @@ class SurveyApp(ctk.CTk):
         self._set_controls_busy(True)
         self.progress.start()
         self._select_result_tab("🧾 Журнал")
-        self._set_status(f"Обрабатываю PDF: {len(jobs)} файл. …")
+        self._set_status(f"Тест всех описаний: файлов {len(jobs)}. Возможны платные запросы.", key=True)
         self._start_background(self._multi_pdf_worker,
                                args=(jobs, signature, cfg, provider, model, key, secret,
                                      self._current_scale(), force))
@@ -8647,25 +8697,38 @@ class SurveyApp(ctk.CTk):
         if not self._worker_is_current():
             return
         try:
+            post("multi_progress", "Подготовка: проверка ключей и возможностей модели.")
             target, router_key = prepare_runtime(cfg, selected_provider=provider, selected_model=model,
                                                  selected_api_key=key, key_secret=secret,
                                                  current=self._worker_is_current)
             if not self._worker_is_current():
                 return
+            post("multi_progress", f"Разбирающая модель: {target.provider} / {target.model}; лимит изображений {target.image_limit}.")
             router = provider_target(cfg, "routerai", legal_page_search.PRIMARY, key_secret=secret,
                                      explicit_key=key if provider == "routerai" else None)
             with open_runtime_callbacks(target, cfg) as (send, choose):
                 batch = run_batch(jobs, cfg, target=target, search_api_key=router_key,
                                   search_base_url=router.base_url, send=send, choose=choose,
                                   scale=scale, force_parse=force, current=self._worker_is_current,
-                                  progress=lambda i, n: post("progress", f"Обрабатываю PDF: {i} из {n}…"))
+                                  detail=lambda text: post("multi_progress", text))
             if batch.cancelled or not self._worker_is_current():
                 return
             view = build_handoff(batch, expected_jobs=jobs)
             post("multi_pdf_done", (view, signature))
         except Cancelled:
             return
-        except Exception:
+        except Exception as exc:
+            # Only known, sanitized operational codes reach the user.
+            from multiple_description_runtime import RuntimeUnavailable
+            reasons = {
+                "provider_key_unavailable": "Не найден или не разблокирован ключ провайдера.",
+                "invalid_provider_endpoint": "Некорректный адрес провайдера.",
+                "provider_or_model_unavailable": "Не выбран провайдер или модель.",
+                "invalid_vision_reserve": "Некорректные настройки резервной Vision-модели.",
+                "invalid_image_limit": "Некорректный лимит изображений модели.",
+            }
+            detail = reasons.get(str(exc), "Не удалось подготовить экспериментальный разбор.") if isinstance(exc, RuntimeUnavailable) else "Не удалось подготовить экспериментальный разбор."
+            post("multi_progress", detail)
             # Safe diagnostics only: never write keys, raw provider errors or PDF contents.
             if not self._worker_is_current():
                 return
@@ -8703,7 +8766,7 @@ class SurveyApp(ctk.CTk):
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
         self._refresh_stepper()
-        self._set_status(f"Подготовлено контуров: {len(view.drawable)}.")
+        self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой.", key=True)
 
     def _parse_pdf_set_job(
         self, job: PdfSetJob, cfg: dict[str, Any], provider_id: str, model_name: str,
@@ -9406,7 +9469,7 @@ class SurveyApp(ctk.CTk):
 
     def _pdf_set_summary_text(self) -> str:
         """Короткий список набора для левой панели: роль, файл, страницы, состояние."""
-        if legal_page_search.enabled(self.config_data):
+        if self._multi_pdf_enabled():
             counts = {d.source: len(d.descriptions) for d in self._multi_scene_handoff.documents} if self._multi_scene_handoff else {}
             rows = [f"{'наш' if item.is_main else 'сосед'}: {item.path.name}"
                     + (f" · контуров: {counts[item.path]}" if item.path in counts else "")
@@ -10459,6 +10522,8 @@ class SurveyApp(ctk.CTk):
             self._log_line(str(payload), level=log_mode.LEVEL_INFO)
         elif kind == "progress":
             self._set_status(str(payload))
+        elif kind == "multi_progress":
+            self._set_status(str(payload), key=True)
         elif kind == "error":
             self._finish_busy()
             self._set_status(str(payload), error=True)
@@ -10508,14 +10573,17 @@ class SurveyApp(ctk.CTk):
             self._finish_busy()
             if completed:
                 self.draw_result = completed[-1][1]
+            for name, result in completed:
+                self._log_line(f"{name}: {result.summary()}", level=log_mode.LEVEL_KEY)
             marking_failed = any("пометк" in str(w).lower() for _, result in completed for w in result.warnings)
             if marking_failed:
                 self._record_multi_cad_diagnostic("cad_marking_failed")
             if error:
                 self._record_multi_cad_diagnostic("cad_draw_failed")
-                self._set_status("Отрисовка остановлена.")
+                self._set_status(f"Отрисовка остановлена; завершено планов: {len(completed)}. "
+                                 "Могли остаться отдельные объекты; повтор может создать дубли.", error=True)
             else:
-                self._set_status(f"Отрисовка завершена: {len(completed)} планов.")
+                self._set_status(f"Отрисовка завершена: {len(completed)} планов.", key=True)
             self._refresh_stepper()
         elif kind == "scene_drawn":
             completed, error = payload
@@ -10689,6 +10757,7 @@ class SurveyApp(ctk.CTk):
         self.batch_neighbors_button.configure(state=state)
         self.clear_neighbors_button.configure(state=state)
         self.load_pdf_button.configure(state=state)
+        self.multi_pdf_mode_switch.configure(state=state)
         self.pdf_set_edit_button.configure(state=state)
         self.pdf_set_report_button.configure(
             state=state if self._pdf_set_report_ready else "disabled"
@@ -11343,7 +11412,7 @@ class SurveyApp(ctk.CTk):
 
     def _start_draw_multi_scene(self, *, neighbors_only: bool = False) -> None:
         """Draw available plans without legacy one-lot checks or extra AI calls."""
-        if not legal_page_search.enabled(self.config_data) or self._multi_scene_handoff is None:
+        if not self._multi_pdf_enabled() or self._multi_scene_handoff is None:
             return
         signature = self._source_signature(mode="📄 PDF")
         if signature != self._ready_source_signature or self._input_incomplete or signature is None:
@@ -11443,7 +11512,7 @@ class SurveyApp(ctk.CTk):
         mode = self._current_source_mode()
         if mode == "📄 PDF" and self.pdf_set:
             # Кнопка разбора перечитывает весь набор, включая уже готовые файлы.
-            self._start_pdf_set(force=not legal_page_search.enabled(self.config_data))
+            self._start_pdf_set(force=not self._multi_pdf_enabled())
             return
         if mode == "📄 PDF":
             self._select_result_tab("🧾 Журнал")  # одиночный PDF / соседние файлы — тоже журнал
@@ -12804,7 +12873,7 @@ class PdfSetDialog:
         self.items = list(items)
         self.fresh = fresh
         self.closed = False
-        self.multi_mode = legal_page_search.enabled(app.config_data)
+        self.multi_mode = app._multi_pdf_enabled()
         # Новый набор при непустой схеме: заменить её или добавить — спрашиваем каждый раз.
         self.ask_scene = bool(fresh and app._scene_plans())
         self.vision_limit = int(app.config_data.get("api", {}).get("vision_max_pages") or 8)

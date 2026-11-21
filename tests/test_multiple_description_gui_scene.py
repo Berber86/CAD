@@ -18,7 +18,8 @@ gui = smoke.gui
 
 def install(gui, tmp_path):
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     result = batch(tmp_path)
     app.pdf_set = [PdfSetItem(path=file.job.path, page_texts=['', ''], is_main=file.job.is_main)
                    for file in result.files]
@@ -82,7 +83,8 @@ def test_scene_disables_legacy_auto_slide_and_neighbor_verification(gui, tmp_pat
 
 def test_preview_partial_chain_has_no_invented_closing_line(gui, tmp_path):
     app = gui.SurveyApp()
-    app.config_data['multiple_description_search']['enabled'] = True
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
     original = batch(tmp_path)
     # Reuse the synthetic PDF inputs; each mock request returns a genuinely
     # incomplete description, not a closed description with a replaced plan.

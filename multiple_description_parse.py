@@ -7,6 +7,7 @@ The existing one-description parser remains unchanged.
 from __future__ import annotations
 
 from multiple_description_cancel import check
+from multiple_description_progress import emit, page_list, waiting
 
 from dataclasses import dataclass
 import json
@@ -284,6 +285,7 @@ def parse_pages(
     send: Callable[[Sequence[PageImage], Mapping[str, str | None]], str],
     choose: Callable[[Sequence[PageImage], Sequence[Attempt]], int] | None = None,
     current_job: Callable[[], bool] = lambda: True,
+    progress: Callable[[str], None] | None = None,
 ) -> ParseResult:
     """Run a single document's experimental parsing policy.
 
@@ -324,9 +326,13 @@ def parse_pages(
     while calls < MAX_PARSE_CALLS and ordinary_failures < MAX_ORDINARY_FAILURES:
         check(current_job)
         calls += 1
+        emit(progress, f"Разбор: запрос {calls}, страницы {page_list([p.number for p in current])}; ожидаем ответ.")
+        check(current_job)
         try:
-            response = send(tuple(current), context)
+            with waiting(progress):
+                response = send(tuple(current), context)
         except ImageSizeRejected as exc:
+            emit(progress, "Разбор: провайдер отклонил размер запроса.")
             attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "size_rejected"))
             if reduced or len(current) <= 1:
                 error = "size_rejected"
@@ -343,6 +349,7 @@ def parse_pages(
             error = "size_rejected"
             continue
         except Exception:  # do not persist provider messages, keys or response bodies
+            emit(progress, "Разбор: запрос не выполнен; подробности ответа не записываются.")
             attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed"))
             ordinary_failures += 1
             error = "request_failed"
@@ -350,6 +357,12 @@ def parse_pages(
         check(current_job)
         attempt = read_response(response, [p.number for p in current])
         attempts.append(attempt)
+        issues = {"invalid_json": "некорректный JSON", "invalid_envelope": "неверная структура ответа",
+                  "invalid_item": "повреждено описание", "no_usable_result": "нет пригодных сторон",
+                  "inconsistent_completeness": "противоречие в признаке полноты"}
+        emit(progress, f"Разбор: получено описаний {len(attempt.items)}, "
+                       + ("ответ принят." if attempt.valid_response else
+                          f"ответ неполный или повреждён: {issues.get(attempt.issue, 'неясный ответ')}."))
         if attempt.valid_response:
             selected = len(attempts) - 1
             rest = tuple(n for n in candidates if n not in attempt.pages)
@@ -374,9 +387,12 @@ def parse_pages(
         longest = max((attempts[i].pages for i in tied), key=len)
         status = "unavailable"
         if choose is not None:
+            emit(progress, f"Сравнение: запрос выбора из {len(tied)} вариантов; ожидаем ответ.")
             page_by_number = {p.number: p for p in pages}
+            check(current_job)
             try:
-                index = choose(tuple(page_by_number[n] for n in longest), tuple(attempts[i] for i in tied))
+                with waiting(progress):
+                    index = choose(tuple(page_by_number[n] for n in longest), tuple(attempts[i] for i in tied))
                 if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(tied):
                     chosen = tied[index]
                     selection = "comparison"
@@ -389,6 +405,10 @@ def parse_pages(
                 status = "invalid_selection"
             except Exception:
                 status = "request_failed"
+        result_text = {"selected": "вариант выбран", "invalid_selection": "ответ неясен",
+                       "size_rejected": "запрос слишком велик", "request_failed": "запрос не выполнен",
+                       "unavailable": "сравнение недоступно"}
+        emit(progress, f"Сравнение: {result_text[status]}.")
         comparison = ComparisonDiagnostic(status, tuple(tied), tuple(longest) if choose is not None else ())
         check(current_job)
         if chosen is None:

@@ -89,16 +89,22 @@ def main(argv: list[str] | None = None) -> int:
                           'maximum_parse_requests': 4, 'maximum_comparison_requests': 1,
                           'message': 'No requests sent. --live is optional and may incur charges.'}, indent=2))
         return 0
+    def progress(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
     try:
         # Unlock only for an explicit live run; secrets remain in memory.
+        progress('Подготовка: проверка сохранённых ключей. При необходимости введите PIN локально.')
         router_key = common.load_provider_key('routerai')
         hydra_key = common.load_provider_key('hydra')
         cfg = copy.deepcopy(lp.load_config())
         cfg.setdefault('multiple_description_search', {})['enabled'] = True
         cfg.setdefault('api', {}).setdefault('providers', {}).setdefault('routerai', {})['api_key'] = router_key
+        progress('Подготовка: проверка модели и настроек. Документ пока не отправлен.')
         target, search_key = runtime.prepare_runtime(cfg, selected_provider='hydra',
                                                       selected_model='grok-4.7', selected_api_key=hydra_key)
         router = runtime.provider_target(cfg, 'routerai', search.PRIMARY, explicit_key=router_key)
+        progress(f'Разбирающая модель: {target.provider} / {target.model}; лимит изображений: {target.image_limit}.')
         with tempfile.TemporaryDirectory(prefix='cad-stage3-') as folder:
             isolated = Path(folder) / args.pdf.name
             shutil.copyfile(args.pdf, isolated)
@@ -107,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             with runtime.open_runtime_callbacks(target, cfg) as (send, choose):
                 batch = runtime.run_batch([runtime.FileJob(isolated, True)], cfg, target=target,
                                           search_api_key=search_key, search_base_url=router.base_url,
-                                          send=send, choose=choose)
+                                          send=send, choose=choose, detail=progress)
             report = describe_result(batch)
             report['image_limit'] = target.image_limit
             report['vision_capability'] = target.capability
@@ -119,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         print('Probe could not complete. Check local settings; a request may already have been charged.',
               file=sys.stderr)
         return 2
+    progress('Проверка завершена. Итог ниже; AutoCAD не запускался.')
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report['status'] == 'parsed' else 1
 

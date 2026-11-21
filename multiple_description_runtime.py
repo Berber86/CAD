@@ -23,6 +23,7 @@ import multiple_description_drawing as drawing
 import multiple_description_cache as cache
 import file_metadata
 from multiple_description_cancel import Cancelled, check
+from multiple_description_progress import emit
 from acad_builder import AcadBuilder, compute_pob_point
 from multiple_description_parse import MAX_IMAGES, DescriptionItem
 
@@ -219,7 +220,8 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
               search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
               force_parse: bool = False,
               current: Callable[[], bool] = lambda: True,
-              progress: Callable[[int, int], None] | None = None) -> BatchResult:
+              progress: Callable[[int, int], None] | None = None,
+              detail: Callable[[str], None] | None = None) -> BatchResult:
     """Process each file independently and plan all usable results, without UI."""
     if not legal_page_search.enabled(cfg):
         raise pipeline.ParseDisabled('Developer multiple-description switch is disabled.')
@@ -230,6 +232,7 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
             return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
         if progress:
             progress(index, len(jobs))
+        emit(detail, f"Файл {index} из {len(jobs)}: {job.path.name}.")
         try:
             portal_lot = job.portal_lot if job.portal_lot is not None else portal_lot_from_passport(job.path)
             result = pipeline.parse_pdf(job.path, cfg, search_api_key=search_api_key,
@@ -237,10 +240,11 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
                                         image_limit=target.image_limit, portal_lot=portal_lot,
                                         send=send, choose=choose, search_send=search_send,
                                         search_base_url=search_base_url,
-                                        force_parse=force_parse, current=current)
+                                        force_parse=force_parse, current=current, progress=detail)
         except Cancelled:
             return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
         except Exception:
+            emit(detail, "Файл: обработка не завершена; подробности ответа не записываются.")
             # Never persist raw provider errors or sensitive text in diagnostics.
             try:
                 cache.record_failure(job.path, file_metadata._digest(job.path), reason='processing_failed', pages=[])
@@ -250,6 +254,11 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
             continue
         if not current():
             return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+        status_text = {'parsed': 'разбор выполнен', 'no_candidates': 'описания поиском не найдены',
+                       'search_incomplete': 'поиск неполный', 'images_unavailable': 'страницы недоступны',
+                       'parse_failed': 'разбор не выполнен'}
+        emit(detail, f"Файл: {status_text.get(result.status, 'неизвестное состояние')}, "
+                     f"описаний {len(result.parse.items) if result.parse else 0}.")
         files.append(FileResult(job, result, result.status))
         if result.parse is None:
             continue
@@ -269,7 +278,9 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
             sources.append(drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item)))
     if not current():
         return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+    emit(detail, f"Подготовка схемы: описаний {len(sources)}.")
     scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
+    emit(detail, f"Схема подготовлена: контуров {len(scene.plans)}, ошибок построения {len(scene.failures)}.")
     by_index = {entry.description_index: entry for entry in scene.plans}
     failures = {entry.description_index: entry.reason for entry in scene.failures}
     offset = 0

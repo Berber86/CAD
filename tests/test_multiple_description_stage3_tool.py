@@ -57,8 +57,11 @@ def test_mock_live_uses_copy_and_cleans_all_diagnostics(tmp_path, monkeypatch, c
         return run_batch(jobs, loaded, search_send=searcher, **kwargs)
     monkeypatch.setattr(tool.runtime, 'run_batch', fake_run)
     assert tool.main([str(source), '--live']) == 0
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    output = captured.out
     report = json.loads(output)
+    assert 'Поиск: запрос' in captured.err and 'Разбор: запрос' in captured.err
+    assert 'Схема подготовлена' in captured.err and 'secret' not in captured.err
     assert report['status'] == 'parsed' and len(report['descriptions']) == 2
     assert report['candidate_pages'] == [1, 2]
     assert 'secret' not in output

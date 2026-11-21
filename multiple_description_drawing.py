@@ -280,10 +280,56 @@ class SceneResult:
     failures: tuple[PlanFailure, ...]
 
 
+# The existing application treats gaps up to 0.015 ft as rounding. A near-
+# closed traverse still stays open and retains every original vector.
+ROUNDING_GAP_LIMIT_FT = 0.015
+
+
+def _near_closed_complete(plan: DrawPlan, item: DescriptionItem) -> bool:
+    edges = plan.boundary_lines
+    if not item.complete or len(edges) < 3:
+        return False
+    gap = math.dist(edges[-1].end, edges[0].start)
+    return math.isfinite(gap) and gap <= ROUNDING_GAP_LIMIT_FT
+
+
+def _decorate_exact_unlocated(builder: AcadBuilder, plan: DrawPlan, item: DescriptionItem) -> DrawPlan:
+    """Use ordinary side/angle layout on a near-closed exact open traverse.
+
+    The boundary is unchanged; the small rounding gap remains at POB. No row
+    extensions or intersection are constructed. Do not treat partial chains or
+    substantial gaps as polygons for annotation.
+    """
+    if not _near_closed_complete(plan, item) or not plan.open_traverse:
+        return plan
+    points = [edge.start for edge in plan.boundary_lines]
+    area = polygon_signed_area(points)
+    if not math.isfinite(area) or abs(area) < 0.5:
+        return plan
+    desc = plan.description
+    front = desc.front_segment_index
+    if isinstance(front, bool) or not isinstance(front, int) or not 0 <= front < len(points):
+        front = None
+    warnings = list(plan.warnings)
+    try:
+        if plan.is_neighbor:
+            label = builder._neighbor_label_item(desc, points, plan.text_height, front)
+            items, arcs = [label], []
+        else:
+            items, arcs, _ = builder._side_items(desc, points, plan.text_height, area > 0,
+                                                 warnings, front_index=front,
+                                                 boundary_lines=plan.boundary_lines)
+            label = builder._neighbor_label_item(desc, points, plan.text_height, front)
+            items.append(replace(label, kind='main-lot-label'))
+    except Exception:
+        return plan
+    return replace(plan, vertices=points, items=items, arcs=arcs, warnings=warnings, ccw=area > 0)
+
+
 def _unlocated_frontage_items(builder: AcadBuilder, plan: DrawPlan, item: DescriptionItem) -> list[TextItem]:
     """Label a documented frontage without inventing a street intersection.
 
-    A trustworthy exterior requires a complete closed traverse and an explicit
+    A trustworthy exterior requires a complete near-closed traverse and an explicit
     frontage index. Never use the legacy builder's configured/guessed index.
     Discard all cross-street items and all extension lines: their position may
     depend on the missing intersection tie.
@@ -293,8 +339,7 @@ def _unlocated_frontage_items(builder: AcadBuilder, plan: DrawPlan, item: Descri
     edges = plan.boundary_lines
     if (not item.complete or not str(desc.main_street or '').strip()
             or isinstance(front, bool) or not isinstance(front, int)
-            or not 0 <= front < len(edges) or len(edges) < 3
-            or math.dist(edges[-1].end, edges[0].start) > 1e-5):
+            or not 0 <= front < len(edges) or not _near_closed_complete(plan, item)):
         return []
     points = [edge.start for edge in edges]
     area = polygon_signed_area(points)
@@ -343,6 +388,7 @@ def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, sc
             # The legacy builder derives a hypothetical intersection even when
             # its input lacks an established tie. An isolated parcel must not
             # carry that invented street geometry or its associated labels.
+            plan = _decorate_exact_unlocated(builder, plan, source.item)
             frontage = _unlocated_frontage_items(builder, plan, source.item) if source.is_main else []
             plan = replace(plan, lines=[], items=[t for t in plan.items
                             if 'street' not in t.kind and t.kind != 'cross-street-distance'] + frontage)
@@ -499,6 +545,7 @@ def make_scene_print_drafts(scene: SceneResult, *, builder_cfg: dict[str, Any]) 
                 if text.kind in {'main-lot-label', 'neighbor-label'}:
                     continue
                 if key[0] == 'unknown' and not (text.kind.startswith('side-') or text.kind.startswith('party-wall-')
+                                                or text.kind.startswith('angle-')
                                                 or text.kind in {'main-street', 'main-street-note', 'main-street-note-extra'}):
                     continue
                 if text.kind.startswith('side-'):

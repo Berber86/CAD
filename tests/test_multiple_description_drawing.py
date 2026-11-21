@@ -401,3 +401,57 @@ def test_unlocated_frontage_does_not_fabricate_closure():
     assert len(scene.plans) == 1
     assert not any(t.kind == 'main-street' for t in scene.plans[0].plan.items)
     assert not scene.plans[0].plan.lines
+
+
+def deed_example_items():
+    """Actual supplied model output, reconstructed offline; no PDF/AI calls."""
+    values = [
+        ('5', 'Lindberg Avenue', 55.42, [
+            ('N', 55, 4, 10, 'W', 98.60), ('S', 34, 55, 50, 'W', 44.64),
+            ('S', 55, 4, 10, 'E', 96.58), ('N', 37, 31, 21, 'E', 44.69)]),
+        ('6', 'Lindbergh Avenue', 100.11, [
+            ('N', 55, 4, 10, 'W', 96.58), ('S', 34, 55, 50, 'W', 100.00),
+            ('S', 55, 4, 10, 'E', 92.06), ('N', 37, 31, 21, 'E', 100.10)])]
+    entries = []
+    for lot, cross, distance, sides in values:
+        segments = [dict(ns=ns, degrees=deg, minutes=minutes, seconds=seconds, ew=ew, distance_ft=length)
+                    for ns, deg, minutes, seconds, ew, length in sides]
+        entries.append({'complete': True, 'data': {'main_street': 'Hylan Boulevard', 'cross_street': cross,
+                        'distance_to_corner_ft': distance, 'corner_to_pob_bearing': None,
+                        'front_side': 'SE', 'front_segment_index': 3, 'lot_number': lot, 'segments': segments}})
+    return parse.read_response(answer(entries), [2, 3]).items
+
+
+def test_supplied_deed_near_closed_fallback_has_frontage_and_exact_sides(fake_autocad):
+    items = deed_example_items()
+    assert len(items) == 2 and all(i.data.corner_to_pob_bearing is None for i in items)
+    builder, doc = fake_autocad(None)
+    scene = drawing.plan_scene(builder, [record('OUR 6 NEW.pdf', True, item) for item in items])
+    assert len(scene.plans) == 2
+    drafts = drawing.make_scene_print_drafts(scene, builder_cfg=builder.cfg)
+    for entry, original, draft in zip(scene.plans, items, drafts.plans):
+        plan = entry.plan
+        assert not entry.placement_known and entry.diagnostic == 'exact_sides_fallback'
+        assert plan.open_traverse and 0 < plan.closure.distance < 0.015
+        assert len(plan.boundary_lines) == 4 and plan.street_boundary_indices == (3,)
+        assert not plan.lines and not any(t.kind.startswith('cross-street') for t in plan.items)
+        assert any(t.kind == 'main-street' and 'HYLAN' in t.text for t in plan.items)
+        assert any(t.kind == 'main-street' for t in draft.items) and not draft.lines
+        assert not any(t.kind == 'main-lot-label' for t in draft.items)
+        for edge, segment in zip(plan.boundary_lines, original.data.segments):
+            assert _vector(edge) == pytest.approx(segment.vector, abs=1e-6)
+        builder.draw_plan(plan)
+    assert sum('HYLAN' in text.TextString for text in doc.ModelSpace.texts) == 2
+    assert len(doc.ModelSpace.lines) == 8 and not doc.ModelSpace.polylines
+
+
+def test_non_rounding_gap_cannot_produce_frontage_label():
+    import copy
+    original = deed_example_items()[0]
+    changed = copy.deepcopy(original.data)
+    changed.segments[-1].distance_ft += 0.1
+    entry = drawing.plan_scene(ab.AcadBuilder(llm_parser.load_config()),
+                               [record('OUR 6.pdf', True, parse.DescriptionItem(changed, True))]).plans[0]
+    assert entry.plan.closure.distance > drawing.ROUNDING_GAP_LIMIT_FT
+    assert not any(t.kind == 'main-street' for t in entry.plan.items)
+    assert not entry.plan.lines

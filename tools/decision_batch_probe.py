@@ -100,8 +100,11 @@ def check_consistency(answers: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 
 def probe_model(pages: list[dict[str, Any]], model: str, api_key: str,
-                send: Callable[..., Any] = dp.post_routerai) -> dict[str, Any]:
-    questions = questions_for(pages)
+                send: Callable[..., Any] = dp.post_routerai,
+                questions: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    location_questions = questions is None
+    if location_questions:
+        questions = questions_for(pages)
     start = time.monotonic()
     result: dict[str, Any] = {"model": model, "status": "error", "seconds": None}
     try:
@@ -119,7 +122,9 @@ def probe_model(pages: list[dict[str, Any]], model: str, api_key: str,
             except (ValueError, KeyError, TypeError):
                 normalized[key] = {"status": "error", "value": None}
         result.update(status="ok" if all(a["status"] == "ok" for a in normalized.values()) else "partial",
-                      answers=normalized, consistency=check_consistency(normalized))
+                      answers=normalized)
+        if location_questions:
+            result["consistency"] = check_consistency(normalized)
     except httpx.HTTPStatusError as exc:
         result.update(error_kind="http_error", http_status=exc.response.status_code)
     except httpx.TimeoutException:

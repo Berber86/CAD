@@ -1001,8 +1001,9 @@
   },
   "telemetry": {
     "enabled": true,
+    "auto_send": false,
     "url": "https://hggwxxpnkibhvnvwnenw.supabase.co",
     "anon_key": "sb_publishable_SVmGaA-_7Kgi5NebtereUA_6hzrfFhj",
-    "comment": "Журналы программы → разработчик (Supabase). anon_key публичный, доступен каждому пользователю; RLS разрешает только INSERT. Выключить можно переключателем «Журналы разработчику» в шапке или telemetry.enabled=false."
+    "comment": "Журналы НЕ уходят сами: только когда пользователь нажимает «🐛 Пожаловаться» рядом с Настройками. enabled=true разрешает кнопку; auto_send=true включила бы фоновую отправку (не нужно). anon_key публичный — RLS только INSERT."
   }
 }

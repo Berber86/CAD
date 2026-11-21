@@ -125,7 +125,7 @@ def test_client_batches_and_posts_events(tmp_path):
         calls.append((url, headers, json.loads(payload)))
         return 200
 
-    client = _client(tmp_path, transport)
+    client = _client(tmp_path, transport, auto_send=True)
     client.start()
     client.log("Шаг 1 · готово", telemetry.LEVEL_KEY)
     client.log("ошибка разбора", telemetry.LEVEL_ERROR)
@@ -153,7 +153,7 @@ def test_failed_send_goes_to_outbox_and_retries(tmp_path):
         calls.append(url)
         return 500 if state["fail"] else 200
 
-    client = _client(tmp_path, transport)
+    client = _client(tmp_path, transport, auto_send=True)
     client.start()
     client.log("событие без сети", telemetry.LEVEL_WARN)
     assert client.flush() == 0  # не ушло
@@ -182,7 +182,7 @@ def test_log_never_raises_on_garbage(tmp_path):
     def transport(url, headers, payload, timeout):
         raise RuntimeError("сеть упала")
 
-    client = _client(tmp_path, transport)
+    client = _client(tmp_path, transport, auto_send=True)
     client.start()
     client.log(None)  # type: ignore[arg-type]
     client.log("ok", level="не-уровень")  # type: ignore[arg-type]
@@ -202,3 +202,46 @@ def test_sql_migration_contains_rls_insert_only():
     # Политики чтения для anon не должны создаваться.
     assert "for select to anon" not in sql.lower()
     assert "app_logs" in sql and "clients" in sql and "sessions" in sql
+def test_manual_mode_buffers_without_network_until_report(tmp_path):
+    calls = []
+    def transport(url, headers, payload, timeout):
+        calls.append(url)
+        return 200
+    client = _client(tmp_path, transport)  # auto_send False by default
+    client.start()
+    client.log("событие 1", telemetry.LEVEL_INFO)
+    client.log("событие 2", telemetry.LEVEL_WARN)
+    assert client.pending_count == 2
+    assert calls == []  # ничего не ушло фоном
+    # Отправка только по кнопке
+    res = client.send_report(user_message="тест от юзера")
+    assert res["ok"] is True
+    assert res["sent_logs"] == 2
+    # минимум 3 POST: clients, sessions, app_logs + feedback + session_end
+    assert any("/rest/v1/app_logs" in u for u in calls)
+    assert any("/rest/v1/feedback" in u for u in calls)
+    assert client.pending_count == 0
+
+def test_manual_mode_report_with_empty_logs_requires_message(tmp_path):
+    def transport(url, headers, payload, timeout):
+        return 200
+    client = _client(tmp_path, transport)
+    res = client.send_report(user_message="")
+    assert res["ok"] is False
+    res2 = client.send_report(user_message="у меня ошибка")
+    assert res2["ok"] is True
+
+def test_redact_does_not_leak_secrets_in_report(tmp_path):
+    calls = []
+    def transport(url, headers, payload, timeout):
+        calls.append((url, json.loads(payload)))
+        return 200
+    client = _client(tmp_path, transport)
+    client.log("мой ключ tsai1:SuperSecretKey123 здесь", telemetry.LEVEL_INFO)
+    client.send_report(user_message="помогите")
+    # проверяем что tsai1 не попал в payload
+    for url, rows in calls:
+        if "app_logs" in url:
+            for r in rows:
+                assert "tsai1:" not in r["message"]
+

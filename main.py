@@ -1001,20 +1001,21 @@ class SurveyApp(ctk.CTk):
             command=self._apply_log_mode,
         ).grid(row=0, column=4, sticky="e", padx=(12, 0))
 
-        try:
-            _tel_cfg = app_telemetry.load_telemetry_config()
-            _tel_enabled = bool(_tel_cfg.enabled)
-        except Exception:  # noqa: BLE001
-            _tel_enabled = True
-        self.telemetry_enabled_var = ctk.BooleanVar(value=_tel_enabled)
-        ctk.CTkSwitch(
+        # Кнопка «Пожаловаться» — единственный способ отправить логи (по требованию пользователя).
+        # Ничего не уходит фоном; логи копятся локально и отсылаются только отсюда.
+        self.report_button = ctk.CTkButton(
             header_tools,
-            text="Журналы разработчику",
-            variable=self.telemetry_enabled_var,
-            font=ctk.CTkFont(size=11),
-            width=36,
-            command=self._on_telemetry_enabled_changed,
-        ).grid(row=0, column=5, sticky="e", padx=(12, 0))
+            text="🐛 Пожаловаться",
+            width=132,
+            height=30,
+            fg_color="#334155",
+            hover_color="#2563eb",
+            border_width=1,
+            border_color="#475569",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._open_feedback_dialog,
+        )
+        self.report_button.grid(row=0, column=5, padx=(12, 0), sticky="e")
 
         # 1. Глобальные вкладки шагов: «Шаг 1. Граница участка» | «Шаг 2. Автоподписание»
         self._build_step_tab_bar()
@@ -1467,6 +1468,27 @@ class SurveyApp(ctk.CTk):
             justify="left",
             wraplength=400,
         ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        # --- Помощь / Обратная связь — рядом с Настройками, как просил пользователь
+        help_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
+                                 border_width=1, border_color="#f59e0b")
+        help_card.grid(row=5, column=0, sticky="ew", pady=(6, 10))
+        help_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(help_card, text="🆘 ПОМОЩЬ И ОБРАТНАЯ СВЯЗЬ",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#fbbf24", anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        ctk.CTkLabel(help_card, text="Столкнулись с ошибкой? Нажмите «Пожаловаться» — к разработчику уйдут только последние записи журнала и ваш комментарий. Без нажатия ничего не отправляется.",
+                     font=ctk.CTkFont(size=10), text_color=THEME["text_dim"], anchor="w", justify="left", wraplength=400).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+        ctk.CTkButton(help_card, text="🐛 Пожаловаться разработчику",
+                      height=32, fg_color="#ea580c", hover_color="#c2410c",
+                      font=ctk.CTkFont(size=12, weight="bold"),
+                      command=self._open_feedback_dialog).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+        # Для разработчика-нуба — отдельная страница отчётов без команд
+        ctk.CTkButton(help_card, text="📥 Открыть страницу отчётов (для разработчика)",
+                      height=28, fg_color="transparent", hover_color=THEME["btn_secondary"],
+                      border_width=1, border_color=THEME["border_card"],
+                      font=ctk.CTkFont(size=11),
+                      command=self._open_developer_reports).grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
 
         theme_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
                                   border_width=1, border_color=THEME["border_subtle"])
@@ -7781,10 +7803,11 @@ class SurveyApp(ctk.CTk):
         if page is not None:
             page.close()
         self._persist_ai_preferences(report_error=False)
-        # Сообщаем телеметрии о чистом выходе (фоновая отправка, не блокируем UI).
+        # В режиме «по кнопке» на закрытии ничего не шлём — только если стоит auto_send.
         try:
-            tel = getattr(self, "_telemetry", None) or app_telemetry.get_client()
-            tel.session_end(clean=True)
+            tel = getattr(self, "_telemetry", None)
+            if tel is not None and getattr(getattr(tel, "config", None), "auto_send", False):
+                tel.session_end(clean=True)
         except Exception:  # noqa: BLE001
             pass
         self._closing = True
@@ -10042,30 +10065,21 @@ class SurveyApp(ctk.CTk):
         if content:
             self._set_step2_report(content)
 
-    def _on_telemetry_enabled_changed(self) -> None:
-        """Переключатель «Журналы разработчику»: пишет telemetry.enabled в config.local.json."""
-        enabled = bool(self.telemetry_enabled_var.get())
+    def _open_feedback_dialog(self) -> None:
+        """Кнопка «Пожаловаться» рядом с Настройками — единственная точка отправки логов."""
         try:
-            local_settings.save_value(LOCAL_CONFIG_PATH, "telemetry", "enabled", enabled)
-        except (OSError, ValueError) as exc:
-            self._set_status(f"Настройка телеметрии не сохранена: {exc}", warn=True)
-            return
-        if isinstance(self.config_data, dict):
-            self.config_data.setdefault("telemetry", {})["enabled"] = enabled
-        # Обновляем живой клиент (если он уже создан).
+            import feedback_dialog  # noqa: PLC0415
+            feedback_dialog.open_feedback_dialog(self)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Окно отчёта не открылось: {exc}", error=True)
+
+    def _open_developer_reports(self) -> None:
+        """Страница разработчика (без команд) — просмотр пришедших отчётов."""
         try:
-            client = getattr(self, "_telemetry", None)
-            if client is not None:
-                client.set_enabled(enabled)
-            else:
-                # Клиент мог не создаться из-за отсутствия ключей ранее.
-                self._telemetry = app_telemetry.get_client(app_version=APP_VERSION)
-                self._telemetry.reload_config()
-        except Exception:  # noqa: BLE001
-            pass
-        self._set_status(
-            "Журналы разработчику: " + ("включены" if enabled else "выключены") + " (применяется сразу)",
-        )
+            import feedback_dialog  # noqa: PLC0415
+            feedback_dialog.open_developer_reports(self)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Страница отчётов не открылась: {exc}", error=True)
 
     def _log_line(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         if not hasattr(self, "_log"):
@@ -13021,18 +13035,8 @@ def main() -> int:
             print(f"ОТЧЁТ СОХРАНЁН В ФАЙЛ: {log_path}", file=sys.stderr)
         else:
             print("Не удалось сохранить журнал ошибки.", file=sys.stderr)
-        # Пытаемся отправить крэш разработчику (best effort, не больше 1.5с).
-        try:
-            crash_c = app_telemetry.get_client(app_version=APP_VERSION)
-            # Последние 2000 символов — redact всё равно обрежет и вырежет секреты.
-            crash_c.log(f"Крэш при запуске: {report[-2000:]}", level=app_telemetry.LEVEL_ERROR, category="crash")
-            # Быстрая синхронная попытка дослать крэш до показа диалога.
-            try:
-                crash_c.flush(timeout_sec=1.5)
-            except Exception:  # noqa: BLE001
-                pass
-        except Exception:  # noqa: BLE001
-            pass
+        # Крэш теперь НЕ уходит автоматически — пользователь сам решает нажать «Пожаловаться».
+        # Лог сохранён в tsai_crash.log; при следующем запуске пользователь может отправить его одной кнопкой.
         # Консоль могла быть спрятана показом окна: возвращаем её, чтобы текст ошибки
         # и вопрос run.bat об откате были видны (4.41).
         try:

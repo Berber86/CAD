@@ -1,106 +1,87 @@
-# Телеметрия: журналы программы → Supabase
+# Телеметрия: отчёты по кнопке «Пожаловаться» → Supabase
 
-Небольшая БД для сбора журналов действий Title Survey AI у разработчика.
-Клиент (`telemetry.py`) отправляет события из `_log_line` / `_step0_log`
-в Supabase PostgREST; разработчик читает их в Dashboard.
+Программа **не шлёт ничего фоном**. Логи копятся локально и уходят разработчику
+только когда пользователь сам нажимает кнопку **«🐛 Пожаловаться»** рядом с
+**⚙ Настройки** (в шапке) или внутри панели настроек → блок «🆘 ПОМОЩЬ».
 
-## Схема
+## Для пользователя (что видит ваш клиент)
+
+1. В шапке программы — кнопка **«🐛 Пожаловаться»**.
+2. При клике открывается окно:
+   - поле «Что случилось?» (свободный текст),
+   - галочка «Приложить журналы» (вкл. по умолчанию, без API-ключей),
+   - предпросмотр первых 60 строк того, что уйдёт,
+   - кнопка **«📨 Отправить отчёт»**.
+3. До нажатия «Отправить» **ничего никуда не уходит**. Это можно показать клиенту.
+
+## Для разработчика-нуба (без командной строки)
+
+### Где смотреть отчёты — 2 клика мышкой:
+
+1. Открой **Supabase Dashboard** → **Table Editor**:
+   **https://supabase.com/dashboard/project/hggwxxpnkibhvnvwnenw/editor**
+   (логин — твой аккаунт Supabase).
+2. Слева выбери таблицы:
+   - `feedback` — сообщения пользователей («Что случилось?»),
+   - `app_logs` — приложенные строки журнала (`install_id` связывает их),
+   - `sessions` / `clients` — кто и когда жаловался.
+
+**Никаких SQL-команд не нужно** — просто кликай таблицы и сортируй по `created_at ↓`.
+
+### Прямо в программе (отдельная страница):
+
+- **⚙ Настройки** → внизу блок **«🆘 ПОМОЩЬ И ОБРАТНАЯ СВЯЗЬ»** → кнопка
+  **«📥 Открыть страницу отчётов (для разработчика)»**.
+- Откроется окно «📥 Отчёты от пользователей»:
+  - Кнопка **«🔄 Обновить»** — подгружает последние 50 отчётов.
+  - Кнопка **«🌐 Открыть в браузере»** — сразу в Supabase Table Editor.
+  - Если хочешь видеть отчёты прямо в программе без браузера:
+    1. Supabase → Project Settings → API → `service_role` → Copy.
+    2. Создай рядом с exe файл `config.local.json`:
+       ```json
+       {"telemetry": {"service_role_key": "sb_secret_…сюда…"}}
+       ```
+       (файл в `.gitignore`, не коммитить!).
+    3. Перезапусти программу → страница отчётов покажет таблицу внутри.
+
+## Схема БД
 
 | Таблица | Что хранит |
 |---|---|
-| `clients` | Одна строка на установку: анонимный `install_id` (UUID), `first_seen`/`last_seen`, `app_version`, `platform`. Персональных данных нет. |
-| `sessions` | Один запуск: `session_id`, `started_at`/`ended_at`, `exit_clean`, `event_count` (считается триггером). |
-| `app_logs` | События журнала: `level` (`info`/`key`/`warn`/`error`), `category` (`step0`/`step1`/`step2`/`step4`/`app`/`session`/`crash`…), `message` (до 2000 символов), `metadata` (jsonb), `app_version`, `created_at`. |
-| `feedback` | Явные сообщения пользователя разработчику (задел на будущее). |
+| `clients` | Одна строка на установку: `install_id` (UUID), `first_seen/last_seen`, `app_version`, `platform`. |
+| `sessions` | Один запуск: `session_id`, `install_id`, `started_at/ended_at`, `exit_clean`, `event_count`. |
+| `app_logs` | Строки журнала из отчётов: `level` `info/key/warn/error`, `category` `step0/step1/step2/step4/app/crash`, `message` (≤2000), `metadata`, `app_version`, `created_at`. |
+| `feedback` | Текст пользователя из окна «Пожаловаться» (1–4000 символов). |
 
-Индексы по `created_at`, `(install_id, created_at)`, `(level, created_at)`, `category`.
-Триггер `touch_telemetry_parents` обновляет `clients.last_seen` и `sessions.event_count`.
+Триггер `touch_telemetry_parents` обновляет `last_seen`/`event_count`.
+Представления `v_recent_errors` / `v_sessions_summary` — для быстрого просмотра (требуют service_role).
 
 ## Безопасность (RLS)
 
-- Включ клиента (publishable/anon) может **только INSERT** (и upsert своих
-  `clients`/`sessions` при старте). Политики `SELECT`/`DELETE` для `anon` и
-  `authenticated` **нет** — с включённым RLS это «запрещено». Плюс явный `REVOKE`.
-- Разработчик читает через **Dashboard → Table Editor / SQL Editor** (роль `postgres`)
-  или **service_role**-ключом. `service_role` обходит RLS — **никогда не кладите его
-  в клиентское приложение и не коммитьте в git**.
-- Publishable-ключ по дизайну публичный: его можно положить в `config.json`
-  (раздел `telemetry`) для релиза. URL проекта тоже не секрет.
+- Ключ в программе — `publishable` (anon) — может **только INSERT** в `clients/sessions/app_logs/feedback`.
+  Читать/удалять не может (политик `SELECT/DELETE` для `anon` нет → RLS запрещает).
+- Разработчик читает через Dashboard (роль `postgres`) или `service_role` ключом.
+- `service_role` никогда не клади в `config.json` и не отправляй пользователям.
 
-## Готовый проект (этот репозиторий)
+## Установка (уже выполнена для этого проекта)
 
-- Проект: **TitleSurveyAI-telemetry** (`hggwxxpnkibhvnvwnenw`) в `eu-west-1`
-- URL: `https://hggwxxpnkibhvnvwnenw.supabase.co`
-- Publishable ключ уже в `config.json` → `telemetry.anon_key` (публичный, можно коммитить).
-- Миграция уже применена (таблицы `clients`, `sessions`, `app_logs`, `feedback` + RLS + триггер + 2 view).
-- Смотреть логи: **Supabase Dashboard → Table Editor → app_logs** или SQL Editor (примеры ниже).
+- Проект: **TitleSurveyAI-telemetry** `hggwxxpnkibhvnvwnenw` в `eu-west-1`, URL `https://hggwxxpnkibhvnvwnenw.supabase.co`
+- Миграция `supabase/migrations/20261121000000_create_telemetry.sql` уже применена.
+- `config.json → telemetry` содержит `url`+`anon_key` (публичный) и `auto_send=false` (только по кнопке).
+- Пользовательский код: `telemetry.py` (буфер + `send_report()`) + `feedback_dialog.py` (окна) + `main.py` (кнопки).
 
-## Установка (если делаете заново)
+## Как протестировать
 
-1. Создайте проект в Supabase (или возьмите существующий).
-2. **Dashboard → SQL Editor** → вставьте целиком
-   `supabase/migrations/20261121000000_create_telemetry.sql` → **Run**.
-   (Или `supabase db push`, если проект подключён к CLI.)
-3. **Project Settings → API** → скопируйте:
-   - `Project URL` (например `https://abcdef.supabase.co`)
-   - `publishable` (anon) ключ.
-4. Положите их в **`config.local.json`** (не коммитится) — раздел `telemetry`:
+1. Запусти программу, сделай пару действий (чтобы появился журнал).
+2. Нажми **«🐛 Пожаловаться»**, напиши «тест» и отправь.
+3. Открой Dashboard → `feedback` — должна появиться строка, в `app_logs` — строки журнала с тем же `install_id`.
 
-   ```json
-   {
-     "telemetry": {
-       "enabled": true,
-       "url": "https://abcdef.supabase.co",
-       "anon_key": "sb_publishable_…"
-     }
-   }
-   ```
+## Чистка старых данных
 
-   Для релиза те же значения можно положить в `config.json` (anon-ключ публичный).
-   Переменные окружения `SUPABASE_URL` / `SUPABASE_ANON_KEY` /
-   `TSAI_TELEMETRY_ENABLED=0|1` имеют приоритет над файлами.
-5. Перезапустите программу. В шапке окна есть переключатель
-   **«Журналы разработчику»** — им можно выключить отправку.
+В Dashboard → SQL Editor (по желанию, раз в пару месяцев):
 
-## Что отправляется, а что нет
-
-Отправляется: уровень, категория, короткое сообщение журнала, версия,
-метки времени, анонимный `install_id`/`session_id`, платформа.
-Сообщения проходят `redact()`: вырезаются `tsai1:…`, `sk-…`, `Bearer …`,
-`api_key=…` и подобные секреты; длина ограничена 2000 символами.
-
-Не отправляется: API-ключи LLM, PIN, содержимое документов целиком
-(только строки журнала, которые программа и так показывает на экране),
-имя пользователя Windows, IP-адрес (Supabase может логировать его на своей
-стороне — это стандартная практика хостинга).
-
-Если сети нет, события копятся в локальном outbox
-(`%LOCALAPPDATA%/TitleSurveyAI/telemetry_outbox.jsonl`) и досылаются
-при следующем запуске. Телеметрия никогда не блокирует интерфейс и не
-роняет программу: все ошибки глушатся.
-
-## Как смотреть логи (разработчику)
-
-- **Dashboard → Table Editor → `app_logs`** (сортировка по `created_at` desc).
-- **SQL Editor**, примеры:
-
-  ```sql
-  -- Последние ошибки
-  select created_at, category, message, app_version, install_id
-    from public.app_logs
-   where level = 'error'
-   order by created_at desc
-   limit 50;
-
-  -- Всё за один день по одному пользователю
-  select created_at, level, category, message
-    from public.app_logs
-   where install_id = '…' and created_at > now() - interval '1 day'
-   order by created_at;
-
-  -- Кто запускал и сколько событий
-  select * from public.v_sessions_summary limit 20;
-  ```
-
-- Старые данные чистить вручную (см. конец миграции): логи старше 90 дней,
-  сессии старше 90 дней, клиенты без активности старше 180 дней.
+```sql
+delete from public.app_logs where created_at < now() - interval '90 days';
+delete from public.sessions where started_at < now() - interval '90 days';
+delete from public.clients where last_seen < now() - interval '180 days';
+```

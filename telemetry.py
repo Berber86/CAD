@@ -59,6 +59,7 @@ __all__ = [
     "install_id_path",
     "outbox_path",
     "reset_client_for_tests",
+    "fetch_reports_for_viewer",
 ]
 
 _BASE_DIR = Path(__file__).resolve().parent
@@ -131,11 +132,17 @@ def infer_category(message: str) -> str:
 
 @dataclass(frozen=True)
 class TelemetryConfig:
-    """Итоговая конфигурация телеметрии (файлы + окружение)."""
+    """Итоговая конфигурация телеметрии (файлы + окружение).
+
+    Режим по требованию (2026-11-21): логи копятся локально и уходят только
+    когда пользователь нажимает «Пожаловаться». ``auto_send=False`` означает
+    «не слать фоном» — отправка только через ``send_report()``.
+    """
 
     enabled: bool = False
     url: str = ""
     anon_key: str = ""
+    auto_send: bool = False
     batch_size: int = DEFAULT_BATCH_SIZE
     flush_interval_sec: float = DEFAULT_FLUSH_INTERVAL_SEC
     http_timeout_sec: float = DEFAULT_HTTP_TIMEOUT_SEC
@@ -186,6 +193,12 @@ def load_telemetry_config(
     else:
         enabled = bool(merged.get("enabled", True))
 
+    auto_send_raw = env.get("TSAI_TELEMETRY_AUTO_SEND")
+    if auto_send_raw is not None and str(auto_send_raw).strip() != "":
+        auto_send = str(auto_send_raw).strip().lower() in ("1", "true", "yes", "on")
+    else:
+        auto_send = bool(merged.get("auto_send", False))
+
     def _int(key: str, default: int) -> int:
         try:
             return max(1, int(merged.get(key, default)))
@@ -202,6 +215,7 @@ def load_telemetry_config(
         enabled=enabled,
         url=url,
         anon_key=anon_key,
+        auto_send=auto_send,
         batch_size=_int("batch_size", DEFAULT_BATCH_SIZE),
         flush_interval_sec=_float("flush_interval_sec", DEFAULT_FLUSH_INTERVAL_SEC),
         http_timeout_sec=_float("http_timeout_sec", DEFAULT_HTTP_TIMEOUT_SEC),
@@ -342,6 +356,7 @@ class TelemetryClient:
                 enabled=bool(enabled),
                 url=cur.url,
                 anon_key=cur.anon_key,
+                auto_send=cur.auto_send,
                 batch_size=cur.batch_size,
                 flush_interval_sec=cur.flush_interval_sec,
                 http_timeout_sec=cur.http_timeout_sec,
@@ -352,19 +367,24 @@ class TelemetryClient:
 
     # -- публичный API --------------------------------------------------------
     def start(self) -> None:
-        """Старт сессии: upsert клиента/сессии и досылка outbox'а. Идемпотентна."""
+        """Старт сессии: готовит install_id/session_id. Сеть — только если auto_send."""
         if self._started:
             return
         self._started = True
         if not self.active:
             _debug("телеметрия выключена или не настроена (нет URL/ключа) — no-op")
             return
-        # install_id/session_id создаются лениво, но здесь — чтобы upsert ушёл сразу.
-        _ = self.install_id
-        _ = self.session_id
+        # install_id/session_id создаются лениво, но нужны для отчёта.
+        try:
+            _ = self.install_id
+            _ = self.session_id
+        except Exception:
+            pass
+        # В режиме «только по кнопке Пожаловаться» сеть не трогаем до явного send_report().
+        if not self.config.auto_send:
+            _debug("телеметрия в режиме по требованию — фоновая отправка отключена")
+            return
         self._enqueue_control("session_start")
-        self._ensure_worker()
-        # Досылка накопленного outbox'а — в фоне, не блокируем запуск.
         self._ensure_worker()
         threading.Thread(target=self._flush_outbox, name="telemetry-outbox", daemon=True).start()
 
@@ -376,7 +396,7 @@ class TelemetryClient:
         category: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Поставить событие в очередь. Никогда не бросает и не блокирует."""
+        """Поставить событие в локальный буфер. Сеть — только если auto_send или send_report()."""
         if not self.active:
             return
         try:
@@ -395,28 +415,158 @@ class TelemetryClient:
             try:
                 self._queue.put_nowait(event)
             except queue.Full:
-                # Очередь переполнена — дропаем самое старое, не блокируемся.
                 try:
                     self._queue.get_nowait()
                     self._queue.put_nowait(event)
-                except queue.Empty:  # pragma: no cover - гонка потоков
+                except queue.Empty:  # pragma: no cover
                     pass
-            self._ensure_worker()
-        except Exception as exc:  # noqa: BLE001 - телеметрия не должна ронять программу
+            # В режиме по требованию воркер не запускаем — отправим пачкой при send_report().
+            if self.config.auto_send:
+                self._ensure_worker()
+        except Exception as exc:  # noqa: BLE001
             _debug(f"log() проигнорирован: {exc}")
 
+    @property
+    def pending_count(self) -> int:
+        """Сколько событий ждёт отправки (в памяти)."""
+        try:
+            return int(self._queue.qsize())
+        except Exception:
+            return 0
+
+    def send_report(
+        self,
+        user_message: str = "",
+        log_entries: list[tuple[str, str]] | None = None,
+        step0_entries: list[tuple[str, str]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Отправить отчёт по кнопке «Пожаловаться» (только по действию пользователя).
+
+        Собирает upsert clients/sessions + batch app_logs + одну строку feedback.
+        Возвращает ``{"ok": bool, "sent_logs": int, "detail": str}``.
+        Никогда не бросает.
+        """
+        if not self.config.configured:
+            return {"ok": False, "error": "телеметрия не настроена (нет URL/ключа)", "detail": "not configured"}
+        if not self.config.enabled:
+            return {"ok": False, "error": "телеметрия выключена", "detail": "disabled"}
+        # Убедимся, что ids есть
+        try:
+            iid = self.install_id
+            sid = self.session_id
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"install_id: {exc}", "detail": str(exc)}
+
+        # 1) upsert родителей (best effort, не фейлим отчёт если не вышло)
+        try:
+            self._post_rows("clients", [{"install_id": iid, "app_version": self.app_version or None, "platform": platform.system() or None, "first_seen": datetime.now(timezone.utc).isoformat(), "last_seen": datetime.now(timezone.utc).isoformat()}], on_conflict="install_id")
+            self._post_rows("sessions", [{"session_id": sid, "install_id": iid, "app_version": self.app_version or None, "started_at": datetime.now(timezone.utc).isoformat()}], on_conflict="session_id")
+        except Exception as exc:  # noqa: BLE001
+            _debug(f"send_report control upsert: {exc}")
+
+        events: list[_Event] = []
+
+        # 2) События из внутренней очереди (через log())
+        drained: list[_Event] = []
+        while True:
+            try:
+                drained.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        if drained:
+            events.extend(drained)
+
+        # 3) События напрямую из main.py (_log / _step0_lines), если переданы
+        def _from_pairs(pairs: list[tuple[str, str]] | None, default_cat: str | None = None) -> None:
+            if not pairs:
+                return
+            for lvl, msg in pairs:
+                try:
+                    clean_lvl = str(lvl or LEVEL_INFO).strip().lower()
+                    if clean_lvl not in _VALID_LEVELS:
+                        clean_lvl = LEVEL_INFO
+                    # msg может быть уже с таймштампом — redact обрежет лишнее
+                    events.append(_Event(level=clean_lvl, category=infer_category(str(msg)) if default_cat is None else str(default_cat), message=redact(str(msg)), metadata={}, created_at=datetime.now(timezone.utc).isoformat()))
+                except Exception:
+                    continue
+        if log_entries is not None:
+            # log_entries перекрывает drained, чтобы не дублировать — если передано, считаем что это полный набор
+            # но мы уже добавили drained; чтобы не дублировать, не добавляем снова если drained не пусто и это те же объекты?
+            # Проще: если log_entries передано и drained пусто — строим из него.
+            if not drained:
+                _from_pairs(log_entries)
+            else:
+                # drained уже содержит то же — пропускаем
+                pass
+        elif drained:
+            pass
+        # Step0 добавляем отдельно (если не было в log_entries)
+        if step0_entries:
+            # чтобы не дублировать если log_entries уже включал step0, проверим что drained пуст
+            if not drained:
+                _from_pairs(step0_entries, default_cat="step0")
+
+        # Ограничим размер отчёта, чтобы не упереться в лимиты БД
+        max_logs = 400
+        if len(events) > max_logs:
+            events = events[-max_logs:]
+
+        sent_logs = 0
+        if events:
+            # Шлём батчами
+            rows_all = [e.as_row(install_id=iid, session_id=sid, app_version=self.app_version) for e in events]
+            ok_all = True
+            for start in range(0, len(rows_all), self.config.batch_size):
+                chunk = rows_all[start:start + self.config.batch_size]
+                if self._post_rows("app_logs", chunk):
+                    sent_logs += len(chunk)
+                else:
+                    ok_all = False
+                    # остаток — в outbox для повторной попытки при следующем отчёте
+                    remaining_events = events[start:]
+                    try:
+                        self._save_to_outbox(remaining_events)
+                    except Exception:
+                        pass
+                    break
+            if not ok_all and sent_logs == 0:
+                return {"ok": False, "error": "не удалось отправить логи (сеть/сервер)", "detail": "app_logs POST failed", "sent_logs": 0}
+
+        # 4) Сообщение пользователя (feedback) — даже если логов нет
+        fb_msg = str(user_message or "").strip()
+        if fb_msg:
+            # redact не нужен — это текст пользователя, но обрежем
+            if len(fb_msg) > 4000:
+                fb_msg = fb_msg[:3999] + "…"
+            fb_ok = self._post_rows("feedback", [{"install_id": iid, "session_id": sid, "message": fb_msg, "is_read": False}])
+            if not fb_ok:
+                _debug("feedback POST failed")
+                # не фейлим весь отчёт из-за feedback — логи уже ушли
+        elif sent_logs == 0:
+            # Пустой отчёт (ни логов, ни текста) — нечего слать
+            return {"ok": False, "error": "пустой отчёт", "detail": "no logs and no message"}
+
+        # 5) Пометить сессию завершённой (best effort)
+        try:
+            self._post_rows("sessions", [{"session_id": sid, "install_id": iid, "ended_at": datetime.now(timezone.utc).isoformat(), "exit_clean": True}], on_conflict="session_id")
+        except Exception:
+            pass
+
+        # 6) Попытка дослать старый outbox (если был)
+        try:
+            self._flush_outbox()
+        except Exception:
+            pass
+
+        return {"ok": True, "sent_logs": sent_logs, "detail": f"отправлено логов: {sent_logs}, сообщение: {'да' if fb_msg else 'нет'}"}
+
     def session_end(self, *, clean: bool = True) -> None:
-        """Завершение сессии: событие + попытка быстрой отправки остатка."""
-        if not self.active:
+        """Завершение сессии — в режиме по требованию ничего не шлёт (ждём кнопку)."""
+        if not self.active or not self.config.auto_send:
             return
-        self.log(
-            "Сессия завершена",
-            LEVEL_KEY,
-            category="session",
-            metadata={"clean_exit": bool(clean)},
-        )
+        self.log("Сессия завершена", LEVEL_KEY, category="session", metadata={"clean_exit": bool(clean)})
         self._enqueue_control("session_end")
-        # Быстрая синхронная попытка (короткий таймаут) — окно закрывается.
         try:
             self.flush(timeout_sec=1.5)
         except Exception as exc:  # noqa: BLE001
@@ -624,6 +774,74 @@ class TelemetryClient:
                 path.unlink(missing_ok=True)
         except OSError as exc:
             _debug(f"outbox после досылки не обновлён: {exc}")
+
+
+def _service_role_key(*, config: TelemetryConfig | None = None) -> str:
+    """Ключ для чтения отчётов (только у разработчика, не коммитить)."""
+    # 1) env, 2) config.local.json/service_role_key, 3) config.json/service_role_key
+    import os as _os
+    env_key = (_os.environ.get("SUPABASE_SERVICE_KEY") or _os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if env_key:
+        return env_key
+    for path in (_LOCAL_CONFIG_PATH, _CONFIG_PATH):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8") or "{}")
+            sec = data.get("telemetry") if isinstance(data, dict) else None
+            if isinstance(sec, dict):
+                v = str(sec.get("service_role_key") or sec.get("service_key") or "").strip()
+                if v:
+                    return v
+        except Exception:
+            continue
+    if config is not None:
+        # allow passing config with url but key stored elsewhere — try reload
+        try:
+            cfg2 = load_telemetry_config()
+            for path in (_LOCAL_CONFIG_PATH, _CONFIG_PATH):
+                try:
+                    data = json.loads(Path(path).read_text(encoding="utf-8") or "{}")
+                    sec = data.get("telemetry") if isinstance(data, dict) else None
+                    if isinstance(sec, dict):
+                        v = str(sec.get("service_role_key") or "").strip()
+                        if v:
+                            return v
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return ""
+
+
+def fetch_reports_for_viewer(limit: int = 50, *, config: TelemetryConfig | None = None) -> dict[str, Any]:
+    """Загрузить последние отчёты для страницы разработчика (без SQL).
+
+    Использует service_role ключ, если он есть локально. Для anon чтения нет —
+    вернёт подсказку открыть Dashboard в браузере.
+    """
+    cfg = config or load_telemetry_config()
+    if not cfg.url:
+        return {"ok": False, "error": "телеметрия не настроена (нет URL)", "rows": []}
+    svc = _service_role_key(config=cfg)
+    if not svc:
+        return {"ok": False, "error": "нет service_role ключа — откройте в браузере (кнопка 🌐)", "rows": []}
+    # Пробуем feedback first, потом app_logs
+    url = f"{cfg.url}/rest/v1/feedback?select=*&order=created_at.desc&limit={max(1, int(limit))}"
+    headers = {"apikey": svc, "Authorization": f"Bearer {svc}", "Accept": "application/json"}
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")  # type: ignore[arg-type]
+        with urllib.request.urlopen(req, timeout=10) as resp:  # type: ignore[arg-type]
+            body = resp.read().decode("utf-8")
+            rows = json.loads(body) if body else []
+            # подмешаем app_logs preview для тех же install_id? пока просто feedback
+            return {"ok": True, "rows": rows if isinstance(rows, list) else [], "source": "feedback"}
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")[:500]  # type: ignore[union-attr]
+        except Exception:
+            detail = str(exc)
+        return {"ok": False, "error": f"Supabase HTTP {exc.code}: {detail[:200]}", "rows": []}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"сеть: {exc}", "rows": []}
 
 
 # -- модульный синглтон для main.py -------------------------------------------

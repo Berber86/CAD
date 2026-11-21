@@ -80,6 +80,7 @@ def test_experiment_requires_opt_in_and_has_no_network_in_dry_run(tmp_path, monk
         pdf.new_page()
         pdf.save(path)
     monkeypatch.setattr(dp, "post_routerai", lambda *a, **kw: pytest.fail("network call in dry run"))
+    monkeypatch.setattr(probe, "load_provider_key", lambda *a: pytest.fail("dry run must not read credentials"))
     assert probe.main([str(path)]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "dry-run" and result["planned_requests"] == 2
@@ -94,6 +95,9 @@ def test_both_models_receive_identical_inputs_even_when_first_model_fails(tmp_pa
         pdf.new_page()
         pdf.save(path)
     monkeypatch.setenv("ROUTERAI_API_KEY", "secret")
+    monkeypatch.setattr(probe.lp, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(probe.lp, "LOCAL_CONFIG_PATH", tmp_path / "config.local.json")
+    monkeypatch.setattr(probe.lp, "ENV_PATH", tmp_path / ".env")
     bodies = []
     def post(url, **kwargs):
         body = json.loads(kwargs["content"])
@@ -151,6 +155,89 @@ def test_hydra_cannot_silently_substitute_another_model(tmp_path, capsys):
 
 def test_live_without_configured_key_is_rejected_before_any_requests(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("ROUTERAI_API_KEY", raising=False)
+    monkeypatch.setattr(probe.lp, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(probe.lp, "LOCAL_CONFIG_PATH", tmp_path / "config.local.json")
+    monkeypatch.setattr(probe.lp, "ENV_PATH", tmp_path / ".env")
     monkeypatch.setattr(dp, "prepare_documents", lambda *a, **kw: pytest.fail("must stop before preparation"))
     assert probe.main([str(tmp_path / "input.pdf"), "--live"]) == 2
     assert "No requests sent" in capsys.readouterr().err
+
+
+@pytest.fixture
+def isolated_key_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(probe.lp, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(probe.lp, "LOCAL_CONFIG_PATH", tmp_path / "config.local.json")
+    monkeypatch.setattr(probe.lp, "ENV_PATH", tmp_path / ".env")
+    for name in ("ROUTERAI_API_KEY", "HYDRA_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "CAD_LLM_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path
+
+
+def test_saved_pin_protected_key_from_dotenv_is_unlocked_for_both_models(isolated_key_files, monkeypatch, capsys):
+    import pymupdf
+    path = isolated_key_files / "doc.pdf"
+    with pymupdf.open() as pdf:
+        pdf.new_page()
+        pdf.save(path)
+    token = probe.lp.protect_api_key("routerai", "private-api-key", secret="4815")
+    env_file = isolated_key_files / ".env"
+    env_file.write_text("ROUTERAI_API_KEY=" + token + "\n", encoding="utf-8")
+    original = env_file.read_bytes()
+    monkeypatch.setattr(probe.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(probe.getpass, "getpass", lambda prompt: "4815")
+    calls = []
+    def post(url, **kwargs):
+        calls.append((json.loads(kwargs["content"])["model"], kwargs["headers"]["Authorization"]))
+        return httpx.Response(200, request=httpx.Request("POST", url),
+                              json={"answers": {"q1": {"type": "noul", "noul": 0.8}}})
+    monkeypatch.setattr(dp.httpx, "post", post)
+    assert probe.main([str(path), "--live"]) == 0
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert [r["model"] for r in result["results"]] == ["typesafe/jev-1.14", probe.ROUTERAI_MICROSOFT]
+    assert all(header == "Bearer private-api-key" for _, header in calls)
+    assert env_file.read_bytes() == original
+    assert all(secret not in captured.out + captured.err for secret in ("private-api-key", "4815", token))
+
+
+def test_saved_unprotected_pinless_key_in_config_needs_no_prompt(isolated_key_files, monkeypatch):
+    token = probe.lp.protect_api_key("routerai", "router-key")
+    (isolated_key_files / "config.local.json").write_text(json.dumps({"api": {"providers": {
+        "routerai": {"api_key": token}}}}), encoding="utf-8")
+    monkeypatch.setattr(probe.getpass, "getpass", lambda *a: pytest.fail("PIN not needed"))
+    assert probe.load_provider_key("routerai") == "router-key"
+
+
+def test_wrong_pin_stops_without_network_or_secret_leak(isolated_key_files, monkeypatch, capsys):
+    token = probe.lp.protect_api_key("routerai", "private-api-key", secret="4815")
+    (isolated_key_files / ".env").write_text("ROUTERAI_API_KEY=" + token + "\n", encoding="utf-8")
+    monkeypatch.setattr(probe.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(probe.getpass, "getpass", lambda prompt: "wrong-pin")
+    monkeypatch.setattr(dp, "prepare_documents", lambda *a, **kw: pytest.fail("must stop before preparation"))
+    assert probe.main([str(isolated_key_files / "doc.pdf"), "--live"]) == 2
+    output = capsys.readouterr()
+    assert "No requests sent" in output.err
+    assert all(secret not in output.out + output.err for secret in ("private-api-key", "wrong-pin", token))
+
+
+def test_pin_prompt_requires_tty_and_fails_closed_on_getpass_fallback(isolated_key_files, monkeypatch):
+    token = probe.lp.protect_api_key("routerai", "secret", secret="4815")
+    (isolated_key_files / ".env").write_text("ROUTERAI_API_KEY=" + token + "\n", encoding="utf-8")
+    monkeypatch.setattr(probe.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(probe.getpass, "getpass", lambda *a: pytest.fail("no prompt without tty"))
+    with pytest.raises(probe.KeyUnavailable, match="terminal"):
+        probe.load_provider_key("routerai")
+    monkeypatch.setattr(probe.sys.stdin, "isatty", lambda: True)
+    def unsafe_prompt(*a):
+        import warnings
+        warnings.warn("echo would be enabled", probe.getpass.GetPassWarning)
+        pytest.fail("must not accept unmasked input")
+    monkeypatch.setattr(probe.getpass, "getpass", unsafe_prompt)
+    with pytest.raises(probe.KeyUnavailable):
+        probe.load_provider_key("routerai")
+
+
+def test_does_not_use_other_provider_key_if_routerai_is_absent(isolated_key_files):
+    (isolated_key_files / ".env").write_text("OPENROUTER_API_KEY=wrong-provider-secret\n", encoding="utf-8")
+    with pytest.raises(probe.KeyUnavailable, match="No saved routerai key"):
+        probe.load_provider_key("routerai")

@@ -89,6 +89,22 @@ class ParseResult:
     error: str | None
 
 
+def _validated_segment(raw: Any) -> Segment:
+    segment = Segment.model_validate(raw)
+    if not math.isfinite(segment.distance_ft) or not all(math.isfinite(x) for x in segment.vector):
+        raise ValueError("non-finite side")
+    return segment
+
+
+def _validated_description(model: type[LegalDescription], raw: Any) -> LegalDescription:
+    description = model.model_validate(raw)
+    if not math.isfinite(description.distance_to_corner_ft):
+        raise ValueError("non-finite tie distance")
+    if description.corner_to_pob_bearing is not None:
+        _validated_segment(description.corner_to_pob_bearing)
+    return description
+
+
 def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
     if not isinstance(raw, list):
         return (), False
@@ -108,9 +124,9 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             if not isinstance(segments, list) or not segments:
                 raise ValueError("missing sides")
             for segment in segments:
-                Segment.model_validate(segment)
+                _validated_segment(segment)
             model = LegalDescription if entry["complete"] else PartialLegalDescription
-            result.append(DescriptionItem(model.model_validate(raw_data), entry["complete"]))
+            result.append(DescriptionItem(_validated_description(model, raw_data), entry["complete"]))
         except Exception:  # validation errors belong only to this item
             all_valid = False
             # Keep a continuous, independently valid prefix of sides if the
@@ -123,7 +139,7 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             prefix = []
             for segment in segments:
                 try:
-                    Segment.model_validate(segment)
+                    _validated_segment(segment)
                 except Exception:
                     break
                 prefix.append(segment)
@@ -132,7 +148,7 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             if len(prefix) == len(segments) and (not entry["complete"] or len(prefix) >= 3):
                 continue
             try:
-                partial = PartialLegalDescription.model_validate({**data, "segments": prefix})
+                partial = _validated_description(PartialLegalDescription, {**data, "segments": prefix})
             except Exception:
                 continue
             result.append(DescriptionItem(partial, False))

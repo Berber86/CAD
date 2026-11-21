@@ -1050,13 +1050,18 @@ class DrawPlan:
     suspicion: LotSuspicionReport | None = None
     #: Черновик для печати (правила — docs/customer_rules.md, раздел «Черновик для печати»).
     print_draft: bool = False
+    #: Достоверная незамкнутая часть обхода; не добавлять замыкающую сторону.
+    open_traverse: bool = False
 
     @property
     def area_sqft(self) -> float:
-        return abs(polygon_signed_area(self.vertices))
+        return 0.0 if self.open_traverse else abs(polygon_signed_area(self.vertices))
 
     @property
     def centroid(self) -> tuple[float, float]:
+        if self.open_traverse and self.vertices:
+            xs, ys = zip(*self.vertices)
+            return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
         return polygon_centroid(self.vertices)
 
 
@@ -3181,7 +3186,26 @@ class AcadBuilder:
             draw_as_lines = bool(drawing.get("property_as_lines", True))
             primary_entity: Any = None
             created_boundary_lines = 0
-            if not is_neighbor:
+            if geo.open_traverse:
+                # Незавершённый обход рисуется только по известным сторонам.
+                # Нельзя замыкать его полилинией или угадывать фасад.
+                if not geo.boundary_lines or not hasattr(model_space, "AddLine"):
+                    raise AcadDrawError("Не удалось построить известные стороны открытого обхода.")
+                street_indices = set(geo.street_boundary_indices) if not is_neighbor else set()
+                for index, b_line in enumerate(geo.boundary_lines):
+                    if is_neighbor:
+                        line_ent = self._add_line(model_space, b_line, poly_target_layer)
+                    else:
+                        on_street = index in street_indices
+                        layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                        line_ent = self._add_survey_line(
+                            model_space, b_line, layer, color,
+                            linetype="ByLayer" if on_street else "Continuous",
+                        )
+                    created_boundary_lines += 1
+                    if primary_entity is None:
+                        primary_entity = line_ent
+            elif not is_neighbor:
                 # Разные слои в одном контуре требуют отдельных LINE, даже если
                 # в старом config.json была выбрана полилиния.
                 if not geo.boundary_lines or not hasattr(model_space, "AddLine"):

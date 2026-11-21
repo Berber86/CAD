@@ -204,7 +204,10 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "multiple_description_search": {"enabled": False},
+    "multiple_description_search": {
+        "enabled": False,
+        "vision_fallback": {"provider": "hydra", "model": "grok-4.7", "image_limit": 10},
+    },
     "api": {
         "provider": "hydra",
         "api_key": "",

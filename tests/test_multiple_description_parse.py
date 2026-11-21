@@ -1,5 +1,6 @@
 """Network-free tests for the experimental stage 3 parsing policy."""
 import json
+import math
 
 import pytest
 
@@ -258,3 +259,12 @@ def test_short_complete_item_keeps_known_sides_as_incomplete_after_retries():
     result = call(lambda *a: answer([short]))
     assert len(result.items) == 1 and len(result.items[0].data.segments) == 2
     assert not result.items[0].complete and not result.complete
+
+
+def test_nonfinite_side_never_produces_nonfinite_geometry():
+    value = item('5')
+    value['data']['segments'][1]['distance_ft'] = float('inf')
+    result = call(lambda *a: answer([value]))
+    assert len(result.items) == 1 and not result.items[0].complete
+    assert len(result.items[0].data.segments) == 1
+    assert all(math.isfinite(x) for x in result.items[0].data.segments[0].vector)

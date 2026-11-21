@@ -28,6 +28,22 @@ class VisionTarget:
     image_limit: int
 
 
+def configured_vision_fallback(config: Mapping[str, Any] | None) -> VisionTarget | None:
+    """Read the explicit reserve without accessing credentials or the network."""
+    section = config.get('multiple_description_search') if isinstance(config, Mapping) else None
+    data = section.get('vision_fallback') if isinstance(section, Mapping) else None
+    if data is None:
+        return None
+    if not isinstance(data, Mapping):
+        raise ValueError('Invalid vision reserve configuration')
+    provider, model, limit = data.get('provider'), data.get('model'), data.get('image_limit')
+    if (not isinstance(provider, str) or not provider.strip()
+            or not isinstance(model, str) or not model.strip()
+            or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_IMAGES):
+        raise ValueError('Invalid vision reserve configuration')
+    return VisionTarget(provider.strip(), model.strip(), limit)
+
+
 def choose_vision_target(selected: VisionTarget, support: str, fallback: VisionTarget | None) -> VisionTarget:
     """Unknown capability is tried; only confirmed absence uses the reserve.
 

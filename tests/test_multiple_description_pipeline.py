@@ -133,3 +133,21 @@ def test_vision_fallback_only_on_confirmed_absence():
         pipeline.choose_vision_target(selected, 'no', None)
     with pytest.raises(ValueError):
         pipeline.choose_vision_target(selected, 'timeout', fallback)
+
+
+def test_grok_vision_reserve_is_configured_but_switch_remains_off():
+    import llm_parser
+    for cfg in (llm_parser.DEFAULT_CONFIG, json.loads(__import__('pathlib').Path('config.json').read_text())):
+        assert cfg['multiple_description_search']['enabled'] is False
+        reserve = pipeline.configured_vision_fallback(cfg)
+        assert reserve == pipeline.VisionTarget('hydra', 'grok-4.7', 10)
+        current = pipeline.VisionTarget('hydra', 'glm-5.2', 50)
+        assert pipeline.choose_vision_target(current, 'unknown', reserve) == current
+        assert pipeline.choose_vision_target(current, 'no', reserve) == reserve
+
+
+def test_invalid_reserve_cannot_implicitly_enable_or_guess_limit():
+    with pytest.raises(ValueError):
+        pipeline.configured_vision_fallback({'multiple_description_search': {'vision_fallback':
+                                             {'provider': 'hydra', 'model': 'grok-4.7', 'image_limit': True}}})
+    assert pipeline.configured_vision_fallback({}) is None

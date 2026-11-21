@@ -318,3 +318,16 @@ def test_changed_pdf_after_parse_never_assigns_old_ai_observations_to_new_file(t
     assert batch.files[0].result.parse.items[0].data._source_file_sha256 == ''
     sidecar = json.loads((tmp_path / (pdf.name + '.multi-parse.json')).read_text())
     assert all(run.get('error') != 'metadata_unavailable' for run in sidecar['runs'])
+
+
+def test_unlocated_placement_is_reported_to_user(tmp_path):
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    messages = []
+    target = runtime.ResolvedTarget('hydra', 'grok', 'https://example.test', 'secret', 10)
+    result = runtime.run_batch([runtime.FileJob(pdf, True)], config(), target=target,
+                               search_api_key='router', send=lambda *a: answer([described('5', 55, tie=False)]),
+                               choose=None, search_send=searcher, detail=messages.append)
+    assert not result.scene.plans[0].placement_known
+    assert any('без подтверждённой привязки' in message and 'размещены отдельно' in message
+               for message in messages)

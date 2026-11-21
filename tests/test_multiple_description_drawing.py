@@ -314,7 +314,11 @@ def test_unlocated_full_contour_has_no_guessed_street_intersection():
     entry = scene.plans[0]
     assert entry.diagnostic == 'unresolved_position'
     assert not entry.plan.lines
-    assert not any('street' in t.kind for t in entry.plan.items)
+    assert any(t.kind == 'main-street' for t in entry.plan.items)
+    assert not any(t.kind.startswith('cross-street') for t in entry.plan.items)
+    draft = drawing.make_scene_print_drafts(scene, builder_cfg=builder.cfg).plans[0]
+    assert any(t.kind == 'main-street' for t in draft.items)
+    assert not draft.lines
     assert any(t.kind == 'main-lot-label' and t.text == 'LOT 6' for t in entry.plan.items)
     for edge, segment in zip(entry.plan.boundary_lines, desc.segments):
         assert _vector(edge) == pytest.approx(segment.vector, abs=1e-6)
@@ -368,3 +372,32 @@ def test_unclosed_full_description_keeps_continuous_sides_from_pob(fake_autocad,
     result = builder.draw_plan(plan)
     assert result.boundary_line_count == len(parsed.data.segments)
     assert not doc.ModelSpace.polylines
+
+
+def test_unlocated_frontage_never_uses_a_guessed_side_or_open_geometry():
+    from pathlib import Path
+    desc, _ = llm_parser.parse_with_regex(Path('tests/data/lot72_render_e600.txt').read_text(encoding='utf-8'),
+                                          auto_repair_typos=False)
+    builder = ab.AcadBuilder(llm_parser.load_config())
+    for changed, complete in [
+        (desc.model_copy(deep=True, update={'front_segment_index': None}), True),
+        (desc.model_copy(deep=True, update={'main_street': ''}), True),
+        (desc, False),
+    ]:
+        scene = drawing.plan_scene(builder, [record('OUR 6.pdf', True, parse.DescriptionItem(changed, complete))])
+        assert len(scene.plans) == 1
+        assert not any('street' in t.kind for t in scene.plans[0].plan.items)
+        assert not scene.plans[0].plan.lines
+
+
+def test_unlocated_frontage_does_not_fabricate_closure():
+    from pathlib import Path
+    desc, _ = llm_parser.parse_with_regex(Path('tests/data/lot72_render_e600.txt').read_text(encoding='utf-8'),
+                                          auto_repair_typos=False)
+    desc = desc.model_copy(deep=True)
+    desc.segments[-1].distance_ft += 1
+    scene = drawing.plan_scene(ab.AcadBuilder(llm_parser.load_config()),
+                               [record('OUR 6.pdf', True, parse.DescriptionItem(desc, True))])
+    assert len(scene.plans) == 1
+    assert not any(t.kind == 'main-street' for t in scene.plans[0].plan.items)
+    assert not scene.plans[0].plan.lines

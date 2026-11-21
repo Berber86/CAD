@@ -281,6 +281,15 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
     emit(detail, f"Подготовка схемы: описаний {len(sources)}.")
     scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
     emit(detail, f"Схема подготовлена: контуров {len(scene.plans)}, ошибок построения {len(scene.failures)}.")
+    unlocated = sum(not entry.placement_known for entry in scene.plans)
+    if unlocated:
+        emit(detail, f"Внимание: {unlocated} контуров без подтверждённой привязки к перекрёстку; "
+                     "они размещены отдельно, взаимное положение не установлено. "
+                     "Перекрёсток и расстояние до него не нарисованы.")
+    fallback = sum(entry.diagnostic == 'exact_sides_fallback' for entry in scene.plans)
+    if fallback:
+        emit(detail, f"Внимание: {fallback} контуров построено по исходным сторонам "
+                     "без полного оформления обычного режима.")
     by_index = {entry.description_index: entry for entry in scene.plans}
     failures = {entry.description_index: entry.reason for entry in scene.failures}
     offset = 0

@@ -298,3 +298,17 @@ def test_parse_http_status_and_timing_appear_in_visible_log_without_response_bod
     data = json.loads((tmp_path / (our.name + '.multi-parse.json')).read_text())
     attempts = data['runs'][-1]['attempts']
     assert len(attempts) == 3 and all(a['failure_kind'] == 'http_429' and a['elapsed_seconds'] >= 0 for a in attempts)
+
+
+def test_unlocated_scene_warns_user_without_changing_cached_requests(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path,
+                           parse=lambda *a: answer([described('5', 55, tie=False),
+                                                    described('6', 100, tie=False)]))
+    submit(app, gui, tmp_path)
+    assert 'Без подтверждённой привязки: 4' in app.status_var.get()
+    assert 'размещены отдельно' in app.status_var.get()
+    assert calls['parse'] == 2 and calls['search'] == 2
+    app._start(parse_only=True)
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 2 and calls['search'] == 2
+    assert 'Без подтверждённой привязки: 4' in app.status_var.get()

@@ -8766,7 +8766,13 @@ class SurveyApp(ctk.CTk):
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
         self._refresh_stepper()
-        self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой.", key=True)
+        unlocated = sum(not entry.placement_known for entry in view.drawable)
+        if unlocated:
+            self._set_status(
+                f"Подготовлено контуров: {len(view.drawable)}. Без подтверждённой привязки: {unlocated}; "
+                "они размещены отдельно. Сверьте схему с документом.", warn=True)
+        else:
+            self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой.", key=True)
 
     def _parse_pdf_set_job(
         self, job: PdfSetJob, cfg: dict[str, Any], provider_id: str, model_name: str,

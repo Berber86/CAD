@@ -15,7 +15,7 @@ from typing import Any, Sequence
 import lot_identity
 from acad_builder import (
     AcadBuilder, DrawPlan, LineItem, TextItem, build_polygon_points,
-    build_side_lines, closure_error, description_uses_feet_inches, estimate_text_width, text_rotation,
+    build_side_lines, closure_error, description_uses_feet_inches, estimate_text_width, polygon_signed_area, text_rotation,
 )
 from multiple_description_parse import DescriptionItem
 
@@ -280,6 +280,38 @@ class SceneResult:
     failures: tuple[PlanFailure, ...]
 
 
+def _unlocated_frontage_items(builder: AcadBuilder, plan: DrawPlan, item: DescriptionItem) -> list[TextItem]:
+    """Label a documented frontage without inventing a street intersection.
+
+    A trustworthy exterior requires a complete closed traverse and an explicit
+    frontage index. Never use the legacy builder's configured/guessed index.
+    Discard all cross-street items and all extension lines: their position may
+    depend on the missing intersection tie.
+    """
+    desc = plan.description
+    front = desc.front_segment_index
+    edges = plan.boundary_lines
+    if (not item.complete or not str(desc.main_street or '').strip()
+            or isinstance(front, bool) or not isinstance(front, int)
+            or not 0 <= front < len(edges) or len(edges) < 3
+            or math.dist(edges[-1].end, edges[0].start) > 1e-5):
+        return []
+    points = [edge.start for edge in edges]
+    area = polygon_signed_area(points)
+    if abs(area) < 0.5:
+        return []
+    # The legacy layout handles text sizing, rotation and street notes. Remove
+    # the cross street from its input to avoid even computing a guessed corner.
+    local_desc = desc.model_copy(update={'cross_street': None, 'cross_street_former': None})
+    try:
+        items, _ = builder._street_items(local_desc, points, plan.text_height, area > 0,
+                                        [], front_index=front, boundary_lines=edges)
+    except Exception:
+        # A label/layout failure must not hide an otherwise usable contour.
+        return []
+    return [text for text in items if text.kind in {'main-street', 'main-street-note', 'main-street-note-extra'}]
+
+
 def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, scale: float = 16.0,
                separation_ft: float = 200.0) -> SceneResult:
     """Plan all records; unrelated groups are laid out separately to the right.
@@ -311,8 +343,9 @@ def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, sc
             # The legacy builder derives a hypothetical intersection even when
             # its input lacks an established tie. An isolated parcel must not
             # carry that invented street geometry or its associated labels.
+            frontage = _unlocated_frontage_items(builder, plan, source.item) if source.is_main else []
             plan = replace(plan, lines=[], items=[t for t in plan.items
-                            if 'street' not in t.kind and t.kind != 'cross-street-distance'])
+                            if 'street' not in t.kind and t.kind != 'cross-street-distance'] + frontage)
         prepared.append(PlannedDescription(Path(source.source), source.is_main, index, plan,
                                            anchor.group if anchor else None, anchor is not None,
                                            reason if anchor is not None else (reason or 'unresolved_position')))
@@ -465,7 +498,8 @@ def make_scene_print_drafts(scene: SceneResult, *, builder_cfg: dict[str, Any]) 
             for text in draft.items:
                 if text.kind in {'main-lot-label', 'neighbor-label'}:
                     continue
-                if key[0] == 'unknown' and not (text.kind.startswith('side-') or text.kind.startswith('party-wall-')):
+                if key[0] == 'unknown' and not (text.kind.startswith('side-') or text.kind.startswith('party-wall-')
+                                                or text.kind in {'main-street', 'main-street-note', 'main-street-note-extra'}):
                     continue
                 if text.kind.startswith('side-'):
                     text = replace(text, text=re.sub(r' {2,}', ' ', text.text))

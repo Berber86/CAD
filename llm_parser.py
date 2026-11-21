@@ -50,6 +50,7 @@ import drawing_warnings
 
 import ocr_numbers
 import street_names
+from legal_street_policy import NYC_STREET_INSTRUCTION
 from description_check import CLOSURE_OK_FT, accepted_without_ai
 
 __all__ = [
@@ -2373,7 +2374,7 @@ CRITICAL SURVEY RULES
    - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
-6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only."""
+6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only.""" + "\n\n" + NYC_STREET_INSTRUCTION
 
 USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 \"\"\"

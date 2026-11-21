@@ -203,3 +203,14 @@ def test_offline_restore_rejects_incomplete_and_mismatched_filename(tmp_path):
     other.write_bytes(b'original')
     cache.diagnostics_path(other).write_bytes(cache.diagnostics_path(pdf).read_bytes())
     assert cache.load_latest_offline(other) is None
+
+
+def test_old_known_prompt_only_restored_offline_not_as_current_parse(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    ctx = context(pdf)
+    ctx['instruction_sha256'] = '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'
+    cache.save_result(pdf, ctx, parse(), portal_lot=None)
+    found = cache.load_latest_offline(pdf)
+    assert found is not None and found[1]['instruction_sha256'] == ctx['instruction_sha256']
+    assert cache.load_result(pdf, context(pdf)) is None

@@ -339,7 +339,7 @@ def _decorate_exact_anchored(builder: AcadBuilder, plan: DrawPlan, source: Descr
     from acad_builder import compute_pob_point
     desc = plan.description
     if (not plan.open_traverse or not _near_closed_complete(plan, source.item)
-            or source.anchor is None or not source.anchor.group.startswith('confirmed-file:')
+            or source.anchor is None or not source.anchor.group.startswith(('confirmed-file:', 'auto-row:'))
             or desc.corner_to_pob_bearing is None
             or math.dist(compute_pob_point(desc), source.anchor.pob) > 1e-5):
         return plan
@@ -579,7 +579,11 @@ def make_scene_print_drafts(scene: SceneResult, *, builder_cfg: dict[str, Any]) 
                 by_index.update((entry.description_index, plan) for entry, plan in zip(entries, result.plans))
                 continue
             notes.append(result.diagnostic or 'draft_group_unavailable')
-        if key[0] == 'known' and len(entries) == 1 and not entries[0].plan.open_traverse:
+        if (key[0] == 'known' and len(entries) == 1
+                and (not entries[0].plan.open_traverse or (
+                    entries[0].diagnostic == 'exact_sides_fallback'
+                    and entries[0].plan.closure.distance <= ROUNDING_GAP_LIMIT_FT
+                    and any(line.kind == 'main-street-row-tie' for line in entries[0].plan.lines)))):
             try:
                 draft = make_print_draft(entries[0].plan, {}, builder_cfg=builder_cfg)
                 by_index[entries[0].description_index] = draft

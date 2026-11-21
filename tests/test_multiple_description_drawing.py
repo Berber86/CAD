@@ -416,8 +416,10 @@ def deed_example_items():
     for lot, cross, distance, sides in values:
         segments = [dict(ns=ns, degrees=deg, minutes=minutes, seconds=seconds, ew=ew, distance_ft=length)
                     for ns, deg, minutes, seconds, ew, length in sides]
+        segments[-1]['course_note'] = 'along the northwesterly side of Hylan Boulevard'
         entries.append({'complete': True, 'data': {'main_street': 'Hylan Boulevard', 'cross_street': cross,
-                        'distance_to_corner_ft': distance, 'corner_to_pob_bearing': None,
+                        'distance_to_corner_ft': distance, 'distance_to_corner_source': f'{distance:.2f} feet',
+                        'corner_to_pob_bearing': None, 'borough_or_city': 'Staten Island, NY',
                         'front_side': 'SE', 'front_segment_index': 3, 'lot_number': lot, 'segments': segments}})
     return parse.read_response(answer(entries), [2, 3]).items
 

@@ -8833,37 +8833,7 @@ class SurveyApp(ctk.CTk):
             self._input_incomplete = True
             self._set_status("Обработка PDF не завершена.")
             return
-        # A pattern is only a proposal. The user must explicitly confirm the
-        # shared intersection and assumed direction before we alter placement.
-        from multiple_description_handoff import row_proposal, confirm_row
-        proposal = row_proposal(view)
-        if proposal is not None:
-            from tkinter import messagebox
-            question = (
-                f"В файле {proposal.source.name} два контура могут иметь общую сторону "
-                f"{proposal.shared_length:.2f} ft на {proposal.main_street}.\n\n"
-                f"Пересекающая улица указана как «{proposal.near_cross}» и «{proposal.far_cross}». "
-                f"Для схемы будет использовано «{proposal.near_cross}».\n"
-                f"Предлагаемая привязка от общего перекрёстка к точкам начала: "
-                f"{proposal.near_distance:.2f} и {proposal.far_distance:.2f} ft по "
-                f"{proposal.tie_label}. Направление восстановлено по сторонам, не прочитано из кэша. "
-                "Направление пересекающей улицы будет условно перпендикулярным.\n\n"
-                "Сверьте с PDF: это один и тот же перекрёсток и участки действительно соседние? "
-                "Построить предложенную схему?"
-            )
-            if messagebox.askyesno("Подтвердите взаимное положение", question, parent=self, default="no"):
-                try:
-                    confirmed = confirm_row(view, proposal, builder_cfg=self.config_data, scale=self._current_scale())
-                    self._install_multi_scene(confirmed)  # rechecks the source hash
-                    view = confirmed
-                    self._log_line("Взаимное расположение и общий перекрёсток подтверждены пользователем; "
-                                   "условное направление пересекающей улицы требует проверки.")
-                except (InvalidHandoff, ValueError):
-                    self._ready_source_signature = None
-                    self._input_incomplete = True
-                    self._set_status("Подтверждённое расположение не применено; повторите обработку PDF.", warn=True)
-                    return
-        # The confirmation dialog may have been open while a source changed.
+        # A PDF may have changed after the background worker built its scene.
         try:
             valid_sources = all(doc.pdf_sha256 is None or file_metadata._digest(doc.source) == doc.pdf_sha256
                                 for doc in view.documents)
@@ -8882,8 +8852,7 @@ class SurveyApp(ctk.CTk):
         unlocated = sum(not entry.placement_known for entry in view.drawable)
         if unlocated:
             self._set_status(
-                f"Подготовлено контуров: {len(view.drawable)}. Без подтверждённой привязки: {unlocated}; "
-                "они размещены отдельно. Сверьте схему с документом.", warn=True)
+                f"Подготовлено контуров: {len(view.drawable)}. Отдельно размещено: {unlocated}.", key=True)
         else:
             self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой.", key=True)
 

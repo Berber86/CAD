@@ -305,65 +305,50 @@ def test_unlocated_scene_warns_user_without_changing_cached_requests(gui, tmp_pa
                            parse=lambda *a: answer([described('5', 55, tie=False),
                                                     described('6', 100, tie=False)]))
     submit(app, gui, tmp_path)
-    assert 'Без подтверждённой привязки: 4' in app.status_var.get()
-    assert 'размещены отдельно' in app.status_var.get()
+    assert 'Отдельно размещено: 4' in app.status_var.get()
     assert calls['parse'] == 2 and calls['search'] == 2
     app._start(parse_only=True)
     smoke._wait_for_gui_worker(app)
     assert calls['parse'] == 2 and calls['search'] == 2
-    assert 'Без подтверждённой привязки: 4' in app.status_var.get()
+    assert 'Отдельно размещено: 4' in app.status_var.get()
 
 
-@pytest.mark.parametrize('accept', [True, False])
-def test_user_can_confirm_or_decline_deed_row_without_new_ai(gui, tmp_path, monkeypatch, accept):
+def test_deed_row_is_placed_automatically_without_prompt(gui, tmp_path, monkeypatch):
     from tkinter import messagebox
     from test_multiple_description_drawing import deed_example_items
-    items = deed_example_items()
-    payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in items]
+    payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in deed_example_items()]
     app, calls = setup_app(gui, monkeypatch, tmp_path, parse=lambda *a: answer(payload))
-    prompts = []
-    def ask(title, question, **kwargs):
-        prompts.append((title, question, kwargs))
-        return accept
-    monkeypatch.setattr(messagebox, 'askyesno', ask)
+    monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: pytest.fail('unexpected decision'))
     our = tmp_path / 'OUR 6 NEW.pdf'
     make_pdf(our, 2)
-    jobs, errors = app._make_pdf_set_items([our])
-    assert not errors
+    jobs, _ = app._make_pdf_set_items([our])
     jobs[0].is_main = True
     app._submit_pdf_set(jobs, scene_mode='update', fresh=True)
     smoke._wait_for_gui_worker(app)
     assert calls['parse'] == 1 and calls['search'] == 1
-    assert len(prompts) == 1
-    assert all(s in prompts[0][1] for s in ['Lindberg Avenue', 'Lindbergh Avenue', '96.58',
-                                             '55.42', '100.11', 'условно перпендикулярным'])
     view = app._multi_scene_handoff
-    assert [d.placement_known for d in view.drawable] == [accept, accept]
+    assert all(d.placement_known for d in view.drawable)
     assert all(d.outcome.data.corner_to_pob_bearing is None for d in view.drawable)
     assert view.drawable[1].outcome.data.cross_street == 'Lindbergh Avenue'
-    if accept:
-        from multiple_description_drawing import make_scene_print_drafts
-        draft = make_scene_print_drafts(view.scene, builder_cfg=app.config_data)
-        assert draft.diagnostic is None and len(draft.plans) == 2
-        assert any(t.kind == 'cross-street' for p in view.scene.plans for t in p.plan.items)
-    else:
-        assert 'размещены отдельно' in app.status_var.get()
+    from multiple_description_drawing import make_scene_print_drafts
+    draft = make_scene_print_drafts(view.scene, builder_cfg=app.config_data)
+    assert draft.diagnostic is None and len(draft.plans) == 2
+    assert any(t.kind == 'cross-street' for p in view.scene.plans for t in p.plan.items)
     assert app._ready_source_signature and not app._input_incomplete
-    assert calls['parse'] == 1 and calls['search'] == 1
 
 
-def test_source_changed_while_row_confirmation_open_disables_drawing(gui, tmp_path, monkeypatch):
-    from tkinter import messagebox
+def test_source_changed_after_installation_disables_drawing(gui, tmp_path, monkeypatch):
     from test_multiple_description_drawing import deed_example_items
     payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in deed_example_items()]
     app, _ = setup_app(gui, monkeypatch, tmp_path, parse=lambda *a: answer(payload))
     our = tmp_path / 'OUR 6 NEW.pdf'
     make_pdf(our, 2)
-    def mutate(*a, **k):
+    original = app._install_multi_scene
+    def mutate_after_install(view):
+        original(view)
         with our.open('ab') as file:
             file.write(b'changed')
-        return False
-    monkeypatch.setattr(messagebox, 'askyesno', mutate)
+    monkeypatch.setattr(app, '_install_multi_scene', mutate_after_install)
     jobs, _ = app._make_pdf_set_items([our])
     jobs[0].is_main = True
     app._submit_pdf_set(jobs, scene_mode='update', fresh=True)
@@ -372,7 +357,7 @@ def test_source_changed_while_row_confirmation_open_disables_drawing(gui, tmp_pa
     assert 'изменился' in app.status_var.get()
 
 
-def test_explicit_cache_restore_is_offline_and_supports_user_confirmation(gui, tmp_path, monkeypatch):
+def test_explicit_cache_restore_is_offline_and_automatically_positions_supported_row(gui, tmp_path, monkeypatch):
     from tkinter import filedialog, messagebox
     import file_metadata
     import multiple_description_cache as cache
@@ -388,19 +373,19 @@ def test_explicit_cache_restore_is_offline_and_supports_user_confirmation(gui, t
     context = cache.cache_context(pdf_sha256=file_metadata._digest(pdf), pages=pages(2), image_settings={},
                                   provider='openrouter', model='nvidia/nemotron-3.5-super-vl:free',
                                   filename_lot='6', search_complete=True, image_limit=50)
+    # Actual 4.80.3–4.80.6 prompt hash, as in the user's saved cache.
+    context['instruction_sha256'] = '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'
     cache.save_result(pdf, context, parse_result, portal_lot=None)
     original_bytes = cache.diagnostics_path(pdf).read_bytes()
     app, calls = setup_app(gui, monkeypatch, tmp_path)
     monkeypatch.setattr(runtime, 'prepare_runtime', lambda *a, **k: pytest.fail('network/key access'))
     monkeypatch.setattr(runtime, 'open_runtime_callbacks', lambda *a, **k: pytest.fail('network access'))
     monkeypatch.setattr(filedialog, 'askopenfilename', lambda **k: str(pdf))
-    prompts = []
-    monkeypatch.setattr(messagebox, 'askyesno', lambda title, question, **k: prompts.append(question) or True)
+    monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: pytest.fail('unexpected decision'))
     app._restore_multi_cache()
     smoke._wait_for_gui_worker(app)
     assert calls['parse'] == calls['search'] == 0
     assert cache.diagnostics_path(pdf).read_bytes() == original_bytes
-    assert len(prompts) == 1 and 'Lindberg Avenue' in prompts[0]
     assert app._ready_source_signature and not app._input_incomplete
     assert len(app._scene_plans()) == 2
     assert all(d.placement_known for d in app._multi_scene_handoff.drawable)

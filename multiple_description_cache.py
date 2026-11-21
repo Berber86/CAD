@@ -255,8 +255,8 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
     """Restore a compatible complete snapshot without a network/key lookup.
 
     This is an explicit historical restore, not a fresh parse or current-model
-    cache hit. PDF digest, filename identity, prompt, schema and the original
-    cache fingerprint must all match. No sidecars are written.
+    cache hit. PDF digest, filename identity, compatible prompt, schema and the
+    original cache fingerprint must all match. No sidecars are written.
     """
     import lot_identity
     from multiple_description_parse import SCHEMA_VERSION
@@ -267,13 +267,17 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
     schema_hash = hashlib.sha256(json.dumps(
         LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
         separators=(',', ':')).encode('utf-8')).hexdigest()
+    # Only offline historical restore may use the known 4.80.3–4.80.6 prompt.
+    # Normal parse cache matching always requires the exact current prompt.
+    compatible_prompts = {hashlib.sha256(system_instruction().encode('utf-8')).hexdigest(),
+                          '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769'}
     for run in reversed(history['runs']):
         if not isinstance(run, dict) or not isinstance(run.get('context'), dict):
             continue
         ctx = run['context']
         if (ctx.get('pdf_sha256') != digest or ctx.get('filename_lot') != lot_identity.lot_from_filename(path)
                 or ctx.get('response_format') != SCHEMA_VERSION
-                or ctx.get('instruction_sha256') != hashlib.sha256(system_instruction().encode('utf-8')).hexdigest()
+                or ctx.get('instruction_sha256') not in compatible_prompts
                 or ctx.get('comparison_instruction_sha256') != hashlib.sha256(COMPARISON_INSTRUCTION.encode('utf-8')).hexdigest()
                 or ctx.get('description_schema_sha256') != schema_hash
                 or not isinstance(ctx.get('provider'), str) or not ctx['provider']

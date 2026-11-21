@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from llm_parser import LegalDescription, Segment
 from pydantic import model_validator
+from legal_street_policy import NYC_STREET_INSTRUCTION
 
 MAX_IMAGES = 50
 MAX_PARSE_CALLS = 4
@@ -54,7 +55,7 @@ def system_instruction() -> str:
         'Never infer from frontage or a word direction.'
     )
     schema = json.dumps(schema_data, ensure_ascii=False, separators=(',', ':'))
-    return (INSTRUCTION + '\nEach item data must conform to this JSON schema: ' + schema +
+    return (INSTRUCTION + '\n' + NYC_STREET_INSTRUCTION + '\nEach item data must conform to this JSON schema: ' + schema +
             '\nUse exactly the keys descriptions and complete at the top level, and exactly '
             'the keys complete and data for each item. Return JSON only.')
 

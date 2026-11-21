@@ -329,5 +329,30 @@ def test_unlocated_placement_is_reported_to_user(tmp_path):
                                search_api_key='router', send=lambda *a: answer([described('5', 55, tie=False)]),
                                choose=None, search_send=searcher, detail=messages.append)
     assert not result.scene.plans[0].placement_known
-    assert any('без подтверждённой привязки' in message and 'размещены отдельно' in message
+    assert any('без установленной привязки' in message and 'размещены отдельно' in message
                for message in messages)
+
+
+def test_two_pdf_cross_borough_safe_auto_row_uses_no_additional_model_calls(tmp_path):
+    from test_multiple_description_drawing import deed_example_items
+    first, second = tmp_path / 'OUR 6.pdf', tmp_path / 'LOT 5.pdf'
+    make_pdf(first, 2)
+    make_pdf(second, 2)
+    values = deed_example_items()
+    raw = []
+    for value in values:
+        data = value.data.model_copy(deep=True, update={'borough_or_city': 'Staten Island, NY'})
+        raw.append({'complete': True, 'data': data.model_dump(mode='json')})
+    calls = []
+    def send(images, context):
+        calls.append(context['filename_lot'])
+        return answer([raw[0] if context['filename_lot'] == '6' else raw[1]])
+    target = runtime.ResolvedTarget('hydra', 'grok', 'https://example.test', 'secret', 10)
+    jobs = [runtime.FileJob(first, True), runtime.FileJob(second, False)]
+    batch = runtime.run_batch(jobs, config(), target=target, search_api_key='router', send=send,
+                              choose=None, search_send=searcher)
+    assert calls == ['6', '5']
+    assert len(batch.scene.plans) == 2 and all(p.placement_known for p in batch.scene.plans)
+    assert batch.scene.plans[0].group == batch.scene.plans[1].group
+    assert [p.plan.is_neighbor for p in batch.scene.plans] == [False, True]
+    assert batch.files[1].result.parse.items[0].data.cross_street == 'Lindbergh Avenue'

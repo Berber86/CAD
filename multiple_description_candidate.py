@@ -1,17 +1,18 @@
-"""Conservative *proposals*, never automatic proof of a shared intersection.
+"""Evidence-based row matching scoped to a scene, never a street registry.
 
-A narrow two-lot row pattern can be offered to the user for review. The
-candidate's direction is derived from the frontage and corroborating shared
-edge, not read from the source; acceptance is required before using it.
+A one-letter name difference is considered only along with matching geometry,
+locality and a unique pair. It is not evidence of an officially correct spelling.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 from pathlib import Path
 from typing import Sequence
 
 from shapely.geometry import Polygon
+import street_names
 
 from acad_builder import build_polygon_points, compute_pob_point
 from llm_parser import _make_tie_segment_like
@@ -35,18 +36,30 @@ class RowProposal:
     tie_label: str
 
 
+def _borough(raw: str | None) -> str | None:
+    value = str(raw or '').upper()
+    patterns = {
+        'STATEN ISLAND': r'\b(?:STATEN ISLAND|RICHMOND COUNTY)\b',
+        'BROOKLYN': r'\b(?:BROOKLYN|KINGS COUNTY)\b',
+        'QUEENS': r'\bQUEENS\b',
+        'MANHATTAN': r'\b(?:MANHATTAN|NEW YORK COUNTY)\b',
+        'BRONX': r'\bBRONX\b',
+    }
+    found = [name for name, pattern in patterns.items() if re.search(pattern, value)]
+    return found[0] if len(found) == 1 else None
+
+
 def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
-    """Offer only a unique simple same-file pair, never merge on names alone."""
+    """Find one simple supported pair; caller must reject ambiguous pairings."""
     if len(sources) != 2:
         return None
     a, b = sources
-    if (Path(a.source) != Path(b.source) or not a.is_main or not b.is_main
-            or a.anchor is not None or b.anchor is not None
-            or not a.item.complete or not b.item.complete):
+    if (not a.item.complete or not b.item.complete
+            or (Path(a.source) == Path(b.source) and a.is_main != b.is_main)):
         return None
     descs = [a.item.data, b.item.data]
     for desc in descs:
-        if (not desc.main_street or not desc.cross_street or desc.corner_to_pob_bearing is not None
+        if (not desc.main_street or not desc.cross_street
                 or desc.cross_street_side_index is not None or len(desc.segments) < 3
                 or desc.front_segment_index != len(desc.segments) - 1
                 or desc.distance_to_corner_ft <= 0
@@ -55,8 +68,12 @@ def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
         pts = build_polygon_points(desc.segments)
         if math.dist(pts[0], pts[-1]) > ROUNDING_GAP_LIMIT_FT:
             return None
-    normalize = lambda text: ' '.join(text.upper().split())
-    if normalize(descs[0].main_street) != normalize(descs[1].main_street):
+    if (not street_names.scene_street_match(descs[0].main_street, descs[1].main_street)
+            or not street_names.scene_street_match(descs[0].cross_street, descs[1].cross_street)):
+        return None
+    boroughs = [_borough(d.borough_or_city) for d in descs]
+    if (all(boroughs) and boroughs[0] != boroughs[1]) or (
+            Path(a.source) != Path(b.source) and (not all(boroughs) or boroughs[0] != boroughs[1])):
         return None
     near_index, far_index = sorted((0, 1), key=lambda i: descs[i].distance_to_corner_ft)
     near, far = descs[near_index], descs[far_index]
@@ -70,6 +87,18 @@ def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
     if (abs(delta - front.distance_ft) > TOLERANCE_FT
             or math.hypot(ux - fux, uy - fuy) > 1e-6):
         return None
+    for source in (a, b):
+        desc = source.item.data
+        tie = desc.corner_to_pob_bearing
+        if source.anchor is not None and (tie is None or not source.anchor.group.startswith('file:')
+                                           or math.dist(source.anchor.pob, compute_pob_point(desc)) > 1e-5):
+            return None
+        if tie is not None:
+            if not tie.has_bearing or tie.bearing_solved or tie.distance_ft <= 1e-6:
+                return None
+            tx, ty = tie.vector
+            if math.hypot(tx / tie.distance_ft + ux, ty / tie.distance_ft + uy) > 1e-6:
+                return None
     near_pts = build_polygon_points(near.segments, start=(0, 0))
     far_pts = build_polygon_points(far.segments, start=(-delta * ux, -delta * uy))
     matches = []
@@ -97,7 +126,7 @@ def propose_row(sources: Sequence[DescriptionSource]) -> RowProposal | None:
 
 
 def accept_row(sources: Sequence[DescriptionSource], proposal: RowProposal) -> tuple[DescriptionSource, ...]:
-    """Apply a freshly revalidated user-confirmed proposal without changing cached data."""
+    """Apply a revalidated geometry match in memory, without changing source data."""
     if propose_row(sources) != proposal:
         raise ValueError('stale or invalid row proposal')
     near = sources[proposal.near_index].item.data
@@ -106,10 +135,45 @@ def accept_row(sources: Sequence[DescriptionSource], proposal: RowProposal) -> t
     output = []
     for source in sources:
         desc = source.item.data
-        tie = _make_tie_segment_like(desc.segments[-1], distance_ft=desc.distance_to_corner_ft, flip_180=True)
-        # Canonical label was explicitly displayed for approval; the original
-        # parsed outcome remains untouched in the handoff and its cache.
-        placed = desc.model_copy(update={'corner_to_pob_bearing': tie, 'cross_street': cross})
+        tie = (desc.corner_to_pob_bearing or
+               _make_tie_segment_like(desc.segments[-1], distance_ft=desc.distance_to_corner_ft, flip_180=True))
+        # Use the nearer description's printed label within this scene only;
+        # neither spelling is claimed to have been verified as official.
+        placed = desc.model_copy(update={'corner_to_pob_bearing': tie, 'cross_street': cross,
+                                         'main_street': near.main_street})
         output.append(DescriptionSource(source.source, source.is_main, DescriptionItem(placed, True),
                                         Anchor(group, compute_pob_point(placed))))
     return tuple(output)
+
+
+def auto_place_rows(sources: Sequence[DescriptionSource], *, eligible: Sequence[bool] | None = None
+                    ) -> tuple[tuple[DescriptionSource, ...], int]:
+    """Place only mutually unique geometric pairs; keep duplicates and ambiguity separate."""
+    if eligible is None:
+        eligible = [True] * len(sources)
+    if len(eligible) != len(sources):
+        raise ValueError('invalid eligibility')
+    matches = []
+    counts = [0] * len(sources)
+    for i in range(len(sources)):
+        for j in range(i + 1, len(sources)):
+            if not eligible[i] or not eligible[j]:
+                continue
+            proposal = propose_row((sources[i], sources[j]))
+            if proposal is not None:
+                matches.append((i, j, proposal))
+                counts[i] += 1
+                counts[j] += 1
+    result = list(sources)
+    placed = 0
+    from dataclasses import replace
+    for i, j, proposal in matches:
+        if counts[i] != 1 or counts[j] != 1:
+            continue
+        pair = accept_row((sources[i], sources[j]), proposal)
+        # A distinct group for each match, even when a file has several pairs.
+        group = f'auto-row:{i}:{j}'
+        for index, item in zip((i, j), pair):
+            result[index] = replace(item, anchor=replace(item.anchor, group=group))
+        placed += 1
+    return tuple(result), placed

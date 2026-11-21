@@ -214,6 +214,49 @@ def anchor_for(path: Path, item: DescriptionItem) -> drawing.Anchor | None:
     return drawing.Anchor(f'{scope}|{main}|{cross}', position)
 
 
+def _plan_with_auto_rows(builder: AcadBuilder, sources: Sequence[drawing.DescriptionSource], *,
+                         eligible: Sequence[bool] | None = None, scale: float = 16.0
+                         ) -> tuple[drawing.SceneResult, int]:
+    """Only publish auto groups when their plans preserve a usable real tie."""
+    import math
+    from multiple_description_candidate import auto_place_rows
+    original = tuple(sources)
+    proposed, _ = auto_place_rows(original, eligible=eligible)
+    scene = drawing.plan_scene(builder, proposed, scale=scale)
+    groups: dict[str, list[int]] = {}
+    for i, source in enumerate(proposed):
+        if source.anchor and source.anchor.group.startswith('auto-row:'):
+            groups.setdefault(source.anchor.group, []).append(i)
+    by_index = {entry.description_index: entry for entry in scene.plans}
+    failed: set[str] = set()
+    for group, indices in groups.items():
+        if len(indices) != 2 or any(i not in by_index for i in indices):
+            failed.add(group)
+            continue
+        for i in indices:
+            if not proposed[i].is_main:
+                continue
+            plan = by_index[i].plan
+            ties = [line for line in plan.lines if line.kind == 'main-street-row-tie']
+            distance = plan.description.distance_to_corner_ft
+            bearing = plan.description.corner_to_pob_bearing
+            if bearing is None:
+                failed.add(group)
+                break
+            vx, vy = bearing.vector
+            expected_corner = (plan.pob[0] - vx, plan.pob[1] - vy)
+            if (len(ties) != 1 or math.dist(ties[0].end, plan.pob) > drawing.ROUNDING_GAP_LIMIT_FT
+                    or math.dist(ties[0].start, expected_corner) > drawing.ROUNDING_GAP_LIMIT_FT
+                    or abs(math.dist(ties[0].start, ties[0].end) - distance) > drawing.ROUNDING_GAP_LIMIT_FT):
+                failed.add(group)
+                break
+    if failed:
+        safe = tuple(original[i] if source.anchor and source.anchor.group in failed else source
+                     for i, source in enumerate(proposed))
+        scene = drawing.plan_scene(builder, safe, scale=scale)
+    return scene, len(groups) - len(failed)
+
+
 def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: ResolvedTarget,
               search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
               search_send: Callable[..., Any] | None = None,
@@ -227,6 +270,7 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
         raise pipeline.ParseDisabled('Developer multiple-description switch is disabled.')
     files: list[FileResult] = []
     sources: list[drawing.DescriptionSource] = []
+    source_complete: list[bool] = []
     for index, job in enumerate(jobs, 1):
         if not current():
             return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
@@ -276,19 +320,22 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
                 except (OSError, ValueError, cache.CacheError):
                     pass
             sources.append(drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item)))
+            source_complete.append(result.parse.complete)
     if not current():
         return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
     emit(detail, f"Подготовка схемы: описаний {len(sources)}.")
-    scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
+    scene, paired = _plan_with_auto_rows(AcadBuilder(dict(cfg)), sources, eligible=source_complete, scale=scale)
     emit(detail, f"Схема подготовлена: контуров {len(scene.plans)}, ошибок построения {len(scene.failures)}.")
+    if paired:
+        emit(detail, f"Геометрически сопоставлено пар участков: {paired}.")
     unlocated = sum(not entry.placement_known for entry in scene.plans)
     if unlocated:
-        emit(detail, f"Внимание: {unlocated} контуров без подтверждённой привязки к перекрёстку; "
+        emit(detail, f"{unlocated} контуров без установленной привязки к перекрёстку; "
                      "они размещены отдельно, взаимное положение не установлено. "
                      "Перекрёсток и расстояние до него не нарисованы.")
     fallback = sum(entry.diagnostic == 'exact_sides_fallback' for entry in scene.plans)
     if fallback:
-        emit(detail, f"Внимание: {fallback} контуров построено по исходным сторонам "
+        emit(detail, f"{fallback} контуров построено по исходным сторонам "
                      "без полного оформления обычного режима.")
     by_index = {entry.description_index: entry for entry in scene.plans}
     failures = {entry.description_index: entry.reason for entry in scene.failures}
@@ -343,7 +390,7 @@ def restore_cached_batch(job: FileJob, cfg: Mapping[str, Any], *, scale: float =
     parsed, context = loaded
     sources = [drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item))
                for item in parsed.items]
-    scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
+    scene, _ = _plan_with_auto_rows(AcadBuilder(dict(cfg)), sources, scale=scale)
     if file_metadata._digest(job.path) != context['pdf_sha256']:
         raise RuntimeUnavailable('offline_cache_unavailable')
     result = pipeline.PipelineResult(search={'pdf_sha256': context['pdf_sha256']}, parse=parsed,

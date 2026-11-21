@@ -346,3 +346,25 @@ def test_shared_equal_ties_remain_available_for_common_draft():
     assert all(any(line.kind == 'main-street-row-tie' for line in entry.plan.lines) for entry in scene.plans)
     result = drawing.draft_row_group(scene, builder_cfg=cfg)
     assert result.diagnostic is None and len(result.plans) == 2
+
+
+@pytest.mark.parametrize('is_main', [True, False])
+@pytest.mark.parametrize('as_lines', [True, False])
+def test_unclosed_full_description_keeps_continuous_sides_from_pob(fake_autocad, is_main, as_lines):
+    builder, doc = fake_autocad(None)
+    builder.cfg['drawing']['property_as_lines'] = as_lines
+    parsed = parse.read_response(answer([item('5', delta=3)]), [1]).items[0]
+    source = record('OUR 6.pdf', is_main, parsed, 'shared', (55, 10))
+    entry, = drawing.plan_scene(builder, [source]).plans
+    plan = entry.plan
+    assert entry.diagnostic == 'exact_sides_fallback' and plan.open_traverse
+    assert plan.pob == pytest.approx((55, 10))
+    expected = plan.pob
+    for edge, seg in zip(plan.boundary_lines, parsed.data.segments):
+        assert edge.start == pytest.approx(expected)
+        assert _vector(edge) == pytest.approx(seg.vector)
+        expected = edge.end
+    assert math.dist(expected, plan.pob) == pytest.approx(3)
+    result = builder.draw_plan(plan)
+    assert result.boundary_line_count == len(parsed.data.segments)
+    assert not doc.ModelSpace.polylines

@@ -259,10 +259,11 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
             try:
                 outcome = lp.ParseOutcome(data=item.data, source='llm:multi', provider=target.provider,
                                           model=target.model)
-                item.data._source_identity = file_metadata.record_outcome(job.path, outcome)
+                item.data._source_identity = file_metadata.record_outcome(
+                    job.path, outcome, expected_digest=result.search['pdf_sha256'])
             except (OSError, ValueError):
                 try:
-                    cache.record_failure(job.path, file_metadata._digest(job.path), reason='metadata_unavailable', pages=[])
+                    cache.record_failure(job.path, result.search['pdf_sha256'], reason='metadata_unavailable', pages=[])
                 except (OSError, ValueError, cache.CacheError):
                     pass
             sources.append(drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item)))

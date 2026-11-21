@@ -104,6 +104,14 @@ class Attempt:
 
 
 @dataclass(frozen=True)
+class ComparisonDiagnostic:
+    """Sanitized metadata about the optional one-shot candidate comparison."""
+    status: str
+    attempt_indices: tuple[int, ...]
+    pages: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ParseResult:
     items: tuple[DescriptionItem, ...]
     pages: tuple[int, ...]
@@ -113,6 +121,7 @@ class ParseResult:
     selected_attempt: int | None
     selection: str | None
     error: str | None
+    comparison: ComparisonDiagnostic | None = None
 
 
 def _validated_segment(raw: Any) -> Segment:
@@ -358,19 +367,29 @@ def parse_pages(
     largest = max(len(attempts[i].items) for i in viable)
     tied = [i for i in viable if len(attempts[i].items) == largest]
     selection = "most_items"
+    comparison = None
     if len(tied) > 1:
         chosen = None
+        # Use the largest page set from a usable tied attempt, never add pages.
+        longest = max((attempts[i].pages for i in tied), key=len)
+        status = "unavailable"
         if choose is not None:
-            # Use the largest page set from a usable tied attempt, never add pages.
-            longest = max((attempts[i].pages for i in tied), key=len)
             page_by_number = {p.number: p for p in pages}
             try:
                 index = choose(tuple(page_by_number[n] for n in longest), tuple(attempts[i] for i in tied))
                 if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(tied):
                     chosen = tied[index]
                     selection = "comparison"
+                    status = "selected"
+                else:
+                    status = "invalid_selection"
+            except ImageSizeRejected:
+                status = "size_rejected"
+            except (ValueError, TypeError):
+                status = "invalid_selection"
             except Exception:
-                pass
+                status = "request_failed"
+        comparison = ComparisonDiagnostic(status, tuple(tied), tuple(longest) if choose is not None else ())
         check(current_job)
         if chosen is None:
             chosen = max(tied, key=lambda i: _closure_score(attempts[i]))
@@ -382,4 +401,4 @@ def parse_pages(
     selected_attempt = attempts[chosen]
     rest = tuple(n for n in candidates if n not in selected_attempt.pages)
     return ParseResult(selected_attempt.items, selected_attempt.pages, rest, False,
-                       tuple(attempts), chosen, selection, error)
+                       tuple(attempts), chosen, selection, error, comparison)

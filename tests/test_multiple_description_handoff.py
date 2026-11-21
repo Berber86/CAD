@@ -119,3 +119,16 @@ def test_handoff_rejects_plan_with_changed_recorded_side(tmp_path):
     scene = drawing.SceneResult((replace(first, plan=bad_plan),) + result.scene.plans[1:], ())
     with pytest.raises(handoff.InvalidHandoff, match='plan sides mismatch'):
         handoff.build_handoff(replace(result, scene=scene))
+
+
+def test_handoff_rejects_relocated_side_even_if_its_vector_is_unchanged(tmp_path):
+    result = batch(tmp_path)
+    first = result.scene.plans[0]
+    plan = first.plan
+    edge = plan.boundary_lines[1]
+    shifted = replace(edge, start=(edge.start[0] + 2, edge.start[1]),
+                      end=(edge.end[0] + 2, edge.end[1]))
+    damaged = replace(plan, boundary_lines=[plan.boundary_lines[0], shifted, *plan.boundary_lines[2:]])
+    scene = drawing.SceneResult((replace(first, plan=damaged),) + result.scene.plans[1:], ())
+    with pytest.raises(handoff.InvalidHandoff, match='plan sides mismatch'):
+        handoff.build_handoff(replace(result, scene=scene))

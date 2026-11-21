@@ -114,15 +114,25 @@ class PlannedDescription:
 
 
 def _shape_matches(plan: DrawPlan, item: DescriptionItem) -> bool:
-    """Reject legacy analytic closure or an artificial closing edge."""
+    """Reject modified vectors or a break moved away from the end of the chain.
+
+    The legacy planner can relocate an unclosed gap into an interior corner
+    while preserving every vector. That moves later sides relative to POB and
+    cannot establish their original document positions in a shared scene.
+    """
     if len(plan.boundary_lines) != len(item.data.segments):
         return False
+    expected_start = plan.pob
     for segment, edge in zip(item.data.segments, plan.boundary_lines):
+        start_error = math.dist(expected_start, edge.start)
+        if not math.isfinite(start_error) or start_error > 1e-6:
+            return False
         dx, dy = segment.vector
         error = math.hypot(edge.end[0] - edge.start[0] - dx,
                            edge.end[1] - edge.start[1] - dy)
         if not math.isfinite(error) or error > 1e-6:
             return False
+        expected_start = edge.end
     return True
 
 

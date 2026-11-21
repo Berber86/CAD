@@ -164,7 +164,10 @@ def save_result(pdf: str | Path, context: Mapping[str, Any], result: ParseResult
            "items": _serialized_items(result.items), "pages": list(result.pages),
            "unparsed_pages": list(result.unparsed_pages), "complete": result.complete,
            "attempts": attempts, "selected_attempt": result.selected_attempt,
-           "selection": result.selection, "error": result.error}
+           "selection": result.selection, "error": result.error,
+           "comparison": ({"status": result.comparison.status,
+                           "attempt_indices": list(result.comparison.attempt_indices),
+                           "pages": list(result.comparison.pages)} if result.comparison else None)}
     try:
         with file_metadata._LOCK:
             history = _load(target)

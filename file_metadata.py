@@ -142,12 +142,17 @@ def _digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def record(path: str | Path, observations: Mapping[str, Any], *, digest: str = "") -> dict[str, list[dict[str, str]]]:
+def record(path: str | Path, observations: Mapping[str, Any], *, digest: str = "",
+           expected_digest: str | None = None) -> dict[str, list[dict[str, str]]]:
     """Merge evidence into a document passport; sync matching manifest entry only."""
     path = Path(path)
     if not path.is_file():
+        if expected_digest is not None:
+            raise ValueError("source file unavailable; observations not recorded")
         return combine(observations)
     with _LOCK:
+        if expected_digest is not None and _digest(path) != expected_digest:
+            raise ValueError("source file changed; observations not recorded")
         passport, raw = _passport(path)
         if "identity" in raw and (not isinstance(raw["identity"], dict) or
                                   any(not isinstance(raw["identity"].get(field, []), list) for field in FIELDS)):
@@ -196,7 +201,7 @@ def record(path: str | Path, observations: Mapping[str, Any], *, digest: str = "
         return raw["identity"]
 
 
-def record_outcome(path: str | Path, outcome: Any) -> dict[str, list[dict[str, str]]]:
+def record_outcome(path: str | Path, outcome: Any, *, expected_digest: str | None = None) -> dict[str, list[dict[str, str]]]:
     path = Path(path)
     entries = filename_observations(path)
     source = str(getattr(outcome, "source", "") or "").lower()
@@ -213,10 +218,13 @@ def record_outcome(path: str | Path, outcome: Any) -> dict[str, list[dict[str, s
         origin, method = "unknown", source
     digest = _digest(path) if path.is_file() else ""
     desc = outcome.data
-    desc._source_file_sha256 = digest
+    if expected_digest is not None and digest != expected_digest:
+        raise ValueError("source file changed; outcome not recorded")
     for field, attr in (("block", "block_number"), ("lot", "lot_number"), ("borough", "borough_or_city")):
         add(entries, field, observation(getattr(desc, attr, None), origin, method=method, file=path.name, digest=digest))
-    return record(path, entries, digest=digest)
+    result = record(path, entries, digest=digest, expected_digest=expected_digest)
+    desc._source_file_sha256 = digest
+    return result
 
 
 def intake_observations(block: int, lot: int, borough: str, neighbours: list[int],

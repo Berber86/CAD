@@ -321,3 +321,20 @@ def test_missing_street_name_does_not_discard_a_valid_partial_traverse():
     result = call(lambda *args: answer([value], complete=False))
     assert len(result.items) == 1 and len(result.items[0].data.segments) == 2
     assert result.items[0].data.main_street == '' and not result.complete
+
+
+@pytest.mark.parametrize('choice,status', [
+    (lambda *a: 1, 'selected'),
+    (lambda *a: None, 'invalid_selection'),
+    (lambda *a: (_ for _ in ()).throw(ValueError('secret')), 'invalid_selection'),
+    (lambda *a: (_ for _ in ()).throw(md.ImageSizeRejected()), 'size_rejected'),
+    (lambda *a: (_ for _ in ()).throw(TimeoutError('secret')), 'request_failed'),
+    (None, 'unavailable'),
+])
+def test_comparison_diagnostics_are_sanitized_and_describe_attempts(choice, status):
+    values = [answer([item('a'), {}]), answer([item('b'), {}]), answer([item('c'), {}])]
+    result = call(lambda *a: values.pop(0), choose=choice)
+    assert result.comparison.status == status
+    assert result.comparison.attempt_indices == (0, 1, 2)
+    assert result.comparison.pages == (() if choice is None else (1, 2))
+    assert 'secret' not in repr(result.comparison)

@@ -298,3 +298,23 @@ def test_unproven_corner_and_nominal_ties_are_not_anchors(tmp_path):
         parsed = md.read_response(answer([raw]), [1])
         assert len(parsed.items) == 1
         assert runtime.anchor_for(tmp_path / 'our.pdf', parsed.items[0]) is None
+
+
+def test_changed_pdf_after_parse_never_assigns_old_ai_observations_to_new_file(tmp_path, monkeypatch):
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 2)
+    original = pipeline.parse_pdf
+    def parse_then_replace(*args, **kwargs):
+        result = original(*args, **kwargs)
+        pdf.write_bytes(b'replaced PDF')
+        return result
+    monkeypatch.setattr(pipeline, 'parse_pdf', parse_then_replace)
+    target = runtime.ResolvedTarget('hydra', 'grok', 'https://example.test', 'test', 10)
+    batch = runtime.run_batch([runtime.FileJob(pdf, True)], config(), target=target,
+                              search_api_key='key', search_send=searcher, choose=None,
+                              send=lambda *a: answer([described('5', 55)]))
+    assert len(batch.scene.plans) == 1
+    assert not pdf.with_suffix('.json').exists()
+    assert batch.files[0].result.parse.items[0].data._source_file_sha256 == ''
+    sidecar = json.loads((tmp_path / (pdf.name + '.multi-parse.json')).read_text())
+    assert all(run.get('error') != 'metadata_unavailable' for run in sidecar['runs'])

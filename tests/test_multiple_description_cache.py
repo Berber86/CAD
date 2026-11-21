@@ -142,3 +142,18 @@ def test_cache_fingerprints_exact_model_and_selector_instructions(tmp_path):
     assert ctx['comparison_instruction_sha256'] == hashlib.sha256(md.COMPARISON_INSTRUCTION.encode()).hexdigest()
     cache.save_result(pdf, ctx, parse(), portal_lot=None)
     assert cache.load_result(pdf, context(pdf, comparison_instruction='different comparison')) is None
+
+
+def test_comparison_failure_is_recorded_without_exception_details(tmp_path):
+    pdf = tmp_path / 'test.pdf'
+    pdf.write_bytes(b'pdf')
+    result = md.parse_pages(ON, pages(2), image_limit=10, filename_lot='6', portal_lot=None,
+                            search_complete=True, send=lambda *a: answer([item(), {}]),
+                            choose=lambda *a: (_ for _ in ()).throw(TimeoutError('secret-response')))
+    cache.save_result(pdf, context(pdf), result, portal_lot=None)
+    content = cache.diagnostics_path(pdf).read_text()
+    run = json.loads(content)['runs'][-1]
+    assert run['comparison'] == {'status': 'request_failed', 'attempt_indices': [0, 1, 2], 'pages': [1, 2]}
+    assert run['context']['provider'] == 'hydra' and run['context']['model'] == 'grok-4.7'
+    assert run['selected_attempt'] == 0 and 'secret-response' not in content
+    assert cache.load_result(pdf, context(pdf)) is not None

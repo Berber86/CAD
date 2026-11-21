@@ -133,3 +133,24 @@ def test_gui_scene_draft_and_all_main_plans_draw_in_fake_autocad(gui, tmp_path, 
     all_texts = [t.TextString for t in doc.ModelSpace.texts]
     assert all_texts.count('LOT 6') == 2 and all_texts.count('LOT 5') == 2
     assert len(drafts) == 2 and len(app._scene_plans()) == 4
+
+
+def test_multi_preview_includes_street_extent_and_counterclockwise_arc(gui, tmp_path):
+    import math
+    from types import SimpleNamespace
+    from acad_builder import ArcItem, LineItem
+    app, _, view = install(gui, tmp_path)
+    original = view.drawable[0].plan
+    plan = replace(original, lines=[LineItem((0, 0), (500, 0), 'main-street-row-1')],
+                   arcs=[ArcItem((100, 100), 10, 3 * math.pi / 2, math.pi / 2)])
+    app._multi_scene_handoff = SimpleNamespace(drawable=[SimpleNamespace(plan=plan)])
+    canvas = app.preview_canvas
+    canvas.delete('all')
+    app._draw_multi_preview_canvas(canvas, 460, 280)
+    cx, cy, scale, width, height = app._last_world_transform
+    assert 34 <= width / 2 + (500 - cx) * scale <= width - 34
+    arcs = [v for v in canvas.items if v[0] == 'arc']
+    assert len(arcs) == 1
+    assert arcs[0][2]['start'] == pytest.approx(270)
+    assert arcs[0][2]['extent'] == pytest.approx(180)
+    assert arcs[0][2]['style'] == 'arc'

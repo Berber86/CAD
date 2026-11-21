@@ -329,6 +329,10 @@ class _FakeCanvas(_Widget):
         self.items.append(("line", coords, dict(kwargs)))
         return len(self.items)
 
+    def create_arc(self, *coords, **kwargs):
+        self.items.append(("arc", coords, dict(kwargs)))
+        return len(self.items)
+
     def create_oval(self, *coords, **kwargs):
         self.items.append(("oval", coords, dict(kwargs)))
         return len(self.items)

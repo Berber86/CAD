@@ -7459,13 +7459,14 @@ class SurveyApp(ctk.CTk):
     def _draw_multi_preview_canvas(self, canvas: Any, width: int, height: int) -> None:
         """Draw exactly the planned chains, without a guessed origin or tie."""
         plans = [entry.plan for entry in self._multi_scene_handoff.drawable]
-        points = [pt for plan in plans for edge in plan.boundary_lines for pt in (edge.start, edge.end)]
-        if not points:
+        from multiple_description_drawing import _bounds
+        try:
+            left, bottom, right, top = _bounds(plans)
+        except ValueError:
             self._last_world_transform = None
             return
-        xs, ys = zip(*points)
-        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-        sx, sy = max(max(xs) - min(xs), 10.0), max(max(ys) - min(ys), 10.0)
+        cx, cy = (left + right) / 2, (bottom + top) / 2
+        sx, sy = max(right - left, 10.0), max(top - bottom, 10.0)
         zoom = max(0.6, min(10.0, float(self._canvas_zoom or 1.0)))
         scale = min(max((width - 68) / sx, 0.05), max((height - 68) / sy, 0.05)) * zoom
         self._last_world_transform = (cx, cy, scale, width, height)
@@ -7482,6 +7483,12 @@ class SurveyApp(ctk.CTk):
                 x1, y1 = screen(line.start)
                 x2, y2 = screen(line.end)
                 canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
+            for arc in plan.arcs:
+                x1, y1 = screen((arc.center[0] - arc.radius, arc.center[1] + arc.radius))
+                x2, y2 = screen((arc.center[0] + arc.radius, arc.center[1] - arc.radius))
+                canvas.create_arc(x1, y1, x2, y2, start=math.degrees(arc.start_angle),
+                                  extent=math.degrees((arc.end_angle - arc.start_angle) % (2 * math.pi)),
+                                  style="arc", outline=color, width=1.2)
             for text in plan.items:
                 kind = str(text.kind)
                 if not (kind in {"main-lot-label", "neighbor-label", "main-street", "cross-street",

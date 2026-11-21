@@ -1,5 +1,6 @@
 """Strict, offline caching for the experimental all-descriptions parser."""
 import json
+import hashlib
 
 import pytest
 
@@ -131,3 +132,13 @@ def test_partial_single_side_survives_cache_validation(tmp_path):
     cache.save_result(pdf, context(pdf), result, portal_lot=None)
     cached, _ = cache.load_result(pdf, context(pdf))
     assert not cached.complete and len(cached.items[0].data.segments) == 1
+
+
+def test_cache_fingerprints_exact_model_and_selector_instructions(tmp_path):
+    pdf = tmp_path / 'test.pdf'
+    pdf.write_bytes(b'pdf')
+    ctx = context(pdf)
+    assert ctx['instruction_sha256'] == hashlib.sha256(md.system_instruction().encode()).hexdigest()
+    assert ctx['comparison_instruction_sha256'] == hashlib.sha256(md.COMPARISON_INSTRUCTION.encode()).hexdigest()
+    cache.save_result(pdf, ctx, parse(), portal_lot=None)
+    assert cache.load_result(pdf, context(pdf, comparison_instruction='different comparison')) is None

@@ -198,12 +198,14 @@ def anchor_for(path: Path, item: DescriptionItem) -> drawing.Anchor | None:
     cross = ' '.join(str(desc.cross_street or '').upper().split())
     if not main or not cross:
         return None
-    if desc.distance_to_corner_ft > 1e-6 and desc.corner_to_pob_bearing is not None:
-        position = compute_pob_point(desc)
-    elif desc.cross_street_side_index is not None and desc.distance_to_corner_ft <= 1e-6:
-        position = (0.0, 0.0)
-    else:
+    tie = desc.corner_to_pob_bearing
+    if (desc.distance_to_corner_ft <= 1e-6 or tie is None or not tie.has_bearing
+            or tie.bearing_solved):
+        # A zero may also mean an absent tie, and a cross-street boundary does
+        # not prove that POB itself is at the intersection. Nominal or solved
+        # directions likewise cannot establish a shared coordinate frame.
         return None
+    position = compute_pob_point(desc)
     # Same-named streets, even in the same borough, do not establish that
     # separate PDFs refer to one physical intersection. Keep different source
     # documents apart until a stronger cross-document tie is available.

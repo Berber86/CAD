@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 import file_metadata
 from llm_parser import LegalDescription
 from multiple_description_parse import (
-    DescriptionItem, INSTRUCTION, PageImage, ParseResult, SCHEMA_VERSION, _items,
+    COMPARISON_INSTRUCTION, DescriptionItem, PageImage, ParseResult, SCHEMA_VERSION, _items, system_instruction,
 )
 
 SIDECAR_SCHEMA = "titlesurveyai.multiple_description_parse.v1"
@@ -32,8 +32,8 @@ def diagnostics_path(pdf: str | Path) -> Path:
 
 def cache_context(*, pdf_sha256: str, pages: Sequence[PageImage], image_settings: Mapping[str, Any],
                   provider: str, model: str, filename_lot: str | None, search_complete: bool,
-                  image_limit: int, candidate_pages: Sequence[int] | None = None, instruction: str = INSTRUCTION,
-                  response_format: str = SCHEMA_VERSION) -> dict[str, Any]:
+                  image_limit: int, candidate_pages: Sequence[int] | None = None, instruction: str | None = None,
+                  response_format: str = SCHEMA_VERSION, comparison_instruction: str = COMPARISON_INSTRUCTION) -> dict[str, Any]:
     """Compute the full request identity; portal context is intentionally excluded.
 
     Image hashes also cover the exact prepared images; image parameters and
@@ -49,7 +49,10 @@ def cache_context(*, pdf_sha256: str, pages: Sequence[PageImage], image_settings
         raise ValueError("invalid coverage or image limit")
     if filename_lot is not None and not isinstance(filename_lot, str):
         raise ValueError("invalid filename lot")
-    if not isinstance(instruction, str) or not instruction or not isinstance(response_format, str) or not response_format:
+    if instruction is None:
+        instruction = system_instruction()
+    if (not isinstance(instruction, str) or not instruction or not isinstance(response_format, str) or not response_format
+            or not isinstance(comparison_instruction, str) or not comparison_instruction):
         raise ValueError("instruction and response format are required")
     if not isinstance(image_settings, Mapping):
         raise ValueError("image settings are required")
@@ -71,7 +74,9 @@ def cache_context(*, pdf_sha256: str, pages: Sequence[PageImage], image_settings
             "image_sha256": [hashlib.sha256(p.data_url.encode('utf-8')).hexdigest() for p in pages],
             "image_settings": settings, "provider": provider, "model": model,
             "filename_lot": filename_lot, "search_complete": search_complete,
-            "image_limit": image_limit, "instruction": instruction, "response_format": response_format,
+            "image_limit": image_limit, "instruction_sha256": hashlib.sha256(instruction.encode('utf-8')).hexdigest(),
+            "response_format": response_format,
+            "comparison_instruction_sha256": hashlib.sha256(comparison_instruction.encode('utf-8')).hexdigest(),
             "description_schema_sha256": hashlib.sha256(json.dumps(
                 LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
                 separators=(',', ':')).encode('utf-8')).hexdigest()}

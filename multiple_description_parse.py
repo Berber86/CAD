@@ -20,7 +20,7 @@ from pydantic import model_validator
 MAX_IMAGES = 50
 MAX_PARSE_CALLS = 4
 MAX_ORDINARY_FAILURES = 3
-SCHEMA_VERSION = "multiple-legal-descriptions-v2"
+SCHEMA_VERSION = "multiple-legal-descriptions-v3"
 INSTRUCTION = (
     "Read all supplied whole PDF pages. Return every separate land boundary "
     "description as a separate item in document order, including repeated "
@@ -28,8 +28,32 @@ INSTRUCTION = (
     "together and in order. Lot identifiers from the filename and portal are "
     "context only, not a reason to exclude a description. Do not invent "
     "unreadable sides or claim a cut-off description is complete. Return JSON "
-    "with descriptions (each item: complete, data) and complete (boolean)."
+    "with descriptions (each item: complete, data) and complete (boolean). "
+    "For corner_to_pob_bearing give a bearing only when the document explicitly "
+    "states that bearing from the intersection to POB; otherwise use null. "
+    "Do not calculate or infer this bearing from a frontage or from a word direction."
 )
+
+
+COMPARISON_INSTRUCTION = (
+    'Compare the candidate parses against the supplied whole PDF pages. '
+    'Select one candidate only, do not combine them. Each candidate lists the pages '
+    'it originally received. If unable to decide, return selected as null. '
+    'Return only JSON {"selected": <zero-based candidate index or null>}.'
+)
+
+
+def system_instruction() -> str:
+    """Exact static parsing prompt; changes invalidate the diagnostic cache."""
+    schema_data = LegalDescription.model_json_schema()
+    schema_data['properties']['corner_to_pob_bearing']['description'] = (
+        'Bearing from intersection to POB only if explicitly stated in the document; otherwise null. '
+        'Never infer from frontage or a word direction.'
+    )
+    schema = json.dumps(schema_data, ensure_ascii=False, separators=(',', ':'))
+    return (INSTRUCTION + '\nEach item data must conform to this JSON schema: ' + schema +
+            '\nUse exactly the keys descriptions and complete at the top level, and exactly '
+            'the keys complete and data for each item. Return JSON only.')
 
 
 class ParseDisabled(RuntimeError):
@@ -99,7 +123,10 @@ def _validated_segment(raw: Any) -> Segment:
 
 
 def _validated_description(model: type[LegalDescription], raw: Any) -> LegalDescription:
-    description = model.model_validate(raw)
+    # A legible traversal may have no readable street name. This is an empty
+    # metadata field, not an inferred street or a reason to discard sides.
+    normalized_raw = {"main_street": "", **raw} if isinstance(raw, dict) else raw
+    description = model.model_validate(normalized_raw)
     # The legacy model derives a tie from the traverse when none was supplied.
     # In this workflow such an inferred value is not a confirmed intersection:
     # never turn that default into an apparent relative position or cache it as
@@ -224,7 +251,10 @@ def _closure_score(attempt: Attempt) -> tuple[int, float]:
     """More measurable complete contours first, then smaller worst error."""
     closures = []
     for item in attempt.items:
-        if not item.complete or len(item.data.segments) < 3:
+        if (not item.complete or len(item.data.segments) < 3
+                or any(not segment.has_bearing or segment.bearing_solved for segment in item.data.segments)):
+            # A nominal/closure-derived direction cannot establish a measured
+            # misclosure. In particular, unknown must never rank as zero.
             continue
         vectors = [segment.vector for segment in item.data.segments]
         distance = math.hypot(sum(v[0] for v in vectors), sum(v[1] for v in vectors))
@@ -344,7 +374,9 @@ def parse_pages(
         check(current_job)
         if chosen is None:
             chosen = max(tied, key=lambda i: _closure_score(attempts[i]))
-            selection = "closure_fallback"
+            best_score = _closure_score(attempts[chosen])
+            selection = ("closure_fallback_uncertain" if sum(_closure_score(attempts[i]) == best_score for i in tied) > 1
+                         else "closure_fallback")
     else:
         chosen = tied[0]
     selected_attempt = attempts[chosen]

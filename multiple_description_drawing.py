@@ -1,8 +1,7 @@
-"""Experimental planning of known portions of incomplete boundary traverses.
+"""Experimental multi-description scene and print-draft planning.
 
-Not connected to the application's scene or print-draft workflow yet. No COM
-calls occur here. AutoCAD drawing uses the explicit open_traverse flag so an
-incomplete description is never silently closed, even in polyline mode.
+The GUI uses these helpers only behind the disabled-by-default developer flag.
+No COM calls occur here; open_traverse prevents silently closing partial sides.
 """
 from __future__ import annotations
 
@@ -180,24 +179,72 @@ def _bounds(plans: Sequence[DrawPlan]) -> tuple[float, float, float, float]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _remove_exact_shared_streets(plans: list[DrawPlan]) -> list[DrawPlan]:
-    """Remove only identical auxiliary streets in an established common group.
+def _street_family(kind: str) -> str | None:
+    if kind.startswith('main-street-row-'):
+        return 'main'
+    if kind.startswith('cross-street-row'):
+        return 'cross'
+    return None
 
-    Property boundaries, lot labels, and dimensions are never deduplicated.
-    Partially overlapping lines are left untouched rather than changed.
+
+def _uncovered_street_parts(line: LineItem, previous: Sequence[LineItem]) -> list[LineItem]:
+    """Subtract collinear same-street coverage without extending any line.
+
+    Tight absolute tolerances deliberately leave questionable overlaps alone.
+    Property boundaries are never inputs. A row tie remains intact because the
+    common draft uses its original endpoints to establish the intersection.
     """
-    seen_lines: set[tuple[Any, ...]] = set()
+    if line.kind == 'main-street-row-tie':
+        return [line]
+    dx, dy = line.end[0] - line.start[0], line.end[1] - line.start[1]
+    length = math.hypot(dx, dy)
+    family = _street_family(line.kind)
+    if family is None or length <= 1e-9:
+        return [line]
+    ux, uy = dx / length, dy / length
+    intervals = [(0.0, length)]
+    for other in previous:
+        if _street_family(other.kind) != family:
+            continue
+        rel = [(p[0] - line.start[0], p[1] - line.start[1]) for p in (other.start, other.end)]
+        if any(abs(x * uy - y * ux) > 1e-8 for x, y in rel):
+            continue
+        lo, hi = sorted(x * ux + y * uy for x, y in rel)
+        new = []
+        for a, b in intervals:
+            if hi <= a or lo >= b:
+                new.append((a, b))
+            else:
+                if lo > a + 1e-9:
+                    new.append((a, min(lo, b)))
+                if hi < b - 1e-9:
+                    new.append((max(hi, a), b))
+        intervals = new
+    def point(t: float) -> tuple[float, float]:
+        if t == 0.0:
+            return line.start
+        if t == length:
+            return line.end
+        return (line.start[0] + ux * t, line.start[1] + uy * t)
+    return [replace(line, start=point(a), end=point(b)) for a, b in intervals if b - a > 1e-9]
+
+
+def _remove_exact_shared_streets(plans: list[DrawPlan]) -> list[DrawPlan]:
+    """Deduplicate safe auxiliary street coverage in one confirmed group.
+
+    Never modify property boundaries, dimensions or tie endpoints. Identical or
+    partially overlapping street extensions are clipped only when collinear and
+    assigned to the same main/cross street family.
+    """
+    previous_lines: list[LineItem] = []
     seen_texts: set[tuple[str, str]] = set()
     output: list[DrawPlan] = []
     for plan in plans:
         lines = []
         for line in plan.lines:
-            ends = sorted(((round(line.start[0], 6), round(line.start[1], 6)),
-                           (round(line.end[0], 6), round(line.end[1], 6))))
-            key = (ends[0], ends[1])
-            if key not in seen_lines:
-                seen_lines.add(key)
-                lines.append(line)
+            parts = _uncovered_street_parts(line, previous_lines)
+            lines.extend(parts)
+            previous_lines.extend(parts)
         texts = []
         for text in plan.items:
             if text.kind in {'main-street', 'cross-street', 'main-street-former', 'cross-street-former'}:
@@ -290,7 +337,7 @@ def draft_row_group(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> Draft
 
     This limited helper is intentionally fail-closed: mixed/unknown groups,
     incomplete contours, corners and incompatible ties are not approximated.
-    The GUI and general multi-group print workflow are not connected yet.
+    The GUI uses it through the multi-group print workflow under the flag.
     """
     from acad_builder import make_print_draft
     ours = [entry for entry in scene.plans if entry.is_main]

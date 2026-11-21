@@ -7,6 +7,7 @@ import pytest
 
 import llm_parser as lp
 import multiple_description_pipeline as pipeline
+import multiple_description_parse as md
 import multiple_description_runtime as runtime
 from test_legal_page_search import make_pdf, response
 from test_multiple_description_parse import ON, answer, item
@@ -284,3 +285,16 @@ def test_cancel_during_catalog_lookup_stops_before_resolving_model_target(monkey
         runtime.prepare_runtime(cfg, selected_provider='hydra', selected_model='glm-5.2',
                                 catalog_fetch=catalog_fetch, current=lambda: state['active'])
     assert targets == ['routerai']
+
+
+def test_unproven_corner_and_nominal_ties_are_not_anchors(tmp_path):
+    for raw in [described('corner', 0), described('nominal', 55), described('solved', 55)]:
+        if raw['data']['distance_to_corner_ft'] == 0:
+            raw['data']['cross_street_side_index'] = 1
+        elif raw['data']['lot_number'] == 'nominal':
+            raw['data']['corner_to_pob_bearing']['has_bearing'] = False
+        else:
+            raw['data']['corner_to_pob_bearing']['bearing_solved'] = True
+        parsed = md.read_response(answer([raw]), [1])
+        assert len(parsed.items) == 1
+        assert runtime.anchor_for(tmp_path / 'our.pdf', parsed.items[0]) is None

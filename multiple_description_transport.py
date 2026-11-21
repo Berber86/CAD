@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
-from llm_parser import LegalDescription
-from multiple_description_parse import Attempt, INSTRUCTION, ImageSizeRejected, PageImage
+from multiple_description_parse import (Attempt, COMPARISON_INSTRUCTION, ImageSizeRejected, PageImage,
+                                        system_instruction)
 
 
 def _images(pages: Sequence[PageImage]) -> list[dict[str, Any]]:
@@ -60,10 +60,7 @@ def create_client(target: Mapping[str, str], *, timeout: float = 180) -> Any:
 
 def make_sender(client: Any, model: str):
     """Return the parser's ``send`` callback, one request per invocation."""
-    schema = json.dumps(LegalDescription.model_json_schema(), ensure_ascii=False, separators=(',', ':'))
-    system = (INSTRUCTION + '\nEach item data must conform to this JSON schema: ' + schema +
-              '\nUse exactly the keys descriptions and complete at the top level, and exactly '
-              'the keys complete and data for each item. Return JSON only.')
+    system = system_instruction()
 
     def send(pages: Sequence[PageImage], context: Mapping[str, str | None]) -> str:
         # Only the explicitly agreed file/portal lot context is sent, not search
@@ -83,10 +80,7 @@ def make_selector(client: Any, model: str):
                      'descriptions': [{'complete': item.complete, 'data': item.data.model_dump(mode='json')}
                                       for item in attempt.items]}
                     for idx, attempt in enumerate(attempts)]
-        instruction = ('Compare the candidate parses against the supplied whole PDF pages. '
-                       'Select one candidate only, do not combine them. Each candidate lists the pages '
-                       'it originally received. If unable to decide, return selected as null. '
-                       'Return only JSON {"selected": <zero-based candidate index or null>}.')
+        instruction = COMPARISON_INSTRUCTION
         content = [{'type': 'text', 'text': json.dumps(variants, ensure_ascii=False)}, *_images(pages)]
         raw = _call(client, model, [{'role': 'system', 'content': instruction},
                                     {'role': 'user', 'content': content}])

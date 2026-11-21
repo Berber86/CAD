@@ -318,3 +318,31 @@ def test_unlocated_full_contour_has_no_guessed_street_intersection():
     assert any(t.kind == 'main-lot-label' and t.text == 'LOT 6' for t in entry.plan.items)
     for edge, segment in zip(entry.plan.boundary_lines, desc.segments):
         assert _vector(edge) == pytest.approx(segment.vector, abs=1e-6)
+
+
+def test_shared_street_extensions_clip_overlap_but_preserve_ties_and_other_lines():
+    line = ab.LineItem
+    previous = [line((2, 0), (8, 0), 'main-street-row-1')]
+    parts = drawing._uncovered_street_parts(line((10, 0), (0, 0), 'main-street-row-2'), previous)
+    assert [(p.start, p.end) for p in parts] == [((10, 0), (8, 0)), ((2, 0), (0, 0))]
+    tie = line((0, 0), (10, 0), 'main-street-row-tie')
+    assert drawing._uncovered_street_parts(tie, previous) == [tie]
+    for different in [line((0, 1e-5), (10, 1e-5), 'main-street-row-1'),
+                      line((0, 0), (10, 0), 'cross-street-row'),
+                      line((0, 0), (10, 0), 'custom')]:
+        assert drawing._uncovered_street_parts(different, previous) == [different]
+
+
+def test_shared_equal_ties_remain_available_for_common_draft():
+    from pathlib import Path
+    model, _ = llm_parser.parse_with_regex(
+        Path('tests/data/lot72_render_e600.txt').read_text(encoding='utf-8'), auto_repair_typos=False)
+    cfg = llm_parser.load_config()
+    builder = ab.AcadBuilder(cfg)
+    pos = ab.compute_pob_point(model)
+    records = [record('OUR 6.pdf', True, parse.DescriptionItem(model, True), 'intersection', pos)
+               for _ in range(2)]
+    scene = drawing.plan_scene(builder, records)
+    assert all(any(line.kind == 'main-street-row-tie' for line in entry.plan.lines) for entry in scene.plans)
+    result = drawing.draft_row_group(scene, builder_cfg=cfg)
+    assert result.diagnostic is None and len(result.plans) == 2

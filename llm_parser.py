@@ -204,6 +204,7 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "multiple_description_search": {"enabled": False},
     "api": {
         "provider": "hydra",
         "api_key": "",

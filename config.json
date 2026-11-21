@@ -1,4 +1,7 @@
 {
+  "multiple_description_search": {
+    "enabled": false
+  },
   "api": {
     "provider": "hydra",
     "api_key": "",

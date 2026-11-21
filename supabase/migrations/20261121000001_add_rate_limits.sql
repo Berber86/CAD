@@ -25,8 +25,8 @@ declare cnt int;
 begin
   select count(*) into cnt from public.app_logs
    where install_id = new.install_id and created_at > now() - interval '1 hour';
-  if cnt >= 200 then
-    raise exception 'rate limit: too many app_logs from this install_id (200/hour)';
+  if cnt >= 2000 then
+    raise exception 'rate limit: too many app_logs from this install_id (2000/hour)'; end if;
   end if;
   return new;
 end;

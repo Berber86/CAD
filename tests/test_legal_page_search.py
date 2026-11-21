@@ -372,3 +372,19 @@ def test_real_transport_format_with_mocked_http_and_sanitized_errors(tmp_path, m
     assert result['attempts'][-1]['usage'] == {'input_tokens': 100}
     recorded = search.diagnostics_path(pdf).read_text()
     assert 'private server response' not in recorded and 'secret' not in recorded
+
+
+def test_isolated_live_test_temporarily_enables_only_the_runner(tmp_path, monkeypatch, capsys):
+    from tools import legal_page_search_stage2 as cli
+    pdf = tmp_path / 'doc.pdf'
+    config = {'multiple_description_search': {'enabled': False}}
+    monkeypatch.setattr(cli.lp, 'load_config', lambda: config)
+    monkeypatch.setattr(cli.common, 'load_provider_key', lambda *_: 'secret')
+    def fake(path, passed_config, *, api_key):
+        assert search.enabled(passed_config) and not search.enabled(config)
+        return {'pdf_pages': 1, 'covered_pages': 1, 'uncovered_pages': 0,
+                'coverage_complete': True, 'candidate_pages': [1]}
+    monkeypatch.setattr(cli.search, 'search_pdf', fake)
+    assert cli.main([str(pdf), '--live', '--isolated-test']) == 0
+    assert not search.enabled(config)
+    assert 'secret' not in capsys.readouterr().out

@@ -333,3 +333,20 @@ def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
         yield transport.make_sender(client, target.model), transport.make_selector(client, target.model)
     finally:
         client.close()
+
+
+def restore_cached_batch(job: FileJob, cfg: Mapping[str, Any], *, scale: float = 16.0) -> BatchResult:
+    """Explicitly restore one complete historic parse; never call a provider."""
+    loaded = cache.load_latest_offline(job.path)
+    if loaded is None:
+        raise RuntimeUnavailable('offline_cache_unavailable')
+    parsed, context = loaded
+    sources = [drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item))
+               for item in parsed.items]
+    scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
+    if file_metadata._digest(job.path) != context['pdf_sha256']:
+        raise RuntimeUnavailable('offline_cache_unavailable')
+    result = pipeline.PipelineResult(search={'pdf_sha256': context['pdf_sha256']}, parse=parsed,
+                                     status='parsed', cached=True, original_portal_lot=None,
+                                     current_portal_lot=None, render_errors=())
+    return BatchResult((FileResult(job, result, 'parsed'),), scene, context['provider'], context['model'])

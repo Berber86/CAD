@@ -171,3 +171,35 @@ def test_failed_attempt_history_has_only_safe_category_and_timing(tmp_path):
     attempts = json.loads(text)['runs'][-1]['attempts']
     assert all(a['failure_kind'] == 'timeout' and a['elapsed_seconds'] >= 0 for a in attempts)
     assert 'SECRET' not in text
+
+
+def test_offline_restore_rejects_changed_or_incompatible_history(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    ctx = context(pdf)
+    result = parse()
+    cache.save_result(pdf, ctx, result, portal_lot=None)
+    original = cache.diagnostics_path(pdf).read_bytes()
+    found = cache.load_latest_offline(pdf)
+    assert found and found[0].complete and found[1] == ctx
+    assert cache.diagnostics_path(pdf).read_bytes() == original
+    pdf.write_bytes(b'changed')
+    assert cache.load_latest_offline(pdf) is None
+    pdf.write_bytes(b'original')
+    bad = json.loads(original)
+    bad['runs'][0]['context']['instruction_sha256'] = '0' * 64
+    cache.diagnostics_path(pdf).write_text(json.dumps(bad))
+    assert cache.load_latest_offline(pdf) is None
+
+
+def test_offline_restore_rejects_incomplete_and_mismatched_filename(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    ctx = context(pdf)
+    result = parse(response=answer([item('5', complete=False)], complete=False))
+    cache.save_result(pdf, ctx, result, portal_lot=None)
+    assert cache.load_latest_offline(pdf) is None
+    other = tmp_path / 'OUR 7.pdf'
+    other.write_bytes(b'original')
+    cache.diagnostics_path(other).write_bytes(cache.diagnostics_path(pdf).read_bytes())
+    assert cache.load_latest_offline(other) is None

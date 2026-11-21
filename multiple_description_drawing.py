@@ -257,7 +257,8 @@ def _remove_exact_shared_streets(plans: list[DrawPlan]) -> list[DrawPlan]:
             previous_lines.extend(parts)
         texts = []
         for text in plan.items:
-            if text.kind in {'main-street', 'cross-street', 'main-street-former', 'cross-street-former'}:
+            if text.kind in {'main-street', 'cross-street', 'main-street-former', 'cross-street-former',
+                             'main-street-note', 'main-street-note-extra'}:
                 key = (text.kind, ' '.join(text.text.upper().split()))
                 if key in seen_texts:
                     continue
@@ -290,7 +291,14 @@ def _near_closed_complete(plan: DrawPlan, item: DescriptionItem) -> bool:
     if not item.complete or len(edges) < 3:
         return False
     gap = math.dist(edges[-1].end, edges[0].start)
-    return math.isfinite(gap) and gap <= ROUNDING_GAP_LIMIT_FT
+    if not math.isfinite(gap) or gap > ROUNDING_GAP_LIMIT_FT:
+        return False
+    try:
+        from shapely.geometry import Polygon
+        polygon = Polygon([edge.start for edge in edges])
+        return polygon.is_valid and polygon.area >= 0.5
+    except Exception:
+        return False
 
 
 def _decorate_exact_unlocated(builder: AcadBuilder, plan: DrawPlan, item: DescriptionItem) -> DrawPlan:
@@ -326,6 +334,41 @@ def _decorate_exact_unlocated(builder: AcadBuilder, plan: DrawPlan, item: Descri
     return replace(plan, vertices=points, items=items, arcs=arcs, warnings=warnings, ccw=area > 0)
 
 
+def _decorate_exact_anchored(builder: AcadBuilder, plan: DrawPlan, source: DescriptionSource) -> DrawPlan:
+    """Recover full annotations on a confirmed tie and exact near-closed sides."""
+    from acad_builder import compute_pob_point
+    desc = plan.description
+    if (not plan.open_traverse or not _near_closed_complete(plan, source.item)
+            or source.anchor is None or not source.anchor.group.startswith('confirmed-file:')
+            or desc.corner_to_pob_bearing is None
+            or math.dist(compute_pob_point(desc), source.anchor.pob) > 1e-5):
+        return plan
+    plan = _decorate_exact_unlocated(builder, plan, source.item)
+    if plan.is_neighbor:
+        return plan
+    front = desc.front_segment_index
+    if not isinstance(front, int) or isinstance(front, bool) or not 0 <= front < len(plan.boundary_lines):
+        return plan
+    points = [edge.start for edge in plan.boundary_lines]
+    try:
+        _, _, bands = builder._side_items(desc, points, plan.text_height, plan.ccw, [],
+                                          front_index=front, boundary_lines=plan.boundary_lines)
+        items, lines = builder._street_items(desc, points, plan.text_height, plan.ccw, [],
+                                              side_band_extra=bands, front_index=front,
+                                              boundary_lines=plan.boundary_lines)
+    except Exception:
+        return plan
+    ties = [line for line in lines if line.kind == 'main-street-row-tie']
+    if (len(ties) != 1 or math.dist(ties[0].start, (0, 0)) > ROUNDING_GAP_LIMIT_FT
+            or math.dist(ties[0].end, plan.pob) > ROUNDING_GAP_LIMIT_FT):
+        return plan
+    # POB is the end of the legal tie. The adjacent measured frontage endpoint
+    # may be separated from it by a rounding gap; do not change the boundary.
+    lines = [replace(line, start=(0.0, 0.0), end=plan.pob)
+             if line.kind == 'main-street-row-tie' else line for line in lines]
+    return replace(plan, items=plan.items + items, lines=lines)
+
+
 def _unlocated_frontage_items(builder: AcadBuilder, plan: DrawPlan, item: DescriptionItem) -> list[TextItem]:
     """Label a documented frontage without inventing a street intersection.
 
@@ -349,8 +392,10 @@ def _unlocated_frontage_items(builder: AcadBuilder, plan: DrawPlan, item: Descri
     # the cross street from its input to avoid even computing a guessed corner.
     local_desc = desc.model_copy(update={'cross_street': None, 'cross_street_former': None})
     try:
+        _, _, bands = builder._side_items(local_desc, points, plan.text_height, area > 0,
+                                          [], front_index=front, boundary_lines=edges)
         items, _ = builder._street_items(local_desc, points, plan.text_height, area > 0,
-                                        [], front_index=front, boundary_lines=edges)
+                                        [], side_band_extra=bands, front_index=front, boundary_lines=edges)
     except Exception:
         # A label/layout failure must not hide an otherwise usable contour.
         return []
@@ -384,6 +429,8 @@ def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, sc
         except Exception:  # A damaged description must not hide other results.
             failures.append(PlanFailure(Path(source.source), index, 'planning_failed'))
             continue
+        if anchor is not None:
+            plan = _decorate_exact_anchored(builder, plan, source)
         if anchor is None:
             # The legacy builder derives a hypothetical intersection even when
             # its input lacks an established tie. An isolated parcel must not
@@ -433,7 +480,10 @@ def draft_row_group(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> Draft
     if scene.failures or len(ours) < 2:
         return DraftSceneResult((), 'unsupported_scene')
     groups = {entry.group for entry in ours}
-    if (len(groups) != 1 or None in groups or any(not e.placement_known or e.plan.open_traverse for e in ours)):
+    if (len(groups) != 1 or None in groups or any(
+            not e.placement_known or (e.plan.open_traverse and not (
+                e.diagnostic == 'exact_sides_fallback' and len(e.plan.boundary_lines) >= 3
+                and e.plan.closure.distance <= ROUNDING_GAP_LIMIT_FT)) for e in ours)):
         return DraftSceneResult((), 'unsupported_scene')
     streets = {(' '.join(str(e.plan.description.main_street or '').upper().split()),
                 ' '.join(str(e.plan.description.cross_street or '').upper().split())) for e in ours}
@@ -485,7 +535,8 @@ def draft_row_group(scene: SceneResult, *, builder_cfg: dict[str, Any]) -> Draft
             continue
         label_items: list[TextItem] = []
         for text in draft.items:
-            if text.kind.startswith('side-') or text.kind.startswith('party-wall-'):
+            if (text.kind.startswith('side-') or text.kind.startswith('party-wall-')
+                    or text.kind.startswith('angle-')):
                 label_items.append(text)
             elif text.kind == 'cross-street-distance':
                 end = (ties[index].end[0] + 1000.0, ties[index].end[1])

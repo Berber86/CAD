@@ -249,3 +249,40 @@ def record_scene_diagnostics(pdf: str | Path, pdf_sha256: str, *, is_main: bool,
             file_metadata._write_json(target, history)
     except OSError as exc:
         raise CacheError('Cannot save scene diagnostics.') from exc
+
+
+def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] | None:
+    """Restore a compatible complete snapshot without a network/key lookup.
+
+    This is an explicit historical restore, not a fresh parse or current-model
+    cache hit. PDF digest, filename identity, prompt, schema and the original
+    cache fingerprint must all match. No sidecars are written.
+    """
+    import lot_identity
+    from multiple_description_parse import SCHEMA_VERSION
+    path = Path(pdf)
+    digest = file_metadata._digest(path)
+    with file_metadata._LOCK:
+        history = _load(diagnostics_path(path))
+    schema_hash = hashlib.sha256(json.dumps(
+        LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    for run in reversed(history['runs']):
+        if not isinstance(run, dict) or not isinstance(run.get('context'), dict):
+            continue
+        ctx = run['context']
+        if (ctx.get('pdf_sha256') != digest or ctx.get('filename_lot') != lot_identity.lot_from_filename(path)
+                or ctx.get('response_format') != SCHEMA_VERSION
+                or ctx.get('instruction_sha256') != hashlib.sha256(system_instruction().encode('utf-8')).hexdigest()
+                or ctx.get('comparison_instruction_sha256') != hashlib.sha256(COMPARISON_INSTRUCTION.encode('utf-8')).hexdigest()
+                or ctx.get('description_schema_sha256') != schema_hash
+                or not isinstance(ctx.get('provider'), str) or not ctx['provider']
+                or not isinstance(ctx.get('model'), str) or not ctx['model']):
+            continue
+        try:
+            restored = load_result(path, ctx)
+        except (CacheError, ValueError, TypeError):
+            continue
+        if restored is not None and restored[0].complete and restored[0].items:
+            return restored[0], dict(ctx)
+    return None

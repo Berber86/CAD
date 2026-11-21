@@ -1930,6 +1930,13 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11), text_color=THEME["warn"], anchor="w", justify="left", wraplength=320,
         ).grid(row=7, column=0, sticky="ew", pady=(4, 0))
 
+        self.multi_cache_restore_button = ctk.CTkButton(
+            self.pdf_mode_card, text="Восстановить из кэша · без запросов", height=30,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._restore_multi_cache,
+        )
+        self.multi_cache_restore_button.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+
         # Пустой режим «📷 Фото» тоже должен позволять выбрать первый файл.
         self.photo_empty_card = ctk.CTkFrame(input_frame, fg_color="transparent")
         self.photo_empty_card.grid(row=2, column=0, rowspan=2, sticky="new", padx=16)
@@ -8687,6 +8694,71 @@ class SurveyApp(ctk.CTk):
                                args=(jobs, signature, cfg, provider, model, key, secret,
                                      self._current_scale(), force))
 
+    def _restore_multi_cache(self) -> None:
+        """Select one our PDF and restore its complete cached parse, offline."""
+        if (self._busy or getattr(self, "_source_role_dialog", None) is not None
+                or self.pending_conflict is not None or self.pending_doubt is not None):
+            return
+        if not self._multi_pdf_enabled():
+            self._set_status("Сначала включите «Тест: все описания в PDF».", warn=True)
+            return
+        from tkinter import filedialog, messagebox
+        selected = filedialog.askopenfilename(
+            title="Выберите наш PDF для восстановления из локального кэша — без запросов",
+            filetypes=[("PDF", "*.pdf")], parent=self)
+        if not selected:
+            return
+        if self._scene_plans() and not messagebox.askyesno(
+                "Заменить схему", "Восстановление заменит текущую схему. Продолжить?",
+                parent=self, default="no"):
+            return
+        items, errors = self._make_pdf_set_items([Path(selected)])
+        if len(items) != 1:
+            self._set_status("Не удалось открыть PDF для восстановления.", error=True)
+            return
+        items[0].is_main = True
+        self._clear_preview_scene()
+        self._reset_visual_sources()
+        self._visual_source_role = "set"
+        self.pdf_set = items
+        self.text_box.delete("1.0", "end")
+        self._refresh_text_counter()
+        self.source_mode_var.set("📄 PDF")
+        self.source_mode_switch.set("📄 PDF")
+        self._on_source_mode_changed()
+        self.pdf_label.configure(text="Набор PDF: 1 файл · восстановление из кэша", text_color=THEME["warn"])
+        from multiple_description_runtime import FileJob
+        job = FileJob(items[0].path, True)
+        signature = self._source_signature(mode="📄 PDF")
+        self._running_source_signature = signature
+        self._ready_source_signature = None
+        self._input_incomplete = True
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._select_result_tab("🧾 Журнал")
+        self._set_status("Восстановление локального кэша: без запросов к ИИ.", key=True)
+        self._start_background(self._multi_cache_worker,
+                               args=(job, signature, copy.deepcopy(self.config_data), self._current_scale()))
+
+    def _multi_cache_worker(self, job: Any, signature: Any, cfg: dict[str, Any], scale: float) -> None:
+        from multiple_description_runtime import restore_cached_batch
+        from multiple_description_handoff import build_handoff
+        post = self._worker_poster()
+        if not self._worker_is_current():
+            return
+        try:
+            batch = restore_cached_batch(job, cfg, scale=scale)
+            if not self._worker_is_current():
+                return
+            view = build_handoff(batch, expected_jobs=(job,))
+            post("multi_progress", f"Восстановлен предыдущий результат: {batch.provider} / {batch.model}. "
+                                   "Новых запросов не было; сверьте данные с PDF.")
+            post("multi_pdf_done", (view, signature))
+        except Exception:
+            if self._worker_is_current():
+                post("multi_cache_missing", None)
+
     def _multi_pdf_worker(self, jobs: Any, signature: Any, cfg: dict[str, Any], provider: str,
                           model: str, key: str | None, secret: str, scale: float, force: bool) -> None:
         from multiple_description_runtime import (prepare_runtime, provider_target, run_batch,
@@ -8760,6 +8832,47 @@ class SurveyApp(ctk.CTk):
             self._ready_source_signature = None
             self._input_incomplete = True
             self._set_status("Обработка PDF не завершена.")
+            return
+        # A pattern is only a proposal. The user must explicitly confirm the
+        # shared intersection and assumed direction before we alter placement.
+        from multiple_description_handoff import row_proposal, confirm_row
+        proposal = row_proposal(view)
+        if proposal is not None:
+            from tkinter import messagebox
+            question = (
+                f"В файле {proposal.source.name} два контура могут иметь общую сторону "
+                f"{proposal.shared_length:.2f} ft на {proposal.main_street}.\n\n"
+                f"Пересекающая улица указана как «{proposal.near_cross}» и «{proposal.far_cross}». "
+                f"Для схемы будет использовано «{proposal.near_cross}».\n"
+                f"Предлагаемая привязка от общего перекрёстка к точкам начала: "
+                f"{proposal.near_distance:.2f} и {proposal.far_distance:.2f} ft по "
+                f"{proposal.tie_label}. Направление восстановлено по сторонам, не прочитано из кэша. "
+                "Направление пересекающей улицы будет условно перпендикулярным.\n\n"
+                "Сверьте с PDF: это один и тот же перекрёсток и участки действительно соседние? "
+                "Построить предложенную схему?"
+            )
+            if messagebox.askyesno("Подтвердите взаимное положение", question, parent=self, default="no"):
+                try:
+                    confirmed = confirm_row(view, proposal, builder_cfg=self.config_data, scale=self._current_scale())
+                    self._install_multi_scene(confirmed)  # rechecks the source hash
+                    view = confirmed
+                    self._log_line("Взаимное расположение и общий перекрёсток подтверждены пользователем; "
+                                   "условное направление пересекающей улицы требует проверки.")
+                except (InvalidHandoff, ValueError):
+                    self._ready_source_signature = None
+                    self._input_incomplete = True
+                    self._set_status("Подтверждённое расположение не применено; повторите обработку PDF.", warn=True)
+                    return
+        # The confirmation dialog may have been open while a source changed.
+        try:
+            valid_sources = all(doc.pdf_sha256 is None or file_metadata._digest(doc.source) == doc.pdf_sha256
+                                for doc in view.documents)
+        except OSError:
+            valid_sources = False
+        if not valid_sources or signature != self._source_signature(mode="📄 PDF"):
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            self._set_status("PDF изменился; повторите обработку.", warn=True)
             return
         self._ready_source_signature = signature if view.drawable else None
         self._input_incomplete = not bool(view.drawable)
@@ -10741,6 +10854,11 @@ class SurveyApp(ctk.CTk):
             self._handle_pdf_set_done(payload)
         elif kind == "multi_pdf_done":
             self._handle_multi_pdf_done(*payload)
+        elif kind == "multi_cache_missing":
+            self._finish_busy()
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            self._set_status("Подходящий полный кэш не найден или PDF изменился. Запросы не отправлялись.", warn=True)
         elif kind == "feature_labeled":
             label_result, label_error, label_mode = payload
             self._finish_busy()
@@ -10764,6 +10882,7 @@ class SurveyApp(ctk.CTk):
         self.clear_neighbors_button.configure(state=state)
         self.load_pdf_button.configure(state=state)
         self.multi_pdf_mode_switch.configure(state=state)
+        self.multi_cache_restore_button.configure(state=state)
         self.pdf_set_edit_button.configure(state=state)
         self.pdf_set_report_button.configure(
             state=state if self._pdf_set_report_ready else "disabled"

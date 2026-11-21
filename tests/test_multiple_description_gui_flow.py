@@ -312,3 +312,116 @@ def test_unlocated_scene_warns_user_without_changing_cached_requests(gui, tmp_pa
     smoke._wait_for_gui_worker(app)
     assert calls['parse'] == 2 and calls['search'] == 2
     assert 'Без подтверждённой привязки: 4' in app.status_var.get()
+
+
+@pytest.mark.parametrize('accept', [True, False])
+def test_user_can_confirm_or_decline_deed_row_without_new_ai(gui, tmp_path, monkeypatch, accept):
+    from tkinter import messagebox
+    from test_multiple_description_drawing import deed_example_items
+    items = deed_example_items()
+    payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in items]
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=lambda *a: answer(payload))
+    prompts = []
+    def ask(title, question, **kwargs):
+        prompts.append((title, question, kwargs))
+        return accept
+    monkeypatch.setattr(messagebox, 'askyesno', ask)
+    our = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(our, 2)
+    jobs, errors = app._make_pdf_set_items([our])
+    assert not errors
+    jobs[0].is_main = True
+    app._submit_pdf_set(jobs, scene_mode='update', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 1 and calls['search'] == 1
+    assert len(prompts) == 1
+    assert all(s in prompts[0][1] for s in ['Lindberg Avenue', 'Lindbergh Avenue', '96.58',
+                                             '55.42', '100.11', 'условно перпендикулярным'])
+    view = app._multi_scene_handoff
+    assert [d.placement_known for d in view.drawable] == [accept, accept]
+    assert all(d.outcome.data.corner_to_pob_bearing is None for d in view.drawable)
+    assert view.drawable[1].outcome.data.cross_street == 'Lindbergh Avenue'
+    if accept:
+        from multiple_description_drawing import make_scene_print_drafts
+        draft = make_scene_print_drafts(view.scene, builder_cfg=app.config_data)
+        assert draft.diagnostic is None and len(draft.plans) == 2
+        assert any(t.kind == 'cross-street' for p in view.scene.plans for t in p.plan.items)
+    else:
+        assert 'размещены отдельно' in app.status_var.get()
+    assert app._ready_source_signature and not app._input_incomplete
+    assert calls['parse'] == 1 and calls['search'] == 1
+
+
+def test_source_changed_while_row_confirmation_open_disables_drawing(gui, tmp_path, monkeypatch):
+    from tkinter import messagebox
+    from test_multiple_description_drawing import deed_example_items
+    payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in deed_example_items()]
+    app, _ = setup_app(gui, monkeypatch, tmp_path, parse=lambda *a: answer(payload))
+    our = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(our, 2)
+    def mutate(*a, **k):
+        with our.open('ab') as file:
+            file.write(b'changed')
+        return False
+    monkeypatch.setattr(messagebox, 'askyesno', mutate)
+    jobs, _ = app._make_pdf_set_items([our])
+    jobs[0].is_main = True
+    app._submit_pdf_set(jobs, scene_mode='update', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    assert app._ready_source_signature is None and app._input_incomplete
+    assert 'изменился' in app.status_var.get()
+
+
+def test_explicit_cache_restore_is_offline_and_supports_user_confirmation(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog, messagebox
+    import file_metadata
+    import multiple_description_cache as cache
+    import multiple_description_parse as parse
+    from test_multiple_description_drawing import deed_example_items
+    from test_multiple_description_parse import pages
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    payload = [{'complete': i.complete, 'data': i.data.model_dump(mode='json')} for i in deed_example_items()]
+    parse_result = parse.parse_pages({'multiple_description_search': {'enabled': True}}, pages(2),
+                                     image_limit=50, filename_lot='6', portal_lot=None, search_complete=True,
+                                     send=lambda *a: answer(payload))
+    context = cache.cache_context(pdf_sha256=file_metadata._digest(pdf), pages=pages(2), image_settings={},
+                                  provider='openrouter', model='nvidia/nemotron-3.5-super-vl:free',
+                                  filename_lot='6', search_complete=True, image_limit=50)
+    cache.save_result(pdf, context, parse_result, portal_lot=None)
+    original_bytes = cache.diagnostics_path(pdf).read_bytes()
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime, 'prepare_runtime', lambda *a, **k: pytest.fail('network/key access'))
+    monkeypatch.setattr(runtime, 'open_runtime_callbacks', lambda *a, **k: pytest.fail('network access'))
+    monkeypatch.setattr(filedialog, 'askopenfilename', lambda **k: str(pdf))
+    prompts = []
+    monkeypatch.setattr(messagebox, 'askyesno', lambda title, question, **k: prompts.append(question) or True)
+    app._restore_multi_cache()
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == calls['search'] == 0
+    assert cache.diagnostics_path(pdf).read_bytes() == original_bytes
+    assert len(prompts) == 1 and 'Lindberg Avenue' in prompts[0]
+    assert app._ready_source_signature and not app._input_incomplete
+    assert len(app._scene_plans()) == 2
+    assert all(d.placement_known for d in app._multi_scene_handoff.drawable)
+    assert app._multi_scene_handoff.documents[0].cached
+    assert app._multi_scene_handoff.drawable[0].outcome.provider == 'openrouter'
+
+
+def test_offline_restore_missing_cache_never_falls_back_to_network(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    monkeypatch.setattr(filedialog, 'askopenfilename', lambda **k: str(pdf))
+    monkeypatch.setattr(runtime, 'prepare_runtime', lambda *a, **k: pytest.fail('network/key access'))
+    app._restore_multi_cache()
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == calls['search'] == 0
+    assert app._ready_source_signature is None and app._input_incomplete
+    assert not cache_path_exists(pdf)
+
+
+def cache_path_exists(pdf):
+    import multiple_description_cache as cache
+    return cache.diagnostics_path(pdf).exists()

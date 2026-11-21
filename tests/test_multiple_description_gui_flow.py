@@ -1,0 +1,218 @@
+"""End-to-end GUI orchestration with synthetic PDFs and mocked models/AutoCAD."""
+import contextlib
+import json
+import threading
+import types
+
+import pytest
+
+import developer_probability as dp
+import multiple_description_runtime as runtime
+from test_legal_page_search import make_pdf, response
+from test_multiple_description_parse import answer, item
+from test_multiple_description_runtime import described
+from test_print_draft import fake_autocad  # noqa: F401
+import test_gui_smoke as smoke
+
+gui = smoke.gui
+
+
+def setup_app(gui, monkeypatch, tmp_path, *, parse=None, search=None):
+    app = gui.SurveyApp()
+    app.config_data['multiple_description_search']['enabled'] = True  # isolated in-memory fixture only
+    target = runtime.ResolvedTarget('hydra', 'grok-4.7', 'https://example.test', 'fake', 10, 'yes')
+    router = runtime.ResolvedTarget('routerai', 'decision', 'https://routerai.test/api/v1', 'fake-router')
+    calls = {'parse': 0, 'search': 0, 'targets': []}
+    def prepare(*args, **kwargs):
+        calls['targets'].append('prepared')
+        return target, router.api_key
+    def sender(images, context):
+        calls['parse'] += 1
+        if parse is not None:
+            return parse(images, context)
+        return answer([described('5', 55.42), described('6', 100.11)])
+    def searcher(base, key, model, state, assets, questions):
+        calls['search'] += 1
+        assert base == router.base_url and key == router.api_key
+        if search is not None:
+            return search(base, key, model, state, assets, questions)
+        return response(questions, {1: .9, 2: .8}, 'two')
+    @contextlib.contextmanager
+    def callbacks(target_, cfg):
+        assert target_ is target
+        yield sender, None
+    monkeypatch.setattr(runtime, 'prepare_runtime', prepare)
+    monkeypatch.setattr(runtime, 'provider_target', lambda *a, **k: router)
+    monkeypatch.setattr(runtime, 'open_runtime_callbacks', callbacks)
+    monkeypatch.setattr(dp, 'post_routerai', searcher)
+    monkeypatch.setattr(app, '_pdf_set_worker', lambda *a, **k: pytest.fail('legacy worker'))
+    monkeypatch.setattr(gui.SurveyApp, '_print_draft_plans', gui._real_print_draft_plans)
+    return app, calls
+
+
+def submit(app, gui, tmp_path):
+    our, neighbor = tmp_path / 'OUR 6.pdf', tmp_path / 'LOT 5.pdf'
+    make_pdf(our, 2)
+    make_pdf(neighbor, 2)
+    items, errors = app._make_pdf_set_items([our, neighbor])
+    assert not errors
+    items[0].is_main = True
+    app._submit_pdf_set(items, scene_mode='update', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    return our, neighbor
+
+
+def test_background_pdf_to_scene_reuse_and_fake_autocad(gui, tmp_path, monkeypatch, fake_autocad):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    our, neighbor = submit(app, gui, tmp_path)
+    assert len(app._scene_plans()) == 4 and [len(i.multi_outcomes) for i in app.pdf_set] == [2, 2]
+    assert [p.is_neighbor for _, p in app._scene_plans()] == [False, False, True, True]
+    assert app._ready_source_signature and not app._input_incomplete
+    assert calls['parse'] == 2 and calls['search'] == 2
+    app._start(parse_only=True)  # ordinary repeat reuses even an incomplete cached result
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 2 and calls['search'] == 2
+    assert len(app._scene_plans()) == 4
+
+    assert app._source_signature(mode='📄 PDF') == app._ready_source_signature, (app._source_signature(mode='📄 PDF'), app._ready_source_signature, app._input_incomplete)
+    builder, doc = fake_autocad(None)
+    monkeypatch.setattr(gui, 'sys', types.SimpleNamespace(platform='win32'))
+    monkeypatch.setattr(gui, 'AcadBuilder', lambda cfg: builder)
+    from tkinter import messagebox
+    monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: pytest.fail('unexpected warning'))
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    texts = [t.TextString for t in doc.ModelSpace.texts]
+    assert texts.count('LOT 6') == 2 and texts.count('LOT 5') == 2, app.status_var.get()
+    assert 'Отрисовка завершена' in app.status_var.get()
+    assert calls['parse'] == 2 and calls['search'] == 2
+
+
+def test_one_failed_pdf_does_not_hide_successful_contours(gui, tmp_path, monkeypatch):
+    def parse(images, context):
+        if context['filename_lot'] == '5':
+            raise TimeoutError('sensitive error body')
+        return answer([described('5', 55), described('6', 100)])
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=parse)
+    our, neighbor = submit(app, gui, tmp_path)
+    assert calls['parse'] == 4  # successful file once, failed file exactly three attempts
+    assert [d.status for d in app._multi_scene_handoff.documents] == ['parsed', 'parse_failed']
+    assert len(app._scene_plans()) == 2 and not app._input_incomplete
+    diagnostics = (tmp_path / (neighbor.name + '.multi-parse.json')).read_text()
+    assert 'sensitive error body' not in diagnostics
+    assert json.loads(diagnostics)['runs'][-1]['error'] == 'request_failed'
+
+
+def test_no_candidates_does_not_hide_contours_from_other_file(gui, tmp_path, monkeypatch):
+    searches = iter([response_value for response_value in ('yes', 'no')])
+    def search(base, key, model, state, assets, questions):
+        return response(questions, {1: .9, 2: .8} if next(searches) == 'yes' else {}, 'zero')
+    app, calls = setup_app(gui, monkeypatch, tmp_path, search=search)
+    submit(app, gui, tmp_path)
+    assert [d.status for d in app._multi_scene_handoff.documents] == ['parsed', 'no_candidates']
+    assert len(app._scene_plans()) == 2 and not app._input_incomplete
+
+
+def test_file_mutation_after_parse_blocks_drawing_without_ai(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    our, neighbor = submit(app, gui, tmp_path)
+    with our.open('ab') as handle:
+        handle.write(b'changed')
+    monkeypatch.setattr(app, '_start_background', lambda *a, **k: pytest.fail('stale scene sent to AutoCAD'))
+    app._start_draw_scene()
+    assert app._input_incomplete and app._ready_source_signature is None
+    assert calls['parse'] == 2
+
+
+def test_reset_in_flight_stops_retries_and_does_not_publish_scene(gui, tmp_path, monkeypatch):
+    started, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    def parse(images, context):
+        started.set()
+        assert resume.wait(5)
+        finished.set()
+        raise TimeoutError('request already sent')
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=parse)
+    our = tmp_path / 'OUR 6.pdf'
+    make_pdf(our, 2)
+    items, _ = app._make_pdf_set_items([our])
+    items[0].is_main = True
+    app._submit_pdf_set(items, scene_mode='update', fresh=True)
+    assert started.wait(5)
+    app._reset_session()
+    resume.set()
+    assert finished.wait(5)
+    # Join the actual worker rather than sleeping/polling; it may still be
+    # unwinding the cancellation check after the in-flight response.
+    for thread in threading.enumerate():
+        if thread.name.startswith('Thread-') and thread is not threading.current_thread():
+            thread.join(timeout=5)
+    app._drain_events()
+    assert calls['parse'] == 1 and not app._busy and not app._scene_plans()
+    assert not (tmp_path / (our.name + '.multi-parse.json')).exists()
+
+
+def test_incomplete_result_reused_after_portal_change(gui, tmp_path, monkeypatch):
+    value = item('5', complete=False)
+    value['data']['segments'] = value['data']['segments'][:2]
+    contexts = []
+    def parse(images, context):
+        contexts.append(dict(context))
+        return answer([value], complete=False)
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=parse)
+    our, neighbor = submit(app, gui, tmp_path)
+    assert all(not d.complete for d in app._multi_scene_handoff.documents)
+    assert len(app._scene_plans()) == 2 and all(p.open_traverse for _, p in app._scene_plans())
+    passport = our.with_suffix('.json')
+    data = json.loads(passport.read_text())
+    data.setdefault('identity', {}).setdefault('lot', []).append({'source': 'portal', 'value': '7'})
+    passport.write_text(json.dumps(data))
+    app._start(parse_only=True)
+    smoke._wait_for_gui_worker(app)
+    assert calls['parse'] == 2 and calls['search'] == 2
+    diagnostic = json.loads((tmp_path / (our.name + '.multi-parse.json')).read_text())
+    assert diagnostic['portal_observations'][-1]['lot'] == '7'
+    assert contexts[0]['portal_lot'] is None
+
+
+def test_runtime_failure_is_noncacheable_and_does_not_leak_provider_error(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    def failing(*args, **kwargs):
+        raise runtime.RuntimeUnavailable('private key or provider message')
+    monkeypatch.setattr(runtime, 'prepare_runtime', failing)
+    our = tmp_path / 'OUR 6.pdf'
+    make_pdf(our, 2)
+    items, _ = app._make_pdf_set_items([our])
+    items[0].is_main = True
+    app._submit_pdf_set(items, scene_mode='update', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    assert not app._busy and app._input_incomplete and not app._scene_plans()
+    data = (tmp_path / (our.name + '.multi-parse.json')).read_text()
+    assert 'private key' not in data and json.loads(data)['runs'][-1]['error'] == 'runtime_unavailable'
+    assert 'private key' not in app.status_var.get()
+    assert calls['parse'] == 0 and calls['search'] == 0
+
+
+def test_add_to_multi_scene_reuses_old_documents_and_keeps_every_contour(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    our, neighbor = submit(app, gui, tmp_path)
+    assert app._multi_scene_can_add()
+    third = tmp_path / 'LOT 3.pdf'
+    make_pdf(third, 2)
+    items, _ = app._make_pdf_set_items([third])
+    app._submit_pdf_set(items, scene_mode='add', fresh=True)
+    smoke._wait_for_gui_worker(app)
+    assert [i.path for i in app.pdf_set] == [our, neighbor, third]
+    assert len(app._scene_plans()) == 6 and calls['parse'] == 3 and calls['search'] == 3
+    assert [len(i.multi_outcomes) for i in app.pdf_set] == [2, 2, 2]
+
+
+def test_add_rejects_stale_or_unrelated_scene_without_losing_it(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    submit(app, gui, tmp_path)
+    before = app._scene_plans()
+    app._ready_source_signature = None
+    third = tmp_path / 'LOT 3.pdf'
+    make_pdf(third, 2)
+    items, _ = app._make_pdf_set_items([third])
+    app._submit_pdf_set(items, scene_mode='add', fresh=True)
+    assert not app._busy and app._scene_plans() == before and calls['parse'] == 2

@@ -250,6 +250,12 @@ def plan_scene(builder: AcadBuilder, sources: Sequence[DescriptionSource], *, sc
         except Exception:  # A damaged description must not hide other results.
             failures.append(PlanFailure(Path(source.source), index, 'planning_failed'))
             continue
+        if anchor is None:
+            # The legacy builder derives a hypothetical intersection even when
+            # its input lacks an established tie. An isolated parcel must not
+            # carry that invented street geometry or its associated labels.
+            plan = replace(plan, lines=[], items=[t for t in plan.items
+                            if 'street' not in t.kind and t.kind != 'cross-street-distance'])
         prepared.append(PlannedDescription(Path(source.source), source.is_main, index, plan,
                                            anchor.group if anchor else None, anchor is not None,
                                            reason if anchor is not None else (reason or 'unresolved_position')))

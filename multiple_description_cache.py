@@ -121,7 +121,7 @@ def record_portal_observation(pdf: str | Path, pdf_sha256: str, lot: str | None)
 
 def record_failure(pdf: str | Path, pdf_sha256: str, *, reason: str, pages: Sequence[int]) -> None:
     """Record a sanitized failure when no parser request can be formed."""
-    if reason not in {"images_unavailable", "processing_failed", "runtime_unavailable", "metadata_unavailable"}:
+    if reason not in {"images_unavailable", "processing_failed", "runtime_unavailable", "metadata_unavailable", "cad_draw_failed", "cad_marking_failed"}:
         raise ValueError("unsupported diagnostic failure")
     if file_metadata._digest(Path(pdf)) != pdf_sha256:
         raise CacheError("PDF changed; failure not saved.")
@@ -209,3 +209,34 @@ def load_result(pdf: str | Path, context: Mapping[str, Any]) -> tuple[ParseResul
         return (ParseResult(items, tuple(page_list), tuple(unparsed), complete, (), None,
                             'cache', None), portal)
     return None
+
+
+def record_scene_diagnostics(pdf: str | Path, pdf_sha256: str, *, is_main: bool,
+                             descriptions: Sequence[Mapping[str, Any]]) -> None:
+    """Record placement/planning metadata without document text or geometry."""
+    if not isinstance(is_main, bool):
+        raise ValueError('invalid source role')
+    safe = []
+    allowed = {'unresolved_position', 'partial_description', 'exact_sides_fallback', 'planning_failed', None}
+    for entry in descriptions:
+        if not isinstance(entry, Mapping) or set(entry) != {'ordinal', 'placement_known', 'reason'}:
+            raise ValueError('invalid scene diagnostic')
+        ordinal, known, reason = entry['ordinal'], entry['placement_known'], entry['reason']
+        if (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1
+                or (known is not None and not isinstance(known, bool)) or reason not in allowed):
+            raise ValueError('invalid scene diagnostic value')
+        safe.append({'ordinal': ordinal, 'placement_known': known, 'reason': reason})
+    if file_metadata._digest(Path(pdf)) != pdf_sha256:
+        raise CacheError('PDF changed; scene diagnostics not saved.')
+    target = diagnostics_path(pdf)
+    try:
+        with file_metadata._LOCK:
+            history = _load(target)
+            runs = history.setdefault('scene_history', [])
+            if not isinstance(runs, list):
+                raise CacheError('Invalid scene diagnostics; file not overwritten.')
+            runs.append({'created_at': datetime.now(timezone.utc).isoformat(), 'pdf_sha256': pdf_sha256,
+                         'role': 'our' if is_main else 'neighbor', 'descriptions': safe})
+            file_metadata._write_json(target, history)
+    except OSError as exc:
+        raise CacheError('Cannot save scene diagnostics.') from exc

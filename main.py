@@ -4982,6 +4982,8 @@ class SurveyApp(ctk.CTk):
         return plans
 
     def _scene_suspicion_reports(self) -> list[tuple[str, LotSuspicionReport]]:
+        if self._multi_scene_handoff is not None:
+            return []  # legacy single-lot checks are not the multi-document workflow
         return [(name, plan.suspicion) for name, plan in self._scene_plans() if plan.suspicion is not None]
 
     def _plan_diagnostic_items(self, plan: DrawPlan) -> list[SuspicionItem]:
@@ -7076,11 +7078,10 @@ class SurveyApp(ctk.CTk):
         self._render_empty_inspector()
 
     def _install_multi_scene(self, handoff: Any) -> None:
-        """Install a prevalidated developer handoff without dropping duplicate plans.
+        """Install a prevalidated handoff without dropping duplicate plans.
 
-        This preview hook is deliberately not the PDF worker yet. Until the
-        worker and full draw pipeline are integrated, readiness stays false.
-        Never use legacy one-plan-per-file replacement or geometry verification.
+        The caller establishes readiness after checking the worker generation;
+        installation alone must never make a stale result drawable.
         """
         from multiple_description_handoff import InvalidHandoff, SceneHandoff
         if not legal_page_search.enabled(self.config_data):
@@ -7134,11 +7135,20 @@ class SurveyApp(ctk.CTk):
         self.preview_mode_switch.set("📐 Схема CAD")
         self._redraw_preview_canvas()
 
+    def _multi_scene_can_add(self) -> bool:
+        multi = self._multi_scene_handoff
+        return bool(multi is not None and self._ready_source_signature is not None and not self._input_incomplete
+                    and self._source_signature(mode="📄 PDF") == self._ready_source_signature
+                    and tuple((d.source, d.is_main) for d in multi.documents)
+                    == tuple((i.path, bool(i.is_main)) for i in self.pdf_set))
+
     def _clear_multi_scene_neighbors(self) -> None:
         from multiple_description_drawing import SceneResult
         multi = self._multi_scene_handoff
         if multi is None:
             return
+        if tuple((d.source, d.is_main) for d in multi.documents) != tuple((i.path, bool(i.is_main)) for i in self.pdf_set):
+            return  # the source list was cleared/changed; do not corrupt the stored scene
         ours = tuple(dataclasses.replace(doc, descriptions=tuple(
             dataclasses.replace(d, file_index=index) for d in doc.descriptions))
             for index, doc in enumerate(doc for doc in multi.documents if doc.is_main))
@@ -7156,8 +7166,12 @@ class SurveyApp(ctk.CTk):
                     raise InvalidHandoff("source unavailable") from exc
                 if digest != doc.pdf_sha256:
                     raise InvalidHandoff("source changed")
+        was_ready = self._ready_source_signature is not None and not self._input_incomplete
         self.pdf_set = [item for item in self.pdf_set if item.is_main]
         self._install_multi_scene(dataclasses.replace(multi, documents=ours, scene=scene))
+        if was_ready and self._multi_scene_handoff.drawable:
+            self._ready_source_signature = self._source_signature(mode="📄 PDF")
+            self._input_incomplete = False
         self._pending_neighbor_files.clear()
         self._neighbor_report = None
         self._refresh_neighbors_list()
@@ -8464,6 +8478,12 @@ class SurveyApp(ctk.CTk):
         """
         if self._busy or not items:
             return
+        if legal_page_search.enabled(self.config_data) and scene_mode == "add":
+            if not self._multi_scene_can_add():
+                # A single-lot/stale scene has no reusable multi-result context.
+                return
+            known = {item.path for item in self.pdf_set}
+            items = list(self.pdf_set) + [item for item in items if item.path not in known]
         if self.pending_conflict is not None or self.pending_doubt is not None:
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
             return
@@ -8517,11 +8537,7 @@ class SurveyApp(ctk.CTk):
         if self._busy or not self.pdf_set:
             return
         if legal_page_search.enabled(self.config_data):
-            # Until the experimental multi-result scene is fully wired, never
-            # silently fall back to the old one-description-per-file parser.
-            self._ready_source_signature = None
-            self._input_incomplete = True
-            self._set_status("Многоконтурный разбор ещё не подключён.")
+            self._start_multi_pdf_set(force=force)
             return
         if self.pending_conflict is not None or self.pending_doubt is not None:
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
@@ -8586,6 +8602,101 @@ class SurveyApp(ctk.CTk):
                 dict(self._pdf_set_advice), ask_advisor, join_mode, join_images,
             ),
         )
+
+    def _start_multi_pdf_set(self, *, force: bool = False) -> None:
+        """Start the separate multi-PDF worker, without invoking the legacy parser."""
+        from multiple_description_runtime import FileJob
+        if self._busy or not self.pdf_set:
+            return
+        cfg, provider, model, key, secret = self._build_runtime_config()
+        cfg["multiple_description_search"] = copy.deepcopy(self.config_data["multiple_description_search"])
+        jobs = tuple(FileJob(item.path, item.is_main) for item in self.pdf_set)
+        signature = self._source_signature(mode="📄 PDF")
+        self._running_source_signature = signature
+        self._ready_source_signature = None
+        self._input_incomplete = True
+        self._main_analysis_pending = False
+        self._neighbor_text_pending = False
+        self._pending_neighbor_files.clear()
+        self._pending_join_accept = []
+        self._pdf_set_analysis = None
+        self._pdf_set_report_ready = False
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._select_result_tab("🧾 Журнал")
+        self._set_status(f"Обрабатываю PDF: {len(jobs)} файл. …")
+        self._start_background(self._multi_pdf_worker,
+                               args=(jobs, signature, cfg, provider, model, key, secret,
+                                     self._current_scale(), force))
+
+    def _multi_pdf_worker(self, jobs: Any, signature: Any, cfg: dict[str, Any], provider: str,
+                          model: str, key: str | None, secret: str, scale: float, force: bool) -> None:
+        from multiple_description_runtime import (prepare_runtime, provider_target, run_batch,
+                                                   open_runtime_callbacks, Cancelled)
+        from multiple_description_handoff import build_handoff
+        import multiple_description_cache as multi_cache
+        post = self._worker_poster()
+        if not self._worker_is_current():
+            return
+        try:
+            target, router_key = prepare_runtime(cfg, selected_provider=provider, selected_model=model,
+                                                 selected_api_key=key, key_secret=secret,
+                                                 current=self._worker_is_current)
+            if not self._worker_is_current():
+                return
+            router = provider_target(cfg, "routerai", legal_page_search.PRIMARY, key_secret=secret,
+                                     explicit_key=key if provider == "routerai" else None)
+            with open_runtime_callbacks(target, cfg) as (send, choose):
+                batch = run_batch(jobs, cfg, target=target, search_api_key=router_key,
+                                  search_base_url=router.base_url, send=send, choose=choose,
+                                  scale=scale, force_parse=force, current=self._worker_is_current,
+                                  progress=lambda i, n: post("progress", f"Обрабатываю PDF: {i} из {n}…"))
+            if batch.cancelled or not self._worker_is_current():
+                return
+            view = build_handoff(batch, expected_jobs=jobs)
+            post("multi_pdf_done", (view, signature))
+        except Cancelled:
+            return
+        except Exception:
+            # Safe diagnostics only: never write keys, raw provider errors or PDF contents.
+            if not self._worker_is_current():
+                return
+            for job in jobs:
+                if not self._worker_is_current():
+                    return
+                try:
+                    multi_cache.record_failure(job.path, file_metadata._digest(job.path),
+                                               reason="runtime_unavailable", pages=[])
+                except (OSError, ValueError, multi_cache.CacheError):
+                    pass
+            post("multi_pdf_done", (None, signature))
+
+    def _handle_multi_pdf_done(self, view: Any, signature: Any) -> None:
+        from multiple_description_handoff import InvalidHandoff
+        self._finish_busy()
+        if signature != self._source_signature(mode="📄 PDF"):
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            return
+        if view is None:
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            self._set_status("Обработка PDF не завершена.")
+            return
+        try:
+            self._install_multi_scene(view)
+        except InvalidHandoff:
+            self._ready_source_signature = None
+            self._input_incomplete = True
+            self._set_status("Обработка PDF не завершена.")
+            return
+        self._ready_source_signature = signature if view.drawable else None
+        self._input_incomplete = not bool(view.drawable)
+        self._refresh_pdf_selection_ui()
+        self._refresh_parse_actions()
+        self._refresh_stepper()
+        self._set_status(f"Подготовлено контуров: {len(view.drawable)}.")
 
     def _parse_pdf_set_job(
         self, job: PdfSetJob, cfg: dict[str, Any], provider_id: str, model_name: str,
@@ -9288,6 +9399,14 @@ class SurveyApp(ctk.CTk):
 
     def _pdf_set_summary_text(self) -> str:
         """Короткий список набора для левой панели: роль, файл, страницы, состояние."""
+        if legal_page_search.enabled(self.config_data):
+            counts = {d.source: len(d.descriptions) for d in self._multi_scene_handoff.documents} if self._multi_scene_handoff else {}
+            rows = [f"{'наш' if item.is_main else 'сосед'}: {item.path.name}"
+                    + (f" · контуров: {counts[item.path]}" if item.path in counts else "")
+                    for item in self.pdf_set[:6]]
+            if len(self.pdf_set) > 6:
+                rows.append(f"… и ещё {len(self.pdf_set) - 6}")
+            return "\n".join(rows)
         lines: list[str] = []
         ordered = sorted(self.pdf_set, key=lambda item: not item.is_main)
         for item in ordered[:6]:
@@ -10377,6 +10496,20 @@ class SurveyApp(ctk.CTk):
                     )
                 except Exception:  # noqa: BLE001
                     self._update_closure_badge(self._closure_text(outcome), None)
+        elif kind == "multi_scene_drawn":
+            completed, error = payload
+            self._finish_busy()
+            if completed:
+                self.draw_result = completed[-1][1]
+            marking_failed = any("пометк" in str(w).lower() for _, result in completed for w in result.warnings)
+            if marking_failed:
+                self._record_multi_cad_diagnostic("cad_marking_failed")
+            if error:
+                self._record_multi_cad_diagnostic("cad_draw_failed")
+                self._set_status("Отрисовка остановлена.")
+            else:
+                self._set_status(f"Отрисовка завершена: {len(completed)} планов.")
+            self._refresh_stepper()
         elif kind == "scene_drawn":
             completed, error = payload
             self._finish_busy()
@@ -10525,6 +10658,8 @@ class SurveyApp(ctk.CTk):
         elif kind == "pdf_set_done":
             self._finish_busy()
             self._handle_pdf_set_done(payload)
+        elif kind == "multi_pdf_done":
+            self._handle_multi_pdf_done(*payload)
         elif kind == "feature_labeled":
             label_result, label_error, label_mode = payload
             self._finish_busy()
@@ -11098,6 +11233,9 @@ class SurveyApp(ctk.CTk):
         """Рисует только то, что уже рассчитано и видно на схеме, без вызова парсера."""
         if self._busy or getattr(self, "_source_role_dialog", None) is not None:
             return
+        if self._multi_scene_handoff is not None:
+            self._start_draw_multi_scene(neighbors_only=neighbors_only)
+            return
         if self.pending_conflict is not None or self.pending_doubt is not None:
             self._set_status("Сначала разрешите конфликт или сомнение в результате разбора.", error=True)
             return
@@ -11196,6 +11334,55 @@ class SurveyApp(ctk.CTk):
         )
         self._start_background(self._draw_scene_worker, args=(draw_plans, cfg))
 
+    def _start_draw_multi_scene(self, *, neighbors_only: bool = False) -> None:
+        """Draw available plans without legacy one-lot checks or extra AI calls."""
+        if not legal_page_search.enabled(self.config_data) or self._multi_scene_handoff is None:
+            return
+        signature = self._source_signature(mode="📄 PDF")
+        if signature != self._ready_source_signature or self._input_incomplete or signature is None:
+            self._set_status("Сначала выполните обработку PDF.")
+            return
+        for doc in self._multi_scene_handoff.documents:
+            if doc.pdf_sha256 is None:
+                continue
+            try:
+                valid = file_metadata._digest(doc.source) == doc.pdf_sha256
+            except OSError:
+                valid = False
+            if not valid:
+                self._ready_source_signature = None
+                self._input_incomplete = True
+                self._set_status("Сначала выполните обработку PDF.")
+                return
+        plans = [(name, plan) for name, plan in self._scene_plans() if not neighbors_only or plan.is_neighbor]
+        if not plans:
+            self._set_status("Нет подготовленных контуров.")
+            return
+        try:
+            drafts = [] if neighbors_only else self._print_draft_plans()
+        except Exception:
+            self._record_multi_cad_diagnostic("cad_draw_failed")
+            self._set_status("Отрисовка не начата.")
+            return
+        cfg, _provider, _model, _key, _secret = self._build_runtime_config()
+        self._busy = True
+        self._set_controls_busy(True)
+        self.progress.start()
+        self._set_status(f"Рисую подготовленные контуры: {len(plans)}…")
+        self._start_background(self._draw_scene_worker, args=(drafts + plans, cfg, True))
+
+    def _record_multi_cad_diagnostic(self, reason: str) -> None:
+        import multiple_description_cache as multi_cache
+        if self._multi_scene_handoff is None:
+            return
+        for doc in self._multi_scene_handoff.documents:
+            if doc.pdf_sha256 is None:
+                continue
+            try:
+                multi_cache.record_failure(doc.source, doc.pdf_sha256, reason=reason, pages=[])
+            except (OSError, ValueError, multi_cache.CacheError):
+                pass
+
     def _print_draft_plans(self) -> list[tuple[str, DrawPlan]]:
         """Черновик для печати из основного участка: без соседей, на +1000 по X."""
         if getattr(self, "_multi_scene_handoff", None) is not None:
@@ -11209,7 +11396,8 @@ class SurveyApp(ctk.CTk):
         label = self._plan_source_labels.get(id(main), "текст")
         return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg, builder_cfg=self.config_data))]
 
-    def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any]) -> None:
+    def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any],
+                           multi: bool = False) -> None:
         post = self._worker_poster()
         completed: list[tuple[str, DrawResult]] = []
         error = ""
@@ -11230,7 +11418,7 @@ class SurveyApp(ctk.CTk):
                 completed.append((name, result))
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
-        post("scene_drawn", (completed, error))
+        post("multi_scene_drawn" if multi else "scene_drawn", (completed, error))
         post("done", None)
 
     def _start(
@@ -11248,7 +11436,7 @@ class SurveyApp(ctk.CTk):
         mode = self._current_source_mode()
         if mode == "📄 PDF" and self.pdf_set:
             # Кнопка разбора перечитывает весь набор, включая уже готовые файлы.
-            self._start_pdf_set(force=True)
+            self._start_pdf_set(force=not legal_page_search.enabled(self.config_data))
             return
         if mode == "📄 PDF":
             self._select_result_tab("🧾 Журнал")  # одиночный PDF / соседние файлы — тоже журнал
@@ -12700,6 +12888,8 @@ class PdfSetDialog:
             font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
         )
         self.scene_add_radio.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=8)
+        if self.multi_mode and not app._multi_scene_can_add():
+            self.scene_add_radio.grid_remove()
         if not self.ask_scene:
             self.scene_frame.grid_remove()
 
@@ -13089,6 +13279,8 @@ class PdfSetDialog:
         if not self.multi_mode and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
             problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
         scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
+        if self.multi_mode and scene_mode == "add" and not self.app._multi_scene_can_add():
+            scene_mode = ""
         if self.ask_scene and scene_mode not in {"replace", "add"}:
             problems.append("выберите, заменить схему этим набором или добавить к имеющимся участкам")
         if problems:

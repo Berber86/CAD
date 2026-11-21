@@ -2,7 +2,8 @@
 
 Creating a transport does not contact a provider. Each callback makes exactly
 one SDK call; it deliberately disables SDK-level retries so the parser's
-explicit call budget remains authoritative. Not wired into the GUI.
+explicit call budget remains authoritative. The GUI uses it only through
+the disabled-by-default experimental workflow.
 """
 from __future__ import annotations
 

@@ -86,7 +86,9 @@ def build_handoff(batch: BatchResult, *, expected_jobs: Sequence[FileJob] | None
             continue
         if result.status != file.status:
             raise InvalidHandoff('document status mismatch')
-        if file.status == 'parsed' and (result.parse is None or result.parse.selected_attempt is None):
+        if file.status == 'parsed' and (result.parse is None or
+                                        (result.parse.selected_attempt is None and
+                                         not (result.cached and result.parse.selection == 'cache'))):
             raise InvalidHandoff('parsed document has no selected response')
         if file.status in {'no_candidates', 'search_incomplete', 'images_unavailable'} and result.parse is not None:
             raise InvalidHandoff('unexpected parse result')

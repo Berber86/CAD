@@ -228,3 +228,59 @@ def test_cancel_during_parse_does_not_retry_or_cache_failure(tmp_path):
     assert result.cancelled and not result.scene.plans and state['parse'] == 1
     sidecar = tmp_path / (pdf.name + '.multi-parse.json')
     assert not sidecar.exists()
+
+
+def test_unlocated_planning_reason_recorded_without_pdf_text_or_key(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    make_pdf(pdf, 2)
+    target = runtime.ResolvedTarget('hydra', 'grok', 'https://example.test', 'private-key', 10)
+    result = runtime.run_batch([runtime.FileJob(pdf, True)], config(), target=target, search_api_key='router',
+                               send=lambda *a: answer([described('5', 55, tie=False)]), choose=None,
+                               search_send=searcher)
+    assert result.scene.plans[0].diagnostic == 'unresolved_position'
+    data = json.loads((tmp_path / (pdf.name + '.multi-parse.json')).read_text())
+    assert data['scene_history'][-1]['descriptions'] == [
+        {'ordinal': 1, 'placement_known': False, 'reason': 'unresolved_position'}]
+    assert 'private-key' not in json.dumps(data['scene_history'])
+    assert 'Main Street' not in json.dumps(data['scene_history'])
+
+
+def test_runtime_client_is_closed_on_normal_and_exceptional_exit(monkeypatch):
+    class Client:
+        closed = False
+        def close(self):
+            self.closed = True
+    clients = []
+    def create(*a, **kw):
+        client = Client()
+        clients.append(client)
+        return client
+    monkeypatch.setattr(runtime.transport, 'create_client', create)
+    monkeypatch.setattr(runtime.transport, 'make_sender', lambda *a: 'sender')
+    monkeypatch.setattr(runtime.transport, 'make_selector', lambda *a: 'selector')
+    target = runtime.ResolvedTarget('hydra', 'grok', 'https://example.test', 'test', 10)
+    with runtime.open_runtime_callbacks(target, config()) as callbacks:
+        assert callbacks == ('sender', 'selector')
+    assert clients[-1].closed
+    with pytest.raises(RuntimeError):
+        with runtime.open_runtime_callbacks(target, config()):
+            raise RuntimeError('cancelled')
+    assert clients[-1].closed
+
+
+def test_cancel_during_catalog_lookup_stops_before_resolving_model_target(monkeypatch):
+    cfg = config()
+    state = {'active': True}
+    original = runtime.provider_target
+    targets = []
+    def resolve(*args, **kwargs):
+        targets.append(args[1])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(runtime, 'provider_target', resolve)
+    def catalog_fetch():
+        state['active'] = False
+        return catalog()
+    with pytest.raises(runtime.Cancelled):
+        runtime.prepare_runtime(cfg, selected_provider='hydra', selected_model='glm-5.2',
+                                catalog_fetch=catalog_fetch, current=lambda: state['active'])
+    assert targets == ['routerai']

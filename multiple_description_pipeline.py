@@ -1,7 +1,7 @@
-"""Experimental per-PDF search + parse coordinator, not connected to the GUI.
+"""Experimental per-PDF search + parse coordinator.
 
-All provider calls are explicitly injected. This module does not provide
-AutoCAD integration, configure a fallback model, or run requests on import.
+All provider calls are explicitly injected; the disabled-by-default runtime
+resolves the provider. This module does not run requests on import.
 """
 from __future__ import annotations
 

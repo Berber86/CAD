@@ -726,7 +726,7 @@ def test_multi_roles_are_prepopulated_only_from_explicit_passport(gui, tmp_path,
     assert [item.is_main for item in captured[0]] == [False, False, True]
 
 
-def test_incomplete_multi_integration_never_runs_legacy_parser_or_draws(gui, tmp_path, monkeypatch):
+def test_multi_start_dispatches_only_new_worker_and_is_not_ready_yet(gui, tmp_path, monkeypatch):
     app = gui.SurveyApp()
     app.config_data['multiple_description_search']['enabled'] = True
     path = tmp_path / 'OUR 6.pdf'
@@ -734,8 +734,9 @@ def test_incomplete_multi_integration_never_runs_legacy_parser_or_draws(gui, tmp
     dialog = _open_set(app, monkeypatch, path)
     dialog.rows[0]['role_var'].set(True)
     monkeypatch.setattr(app, '_pdf_set_worker', lambda *a, **k: pytest.fail('legacy parser ran'))
-    monkeypatch.setattr(app, '_start_background', lambda *a, **k: pytest.fail('unexpected job'))
+    starts = []
+    monkeypatch.setattr(app, '_start_background', lambda target, **kwargs: starts.append((target, kwargs)))
     dialog.submit()
-    assert not app._busy and len(app.pdf_set) == 1
+    assert app._busy and len(app.pdf_set) == 1
     assert app._ready_source_signature is None and app._input_incomplete
-    assert 'ещё не подключён' in app.status_var.get()
+    assert len(starts) == 1 and starts[0][0].__name__ == '_multi_pdf_worker'

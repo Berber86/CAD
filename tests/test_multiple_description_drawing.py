@@ -303,3 +303,18 @@ def test_scene_print_common_row_group_has_single_intersection():
     assert len(draft.plans) == 2 and draft.diagnostic is None
     ties = [l for p in draft.plans for l in p.lines if l.kind == 'main-street-row-tie']
     assert len(ties) == 1 and math.dist(ties[0].start, ties[0].end) == pytest.approx(40)
+
+
+def test_unlocated_full_contour_has_no_guessed_street_intersection():
+    from pathlib import Path
+    desc, _ = llm_parser.parse_with_regex(Path('tests/data/lot72_render_e600.txt').read_text(encoding='utf-8'),
+                                          auto_repair_typos=False)
+    builder = ab.AcadBuilder(llm_parser.load_config())
+    scene = drawing.plan_scene(builder, [record('OUR 6.pdf', True, parse.DescriptionItem(desc, True))])
+    entry = scene.plans[0]
+    assert entry.diagnostic == 'unresolved_position'
+    assert not entry.plan.lines
+    assert not any('street' in t.kind for t in entry.plan.items)
+    assert any(t.kind == 'main-lot-label' and t.text == 'LOT 6' for t in entry.plan.items)
+    for edge, segment in zip(entry.plan.boundary_lines, desc.segments):
+        assert _vector(edge) == pytest.approx(segment.vector, abs=1e-6)

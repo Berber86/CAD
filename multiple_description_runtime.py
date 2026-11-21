@@ -8,6 +8,7 @@ workflow has been explicitly started by the application.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -21,7 +22,7 @@ import multiple_description_transport as transport
 import multiple_description_drawing as drawing
 import multiple_description_cache as cache
 import file_metadata
-from multiple_description_cancel import Cancelled
+from multiple_description_cancel import Cancelled, check
 from acad_builder import AcadBuilder, compute_pob_point
 from multiple_description_parse import MAX_IMAGES, DescriptionItem
 
@@ -129,7 +130,8 @@ def model_capability(catalog: Any, model: str) -> tuple[str, int | None]:
 
 def prepare_runtime(cfg: Mapping[str, Any], *, selected_provider: str, selected_model: str,
                     selected_api_key: str | None = None, key_secret: str = '',
-                    catalog_fetch: Callable[[], Any] = fetch_hydra_catalog) -> tuple[ResolvedTarget, str]:
+                    catalog_fetch: Callable[[], Any] = fetch_hydra_catalog,
+                    current: Callable[[], bool] = lambda: True) -> tuple[ResolvedTarget, str]:
     """Resolve selected/vision-reserve target and the separate RouterAI key.
 
     A Hydra catalog failure or missing modalities means unknown and causes the
@@ -137,6 +139,7 @@ def prepare_runtime(cfg: Mapping[str, Any], *, selected_provider: str, selected_
     """
     if not legal_page_search.enabled(cfg):
         raise pipeline.ParseDisabled('Developer multiple-description switch is disabled.')
+    check(current)
     router = provider_target(cfg, 'routerai', legal_page_search.PRIMARY, key_secret=key_secret,
                              explicit_key=selected_api_key if selected_provider == 'routerai' else None)
     try:
@@ -151,13 +154,14 @@ def prepare_runtime(cfg: Mapping[str, Any], *, selected_provider: str, selected_
             metadata = catalog_fetch()
         except Exception:
             metadata = None
+    check(current)
     capability, limit = model_capability(metadata, selected_model) if selected_provider == 'hydra' else ('unknown', None)
-    current = pipeline.VisionTarget(selected_provider, selected_model, min(MAX_IMAGES, limit or MAX_IMAGES))
+    selected = pipeline.VisionTarget(selected_provider, selected_model, min(MAX_IMAGES, limit or MAX_IMAGES))
     try:
-        choice = pipeline.choose_vision_target(current, capability, fallback)
+        choice = pipeline.choose_vision_target(selected, capability, fallback)
     except pipeline.VisionUnavailable as exc:
         raise RuntimeUnavailable('vision_reserve_unavailable') from exc
-    if choice != current:
+    if choice != selected:
         fallback_capability, fallback_limit = model_capability(metadata, choice.model) if choice.provider == 'hydra' else ('unknown', None)
         if fallback_capability == 'no':
             raise RuntimeUnavailable('vision_reserve_unavailable')
@@ -165,7 +169,7 @@ def prepare_runtime(cfg: Mapping[str, Any], *, selected_provider: str, selected_
         provider, model = choice.provider, choice.model
         actual_capability = fallback_capability
     else:
-        limit, provider, model, actual_capability = current.image_limit, current.provider, current.model, capability
+        limit, provider, model, actual_capability = selected.image_limit, selected.provider, selected.model, capability
     target = provider_target(cfg, provider, model, key_secret=key_secret,
                              explicit_key=selected_api_key if provider == selected_provider else None,
                              image_limit=limit, capability=actual_capability)
@@ -209,7 +213,8 @@ def anchor_for(path: Path, item: DescriptionItem) -> drawing.Anchor | None:
 
 def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: ResolvedTarget,
               search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
-              search_send: Callable[..., Any] | None = None, scale: float = 16.0,
+              search_send: Callable[..., Any] | None = None,
+              search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
               force_parse: bool = False,
               current: Callable[[], bool] = lambda: True,
               progress: Callable[[int, int], None] | None = None) -> BatchResult:
@@ -229,6 +234,7 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
                                         provider=target.provider, model=target.model,
                                         image_limit=target.image_limit, portal_lot=portal_lot,
                                         send=send, choose=choose, search_send=search_send,
+                                        search_base_url=search_base_url,
                                         force_parse=force_parse, current=current)
         except Cancelled:
             return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
@@ -240,10 +246,14 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
                 pass
             files.append(FileResult(job, None, 'processing_failed'))
             continue
+        if not current():
+            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
         files.append(FileResult(job, result, result.status))
         if result.parse is None:
             continue
         for item in result.parse.items:
+            if not current():
+                return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
             try:
                 outcome = lp.ParseOutcome(data=item.data, source='llm:multi', provider=target.provider,
                                           model=target.model)
@@ -257,6 +267,29 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
     if not current():
         return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
     scene = drawing.plan_scene(AcadBuilder(dict(cfg)), sources, scale=scale)
+    by_index = {entry.description_index: entry for entry in scene.plans}
+    failures = {entry.description_index: entry.reason for entry in scene.failures}
+    offset = 0
+    for file in files:
+        if not current():
+            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+        result = file.result
+        parsed = result.parse.items if result and result.parse else ()
+        rows = []
+        for ordinal, _item in enumerate(parsed, 1):
+            index = offset + ordinal - 1
+            entry = by_index.get(index)
+            rows.append({'ordinal': ordinal, 'placement_known': entry.placement_known if entry else None,
+                         'reason': entry.diagnostic if entry else failures.get(index, 'planning_failed')})
+        offset += len(parsed)
+        if result and rows:
+            try:
+                cache.record_scene_diagnostics(file.job.path, result.search['pdf_sha256'],
+                                               is_main=file.job.is_main, descriptions=rows)
+            except (OSError, ValueError, cache.CacheError):
+                pass
+    if not current():
+        return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
     return BatchResult(tuple(files), scene, target.provider, target.model)
 
 
@@ -265,3 +298,15 @@ def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
     timeout = float(api.get('timeout_sec') or 180)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
     return transport.make_sender(client, target.model), transport.make_selector(client, target.model)
+
+
+@contextmanager
+def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
+    """Own the transport client for one job and close it even on cancellation."""
+    api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
+    timeout = float(api.get('timeout_sec') or 180)
+    client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
+    try:
+        yield transport.make_sender(client, target.model), transport.make_selector(client, target.model)
+    finally:
+        client.close()

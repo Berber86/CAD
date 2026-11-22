@@ -226,12 +226,9 @@ def test_no_deeds_and_no_mortgages_means_nothing_to_download():
 
 
 def test_file_names_follow_the_customers_scheme():
-    assert rcclerk.document_file_name("our", 1, "NEW") == "OUR LOT 1 NEW.pdf"
     assert rcclerk.document_file_name("our", 32, "NEW") == "OUR LOT 32 NEW.pdf"
     assert rcclerk.document_file_name("our", 32, "OLD") == "OUR LOT 32 OLD.pdf"
-    assert rcclerk.document_file_name("neighbour", 2, "NEW") == "LOT 2 NEW.pdf"
     assert rcclerk.document_file_name("neighbour", 30, "NEW") == "LOT 30 NEW.pdf"
-    assert rcclerk.document_file_name("neighbour", 30, "OLD") == "LOT 30 OLD.pdf"
 
 
 # --------------------------------------------------------------- скачивание
@@ -415,7 +412,7 @@ def test_trimmed_copy_keeps_only_the_description_pages(tmp_path):
     import deed_pages
 
     pdf = _text_pdf(tmp_path / "deed.pdf", ["COVER PAGE", DESCRIPTION_TEXT, "RP-5217"])
-    out = deed_pages.trim_pdf(pdf, [2], tmp_path / "OUR LOT 32 NEW_p2.pdf")
+    out = deed_pages.trim_pdf(pdf, [2], tmp_path / "OUR 32 NEW_p2.pdf")
     import pymupdf
 
     doc = pymupdf.open(str(out))

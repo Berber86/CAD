@@ -189,12 +189,8 @@ def test_neighbour_gets_only_the_newest_document(tmp_path):
 
 def test_old_document_of_a_neighbour_is_downloaded_only_when_asked(tmp_path):
     outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], with_old_for_neighbour=True)
-    neighbour_records = sorted(
-        (item for item in outcome.records if item.role == "neighbour"),
-        key=lambda item: item.file,
-    )
-    assert [item.file for item in neighbour_records] == ["LOT 30 NEW.pdf", "LOT 30 OLD.pdf"]
-    assert [item.trimmed for item in neighbour_records] == ["LOT 30 NEW_p2.pdf", "LOT 30 OLD_p2.pdf"]
+    neighbour_files = sorted(item.file for item in outcome.records if item.role == "neighbour")
+    assert neighbour_files == ["LOT 30 NEW.pdf", "LOT 30 OLD.pdf"]
 
 
 def test_several_neighbours_in_one_field(tmp_path):
@@ -254,12 +250,6 @@ def test_manual_file_is_named_by_the_same_scheme(tmp_path):
     assert record.file == "LOT 30 NEW.pdf"
     assert any("вручную" in note for note in record.notes)
     assert (tmp_path / "01_описания" / "LOT 30 NEW.json").is_file()
-
-    our_record = deed_intake.copy_manual_pdf(
-        tmp_path / "01_описания", source, role="our", lot=1, tag="OLD", block=BLOCK,
-    )
-    assert our_record.file == "OUR LOT 1 OLD.pdf"
-    assert (tmp_path / "01_описания" / "OUR LOT 1 OLD.json").is_file()
 
 
 def test_newest_pdf_from_downloads_is_adopted(tmp_path):

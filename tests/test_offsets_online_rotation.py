@@ -82,29 +82,27 @@ def rotation_on(monkeypatch):
 
 
 def test_rotation_is_on_by_default_and_off_by_flag():
-    """С 4.26 поворот включён (R10): подпись без выноски идёт вдоль своей линии."""
+    """С 4.26 поворот включён (R10), но подпись дома всегда горизонтальна (R28): 0° в обоих режимах."""
     assert off.TEXT_FOLLOWS_BOUNDARY is True
     house = _house([(6.0, 10.0), (14.0, 10.0), (14.0, 30.0), (6.0, 30.0)])
-    plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
-    assert any(math.isclose(abs(it.rotation_deg), 90.0, abs_tol=0.01)
-               for it in plan.items if it.style == "text")
-    saved = off.TEXT_FOLLOWS_BOUNDARY
-    off.TEXT_FOLLOWS_BOUNDARY = False
-    try:
-        plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
-    finally:
-        off.TEXT_FOLLOWS_BOUNDARY = saved
-    assert all(it.rotation_deg == 0.0 for it in plan.items)
+    for flag in (True, False):
+        saved = off.TEXT_FOLLOWS_BOUNDARY
+        off.TEXT_FOLLOWS_BOUNDARY = flag
+        try:
+            plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
+        finally:
+            off.TEXT_FOLLOWS_BOUNDARY = saved
+        assert all(it.rotation_deg == 0.0 for it in plan.items if it.style == "text")
 
 
 def test_house_text_is_parallel_to_its_boundary(rotation_on):
-    # Дом в 6 ft от левой (вертикальной) границы: текст без выноски вдоль неё — 90°.
+    # Даже с поворотом вдоль границы (R10) текст дома всегда 0° — «как в книге» (R28).
     house = _house([(6.0, 10.0), (14.0, 10.0), (14.0, 30.0), (6.0, 30.0)])
     plan = off.plan_offsets(LOT40, [house], north_deg=90.0)
     text_items = [it for it in plan.items if it.style == "text"]
     assert text_items, "дом должен получить текст без выноски"
     for it in text_items:
-        assert math.isclose(abs(it.rotation_deg), 90.0, abs_tol=0.01)
+        assert it.rotation_deg == 0.0
 
 
 def test_house_text_near_horizontal_boundary_is_horizontal(rotation_on):

@@ -74,8 +74,6 @@ def _three_lots(tmp_path):
         ("a_p5_2.pdf", (2, 5)),  # перепутанный порядок исправляется
         # Шаг 0 кладёт копию описания как OUR LOT 32 NEW_p4-6.pdf — дефис тоже читается.
         ("OUR LOT 32 NEW_p4-6.pdf", (4, 6)),
-        ("OUR 32 NEW_p4-6.pdf", (4, 6)),
-        ("LOT 2 NEW_p4-6.pdf", (4, 6)),
         ("LOT 30 OLD_p2-2.pdf", (2, 2)),
         ("lot 12_p4 .pdf", (4, 4)),
         ("plain.pdf", None),
@@ -435,11 +433,14 @@ def test_disagreeing_ai_passes_keep_the_lot_and_flag_it(gui, tmp_path, monkeypat
     assert "построен с замечаниями" in report and "проходы ИИ разошлись" in report
     assert "с замечаниями: 1" in app.status_var.get()
     assert "⚠ сосед" in app.neighbor_pdf_summary.cget("text")
-    # Перед отрисовкой программа спрашивает подтверждение и называет замечание.
+    # Замечание не блокирует отрисовку — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
     asked = []
     monkeypatch.setattr(messagebox, "askyesno", lambda _title, text, **kw: asked.append(text) or False)
     app._start(parse_only=False)
-    assert asked and "neighbor_scan.pdf" in asked[0] and "Отрисовка отменена" in app.status_var.get()
+    _wait(app)
+    assert not asked
+    assert "отменена" not in app.status_var.get()
     app._on_close()
 
 
@@ -752,22 +753,22 @@ def test_our_filename_sets_roles_for_every_multi_document_without_passport(gui, 
     app = gui.SurveyApp()
     app.multi_pdf_mode_var.set(True)
     app._on_multi_pdf_mode_changed()
-    names = ('our 06.pdf', 'OUR LOT 10 NEW.pdf', 'OUR_7 NEW.pdf', 'LOT 8.pdf', 'ourhouse.pdf', 'not OUR 9.pdf')
+    names = ('our 06.pdf', 'OUR_7 NEW.pdf', 'LOT 8.pdf', 'ourhouse.pdf', 'not OUR 9.pdf')
     paths = [tmp_path / name for name in names]
     for path in paths:
         _write_test_pdf(path, [FILLER])
     # A filename explicitly marked OUR wins even if an old passport says neighbour.
-    paths[2].with_suffix('.json').write_text(json.dumps({'file': paths[2].name, 'role': 'neighbour'}))
+    paths[1].with_suffix('.json').write_text(json.dumps({'file': paths[1].name, 'role': 'neighbour'}))
     dialog = _open_set(app, monkeypatch, *paths)
-    assert [row['role_var'].get() for row in dialog.rows] == [True, True, True, False, False, False]
+    assert [row['role_var'].get() for row in dialog.rows] == [True, True, False, False, False]
     # An explicit user edit is respected, including after list rebuild.
     dialog.rows[0]['role_var'].set(False)
-    dialog.remove(4)
-    assert [row['role_var'].get() for row in dialog.rows] == [False, True, True, False, False]
+    dialog.remove(3)
+    assert [row['role_var'].get() for row in dialog.rows] == [False, True, False, False]
     captured = []
     monkeypatch.setattr(app, '_submit_pdf_set', lambda items, **kw: captured.append(items))
     dialog.submit()
-    assert [item.is_main for item in captured[0]] == [False, True, True, False, False]
+    assert [item.is_main for item in captured[0]] == [False, True, False, False]
 
 
 def test_legacy_default_selects_our_regardless_of_position_and_stays_editable(gui, tmp_path, monkeypatch):

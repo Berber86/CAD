@@ -2458,12 +2458,11 @@ def test_suspicious_neighbor_is_not_silently_drawn_in_batch(gui, tmp_path, monke
     assert all(any("Возможная опечатка" in item.title for item in app._plan_diagnostic_items(plan))
                for plan in app._preview_neighbor_plans)
     app._start(parse_only=False)
-    assert draws == [] and prompts and "опечатка" in prompts[0]
-    assert "Отрисовка отменена" in app.status_var.get()
-    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
-    app._start(parse_only=False)
     _wait_for_gui_worker(app)
-    assert draws == app._preview_neighbor_plans and len(calls) == 2
+    # Подозрительный сосед рисуется в любом случае — без подтверждения и без отмены.
+    assert not prompts
+    assert draws == app._preview_neighbor_plans
+    assert "отменена" not in app.status_var.get()
     app._on_close()
 
 
@@ -5238,8 +5237,11 @@ def test_auto_fix_does_not_open_typo_question_but_independent_risk_can_prompt(gu
     prompts = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
     app._start(parse_only=False)
-    assert prompts and "невязка" in prompts[0].lower()
-    assert "Отрисовка отменена" in app.status_var.get()
+    _wait_for_gui_worker(app)
+    # Рисование не блокируется невязкой — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
+    assert not prompts
+    assert "отменена" not in app.status_var.get()
 
 
 def test_doubt_checkbox_atomic_failure_does_not_damage_other_local_data(gui, monkeypatch):
@@ -5282,8 +5284,11 @@ def test_checked_ambiguous_109_not_modified_and_warns_before_drawing(gui, monkey
     prompts = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
     app._start(parse_only=False)
-    assert len(prompts) == 1 and "невязка" in prompts[0].lower()
-    assert "Отрисовка отменена" in app.status_var.get()
+    _wait_for_gui_worker(app)
+    # Рисование не блокируется невязкой — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
+    assert not prompts
+    assert "отменена" not in app.status_var.get()
 
 
 @pytest.mark.parametrize("ask,good_provider", [(True, "hydra"), (False, "openrouter")])

@@ -65,9 +65,12 @@ def test_front_only_along_removed_other_notes_preserved():
     desc = desc.model_copy(update={"segments": segments})
     plan = ab.AcadBuilder(lp.load_config()).plan(desc)
     for scene in (plan, ab.make_print_draft(plan, {})):
+        # side-1 не фротальная: course_note без изменений
         assert any(i.kind.startswith("side-1-note") and "ALONG" in i.text for i in scene.items)
-        assert any(i.kind.startswith("side-4-note") and "RIGHT ANGLES" in i.text for i in scene.items)
+        # side-4 фротальная: остаётся только название улицы, все пояснения удалены
+        assert any(i.kind.startswith("side-4-note") and "BORDEN AVENUE" in i.text for i in scene.items)
         assert not any(i.kind.startswith("side-4-note") and "ALONG" in i.text for i in scene.items)
+        assert not any(i.kind.startswith("side-4-note") and "RIGHT ANGLES" in i.text for i in scene.items)
 
 
 def test_mixed_units_keep_nonzero_decimals_and_integer_zero_inches_on_both_plans():

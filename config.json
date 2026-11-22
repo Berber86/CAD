@@ -1,6 +1,11 @@
 {
   "multiple_description_search": {
-    "enabled": false
+    "enabled": false,
+    "vision_fallback": {
+      "provider": "hydra",
+      "model": "grok-4.7",
+      "image_limit": 10
+    }
   },
   "api": {
     "provider": "hydra",

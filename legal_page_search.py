@@ -19,6 +19,8 @@ from typing import Any, Callable, Mapping
 import httpx
 import developer_probability as dp
 import file_metadata
+from multiple_description_cancel import check
+from multiple_description_progress import emit, page_list, waiting
 
 PRIMARY = "microsoft/microsoft-decision-1.1"
 FALLBACK = "typesafe/jev-1.14"
@@ -175,14 +177,18 @@ def _request(pages: list[dict[str, Any]], questions: dict[str, Any], model: str,
 
 def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: str,
                base_url: str = BASE_URL, image_side: int = dp.PDF_IMAGE_MAX_SIDE,
-               send: Callable[..., Any] | None = None) -> dict[str, Any]:
+               send: Callable[..., Any] | None = None,
+               current: Callable[[], bool] = lambda: True,
+               progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Evaluate up to 200 pages and save a diagnostic sidecar; never build geometry.
 
-    Do not call from the live workflow yet. An unknown page with an available
-    image is included in candidate_pages, not classified as empty.
+    The GUI calls this only after the user explicitly selects the experimental
+    session mode. An unknown page with an available image is included in
+    candidate_pages, not classified as empty.
     """
     if not enabled(config):
         raise SearchDisabled("Developer page search is disabled.")
+    check(current)
     if not api_key:
         raise SearchError("RouterAI key is unavailable; no requests sent.")
     dp.valid_pdf_image_side(image_side)
@@ -206,9 +212,13 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         raise SearchError("Cannot open the PDF; no requests sent.") from exc
     covered = min(total, PAGE_CAP)
     groups = batch_numbers(covered)
+    emit(progress, f"Поиск: подготовка {covered} из {total} страниц PDF.")
     rendered: dict[int, dict[str, Any]] = {}
     render_errors = []
     for n in range(1, covered + 1):
+        check(current)
+        if n == 1 or n == covered or n % 10 == 0:
+            emit(progress, f"Поиск: подготовка страницы {n} из {covered}.")
         try:
             page = dp.prepare_documents([(str(path), str(n))], "visual", provider=PROVIDER,
                                         pdf_image_side=image_side)
@@ -223,6 +233,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     attempts: list[dict[str, Any]] = []
     results = []
     for group in groups:
+        check(current)
         available = [n for n in group if n in rendered]
         pending = list(available)
         observed: dict[int, dict[str, Any]] = {}
@@ -230,17 +241,29 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
 
         def attempt(numbers: list[int], model: str, include_count: bool) -> None:
             nonlocal count_result
+            check(current)
             pages = [rendered[n] for n in numbers]
             questions = questions_for(numbers, count=include_count)
             fp = _fingerprint(digest, pages, questions, model, image_side, base_url)
             cached = _cached(history, fp, questions, model)
             if cached:
+                emit(progress, f"Поиск: кэш {model}, страницы {page_list(numbers)}.")
                 answers = {name: ({"status": "ok", "value": cached[name]} if name in cached else
                                   {"status": "error", "value": None}) for name in questions}
                 error, seconds, source, usage = None, 0.0, "cache", None
             else:
-                answers, error, seconds, usage = _request(pages, questions, model, api_key, base_url, send)
+                emit(progress, f"Поиск: запрос {model}, страницы {page_list(numbers)}; ожидаем ответ.")
+                check(current)
+                with waiting(progress):
+                    answers, error, seconds, usage = _request(pages, questions, model, api_key, base_url, send)
+                check(current)
                 source = "network"
+            valid_pages = sum(answers[f"page_{n}"]["status"] == "ok" for n in numbers)
+            error_text = {"timeout": "тайм-аут", "network_error": "ошибка сети",
+                          "invalid_response": "некорректный ответ", "processing_error": "ошибка обработки"}
+            problem = error_text.get(error, error if error and error.startswith('http_') else "ошибка запроса") if error else ""
+            emit(progress, f"Поиск: ответ {model}, страниц с оценкой {valid_pages}/{len(numbers)}, "
+                           f"{seconds:.1f} с" + (f", {problem}" if problem else "") + ".")
             attempts.append({"batch_pages": group, "pages": numbers, "model": model,
                              "fingerprint": fp, "source": source, "seconds": seconds, "usage": usage,
                              "error_kind": error, "answers": answers})
@@ -283,6 +306,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                 pending = [n for n in pending if n not in observed]
         results.append({"pages": group, "count": count_result,
                         "observations": {str(n): observed.get(n) for n in group}})
+    check(current)
     page_results = []
     for n in range(1, covered + 1):
         obs = [b["observations"][str(n)] for b in results if n in b["pages"]]
@@ -312,4 +336,6 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         raise
     except OSError as exc:
         raise SearchError("Cannot save search diagnostics.") from exc
+    emit(progress, f"Поиск завершён: отобрано страниц {len(run['candidate_pages'])}, "
+                   f"полный просмотр: {'да' if run['coverage_complete'] else 'нет'}.")
     return copy.deepcopy(run)

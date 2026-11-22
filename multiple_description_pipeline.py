@@ -1,7 +1,7 @@
-"""Experimental per-PDF search + parse coordinator, not connected to the GUI.
+"""Experimental per-PDF search + parse coordinator.
 
-All provider calls are explicitly injected. This module does not provide
-AutoCAD integration, configure a fallback model, or run requests on import.
+All provider calls are explicitly injected; the disabled-by-default runtime
+resolves the provider. This module does not run requests on import.
 """
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from typing import Any, Callable, Mapping, Sequence
 import file_metadata
 import legal_page_search
 import lot_identity
+from multiple_description_cancel import check
+from multiple_description_progress import emit, page_list
 import multiple_description_cache as cache
 from llm_parser import render_pdf_pages_base64
 from multiple_description_parse import MAX_IMAGES, Attempt, PageImage, ParseDisabled, ParseResult, parse_pages
@@ -26,6 +28,22 @@ class VisionTarget:
     provider: str
     model: str
     image_limit: int
+
+
+def configured_vision_fallback(config: Mapping[str, Any] | None) -> VisionTarget | None:
+    """Read the explicit reserve without accessing credentials or the network."""
+    section = config.get('multiple_description_search') if isinstance(config, Mapping) else None
+    data = section.get('vision_fallback') if isinstance(section, Mapping) else None
+    if data is None:
+        return None
+    if not isinstance(data, Mapping):
+        raise ValueError('Invalid vision reserve configuration')
+    provider, model, limit = data.get('provider'), data.get('model'), data.get('image_limit')
+    if (not isinstance(provider, str) or not provider.strip()
+            or not isinstance(model, str) or not model.strip()
+            or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_IMAGES):
+        raise ValueError('Invalid vision reserve configuration')
+    return VisionTarget(provider.strip(), model.strip(), limit)
 
 
 def choose_vision_target(selected: VisionTarget, support: str, fallback: VisionTarget | None) -> VisionTarget:
@@ -71,6 +89,9 @@ def parse_pdf(
     render_dpi: int = 220,
     render_max_side: int = 3200,
     render: Callable[..., list[str]] = render_pdf_pages_base64,
+    force_parse: bool = False,
+    current: Callable[[], bool] = lambda: True,
+    progress: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """Search a PDF and parse its candidates using the injected callbacks.
 
@@ -79,6 +100,7 @@ def parse_pdf(
     """
     if not legal_page_search.enabled(config):
         raise ParseDisabled('Developer multiple-description switch is disabled.')
+    check(current)
     if (not isinstance(provider, str) or not provider or not isinstance(model, str) or not model
             or isinstance(image_limit, bool) or not isinstance(image_limit, int) or image_limit < 1):
         raise ValueError('A provider, model and positive image limit are required')
@@ -87,13 +109,17 @@ def parse_pdf(
         raise ValueError('Invalid rendering settings')
     if portal_lot is not None and not isinstance(portal_lot, str):
         raise ValueError('Invalid portal lot')
+    if not isinstance(force_parse, bool):
+        raise ValueError('force_parse must be a boolean')
     if not callable(send) or (choose is not None and not callable(choose)):
         raise ValueError('Transport callbacks must be callable')
     path = Path(path)
     search = legal_page_search.search_pdf(path, config, api_key=search_api_key,
                                           base_url=search_base_url, image_side=search_image_side,
-                                          send=search_send)
+                                          send=search_send, current=current, progress=progress)
+    check(current)
     candidates = search['candidate_pages']
+    emit(progress, f"Страницы для разбора: {page_list(candidates) if candidates else 'нет'}.")
     cache.record_portal_observation(path, search['pdf_sha256'], portal_lot)
     if not candidates:
         status = 'no_candidates' if search['coverage_complete'] else 'search_incomplete'
@@ -104,8 +130,10 @@ def parse_pdf(
     errors: list[int] = []
     limit = min(MAX_IMAGES, image_limit)
     for n in candidates:
+        check(current)
         if len(pages) >= limit:
             break
+        emit(progress, f"Разбор: подготовка изображения страницы {n}.")
         try:
             data = render(path, dpi=render_dpi, max_pages=1, max_side_px=render_max_side,
                           pages=[n], rotation_deg=0, enhance_scan=False, output_format='png')
@@ -114,6 +142,7 @@ def parse_pdf(
             pages.append(PageImage(n, data[0]))
         except Exception:
             errors.append(n)
+    check(current)
     if file_metadata._digest(path) != search['pdf_sha256']:
         raise cache.CacheError('PDF changed while rendering; parse not started.')
     if not pages:
@@ -128,13 +157,15 @@ def parse_pdf(
                                   candidate_pages=candidates, image_settings=settings,
                                   provider=provider, model=model, filename_lot=lot_identity.lot_from_filename(path),
                                   search_complete=complete, image_limit=image_limit)
-    saved = cache.load_result(path, context)
+    saved = None if force_parse else cache.load_result(path, context)
     if saved is not None:
+        emit(progress, "Разбор: использован сохранённый результат, новый запрос не отправлялся.")
         result, original_portal_lot = saved
         return PipelineResult(search, result, 'parsed', True, original_portal_lot, portal_lot, tuple(errors))
     result = parse_pages(config, pages, candidate_pages=candidates, image_limit=image_limit,
                          filename_lot=lot_identity.lot_from_filename(path), portal_lot=portal_lot,
-                         search_complete=complete, send=send, choose=choose)
+                         search_complete=complete, send=send, choose=choose, current_job=current, progress=progress)
+    check(current)
     cache.save_result(path, context, result, portal_lot=portal_lot)
     return PipelineResult(search, result, 'parsed' if result.selected_attempt is not None else 'parse_failed',
                           False, portal_lot, portal_lot, tuple(errors))

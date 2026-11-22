@@ -482,7 +482,7 @@ def _extract_portal_details(rows: Sequence[ScreenText]) -> tuple[str, str, str |
 
     borough_raw = _label_text(rows, "Borough") or ""
     borough = next(
-        (name for name in BOROUGH_NAMES if _normalise(name) in _normalise(borough_raw)),
+        (name for name in BOROUGH_NAMES if _normalise(name) == _normalise(borough_raw)),
         borough_raw.strip() or None,
     )
     return block, lot, borough

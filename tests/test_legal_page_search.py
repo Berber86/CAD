@@ -388,3 +388,22 @@ def test_isolated_live_test_temporarily_enables_only_the_runner(tmp_path, monkey
     assert cli.main([str(pdf), '--live', '--isolated-test']) == 0
     assert not search.enabled(config)
     assert 'secret' not in capsys.readouterr().out
+
+
+def test_progress_reports_attempts_before_network_and_cache_without_secrets(tmp_path):
+    pdf = tmp_path / 'progress.pdf'
+    make_pdf(pdf, 2)
+    messages, calls = [], []
+    def send(base, key, model, state, assets, qs):
+        assert any('Поиск: запрос' in line for line in messages)
+        calls.append(1)
+        return response(qs, {1: .9})
+    result = search.search_pdf(pdf, ON, api_key='secret-key', send=send, progress=messages.append)
+    assert calls == [1] and result['candidate_pages'] == [1]
+    assert any('полный просмотр: да' in line for line in messages)
+    assert 'secret-key' not in ' '.join(messages)
+    messages.clear()
+    search.search_pdf(pdf, ON, api_key='secret-key', send=lambda *a: pytest.fail('unexpected request'),
+                      progress=messages.append)
+    assert any('кэш' in line for line in messages)
+    assert not any('Поиск: запрос' in line for line in messages)

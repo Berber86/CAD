@@ -6,19 +6,25 @@ The existing one-description parser remains unchanged.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from multiple_description_cancel import check
+from multiple_description_progress import emit, page_list, waiting
+from multiple_description_errors import classify_exception, describe_failure
+
+from dataclasses import dataclass, replace
 import json
 import math
 import re
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from llm_parser import LegalDescription, Segment
 from pydantic import model_validator
+from legal_street_policy import NYC_STREET_INSTRUCTION
 
 MAX_IMAGES = 50
 MAX_PARSE_CALLS = 4
 MAX_ORDINARY_FAILURES = 3
-SCHEMA_VERSION = "multiple-legal-descriptions-v1"
+SCHEMA_VERSION = "multiple-legal-descriptions-v4"
 INSTRUCTION = (
     "Read all supplied whole PDF pages. Return every separate land boundary "
     "description as a separate item in document order, including repeated "
@@ -26,8 +32,32 @@ INSTRUCTION = (
     "together and in order. Lot identifiers from the filename and portal are "
     "context only, not a reason to exclude a description. Do not invent "
     "unreadable sides or claim a cut-off description is complete. Return JSON "
-    "with descriptions (each item: complete, data) and complete (boolean)."
+    "with descriptions (each item: complete, data) and complete (boolean). "
+    "For corner_to_pob_bearing give a bearing only when the document explicitly "
+    "states that bearing from the intersection to POB; otherwise use null. "
+    "Do not calculate or infer this bearing from a frontage or from a word direction."
 )
+
+
+COMPARISON_INSTRUCTION = (
+    'Compare the candidate parses against the supplied whole PDF pages. '
+    'Select one candidate only, do not combine them. Each candidate lists the pages '
+    'it originally received. If unable to decide, return selected as null. '
+    'Return only JSON {"selected": <zero-based candidate index or null>}.'
+)
+
+
+def system_instruction() -> str:
+    """Exact static parsing prompt; changes invalidate the diagnostic cache."""
+    schema_data = LegalDescription.model_json_schema()
+    schema_data['properties']['corner_to_pob_bearing']['description'] = (
+        'Bearing from intersection to POB only if explicitly stated in the document; otherwise null. '
+        'Never infer from frontage or a word direction.'
+    )
+    schema = json.dumps(schema_data, ensure_ascii=False, separators=(',', ':'))
+    return (INSTRUCTION + '\n' + NYC_STREET_INSTRUCTION + '\nEach item data must conform to this JSON schema: ' + schema +
+            '\nUse exactly the keys descriptions and complete at the top level, and exactly '
+            'the keys complete and data for each item. Return JSON only.')
 
 
 class ParseDisabled(RuntimeError):
@@ -37,9 +67,10 @@ class ParseDisabled(RuntimeError):
 class ImageSizeRejected(Exception):
     """The provider explicitly rejected request size, not a general failure."""
 
-    def __init__(self, limit: int | None = None):
+    def __init__(self, limit: int | None = None, *, status_code: int | None = None):
         super().__init__("request size rejected")
         self.limit = limit
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -75,6 +106,16 @@ class Attempt:
     complete: bool
     valid_response: bool
     issue: str | None
+    failure_kind: str | None = None
+    elapsed_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ComparisonDiagnostic:
+    """Sanitized metadata about the optional one-shot candidate comparison."""
+    status: str
+    attempt_indices: tuple[int, ...]
+    pages: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -87,6 +128,32 @@ class ParseResult:
     selected_attempt: int | None
     selection: str | None
     error: str | None
+    comparison: ComparisonDiagnostic | None = None
+
+
+def _validated_segment(raw: Any) -> Segment:
+    segment = Segment.model_validate(raw)
+    if not math.isfinite(segment.distance_ft) or not all(math.isfinite(x) for x in segment.vector):
+        raise ValueError("non-finite side")
+    return segment
+
+
+def _validated_description(model: type[LegalDescription], raw: Any) -> LegalDescription:
+    # A legible traversal may have no readable street name. This is an empty
+    # metadata field, not an inferred street or a reason to discard sides.
+    normalized_raw = {"main_street": "", **raw} if isinstance(raw, dict) else raw
+    description = model.model_validate(normalized_raw)
+    # The legacy model derives a tie from the traverse when none was supplied.
+    # In this workflow such an inferred value is not a confirmed intersection:
+    # never turn that default into an apparent relative position or cache it as
+    # if the AI explicitly returned the tie.
+    if isinstance(raw, dict) and raw.get("corner_to_pob_bearing") is None:
+        description.corner_to_pob_bearing = None
+    if not math.isfinite(description.distance_to_corner_ft):
+        raise ValueError("non-finite tie distance")
+    if description.corner_to_pob_bearing is not None:
+        _validated_segment(description.corner_to_pob_bearing)
+    return description
 
 
 def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
@@ -108,9 +175,9 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             if not isinstance(segments, list) or not segments:
                 raise ValueError("missing sides")
             for segment in segments:
-                Segment.model_validate(segment)
+                _validated_segment(segment)
             model = LegalDescription if entry["complete"] else PartialLegalDescription
-            result.append(DescriptionItem(model.model_validate(raw_data), entry["complete"]))
+            result.append(DescriptionItem(_validated_description(model, raw_data), entry["complete"]))
         except Exception:  # validation errors belong only to this item
             all_valid = False
             # Keep a continuous, independently valid prefix of sides if the
@@ -123,7 +190,7 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             prefix = []
             for segment in segments:
                 try:
-                    Segment.model_validate(segment)
+                    _validated_segment(segment)
                 except Exception:
                     break
                 prefix.append(segment)
@@ -132,7 +199,7 @@ def _items(raw: Any) -> tuple[tuple[DescriptionItem, ...], bool]:
             if len(prefix) == len(segments) and (not entry["complete"] or len(prefix) >= 3):
                 continue
             try:
-                partial = PartialLegalDescription.model_validate({**data, "segments": prefix})
+                partial = _validated_description(PartialLegalDescription, {**data, "segments": prefix})
             except Exception:
                 continue
             result.append(DescriptionItem(partial, False))
@@ -200,7 +267,10 @@ def _closure_score(attempt: Attempt) -> tuple[int, float]:
     """More measurable complete contours first, then smaller worst error."""
     closures = []
     for item in attempt.items:
-        if not item.complete or len(item.data.segments) < 3:
+        if (not item.complete or len(item.data.segments) < 3
+                or any(not segment.has_bearing or segment.bearing_solved for segment in item.data.segments)):
+            # A nominal/closure-derived direction cannot establish a measured
+            # misclosure. In particular, unknown must never rank as zero.
             continue
         vectors = [segment.vector for segment in item.data.segments]
         distance = math.hypot(sum(v[0] for v in vectors), sum(v[1] for v in vectors))
@@ -220,6 +290,8 @@ def parse_pages(
     candidate_pages: Sequence[int] | None = None,
     send: Callable[[Sequence[PageImage], Mapping[str, str | None]], str],
     choose: Callable[[Sequence[PageImage], Sequence[Attempt]], int] | None = None,
+    current_job: Callable[[], bool] = lambda: True,
+    progress: Callable[[str], None] | None = None,
 ) -> ParseResult:
     """Run a single document's experimental parsing policy.
 
@@ -231,6 +303,7 @@ def parse_pages(
     section = config.get("multiple_description_search") if isinstance(config, Mapping) else None
     if not isinstance(section, Mapping) or section.get("enabled") is not True:
         raise ParseDisabled("Developer multiple-description switch is disabled.")
+    check(current_job)
     if isinstance(image_limit, bool) or not isinstance(image_limit, int) or image_limit < 1:
         raise ValueError("image_limit must be a positive integer")
     if not isinstance(search_complete, bool):
@@ -257,11 +330,20 @@ def parse_pages(
     calls = 0
     error: str | None = None
     while calls < MAX_PARSE_CALLS and ordinary_failures < MAX_ORDINARY_FAILURES:
+        check(current_job)
         calls += 1
+        emit(progress, f"Разбор: запрос {calls}, страницы {page_list([p.number for p in current])}; ожидаем ответ.")
+        check(current_job)
+        started = time.monotonic()
         try:
-            response = send(tuple(current), context)
+            with waiting(progress):
+                response = send(tuple(current), context)
         except ImageSizeRejected as exc:
-            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "size_rejected"))
+            elapsed = round(time.monotonic() - started, 2)
+            kind = classify_exception(exc)
+            kind = kind if kind.startswith('http_') else 'size_rejected'
+            emit(progress, f"Разбор: провайдер отклонил размер запроса, {elapsed:.1f} с.")
+            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "size_rejected", kind, elapsed))
             if reduced or len(current) <= 1:
                 error = "size_rejected"
                 break
@@ -276,13 +358,24 @@ def parse_pages(
             reduced = True
             error = "size_rejected"
             continue
-        except Exception:  # do not persist provider messages, keys or response bodies
-            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed"))
+        except Exception as exc:  # never persist provider messages, keys or response bodies
+            elapsed = round(time.monotonic() - started, 2)
+            kind = classify_exception(exc)
+            emit(progress, f"Разбор: запрос не выполнен ({describe_failure(kind)}), {elapsed:.1f} с.")
+            attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed", kind, elapsed))
             ordinary_failures += 1
             error = "request_failed"
             continue
+        check(current_job)
         attempt = read_response(response, [p.number for p in current])
+        attempt = replace(attempt, elapsed_seconds=round(time.monotonic() - started, 2))
         attempts.append(attempt)
+        issues = {"invalid_json": "некорректный JSON", "invalid_envelope": "неверная структура ответа",
+                  "invalid_item": "повреждено описание", "no_usable_result": "нет пригодных сторон",
+                  "inconsistent_completeness": "противоречие в признаке полноты"}
+        emit(progress, f"Разбор: получено описаний {len(attempt.items)}, "
+                       + ("ответ принят." if attempt.valid_response else
+                          f"ответ неполный или повреждён: {issues.get(attempt.issue, 'неясный ответ')}."))
         if attempt.valid_response:
             selected = len(attempts) - 1
             rest = tuple(n for n in candidates if n not in attempt.pages)
@@ -292,6 +385,7 @@ def parse_pages(
         ordinary_failures += 1
         error = attempt.issue
 
+    check(current_job)
     # Keep one attempt, never concatenate attempts or deduplicate within one.
     viable = [i for i, attempt in enumerate(attempts) if attempt.items]
     if not viable:
@@ -299,25 +393,45 @@ def parse_pages(
     largest = max(len(attempts[i].items) for i in viable)
     tied = [i for i in viable if len(attempts[i].items) == largest]
     selection = "most_items"
+    comparison = None
     if len(tied) > 1:
         chosen = None
+        # Use the largest page set from a usable tied attempt, never add pages.
+        longest = max((attempts[i].pages for i in tied), key=len)
+        status = "unavailable"
         if choose is not None:
-            # Use the largest page set from a usable tied attempt, never add pages.
-            longest = max((attempts[i].pages for i in tied), key=len)
+            emit(progress, f"Сравнение: запрос выбора из {len(tied)} вариантов; ожидаем ответ.")
             page_by_number = {p.number: p for p in pages}
+            check(current_job)
             try:
-                index = choose(tuple(page_by_number[n] for n in longest), tuple(attempts[i] for i in tied))
+                with waiting(progress):
+                    index = choose(tuple(page_by_number[n] for n in longest), tuple(attempts[i] for i in tied))
                 if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(tied):
                     chosen = tied[index]
                     selection = "comparison"
+                    status = "selected"
+                else:
+                    status = "invalid_selection"
+            except ImageSizeRejected:
+                status = "size_rejected"
+            except (ValueError, TypeError):
+                status = "invalid_selection"
             except Exception:
-                pass
+                status = "request_failed"
+        result_text = {"selected": "вариант выбран", "invalid_selection": "ответ неясен",
+                       "size_rejected": "запрос слишком велик", "request_failed": "запрос не выполнен",
+                       "unavailable": "сравнение недоступно"}
+        emit(progress, f"Сравнение: {result_text[status]}.")
+        comparison = ComparisonDiagnostic(status, tuple(tied), tuple(longest) if choose is not None else ())
+        check(current_job)
         if chosen is None:
             chosen = max(tied, key=lambda i: _closure_score(attempts[i]))
-            selection = "closure_fallback"
+            best_score = _closure_score(attempts[chosen])
+            selection = ("closure_fallback_uncertain" if sum(_closure_score(attempts[i]) == best_score for i in tied) > 1
+                         else "closure_fallback")
     else:
         chosen = tied[0]
     selected_attempt = attempts[chosen]
     rest = tuple(n for n in candidates if n not in selected_attempt.pages)
     return ParseResult(selected_attempt.items, selected_attempt.pages, rest, False,
-                       tuple(attempts), chosen, selection, error)
+                       tuple(attempts), chosen, selection, error, comparison)

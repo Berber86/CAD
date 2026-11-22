@@ -104,3 +104,14 @@ def test_our_lot_label_main_but_not_print_draft(filename, deed, expected, warnin
     else:
         assert not any("номер лота" in w for w in plan.warnings)
     assert [s.distance_ft for s in plan.description.segments] == [s.distance_ft for s in desc.segments]
+
+
+@pytest.mark.parametrize('path,expected', [
+    ('OUR 6 NEW.pdf', True), ('our 06.pdf', True), ('Our_6_p2.pdf', True),
+    ('OUR6.pdf', True), ('OUR.pdf', True), ('OUR(1).PDF', True),
+    ('C:\\OUR files\\LOT 5.pdf', False), ('not OUR 6.pdf', False),
+    ('ours.pdf', False), ('ourhouse.pdf', False), ('OURАллея.pdf', False),
+    ('LOT 6.pdf', False), ('', False),
+])
+def test_our_role_prefix_is_on_the_basename_only(path, expected):
+    assert li.has_our_prefix(path) is expected

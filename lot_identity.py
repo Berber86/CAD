@@ -23,6 +23,15 @@ def lot_from_filename(path: Any) -> str | None:
     return matches[0]
 
 
+def has_our_prefix(path: Any) -> bool:
+    """Role hint from the filename, not from a directory or an embedded word."""
+    if not path:
+        return False
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1].strip()
+    stem = PurePath(name).stem
+    return stem[:3].casefold() == "our" and (len(stem) == 3 or not stem[3].isalpha())
+
+
 def canonical(value: Any) -> str:
     value = str(value or "").strip().upper()
     match = re.fullmatch(r"0*(\d+)([A-Z]?)", value)

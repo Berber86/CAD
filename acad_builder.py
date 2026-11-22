@@ -25,6 +25,7 @@ Python: 3.11+, Windows, запущенный AutoCAD.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import math
 import re
 import threading
@@ -1002,6 +1003,8 @@ class TextItem:
     rotation: float
     kind: str = "side"
     height: float | None = None
+    correction_indices: tuple[int, ...] = ()
+    correction_deleted: str = ""
 
 
 @dataclass
@@ -1050,13 +1053,18 @@ class DrawPlan:
     suspicion: LotSuspicionReport | None = None
     #: Черновик для печати (правила — docs/customer_rules.md, раздел «Черновик для печати»).
     print_draft: bool = False
+    #: Достоверная незамкнутая часть обхода; не добавлять замыкающую сторону.
+    open_traverse: bool = False
 
     @property
     def area_sqft(self) -> float:
-        return abs(polygon_signed_area(self.vertices))
+        return 0.0 if self.open_traverse else abs(polygon_signed_area(self.vertices))
 
     @property
     def centroid(self) -> tuple[float, float]:
+        if self.open_traverse and self.vertices:
+            xs, ys = zip(*self.vertices)
+            return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
         return polygon_centroid(self.vertices)
 
 
@@ -1210,7 +1218,8 @@ def make_print_draft(
             is_side_dimension = (bool(plan.description.segments[index].has_bearing)
                                  and not re.search(r"\bPARALLEL\s+(?:WITH|TO)\b", item.text, re.IGNORECASE))
         height = 4.0 if is_street else (2.0 if is_side_dimension else 1.6)
-        items.append(dc_replace(item, point=point, height=height))
+        items.append(dc_replace(item, point=point, height=height,
+                                correction_indices=(), correction_deleted=""))
 
     # Отдельная строка у той стороны, к которой относится отметка в описании.
     for index, segment in enumerate(plan.description.segments):
@@ -1673,6 +1682,7 @@ class AcadBuilder:
         self._doc: Any | None = None
         self._com_thread_id: int | None = None
         self._com_owned: bool = False
+        self._hold_connection: bool = False
         self._unit_warning: str | None = None
         self._unit_code: int | None = None
         self._front_warning: str | None = None
@@ -2223,7 +2233,9 @@ class AcadBuilder:
             former = street_names.former_line(getattr(description, "main_street_former", None))
             if former:
                 sub_lines.append((former, "main-street-note-extra"))
-            main_entry = (street_names.street_text(description.main_street), "main-street")
+            main_display, main_marks, main_deleted = street_names.correction_marks(
+                description.main_street, description.main_street_corrected)
+            main_entry = (main_display, "main-street")
             # Порядок как раньше: при одной ориентации названия ближе к улице, при другой — дальше.
             ordered = (
                 [main_entry] + sub_lines if up_dot_n < 0.0 else list(reversed(sub_lines)) + [main_entry]
@@ -2238,6 +2250,8 @@ class AcadBuilder:
                         rotation=rot,
                         kind=kind,
                         height=street_h if kind == "main-street" else street_note_h,
+                        correction_indices=main_marks if kind == "main-street" else (),
+                        correction_deleted=main_deleted if kind == "main-street" else "",
                     )
                 )
         else:
@@ -2262,6 +2276,8 @@ class AcadBuilder:
                 )
             return items, row_lines
 
+        cross_display, cross_marks, cross_deleted = street_names.correction_marks(
+            description.cross_street, description.cross_street_corrected)
         cross_idx = getattr(description, "cross_street_side_index", None)
         is_corner_lot = (
             cross_idx is not None
@@ -2289,10 +2305,11 @@ class AcadBuilder:
                 c_offset = base_street_offset + c_extra
                 items.append(
                     TextItem(
-                        text=street_names.street_text(description.cross_street),
+                        text=cross_display,
                         point=(c_mid[0] + cnx * c_offset, c_mid[1] + cny * c_offset),
                         rotation=text_rotation(c_angle),
                         kind="cross-street",
+                        correction_indices=cross_marks, correction_deleted=cross_deleted,
                         height=street_h,
                     )
                 )
@@ -2406,13 +2423,14 @@ class AcadBuilder:
         cross_normal_shift = 0.65 * street_offset
         items.append(
             TextItem(
-                text=street_names.street_text(description.cross_street),
+                text=cross_display,
                 point=(
                     corner_pt[0] + tux * cross_along_shift + nx * cross_normal_shift,
                     corner_pt[1] + tuy * cross_along_shift + ny * cross_normal_shift,
                 ),
                 rotation=text_rotation(angle + math.pi / 2.0),
                 kind="cross-street",
+                correction_indices=cross_marks, correction_deleted=cross_deleted,
                 height=street_h,
             )
         )
@@ -2636,6 +2654,12 @@ class AcadBuilder:
             ]
             row_lines: list[LineItem] = []
             arcs: list[ArcItem] = []
+            if front_index is not None and (description.main_street_corrected or description.cross_street_corrected):
+                neighbor_streets, _ = self._street_items(
+                    description, vertices, height, ccw, warnings,
+                    front_index=front_index, boundary_lines=boundary_lines)
+                items.extend(t for t in neighbor_streets
+                             if t.correction_indices or t.correction_deleted)
         else:
             items, arcs, side_band_extra = self._side_items(
                 description,
@@ -2761,6 +2785,24 @@ class AcadBuilder:
         self._com_owned = bool(co_inited)
         self._warn_about_units(doc)
         return app, doc
+
+    @contextmanager
+    def drawing_session(self):
+        """Keep the same COM document for a multi-plan draw and its SaveAs."""
+        if self._hold_connection:
+            raise AcadConnectionError("сеанс AutoCAD уже открыт")
+        app, doc = self.connect()
+        self._hold_connection = True
+        try:
+            yield app, doc
+        finally:
+            self._hold_connection = False
+            if self._com_owned:
+                self._app = None
+                self._doc = None
+                self._com_owned = False
+                self._com_thread_id = None
+                _co_uninitialize()
 
     def _warn_about_units(self, doc: Any) -> None:
         self._unit_warning = None
@@ -2992,6 +3034,43 @@ class AcadBuilder:
         text.Rotation = item.rotation
         return text
 
+    def _add_corrected_street_text(
+        self, model_space: Any, item: TextItem, default_height: float, layer: str, style: str,
+    ) -> Any:
+        """One centered MTEXT with inline ACI red; unmodified glyphs stay ByLayer."""
+        def escape(value: str) -> str:
+            return value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        marked = set(item.correction_indices)
+        runs: list[str] = []
+        active = False
+        for index, char in enumerate(item.text):
+            red = index in marked
+            if red != active:
+                runs.append("{\\C1;" if red else "}")
+                active = red
+            runs.append(escape(char))
+        if active:
+            runs.append("}")
+        if item.correction_deleted:
+            runs.append(" {\\C1;[-" + escape(item.correction_deleted) + "]}")
+        entity = _com_retry(model_space.AddMText, _variant_point(item.point), 0.0, ''.join(runs))
+        try:
+            entity.StyleName = style
+            entity.Height = float(item.height if item.height is not None else default_height)
+            entity.Layer = layer
+            entity.AttachmentPoint = 5  # acAttachmentPointMiddleCenter
+            entity.InsertionPoint = _variant_point(item.point)
+            entity.Rotation = item.rotation
+            if str(entity.Layer).casefold() != layer.casefold():
+                raise ValueError("AutoCAD не сохранил слой текста")
+        except Exception:
+            try:
+                entity.Delete()
+            except Exception:
+                pass
+            raise
+        return entity
+
     def _fit_print_bearing_text(
         self, entity: Any, item: TextItem, segment: Segment, side_length: float,
         *, feet_inches: bool,
@@ -3181,7 +3260,26 @@ class AcadBuilder:
             draw_as_lines = bool(drawing.get("property_as_lines", True))
             primary_entity: Any = None
             created_boundary_lines = 0
-            if not is_neighbor:
+            if geo.open_traverse:
+                # Незавершённый обход рисуется только по известным сторонам.
+                # Нельзя замыкать его полилинией или угадывать фасад.
+                if not geo.boundary_lines or not hasattr(model_space, "AddLine"):
+                    raise AcadDrawError("Не удалось построить известные стороны открытого обхода.")
+                street_indices = set(geo.street_boundary_indices) if not is_neighbor else set()
+                for index, b_line in enumerate(geo.boundary_lines):
+                    if is_neighbor:
+                        line_ent = self._add_line(model_space, b_line, poly_target_layer)
+                    else:
+                        on_street = index in street_indices
+                        layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                        line_ent = self._add_survey_line(
+                            model_space, b_line, layer, color,
+                            linetype="ByLayer" if on_street else "Continuous",
+                        )
+                    created_boundary_lines += 1
+                    if primary_entity is None:
+                        primary_entity = line_ent
+            elif not is_neighbor:
                 # Разные слои в одном контуре требуют отдельных LINE, даже если
                 # в старом config.json была выбрана полилиния.
                 if not geo.boundary_lines or not hasattr(model_space, "AddLine"):
@@ -3246,10 +3344,19 @@ class AcadBuilder:
             created = 0
             for item in geo.items:
                 try:
-                    entity = self._add_text(
-                        model_space, item, geo.text_height, text_target_layer, style,
-                        strict_style=True,
-                    )
+                    if not geo.print_draft and (item.correction_indices or item.correction_deleted):
+                        try:
+                            entity = self._add_corrected_street_text(
+                                model_space, item, geo.text_height, text_target_layer, style)
+                        except Exception as exc:  # noqa: BLE001
+                            warnings.append(f"не удалось выделить исправление улицы «{item.text}»: {exc}")
+                            entity = self._add_text(model_space, item, geo.text_height, text_target_layer,
+                                                    style, strict_style=True)
+                    else:
+                        entity = self._add_text(
+                            model_space, item, geo.text_height, text_target_layer, style,
+                            strict_style=True,
+                        )
                     created += 1
                     # Только однострочные bearing + расстояние печатного черновика.
                     match = re.fullmatch(r"side-(\d+)", item.kind) if geo.print_draft else None
@@ -3369,7 +3476,7 @@ class AcadBuilder:
                 boundary_line_count=created_boundary_lines,
             )
         finally:
-            if self._com_owned:
+            if self._com_owned and not self._hold_connection:
                 self._app = None
                 self._doc = None
                 self._com_owned = False

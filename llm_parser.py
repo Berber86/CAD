@@ -50,6 +50,7 @@ import drawing_warnings
 
 import ocr_numbers
 import street_names
+from legal_street_policy import NYC_STREET_INSTRUCTION
 from description_check import CLOSURE_OK_FT, accepted_without_ai
 
 __all__ = [
@@ -204,7 +205,10 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "multiple_description_search": {"enabled": False},
+    "multiple_description_search": {
+        "enabled": False,
+        "vision_fallback": {"provider": "hydra", "model": "grok-4.7", "image_limit": 10},
+    },
     "api": {
         "provider": "hydra",
         "api_key": "",
@@ -1338,6 +1342,11 @@ class LegalDescription(BaseModel):
     main_street: str = Field(
         description="Улица, на которую выходит фасад участка (fronting ...)"
     )
+    main_street_corrected: str | None = Field(
+        default=None,
+        description=("Исправленное название фасадной улицы только если меняется написание; "
+                     "исходное прочитанное название обязательно остаётся в main_street, иначе null."),
+    )
     main_street_note: str | None = Field(
         default=None,
         description=(
@@ -1357,6 +1366,11 @@ class LegalDescription(BaseModel):
     cross_street: str | None = Field(
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
+    )
+    cross_street_corrected: str | None = Field(
+        default=None,
+        description=("Исправленное название пересекаемой улицы только при исправлении; "
+                     "исходное название обязательно остаётся в cross_street, иначе null."),
     )
     cross_street_former: str | None = Field(
         default=None,
@@ -1450,6 +1464,16 @@ class LegalDescription(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _require_original_for_correction(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for name in ("main_street", "cross_street"):
+                corrected = data.get(name + "_corrected")
+                if corrected and not _clean_name(data.get(name)):
+                    raise ValueError(f"{name}_corrected requires the original {name}")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _preprocess_corner_tie(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
@@ -1503,7 +1527,9 @@ class LegalDescription(BaseModel):
 
     @field_validator(
         "main_street_note",
+        "main_street_corrected",
         "cross_street",
+        "cross_street_corrected",
         "cross_street_former",
         "distance_to_corner_source",
         "tie_note",
@@ -2360,17 +2386,17 @@ CRITICAL SURVEY RULES
      * "50'-0 3/4\"" -> 50 + 0.75/12 = 50.0625
      * varas (×2.77778) or chains (×66) -> decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
-   - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
+   - `main_street`: the exact name as read for the primary street the lot fronts on; keep it unchanged even when spelling is corrected. `main_street_corrected`: corrected spelling if changed, otherwise null.
    - `main_street_note`: parenthetical subtitle of the front street if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null. Keep the street width in it when the document gives one ("60 feet wide" -> "(60' WIDE)"). Do NOT put an old street name there.
    - `main_street_former`: the OLD name of the front street when the document gives it with "formerly", "previously known as", "formerly known as", "also known as", "a/k/a" or "f/k/a", in parentheses or without them (e.g. "Stafford Avenue (formerly Carlton Street)" -> main_street "Stafford Avenue", main_street_former "Carlton Street"). `main_street` must contain only the current name. Else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
    - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
    - `distance_to_corner_source`: the original feet-and-inches notation for the tie distance, if explicitly printed (else null).
    - `cross_street_former`: former name of the intersecting street only when explicitly associated with it in the document, otherwise null.
-   - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
+   - `cross_street`: exact name as read for the intersecting street, else null. `cross_street_corrected`: corrected spelling if changed, otherwise null; never replace the original in `cross_street`.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
-6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only."""
+6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only.""" + "\n\n" + NYC_STREET_INSTRUCTION
 
 USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 \"\"\"

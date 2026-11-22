@@ -1,5 +1,6 @@
 """Network-free tests for the experimental stage 3 parsing policy."""
 import json
+import math
 
 import pytest
 
@@ -127,7 +128,7 @@ def test_invalid_items_preserved_individually_after_retries():
     assert len(calls) == 3
     assert [x.data.lot_number for x in result.items] == ['5', '6']
     assert not result.complete and result.error == 'invalid_item'
-    assert result.selection == 'closure_fallback'
+    assert result.selection == 'closure_fallback_uncertain'
 
 
 def test_recover_only_unambiguous_top_level_prefix():
@@ -191,6 +192,7 @@ def test_geometric_tie_prefers_measurable_then_first():
               answer([item('complete2', delta=3), {}])]
     result = call(lambda *a: values.pop(0))
     assert result.items[0].data.lot_number == 'complete' and result.selected_attempt == 1
+    assert result.selection == 'closure_fallback_uncertain'
 
 
 def test_damaged_item_preserves_only_continuous_valid_prefix_of_sides():
@@ -258,3 +260,100 @@ def test_short_complete_item_keeps_known_sides_as_incomplete_after_retries():
     result = call(lambda *a: answer([short]))
     assert len(result.items) == 1 and len(result.items[0].data.segments) == 2
     assert not result.items[0].complete and not result.complete
+
+
+def test_nonfinite_side_never_produces_nonfinite_geometry():
+    value = item('5')
+    value['data']['segments'][1]['distance_ft'] = float('inf')
+    result = call(lambda *a: answer([value]))
+    assert len(result.items) == 1 and not result.items[0].complete
+    assert len(result.items[0].data.segments) == 1
+    assert all(math.isfinite(x) for x in result.items[0].data.segments[0].vector)
+
+
+def test_legacy_inferred_tie_is_not_passed_off_as_explicit_model_output():
+    value = item('5')
+    value['data']['distance_to_corner_ft'] = 55.42
+    value['data']['cross_street'] = 'Cross Street'
+    result = call(lambda *a: answer([value]))
+    assert result.items[0].data.distance_to_corner_ft == pytest.approx(55.42)
+    assert result.items[0].data.corner_to_pob_bearing is None
+
+
+def test_explicit_tie_from_model_is_preserved():
+    value = item('5')
+    value['data']['distance_to_corner_ft'] = 55.42
+    value['data']['cross_street'] = 'Cross Street'
+    value['data']['corner_to_pob_bearing'] = dict(ns='N', degrees=90, minutes=0, seconds=0,
+                                                  ew='E', distance_ft=55.42)
+    result = call(lambda *a: answer([value]))
+    assert result.items[0].data.corner_to_pob_bearing is not None
+    assert result.items[0].data.corner_to_pob_bearing.distance_ft == pytest.approx(55.42)
+
+
+def test_nominal_or_closure_solved_bearing_does_not_fabricate_measurable_zero():
+    unknown = item('unknown')
+    unknown['data']['segments'][0]['has_bearing'] = False
+    solved = item('solved')
+    solved['data']['segments'][0]['bearing_solved'] = True
+    actual = item('actual', delta=3)
+    values = [answer([unknown, {}]), answer([solved, {}]), answer([actual, {}])]
+    result = call(lambda *a: values.pop(0))
+    assert result.items[0].data.lot_number == 'actual'
+    assert result.selection == 'closure_fallback'
+
+
+def test_all_unknown_closures_choose_first_and_record_uncertainty():
+    def unknown(lot):
+        data = item(lot)
+        data['data']['segments'][0]['has_bearing'] = False
+        return answer([data, {}])
+    values = [unknown('first'), unknown('second'), unknown('third')]
+    result = call(lambda *a: values.pop(0))
+    assert result.items[0].data.lot_number == 'first'
+    assert result.selection == 'closure_fallback_uncertain'
+
+
+def test_missing_street_name_does_not_discard_a_valid_partial_traverse():
+    value = item('5', complete=False)
+    value['data'].pop('main_street')
+    value['data']['segments'] = value['data']['segments'][:2]
+    result = call(lambda *args: answer([value], complete=False))
+    assert len(result.items) == 1 and len(result.items[0].data.segments) == 2
+    assert result.items[0].data.main_street == '' and not result.complete
+
+
+@pytest.mark.parametrize('choice,status', [
+    (lambda *a: 1, 'selected'),
+    (lambda *a: None, 'invalid_selection'),
+    (lambda *a: (_ for _ in ()).throw(ValueError('secret')), 'invalid_selection'),
+    (lambda *a: (_ for _ in ()).throw(md.ImageSizeRejected()), 'size_rejected'),
+    (lambda *a: (_ for _ in ()).throw(TimeoutError('secret')), 'request_failed'),
+    (None, 'unavailable'),
+])
+def test_comparison_diagnostics_are_sanitized_and_describe_attempts(choice, status):
+    values = [answer([item('a'), {}]), answer([item('b'), {}]), answer([item('c'), {}])]
+    result = call(lambda *a: values.pop(0), choose=choice)
+    assert result.comparison.status == status
+    assert result.comparison.attempt_indices == (0, 1, 2)
+    assert result.comparison.pages == (() if choice is None else (1, 2))
+    assert 'secret' not in repr(result.comparison)
+
+
+def test_failure_diagnostics_include_safe_status_and_elapsed_without_provider_message():
+    class ProviderError(Exception):
+        status_code = 429
+    messages = []
+    def send(*a):
+        raise ProviderError('SECRET TOKEN AND DOCUMENT')
+    result = call(send, progress=messages.append)
+    assert len(result.attempts) == 3
+    assert all(a.issue == 'request_failed' and a.failure_kind == 'http_429' and
+               isinstance(a.elapsed_seconds, float) and a.elapsed_seconds >= 0 for a in result.attempts)
+    assert 'HTTP 429' in ' '.join(messages)
+    assert 'SECRET' not in repr(result) + ' '.join(messages)
+
+
+def test_size_rejection_does_not_invent_http_status():
+    result = call(lambda *a: (_ for _ in ()).throw(md.ImageSizeRejected()), n=2)
+    assert all(a.failure_kind == 'size_rejected' for a in result.attempts)

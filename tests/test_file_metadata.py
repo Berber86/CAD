@@ -251,3 +251,15 @@ def test_manifest_approval_is_reset_when_trimmed_pdf_changes(tmp_path):
     assert raw["accepted"] is False and raw["checks"] == {}
     assert manifest["items"][0]["accepted"] is False and manifest["items"][0]["checks"] == {}
     assert manifest["items"][0]["file_digests"] == raw["file_digests"]
+
+
+def test_expected_digest_prevents_recording_stale_outcome(tmp_path):
+    path = tmp_path / 'OUR 30.pdf'
+    path.write_bytes(b'original')
+    old_digest = fm._digest(path)
+    path.write_bytes(b'replaced')
+    outcome = ParseOutcome(data=desc(), source='llm')
+    with pytest.raises(ValueError, match='changed'):
+        fm.record_outcome(path, outcome, expected_digest=old_digest)
+    assert not path.with_suffix('.json').exists()
+    assert outcome.data._source_file_sha256 == ''

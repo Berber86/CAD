@@ -81,6 +81,7 @@ class IntakeOutcome:
     records: list[deed_store.StoredDeed] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)   # чего не хватает и почему
     notes: list[str] = field(default_factory=list)     # что произошло по ходу
+    page_search_skipped: bool = False
 
     @property
     def ok(self) -> bool:
@@ -103,7 +104,9 @@ class IntakeOutcome:
             lines.append("Собрано:")
             lines.extend(f"  • {record.file}"
                          + (f" — {record.doc_type} от {record.doc_date}" if record.doc_type else "")
-                         + (f", описание стр. {record.pages}" if record.pages else ", страницы описания не найдены")
+                         + (f", описание стр. {record.pages}" if record.pages else
+                            (", поиск страниц пропущен" if self.page_search_skipped
+                             else ", страницы описания не найдены"))
                          for record in self.records)
         else:
             lines.append("")
@@ -169,6 +172,14 @@ def _row_label(row: rcclerk.DeedRow) -> str:
     return f"{kind}{site_word} №{row.endorsement_id} от {when}"
 
 
+def is_richmond_borough(value: object) -> bool:
+    """Only explicit Staten Island/Richmond County identifies this clerk site."""
+    import re
+    text = re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+    return text in {"staten island", "staten island, ny", "staten island, new york",
+                    "richmond county", "richmond county, ny", "richmond county, new york"}
+
+
 def collect_deeds(
     *,
     block: int | str,
@@ -185,6 +196,7 @@ def collect_deeds(
     ocr_dpi: int = ocr_pages.DEFAULT_DPI,
     downloads_dir: str | Path | None = None,
     page_finder: PageFinder | None = None,
+    search_pages: bool = True,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
 ) -> IntakeOutcome:
@@ -199,8 +211,14 @@ def collect_deeds(
     ``auto_save`` — безопасный хук, который ждёт загруженный PDF в браузере и
     отправляет Ctrl+S однократно; ``downloads_dir`` — папка «Загрузки».
     """
+    if not is_richmond_borough(borough):
+        raise ValueError("Richmond County Clerk доступен только для Staten Island / Richmond County; укажите район")
+    if not isinstance(search_pages, bool):
+        raise ValueError("search_pages must be boolean")
     block_no = int(block)
     lot_no = int(lot)
+    if block_no <= 0 or lot_no <= 0:
+        raise ValueError("block and lot must be positive")
     neighbour_lots = parse_lot_list(neighbours)
     target_dir = Path(folder) if folder is not None else Path.cwd() / DESCR_DIR_NAME
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +231,7 @@ def collect_deeds(
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
     )
-    outcome = IntakeOutcome(folder=target_dir)
+    outcome = IntakeOutcome(folder=target_dir, page_search_skipped=not search_pages)
 
     def say(message: str) -> None:
         outcome.notes.append(message)
@@ -268,7 +286,7 @@ def collect_deeds(
                 block_no=block_no, lot_value=lot_value, role=role, row=row, tag=tag,
                 borough=borough, identity=(identity_by_lot or {}).get(str(lot_value)),
                 target_dir=target_dir, base_url=base_url,
-                download=download, find_pages=find_pages, ocr_dpi=ocr_dpi,
+                download=download, find_pages=find_pages if search_pages else None, ocr_dpi=ocr_dpi,
                 say=say, missing=outcome.missing,
             )
             if outcome_item is not None:
@@ -298,7 +316,7 @@ def _collect_one(
     target_dir: Path,
     base_url: str,
     download: Downloader,
-    find_pages: PageFinder,
+    find_pages: PageFinder | None,
     ocr_dpi: int,
     say: Progress,
     missing: list[str],
@@ -330,24 +348,27 @@ def _collect_one(
             say(f"  {name}: скачано ступенью «{rung}»")
         pages = ""
         trimmed_path: Path | None = None
-        say(f"  {name}: ищу начало и конец описания (локальный OCR, {int(ocr_dpi)} dpi)…")
-        try:
-            found = find_pages(saved)
-        except Exception as exc:  # noqa: BLE001 - страницы не обязательны для файла
-            say(f"  {name}: страницы описания не искались — {exc}")
-            found = deed_pages.DescriptionPages()
-        if found.pages:
-            pages = found.pages_spec
-            trimmed_path = Path(tmp) / f"{name}_p{pages}.pdf"
-            try:
-                deed_pages.trim_pdf(saved, found.pages, trimmed_path)
-            except Exception as exc:  # noqa: BLE001
-                say(f"  {name}: не удалось сделать обрезанную копию — {exc}")
-                trimmed_path = None
-            else:
-                say(f"  {name}: описание на стр. {pages} (копия {trimmed_path.name})")
+        found = deed_pages.DescriptionPages()
+        if find_pages is None:
+            say(f"  {name}: полный PDF сохранён; страницы найдёт следующий этап")
         else:
-            say(f"  {name}: страницы описания не найдены — файл кладу целиком")
+            say(f"  {name}: ищу начало и конец описания (локальный OCR, {int(ocr_dpi)} dpi)…")
+            try:
+                found = find_pages(saved)
+            except Exception as exc:  # noqa: BLE001
+                say(f"  {name}: страницы описания не искались — {exc}")
+            if found.pages:
+                pages = found.pages_spec
+                trimmed_path = Path(tmp) / f"{name}_p{pages}.pdf"
+                try:
+                    deed_pages.trim_pdf(saved, found.pages, trimmed_path)
+                except Exception as exc:  # noqa: BLE001
+                    say(f"  {name}: не удалось сделать обрезанную копию — {exc}")
+                    trimmed_path = None
+                else:
+                    say(f"  {name}: описание на стр. {pages} (копия {trimmed_path.name})")
+            else:
+                say(f"  {name}: страницы описания не найдены — файл кладу целиком")
         notes = [f"ступень загрузки: {rung}"] if rung != "direct" else []
         if row.clerk_number:
             notes.append(f"клерк: {row.clerk_number}")

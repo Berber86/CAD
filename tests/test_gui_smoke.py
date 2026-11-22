@@ -329,6 +329,10 @@ class _FakeCanvas(_Widget):
         self.items.append(("line", coords, dict(kwargs)))
         return len(self.items)
 
+    def create_arc(self, *coords, **kwargs):
+        self.items.append(("arc", coords, dict(kwargs)))
+        return len(self.items)
+
     def create_oval(self, *coords, **kwargs):
         self.items.append(("oval", coords, dict(kwargs)))
         return len(self.items)
@@ -3753,6 +3757,7 @@ def _step0_pdf(path):
 
 
 def _fill_step0(app, *, block="6323", lot="32", neighbours="30", folder=""):
+    app.step0_borough_var.set("Staten Island")
     app.step0_block_var.set(block)
     app.step0_lot_var.set(lot)
     app.step0_neighbours_var.set(neighbours)
@@ -3947,6 +3952,9 @@ def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
     assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
     trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
     assert trimmed.name_pages == (2, 2)
+    assert trimmed.is_main
+    assert next(item for item in items if item.path.name == "LOT 30 NEW.pdf").is_main is False
+    assert app._pdf_set_dialog.main_var.get() == str(items.index(trimmed))
 
 
 def test_step0_handover_without_files_explains_itself(gui, tmp_path):
@@ -5931,8 +5939,8 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     app = gui.SurveyApp()
     _fill_step0(app, neighbours="30, 40", folder=tmp_path)
     app.step0_address_var.set("Example address")
-    app.step0_borough_var.set("Queens")
-    portal = SimpleNamespace(block="6323", lot="32", borough="Queens", neighbours=["30"], details_source="vision")
+    app.step0_borough_var.set("Staten Island")
+    portal = SimpleNamespace(block="6323", lot="32", borough="Staten Island", neighbours=["30"], details_source="vision")
     app._step0_lookup_snapshot = ("Example address", portal)
     seen = {}
     def collect(**kwargs):
@@ -5941,8 +5949,30 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
     app._start_step0_intake()
     _wait_step0(app)
-    assert seen["borough"] == "Queens"
+    assert seen["borough"] == "Staten Island"
     assert seen["identity_by_lot"]["32"]["block"][0]["source"] == "portal"
     assert seen["identity_by_lot"]["30"]["lot"][0]["method"] == "vision map (unverified)"
     assert seen["identity_by_lot"]["40"]["lot"][0]["source"] == "manual"
     app._on_close()
+
+
+def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
+    app = gui.SurveyApp()
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
+    folder = tmp_path / '01_описания'
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-new.pdf'), role='our', lot=32,
+                             tag='NEW', block=6323, pages='2',
+                             trimmed_source=_step0_pdf(tmp_path / 'trimmed.pdf'))
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-old.pdf'), role='our', lot=32,
+                             tag='OLD', block=6323)
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'neighbour.pdf'), role='neighbour',
+                             lot=30, tag='NEW', block=6323)
+    _fill_step0(app, folder=folder, neighbours='30')
+    app._step0_to_step1()
+    dialog = app._pdf_set_dialog
+    assert dialog is not None and dialog.multi_mode
+    assert {item.path.name: item.is_main for item in dialog.items} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+    assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}

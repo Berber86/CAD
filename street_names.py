@@ -331,3 +331,86 @@ def with_shared_aliases(description: Any, shared: list[str]) -> Any:
     if merged == own:
         return description
     return description.model_copy(update={"street_aliases": merged})
+
+
+# Comparisons here are scoped to a geometry-supported scene match, not an
+# assertion that two strings are official NYC street names or global aliases.
+_COMPARISON_TYPES = {
+    'ST': 'STREET', 'STREET': 'STREET', 'AVE': 'AVENUE', 'AVENUE': 'AVENUE',
+    'BLVD': 'BOULEVARD', 'BOULEVARD': 'BOULEVARD', 'RD': 'ROAD', 'ROAD': 'ROAD',
+    'DR': 'DRIVE', 'DRIVE': 'DRIVE', 'PL': 'PLACE', 'PLACE': 'PLACE',
+    'LN': 'LANE', 'LANE': 'LANE', 'PKWY': 'PARKWAY', 'PARKWAY': 'PARKWAY',
+    'CT': 'COURT', 'COURT': 'COURT', 'TER': 'TERRACE', 'TERRACE': 'TERRACE',
+    'HWY': 'HIGHWAY', 'HIGHWAY': 'HIGHWAY', 'EXPY': 'EXPRESSWAY', 'EXPRESSWAY': 'EXPRESSWAY',
+}
+_DIRECTIONS = {'N', 'S', 'E', 'W', 'NE', 'NW', 'SE', 'SW', 'NORTH', 'SOUTH',
+               'EAST', 'WEST', 'NORTHEAST', 'NORTHWEST', 'SOUTHEAST', 'SOUTHWEST'}
+
+
+def _one_letter_difference(a: str, b: str) -> bool:
+    if not (a.isascii() and b.isascii() and a.isalpha() and b.isalpha()
+            and min(len(a), len(b)) >= 4 and abs(len(a) - len(b)) <= 1):
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    if len(a) > len(b):
+        a, b = b, a
+    return any(b[:i] + b[i+1:] == a for i in range(len(b)))
+
+
+def scene_street_match(first: str | None, second: str | None) -> bool:
+    """Exact/one-letter match for further corroboration, never proof on its own.
+
+    Directionals, route/ordinal numbers and street types must not differ; a
+    single insertion, deletion or substitution applies to one name token only.
+    """
+    a, b = ' '.join(str(first or '').upper().split()), ' '.join(str(second or '').upper().split())
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if not a.isascii() or not b.isascii():
+        return False
+    left, right = re.findall(r'[A-Z0-9]+', a), re.findall(r'[A-Z0-9]+', b)
+    if not left or len(left) != len(right):
+        return False
+    left[-1] = _COMPARISON_TYPES.get(left[-1], left[-1])
+    right[-1] = _COMPARISON_TYPES.get(right[-1], right[-1])
+    # Punctuation/standard abbreviations alone can match, but no type change.
+    if left == right:
+        return True
+    differences = [(i, x, y) for i, (x, y) in enumerate(zip(left, right)) if x != y]
+    if len(differences) != 1:
+        return False
+    index, x, y = differences[0]
+    if index == len(left) - 1 or x in _DIRECTIONS or y in _DIRECTIONS:
+        return False
+    return _one_letter_difference(x, y)
+
+
+def correction_marks(original: str | None, corrected: str | None) -> tuple[str, tuple[int, ...], str]:
+    """Display spelling, changed character indices and deleted source characters.
+
+    Compare after the same display formatting, ignoring case and spacing, so
+    ordinal typography and doubled spaces aren't mistaken for AI corrections.
+    """
+    from difflib import SequenceMatcher
+    display = street_text(corrected or original)
+    if not original or not corrected:
+        return display, (), ''
+    old = street_text(original)
+    old_chars = [(i, c) for i, c in enumerate(old) if not c.isspace()]
+    new_chars = [(i, c) for i, c in enumerate(display) if not c.isspace()]
+    matcher = SequenceMatcher(None, [c.casefold() for _, c in old_chars],
+                              [c.casefold() for _, c in new_chars], autojunk=False)
+    changed: list[int] = []
+    deleted: list[str] = []
+    for tag, a, b, c, d in matcher.get_opcodes():
+        if tag in ('replace', 'insert'):
+            changed.extend(i for i, _ in new_chars[c:d])
+        if tag == 'delete':
+            deleted.extend(ch for _, ch in old_chars[a:b])
+        elif tag == 'replace' and b - a > d - c:
+            # A replacement can consume more characters than it produces.
+            deleted.extend(ch for _, ch in old_chars[a + (d - c):b])
+    return display, tuple(changed), ''.join(deleted)

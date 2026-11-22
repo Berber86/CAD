@@ -130,6 +130,7 @@ def test_version_is_compared_as_numbers_not_as_text():
     assert up.parse_app_version('APP_VERSION = "4.7"') == (4, 7)
     assert up.version_key("4.7") < up.version_key("4.41")
     assert up.version_key("v4.41.2") == (4, 41, 2)
+    assert up.version_key("4.80") < up.version_key("4.80.1") < up.version_key("4.81")
     assert up.parse_app_version("APP_DATE = '2026-11-19'") is None
     assert up.parse_app_version("") is None
     assert up.version_text((4, 41)) == "4.41"
@@ -190,6 +191,16 @@ def test_discovery_picks_the_branch_with_the_highest_version(github):
     assert found.chosen.version_text == "4.41"
     assert found.is_newer is True
     assert "4.41" in found.message
+
+
+def test_discovery_offers_patch_version_after_base_release(github):
+    fake = FakeGitHub()
+    fake.add("main", version="4.80")
+    fake.add("arena/4054f7eb-cad", version="4.80.1", state={"state": "stable"})
+    github(fake)
+    found = up.discover_branch(fake.owner, fake.repo, installed_version="4.80")
+    assert found.chosen is not None and found.chosen.version_text == "4.80.1"
+    assert found.is_newer is True
 
 
 def test_discovery_skips_branches_without_version_file(github):

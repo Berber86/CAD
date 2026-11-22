@@ -12,7 +12,8 @@ from conflict_resolver import (LotInput, _Scene, Change, apply_changes, advisor_
 
 @pytest.mark.parametrize("filename,expected", [
     ("LOT 30 NEW.pdf", "30"), ("lot30.pdf", "30"), ("LOT_12_P3.PDF", "12"),
-    ("OUR 32 NEW_p4-6.pdf", "32"), ("LOT 30 OLD_p2-2.pdf", "30"),
+    ("OUR LOT 1 NEW.pdf", "1"), ("OUR LOT 32 NEW_p4-6.pdf", "32"), ("OUR LOT 32 OLD.pdf", "32"),
+    ("LOT 2 NEW.pdf", "2"), ("OUR 32 NEW_p4-6.pdf", "32"), ("LOT 30 OLD_p2-2.pdf", "30"),
     ("folder/56th Street LOT 12A.pdf", "12A"), (r"C:\\files\\лот-99.jpg", "99"),
     ("30.pdf", None), ("deed_LOT_20_p1.pdf", "20"), ("lot0012A_p2_5.pdf", "0012A"),
     ("main_2025_p1.pdf", None), ("bruklin250_p2_5.pdf", None),
@@ -80,9 +81,10 @@ def test_both_advisor_requests_explicitly_identify_each_lot_and_source():
 
 
 @pytest.mark.parametrize("filename,deed,expected,warning", [
+    ("OUR LOT 32 NEW.pdf", None, "LOT 32", None),
+    ("OUR LOT 32 NEW.pdf", "32", "LOT 32", None),
+    ("OUR LOT 32 NEW.pdf", "26", "LOT 32", "не совпадает"),
     ("OUR 32 NEW.pdf", None, "LOT 32", None),
-    ("OUR 32 NEW.pdf", "32", "LOT 32", None),
-    ("OUR 32 NEW.pdf", "26", "LOT 32", "не совпадает"),
     ("plain.pdf", "26", "LOT 26", None),
     ("plain.pdf", None, "LOT ?", "не найден"),
 ])
@@ -107,11 +109,12 @@ def test_our_lot_label_main_but_not_print_draft(filename, deed, expected, warnin
 
 
 @pytest.mark.parametrize('path,expected', [
+    ('OUR LOT 1 NEW.pdf', True), ('OUR LOT 32 OLD_p2-4.pdf', True),
     ('OUR 6 NEW.pdf', True), ('our 06.pdf', True), ('Our_6_p2.pdf', True),
     ('OUR6.pdf', True), ('OUR.pdf', True), ('OUR(1).PDF', True),
     ('C:\\OUR files\\LOT 5.pdf', False), ('not OUR 6.pdf', False),
     ('ours.pdf', False), ('ourhouse.pdf', False), ('OURАллея.pdf', False),
-    ('LOT 6.pdf', False), ('', False),
+    ('LOT 2 NEW.pdf', False), ('LOT 6.pdf', False), ('', False),
 ])
 def test_our_role_prefix_is_on_the_basename_only(path, expected):
     assert li.has_our_prefix(path) is expected

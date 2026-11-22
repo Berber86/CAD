@@ -3855,7 +3855,7 @@ def test_step0_success_enables_handover_to_step1(gui, tmp_path):
     outcome = gui.deed_intake.IntakeOutcome(
         folder=folder,
         records=[
-            gui.deed_store.StoredDeed(file="OUR 32 NEW.pdf", role="our", lot="32", pages="2"),
+            gui.deed_store.StoredDeed(file="OUR LOT 32 NEW.pdf", role="our", lot="32", pages="2"),
         ],
     )
     saved = gui.deed_intake.collect_deeds
@@ -3867,7 +3867,7 @@ def test_step0_success_enables_handover_to_step1(gui, tmp_path):
     finally:
         gui.deed_intake.collect_deeds = saved
     assert app.step0_to_step1_button.cget("state") == "normal"
-    assert "OUR 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
+    assert "OUR LOT 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
     assert "собрано документов — 1" in app.status_var.get()
 
 
@@ -3949,8 +3949,8 @@ def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
     app._step0_to_step1()
     assert app._pdf_set_dialog is not None
     items = app._pdf_set_dialog.items
-    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
-    trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
+    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR LOT 32 NEW_p2.pdf"]
+    trimmed = next(item for item in items if item.path.name == "OUR LOT 32 NEW_p2.pdf")
     assert trimmed.name_pages == (2, 2)
     assert trimmed.is_main
     assert next(item for item in items if item.path.name == "LOT 30 NEW.pdf").is_main is False
@@ -4027,7 +4027,7 @@ def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(g
     app._step0_to_step1()
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
     # Старый документ нашего участка хранится в папке, но в набор Шага 1 не передаётся (решение пользователя).
-    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
+    assert names == ["LOT 30 NEW.pdf", "OUR LOT 32 NEW_p2.pdf"]
     assert any("В manifest не было LOT 30 NEW.pdf" in line for line in _step0_texts(app))
     assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in _step0_texts(app))
 
@@ -5973,6 +5973,6 @@ def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_
     dialog = app._pdf_set_dialog
     assert dialog is not None and dialog.multi_mode
     assert {item.path.name: item.is_main for item in dialog.items} == {
-        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+        'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
     assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
-        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+        'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}

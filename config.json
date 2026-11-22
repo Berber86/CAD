@@ -823,7 +823,8 @@
     "obstacle_layer_exclude": [],
     "text_obstacle_layers": [
       "BOUNDARY_TEXT*",
-      "M-TAX-DIM"
+      "M-TAX-DIM",
+      "LETTER"
     ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,

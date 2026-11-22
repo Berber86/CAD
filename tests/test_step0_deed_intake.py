@@ -7,7 +7,7 @@
 * берутся строки **Deed**, а если их нет — **Mortgage**;
 * для нашего лота качаются самый свежий и самый старый документ, для соседей —
   только свежий;
-* имя файла: ``OUR 32 NEW.pdf`` / ``OUR 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``);
+* имя файла: ``OUR LOT 32 NEW.pdf`` / ``OUR LOT 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``);
 * скачивание честно падает, если сайт показал проверку Cloudflare, и объясняет,
   что делать руками.
 
@@ -226,9 +226,12 @@ def test_no_deeds_and_no_mortgages_means_nothing_to_download():
 
 
 def test_file_names_follow_the_customers_scheme():
-    assert rcclerk.document_file_name("our", 32, "NEW") == "OUR 32 NEW.pdf"
-    assert rcclerk.document_file_name("our", 32, "OLD") == "OUR 32 OLD.pdf"
+    assert rcclerk.document_file_name("our", 1, "NEW") == "OUR LOT 1 NEW.pdf"
+    assert rcclerk.document_file_name("our", 32, "NEW") == "OUR LOT 32 NEW.pdf"
+    assert rcclerk.document_file_name("our", 32, "OLD") == "OUR LOT 32 OLD.pdf"
+    assert rcclerk.document_file_name("neighbour", 2, "NEW") == "LOT 2 NEW.pdf"
     assert rcclerk.document_file_name("neighbour", 30, "NEW") == "LOT 30 NEW.pdf"
+    assert rcclerk.document_file_name("neighbour", 30, "OLD") == "LOT 30 OLD.pdf"
 
 
 # --------------------------------------------------------------- скачивание
@@ -412,7 +415,7 @@ def test_trimmed_copy_keeps_only_the_description_pages(tmp_path):
     import deed_pages
 
     pdf = _text_pdf(tmp_path / "deed.pdf", ["COVER PAGE", DESCRIPTION_TEXT, "RP-5217"])
-    out = deed_pages.trim_pdf(pdf, [2], tmp_path / "OUR 32 NEW_p2.pdf")
+    out = deed_pages.trim_pdf(pdf, [2], tmp_path / "OUR LOT 32 NEW_p2.pdf")
     import pymupdf
 
     doc = pymupdf.open(str(out))
@@ -455,18 +458,18 @@ def test_store_files_the_document_with_sidecar_and_manifest(tmp_path):
         trimmed_source=trimmed,
     )
     # Документ целиком и рядом — только страницы описания (схема «оба»).
-    assert record.file == "OUR 32 NEW.pdf"
-    assert record.trimmed == "OUR 32 NEW_p4-6.pdf"
-    assert (folder / "OUR 32 NEW.pdf").is_file()
-    assert (folder / "OUR 32 NEW_p4-6.pdf").is_file()
-    sidecar = json.loads((folder / "OUR 32 NEW.json").read_text(encoding="utf-8"))
+    assert record.file == "OUR LOT 32 NEW.pdf"
+    assert record.trimmed == "OUR LOT 32 NEW_p4-6.pdf"
+    assert (folder / "OUR LOT 32 NEW.pdf").is_file()
+    assert (folder / "OUR LOT 32 NEW_p4-6.pdf").is_file()
+    sidecar = json.loads((folder / "OUR LOT 32 NEW.json").read_text(encoding="utf-8"))
     assert sidecar["endorsement_id"] == str(NEWEST_ID)
-    assert sidecar["trimmed"] == "OUR 32 NEW_p4-6.pdf"
+    assert sidecar["trimmed"] == "OUR LOT 32 NEW_p4-6.pdf"
     assert sidecar["source_url"].endswith(f"p_endorsementId={NEWEST_ID}")
     manifest = deed_store.read_manifest(folder)
     assert manifest["version"] == deed_store.MANIFEST_VERSION
-    assert [item["file"] for item in manifest["items"]] == ["OUR 32 NEW.pdf"]
-    assert manifest["items"][0]["trimmed"] == "OUR 32 NEW_p4-6.pdf"
+    assert [item["file"] for item in manifest["items"]] == ["OUR LOT 32 NEW.pdf"]
+    assert manifest["items"][0]["trimmed"] == "OUR LOT 32 NEW_p4-6.pdf"
 
 
 def test_manifest_lists_our_lot_first_and_neighbours_after(tmp_path):

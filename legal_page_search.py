@@ -329,9 +329,10 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         if file_metadata._digest(path) != digest:
             raise SearchError("PDF changed during search; results were not saved.")
         with file_metadata._LOCK:
-            current = _load_history(target)
-            current["runs"].append(run)
-            file_metadata._write_json(target, current)
+            # Never rebind ``current``: it is the cancellation callback of this run.
+            history_now = _load_history(target)
+            history_now["runs"].append(run)
+            file_metadata._write_json(target, history_now)
     except SearchError:
         raise
     except OSError as exc:

@@ -99,7 +99,11 @@
 | AutoCAD, печатный черновик и уникальное сохранение | `acad_builder.py`, `auto_dwg_save.py`; цветовые отметки — `street_names.py`, `drawing_warnings.py` |
 | Версия и запуск | `version.py`, `run.bat`, `requirements.txt`, `requirements-ocr.txt` |
 
-`docs/customer_rules.md` содержит подробные правила заказчика. План
+`docs/customer_rules.md` содержит подробные правила заказчика. Аудит готовящегося
+автономного прохода «адрес → DWG в папке проекта» —
+`docs/audit_avtopotok_adres_do_dwg.md` (22.11.2026): узкие места, предлагаемые
+подпорки и пять вопросов, решение по которым остаётся за пользователем; ничего из
+действующих правил этот документ не отменяет. План
 `docs/multiple_legal_descriptions_plan.md`, карта `docs/karta_potoka_pdf_autocad.md`
 и старые patch notes включают **исторические** решения/статусы. Например,
 подпапка и запрет сохранения неполного чертежа из `patch_notes_4.80.11.md`

@@ -1,0 +1,298 @@
+"""Local diagnostics and strict cache for experimental multi-description parsing.
+
+No image bytes, source document text, API credentials or raw provider responses
+are written. This module is not wired to the existing application workflow.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import re
+from typing import Any, Mapping, Sequence
+
+import file_metadata
+from llm_parser import LegalDescription
+from multiple_description_parse import (
+    COMPARISON_INSTRUCTION, DescriptionItem, PageImage, ParseResult, SCHEMA_VERSION, _items, system_instruction,
+)
+
+SIDECAR_SCHEMA = "titlesurveyai.multiple_description_parse.v1"
+
+
+class CacheError(RuntimeError):
+    pass
+
+
+def diagnostics_path(pdf: str | Path) -> Path:
+    path = Path(pdf)
+    return path.with_name(path.name + ".multi-parse.json")
+
+
+def cache_context(*, pdf_sha256: str, pages: Sequence[PageImage], image_settings: Mapping[str, Any],
+                  provider: str, model: str, filename_lot: str | None, search_complete: bool,
+                  image_limit: int, candidate_pages: Sequence[int] | None = None, instruction: str | None = None,
+                  response_format: str = SCHEMA_VERSION, comparison_instruction: str = COMPARISON_INSTRUCTION) -> dict[str, Any]:
+    """Compute the full request identity; portal context is intentionally excluded.
+
+    Image hashes also cover the exact prepared images; image parameters and
+    requested candidates are retained, even when the successful attempt used a
+    smaller prefix following a size rejection.
+    """
+    if not isinstance(pdf_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", pdf_sha256):
+        raise ValueError("invalid SHA-256")
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        raise ValueError("provider and model are required")
+    if (not isinstance(search_complete, bool) or isinstance(image_limit, bool)
+            or not isinstance(image_limit, int) or image_limit < 1):
+        raise ValueError("invalid coverage or image limit")
+    if filename_lot is not None and not isinstance(filename_lot, str):
+        raise ValueError("invalid filename lot")
+    if instruction is None:
+        instruction = system_instruction()
+    if (not isinstance(instruction, str) or not instruction or not isinstance(response_format, str) or not response_format
+            or not isinstance(comparison_instruction, str) or not comparison_instruction):
+        raise ValueError("instruction and response format are required")
+    if not isinstance(image_settings, Mapping):
+        raise ValueError("image settings are required")
+    try:
+        settings = json.loads(json.dumps(dict(image_settings), sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("image settings must be JSON-serializable") from exc
+    nums = [p.number for p in pages]
+    if not nums or nums != sorted(set(nums)) or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in nums):
+        raise ValueError("pages must be distinct, positive and ordered")
+    if any(not isinstance(p.data_url, str) or not p.data_url.startswith("data:image/") for p in pages):
+        raise ValueError("invalid page image")
+    candidates = list(nums if candidate_pages is None else candidate_pages)
+    if (not candidates or candidates != sorted(set(candidates))
+            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in candidates)
+            or not set(nums).issubset(candidates)):
+        raise ValueError("invalid candidate pages")
+    return {"pdf_sha256": pdf_sha256, "pages": nums, "candidate_pages": candidates,
+            "image_sha256": [hashlib.sha256(p.data_url.encode('utf-8')).hexdigest() for p in pages],
+            "image_settings": settings, "provider": provider, "model": model,
+            "filename_lot": filename_lot, "search_complete": search_complete,
+            "image_limit": image_limit, "instruction_sha256": hashlib.sha256(instruction.encode('utf-8')).hexdigest(),
+            "response_format": response_format,
+            "comparison_instruction_sha256": hashlib.sha256(comparison_instruction.encode('utf-8')).hexdigest(),
+            "description_schema_sha256": hashlib.sha256(json.dumps(
+                LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
+                separators=(',', ':')).encode('utf-8')).hexdigest()}
+
+
+def fingerprint(context: Mapping[str, Any]) -> str:
+    payload = json.dumps(dict(context), ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _load(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"schema": SIDECAR_SCHEMA, "runs": []}
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise CacheError("Cannot read existing multi-parse diagnostics; file not overwritten.") from exc
+    if not isinstance(value, dict) or value.get('schema') != SIDECAR_SCHEMA or not isinstance(value.get('runs'), list):
+        raise CacheError("Incompatible multi-parse diagnostics; file not overwritten.")
+    return value
+
+
+def record_portal_observation(pdf: str | Path, pdf_sha256: str, lot: str | None) -> None:
+    """Keep newly supplied portal identity separately from the parsed context."""
+    if lot is None:
+        return
+    if not isinstance(lot, str):
+        raise ValueError("invalid portal lot")
+    if file_metadata._digest(Path(pdf)) != pdf_sha256:
+        raise CacheError("PDF changed; portal observation not saved.")
+    target = diagnostics_path(pdf)
+    try:
+        with file_metadata._LOCK:
+            history = _load(target)
+            observations = history.setdefault("portal_observations", [])
+            if not isinstance(observations, list):
+                raise CacheError("Invalid portal observations; file not overwritten.")
+            if observations and not isinstance(observations[-1], dict):
+                raise CacheError("Invalid portal observation; file not overwritten.")
+            if not observations or observations[-1].get("lot") != lot or observations[-1].get("pdf_sha256") != pdf_sha256:
+                observations.append({"created_at": datetime.now(timezone.utc).isoformat(),
+                                     "pdf_sha256": pdf_sha256, "lot": lot, "source": "portal"})
+                file_metadata._write_json(target, history)
+    except OSError as exc:
+        raise CacheError("Cannot save portal observation.") from exc
+
+
+def record_failure(pdf: str | Path, pdf_sha256: str, *, reason: str, pages: Sequence[int]) -> None:
+    """Record a sanitized failure when no parser request can be formed."""
+    if reason not in {"images_unavailable", "processing_failed", "runtime_unavailable", "metadata_unavailable", "cad_draw_failed", "cad_marking_failed"}:
+        raise ValueError("unsupported diagnostic failure")
+    if file_metadata._digest(Path(pdf)) != pdf_sha256:
+        raise CacheError("PDF changed; failure not saved.")
+    target = diagnostics_path(pdf)
+    try:
+        with file_metadata._LOCK:
+            history = _load(target)
+            history["runs"].append({"created_at": datetime.now(timezone.utc).isoformat(),
+                                    "pdf_sha256": pdf_sha256, "cacheable": False,
+                                    "error": reason, "unparsed_pages": list(pages)})
+            file_metadata._write_json(target, history)
+    except OSError as exc:
+        raise CacheError("Cannot save parse failure.") from exc
+
+
+def _serialized_items(items: Sequence[DescriptionItem]) -> list[dict[str, Any]]:
+    return [{"complete": i.complete, "data": i.data.model_dump(mode='json')} for i in items]
+
+
+def save_result(pdf: str | Path, context: Mapping[str, Any], result: ParseResult, *,
+                portal_lot: str | None) -> None:
+    """Append one result or sanitized failure; do not overwrite incompatible files."""
+    if portal_lot is not None and not isinstance(portal_lot, str):
+        raise ValueError("invalid portal lot")
+    identity = fingerprint(context)
+    target = diagnostics_path(pdf)
+    if file_metadata._digest(Path(pdf)) != context.get('pdf_sha256'):
+        raise CacheError("PDF changed during parsing; result not saved.")
+    attempts = [{"pages": list(a.pages), "item_count": len(a.items), "complete": a.complete,
+                 "valid_response": a.valid_response, "issue": a.issue,
+                 "failure_kind": a.failure_kind, "elapsed_seconds": a.elapsed_seconds} for a in result.attempts]
+    # Failure is recorded for diagnostics but never used as a cache hit.
+    cacheable = result.selected_attempt is not None and (bool(result.items) or result.complete)
+    run = {"created_at": datetime.now(timezone.utc).isoformat(), "fingerprint": identity,
+           "context": dict(context), "portal_lot": portal_lot, "cacheable": cacheable,
+           "items": _serialized_items(result.items), "pages": list(result.pages),
+           "unparsed_pages": list(result.unparsed_pages), "complete": result.complete,
+           "attempts": attempts, "selected_attempt": result.selected_attempt,
+           "selection": result.selection, "error": result.error,
+           "comparison": ({"status": result.comparison.status,
+                           "attempt_indices": list(result.comparison.attempt_indices),
+                           "pages": list(result.comparison.pages)} if result.comparison else None)}
+    try:
+        with file_metadata._LOCK:
+            history = _load(target)
+            history['runs'].append(run)
+            file_metadata._write_json(target, history)
+    except OSError as exc:
+        raise CacheError("Cannot save multi-parse diagnostics.") from exc
+
+
+def load_result(pdf: str | Path, context: Mapping[str, Any]) -> tuple[ParseResult, str | None] | None:
+    """Return (cached result, original portal lot), or None on a cache miss.
+
+    A newer portal lot intentionally does not invalidate a matching parse; the
+    caller must retain its separate source and the old actual model context.
+    """
+    identity = fingerprint(context)
+    if file_metadata._digest(Path(pdf)) != context.get('pdf_sha256'):
+        return None
+    with file_metadata._LOCK:
+        history = _load(diagnostics_path(pdf))
+    for run in reversed(history['runs']):
+        if not isinstance(run, dict) or run.get('fingerprint') != identity or run.get('context') != dict(context):
+            continue
+        if run.get('cacheable') is not True:
+            continue
+        raw_items = run.get('items')
+        items, valid = _items(raw_items)
+        if not valid or not isinstance(raw_items, list):
+            continue
+        page_list = run.get('pages')
+        unparsed = run.get('unparsed_pages')
+        available = context.get('pages')
+        candidates = context.get('candidate_pages')
+        complete = run.get('complete')
+        if (not isinstance(page_list, list) or not isinstance(unparsed, list)
+                or not isinstance(candidates, list) or not isinstance(available, list) or not isinstance(complete, bool)
+                or not page_list or page_list != available[:len(page_list)]
+                or unparsed != [n for n in candidates if n not in page_list]
+                or (complete and (unparsed or not context.get('search_complete') or any(not i.complete for i in items)))
+                or (not items and not complete)):
+            continue
+        portal = run.get('portal_lot')
+        if portal is not None and not isinstance(portal, str):
+            continue
+        # Cache hits do not fabricate prior attempts. Their full history remains
+        # in the sidecar; selection is marked as cache to the caller.
+        return (ParseResult(items, tuple(page_list), tuple(unparsed), complete, (), None,
+                            'cache', None), portal)
+    return None
+
+
+def record_scene_diagnostics(pdf: str | Path, pdf_sha256: str, *, is_main: bool,
+                             descriptions: Sequence[Mapping[str, Any]]) -> None:
+    """Record placement/planning metadata without document text or geometry."""
+    if not isinstance(is_main, bool):
+        raise ValueError('invalid source role')
+    safe = []
+    allowed = {'unresolved_position', 'partial_description', 'exact_sides_fallback', 'planning_failed', None}
+    for entry in descriptions:
+        if not isinstance(entry, Mapping) or set(entry) != {'ordinal', 'placement_known', 'reason'}:
+            raise ValueError('invalid scene diagnostic')
+        ordinal, known, reason = entry['ordinal'], entry['placement_known'], entry['reason']
+        if (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1
+                or (known is not None and not isinstance(known, bool)) or reason not in allowed):
+            raise ValueError('invalid scene diagnostic value')
+        safe.append({'ordinal': ordinal, 'placement_known': known, 'reason': reason})
+    if file_metadata._digest(Path(pdf)) != pdf_sha256:
+        raise CacheError('PDF changed; scene diagnostics not saved.')
+    target = diagnostics_path(pdf)
+    try:
+        with file_metadata._LOCK:
+            history = _load(target)
+            runs = history.setdefault('scene_history', [])
+            if not isinstance(runs, list):
+                raise CacheError('Invalid scene diagnostics; file not overwritten.')
+            runs.append({'created_at': datetime.now(timezone.utc).isoformat(), 'pdf_sha256': pdf_sha256,
+                         'role': 'our' if is_main else 'neighbor', 'descriptions': safe})
+            file_metadata._write_json(target, history)
+    except OSError as exc:
+        raise CacheError('Cannot save scene diagnostics.') from exc
+
+
+def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] | None:
+    """Restore a compatible complete snapshot without a network/key lookup.
+
+    This is an explicit historical restore, not a fresh parse or current-model
+    cache hit. PDF digest, filename identity, compatible prompt, schema and the
+    original cache fingerprint must all match. No sidecars are written.
+    """
+    import lot_identity
+    from multiple_description_parse import SCHEMA_VERSION
+    path = Path(pdf)
+    digest = file_metadata._digest(path)
+    with file_metadata._LOCK:
+        history = _load(diagnostics_path(path))
+    schema_hash = hashlib.sha256(json.dumps(
+        LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    # Historic snapshots are allowed only by the explicit offline command.
+    # Pair the known prompt and schema hashes; the ordinary cache still checks
+    # the exact current context and cannot silently masquerade as a new parse.
+    current_prompt = hashlib.sha256(system_instruction().encode('utf-8')).hexdigest()
+    compatible = {(SCHEMA_VERSION, current_prompt, schema_hash),
+                  ('multiple-legal-descriptions-v3',
+                   '8d57be14196feb1e104ac5c60219f40e071bcc9d6007e81a4fc5a008bd4a4769',
+                   '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc'),
+                  ('multiple-legal-descriptions-v3',
+                   '1e05287cfcb562ac81cae64b7e3c95c82047ed850424fe38a920533297de0502',
+                   '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc')}
+    for run in reversed(history['runs']):
+        if not isinstance(run, dict) or not isinstance(run.get('context'), dict):
+            continue
+        ctx = run['context']
+        if (ctx.get('pdf_sha256') != digest or ctx.get('filename_lot') != lot_identity.lot_from_filename(path)
+                or (ctx.get('response_format'), ctx.get('instruction_sha256'),
+                    ctx.get('description_schema_sha256')) not in compatible
+                or ctx.get('comparison_instruction_sha256') != hashlib.sha256(COMPARISON_INSTRUCTION.encode('utf-8')).hexdigest()
+                or not isinstance(ctx.get('provider'), str) or not ctx['provider']
+                or not isinstance(ctx.get('model'), str) or not ctx['model']):
+            continue
+        try:
+            restored = load_result(path, ctx)
+        except (CacheError, ValueError, TypeError):
+            continue
+        if restored is not None and restored[0].complete and restored[0].items:
+            return restored[0], dict(ctx)
+    return None

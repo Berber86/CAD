@@ -6,6 +6,7 @@
 # UnicodeDecodeError. Comments in Russian live in README.md instead.
 
 openai>=1.50,<3          # Structured Outputs (client.beta.chat.completions.parse)
+httpx>=0.23,<1           # System One API for developer probability mode
 pydantic>=2.7,<3         # strict response schema for the LLM
 customtkinter>=5.2       # GUI
 pywin32>=306; sys_platform == "win32"  # win32com.client / pythoncom (Windows only)

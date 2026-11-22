@@ -435,6 +435,34 @@ def test_shipped_config_mirrors_feature_defaults():
     assert fl.feature_settings(load_config()) == fl.DEFAULT_FEATURE_CONFIG
 
 
+def test_plain_copy_matches_deepcopy_and_stays_independent():
+    """Ускорение запуска (4.39): быстрая копия настроек равна ``copy.deepcopy``."""
+    import copy
+
+    samples = [
+        fl.DEFAULT_FEATURE_CONFIG,
+        {"a": [1, 2, {"b": (3, None)}], "c": "строка", "d": True, "e": 4.5},
+        {},
+        [],
+        # Не-«плоские» значения уходят в честный deepcopy: множество и объект.
+        {"set": {1, 2}, "obj": copy.copy(fl.DEFAULT_FEATURE_CONFIG)},
+    ]
+    for sample in samples:
+        assert fl._plain_copy(sample) == copy.deepcopy(sample)
+
+    # Вложенные списки/словари — свои, шаблон настроек не меняется.
+    result = fl.feature_settings(None)
+    result["linetype_scale_rules"]["S-FENCE"]["fixed"] = 99.0
+    result["field_note_layers"].append("MY_LAYER")
+    assert fl.DEFAULT_FEATURE_CONFIG["linetype_scale_rules"]["S-FENCE"]["fixed"] == 5.0
+    assert "MY_LAYER" not in fl.DEFAULT_FEATURE_CONFIG["field_note_layers"]
+    # Результат не связан и с конфигом заказчика: правка копии не портит вход.
+    cfg = {"feature_labeling": {"linetype_scale_rules": {"S-FENCE": {"fixed": 3.0}}}}
+    got = fl.feature_settings(cfg)
+    got["linetype_scale_rules"]["S-FENCE"]["fixed"] = 7.0
+    assert cfg["feature_labeling"]["linetype_scale_rules"]["S-FENCE"]["fixed"] == 3.0
+
+
 def test_feature_settings_override_replaces_key_and_null_keeps_default():
     cfg = {"feature_labeling": {"point_to_fence_max_ft": 5.0, "search_buffer_ft": None,
                                 "layer_label_mapping": {"MY_SHED": "SHED"}}}
@@ -3883,3 +3911,26 @@ def test_fence_on_wall_duplicate_check_knows_abbreviations_both_ways():
         assert fl.labels_similar(existing, label, synonyms), (existing, label)
     assert not fl.labels_similar("VINYL FENCE ATOP MASONRY WALL", "C.L.F. ATOP CONC. WALL", synonyms)
     assert not fl.labels_similar("C.L.F. ATOP CONC. WALL", "C.L.F.", synonyms)
+
+
+def test_step1_tax_text_is_obstacle_even_with_old_settings():
+    from feature_labeler import LayerClassifier, feature_settings
+    from llm_parser import load_config
+    cfg = dict(feature_settings(load_config()))
+    cfg["text_obstacle_layers"] = ["BOUNDARY_TEXT*"]
+    classifier = LayerClassifier(cfg)
+    assert classifier.is_text_obstacle("M-TAX-DIM")
+    assert classifier.is_text_obstacle("BOUNDARY_TEXT_AI")
+    assert not classifier.is_field_note("M-TAX-DIM")
+
+
+def test_step2_avoids_actual_tax_boundary_text_with_old_config():
+    cfg = {"feature_labeling": {"text_obstacle_layers": ["BOUNDARY_TEXT*"]}}
+    baseline = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE, cfg=cfg)
+    shed = item_for(baseline, "SUBJECT_SHED_OUTLINE")
+    snap = build_stafford_scene()
+    snap.texts.append(DrawingText("M-TAX-DIM", "N 56°36'12\" W", shed.point, height=1.0))
+    changed = make_plan(snap, house=STAFFORD_HOUSE, cfg=cfg)
+    moved = item_for(changed, "SUBJECT_SHED_OUTLINE")
+    assert moved.point != pytest.approx(shed.point)
+    assert not moved.box.intersects(ab._existing_text_box(snap.texts[-1], 1.0, {}))

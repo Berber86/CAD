@@ -21,6 +21,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+import file_metadata
+
 MANIFEST_NAME = "_manifest.json"
 MANIFEST_VERSION = 1
 
@@ -37,6 +39,8 @@ class StoredDeed:
     role: str = "our"              # our | neighbour
     lot: str = ""
     block: str = ""
+    borough: str = ""
+    identity: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     tag: str = "NEW"               # NEW | OLD
     doc_type: str = ""             # DEED / MORTGAGE
     doc_date: str = ""             # ISO, как пришло
@@ -60,6 +64,7 @@ def _iso(value: Any) -> str:
     return str(value or "")
 
 
+@file_metadata.with_lock
 def store_pdf(
     folder: str | Path,
     source_pdf: str | Path,
@@ -68,6 +73,8 @@ def store_pdf(
     lot: int | str,
     tag: str,
     block: int | str = "",
+    borough: str = "",
+    identity: dict[str, list[dict[str, str]]] | None = None,
     doc_type: str = "",
     doc_date: Any = "",
     endorsement_id: int | str = "",
@@ -94,11 +101,30 @@ def store_pdf(
 
     destination = target_dir / document_file_name(role, lot, tag)
     final_name = destination.name
+    passport = target_dir / f"{destination.stem}.json"
+    previous: dict[str, Any] = {}
+    if passport.exists():
+        previous = file_metadata._read_json(passport)
+        if previous.get("file") != final_name:
+            raise DeedStoreError(f"паспорт {passport.name} принадлежит другому файлу")
+        if "file_digests" in previous and not isinstance(previous["file_digests"], dict):
+            raise DeedStoreError(f"формат file_digests в {passport.name} не поддерживается; паспорт не изменён")
+        if "document_history" in previous and not isinstance(previous["document_history"], list):
+            raise DeedStoreError(f"формат document_history в {passport.name} не поддерживается; паспорт не изменён")
+        if "identity" in previous and not isinstance(previous["identity"], dict):
+            raise DeedStoreError(f"формат identity в {passport.name} не поддерживается; паспорт не изменён")
+        try:
+            file_metadata.combine(previous.get("identity"))
+        except ValueError as exc:
+            raise DeedStoreError(f"формат identity в {passport.name} не поддерживается; паспорт не изменён") from exc
+    supplied = file_metadata.combine(identity)
     source = Path(source_pdf)
     if source.suffix.lower() != ".pdf":
         raise DeedStoreError(f"ожидался PDF, получено: {source.name}")
+    previous_digest = file_metadata._digest(destination) if previous and destination.is_file() else ""
     if source.resolve() != destination.resolve():
         shutil.copyfile(source, destination)
+    same_content = bool(previous_digest and previous_digest == file_metadata._digest(destination))
     trimmed_name = ""
     if pages and trimmed_source is not None:
         trimmed_name = f"{destination.stem}_p{pages}.pdf"
@@ -110,6 +136,7 @@ def store_pdf(
         role=role,
         lot=str(lot),
         block=str(block),
+        borough=str(borough or ""),
         tag=tag,
         doc_type=doc_type,
         doc_date=_iso(doc_date),
@@ -121,11 +148,62 @@ def store_pdf(
         downloaded=datetime.now().isoformat(timespec="seconds"),
         notes=list(notes),
     )
-    if record.text_file:
+    if previous and same_content:
+        if not record.borough:
+            record.borough = str(previous.get("borough") or "")
+        if not record.block:
+            record.block = str(previous.get("block") or "")
+        if not pages and previous.get("pages"):
+            record.pages = str(previous["pages"])
+        if not record.trimmed and record.pages == str(previous.get("pages") or ""):
+            old_trimmed = str(previous.get("trimmed") or "")
+            if old_trimmed and (target_dir / old_trimmed).is_file():
+                record.trimmed = old_trimmed
+        if not record.text_file:
+            old_text = str(previous.get("text_file") or "")
+            if old_text and (target_dir / old_text).is_file():
+                record.text_file = old_text
+        old_notes = previous.get("notes")
+        if isinstance(old_notes, list):
+            record.notes = list(dict.fromkeys([*old_notes, *record.notes]))
+    if text.strip() and record.text_file:
         (target_dir / record.text_file).write_text(text, encoding="utf-8")
-    (target_dir / record.sidecar_name()).write_text(
-        json.dumps(asdict(record), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    observations = file_metadata.filename_observations(destination)
+    # Без известной истории ввода это ручные значения, а не данные портала.
+    for field_name, value in (("block", block), ("lot", lot), ("borough", borough)):
+        if value and not any(str(entry.get("value", "")).strip() == str(value).strip()
+                             for entry in supplied.get(field_name, [])):
+            file_metadata.add(supplied, field_name, file_metadata.observation(value, "manual"))
+    digest = file_metadata._digest(destination)
+    for field_name in file_metadata.FIELDS:
+        for entry in supplied.get(field_name, []):
+            entry.setdefault("file", final_name)
+            entry.setdefault("sha256", digest)
+    legacy: dict[str, list[dict[str, str]]] = {}
+    if previous and "identity" not in previous:
+        for field_name in file_metadata.FIELDS:
+            file_metadata.add(legacy, field_name, file_metadata.observation(previous.get(field_name), "unknown", method="legacy passport"))
+    record.identity = file_metadata.combine(previous.get("identity"), legacy, observations, supplied)
+    if previous and same_content:
+        record.accepted = bool(previous.get("accepted", False))
+        record.checks = previous.get("checks") if isinstance(previous.get("checks"), dict) else {}
+    raw = dict(previous)
+    if previous_digest and not same_content:
+        history = raw.get("document_history", [])
+        if not isinstance(history, list):
+            raise DeedStoreError(f"формат document_history в {passport.name} не поддерживается")
+        old_snapshot = {key: value for key, value in previous.items() if key != "document_history"}
+        old_snapshot["content_sha256"] = previous_digest
+        history = [*history, old_snapshot]
+        raw["document_history"] = history
+    hashes = dict(raw.get("file_digests", {}))
+    hashes[final_name] = digest
+    if record.trimmed and (target_dir / record.trimmed).is_file():
+        hashes[record.trimmed] = file_metadata._digest(target_dir / record.trimmed)
+    raw["file_digests"] = hashes
+    raw.pop("standalone", None)
+    raw.update(asdict(record))
+    file_metadata._write_json(passport, raw)
     write_manifest(target_dir)
     return record
 
@@ -140,7 +218,7 @@ def read_records(folder: str | Path) -> list[StoredDeed]:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if not isinstance(raw, dict) or "file" not in raw:
+        if not isinstance(raw, dict) or "file" not in raw or raw.get("standalone"):
             continue
         known = {field_name for field_name in StoredDeed.__dataclass_fields__}
         records.append(StoredDeed(**{key: value for key, value in raw.items() if key in known}))
@@ -158,6 +236,7 @@ def duplicate_of(records: Iterable[StoredDeed], endorsement_id: int | str) -> St
     return None
 
 
+@file_metadata.with_lock
 def write_manifest(
     folder: str | Path,
     *,
@@ -175,18 +254,26 @@ def write_manifest(
     target_dir.mkdir(parents=True, exist_ok=True)
     records = read_records(target_dir)
     ordered = sorted(records, key=lambda record: (record.role != "our", record.lot, record.tag != "NEW"))
+    existing = read_manifest(target_dir)
+    items = []
+    for record in ordered:
+        # Include forward-compatible passport fields, rather than dropping them.
+        passport_path = target_dir / record.sidecar_name()
+        passport = file_metadata._read_json(passport_path) if passport_path.is_file() else asdict(record)
+        items.append(passport)
     manifest = {
+        **existing,
         "version": MANIFEST_VERSION,
-        "address": address,
-        "bbl": bbl,
-        "block": str(block or ""),
-        "lot": str(lot or ""),
+        "address": address or existing.get("address", ""),
+        "bbl": bbl or existing.get("bbl", ""),
+        "block": str(block or existing.get("block", "")),
+        "lot": str(lot or existing.get("lot", "")),
         "created": datetime.now().isoformat(timespec="seconds"),
-        "items": [asdict(record) for record in ordered],
+        "items": items,
         "missing": list(missing),
     }
     path = target_dir / MANIFEST_NAME
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    file_metadata._write_json(path, manifest)
     return path
 
 

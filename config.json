@@ -1,4 +1,12 @@
 {
+  "multiple_description_search": {
+    "enabled": false,
+    "vision_fallback": {
+      "provider": "hydra",
+      "model": "grok-4.7",
+      "image_limit": 10
+    }
+  },
   "api": {
     "provider": "hydra",
     "api_key": "",
@@ -121,34 +129,17 @@
       8000.0
     ]
   },
-  "print_draft": {
-    "enabled": true,
-    "shift_ft": [
-      1000.0,
-      0.0
-    ],
-    "tie_length_ft": 40.0,
-    "layers": {
-      "property_line": "PL-PRINT",
-      "boundary_text": "D-TOPO-TEXT-PRINT",
-      "street_row": "M-ROW-LINE-PRINT"
-    },
-    "layer_colors": {
-      "property_line": 7,
-      "boundary_text": 7,
-      "street_row": 1
-    }
-  },
+  "print_draft": {},
   "layers": {
     "property_line": "PL",
-    "boundary_text": "D-TOPO-TEXT",
+    "boundary_text": "M-TAX-DIM",
     "street_row": "M-ROW-LINE",
     "neighbor_lot": "NEIGHBOR_LOT"
   },
   "layer_colors": {
     "property_line": 3,
     "boundary_text": 7,
-    "street_row": 5,
+    "street_row": 1,
     "neighbor_lot": 4
   },
   "feature_labeling": {
@@ -831,7 +822,8 @@
     ],
     "obstacle_layer_exclude": [],
     "text_obstacle_layers": [
-      "BOUNDARY_TEXT*"
+      "BOUNDARY_TEXT*",
+      "M-TAX-DIM"
     ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,

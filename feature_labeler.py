@@ -435,7 +435,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # Тексты-препятствия — только те, что остаются в итоговом чертеже: готовые
     # подписи (existing_label_layers) и подписи границы Шага 1. Tax-тексты
     # полевого чертежа («#87 LOT 70», румбы красных линий) подписям не мешают.
-    "text_obstacle_layers": ["BOUNDARY_TEXT*"],
+    "text_obstacle_layers": ["BOUNDARY_TEXT*", "M-TAX-DIM"],
     "point_labels_as_obstacles": False,
     # --- дедупликация --------------------------------------------------------
     "skip_existing_labels": True,
@@ -622,6 +622,29 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
 }
 
 
+def _plain_copy(value: Any) -> Any:
+    """
+    Копия данных конфигурации быстрее ``copy.deepcopy`` (в 2+ раза на нашем словаре).
+
+    Настройки — это JSON-подобные структуры (``dict``/``list``/``tuple``/числа/строки/``None``),
+    поэтому обходимся без ``copy._deepcopy_atomic``/memo-словаря ``deepcopy``. Любой
+    не-«плоский» объект (класс, множество, ссылка на себя) уходит в честный ``deepcopy``,
+    так что результат совпадает с прежним для любого входа.
+
+    ``feature_settings`` вызывается много раз: при сборке окна (подсказки Шага 2) и по
+    несколько раз на каждый объект чертежа, поэтому копирование шаблона заметно в запуске.
+    """
+    if isinstance(value, dict):
+        return {key: _plain_copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_plain_copy(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return copy.deepcopy(value)
+
+
 def feature_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
     """
     Итоговые настройки Шага 2: значения по умолчанию + раздел
@@ -630,7 +653,7 @@ def feature_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
     Каждый ключ раздела замещает значение по умолчанию целиком; ``null``
     означает «использовать значение по умолчанию».
     """
-    result = copy.deepcopy(DEFAULT_FEATURE_CONFIG)
+    result = _plain_copy(DEFAULT_FEATURE_CONFIG)
     section: Any = None
     if isinstance(cfg, dict):
         section = cfg.get("feature_labeling")
@@ -640,7 +663,7 @@ def feature_settings(cfg: dict[str, Any] | None) -> dict[str, Any]:
         for key, value in section.items():
             if value is None:
                 continue
-            result[key] = copy.deepcopy(value)
+            result[key] = _plain_copy(value)
     return result
 
 
@@ -1074,6 +1097,9 @@ class LayerClassifier:
         self._obstacle = _as_patterns(fcfg.get("obstacle_layers"))
         self._obstacle_exclude = _as_patterns(fcfg.get("obstacle_layer_exclude"))
         self._text_obstacle = _as_patterns(fcfg.get("text_obstacle_layers"))
+        # Обязательный слой подписей Шага 1, в том числе при старых настройках.
+        if not layer_matches("M-TAX-DIM", self._text_obstacle):
+            self._text_obstacle.append("M-TAX-DIM")
         self._code_linework = _as_patterns(fcfg.get("code_linework_layers"))
         self._cache: dict[tuple[str, str], Any] = {}
 

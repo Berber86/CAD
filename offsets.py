@@ -59,7 +59,7 @@ FRONT_BOUNDARY_LAYER = "M-ROW-LINE"
 #: Линия расширения улицы по проекту — НЕ граница участка для оффсетов (ответ заказчика, 4.1).
 WIDENING_LINE_LAYER = "M-TAX-LINE"
 #: Версия каркаса шага 4 (для окна программы).
-STEP4_VERSION = "4.36"
+STEP4_VERSION = "4.38"
 #: Допуск совпадения координат двух дампов, футы.
 SAME_FRAME_TOL_FT = 0.01
 
@@ -407,6 +407,39 @@ ON_LINE_FT = 0.5
 #: 2.96 при тех же подписях (63) и совпадениях (35). Начать сразу с 1.2–1.5 ft нельзя — две
 #: подписи перестают влезать (63 → 61, 35 → 33). Замер: docs/step4_spatial_measure.py.
 LEADER_DISTANCES_FT = (2.0, 2.6, 1.5, 1.0, 0.5, 0.0, 3.2)
+#: R26 (4.38, замер по шести листам): подпись забора и стены стоит ПО ДРУГУЮ сторону линии
+#: участка от объекта — то есть выноска идёт через линию наружу, а не вдоль неё. У Николая
+#: 35 из 40 подписей забора снаружи контура участка в 1.5–3.0 ft от линии (медиана 2.42),
+#: внутри — только 5, и все у забора, который сам стоит снаружи линии (текст тогда внутри,
+#: то есть снова «с другой стороны от объекта»). Наши подписи до правила прижаты к линии
+#: с обеих сторон: медиана просвета 0.93 ft против его 2.42, и выноска длиннее его
+#: (медиана 3.51 против 2.61), потому что текст искался вдоль линии, а не поперёк.
+FENCE_TEXT_ACROSS_LINE = True
+#: Насколько центр блока должен отойти за линию в «поперечном» заходе, ft: у Николая минимум
+#: 1.48 ft, но это уже с его выноской 2.2 ft; ограничиваем только тем, что блок не должен
+#: лежать на самой линии (половина высоты плюс зазор дают это и так).
+FENCE_TEXT_ACROSS_MIN_FT = 0.0
+#: R27 (4.38, замер по шести листам): подпись дома не лежит на линии участка. У Николая просвет
+#: от края блока до линии ≥ 0.78 ft у всех 13 оффсетных подписей дома (снаружи медиана 2.29,
+#: внутри участка — у выносок в глубине строения — 3.7–9.0); у нас до правила 15 подписей дома
+#: с просветом 0.1–0.7 ft, то есть блок касался линии границы. Первый ярус раскладки требует
+#: просвет не меньше этого, дальше — прежние ярусы (подпись важнее просвета).
+#:
+#: Флаг ВЫКЛЮЧЕН (0.0): замер с просветом 0.8 дал совпадений 47 → 46 и предупреждений 2 → 3
+#: (1373 East 55th: текст дома не встал ни с просветом, ни без него, подпись потерялась вместе
+#: с совпадением; забор 50 → 49 каскадом из-за занятого места). По регламенту (§15) правило не
+#: включается, пока метрика хуже хотя бы на одном чертеже. Вернуться к нему вместе с ответом
+#: Николая на вопрос 11 (где он держит текст дома относительно линии).
+HOUSE_TEXT_LINE_GAP_MIN_FT = 0.0
+#: Просвет между блоком подписи и линией участка в поперечном заходе, ft: у Николая край блока
+#: стоит в 1.5–2.6 ft от линии (медиана 2.0, p90 2.6 по 36 подписям забора снаружи контура),
+#: у нас до правила — 0.9–1.6 ft, блок прилипал к линии. Верхняя граница — его p90 по всем
+#: подписям забора (4.6 ft): дальше текст отрывается от своего места.
+FENCE_TEXT_LINE_GAP_FT = (1.4, 4.6)
+#: Порядок направлений в поперечном заходе: сначала наружу от линии (выноска через линию),
+#: затем по кругу, как раньше.
+ACROSS_LEADER_ANGLES_DEG = (0.0, 30.0, -30.0, 60.0, -60.0, 90.0, -90.0, 120.0, -120.0, 150.0, -150.0, 180.0)
+ACROSS_LEADER_DISTANCES_FT = (0.5, 1.0, 1.5, 2.0, 2.6, 3.2)
 #: Направления выноски относительно линии измерения, градусы; перпендикуляр пробуем первым.
 LEADER_ANGLES_DEG = (90, -90, 60, -60, 120, -120, 30, -30, 150, -150, 0, 180)
 #: Зазор текста до линии и выноски, доля высоты текста.
@@ -438,6 +471,42 @@ ONLINE_LABELS = True
 ONLINE_FENCE_TEXT = "FE.O/L"
 #: Вторая строка подписи «на линии» у дома и стены: ``BLDG`` / ``O/L`` (378 Mother Gaston).
 ONLINE_TEXT = "O/L"
+#: R25 (золотое правило №10, ответ заказчика 19.11.2026): «Для выноски и для угла дома — в две
+#: строчки. Если для всей стороны дома — хоть для фронта, хоть для бочины дома — если он по обеим
+#: сторонам получается ``O/L``, то в одну строчку».
+#:
+#: Целая сторона объекта, лежащая на линии границы (оба её конца на линии), подписывается
+#: ОДНОЙ строкой простым текстом без выноски: ``BLDG O/L`` / ``WALL O/L``. Подтверждено листами
+#: заказчика (однострочные подписи — это ``AcDbText`` без выноски, двухстрочные — ``MText``
+#: с выноской):
+#:
+#: * 378 Mother Gaston — ``BLDG O/L`` (Text, h 1.1, rot 359.97°) вдоль фронтальной стены дома
+#:   24.75 ft, в 2.1 ft от линии; там же два ``BLDG`` / ``O/L`` (MText с выноской) — у угла;
+#: * 1412 East 64th — ``BLDG GEN. O/L`` (Text, rot 90°) вдоль стены 59.0 ft на боковой линии,
+#:   в 1.0 ft от неё;
+#: * 1373 East 55th — два ``O/L`` (Text, h 0.9, rot 270.2°) без приставки.
+#:
+#: Флаг ВЫКЛЮЧЕН: правило воспроизводит форму, но не отбор мест у заказчика. Замер 4.37 на шести
+#: листах (``ONLINE_SIDE_MIN_FT = 20``, только дом и стена): срабатывает дважды — 1412 East 64th
+#: (стена 59.0 ft, наша подпись в 2.96 ft от его ``BLDG GEN. O/L``, в 0.9 ft от стены при его
+#: 1.0 ft — верно) и 192 Geldner (стена
+#: 20.9 ft на тыльной линии, у заказчика там ничего — лишняя). Совпадения не меняются (47 из 69:
+#: подписи «O/L» не числовые и в эталон не входят), предупреждений 2. Его собственный пример —
+#: 378 Mother Gaston, стена 24.75 ft на ``M-ROW-LINE`` — не воспроизводится: фрагмент состоит
+#: из двух рёбер, и оба на линии, поэтому фильтр «не сам контур» его отсекает; вариант фильтра
+#: «все края на одной линии» возвращает Gaston, но теряет East 64th (у того края на двух линиях)
+#: и добавляет две подписи на стенах 38.7 ft у 192 Geldner. Ждём ответа на вопрос §13.10.
+ONLINE_SIDE_LABELS = False
+#: Сторона объекта считается лежащей на линии границы, если оба её конца не дальше этого, футы.
+ONLINE_SIDE_TOL_FT = ONLINE_TOL_FT
+#: Короче этого края «вся сторона дома» не наступает: у заказчика однострочная подпись стоит на
+#: стенах 24.75 ft (378 Mother Gaston) и 59.0 ft (1412 East 64th), а двухстрочная — у краёв
+#: 12.8 и 14.2 ft (1412 East 64th) и 5.7 ft (378 Mother Gaston).
+ONLINE_SIDE_MIN_FT = 20.0
+#: У забора форма однострочная и без того (``FE.O/L``), и ставит заказчик её в точке пересечения,
+#: а не посреди пролёта: 192 Geldner — в 2.8 ft от конца пролёта 59.2 ft, 987 Zoe — у концов
+#: пролёта 90.1 ft. Поэтому R25 касается только дома и стены.
+ONLINE_SIDE_KINDS = ("house", "wall")
 #: R10: текст **без выноски** поворачивается вдоль своей линии (0° у горизонтальной, 90° у вертикальной);
 #: текст с выноской у Николая горизонтален, поэтому правило применяется только к ``style == "text"``.
 #: Замер 4.26 по дампам:
@@ -703,6 +772,10 @@ HOUSE_TEXT_INSIDE = True
 #: (внутри строения остаётся вторым заходом, если снаружи места нет).
 HOUSE_TEXT_OUTSIDE = True
 
+#: Строка типа у подписи дома с выноской: «BLDG» / «2.5'S». У подписи дома без выноски строки
+#: типа нет — голое число («3.5'S»), как у заказчика (см. листы Alvine, Gaston, Zoe, East 64th).
+HOUSE_LEADER_PREFIX = "BLDG"
+
 #: Подпись забора и стены — выноской, как у Николая.
 #:
 #: В 4.21 было наоборот (по разбору соседней ветки «стрелок нет ни одной»), но дампы
@@ -845,6 +918,111 @@ def online_text(kind: str) -> str:
     if kind == "wall":
         return f"WALL\n{ONLINE_TEXT}"
     return f"BLDG\n{ONLINE_TEXT}"
+
+
+def online_side_text(kind: str) -> str:
+    """
+    Однострочная подпись стороны объекта, лежащей на линии границы (R25): ``BLDG O/L``.
+
+    У забора форма та же, что и у угла — ``FE.O/L`` одной строкой (вопрос 10 уточняется:
+    нужна ли у забора с выноской вторая строка).
+    """
+    if kind == "fence":
+        return ONLINE_FENCE_TEXT
+    if kind == "wall":
+        return f"WALL {ONLINE_TEXT}"
+    return f"{HOUSE_LEADER_PREFIX} {ONLINE_TEXT}"
+
+
+def online_side_walls(
+    feature: "Feature",
+    sides: Sequence["SideLine"],
+    *,
+    tol_ft: float = ONLINE_SIDE_TOL_FT,
+    min_ft: float = ONLINE_SIDE_MIN_FT,
+    kinds: Sequence[str] = ONLINE_SIDE_KINDS,
+) -> list[tuple[tuple[Point, Point], "SideLine"]]:
+    """
+    Стороны объекта, лежащие ЦЕЛИКОМ на линии границы участка (R25, золотое правило №10).
+
+    Возвращает по одному самому длинному краю на каждую линию границы: ``((конец A, конец B),
+    сторона участка)``. Три фильтра — по измерениям на шести листах заказчика:
+
+    * вид объекта: у забора форма и так однострочная (``FE.O/L``), и ставит он её в точке
+      пересечения, а не вдоль пролёта (192 Geldner: его ``FE.O/L`` в 2.8 ft от конца 59-футового
+      пролёта, 987 Zoe — у обоих концов, но не в середине);
+    * длина края ≥ ``min_ft``: одна строка у заказчика встречается на стенах 24.75 ft (378 Mother
+      Gaston) и 59.0 ft (1412 East 64th), а двухстрочная — у краёв 12.8 и 14.2 ft (там же);
+    * у объекта есть хотя бы один край НЕ на линии: иначе это не здание на границе, а сам
+      контур участка, обведённый как объект (1373 Brooklyn, 24 Alvine — подписи нет).
+    """
+    if not sides or feature.kind not in kinds:
+        return []
+    pts, closed = feature_contour(feature)
+    if len(pts) < 2:
+        return []
+    seq = pts + [pts[0]] if closed else pts
+    edges = [(a, b) for a, b in zip(seq, seq[1:]) if math.dist(a, b) > 1e-9]
+    on_line: dict[int, tuple[tuple[Point, Point], "SideLine"]] = {}
+    for index, (a, b) in enumerate(edges):
+        for side in sides:
+            if (
+                _point_segment_distance(a, (side.a, side.b)) <= tol_ft
+                and _point_segment_distance(b, (side.a, side.b)) <= tol_ft
+            ):
+                on_line[index] = ((a, b), side)
+                break
+    if not on_line or len(on_line) == len(edges):
+        # Либо ни одного края на линии, либо объект — сама граница, обведённая как объект:
+        # 1373 Brooklyn «дом» 46.0 × 18.0 × 100.0 ft (все три ребра на трёх линиях участка),
+        # 24 Alvine «дом» 174.9 × 45.3 × 153.6 ft. Подписи «в одну строчку» у заказчика там нет.
+        return []
+    best: dict[tuple[Point, Point], tuple[tuple[Point, Point], "SideLine"]] = {}
+    for (a, b), side in on_line.values():
+        if math.dist(a, b) < min_ft:
+            continue
+        key = (side.a, side.b)
+        if key not in best or math.dist(a, b) > math.dist(*best[key]):
+            best[key] = ((a, b), side)
+    return list(best.values())
+
+
+def _place_online_side(
+    wall: tuple[Point, Point],
+    side: "SideLine",
+    text: str,
+    height: float,
+    width_of: Callable[[str, float], float],
+    ok: Callable[[Rect, Point], bool],
+    rotation_deg: float,
+) -> Point | None:
+    """
+    Место однострочной подписи «на линии» (R25): текст вдоль стены, первым делом внутри участка.
+
+    У заказчика он стоит так: 378 Mother Gaston — в 2.1 ft от линии и в 4.3 ft от середины
+    стены 24.75 ft; 1412 East 64th — в 1.0 ft от линии вдоль стены 59.0 ft. Поэтому пробы идут
+    от середины стены к её краям и с растущим отступом от линии; если внутри места нет —
+    снаружи (у Николая часть подписей стоит вне контура участка).
+    """
+    a, b = wall
+    width, block_h = _text_block(text, height, width_of, rotation_deg)
+    # Отступ от линии считается по высоте строки, а не по габариту повёрнутого блока: у
+    # вертикальной стены блок 1.1 × 5 ft, и половина его «высоты» уводила бы текст на 3.4 ft
+    # от линии, тогда как у заказчика 1.0–2.1 ft (378 Mother Gaston — 2.1 ft, 1412 East 64th —
+    # 1.0 ft).
+    _w0, line_h = _text_block(text, height, width_of)
+    gap = TEXT_GAP_FACTOR * height
+    inward = (-side.normal[0], -side.normal[1])
+    for share in (0.5, 0.42, 0.58, 0.35, 0.65, 0.28, 0.72):
+        point = (a[0] + (b[0] - a[0]) * share, a[1] + (b[1] - a[1]) * share)
+        for extra in (0.0, 0.5 * height, height, 2.0 * height):
+            depth = line_h / 2.0 + gap + extra
+            for sign in (1.0, -1.0):
+                center = (point[0] + inward[0] * depth * sign, point[1] + inward[1] * depth * sign)
+                rect = _rect_at(center, width, block_h)
+                if ok(rect, center) and not _segment_hits_rect(a, b, rect):
+                    return center
+    return None
 
 
 def offset_prefix(kind: str) -> str:
@@ -1069,6 +1247,9 @@ class OffsetItem:
     #: подпись стоит в точке пересечения забора с продолжением стороны (не вершина объекта):
     #: у неё нет точки съёмки, и правила «только снятые вершины» (R13/R13b) к ней не относятся
     crossing: bool = False
+    #: однострочная подпись стороны объекта, лежащей на линии границы (R25, золотое правило №10):
+    #: ``BLDG O/L`` простым текстом вдоль стены, без выноски и без числа
+    online_side: bool = False
 
 
 @dataclass
@@ -1177,17 +1358,87 @@ def _place_house_text(
     return None
 
 
+def _line_gap_ok(rect: Rect, foot: Point, line_angle_deg: float, min_gap: float) -> bool:
+    """Край блока не ближе ``min_gap`` к линии измерения (R26/R27): блок не лежит на границе."""
+    ux, uy = math.cos(math.radians(line_angle_deg)), math.sin(math.radians(line_angle_deg))
+    nx, ny = -uy, ux
+    center = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0)
+    c_side = (center[0] - foot[0]) * nx + (center[1] - foot[1]) * ny
+    extent = abs(nx) * (rect[2] - rect[0]) / 2.0 + abs(ny) * (rect[3] - rect[1]) / 2.0
+    return abs(c_side) - extent >= min_gap
+
+
+def _across_line(
+    feature: "Feature", rows: Sequence["EdgeRow"], foot: Point | None = None,
+) -> tuple[Point, float] | None:
+    """
+    Линия измерения для поперечного захода выноски (R26): ``(точка на линии, угол линии)``.
+
+    Только забор и стена: у Николая их подписи стоят по другую сторону линии участка от
+    объекта (35 из 40 подписей забора снаружи контура, в 1.5–3.0 ft от линии). У дома подпись
+    живёт у стены строения — внутри него или снаружи участка, — и поперечное правило там
+    только мешало бы.
+    """
+    if not FENCE_TEXT_ACROSS_LINE or feature.kind not in ("fence", "wall") or not rows:
+        return None
+    row = rows[0]
+    return (foot if foot is not None else row.foot), row.side_angle_deg
+
+
 def _place_leader(
     anchor: Point, target: Point, text: str, height: float, width_of: Callable[[str, float], float],
     ok: Callable[[Rect, Point], bool], factor: float,
+    across: tuple[Point, float] | None = None,
 ) -> tuple[Point, Point] | None:
-    """Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые."""
+    """
+    Выноска от объекта к тексту: перпендикуляр к линии измерения первым, затем косые.
+
+    ``across`` = ``(точка на линии измерения, угол линии)`` — R26: первым заходом текст ищется
+    ПО ДРУГУЮ сторону этой линии от объекта (выноска через линию наружу), и только в наружной
+    полусфере направлений; не нашлось места — прежний круговой поиск. У Николая подписи забора
+    стоят именно так: снаружи линии участка в 1.5–3.0 ft, конец выноски у края текста.
+    """
     base = math.atan2(target[1] - anchor[1], target[0] - anchor[0])
     # Текст выноски у Николая горизонтален всегда — поворот к нему не применяется (R10).
     width, block_h = _text_block(text, height, width_of)
     gap = TEXT_GAP_FACTOR * height
-    for extra in LEADER_DISTANCES_FT:
-        for angle in LEADER_ANGLES_DEG:
+    searches: list[tuple[Sequence[float], Callable[[Rect, Point], bool] | None, Sequence[float]]] = [
+        (LEADER_ANGLES_DEG, None, LEADER_DISTANCES_FT)
+    ]
+    if across is not None:
+        foot, line_angle_deg = across
+        ux, uy = math.cos(math.radians(line_angle_deg)), math.sin(math.radians(line_angle_deg))
+        nx, ny = -uy, ux
+        obj_side = (anchor[0] - foot[0]) * nx + (anchor[1] - foot[1]) * ny
+
+        def across_ok(rect: Rect, center: Point) -> bool:
+            c_side = (center[0] - foot[0]) * nx + (center[1] - foot[1]) * ny
+            if c_side * obj_side >= 0.0:
+                return False  # текст с той же стороны линии, что и объект — не его случай
+            extent = abs(nx) * (rect[2] - rect[0]) / 2.0 + abs(ny) * (rect[3] - rect[1]) / 2.0
+            gap = abs(c_side) - extent
+            if not FENCE_TEXT_LINE_GAP_FT[0] <= gap <= FENCE_TEXT_LINE_GAP_FT[1]:
+                return False
+            return ok(rect, center)
+
+        searches.insert(0, (ACROSS_LEADER_ANGLES_DEG, across_ok, ACROSS_LEADER_DISTANCES_FT))
+    for angles, side_ok, distances in searches:
+        spot = _leader_search(
+            anchor, base, text, width, block_h, gap, factor, height, angles,
+            ok if side_ok is None else side_ok, distances,
+        )
+        if spot is not None:
+            return spot
+    return None
+
+
+def _leader_search(
+    anchor: Point, base: float, text: str, width: float, block_h: float, gap: float,
+    factor: float, height: float, angles: Sequence[float], ok: Callable[[Rect, Point], bool],
+    distances: Sequence[float] = LEADER_DISTANCES_FT,
+) -> tuple[Point, Point] | None:
+    for extra in distances:
+        for angle in angles:
             a = base + math.radians(angle)
             ux, uy = math.cos(a), math.sin(a)
             # Расстояние до центра блока — половина его габарита в направлении выноски плюс
@@ -1881,6 +2132,7 @@ def plan_offsets(
                 boundary_segs=boundary_segs, lines=lines, known=known, placed=placed,
                 width_of=width_of, dup_radius=dup_radius, text_rects=text_rects,
                 known_in_plan=known_in_plan, exempt=frozenset(crossings),
+                sides=edge_sides,
                 front_segs=tuple(
                     (tuple(line[0]), tuple(line[-1])) for line in front if len(line) >= 2
                 ),
@@ -2000,7 +2252,22 @@ def plan_offsets(
                 leader_text = "\n".join(
                     [text] + [offset_text(feature.kind, v, d) for v, d in extra]
                 )
-                spot = _place_leader(best.vertex, best.foot, leader_text, height, width_of, ok, factor)
+                plain_text = leader_text
+                if feature.kind == "house" and HOUSE_LEADER_PREFIX:
+                    leader_text = "\n".join([HOUSE_LEADER_PREFIX, *leader_text.split("\n")])
+                across = None
+                if FENCE_TEXT_ACROSS_LINE and feature.kind in ("fence", "wall") and best.segment >= 0:
+                    a = ring[best.segment % len(ring)]
+                    b = ring[(best.segment + 1) % len(ring)]
+                    across = (best.foot, math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])))
+                spot = _place_leader(
+                    best.vertex, best.foot, leader_text, height, width_of, ok, factor, across=across
+                )
+                if spot is None and leader_text != plain_text:
+                    leader_text = plain_text
+                    spot = _place_leader(
+                        best.vertex, best.foot, leader_text, height, width_of, ok, factor, across=across
+                    )
                 if spot is None:
                     plan.warnings.append(
                         f"{label}: нет свободного места для «{leader_text}» в области — подпись не поставлена"
@@ -2045,6 +2312,7 @@ def _plan_edge_labels(
     front_segs: Sequence[tuple[Point, Point]] = (),
     bare_number: bool = False,
     two_letters: bool = False,
+    sides: Sequence["SideLine"] = (),
 ) -> None:
     """
     Подписи объекта по правилам R11–R13: каждая снятая вершина у границы подписывается по
@@ -2274,8 +2542,24 @@ def _plan_edge_labels(
             if test is not None
         ]
 
-        def first_spot(placer) -> Point | None:
-            for test in tiers:
+        gap_tiers = tiers
+        if feature.kind == "house" and HOUSE_TEXT_LINE_GAP_MIN_FT > 0:
+            # R27: первым ярусом — место с просветом до линии измерения, как у Николая. Только
+            # для текста без выноски: у выноски место диктует длина стрелки, и в тесном lote
+            # (1373 East 55th) требование просвета снимало подпись и совпадение.
+            gap_foot, gap_angle = primary.foot, rows[0].side_angle_deg
+            gap_tiers = [
+                *(
+                    (lambda test: lambda rect, center: _line_gap_ok(
+                        rect, gap_foot, gap_angle, HOUSE_TEXT_LINE_GAP_MIN_FT
+                    ) and test(rect, center))(test)
+                    for test in tiers
+                ),
+                *tiers,
+            ]
+
+        def first_spot(placer, use_gap: bool = True) -> Point | None:
+            for test in gap_tiers if use_gap else tiers:
                 spot = placer(test)
                 if spot is not None:
                     return spot
@@ -2304,6 +2588,17 @@ def _plan_edge_labels(
         if beside is None and feature.kind == "house" and HOUSE_TEXT_OUTSIDE:
             # Снаружи места не нашлось — второй заход по-старому: внутри строения, потом сбоку.
             inside_tiers = [test for test in (ok_lot, ok_strict, ok) if test is not None]
+            if HOUSE_TEXT_LINE_GAP_MIN_FT > 0:
+                gap_foot2, gap_angle2 = primary.foot, rows[0].side_angle_deg
+                inside_tiers = [
+                    *(
+                        (lambda test: lambda rect, center: _line_gap_ok(
+                            rect, gap_foot2, gap_angle2, HOUSE_TEXT_LINE_GAP_MIN_FT
+                        ) and test(rect, center))(test)
+                        for test in inside_tiers
+                    ),
+                    *inside_tiers,
+                ]
             for test in inside_tiers:
                 beside = _place_house_text(
                     contour, vertex, primary.foot, label_text, height, width_of, test, rotation
@@ -2329,12 +2624,34 @@ def _plan_edge_labels(
             rect_w, rect_h = _text_block(label_text, height, width_of, rotation)
             rect = _rect_at(beside, rect_w, rect_h)
         else:
+            # У дома подпись с выноской идёт со строкой типа: «BLDG» / «2.5'S» (§8.1). Так у
+            # заказчика во всех выносочных подписях дома (Alvine «BLDG\\P2.5'S» и «BLDG\\P2.6'S»,
+            # 378 Mother Gaston «BLDG\\P0.3'S» и «BLDG\\P0.2'S», 18 Zoe «BLDG\\P6.8'S»,
+            # 1412 East 64th «BLDG\\P3.2'S»), а подпись дома БЕЗ выноски — голое число
+            # («3.5'S», «0.4'W», «2.4'S»). До 4.37 строка типа у выноски терялась.
             leader_text = label_text
+            if feature.kind == "house" and not bare_number and HOUSE_LEADER_PREFIX:
+                leader_text = "\n".join([HOUSE_LEADER_PREFIX, *label_text.split("\n")])
+            across = _across_line(feature, rows)
             spot = first_spot(
                 lambda test: _place_leader(
-                    vertex, primary.foot, leader_text, height, width_of, test, factor
-                )
+                    vertex, primary.foot, leader_text, height, width_of, test, factor,
+                    across=across,
+                ),
+                use_gap=False,
             )
+            if spot is None and leader_text != label_text:
+                # Двухстрочный блок со строкой типа в тесном месте не влезает (1373 East 55th:
+                # дом в 0.1 ft от линии соседей). Подпись важнее формы — остаётся одна строка;
+                # такая выноска у заказчика тоже есть («3.0'E» у кирпичной колонны, 1412 East 64th).
+                leader_text = label_text
+                spot = first_spot(
+                    lambda test: _place_leader(
+                        vertex, primary.foot, leader_text, height, width_of, test, factor,
+                        across=across,
+                    ),
+                    use_gap=False,
+                )
             if spot is None:
                 plan.warnings.append(
                     f"{label}: нет свободного места для «{leader_text}» в области — подпись не поставлена"
@@ -2383,11 +2700,14 @@ def _plan_edge_labels(
                 for old, p, _h in known
             )
             spot = None
+            online_across = _across_line(feature, online[vertex], foot=vertex)
             if not same_near:
                 spot = _place_leader(
-                    vertex, vertex, o_l_text, height, width_of, ok_strict, factor
+                    vertex, vertex, o_l_text, height, width_of, ok_strict, factor,
+                    across=online_across,
                 ) or _place_leader(
-                    vertex, vertex, o_l_text, height, width_of, ok, factor
+                    vertex, vertex, o_l_text, height, width_of, ok, factor,
+                    across=online_across,
                 )
             if spot is None:
                 if not same_near:
@@ -2409,6 +2729,43 @@ def _plan_edge_labels(
             # Числовые подписи у вершин на линии не ставим: там у Николая только «O/L»
             # (строка с нулевым замером отсекается основным циклом по value <= 0).
 
+    if ONLINE_SIDE_LABELS and sides:
+        # R25 (золотое правило №10, ответ заказчика 19.11.2026): «Для выноски и для угла дома —
+        # в две строчки. Если для всей стороны дома — хоть для фронта, хоть для бочины дома —
+        # если он по обеим сторонам получается O/L, то в одну строчку». Целая сторона объекта
+        # лежит на линии границы → одна строка простым текстом вдоль стены, без выноски и без
+        # числа. Подпись ДОБАВЛЯЕТСЯ к угловой двухстрочной, а не заменяет её: в 378 Mother
+        # Gaston у заказчика на одном углу стоят обе — «BLDG» / «O/L» (MText с выноской, дважды,
+        # у вершин 3487.54 и 3487.56) и «BLDG O/L» (Text, rot 359.97°) вдоль стены 24.75 ft.
+        for (a, b), side in online_side_walls(feature, sides):
+            one_line = online_side_text(feature.kind)
+            # Та же подпись уже стоит у этого края (угловая «BLDG» / «O/L» в конце стены) — вторая
+            # не нужна. Радиус общий (`dup_radius`), поэтому на 1412 East 64th стена 83.6 ft с
+            # угловой подписью второй подписи не получает — как и у заказчика.
+            if any(
+                _key(old) == _key(one_line)
+                and _point_segment_distance(old_point, (a, b)) <= dup_radius
+                for old, old_point, _h in known
+            ):
+                continue
+            rotation = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
+            center = _place_online_side((a, b), side, one_line, height, width_of, ok, rotation)
+            if center is None:
+                plan.skipped.append((label, f"«{one_line}»: нет места вдоль стороны"))
+                continue
+            rect = _rect_at(center, *_text_block(one_line, height, width_of, rotation))
+            placed.append(rect)
+            fresh_rects.append(rect)
+            plan.items.append(
+                OffsetItem(
+                    kind=feature.kind, value_ft=0.0, direction="", style="text",
+                    height_ft=height, anchor=a, target=b, text=one_line, point=center,
+                    rotation_deg=rotation, online_side=True,
+                )
+            )
+            known.append((one_line, center, height))
+            known_in_plan.append((one_line, a, height))
+
     if POST_PART_DEDUPE and PART_DUPLICATE_FT > 0:
         # H32: одиночная подпись не повторяет часть полной подписи того же вида объекта,
         # стоящей рядом (2 ft). Проверка идёт по уже разложенным подписям: двухстрочная
@@ -2423,7 +2780,11 @@ def _plan_edge_labels(
             kept: list[OffsetItem] = []
             for item in fresh:
                 own = _part_keys(item.text)
-                if len(item.text.split("\n")) == 1 and any(
+                # Подпись без числа («FE.O/L», «BLDG O/L») не может быть частью числовой подписи:
+                # `_part_keys` у неё пуст, а пустое множество — подмножество любого. Без этой
+                # проверки однострочная подпись «на линии» (R25) снималась как дубль стоящего
+                # в 2 ft числового столбика того же объекта (1412 East 64th, house/0).
+                if own and len(item.text.split("\n")) == 1 and any(
                     math.dist(item.anchor, other.anchor) <= PART_DUPLICATE_FT
                     and own <= parts
                     for other, parts in full

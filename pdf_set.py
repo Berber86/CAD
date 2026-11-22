@@ -95,6 +95,9 @@ class PdfSetItem:
     pages_note: str = ""
     # --- результат последнего разбора ---
     outcome: Any = None
+    #: All descriptions from the optional multi-description workflow. The
+    #: legacy single-result cache must never reuse the first item as complete.
+    multi_outcomes: list[Any] = field(default_factory=list)
     parsed_key: tuple[Any, ...] | None = None
     issues: list[str] = field(default_factory=list)
     error: str = ""
@@ -172,6 +175,7 @@ class PdfSetItem:
 
     def forget_result(self) -> None:
         self.outcome = None
+        self.multi_outcomes = []
         self.parsed_key = None
         self.issues = []
         self.error = ""
@@ -258,7 +262,7 @@ def make_job(item: PdfSetItem, *, force: bool = False) -> PdfSetJob:
 
     Режим «Эконом» входит в ключ разбора: смена режима у файла даёт новый разбор.
     """
-    reuse = item.has_fresh_result() and not force
+    reuse = item.has_fresh_result() and not item.multi_outcomes and not force
     source: dict[str, Any] | None = None
     source_error = ""
     if not reuse:

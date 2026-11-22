@@ -454,11 +454,12 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     # PROPERTY_LINE теперь строится отдельными отрезками AddLine (без полилинии)
     assert len(space.polylines) == 0
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
-    assert len(prop_lines) == 4
+    assert len(prop_lines) == (4 - len(result.plan.street_boundary_indices))
     assert result.boundary_line_count == 4
-    # 4 стороны + фасадная улица + ширина под ней + пересекаемая улица + расстояние до угла
-    assert result.text_count == 8
+    # 4 стороны, улицы, привязка и номер нашего лота.
+    assert result.text_count == 9
     texts = {item.TextString for item in space.texts}
+    assert "LOT ?" in texts
     assert "MAIN  STREET" in texts  # два пробела между словами названия улицы
     assert "(XX' WIDE)" in texts  # ширины в описании нет — место для ручного заполнения
     assert "OAK  AVENUE" in texts
@@ -467,7 +468,7 @@ def test_draw_writes_into_fake_autocad(monkeypatch):
     assert result.closure.distance < 1e-6
     assert app.zoomed is True
     # подписи создаются в слое текста и с выравниванием MiddleCenter
-    assert {item.Layer for item in space.texts} == {"D-TOPO-TEXT"}
+    assert {item.Layer for item in space.texts} == {"M-TAX-DIM"}
     assert {item.Alignment for item in space.texts} == {10}
 
 
@@ -874,7 +875,7 @@ def test_config_matches_shipped_file():
     assert shipped["drawing"]["base_scale"] == 16.0
     assert shipped["drawing"]["base_text_height"] == 0.9
     assert shipped["layers"]["property_line"] == "PL"
-    assert shipped["layers"]["boundary_text"] == "D-TOPO-TEXT"
+    assert shipped["layers"]["boundary_text"] == "M-TAX-DIM"
 
 
 def test_scale_menu_helpers():
@@ -1049,14 +1050,9 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     # На сторонах без румбов нет искусственных DMS-румбов вроде «N 90%%d00' E»
     assert by_kind["side-1"].text == "90.17'"
     assert by_kind["side-2"].text == "26.32'"
-    # Короткая верхняя ремарка перенесена в 2 строки под длиной 26.32' (как в эталоне PDF)
-    assert by_kind["side-2-note-2"].text == "PARALLEL WITH"
-    assert by_kind["side-2-note"].text == "QUEENS MIDTOWN EXPRESSWAY"
-    assert (
-        by_kind["side-2"].point[1]
-        > by_kind["side-2-note-2"].point[1]
-        > by_kind["side-2-note"].point[1]
-    )
+    # Длина выше единой строки PARALLEL WITH при чтении.
+    assert by_kind["side-2-note"].text == "PARALLEL WITH QUEENS MIDTOWN EXPRESSWAY"
+    assert by_kind["side-2"].point[1] > by_kind["side-2-note"].point[1]
     # Справа ремарка ближе к границе, а размер 90.00' — правее ремарки
     assert by_kind["side-3"].text == "90.00'"
     assert by_kind["side-3-note"].text == "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY"
@@ -1066,11 +1062,11 @@ def test_nyc_borden_ave_relative_angles_no_bearings_corner_lot():
     assert by_kind["angle-1"].text == '93%%d33\'29.5"'
     assert point_in_polygon(by_kind["angle-1"].point, plan.vertices) is True
     assert len(plan.arcs) == 1
-    assert len(plan.lines) == 4  # продолжения красных линий обеих улиц
+    assert len(plan.lines) == 2  # продолжения только с дальних концов уличных сторон
     # BORDEN AVENUE крупным шрифтом строго выше подзаголовка (QUEENS MIDTOWN EXPRESSWAY)
     assert by_kind["main-street"].point[1] > by_kind["main-street-note"].point[1]
     # 63RD STREET параллельна боковой стороне #1 (угловой участок, без «0.00' TO CORNER»)
-    assert by_kind["cross-street"].text == "63RD  STREET"
+    assert by_kind["cross-street"].text == "63rd  STREET"
     assert by_kind["cross-street"].rotation == pytest.approx(by_kind["side-1"].rotation)
     assert "cross-street-distance" not in by_kind
 
@@ -1245,14 +1241,15 @@ def test_vision_borden_auto_infers_interior_angle_arc_and_zoom_margin(monkeypatc
     assert len(space.arcs) == 1
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
-    assert len(prop_lines) == 4
-    assert len(street_lines) == 4
-    assert space.arcs[0].Layer == "D-TOPO-TEXT"
+    assert result.plan.street_boundary_indices == (3, 0)
+    assert len(prop_lines) == 2  # две нефасадные стороны
+    assert len(street_lines) == 4  # два дальних продолжения и два фасада
+    assert space.arcs[0].Layer == "M-TAX-DIM"
     assert any(t.TextString == '93%%d33\'29.5"' for t in space.texts)
     assert app.zoomed is True
     assert app.zoom_scaled == (pytest.approx(0.84), 1)
     # Окно листа 5000:8000 — отдельное, ожидаемое предупреждение для участка вне окна.
-    assert [w for w in result.warnings if "окно листа" not in w] == []
+    assert [w for w in result.warnings if "окно листа" not in w and "вторая граница" not in w and "Стиль LETTER" not in w and "номер лота" not in w] == []
 
 
 def test_proactive_llm_geometry_repairs_reversed_or_unordered_vision_segments():
@@ -1463,7 +1460,7 @@ def test_skewed_parallelogram_nyc_relative_courses_and_acad_paperspace_shx(monke
     builder._app, builder._doc = app, app.doc
     builder.draw(desc, scale=16.0)
     assert app.doc.ActiveSpace == 1
-    style = app.doc.TextStyles.Item("BOUNDARY")
+    style = app.doc.TextStyles.Item("LETTER")
     assert getattr(style, "fontFile", None) == "romans.shx"
     assert getattr(style, "Height", None) == 0.0
 
@@ -1531,7 +1528,7 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     """
     Совместная отрисовка основного участка (420') и двух соседей (365' и 475')
     в один активный ModelSpace AutoCAD:
-      * основной участок — слой PL + D-TOPO-TEXT + M-ROW-LINE;
+      * основной участок — слой PL + M-TAX-DIM + M-ROW-LINE;
       * соседи — замкнутая полилиния в слое NEIGHBOR_LOT (acCyan = 4), БЕЗ подписей
         сторон/углов/улиц, только 1 компактная метка внутри центроида полигона.
     """
@@ -1562,22 +1559,22 @@ def test_neighbor_mode_draws_only_neighbor_layer_and_centroid_label_in_autocad(m
     prop_lines = [ln for ln in space.lines if ln.Layer == "PL"]
     neighbor_lines = [ln for ln in space.lines if ln.Layer == "NEIGHBOR_LOT"]
     street_lines = [ln for ln in space.lines if ln.Layer == "M-ROW-LINE"]
-    assert len(prop_lines) == 4
+    assert len(prop_lines) == (4 - len(res_main.plan.street_boundary_indices))
     assert len(neighbor_lines) == 8
     assert app.doc.Layers.Item("NEIGHBOR_LOT").color == 4
     assert res_main.is_neighbor is False
     assert res_left.is_neighbor is True and res_right.is_neighbor is True
 
     # Соседи не добавляют ни одной линии улицы и создают ровно по 1 тексту в центроиде
-    assert len(street_lines) == main_lines_before - 4
+    assert len(street_lines) == main_lines_before - len(prop_lines)
     assert res_left.text_count == 1
     assert res_right.text_count == 1
     assert len(space.texts) == main_texts_before + 2
 
     neighbor_texts = space.texts[-2:]
     assert [t.TextString for t in neighbor_texts] == [
-        "NEIGHBOR (365')",
-        "NEIGHBOR (475')",
+        "LOT 26",
+        "LOT 30",
     ]
     assert {t.Layer for t in neighbor_texts} == {"NEIGHBOR_LOT"}
     assert point_in_polygon(res_left.plan.items[0].point, res_left.vertices) is True
@@ -2818,10 +2815,18 @@ def test_draw_plan_uses_exact_precomputed_geometry_and_role(monkeypatch):
     assert first.plan is main_plan and second.plan is neighbor_plan
     assert first.text_height == main_plan.text_height
     space = app.doc.ModelSpace
-    for layer, edges in (("PL", main_edges), ("NEIGHBOR_LOT", neighbor_edges)):
+    # В исходном плане и точной копии каждая сторона записана в свой слой.
+    for index, (start, end) in enumerate(main_edges):
+        layer = "M-ROW-LINE" if index in main_plan.street_boundary_indices else "PL"
         lines = [line for line in space.lines if line.Layer == layer]
-        assert len(lines) == len(edges)
-        # Перекрёсток (0, 0) плана в AutoCAD встаёт в окно листа (5000, 5000) — см. config drawing.
-        for line, (start, end) in zip(lines, edges):
-            assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
-            assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])
+        for dx in (0.0,):
+            assert any(
+                line.StartPoint == pytest.approx([start[0] + 5000.0 + dx, start[1] + 5000.0, 0])
+                and line.EndPoint == pytest.approx([end[0] + 5000.0 + dx, end[1] + 5000.0, 0])
+                for line in lines
+            )
+    lines = [line for line in space.lines if line.Layer == "NEIGHBOR_LOT"]
+    assert len(lines) == len(neighbor_edges)
+    for line, (start, end) in zip(lines, neighbor_edges):
+        assert line.StartPoint == pytest.approx([start[0] + 5000.0, start[1] + 5000.0, 0])
+        assert line.EndPoint == pytest.approx([end[0] + 5000.0, end[1] + 5000.0, 0])

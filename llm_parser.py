@@ -45,10 +45,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 import concurrent.futures
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+import drawing_warnings
 
 import ocr_numbers
 import street_names
+from legal_street_policy import NYC_STREET_INSTRUCTION
 from description_check import CLOSURE_OK_FT, accepted_without_ai
 
 __all__ = [
@@ -203,6 +205,10 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "multiple_description_search": {
+        "enabled": False,
+        "vision_fallback": {"provider": "hydra", "model": "grok-4.7", "image_limit": 10},
+    },
     "api": {
         "provider": "hydra",
         "api_key": "",
@@ -265,14 +271,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "layers": {
         "property_line": "PL",
-        "boundary_text": "D-TOPO-TEXT",
+        "boundary_text": "M-TAX-DIM",
         "street_row": "M-ROW-LINE",
         "neighbor_lot": "NEIGHBOR_LOT",
     },
     "layer_colors": {
         "property_line": 3,
         "boundary_text": 7,
-        "street_row": 5,
+        "street_row": 1,
         "neighbor_lot": 4,
     },
     # Полный путь GitHub (репозиторий/ветка/.zip), откуда кнопка «Обновить версию»
@@ -865,7 +871,7 @@ _VULGAR_FRACTIONS: dict[str, str] = {
 }
 
 _FEET_INCHES_STR_RE = re.compile(
-    r"(?P<ft>\d+(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:-\s*|and\s+)?"
+    r"(?P<ft>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:feet|foot|ft\.?|')\s*(?:-\s*|and\s+)?"
     r"(?:"
     r"(?P<in>\d+(?:\.\d+)?)(?:[\s-]+(?P<fnum>\d+)\s*/\s*(?P<fden>\d+))?"
     r"|(?P<pnum>\d+)\s*/\s*(?P<pden>\d+)"
@@ -882,7 +888,7 @@ def _replace_vulgar_fractions(text: str) -> str:
 
 
 def _feet_inches_match_to_ft(fi: re.Match[str]) -> float:
-    feet = float(fi.group("ft"))
+    feet = float(fi.group("ft").replace(",", ""))
     inches = float(fi.group("in")) if fi.group("in") is not None else 0.0
     if fi.group("fnum") and fi.group("fden") and float(fi.group("fden")) > 0:
         inches += float(fi.group("fnum")) / float(fi.group("fden"))
@@ -937,6 +943,7 @@ class Segment(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+    _auto_corrections: list[drawing_warnings.AutoCorrection] = PrivateAttr(default_factory=list)
 
     ns: Literal["N", "S"] = Field(description="Первая буква румба: N или S")
     degrees: int = Field(ge=0, le=90, description="Градусы румба, 0..90")
@@ -944,6 +951,10 @@ class Segment(BaseModel):
     seconds: float = Field(ge=0, le=60, description="Секунды, 0..60")
     ew: Literal["E", "W"] = Field(description="Вторая буква румба: E или W")
     distance_ft: float = Field(gt=0, description="Длина стороны в футах")
+    distance_source: str | None = Field(
+        default=None,
+        description="Исходный размер этой стороны в футах и дюймах, только если так напечатано; например 13 feet 8 inches",
+    )
     bearing_label: str | None = Field(
         default=None,
         description='Готовая подпись румба, например N 75°20\'20" E',
@@ -966,6 +977,10 @@ class Segment(BaseModel):
         default=None,
         description='Внутренний угол в начальной вершине этой стороны, например 93°33\'29.5"',
     )
+    party_wall: bool = Field(
+        default=False,
+        description="True только если именно эта сторона описана как проходящая через party wall",
+    )
 
     bearing_solved: bool = Field(
         default=False,
@@ -981,6 +996,11 @@ class Segment(BaseModel):
         if not isinstance(data, dict):
             return data
         item = dict(data)
+        raw_distance = item.get("distance_ft")
+        if isinstance(raw_distance, str) and not item.get("distance_source"):
+            raw_normalized = _replace_vulgar_fractions(raw_distance.strip())
+            if _FEET_INCHES_STR_RE.fullmatch(raw_normalized):
+                item["distance_source"] = raw_normalized
 
         # Нормализация кардинальных сокращений от LLM (напр. ns="E", degrees=0 -> N 90° E)
         raw_ns = str(item.get("ns") or "").strip().upper()[:1]
@@ -1060,7 +1080,7 @@ class Segment(BaseModel):
             raise ValueError(f"длина стороны должна быть > 0, получено {number}")
         return number
 
-    @field_validator("bearing_label", "course_note", "interior_angle", mode="before")
+    @field_validator("bearing_label", "course_note", "interior_angle", "distance_source", mode="before")
     @classmethod
     def _normalize_label(cls, value: Any) -> str | None:
         return _clean_name(value)
@@ -1313,9 +1333,19 @@ class LegalDescription(BaseModel):
     """Результат разбора документа целиком (Schedule A / Deed / Survey PDF)."""
 
     model_config = ConfigDict(extra="forbid")
+    # Метаинформация об источнике, не поле LLM-схемы и не часть deed.
+    _source_lot_number: str | None = PrivateAttr(default=None)
+    _source_lot_filename: str | None = PrivateAttr(default=None)
+    _source_identity: dict[str, list[dict[str, str]]] = PrivateAttr(default_factory=dict)
+    _source_file_sha256: str = PrivateAttr(default="")
 
     main_street: str = Field(
         description="Улица, на которую выходит фасад участка (fronting ...)"
+    )
+    main_street_corrected: str | None = Field(
+        default=None,
+        description=("Исправленное название фасадной улицы только если меняется написание; "
+                     "исходное прочитанное название обязательно остаётся в main_street, иначе null."),
     )
     main_street_note: str | None = Field(
         default=None,
@@ -1337,6 +1367,15 @@ class LegalDescription(BaseModel):
         default=None,
         description="Пересекаемая улица, от которой отмеряется расстояние до угла",
     )
+    cross_street_corrected: str | None = Field(
+        default=None,
+        description=("Исправленное название пересекаемой улицы только при исправлении; "
+                     "исходное название обязательно остаётся в cross_street, иначе null."),
+    )
+    cross_street_former: str | None = Field(
+        default=None,
+        description="Старое название пересекаемой улицы, если прямо указано в источнике",
+    )
     street_aliases: list[str] = Field(
         default_factory=list,
         description=(
@@ -1352,6 +1391,10 @@ class LegalDescription(BaseModel):
             "Расстояние вдоль фасадной улицы до угла/пересечения (0.0, 0.0), футы "
             "(0.0 для углового участка или если привязка к углу отсутствует)"
         ),
+    )
+    distance_to_corner_source: str | None = Field(
+        default=None,
+        description="Исходное расстояние привязки в футах и дюймах, только если прямо указано",
     )
     corner_to_pob_bearing: Segment | None = Field(
         default=None,
@@ -1421,6 +1464,16 @@ class LegalDescription(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _require_original_for_correction(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for name in ("main_street", "cross_street"):
+                corrected = data.get(name + "_corrected")
+                if corrected and not _clean_name(data.get(name)):
+                    raise ValueError(f"{name}_corrected requires the original {name}")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _preprocess_corner_tie(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
@@ -1459,7 +1512,10 @@ class LegalDescription(BaseModel):
             out["main_street"] = clean
             former = former or found
         if isinstance(cross_raw, str):
-            out["cross_street"] = street_names.split_former_name(cross_raw)[0]
+            clean_cross, cross_former = street_names.split_former_name(cross_raw)
+            out["cross_street"] = clean_cross
+            if cross_former and not out.get("cross_street_former"):
+                out["cross_street_former"] = cross_former
         if former:
             out["main_street_former"] = former
         return out
@@ -1471,7 +1527,11 @@ class LegalDescription(BaseModel):
 
     @field_validator(
         "main_street_note",
+        "main_street_corrected",
         "cross_street",
+        "cross_street_corrected",
+        "cross_street_former",
+        "distance_to_corner_source",
         "tie_note",
         "block_number",
         "lot_number",
@@ -2315,6 +2375,8 @@ CRITICAL SURVEY RULES
      * Set `has_bearing = false` on every course without an explicit compass bearing;
      * Put exact directional notes printed on that side verbatim (e.g. "PARALLEL WITH QUEENS MIDTOWN EXPY", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY") into `course_note`;
      * ALWAYS look inside the parcel corners for any printed vertex angle (e.g. `93°33'29.5"`) and record it in `interior_angle` of the segment starting at that corner!
+   - If a boundary course explicitly uses feet and inches, put its printed value (e.g. "13 feet 8 inches" or "25'-6 1/2\"") in `distance_source`; otherwise null. Keep `distance_ft` as decimal feet.
+   - Set `party_wall=true` only on each boundary course explicitly described as through/along a party wall; otherwise false. Never infer it merely from a building or a neighbouring course.
 4. DISTANCES (INCLUDING 1980s FRACTIONAL INCHES):
    - `distance_ft` is in decimal feet. Convert all feet-and-inches and fractional inches accurately:
      * "13 feet 8 inches" -> 13.6667
@@ -2324,15 +2386,17 @@ CRITICAL SURVEY RULES
      * "50'-0 3/4\"" -> 50 + 0.75/12 = 50.0625
      * varas (×2.77778) or chains (×66) -> decimal feet.
 5. STREETS, FRONTAGE & NYC METADATA:
-   - `main_street`: primary street the lot fronts on (name only, e.g. "Dartmouth Loop", "Jamie Lane", "Borden Avenue").
+   - `main_street`: the exact name as read for the primary street the lot fronts on; keep it unchanged even when spelling is corrected. `main_street_corrected`: corrected spelling if changed, otherwise null.
    - `main_street_note`: parenthetical subtitle of the front street if shown, e.g. "(38' WIDE ROADWAY EASEMENT)", "(NOT MAPPED ON FINAL CITY PLAN)", "(QUEENS MIDTOWN EXPRESSWAY)", else null. Keep the street width in it when the document gives one ("60 feet wide" -> "(60' WIDE)"). Do NOT put an old street name there.
    - `main_street_former`: the OLD name of the front street when the document gives it with "formerly", "previously known as", "formerly known as", "also known as", "a/k/a" or "f/k/a", in parentheses or without them (e.g. "Stafford Avenue (formerly Carlton Street)" -> main_street "Stafford Avenue", main_street_former "Carlton Street"). `main_street` must contain only the current name. Else null.
    - `front_segment_index`: 0-based index (0 = first segment) in `segments` of the lot boundary that fronts `main_street` (never pick a rear/side wall labeled PARALLEL WITH or AT RIGHT ANGLES!).
    - `front_side`: compass direction ("N", "S", "E", "W", "NE", "NW", "SE", "SW") pointing OUTWARD from the lot toward `main_street` relative to the North Arrow. If the lot is on the North/Northerly side of Main Street -> "S"; if on the Northwesterly side -> "SE".
-   - `cross_street`: intersecting street (e.g. "63rd Street", "Mill Road", "Kenilworth Avenue"), else null.
+   - `distance_to_corner_source`: the original feet-and-inches notation for the tie distance, if explicitly printed (else null).
+   - `cross_street_former`: former name of the intersecting street only when explicitly associated with it in the document, otherwise null.
+   - `cross_street`: exact name as read for the intersecting street, else null. `cross_street_corrected`: corrected spelling if changed, otherwise null; never replace the original in `cross_street`.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
-6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only."""
+6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only.""" + "\n\n" + NYC_STREET_INSTRUCTION
 
 USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:
 \"\"\"
@@ -3142,13 +3206,16 @@ def legal_to_step0_text(data: "LegalDescription") -> str | None:
         )
 
     front = _STEP0_SIDE.get(str(getattr(data, "front_side", "") or ""), "")
-    side_part = f"the {front} side of {main}" if front else main
+    display_main = main + (f" (formerly {data.main_street_former})" if data.main_street_former else "")
+    side_part = f"the {front} side of {display_main}" if front else display_main
     head = f"ALL THAT CERTAIN plot, piece or parcel of land. BEGINNING at a point on {side_part}"
     tie = float(getattr(data, "distance_to_corner_ft", 0.0) or 0.0)
     cross = (getattr(data, "cross_street", "") or "").strip()
     if tie > 0 and cross:
+        if getattr(data, "cross_street_former", None):
+            cross += f" (formerly {data.cross_street_former})"
         head += (
-            f", distant {tie:.2f} feet from the corner formed by the intersection of "
+            f", distant {format_feet_inches_source(data.distance_to_corner_source, tie) or f'{tie:.2f} feet'} from the corner formed by the intersection of "
             f"{main} and {cross}"
         )
     parts = [head + ";"]
@@ -3156,7 +3223,11 @@ def legal_to_step0_text(data: "LegalDescription") -> str | None:
     for index, seg in enumerate(segments):
         lead = "RUNNING THENCE" if index == 0 else "THENCE"
         ending = " to the point or place of BEGINNING." if index == last else " to a point;"
-        parts.append(f"{lead} {bearing(seg)} {float(seg.distance_ft):.2f} feet{ending}")
+        source = format_feet_inches_source(seg.distance_source, seg.distance_ft)
+        dimension = source if source else f"{float(seg.distance_ft):.2f} feet"
+        wall = " through a party wall" if seg.party_wall else ""
+        note = (f" {seg.course_note}," if re.match(r"^PARALLEL WITH\b", seg.course_note or "", re.IGNORECASE) else "")
+        parts.append(f"{lead} {bearing(seg)}{note}{wall} {dimension}{ending}")
     return " ".join(parts)
 
 
@@ -3334,6 +3405,57 @@ def _distance_after(chunk: str) -> float | None:
     return None
 
 
+def _feet_inches_source(chunk: str, distance: float | None) -> str | None:
+    """Сохраняем написание только для выбранной длины, а не иного числа курса."""
+    if distance is None:
+        return None
+    fi = _FEET_INCHES_STR_RE.search(chunk)
+    plain = _DISTANCE_RE.search(chunk)
+    if not fi or (plain and fi.start() > plain.start()):
+        return None
+    if abs(_feet_inches_match_to_ft(fi) - float(distance)) > 0.0001:
+        return None
+    return fi.group(0).strip()
+
+
+def format_feet_inches_source(source: str | None, distance: float) -> str | None:
+    """Формат feet + inches, только при соответствии текущей длине стороны."""
+    if not source:
+        return None
+    raw = _replace_vulgar_fractions(source.strip().replace("′", "'").replace("″", '"'))
+    fi = _FEET_INCHES_STR_RE.fullmatch(raw)
+    if not fi or abs(_feet_inches_match_to_ft(fi) - float(distance)) > 0.0001:
+        return None
+    if ((fi.group("fden") and int(fi.group("fden")) == 0)
+            or (fi.group("pden") and int(fi.group("pden")) == 0)):
+        return None
+    feet = fi.group("ft")
+    inches = fi.group("in") or ""
+    if fi.group("fnum"):
+        inches += f" {fi.group('fnum')}/{fi.group('fden')}"
+    elif fi.group("pnum"):
+        inches = f"{fi.group('pnum')}/{fi.group('pden')}"
+    return f"{feet}'-{inches.strip()}\""
+
+
+def _corner_feet_inches_source(preamble: str, lot_body: str, distance: float | None) -> str | None:
+    if not distance:
+        return None
+    intro = re.split(r"\b(?:RUNNING\s+)?THENCE\b", lot_body, maxsplit=1, flags=re.IGNORECASE)[0]
+    for mark in re.finditer(r"\b(?:distant|distance\s+of)\s+", intro, re.IGNORECASE):
+        match = _FEET_INCHES_STR_RE.match(intro, mark.end())
+        if match and abs(_feet_inches_match_to_ft(match) - distance) <= 0.0001:
+            return match.group(0).strip()
+    # При COMMENCING источником может быть последнее звено привязки.
+    if preamble:
+        bearings = _bearing_matches(preamble)
+        if bearings:
+            source = _feet_inches_source(preamble[bearings[-1].end():], distance)
+            if source:
+                return source
+    return None
+
+
 def _has_min_courses(body: str, minimum: int = 3) -> bool:
     if len(_bearing_matches(body)) >= minimum:
         return True
@@ -3506,12 +3628,14 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
                 "clause": clause,
                 "nominal_az": nominal_az,
                 "distance_ft": dist,
+                "distance_source": _feet_inches_source(clause, dist),
                 "ia_deg": ia_deg,
                 "ia_label": ia_label,
                 "right_angle": bool(
                     re.search(r"\b(?:at\s+right\s+angles|perpendicular)\b", clause, re.IGNORECASE)
                 ),
                 "course_note": _extract_course_note(clause),
+                "party_wall": bool(re.search(r"\bparty[\s-]+wall\b", clause, re.IGNORECASE)),
             }
         )
 
@@ -3581,8 +3705,10 @@ def _segments_from_relative_nyc(text: str) -> tuple[list[dict[str, Any]], list[s
         prev_az = az
         seg = _azimuth_to_quadrant_dict(az)
         seg["distance_ft"] = item["distance_ft"]
+        seg["distance_source"] = item["distance_source"]
         seg["has_bearing"] = False
         seg["course_note"] = item["course_note"]
+        seg["party_wall"] = item["party_wall"]
         seg["interior_angle"] = item["ia_label"]
         segments.append(seg)
 
@@ -3633,6 +3759,7 @@ def _wordy_street_courses(
         note = re.sub(r"[\s,]*\b(?:a\s+)?distance\s+of$", "", note, flags=re.IGNORECASE).strip(" ,;:.")
         seg = _azimuth_to_quadrant_dict(nominal)
         seg["distance_ft"] = distance
+        seg["distance_source"] = _feet_inches_source(clause, distance)
         seg["has_bearing"] = False
         seg["course_note"] = note or None
         found.append((mark.start(), seg))
@@ -3680,6 +3807,7 @@ def _orphan_courses(
                 continue
             seg = _azimuth_to_quadrant_dict(nominal)
             seg["distance_ft"] = distance
+            seg["distance_source"] = _feet_inches_source(chunk[frag.start("dir"):], distance)
             seg["has_bearing"] = False
             seg["course_note"] = None
             found.append((match.end() + frag.start("dir"), seg, ns_hint, ew_hint))
@@ -3796,12 +3924,32 @@ def _segments_from_regex(
                     "seconds": seconds,
                     "ew": ew,
                     "distance_ft": distance,
+                    "distance_source": _feet_inches_source(chunk, distance),
                     "has_bearing": True,
                 },
             )
         )
 
     placed.sort(key=lambda entry: entry[0])
+    # Привязываем party wall только к однозначному курсу внутри THENCE;
+    # отметка до румба и после румба принадлежит одному и тому же курсу.
+    clauses = list(re.finditer(r"\b(?:RUNNING\s+)?THENCE\b", text, re.IGNORECASE))
+    for idx, clause in enumerate(clauses):
+        end = clauses[idx + 1].start() if idx + 1 < len(clauses) else len(text)
+        content = text[clause.end():end]
+        candidates = [seg for pos, seg in placed if clause.end() <= pos < end]
+        relative_note = _extract_course_note(content)
+        if len(candidates) == 1 and relative_note and relative_note.startswith("PARALLEL WITH "):
+            candidates[0]["course_note"] = relative_note
+        if re.search(r"\bparty[\s-]+wall\b", content, re.IGNORECASE):
+            if len(candidates) == 1:
+                candidates[0]["party_wall"] = True
+            else:
+                warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
+    if re.search(r"\bparty[\s-]+wall\b", text, re.IGNORECASE) and not any(
+        seg.get("party_wall") for _, seg in placed
+    ) and not any("PARTY WALL" in warning for warning in warnings):
+        warnings.append("PARTY WALL: не удалось однозначно определить сторону — сверьте legal description")
     segs = [seg for _, seg in placed]
     if orphans:
         hints = {}
@@ -4163,7 +4311,7 @@ def _extract_streets(
     if distance_to_corner is None:
         distance_match = re.search(
             r"(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')"
-            r"(?:\s*(?P<inch>\d+(?:\.\d+)?)\s*(?:inches|inch|in|\"))?\s*"
+            r"(?:\s*(?:-\s*|and\s+)?(?P<inch>(?:\d+(?:\.\d+)?(?:[\s-]+\d+\s*/\s*\d+)?|\d+\s*/\s*\d+))\s*(?:inches|inch|in|\"))?\s*"
             # «U.S. Standard (75.00 feet Deed)» между числом и направлением
             r"(?:\s*U\.?\s*S\.?\s*(?:Standard|Survey)\.?)?"
             r"(?:\s*\([^()]{0,40}\))?"
@@ -4178,12 +4326,21 @@ def _extract_streets(
         if distance_match:
             feet_val = float(distance_match.group("num").replace(",", ""))
             inch_raw = distance_match.groupdict().get("inch")
-            inch_val = float(inch_raw) / 12.0 if inch_raw else 0.0
-            distance_to_corner = feet_val + inch_val
+            feet_inches = _FEET_INCHES_STR_RE.match(text, distance_match.start()) if inch_raw else None
+            if feet_inches and not any(feet_inches.group(name) and int(feet_inches.group(name)) == 0
+                                       for name in ("fden", "pden")):
+                distance_to_corner = _feet_inches_match_to_ft(feet_inches)
+            else:
+                distance_to_corner = feet_val
         elif preamble:
             tie_dists = list(_DISTANCE_RE.finditer(preamble))
             if tie_dists:
-                last_tie = float(tie_dists[-1].group("num").replace(",", ""))
+                # Берём длину последнего курса, а не ширину улицы после него.
+                tie_bearings = _bearing_matches(preamble)
+                last_tie = (_distance_after(preamble[tie_bearings[-1].end():])
+                            if tie_bearings else None)
+                if last_tie is None:
+                    last_tie = _distance_after(preamble[tie_dists[-1].start():])
                 distance_to_corner = last_tie
                 deed_vs_tm = re.search(
                     r"(\d[\d,]*(?:\.\d+)?)\s*(?:feet|ft|')\s*\(\s*DEED\s*\)"
@@ -4354,8 +4511,10 @@ def parse_with_regex(
                 "main_street_note": meta["main_street_note"],
                 "main_street_former": former_name,
                 "cross_street": cross_street,
+                "cross_street_former": street_names.find_former_name(normalized, cross_street),
                 "street_aliases": [f"{cur} = {old}" for cur, old in street_names.street_aliases(normalized)],
                 "distance_to_corner_ft": distance_to_corner,
+                "distance_to_corner_source": _corner_feet_inches_source(preamble, lot_body, distance_to_corner),
                 "corner_to_pob_bearing": corner_tie,
                 "tie_note": meta["tie_note"],
                 "front_side": front_side,
@@ -4571,9 +4730,11 @@ def _flip_segment_direction(seg: Segment) -> Segment:
         seconds=seg.seconds,
         ew=ew_flipped,
         distance_ft=seg.distance_ft,
+        distance_source=seg.distance_source,
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
+        party_wall=seg.party_wall,
     )
 
 
@@ -4683,9 +4844,11 @@ def _mutate_segment_bearing(
         seconds=s_val,
         ew=seg.ew if ew is None else ew,
         distance_ft=seg.distance_ft,
+        distance_source=seg.distance_source,
         has_bearing=seg.has_bearing,
         course_note=seg.course_note,
         interior_angle=seg.interior_angle,
+        party_wall=seg.party_wall,
     )
 
 
@@ -5220,11 +5383,17 @@ def _detect_and_repair_obvious_typos(
     )
     if cand is not None and cand.can_auto_apply(ask_on_doubt=not auto_apply):
         assert cand.repaired_segments is not None
-        return cand.repaired_segments, old_to_new, [*align_notes, cand.reason_ru]
+        repaired = list(cand.repaired_segments)
+        idx = cand.segment_index - 1
+        repaired[idx] = drawing_warnings.mark_auto_correction(segs[idx], repaired[idx])
+        return repaired, old_to_new, [*align_notes, cand.reason_ru]
     clear = _scan_clear_lookalike_typo(segs, unanimous_llm_passes=unanimous_llm_passes)
     if clear is not None and clear.can_auto_apply(ask_on_doubt=False):
         assert clear.repaired_segments is not None
-        return clear.repaired_segments, old_to_new, [*align_notes, clear.reason_ru]
+        repaired = list(clear.repaired_segments)
+        idx = clear.segment_index - 1
+        repaired[idx] = drawing_warnings.mark_auto_correction(segs[idx], repaired[idx])
+        return repaired, old_to_new, [*align_notes, clear.reason_ru]
     return segs, old_to_new, align_notes
 
 
@@ -5989,6 +6158,43 @@ def parse_legal_description_full(
             )
             warnings.extend(repair_notes)
             parsed_model = _ensure_street_width(parsed_model, combined)
+            if local_attempt and len(local_attempt.model.segments) == len(parsed_model.segments):
+                local_segments = local_attempt.model.segments
+                ai_segments = parsed_model.segments
+                if all(abs(a.distance_ft - b.distance_ft) < 0.0001
+                       and _angle_diff_deg(a.azimuth_deg, b.azimuth_deg) < 0.02
+                       for a, b in zip(ai_segments, local_segments)):
+                    parsed_model = parsed_model.model_copy(update={"segments": [
+                        a.model_copy(update={"distance_source": b.distance_source or a.distance_source})
+                        for a, b in zip(ai_segments, local_segments)
+                    ]})
+            if local_attempt and not parsed_model.distance_to_corner_source:
+                local = local_attempt.model
+                if abs(parsed_model.distance_to_corner_ft - local.distance_to_corner_ft) < 0.0001:
+                    parsed_model = parsed_model.model_copy(update={"distance_to_corner_source": local.distance_to_corner_source})
+            if combined and parsed_model.cross_street and not parsed_model.cross_street_former:
+                former = street_names.find_former_name(combined, parsed_model.cross_street)
+                if former:
+                    parsed_model = parsed_model.model_copy(update={"cross_street_former": former})
+            if re.search(r"\bparty[\s-]+wall\b", combined, re.IGNORECASE):
+                local_segments = local_attempt.model.segments if local_attempt else []
+                ai_segments = parsed_model.segments
+                same = len(local_segments) == len(ai_segments) and all(
+                    abs(a.distance_ft - b.distance_ft) < 0.02
+                    and _angle_diff_deg(a.azimuth_deg, b.azimuth_deg) < 0.02
+                    for a, b in zip(local_segments, ai_segments)
+                )
+                if same:
+                    parsed_model = parsed_model.model_copy(update={"segments": [
+                        a.model_copy(update={"party_wall": a.party_wall or b.party_wall})
+                        for a, b in zip(ai_segments, local_segments)
+                    ]})
+                else:
+                    warnings.append("PARTY WALL найден в тексте; привязку к стороне не удалось независимо сверить — проверьте документ")
+                if local_attempt:
+                    warnings.extend(w for w in local_attempt.warnings if "PARTY WALL" in w and w not in warnings)
+                if not any(s.party_wall for s in parsed_model.segments):
+                    warnings.append("PARTY WALL найден, но сторона не определена — проверьте документ")
             suspicions = detect_typo_suspicions(
                 parsed_model,
                 source_text=combined,
@@ -6188,6 +6394,50 @@ class ConsensusResult:
             "либо нажмите «Попробуй разобраться ещё раз» для прицельной перепроверки спорных мест."
         )
         return "\n".join(lines)
+
+    def obvious_geometry_choice(self) -> ParseOutcome | None:
+        """Выбирает один из двух проходов только при резком различии замыкания.
+
+        Замыкание не подтверждает чтение документа. Поэтому остальные поля и
+        метаданные сторон обязаны совпадать, а вычисленные румбы запрещены.
+        При любом другом расхождении возвращается обычный конфликт.
+        """
+        if self.agreed or len(self.pass_outcomes) != 2 or not self.discrepancies:
+            return None
+        if any(not re.fullmatch(r"segments\[\d+\]\.(?:bearing|distance_ft)", d.field_id)
+               for d in self.discrepancies):
+            return None
+        a, b = (o.data for o in self.pass_outcomes)
+        if len(a.segments) != len(b.segments) or len(a.segments) < 3:
+            return None
+        if a.model_dump(exclude={"segments"}) != b.model_dump(exclude={"segments"}):
+            return None
+        geometry_fields = {"ns", "ew", "degrees", "minutes", "seconds", "distance_ft", "bearing_label"}
+        for sa, sb in zip(a.segments, b.segments):
+            if not sa.has_bearing or not sb.has_bearing or sa.bearing_solved or sb.bearing_solved:
+                return None
+            if sa.model_dump(exclude=geometry_fields) != sb.model_dump(exclude=geometry_fields):
+                return None
+        traces = [_trace_closure_and_validity(o.data.segments) for o in self.pass_outcomes]
+        if any(not math.isfinite(err) for err, _ in traces):
+            return None
+        good = [i for i, (err, valid) in enumerate(traces) if valid and err <= 0.015]
+        if len(good) != 1:
+            return None
+        index = good[0]
+        if traces[1 - index][0] < 1.0:
+            return None
+        note = (
+            f"⚠ Проходы ИИ разошлись: автоматически выбран {self.pass_label(index + 1)} "
+            f"по замыканию {traces[index][0]:.4f} ft; другой проход: "
+            f"{traces[1 - index][0]:.4f} ft. Это не консенсус и не доказательство "
+            "правильного чтения — сверьте спорные значения с документом."
+        )
+        outcome = self.resolve_with_pass(index + 1, reason=note)
+        details = "Расхождения проходов: " + "; ".join(
+            d.summary(self.pass_labels_map()) for d in self.discrepancies
+        )
+        return dataclasses.replace(outcome, warnings=[*outcome.warnings, details])
 
     def resolve_with_pass(self, pass_index: int, *, reason: str = "") -> ParseOutcome:
         """Формирует итоговый ParseOutcome на базе выбранного человеком прохода."""

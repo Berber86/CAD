@@ -69,6 +69,7 @@ class _Widget:
                 raise ValueError(f"transparency is not allowed for {type(self).__name__}.{name}")
 
     def __init__(self, *args, **kwargs):
+        self._wm_log: list[str] = []
         self._validate_colors(kwargs)
         self.master = args[0] if args else kwargs.get("master")
         self._children = []
@@ -133,10 +134,30 @@ class _Widget:
     def after(self, *args, **kwargs):
         return None
 
+    def after_cancel(self, *args, **kwargs):
+        return None
+
     def after_idle(self, *args, **kwargs):
         return None
 
+    def withdraw(self, *args, **kwargs):
+        self._wm_log.append("withdraw")
+        return None
+
+    def deiconify(self, *args, **kwargs):
+        self._wm_log.append("deiconify")
+        return None
+
+    def update_idletasks(self, *args, **kwargs):
+        self._wm_log.append("update_idletasks")
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
     def state(self, *args, **kwargs):
+        if args:
+            self._wm_log.append(f"state:{args[0]}")
         return None
 
     def start(self):
@@ -294,8 +315,22 @@ class _FakeCanvas(_Widget):
     def bind(self, event_name, callback):
         self._bindings[event_name] = callback
 
+    def xview(self, *args):
+        return None
+
+    def yview(self, *args):
+        return None
+
+    def create_image(self, *coords, **kwargs):
+        self.items.append(("image", coords, dict(kwargs)))
+        return len(self.items)
+
     def create_line(self, *coords, **kwargs):
         self.items.append(("line", coords, dict(kwargs)))
+        return len(self.items)
+
+    def create_arc(self, *coords, **kwargs):
+        self.items.append(("arc", coords, dict(kwargs)))
         return len(self.items)
 
     def create_oval(self, *coords, **kwargs):
@@ -313,10 +348,79 @@ def _step0_texts(app):
     return [item[1] if isinstance(item, tuple) else item for item in app._step0_lines]
 
 
+class _FakeCTkRoot(_Widget):
+    """
+    Заглушка ``customtkinter.CTk`` с настоящим поведением окна на Windows.
+
+    CustomTkinter помнит, вызывали ли ``withdraw()`` до первого показа окна
+    (``_withdraw_called_before_window_exists``), и в ``update()``/``mainloop()``
+    показывает окно сам только если НЕ вызывали. Кроме того, ``mainloop`` на Windows
+    прячет окно для перекраски заголовка (``_windows_set_titlebar_color``). Именно на
+    этой связке окно в 4.39 «появлялось и исчезало»: заглушка повторяет её дословно,
+    чтобы тест ловил регрессию (источник: customtkinter/windows/ctk_tk.py).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._window_exists = False
+        self._withdraw_called_before_window_exists = False
+        self._iconify_called_before_window_exists = False
+        #: Видно ли окно на экране (withdrawn → False, deiconify → True).
+        self._visible = True
+        self._alpha = 1.0
+
+    def withdraw(self, *args, **kwargs):
+        super().withdraw(*args, **kwargs)
+        if self._window_exists is False:
+            self._withdraw_called_before_window_exists = True
+        self._visible = False
+
+    def deiconify(self, *args, **kwargs):
+        super().deiconify(*args, **kwargs)
+        self._visible = True
+
+    def iconify(self, *args, **kwargs):
+        if self._window_exists is False:
+            self._iconify_called_before_window_exists = True
+        self._visible = False
+
+    def update(self, *args, **kwargs):
+        self._wm_log.append("update")
+        if self._window_exists is False:
+            # как в CTk.update: окно показывается само, только если его не прятали
+            if (
+                not self._withdraw_called_before_window_exists
+                and not self._iconify_called_before_window_exists
+            ):
+                self.deiconify()
+            self._window_exists = True
+        return None
+
+    def mainloop(self, *args, **kwargs):
+        self._wm_log.append("mainloop")
+        if not self._window_exists:
+            # как в CTk.mainloop на Windows: перекраска заголовка прячет окно...
+            self.withdraw()
+            # ...а обратно оно показывается, только если withdraw НЕ звали до показа.
+            if (
+                not self._withdraw_called_before_window_exists
+                and not self._iconify_called_before_window_exists
+            ):
+                self.deiconify()
+            self._window_exists = True
+        return None
+
+    def attributes(self, *args, **kwargs):
+        if len(args) >= 2 and args[0] == "-alpha":
+            self._alpha = float(args[1])
+            self._wm_log.append(f"alpha:{float(args[1]):g}")
+        return super().attributes(*args, **kwargs)
+
+
 def _fake_modules() -> dict[str, types.ModuleType]:
     ctk = types.ModuleType("customtkinter")
+    ctk.CTk = _FakeCTkRoot
     for name in (
-        "CTk",
         "CTkFrame",
         "CTkScrollableFrame",
         "CTkLabel",
@@ -329,6 +433,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
         "CTkCheckBox",
         "CTkTextbox",
         "CTkProgressBar",
+        "CTkSlider",
         "CTkSwitch",
         "CTkToplevel",
     ):
@@ -341,6 +446,7 @@ def _fake_modules() -> dict[str, types.ModuleType]:
 
     tkinter = types.ModuleType("tkinter")
     tkinter.Canvas = _FakeCanvas
+    tkinter.Scrollbar = type("Scrollbar", (_Widget,), {})
     tkinter.Menu = _FakeMenu
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askopenfilename = lambda **kwargs: ""
@@ -350,6 +456,9 @@ def _fake_modules() -> dict[str, types.ModuleType]:
     messagebox.askokcancel = lambda *args, **kwargs: False
     messagebox.askyesno = lambda *args, **kwargs: False
     messagebox.askyesnocancel = lambda *args, **kwargs: None
+    # Диалог сбоя запуска: main() обязан сказать пользователю, почему окна нет (4.40).
+    messagebox.errors: list[tuple[str, str]] = []
+    messagebox.showerror = lambda title, message, **kwargs: messagebox.errors.append((title, message))
     tkinter.messagebox = messagebox
     return {
         "customtkinter": ctk,
@@ -371,9 +480,7 @@ def gui(monkeypatch, tmp_path):
     # sample config while preserving its real defaults for every smoke test.
     import llm_parser
     config_path = tmp_path / "config.json"
-    # Черновик для печати — отдельный план при «Начертить». Подсчёты отрисовки в этих тестах
-    # относятся к основной схеме, поэтому черновик выключен; его проверяет
-    # test_print_draft_is_added_only_for_main_lot_when_enabled ниже и tests/test_print_draft.py.
+    # Старое локальное значение не должно препятствовать черновику в выделенных тестах.
     import json as _json  # noqa: PLC0415
     _cfg_data = _json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
     _cfg_data.setdefault("print_draft", {})["enabled"] = False
@@ -385,6 +492,11 @@ def gui(monkeypatch, tmp_path):
         monkeypatch.setattr(module, "LOCAL_CONFIG_PATH", local_config_path)
         monkeypatch.setattr(module, "ENV_PATH", env_path)
 
+    # Остальные smoke-тесты проверяют основную сцену; реальные сборку и запуск
+    # черновика проверяем отдельно, восстанавливая метод в соответствующих тестах.
+    gui_module._real_print_draft_plans = gui_module.SurveyApp._print_draft_plans
+    monkeypatch.setattr(gui_module.SurveyApp, "_print_draft_plans", lambda self: [])
+
     # В старых тестах выбор роли эмулируется текстовым переключателем; тесты
     # самого диалога и независимости ролей задают явный ответ отдельно.
     # Локальный OCR зависит от машины (установлен пакет или нет), а поведение окна
@@ -392,6 +504,29 @@ def gui(monkeypatch, tmp_path):
     # tests/test_local_ocr.py (движок подменён) и отдельный тест окна.
     if hasattr(gui_module, "ocr_pages"):
         monkeypatch.setattr(gui_module.ocr_pages, "available", lambda: False)
+    # Обновление версии: резолвер источника и поиск веток ходят в GitHub API.
+    # В тестах они подменены заглушкой (без сети); тесты канала обновлений
+    # подменяют их сами на синтетический GitHub (см. tests/test_update_channel.py).
+    def _fake_resolve_update_source(source, **kwargs):
+        text = str(source or "").strip()
+        branch = text.rsplit("/", 1)[-1] if text else "main"
+        return gui_module.app_updater.ResolvedSource(
+            zip_url=f"https://codeload.github.com/Berber86/CAD/zip/refs/heads/{branch}",
+            owner="Berber86",
+            repo="CAD",
+            branch=branch,
+            state=gui_module.app_updater.STATE_STABLE,
+            description="заглушка теста",
+        )
+
+    monkeypatch.setattr(
+        gui_module.app_updater, "resolve_update_source", _fake_resolve_update_source,
+    )
+
+    def _no_network_discovery(*args, **kwargs):
+        raise AssertionError("поиск веток не должен ходить в сеть в этом тесте")
+
+    monkeypatch.setattr(gui_module.app_updater, "discover_branch", _no_network_discovery)
     monkeypatch.setattr(
         gui_module.SurveyApp, "_ask_source_role",
         lambda app, source: (
@@ -467,6 +602,183 @@ def test_main_still_reports_when_crash_log_cannot_be_written(gui, tmp_path, monk
     stderr = capsys.readouterr().err
     assert "RuntimeError: startup without writable log" in stderr
     assert "Не удалось сохранить журнал" in stderr
+
+
+def test_window_stays_hidden_until_assembled_then_opens_maximized_once(gui):
+    """
+    Окно не видно, пока оно собирается: ``withdraw`` — первым делом в ``__init__``, показ —
+    один раз в конце (``deiconify``), и уже развёрнутым (``state('zoomed')`` до показа, вместе
+    с ``update_idletasks``): пользователь не видит ни «сборку из кусочков», ни перестройку
+    «размер по умолчанию → весь экран» (4.39). ``zoomed`` сохраняет заголовок Windows
+    с кнопками — это не полноэкранный режим без рамки.
+    """
+    app = gui.SurveyApp()
+    log = app._wm_log
+    assert log[0] == "withdraw", log
+    assert log.count("deiconify") == 1, log
+    assert "state:zoomed" in log, log
+    assert log.index("state:zoomed") < log.index("update_idletasks") < log.index("deiconify"), log
+    # Кадр дорисовывается до того, как окно стало видимым (иначе — «сборка из кусочков»).
+    assert log.index("deiconify") < log.index("update"), log
+    # Разворачивание не отложено на после первого кадра (прежний after_idle).
+    assert "withdraw" not in log[1:], log
+    assert app._visible is True
+
+
+def test_window_is_invisible_while_assembled_and_revealed_once(gui):
+    """
+    Во время сборки окно не только спрятано, но и прозрачно: CustomTkinter на Windows
+    сам дёргает withdraw/deiconify/update при перекраске заголовка, и одного withdraw
+    не хватает (4.40). Прозрачность снимается последним шагом — после готового кадра.
+    """
+    app = gui.SurveyApp()
+    log = app._wm_log
+    assert log[0] == "withdraw" and log[1] == "alpha:0", log
+    assert log[-1] == "alpha:1", log
+    assert log.count("alpha:0") == 1, log
+    assert app._alpha == 1.0
+    # До показа ни одного deiconify: сначала прозрачность, потом сборка.
+    assert log.index("deiconify") > log.index("alpha:0"), log
+
+
+def test_window_stays_visible_after_customtkinter_mainloop(gui):
+    """
+    Регрессия 4.40: окно появлялось и исчезало ВОВСЕ.
+
+    ``CTk.mainloop`` на Windows прячет окно для перекраски заголовка и показывает
+    обратно только если ``withdraw()`` НЕ вызывали до первого показа. Мы вызывали
+    (окно собирается скрытым), поэтому ``_show_ready`` обязан снять флаги
+    CustomTkinter — иначе после ``mainloop()`` окна на экране нет.
+    """
+    app = gui.SurveyApp()
+    assert app._visible is True and app._alpha == 1.0
+    assert app._window_exists is True
+    assert app._withdraw_called_before_window_exists is False
+    app.mainloop()
+    assert app._visible is True, app._wm_log
+    assert app._alpha == 1.0
+    assert app._wm_log.count("withdraw") == 1, app._wm_log
+
+
+def test_show_ready_reveals_window_even_if_paint_fails(gui, monkeypatch):
+    """Сбой отрисовки не оставляет пользователя с невидимым, но работающим приложением."""
+    app = gui.SurveyApp()
+    app._visible = False
+    app.attributes("-alpha", 0.0)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("paint failed")
+
+    monkeypatch.setattr(app, "update", _boom)
+    app._show_ready()
+    assert app._visible is True
+    assert app._alpha == 1.0
+    assert app._startup_hidden is False
+
+
+def test_main_shows_error_dialog_when_startup_fails(gui, monkeypatch, tmp_path, capsys):
+    """Если сборка окна упала, пользователь видит ошибку, а не исчезнувшее приложение."""
+    import tkinter
+
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path))
+    tkinter.messagebox.errors.clear()
+    shown: list[object] = []
+
+    class BrokenApp(gui.SurveyApp):
+        def _show_ready(self) -> None:
+            shown.append(self)
+            super()._show_ready()
+
+    # Окно «недособрано» до подмены SurveyApp: внутри main() оно уже недоступно,
+    # его возвращает модульная ссылка _STARTUP_WINDOW.
+    broken = BrokenApp()
+    broken._startup_hidden = True
+    broken._visible = False
+    broken.attributes("-alpha", 0.0)
+    shown.clear()  # сборка выше сама звала _show_ready; дальше важен только показ при сбое
+
+    def _raise():
+        gui._STARTUP_WINDOW = broken
+        raise RuntimeError("сборка окна упала")
+
+    monkeypatch.setattr(gui, "SurveyApp", _raise)
+    assert gui.main() == 1
+    assert len(shown) == 1                      # частично собранное окно показано
+    assert shown[0]._visible is True
+    assert (tmp_path / "tsai_crash.log").exists()
+    assert tkinter.messagebox.errors, "нет диалога об ошибке запуска"
+    title, message = tkinter.messagebox.errors[0]
+    assert "сбой запуска" in title
+    assert "сборка окна упала" in message
+    assert str(tmp_path / "tsai_crash.log") in message
+    assert gui._STARTUP_WINDOW is None
+    assert "сборка окна упала" in capsys.readouterr().err
+
+
+def test_console_window_is_hidden_when_run_bat_asks(gui, monkeypatch):
+    """
+    Запасной путь запуска (pythonw.exe в окружении нет): программа работает в консоли
+    run.bat, но прячет её, как только окно показано, — cmd не висит в панели задач (4.41).
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: True)
+    monkeypatch.setattr(gui.console_window, "hide_console", lambda: calls.append("hide") or True)
+    app = gui.SurveyApp()
+    assert calls == ["hide"], "консоль не спрятана после показа окна"
+    assert app._visible is True
+
+
+def test_console_window_is_left_alone_without_run_bat_request(gui, monkeypatch):
+    """Свой терминал разработчика программа не прячет: просьба приходит только из run.bat."""
+    calls: list[str] = []
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: False)
+    monkeypatch.setattr(gui.console_window, "hide_console", lambda: calls.append("hide") or True)
+    gui.SurveyApp()
+    assert calls == []
+
+
+def test_console_hide_failure_does_not_break_startup(gui, monkeypatch):
+    """Сбой WinAPI не мешает окну показаться."""
+    monkeypatch.setattr(gui.console_window, "hide_requested", lambda: True)
+
+    def _boom():
+        raise OSError("нет WinAPI")
+
+    monkeypatch.setattr(gui.console_window, "hide_console", _boom)
+    app = gui.SurveyApp()
+    assert app._visible is True and app._alpha == 1.0
+
+
+def test_main_returns_console_to_screen_when_startup_fails(gui, monkeypatch, tmp_path):
+    """
+    Если запуск не удался, консоль возвращается: run.bat печатает ошибку и предлагает
+    откатиться на резервную копию — этот текст должен быть виден (4.41).
+    """
+    shown: list[str] = []
+    monkeypatch.setattr(gui.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(gui.console_window, "show_console", lambda: shown.append("show") or True)
+
+    def _raise():
+        gui._STARTUP_WINDOW = None
+        raise RuntimeError("окно не собралось")
+
+    monkeypatch.setattr(gui, "SurveyApp", _raise)
+    assert gui.main() == 1
+    assert shown == ["show"]
+
+
+def test_relaunch_after_update_uses_explicit_cmd_c(gui, monkeypatch):
+    """cmd /c (not start /k) closes when the batch ends."""
+    import subprocess
+
+    app = gui.SurveyApp()
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    assert app._relaunch_after_update() == ""
+    command, options = launched[0]
+    assert command[1:] == ["/d", "/v:off", "/c", "run.bat"]
+    assert options["creationflags"] == int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
 
 
 def test_main_returns_success_after_mainloop(gui, monkeypatch):
@@ -1010,7 +1322,7 @@ def test_gui_studio_ux_drawer_preview_canvas_and_inspector(gui, monkeypatch, tmp
     ]
     assert "(0,0)" in canvas_texts
     assert "POB" in canvas_texts
-    assert "СОСЕД" in canvas_texts
+    assert "LOT 26" in canvas_texts
     assert "#1" in canvas_texts and "#4" in canvas_texts
 
     # Участок с открытым гэпом рисует маркер GAP на схеме и подсвечивает невязку янтарным цветом
@@ -1820,6 +2132,7 @@ def test_neighbor_batch_honors_multipass_and_skips_disagreements(gui, tmp_path, 
         return types.SimpleNamespace(
             agreed=kwargs["pdf_path"] == paths[0], pass_outcomes=[out, out],
             selected_outcome=out, discrepancy_report=lambda: "различие румба",
+            obvious_geometry_choice=lambda: None,
         )
     monkeypatch.setattr(gui, "run_multipass_consensus", fake_consensus)
     app._start(parse_only=True)
@@ -2447,7 +2760,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
 
     left = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
     right = ASPENWALL_SAMPLES["Aspenwall St — 475' (Сосед справа)"]
-    path = tmp_path / "single-neighbor.pdf"
+    path = tmp_path / "LOT 77 NEW.pdf"
     _write_test_pdf(path, [left, right])
     app = gui.SurveyApp()
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
@@ -2461,6 +2774,9 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     assert app._preview_main_plan is main_plan
     assert len(app._preview_neighbor_plans) == 1
     assert app._preview_neighbor_plans[0].description.distance_to_corner_ft == pytest.approx(475.0)
+    assert app._preview_neighbor_plans[0].items[0].text == "LOT 77"
+    assert app._preview_neighbor_plans[0].description.lot_number == "30"
+    assert any("не совпадает" in warning for warning in app._preview_neighbor_plans[0].warnings)
     assert list(app._neighbor_plan_sources) == [path]
     assert app._neighbor_parsed_pages[path] == "2" and path not in app._pending_neighbor_pdfs
 
@@ -2500,6 +2816,7 @@ def test_single_neighbor_pdf_pages_and_manual_conflict_keep_neighbor_role(gui, t
     _wait_for_gui_worker(app)
     assert app.pending_conflict is None and app._preview_main_plan is main_plan
     assert len(app._preview_neighbor_plans) == 1 and app._preview_neighbor_plans[0].is_neighbor
+    assert app._preview_neighbor_plans[0].items[0].text == "LOT 77"
     assert app._neighbor_parsed_pages[path] == "2" and path not in app._pending_neighbor_pdfs
     draws.clear()
     app._start(parse_only=False)
@@ -3440,6 +3757,7 @@ def _step0_pdf(path):
 
 
 def _fill_step0(app, *, block="6323", lot="32", neighbours="30", folder=""):
+    app.step0_borough_var.set("Staten Island")
     app.step0_block_var.set(block)
     app.step0_lot_var.set(lot)
     app.step0_neighbours_var.set(neighbours)
@@ -3528,7 +3846,7 @@ def test_step0_our_lot_is_removed_from_the_neighbour_list(gui, tmp_path):
         gui.deed_intake.collect_deeds = saved
     assert collected["neighbours"] == [30]
     assert "соседи: 30" in _step0_texts(app)[0]
-    assert "32" not in _step0_texts(app)[0].split("соседи:")[1]
+    assert "32" not in _step0_texts(app)[0].split("соседи:")[1].split(";")[0]
 
 
 def test_step0_success_enables_handover_to_step1(gui, tmp_path):
@@ -3634,6 +3952,9 @@ def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
     assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
     trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
     assert trimmed.name_pages == (2, 2)
+    assert trimmed.is_main
+    assert next(item for item in items if item.path.name == "LOT 30 NEW.pdf").is_main is False
+    assert app._pdf_set_dialog.main_var.get() == str(items.index(trimmed))
 
 
 def test_step0_handover_without_files_explains_itself(gui, tmp_path):
@@ -4042,12 +4363,47 @@ def test_update_section_is_the_first_scrollable_settings_entry_not_buried_at_the
     assert app.update_version_button in update_row.winfo_children()
 
 
-def test_update_version_requires_a_source_url_before_running(gui):
+def test_update_version_with_an_empty_source_finds_the_branch_itself(gui, monkeypatch):
+    """
+    4.42: пустое поле источника — не ошибка, а «найдите ветку сами».
+
+    Заказчик меняет агента раз в пару дней, а с ним имя ветки, и каждый раз правил
+    ссылку руками. Теперь поле можно не заполнять вовсе.
+    """
+    from tkinter import messagebox
+
     app = gui.SurveyApp()
     app.update_source_var.set("")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    asked: list[str] = []
+    monkeypatch.setattr(
+        messagebox, "askyesno",
+        lambda title, text, **kw: (asked.append(text) or True),
+    )
+    applied: list[str] = []
+
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
+        applied.append(source)
+        return gui.app_updater.UpdateResult(zip_url=source, files_written=3, app_dir=str(app_dir))
+
+    monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
     app._start_update_version()
-    assert not app._update_running
-    assert "ссылку" in app.status_var.get().lower() or "ссылка" in app.status_var.get().lower()
+    _drain_update(app)
+
+    assert applied, "обновление не запустилось при пустом поле источника"
+    assert applied[0].endswith("/zip/refs/heads/main")
+    assert "сам" in asked[0] and "ветк" in asked[0], asked[0]
+
+
+def _drain_update(app, seconds: float = 5.0) -> None:
+    """Крутит очередь событий окна, пока рабочий поток обновления не закончит."""
+    import time
+
+    end = time.monotonic() + seconds
+    while app._update_running and time.monotonic() < end:
+        app._drain_events()
+        time.sleep(0.01)
+    app._drain_events()
 
 
 def test_update_version_shows_download_percent_backup_and_install_stages(gui, monkeypatch):
@@ -4066,7 +4422,7 @@ def test_update_version_shows_download_percent_backup_and_install_stages(gui, mo
 
     monkeypatch.setattr(app, "_show_update_stage", spy)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         on_stage("download", 0.42, "1.0 из 2.4 МБ")
         on_stage("backup", 1.0, "файлов: 3 из 3")
         on_stage("install", 0.5, "файлов: 4 из 8")
@@ -4097,8 +4453,10 @@ def test_update_version_downloads_and_reports_completed_file_count(gui, monkeypa
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
-        assert source == "https://github.com/Berber86/CAD/tree/main"
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
+        # 4.42: в apply_update уходит уже разобранная ссылка на архив — до неё
+        # источник проверяется резолвером (ветка, состояние «тестовая/стабильная»).
+        assert source == "https://codeload.github.com/Berber86/CAD/zip/refs/heads/main"
         if progress:
             progress("скачиваю архив обновления: https://codeload.github.com/...")
             progress("обновление завершено: заменено файлов — 7")
@@ -4126,7 +4484,7 @@ def test_update_version_reports_which_local_settings_were_kept(gui, monkeypatch)
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         return gui.app_updater.UpdateResult(
             zip_url="https://codeload...",
             files_written=42,
@@ -4155,7 +4513,7 @@ def _finish_update(app, gui, monkeypatch, files=7):
     """Запускает обновление с подменённым архивом и дожидается его конца."""
     import time
 
-    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def fake_apply_update(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         return gui.app_updater.UpdateResult(zip_url="https://codeload...", files_written=files, app_dir=str(app_dir))
 
     monkeypatch.setattr(gui.app_updater, "apply_update", fake_apply_update)
@@ -4176,8 +4534,8 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD/tree/main")
     asked: list[tuple[str, str]] = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (asked.append((title, text)) or True))
-    launched: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    launched: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
@@ -4190,13 +4548,12 @@ def test_update_offers_restart_and_relaunches_run_bat(gui, monkeypatch):
     assert restart_questions, "вопрос о перезапуске не показан"
     assert "Перезапустить" in restart_questions[0]
     assert launched, "run.bat не запущен"
-    assert launched[0][:3] == ["cmd", "/c", "start"]
-    assert launched[0][-1].endswith("run.bat")
+    assert launched[0][0][1:] == ["/d", "/v:off", "/c", "run.bat"]
     # run.bat ищется рядом с main.py, а не в текущей папке запуска.
     from pathlib import Path as _Path
 
-    assert _Path(launched[0][-1]) == _Path(gui.__file__).resolve().parent / "run.bat"
-    assert destroyed, "окно должно закрыться после успешного запуска нового экземпляра"
+    assert _Path(launched[0][1]["cwd"]) == _Path(gui.__file__).resolve().parent
+    assert not destroyed, "выход не должен зависеть от потенциально блокирующего destroy"
     assert exit_codes == [0], "процесс старой версии должен завершиться, иначе окно run.bat висит"
 
 
@@ -4265,7 +4622,7 @@ def test_update_version_reports_errors_without_crashing(gui, monkeypatch):
     app.update_source_var.set("https://github.com/Berber86/CAD")
     monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
 
-    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None):
+    def boom(source, app_dir, *, progress=None, timeout=60.0, on_stage=None, developer_mode=False):
         raise gui.app_updater.UpdateError("сеть недоступна")
 
     monkeypatch.setattr(gui.app_updater, "apply_update", boom)
@@ -4336,8 +4693,8 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
 
     questions: list[tuple[str, str]] = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: (questions.append((title, text)) or True))
-    launched: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append(args))
+    launched: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: launched.append((args, kw)))
     monkeypatch.setattr(gui.sys, "platform", "win32")
     destroyed: list[bool] = []
     monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
@@ -4350,8 +4707,8 @@ def test_rollback_restores_the_previous_version_and_offers_restart(gui, tmp_path
     assert not (app_dir / "fresh.py").exists()
     assert any(title == "Откат версии" for title, _ in questions)
     assert any(title == "Откат выполнен" for title, _ in questions)
-    assert launched and launched[0][-1].endswith("run.bat")
-    assert destroyed
+    assert launched and launched[0][0][-1] == "run.bat"
+    assert not destroyed
     assert exit_codes == [0]
     assert app.rollback_button.cget("state") == "disabled"
 
@@ -4449,8 +4806,8 @@ def test_log_mode_switch_saves_to_config_and_keeps_other_keys(gui):
     assert json.loads(gui.CONFIG_PATH.read_text(encoding="utf-8"))["ui"]["log_mode"] == "simple"
 
 
-def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
-    """«Начертить» добавляет черновик для печати только к основному участку и только при enabled."""
+def test_print_draft_is_always_added_only_for_main_lot(gui):
+    """«Начертить» добавляет черновик для печати только к основному участку, даже при старой настройке enabled=false."""
     from types import SimpleNamespace
 
     from llm_parser import ASPENWALL_SAMPLES, load_config, parse_with_regex
@@ -4458,7 +4815,6 @@ def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
     main_desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"])
     main_plan = gui.AcadBuilder(load_config()).plan(main_desc, scale=10, is_neighbor=False)
     print_cfg = dict(load_config().get("print_draft") or {})
-    assert print_cfg, "в config.json должна быть секция print_draft"
 
     def owner(plan, enabled):
         cfg = {"print_draft": {**print_cfg, "enabled": enabled}}
@@ -4466,13 +4822,13 @@ def test_print_draft_is_added_only_for_main_lot_when_enabled(gui):
             _preview_main_plan=plan, config_data=cfg, _plan_source_labels={id(plan): "тест"},
         )
 
-    drafts = gui.SurveyApp._print_draft_plans(owner(main_plan, True))
+    drafts = gui._real_print_draft_plans(owner(main_plan, True))
     assert len(drafts) == 1
     name, draft = drafts[0]
     assert name.startswith("Черновик для печати") and draft.print_draft is True
     assert draft.is_neighbor is False
-    assert gui.SurveyApp._print_draft_plans(owner(main_plan, False)) == []
-    assert gui.SurveyApp._print_draft_plans(owner(None, True)) == []
+    assert len(gui._real_print_draft_plans(owner(main_plan, False))) == 1
+    assert gui._real_print_draft_plans(owner(None, True)) == []
 
 
 
@@ -4495,3 +4851,1128 @@ def test_start_source_setting_opens_chosen_tab_and_saves_choice(gui, tmp_path, m
     app._on_start_source_changed()
     assert app.source_mode_var.get() == "📄 PDF"
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["ui"]["start_source"] == "text"
+
+
+def test_update_developer_checkbox_is_off_and_persists(gui, monkeypatch):
+    app = gui.SurveyApp()
+    saved = []
+    monkeypatch.setattr(gui, "save_config", lambda cfg: saved.append(cfg))
+    assert not app.update_developer_var.get()
+    app.update_developer_var.set(True)
+    app._persist_update_source()
+    assert saved[-1]["update"]["developer_mode"] is True
+    assert saved[-1]["update"]["auto_source_migrated"] is True
+    app.update_developer_var.set(False)
+    app._persist_update_source()
+    assert saved[-1]["update"]["developer_mode"] is False
+
+
+def test_find_branch_disables_update_and_reports_result(gui, monkeypatch):
+    app = gui.SurveyApp()
+    chosen = gui.app_updater.BranchCandidate(name="arena/example", version=(9, 0), version_text="9.0", state="stable")
+    result = gui.app_updater.DiscoveryResult(owner="Berber86", repo="CAD", chosen=chosen, message="Найдена 9.0")
+    monkeypatch.setattr(gui.app_updater, "discover_branch", lambda *a, **kw: result)
+    app._find_update_branch()
+    assert app._update_running
+    assert app.update_version_button.cget("state") == "disabled"
+    _drain_update(app)
+    assert not app._update_running
+    assert "9.0" in app.update_status_label.cget("text")
+    assert app.update_version_button.cget("state") == "normal"
+
+
+def _theme_contrast(first, second):
+    """WCAG contrast ratio for opaque hexadecimal GUI colors."""
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        channels = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
+        return sum(v * weight for v, weight in zip(channels, (0.2126, 0.7152, 0.0722)))
+    low, high = sorted((luminance(first), luminance(second)))
+    return (high + 0.05) / (low + 0.05)
+
+
+@pytest.mark.parametrize("key", ["blue", "lavender", "gray"])
+def test_premium_theme_readability_and_cad_colors(gui, key):
+    theme = gui.ui_theme.PALETTES[key]
+    for foreground in ("text_main", "text_muted", "text_dim"):
+        for background in ("bg_root", "bg_header", "bg_card", "bg_field", "bg_editor"):
+            assert _theme_contrast(theme[foreground], theme[background]) >= 4.5, (foreground, background)
+    for background in ("btn_primary", "btn_primary_hover", "btn_neighbor", "btn_neighbor_hover",
+                       "btn_amber", "btn_amber_hover", "btn_emerald", "btn_emerald_hover"):
+        assert _theme_contrast(theme["text_main"], theme[background]) >= 4.5, background
+    assert _theme_contrast(theme["badge_v1_fg"], theme["badge_v1_bg"]) >= 4.5
+    assert _theme_contrast(theme["version_fg"], theme["version_bg"]) >= 4.5
+    # Geometry colors identify kinds of objects and should not change with UI skin.
+    assert theme["cad_prop"] == "#34d399"
+    assert theme["cad_front"] == "#f87171"
+    assert theme["cad_neighbor"] == "#22d3ee"
+    assert theme["cad_tie"] == "#fbbf24"
+
+
+def test_premium_theme_keeps_navigation_and_actions(gui):
+    app = gui.SurveyApp()
+    assert app.header.cget("fg_color") == gui.THEME["bg_header"]
+    assert app.version_badge.cget("fg_color") == gui.THEME["version_bg"]
+    assert app.left_panel.cget("border_color") == gui.THEME["border_subtle"]
+    assert app.right_panel.cget("border_color") == gui.THEME["border_subtle"]
+    for tab, button in app.step_tab_buttons.items():
+        app._select_step_tab(tab)
+        assert button.cget("fg_color") == gui.THEME["btn_primary"]
+    assert callable(app.draw_button.cget("command"))
+    assert callable(app.update_version_button.cget("command"))
+
+
+def test_neutral_theme_uses_gray_surfaces_and_accent_tokens(gui):
+    theme = gui.ui_theme.PALETTES["gray"]
+    keys = ("bg_root", "bg_header", "bg_card", "bg_inset", "bg_editor", "bg_field",
+            "border_card", "border_subtle", "border_active", "text_main", "text_muted",
+            "text_dim", "accent_soft_bg", "accent_soft_fg", "accent_icon", "seg_sel",
+            "btn_primary", "btn_primary_hover", "btn_secondary", "btn_secondary_hover",
+            "version_bg", "version_fg", "control_on", "control_off")
+    for key in keys:
+        value = theme[key].lower()
+        assert value[1:3] == value[3:5] == value[5:7], (key, value)
+    assert _theme_contrast(theme["control_on"], theme["control_off"]) >= 2.5
+
+
+def test_neutral_customtkinter_defaults_do_not_reintroduce_blue(gui, monkeypatch):
+    import types
+    fields = {
+        "CTkButton": ("fg_color", "hover_color"),
+        "CTkCheckBox": ("fg_color", "hover_color"),
+        "CTkRadioButton": ("fg_color", "hover_color"),
+        "CTkSwitch": ("fg_color", "progress_color"),
+        "CTkProgressBar": ("progress_color",),
+        "CTkSlider": ("button_color", "button_hover_color"),
+        "CTkOptionMenu": ("fg_color", "button_color", "button_hover_color"),
+        "CTkSegmentedButton": ("selected_color", "selected_hover_color"),
+    }
+    theme = {name: {field: "#1F6AA5" for field in options} for name, options in fields.items()}
+    monkeypatch.setattr(gui.ctk, "ThemeManager", types.SimpleNamespace(theme=theme), raising=False)
+    gui.THEME.clear()
+    gui.THEME.update(gui.ui_theme.PALETTES["gray"])
+    gui._apply_widget_theme_defaults()
+    for options in theme.values():
+        for color in options.values():
+            assert color[1:3] == color[3:5] == color[5:7], color
+    assert theme["CTkSwitch"]["fg_color"] != theme["CTkSwitch"]["progress_color"]
+
+
+def test_preview_shows_green_property_and_red_front(gui):
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    plan = app._preview_main_plan
+    assert plan is not None and plan.street_boundary_indices
+    colored = [kwargs.get("fill") for kind, _coords, kwargs in app.preview_canvas.items
+               if kind == "line" and kwargs.get("width") == 2.4]
+    assert colored.count(gui.THEME["cad_front"]) == len(plan.street_boundary_indices)
+    assert colored.count(gui.THEME["cad_prop"]) == len(plan.boundary_lines) - len(plan.street_boundary_indices)
+
+
+def test_actual_draw_scene_adds_one_draft_not_neighbor_copies(gui, monkeypatch):
+    from tkinter import messagebox
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES, parse_with_regex
+
+    monkeypatch.setattr(gui.SurveyApp, "_print_draft_plans", gui._real_print_draft_plans)
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    desc, _ = parse_with_regex(ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"])
+    neighbor = gui.AcadBuilder(app.config_data).plan(desc, scale=10, is_neighbor=True)
+    app._preview_neighbor_plans.append(neighbor)
+    app.config_data["print_draft"] = {"enabled": False, "shift_ft": [22, 9], "tie_length_ft": 9}
+    drawn = []
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 3
+    draft, main, other = drawn
+    assert draft.print_draft and not draft.is_neighbor
+    assert main is app._preview_main_plan and other is neighbor
+    for edge, copy in zip(main.boundary_lines, draft.boundary_lines):
+        assert copy.start == pytest.approx((edge.start[0] + 1000, edge.start[1]))
+        assert copy.end == pytest.approx((edge.end[0] + 1000, edge.end[1]))
+    app._on_close()
+
+
+@pytest.mark.parametrize("key,label", [("blue", "Голубоватая"), ("lavender", "Лавандовая"), ("gray", "Серая")])
+def test_theme_selection_is_saved_and_applied_on_next_launch(gui, key, label):
+    import json
+    # Local settings take precedence over the shipped configuration and must survive saves.
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"api": {"custom": "keep"}, "ui": {"other": 42, "theme": "gray"}}), encoding="utf-8")
+    app = gui.SurveyApp()
+    before = dict(gui.THEME)
+    app.theme_var.set(label)
+    app._on_theme_changed(label)
+    assert dict(gui.THEME) == before  # no redraw or data loss during the session
+    assert "перезапуска" in app.status_var.get()
+    saved = json.loads(gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert saved == {"api": {"custom": "keep"}, "ui": {"other": 42, "theme": key}}
+    assert app._build_runtime_config()[0]["ui"]["theme"] == key
+    restarted = gui.SurveyApp()
+    assert restarted.theme_var.get() == label
+    assert gui.THEME == gui.ui_theme.PALETTES[key]
+    assert restarted.header.cget("fg_color") == gui.ui_theme.PALETTES[key]["bg_header"]
+
+
+def test_theme_save_failure_keeps_selection_and_file(gui, monkeypatch):
+    app = gui.SurveyApp()
+    gui.LOCAL_CONFIG_PATH.write_text('{broken', encoding="utf-8")
+    app.theme_var.set("Серая")
+    app._on_theme_changed("Серая")
+    assert app.theme_var.get() == "Голубоватая"
+    assert app.config_data.get("ui", {}).get("theme") is None
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == '{broken'
+    assert "не сохранена" in app.status_var.get()
+
+
+@pytest.mark.parametrize("value", [None, "unknown", [], {}, 7])
+def test_theme_invalid_value_falls_back_to_blue(gui, value):
+    assert gui.ui_theme.from_config({"ui": {"theme": value}}) == "blue"
+    assert gui.ui_theme.from_config({"ui": value}) == "blue"
+
+
+def test_themes_share_cad_colors_and_have_distinct_surfaces(gui):
+    palettes = gui.ui_theme.PALETTES
+    assert len({p["bg_root"] for p in palettes.values()}) == 3
+    assert all(set(p) == set(palettes["gray"]) for p in palettes.values())
+    for key in ("cad_prop", "cad_front", "cad_neighbor", "cad_tie", "cad_street"):
+        assert len({p[key] for p in palettes.values()}) == 1
+
+
+@pytest.mark.parametrize("key", ["blue", "lavender", "gray"])
+def test_widget_defaults_use_selected_palette_before_root(gui, monkeypatch, key):
+    import json
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"ui": {"theme": key}}), encoding="utf-8")
+    custom = {"CTkButton": {}, "CTkSwitch": {}, "CTkOptionMenu": {}}
+    monkeypatch.setattr(gui.ctk, "ThemeManager", types.SimpleNamespace(theme=custom), raising=False)
+    original_init = _FakeCTkRoot.__init__
+
+    def check_theme_on_root_creation(root, *args, **kwargs):
+        assert gui.THEME == gui.ui_theme.PALETTES[key]
+        assert custom["CTkButton"]["fg_color"] == gui.THEME["btn_primary"]
+        assert custom["CTkSwitch"]["progress_color"] == gui.THEME["control_on"]
+        original_init(root, *args, **kwargs)
+
+    monkeypatch.setattr(_FakeCTkRoot, "__init__", check_theme_on_root_creation)
+    gui.SurveyApp()
+
+
+def test_theme_atomic_replace_failure_preserves_local_data(gui, monkeypatch):
+    contents = '{"ui": {"theme": "blue"}, "key": "preserve"}'
+    gui.LOCAL_CONFIG_PATH.write_text(contents, encoding="utf-8")
+    app = gui.SurveyApp()
+    def fail(*args):
+        raise OSError("write failed")
+    monkeypatch.setattr(gui.ui_theme.os, "replace", fail)
+    app.theme_var.set("Лавандовая")
+    app.theme_switch.cget("command")("Лавандовая")
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == contents
+    assert app.theme_var.get() == "Голубоватая"
+    assert "не сохранена" in app.status_var.get()
+    assert not list(gui.LOCAL_CONFIG_PATH.parent.glob(".theme-*.tmp"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="проверка cmd.exe доступна только в Windows")
+def test_relaunch_real_cmd_handles_special_characters(gui, tmp_path, monkeypatch):
+    import time
+    work = tmp_path / "CAD & test (папка! %PATH%)"
+    work.mkdir()
+    (work / "run.bat").write_bytes(b'@echo off\r\necho ok>started.txt\r\nexit 0\r\n')
+    app = gui.SurveyApp()
+    monkeypatch.setattr(gui, "__file__", str(work / "main.py"))
+    assert app._relaunch_after_update() == ""
+    deadline = time.monotonic() + 20
+    while not (work / "started.txt").exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert (work / "started.txt").exists()
+
+
+def test_declining_restart_keeps_current_work(gui, monkeypatch):
+    from tkinter import messagebox
+    app = gui.SurveyApp()
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
+    monkeypatch.setattr(app, "_relaunch_after_update", lambda: pytest.fail("must not relaunch"))
+    monkeypatch.setattr(app, "_exit_process", lambda code: pytest.fail("must not exit"))
+    app._offer_restart("Обновление", "Перезапустить?", base_text="Готово")
+    assert not app._closing
+
+
+def test_automatic_correction_is_not_written_to_text_cache(gui, tmp_path):
+    from test_clear_typo_autofix import RECT
+    text = RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west")
+    outcome = gui.parse_legal_description_full(text=text, use_llm=False, ask_on_doubt=True)
+    cache = tmp_path / "lot_text.txt"
+    cache.write_text("original data", encoding="utf-8")
+    app = gui.SurveyApp()
+    msg = app._write_ai_to_step0_cache(
+        None, outcome.data, prev_rank=None, cache_path=cache, builder=None, scale=16,
+        cfg={}, provider_id="", model_name="", api_key=None, key_secret="",
+        do_auto_orient=False, post=lambda *args: None,
+    )
+    assert "автоисправление" in msg
+    assert cache.read_text(encoding="utf-8") == "original data"
+
+
+def test_auto_correction_survives_step1_preview_and_main_draw_only(gui, monkeypatch):
+    from tkinter import messagebox
+    import drawing_warnings
+    import acad_builder
+    from acad_builder import DrawResult
+    from test_clear_typo_autofix import RECT
+
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west"))
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    monkeypatch.setattr(gui.SurveyApp, "_print_draft_plans", gui._real_print_draft_plans)
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app._preview_main_plan is not None
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 2 and drawn[0].print_draft and not drawn[1].print_draft
+    assert not drawing_warnings.plan_callouts(drawn[0], acad_builder.segment_distance_label)[0]
+    notes, _ = drawing_warnings.plan_callouts(drawn[1], acad_builder.segment_distance_label)
+    assert len(notes) == 1 and "{\\C1;3}1" in notes[0].text
+
+
+def test_failed_drawing_callout_is_prioritized_in_status(gui):
+    from acad_builder import DrawResult
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    plan = app._preview_main_plan
+    first = DrawResult(plan=plan, text_count=0, layers={}, warnings=["обычное предупреждение черновика"])
+    second = DrawResult(plan=plan, text_count=0, layers={}, warnings=["не удалось создать пометку автоисправления стороны #1"])
+    app._handle_event("scene_drawn", ([("черновик", first), ("основной", second)], ""))
+    assert "пометку автоисправления" in app.status_var.get()
+
+
+@pytest.mark.parametrize("mode", ["Локально", "Эконом", "ИИ"])
+def test_doubt_checkbox_is_available_in_all_modes_and_saves(gui, mode):
+    import json
+    gui.LOCAL_CONFIG_PATH.write_text(json.dumps({"ui": {"theme": "lavender"}, "api": {"providers": {"hydra": {"api_key": "keep"}}}}), encoding="utf-8")
+    app = gui.SurveyApp()
+    app._on_run_mode_clicked(mode)
+    assert app.doubt_settings_card._gridded
+    assert app.ask_on_doubt_check.master is app.doubt_settings_card
+    assert app.ask_on_doubt_check._gridded
+    app.ask_on_doubt_var.set(False)
+    app.ask_on_doubt_check.cget("command")()
+    data = json.loads(gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert data["ui"]["theme"] == "lavender"
+    assert data["api"]["providers"]["hydra"]["api_key"] == "keep"
+    assert data["api"]["ask_on_doubt"] is False
+    restarted = gui.SurveyApp()
+    assert restarted.ask_on_doubt_var.get() is False
+    restarted.ask_on_doubt_var.set(True)
+    restarted.ask_on_doubt_check.cget("command")()
+    assert gui.SurveyApp().ask_on_doubt_var.get() is True
+
+
+def test_doubt_checkbox_save_failure_keeps_previous_value_and_file(gui, monkeypatch):
+    app = gui.SurveyApp()
+    gui.LOCAL_CONFIG_PATH.write_text('{broken', encoding="utf-8")
+    app.ask_on_doubt_var.set(False)
+    app.ask_on_doubt_check.cget("command")()
+    assert app.ask_on_doubt_var.get() is True
+    assert "не сохранена" in app.status_var.get()
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == '{broken'
+
+
+def test_ambiguous_109_is_not_changed_and_unchecked_does_not_prompt(gui, monkeypatch):
+    from tkinter import messagebox
+    from acad_builder import DrawResult
+    from llm_parser import ASPENWALL_SAMPLES
+    original = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    changed = original.replace('S 14°39\'40" E, 100.00 feet', 'S 14°39\'40" E, 109.00 feet')
+    assert changed != original
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", changed)
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: pytest.fail("вопросы должны быть выключены"))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _builder, plan: (
+        drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={})
+    ))
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 109.0
+    assert app._preview_main_plan.closure.distance == pytest.approx(9.0)
+    assert not app._preview_main_plan.description.segments[0]._auto_corrections
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert len(drawn) == 1 and drawn[0].description.segments[0].distance_ft == 109.0
+
+
+def test_auto_fix_does_not_open_typo_question_but_independent_risk_can_prompt(gui, monkeypatch):
+    from tkinter import messagebox
+    from test_clear_typo_autofix import RECT
+    text = RECT.replace("North 31 degrees 46 minutes 56 seconds west", "North 81 degrees 46 minutes 56 seconds west")
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", text)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].degrees == 31
+    assert app._preview_main_plan.description.segments[0]._auto_corrections
+    # Реальная оставшаяся невязка (0.41 ft) и другие проблемы формы — отдельное сомнение.
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
+    app._start(parse_only=False)
+    assert prompts and "невязка" in prompts[0].lower()
+    assert "Отрисовка отменена" in app.status_var.get()
+
+
+def test_doubt_checkbox_atomic_failure_does_not_damage_other_local_data(gui, monkeypatch):
+    original = '{"ui":{"theme":"blue"}, "api":{"ask_on_doubt": true, "secret":"keep"}}'
+    gui.LOCAL_CONFIG_PATH.write_text(original, encoding="utf-8")
+    app = gui.SurveyApp()
+    def fail(*args):
+        raise OSError("не удалось заменить файл")
+    monkeypatch.setattr(gui.local_settings.os, "replace", fail)
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    assert app.ask_on_doubt_var.get() is True
+    assert gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8") == original
+    assert not list(gui.LOCAL_CONFIG_PATH.parent.glob(".setting-*.tmp"))
+    assert "не сохранена" in app.status_var.get()
+
+
+def test_doubt_checkbox_reports_open_question_needs_resolving(gui):
+    app = gui.SurveyApp()
+    app.pending_doubt = {"parse_only": True}
+    app.ask_on_doubt_var.set(False)
+    app._on_ask_on_doubt_changed()
+    assert "Уже открытое сомнение" in app.status_var.get()
+    assert app.pending_doubt is not None
+
+
+def test_checked_ambiguous_109_not_modified_and_warns_before_drawing(gui, monkeypatch):
+    from tkinter import messagebox
+    from llm_parser import ASPENWALL_SAMPLES
+    text = ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"].replace(
+        'S 14°39\'40" E, 100.00 feet', 'S 14°39\'40" E, 109.00 feet')
+    app = gui.SurveyApp()
+    app.use_llm_var.set(False)
+    app.ask_on_doubt_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", text)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app._preview_main_plan.description.segments[0].distance_ft == 109.0
+    prompts = []
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
+    app._start(parse_only=False)
+    assert len(prompts) == 1 and "невязка" in prompts[0].lower()
+    assert "Отрисовка отменена" in app.status_var.get()
+
+
+@pytest.mark.parametrize("ask,good_provider", [(True, "hydra"), (False, "openrouter")])
+def test_obvious_two_pass_choice_runs_without_conflict_and_remains_visible(gui, monkeypatch, ask, good_provider):
+    import llm_parser as lp
+    from acad_builder import DrawResult
+    from tkinter import messagebox
+    sample = lp.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    clean, _ = lp.parse_with_regex(sample, auto_repair_typos=False)
+    bad = clean.model_copy(deep=True)
+    bad.segments[0].distance_ft = 140
+    def extract(text, cfg, api_key=None, progress=None, *, provider=None, model=None, **kwargs):
+        data = clean if provider == good_provider else bad
+        usage = lp.TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5, provider=provider, model=model)
+        return data.model_copy(deep=True), "structured-outputs", usage
+    monkeypatch.setattr(lp, "_extract_with_llm", extract)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("key")
+    app.provider_key_vars["openrouter"].set("key")
+    app.select_passes(2)
+    app.select_provider("Hydra AI")
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    app.use_llm_var.set(True)
+    app.ask_on_doubt_var.set(ask)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is None and app.pending_doubt is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 100
+    assert app._last_consensus_label is None
+    assert "автоматически выбран" in app.log_text()
+    assert "не консенсус" in app.log_text()
+    assert "140.00" in app.log_text()
+    assert app._session_llm_calls == 2
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: pytest.fail("нет риска — вопрос не нужен"))
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    drawn = []
+    monkeypatch.setattr(gui.AcadBuilder, "draw_plan", lambda _, plan: drawn.append(plan) or DrawResult(plan=plan, text_count=0, layers={}))
+    app._start(parse_only=False)
+    _wait_for_gui_worker(app)
+    assert drawn and drawn[-1].description.segments[0].distance_ft == 100
+
+
+def test_conflict_retry_auto_selects_when_disagreement_becomes_obvious(gui, monkeypatch):
+    import llm_parser as lp
+    sample = lp.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    clean, _ = lp.parse_with_regex(sample, auto_repair_typos=False)
+    different_tie = clean.model_copy(update={"distance_to_corner_ft": 425.0}, deep=True)
+    bad = clean.model_copy(deep=True)
+    bad.segments[0].distance_ft = 140
+    def extract(text, cfg, api_key=None, progress=None, *, provider=None, model=None, focus_instruction=None, **kwargs):
+        selected = clean if provider == "hydra" else (bad if focus_instruction else different_tie)
+        return selected.model_copy(deep=True), "structured-outputs", lp.TokenUsage(provider=provider, model=model, total_tokens=1)
+    monkeypatch.setattr(lp, "_extract_with_llm", extract)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("key")
+    app.provider_key_vars["openrouter"].set("key")
+    app.select_passes(2)
+    app.select_provider("Hydra AI")
+    app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
+    app.use_llm_var.set(True)
+    app.text_box.delete("1.0", "end")
+    app.text_box.insert("1.0", sample)
+    app._start(parse_only=True)
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is not None
+    app.retry_conflict_resolution()
+    _wait_for_gui_worker(app)
+    assert app.pending_conflict is None
+    assert app._preview_main_plan.description.segments[0].distance_ft == 100
+    assert "автоматически выбран" in app.log_text()
+    assert app._session_llm_calls == 4
+
+
+def test_neighbor_batch_can_select_obvious_pass_and_preserves_warning(gui, monkeypatch, tmp_path):
+    from test_obvious_consensus_choice import outcomes, consensus
+    sample = tmp_path / "neighbor.txt"
+    sample.write_text("text", encoding="utf-8")
+    monkeypatch.setattr(gui, "run_multipass_consensus", lambda **kwargs: consensus(outcomes()))
+    app = gui.SurveyApp()
+    cfg = {"api": {"consensus": {"passes": 2}}}
+    events = []
+    result, counted = app._parse_neighbor_file(sample, cfg, "hydra", "model", "key", "", True, False, None, lambda _: None, lambda *event: events.append(event))
+    assert counted and events[0][0] == "round_usages"
+    assert result.data.segments[0].distance_ft == 100
+    assert any("автоматически выбран" in w for w in result.warnings)
+
+
+def test_retry_finalization_still_asks_for_independent_risky_geometry(gui, monkeypatch):
+    from test_clear_typo_autofix import RECT
+    from llm_parser import parse_legal_description_full
+    outcome = parse_legal_description_full(text=RECT, use_llm=False)
+    events = []
+    app = gui.SurveyApp()
+    monkeypatch.setattr(app, "_worker_poster", lambda: lambda *event: events.append(event))
+    app._finalize_worker_outcome(outcome, cfg={"api": {"ask_on_doubt": True}}, scale=20,
+                                 parse_only=False, is_neighbor=False)
+    assert events[0][0] == "doubt"
+    assert events[0][1]["plan"].closure.distance > 0.08
+
+
+def test_developer_chat_triple_click_is_temporary_and_requests_are_independent(gui, monkeypatch):
+    import developer_chat
+    from llm_parser import TokenUsage
+    import time
+    calls = []
+    def ask(text, cfg, **kwargs):
+        calls.append((text, kwargs["provider"], kwargs["model"], kwargs["api_key"]))
+        return f"ответ {text}", TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5, available=True)
+    monkeypatch.setattr(developer_chat, "ask_once", ask)
+    app = gui.SurveyApp()
+    app.provider_key_vars["hydra"].set("hydra-key")
+    app.provider_key_vars["openrouter"].set("router-key")
+    assert not getattr(app, "_developer_chat", None)
+    assert "<Triple-Button-1>" in app.brand_logo._bindings
+    assert "<Triple-Button-1>" in app.brand_title._bindings
+    app.brand_logo._bindings["<Triple-Button-1>"](None)
+    page = app._developer_chat
+    assert page is not None
+    app.brand_title._bindings["<Triple-Button-1>"](None)
+    assert app._developer_chat is page
+    app.select_provider("Hydra AI")
+    before = gui.CONFIG_PATH.read_text(encoding="utf-8")
+    page.input.insert("1.0", "секретный вопрос один")
+    page.send()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert "ответ секретный вопрос один" in page.transcript.get("1.0", "end")
+    assert "токены: 3 → 2" in page.status.get()
+    page.copy_reply()
+    assert app._clipboard == "ответ секретный вопрос один"
+    page._on_provider("OpenRouter")
+    page.model_var.set("custom/test-model")
+    page.input.insert("1.0", "вопрос два")
+    page._send_shortcut()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert calls == [("секретный вопрос один", "hydra", calls[0][2], "hydra-key"),
+                     ("вопрос два", "openrouter", "custom/test-model", "router-key")]
+    assert "секретный вопрос один" not in app.log_text()
+    assert "вопрос два" not in app.log_text()
+    assert gui.CONFIG_PATH.read_text(encoding="utf-8") == before
+    page.clear()
+    assert not page.transcript.get("1.0", "end") and not page.last_reply
+    page.close()
+    assert app._developer_chat is None
+    app._open_developer_chat()
+    assert not app._developer_chat.transcript.get("1.0", "end")
+    app._on_close()
+    assert app._developer_chat is None
+
+
+def test_developer_chat_close_or_clear_discards_inflight_answer(gui, monkeypatch):
+    import developer_chat
+    import threading
+    import time
+    started, release = threading.Event(), threading.Event()
+    def ask(*args, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return "очень секретный ответ", None
+    monkeypatch.setattr(developer_chat, "ask_once", ask)
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    page = app._developer_chat
+    page.input.insert("1.0", "test")
+    page.send()
+    assert started.wait(1)
+    page.clear()
+    assert page._inflight and "отброшен" in page.status.get()
+    release.set()
+    for _ in range(100):
+        page._poll()
+        if not page._inflight:
+            break
+        time.sleep(.01)
+    assert not page._inflight and not page.transcript.get("1.0", "end")
+    assert "отброшен" in page.status.get()
+    started.clear(); release.clear()
+    page.input.insert("1.0", "again")
+    page.send()
+    assert started.wait(1)
+    page.close()
+    app._open_developer_chat()
+    fresh = app._developer_chat
+    release.set()
+    time.sleep(.03)
+    page._poll(); fresh._poll()
+    assert page._queue.empty() and not fresh.transcript.get("1.0", "end")
+    assert not fresh._inflight
+    app._on_close()
+
+
+def test_step0_optimal_and_fast_choices_are_exclusive(gui):
+    app = gui.SurveyApp()
+    assert not app.step0_fast_mode_var.get() and not app.step0_optimal_mode_var.get()
+    app.step0_optimal_mode_var.set(True)
+    app._step0_optimal_mode_changed()
+    assert app.step0_optimal_mode_var.get() and not app.step0_fast_mode_var.get()
+    app.step0_fast_mode_var.set(True)
+    app._step0_fast_mode_changed()
+    assert app.step0_fast_mode_var.get() and not app.step0_optimal_mode_var.get()
+    app.step0_optimal_mode_var.set(True)
+    app._step0_optimal_mode_changed()
+    assert app.step0_optimal_mode_var.get() and not app.step0_fast_mode_var.get()
+
+
+def test_step0_portal_worker_passes_optimal_mode(gui, monkeypatch, tmp_path):
+    import nyc_portal as portal_module
+    app = gui.SurveyApp()
+    received = {}
+    def fake_lookup(address, folder, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("стоп")
+    monkeypatch.setattr(portal_module, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "", False, 5, True)
+    assert received.get("optimal_mode") is True and received.get("fast_mode") is False
+
+
+def test_step0_rejects_simultaneous_optimal_and_fast_flags(gui, monkeypatch):
+    app = gui.SurveyApp()
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_optimal_mode_var.set(True)
+    app.step0_fast_mode_var.set(True)
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lambda *a, **kw: pytest.fail("search must not start"))
+    app._start_step0_portal_lookup()
+    assert "выберите один режим" in app.status_var.get().lower()
+
+
+@pytest.mark.parametrize("mode,fast,optimal", [
+    ("Надёжный", False, False),
+    ("Оптимальный", False, True),
+    ("Быстрый", True, False),
+])
+def test_step0_visible_mode_selector_routes_each_search_mode(gui, monkeypatch, tmp_path, mode, fast, optimal):
+    app = gui.SurveyApp()
+    switch = app.step0_portal_mode_switch
+    assert switch.cget("values") == ["Надёжный", "Оптимальный", "Быстрый"]
+    assert app.step0_portal_mode_var.get() == "Надёжный"
+    app.step0_address_var.set("87 Stafford Ave")
+    app.step0_folder_var.set(str(tmp_path))
+    app.step0_fast_pause_var.set("2,5")
+    monkeypatch.setattr(app, "_build_runtime_config", lambda: ({"api": {}}, "hydra", "vision", "key", ""))
+    monkeypatch.setattr(gui, "resolve_api_target", lambda *args, **kwargs: {"api_key": "key"})
+    received = []
+    def lookup(*args, **kwargs):
+        received.append(kwargs)
+        raise RuntimeError("тестовая остановка")
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", lookup)
+    class InlineThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+    monkeypatch.setattr(gui.threading, "Thread", InlineThread)
+    # Те же операции, которые CTkSegmentedButton выполняет при нажатии.
+    app.step0_portal_mode_var.set(mode)
+    switch.cget("command")(mode)
+    app._start_step0_portal_lookup()
+    assert len(received) == 1
+    assert received[0]["fast_mode"] is fast
+    assert received[0].get("optimal_mode", False) is optimal
+    assert received[0]["fast_pause_sec"] == (2.5 if fast else 5.0)
+    assert app.step0_fast_mode_var.get() is fast  # также управляет ожиданием PDF
+    assert app.step0_optimal_mode_var.get() is optimal
+
+
+def test_step0_selector_can_switch_back_and_forth_between_all_three_modes(gui):
+    app = gui.SurveyApp()
+    switch = app.step0_portal_mode_switch
+    command = switch.cget("command")
+    for mode, fast, optimal in [("Быстрый", True, False), ("Оптимальный", False, True),
+                                ("Надёжный", False, False), ("Быстрый", True, False),
+                                ("Надёжный", False, False)]:
+        app.step0_portal_mode_var.set(mode)
+        command(mode)
+        assert switch.get() == mode
+        assert app.step0_fast_mode_var.get() is fast
+        assert app.step0_optimal_mode_var.get() is optimal
+
+
+@pytest.mark.parametrize("mode,ready,stable", [
+    ("Надёжный", 4.0, 1.0), ("Оптимальный", 4.0, 1.0), ("Быстрый", 2.5, 0.0),
+])
+def test_mode_selector_preserves_pdf_wait_behaviour(gui, monkeypatch, tmp_path, mode, ready, stable):
+    app = gui.SurveyApp()
+    app.step0_portal_mode_var.set(mode)
+    app.step0_portal_mode_switch.cget("command")(mode)
+    app.step0_fast_pause_var.set("2.5")
+    _fill_step0(app, folder=tmp_path)
+    monkeypatch.setattr(gui.browser_save, "available", lambda: True)
+    options = []
+    monkeypatch.setattr(gui.browser_save, "auto_save_hook", lambda folder, **kw: options.append(kw))
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", lambda **kw: gui.deed_intake.IntakeOutcome(folder=kw["folder"]))
+    class InlineThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+    monkeypatch.setattr(gui.threading, "Thread", InlineThread)
+    app._start_step0_intake()
+    assert len(options) == 1
+    assert options[0]["ready_delay"] == ready and options[0]["stable_for"] == stable
+
+
+def test_step0_controls_are_scrollable_and_contain_mode_selector(gui):
+    app = gui.SurveyApp()
+    assert type(app.step0_controls_panel).__name__ == "CTkScrollableFrame"
+    parent = app.step0_portal_mode_switch
+    while parent is not None and parent is not app.step0_controls_panel:
+        parent = parent.master
+    assert parent is app.step0_controls_panel
+
+
+@pytest.mark.parametrize("message", [
+    "для этого окна нет подходящих координат — выполняю надёжный поиск",
+    "сохранённая область формы не подошла — оставшиеся действия выполняю по надёжному сценарию",
+    "быстрая проверка карточки не удалась — один повтор после паузы; подсказка адреса остаётся непроверенной",
+])
+def test_portal_automatic_fallback_is_visible_in_simple_log(gui, monkeypatch, tmp_path, message):
+    app = gui.SurveyApp()
+    assert app._log_mode() == gui.log_mode.SIMPLE
+    def fake_lookup(*args, **kwargs):
+        kwargs["progress"](message)
+        raise RuntimeError("тест")
+    monkeypatch.setattr(gui.nyc_portal, "lookup_parcel", fake_lookup)
+    app._step0_portal_worker("87 Stafford Ave", tmp_path, {}, "hydra", "m", None, "")
+    app._drain_events()
+    assert message in app.step0_report_box.get("1.0", "end")
+
+
+def test_step0_vision_card_fallback_is_labeled_and_counts_two_requests(gui, tmp_path):
+    app = gui.SurveyApp()
+    usage = gui.TokenUsage(prompt_tokens=20, completion_tokens=5, total_tokens=25, available=True)
+    details = gui.TokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12, available=True)
+    result = gui.nyc_portal.ParcelLookup("5712", "70", "Staten Island", "68", "72", "high", "",
+                                         tmp_path / "map.png", usage, "vision", details)
+    app._finish_step0_portal_lookup("ok", result)
+    assert app._session_llm_calls == 2 and app._session_prompt_tokens == 30
+    assert any("Vision по карточке" in line for line in _step0_texts(app))
+    assert "проверьте" in app.status_var.get().lower()
+
+
+def test_probability_window_saves_questions_and_displays_parallel_results(gui, monkeypatch, tmp_path):
+    import time
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    settings = tmp_path / 'probability-settings.json'
+    monkeypatch.setattr(dp, 'settings_path', lambda: settings)
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'sample.pdf'),))
+    calls = []
+    monkeypatch.setattr(dp, 'prepare_documents', lambda files, mode: calls.append((files, mode)) or [{'file': 'sample.pdf', 'page': 1, 'content': 'text'}])
+    monkeypatch.setattr(dp, 'run_both', lambda url, key, pages, mode, questions: [
+        {'model': model, 'seconds': .5, 'entries': [{'question': questions[0]['text'], 'answer': {'type': 'noul', 'value': .8}}], 'usage': [{'input_tokens': 5}], 'request_seconds': [.4]} for model in dp.MODELS])
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('hydra-key')
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    assert len(window.rows) == len(dp.DEFAULT_QUESTIONS)
+    window.add_files()
+    window.start()
+    for _ in range(100):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert calls and 'jev-1.14' in window.result.get('1.0', 'end')
+    assert 'solar-decide' in window.result.get('1.0', 'end')
+    assert 'sample.pdf' not in settings.read_text(encoding='utf8')
+    assert 'hydra-key' not in settings.read_text(encoding='utf8')
+    window.mode.set('Изображение (эксперимент)')
+    window.rows[0]['text'].delete(0, 'end')
+    window.rows[0]['text'].insert(0, 'updated question')
+    window.close()
+    chat.open_probability()
+    assert chat._probability.rows[0]['text'].get() == 'updated question'
+    assert chat._probability.mode.get() == 'Изображение (эксперимент)'
+    assert not chat._probability.files
+    app._on_close()
+    assert chat._probability is None
+
+
+def test_probability_never_uses_another_provider_key(gui, monkeypatch, tmp_path):
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'questions.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'doc.pdf'),))
+    monkeypatch.setenv('OPENAI_API_KEY', 'other-provider-secret')
+    monkeypatch.delenv('HYDRA_API_KEY', raising=False)
+    monkeypatch.setattr(ui.lp, 'load_dotenv_dict', lambda: {})
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('')
+    app.select_provider('OpenRouter')
+    app.provider_key_vars['openrouter'].set('other-provider-secret')
+    app._open_developer_chat()
+    app._developer_chat.open_probability()
+    window = app._developer_chat._probability
+    window.add_files()
+    window.start()
+    assert not window.inflight
+    assert 'ключ Hydra' in window.status.get()
+    app._on_close()
+
+
+def test_probability_window_displays_redacted_hydra_diagnostic(gui, monkeypatch, tmp_path):
+    import httpx
+    import developer_probability as dp
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    request = httpx.Request('POST', 'https://api.hydraai.ru/v1/systemone')
+    response = httpx.Response(422, request=request, json={'detail': [
+        {'type': 'extra_forbidden', 'loc': ['body', 'assets'], 'msg': 'PRIVATE_TEXT', 'input': 'SECRET_IMAGE'}]})
+    error = dp._safe_error(httpx.HTTPStatusError('SECRET_KEY', request=request, response=response))
+    result = [
+        {'model': 'jev-1.14', 'seconds': .4, 'entries': [], 'usage': [], 'request_seconds': [.4], 'error': error},
+        {'model': 'solar-decide', 'seconds': .5, 'entries': [], 'usage': [], 'request_seconds': [.5], 'error': error},
+    ]
+    window.inflight = True
+    window.events.put((.1, result, None))
+    window._poll()
+    text = window.result.get('1.0', 'end')
+    assert text.count('HTTP 422') == 2
+    assert 'body.assets' in text and 'лишнее или неподдерживаемое поле' in text
+    assert all(secret not in text for secret in ('PRIVATE_TEXT', 'SECRET_IMAGE', 'SECRET_KEY'))
+    app._on_close()
+
+
+def test_probability_window_displays_full_unredacted_responses(gui, monkeypatch, tmp_path):
+    import developer_probability as dp
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    body = '{\n "input": "PRIVATE_DOCUMENT", "image": "IMAGE_BASE64", "key": "MOCK_KEY"\n}'
+    result = [{'model': 'jev-1.14', 'seconds': .4, 'entries': [], 'usage': [], 'request_seconds': [.4],
+               'error': 'HTTP 422', 'provider_responses': [{'status': 422, 'headers': [('X-Trace', 'PRIVATE_HEADER')], 'body': body, 'encoding': 'текст'}]},
+              {'model': 'solar-decide', 'seconds': .5, 'entries': [], 'usage': [], 'request_seconds': [.5],
+               'provider_responses': [{'status': 200, 'headers': [], 'body': 'FULL_SUCCESS', 'encoding': 'текст'}]}]
+    window.inflight = True
+    window.events.put((.1, result, None))
+    window._poll()
+    text = window.result.get('1.0', 'end')
+    assert 'Полный ответ провайдера № 1 · HTTP 422' in text
+    assert body in text and 'PRIVATE_HEADER' in text and 'FULL_SUCCESS' in text
+    assert 'без маскирования' in text
+    window.copy_result()
+    assert app._clipboard == text
+    assert 'скопирован целиком' in window.status.get()
+    window.close()
+    stored = (tmp_path / 'settings.json').read_text(encoding='utf8')
+    assert all(secret not in stored for secret in ('PRIVATE_DOCUMENT', 'IMAGE_BASE64', 'MOCK_KEY', 'PRIVATE_HEADER'))
+    app._on_close()
+
+
+def test_probability_routerai_uses_its_own_key_and_models(gui, monkeypatch, tmp_path):
+    import time
+    import developer_probability as dp
+    import developer_probability_ui as ui
+    from tkinter import filedialog
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(tmp_path / 'doc.pdf'),))
+    calls = []
+    monkeypatch.setattr(dp, 'prepare_documents', lambda files, mode, **kw: calls.append(('prepare', mode, kw)) or [{'file': 'doc.pdf', 'page': 1, 'content': 'text'}])
+    def both(url, key, pages, mode, questions, **kw):
+        calls.append(('run', url, key, kw))
+        return [{'model': m, 'seconds': .1, 'entries': [], 'usage': [], 'request_seconds': []} for m in dp.ROUTERAI_MODELS]
+    monkeypatch.setattr(dp, 'run_both', both)
+    monkeypatch.delenv('ROUTERAI_API_KEY', raising=False)
+    monkeypatch.setattr(ui.lp, 'load_dotenv_dict', lambda: {})
+    app = gui.SurveyApp()
+    app.provider_key_vars['hydra'].set('hydra-secret')
+    app.provider_key_vars['routerai'].set('')
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.add_files()
+    window.start()
+    assert not window.inflight and 'ключ RouterAI' in window.status.get()
+    app.provider_key_vars['routerai'].set('router-secret')
+    window.start()
+    for _ in range(100):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert calls[0] == ('prepare', 'ocr', {'provider': 'routerai'})
+    assert calls[1][0] == 'run' and calls[1][2] == 'router-secret' and calls[1][3] == {'provider': 'routerai'}
+    assert 'microsoft/microsoft-decision-1.1' in window.result.get('1.0', 'end')
+    window.close()
+    chat.open_probability()
+    assert chat._probability.provider.get() == 'RouterAI · Jev + Microsoft'
+    assert 'router-secret' not in (tmp_path / 'settings.json').read_text(encoding='utf8')
+    app._on_close()
+
+
+def test_probability_pdf_preview_quality_navigation_and_submission(gui, monkeypatch, tmp_path):
+    import time
+    import pymupdf
+    import developer_probability as dp
+    from tkinter import filedialog
+    import PIL
+
+    pdf_path = tmp_path / 'quality.pdf'
+    doc = pymupdf.open()
+    for text in ('page 1', 'page 2', 'page 3'):
+        doc.new_page().insert_text((50, 70), text)
+    doc.save(pdf_path)
+    doc.close()
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(pdf_path),))
+    monkeypatch.setattr(PIL, 'ImageTk', types.SimpleNamespace(PhotoImage=lambda image, master: image), raising=False)
+    app = gui.SurveyApp()
+    app._open_developer_chat()
+    chat = app._developer_chat
+    chat.open_probability()
+    window = chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.mode.set('Изображение (эксперимент)')
+    window.add_files()
+    entry = window.files[0][1]
+    entry.insert(0, '1,3')
+    window._quality_changed(400)
+    window.open_preview(str(pdf_path), entry)
+    preview = window.preview
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.page_number == 1 and preview.image is not None
+    assert '400 px' in preview.info.get() and 'API не вызывается' in preview.info.get()
+    assert preview.image.size == (283, 400)
+    preview.step(1)
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.page_number == 3
+    preview.change_zoom(1)
+    assert preview.zoom == 200 and 'масштаб 200%' in preview.label.get()
+    window._quality_changed(160)
+    assert preview.image is None
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert preview.image.size == (280, 280)
+    window.mode.set('Локальный OCR / текст')
+    window._mode_changed()
+    preview.refresh()
+    for _ in range(100):
+        preview.poll()
+        if preview.image is not None:
+            break
+        time.sleep(.01)
+    assert 'отправится текст' in preview.info.get()
+    window.close()
+    assert preview.closed and window.preview is None
+    chat.open_probability()
+    assert chat._probability.pdf_image_side == 160
+    app._on_close()
+
+
+def test_probability_pdf_quality_used_in_visual_request_and_saved(gui, monkeypatch, tmp_path):
+    import time
+    import pymupdf
+    import developer_probability as dp
+    from tkinter import filedialog
+
+    pdf_path = tmp_path / 'request.pdf'
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 70), 'Property line')
+    doc.save(pdf_path)
+    doc.close()
+    monkeypatch.setattr(dp, 'settings_path', lambda: tmp_path / 'settings.json')
+    monkeypatch.setattr(filedialog, 'askopenfilenames', lambda **kw: (str(pdf_path),))
+    captured = []
+    def both(url, key, pages, mode, questions, **kw):
+        captured.append(pages)
+        return [{'model': model, 'seconds': 0.1, 'entries': [], 'usage': [], 'request_seconds': []} for model in dp.ROUTERAI_MODELS]
+    monkeypatch.setattr(dp, 'run_both', both)
+    app = gui.SurveyApp()
+    app.provider_key_vars['routerai'].set('router-key')
+    app._open_developer_chat()
+    app._developer_chat.open_probability()
+    window = app._developer_chat._probability
+    window.provider.set('RouterAI · Jev + Microsoft')
+    window.mode.set('Изображение (эксперимент)')
+    window.add_files()
+    window._quality_changed(400)
+    window.start()
+    for _ in range(200):
+        window._poll()
+        if not window.inflight:
+            break
+        time.sleep(.01)
+    assert captured
+    expected = dp.prepare_documents([(str(pdf_path), '1')], 'visual', provider='routerai', pdf_image_side=400)
+    assert captured[0][0]['content'] == expected[0]['content']
+    assert 'до 400 px' in window.result.get('1.0', 'end')
+    assert dp.load_settings()['pdf_image_side'] == 400
+    app._on_close()
+
+
+def test_direct_batch_neighbor_files_keep_independent_lot_numbers(gui, tmp_path, monkeypatch):
+    from tkinter import filedialog
+    from llm_parser import ASPENWALL_SAMPLES
+
+    sample = ASPENWALL_SAMPLES["Aspenwall St — 365' (Сосед слева)"]
+    first, second = tmp_path / "LOT 45 NEW.txt", tmp_path / "LOT 46 NEW.txt"
+    first.write_text(sample, encoding="utf-8")
+    second.write_text(sample, encoding="utf-8")
+    app = gui.SurveyApp()
+    app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
+    app.use_llm_var.set(False)
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_: (str(first), str(second)))
+    app._load_neighbor_files()
+    _wait_for_gui_worker(app)
+    assert set(app._neighbor_plan_sources) == {first, second}
+    assert app._neighbor_plan_sources[first].items[0].text == "LOT 45"
+    assert app._neighbor_plan_sources[second].items[0].text == "LOT 46"
+    assert app._neighbor_plan_sources[first].pob == app._neighbor_plan_sources[second].pob
+    assert all(app._neighbor_plan_sources[path].description.lot_number == "26" for path in (first, second))
+    app._on_close()
+
+
+def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    app = gui.SurveyApp()
+    _fill_step0(app, neighbours="30, 40", folder=tmp_path)
+    app.step0_address_var.set("Example address")
+    app.step0_borough_var.set("Staten Island")
+    portal = SimpleNamespace(block="6323", lot="32", borough="Staten Island", neighbours=["30"], details_source="vision")
+    app._step0_lookup_snapshot = ("Example address", portal)
+    seen = {}
+    def collect(**kwargs):
+        seen.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert seen["borough"] == "Staten Island"
+    assert seen["identity_by_lot"]["32"]["block"][0]["source"] == "portal"
+    assert seen["identity_by_lot"]["30"]["lot"][0]["method"] == "vision map (unverified)"
+    assert seen["identity_by_lot"]["40"]["lot"][0]["source"] == "manual"
+    app._on_close()
+
+
+def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
+    app = gui.SurveyApp()
+    app.multi_pdf_mode_var.set(True)
+    app._on_multi_pdf_mode_changed()
+    folder = tmp_path / '01_описания'
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-new.pdf'), role='our', lot=32,
+                             tag='NEW', block=6323, pages='2',
+                             trimmed_source=_step0_pdf(tmp_path / 'trimmed.pdf'))
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'our-old.pdf'), role='our', lot=32,
+                             tag='OLD', block=6323)
+    gui.deed_store.store_pdf(folder, _step0_pdf(tmp_path / 'neighbour.pdf'), role='neighbour',
+                             lot=30, tag='NEW', block=6323)
+    _fill_step0(app, folder=folder, neighbours='30')
+    app._step0_to_step1()
+    dialog = app._pdf_set_dialog
+    assert dialog is not None and dialog.multi_mode
+    assert {item.path.name: item.is_main for item in dialog.items} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+    assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
+        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}

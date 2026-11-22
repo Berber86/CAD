@@ -421,11 +421,18 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     """
     Правила 4.21–4.25 находят больше подписей Николая, чем прежний замер до ближайшей границы.
 
-    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 16 → 12
+    Считаются подписи по четырём парам: забор 9 → 23, дом 7 → 11, лишние у дома 19 → 12
     (было 17 до 4.32: с пределом «подпись не дальше ``TEXT_MAX_FROM_ANCHOR_FT`` от своей вершины»
     одна лишняя подпись дома ставится выноской у самой вершины и дублирует соседнюю; стало 12
     с 4.35 — золотое правило заказчика №6 добавляет подписи дома в глубине участка, а с 4.36
     правило №7 (боковые стороны дома) даёт 14 — на два угла больше).
+
+    В ветке соседа (``EDGE_NORMAL_OFFSETS = False``) лишних у дома с 4.37 стало 19 вместо 16:
+    строка ``BLDG`` перед значением (золотое правило №10 — все выноски дома у заказчика
+    двухстрочные, ``BLDG`` / ``2.5'S``) делает блок выше, и в плотной застройке часть подписей
+    встаёт на другое место либо не встаёт вовсе (24 Alvine теряет ``13.1'S`` и ``14.1'S``,
+    192 Geldner добавляет вторую ``12.2'E``). На основных правилах счёт не меняется:
+    дом 25 подписей, 11 совпадений, 14 лишних — совпадения те же и по каждому листу.
     Рост по заборам — точки пересечения забора с продолжением стороны (0.7'E, 1.4'E),
     конец длинного прогона до 6 ft (5.2'S) и второй угол стены с перекосом (4.25, R13d);
     по дому — вторая строка у вершины до 3 ft (4.25, R12) и запасной предел 4 ft для дома,
@@ -441,7 +448,7 @@ def test_h17_rules_find_more_of_nikolai_than_4_19():
     new = _label_totals()
     assert old["fence"][2] == 9 and new["fence"][2] == 23
     assert old["house"][2] == 7 and new["house"][2] == 11
-    assert old["house"][3] == 16 and new["house"][3] == 14
+    assert old["house"][3] == 19 and new["house"][3] == 14
     for kind in ("fence", "house"):
         assert new[kind][2] > old[kind][2], kind
         # H17: лишних не больше половины подписей Николая того же вида.
@@ -827,7 +834,9 @@ def test_text_is_kept_off_the_lot_sides():
         off.TEXT_LOT_GAP_FT = saved
     assert len(off_gaps) == len(plain_gaps)
     # Подписи не теряются: у всех, кому просвет не достался, остаётся прежнее место.
-    assert statistics.median(off_gaps) > statistics.median(plain_gaps) + 0.05
+    # С 4.38 просвет забору уже даёт R26 (выноска через линию), поэтому вклад первой ступени
+    # R19 меньше, чем был на 4.32 (0.65 → 0.78): медиана растёт, но на сотые доли фута.
+    assert statistics.median(off_gaps) > statistics.median(plain_gaps) + 0.01
     assert statistics.median(off_gaps) >= 0.7
     # Прижатых к границе подписей не становится больше.
     assert sum(1 for gap in off_gaps if gap < 0.05) <= sum(1 for gap in plain_gaps if gap < 0.05)
@@ -883,3 +892,200 @@ def test_no_distance_limit_rule_is_measured_and_off():
     assert wide[2] == base[2]
     # Лишние подписи дома — выше нашего порога H17; это осознанно: правило заказчика главнее.
     assert (wide[3] - wide[4]) > 0.5 * wide[5]
+
+
+def test_house_leader_label_carries_bldg_line():
+    """
+    Золотое правило №10 (ответ заказчика 19.11.2026): «Для выноски и для угла дома — в две строчки».
+
+    Каждая выноска дома у Николая двухстрочная: первая строка — тип объекта, вторая — значение
+    (``BLDG`` / ``2.5'S`` и ``BLDG`` / ``2.6'S`` — 24 Alvine; ``BLDG`` / ``0.3'S``, ``0.2'S`` —
+    378 Mother Gaston; ``BLDG`` / ``6.8'S`` — 18 Zoe; ``BLDG`` / ``3.2'S``, ``0.2'S`` — 1412 East
+    64th; ``BLDG`` / ``1.0'S``, ``2.9'S``, ``0.1'E`` + ``0.4'S`` — 1373 East 55th). Голые числа
+    (``3.5'S``, ``0.4'W``, ``2.4'S``) — это подписи БЕЗ выноски, приставки у них нет. Программа
+    добавляет строку ``BLDG`` в обоих местах, где дом получает выноску (``HOUSE_LEADER_PREFIX``).
+
+    Замер по шести парам (4.37): подписей 84, совпадений 47, предупреждений 2 — ровно как без
+    приставки (эталон числовой, на форму подписи оценка не смотрит). Выносок дома с первой строкой
+    ``BLDG`` — 12, без приставки таких 3 (только подписи «на линии», у них ``BLDG`` в
+    ``online_text`` зашита отдельно).
+
+    Двухстрочный блок выше однострочного, и в тесном месте он не встаёт: 1373 East 55th, дом
+    в 0.1 ft от линии соседей. Там подпись важнее формы — выноска остаётся однострочной (2 из 14),
+    и предупреждений не прибавляется: без отката на одну строку их было 5 вместо 2, а одна подпись
+    дома терялась вовсе. У заказчика однострочная выноска тоже встречается (``3.0'E`` у кирпичной
+    колонны, 1412 East 64th; ``AWNING 4.5'E``, 378 Mother Gaston).
+    """
+    assert off.HOUSE_LEADER_PREFIX == "BLDG"
+    paths = [PRIMER3, PRIMER2, PRIMER1, PRIMER4, PRIMER5, PRIMER7]
+
+    def totals():
+        labels = hits = warnings = prefixed = plain = 0
+        for path in paths:
+            before, after = load_pair(path)
+            data, _nikolai = field_plan(before, after)
+            plan = data["plan"]
+            warnings += len(plan.warnings)
+            got = plan_labels(plan)
+            labels += len(got)
+            hits += score_labels(got, nikolai_labels(before, after))
+            leaders = [
+                item for item in plan.items
+                if item.kind == "house" and item.style == "leader" and item.leader
+            ]
+            prefixed += sum(1 for item in leaders if item.text.split("\n")[0] == "BLDG")
+            plain += sum(1 for item in leaders if "\n" not in item.text)
+        return labels, hits, warnings, prefixed, plain
+
+    with_prefix = totals()
+    saved = off.HOUSE_LEADER_PREFIX
+    off.HOUSE_LEADER_PREFIX = ""
+    try:
+        bare = totals()
+    finally:
+        off.HOUSE_LEADER_PREFIX = saved
+    # Приставка ничего не стоит: те же подписи, совпадения и предупреждения.
+    assert with_prefix[:3] == (84, 47, 2), with_prefix
+    assert bare[:3] == with_prefix[:3], bare
+    assert with_prefix[3] == 12 and bare[3] == 3, (with_prefix, bare)
+    # Откат на одну строку, когда двухстрочный блок не влезает: 2 подписи, предупреждений не больше.
+    assert with_prefix[4] == 2 and bare[4] == 5, (with_prefix, bare)
+
+
+def test_whole_side_on_the_line_rule_is_measured_and_off():
+    """
+    R25 (золотое правило №10, ответ заказчика 19.11.2026): «Если для всей стороны дома — хоть для
+    фронта, хоть для бочины дома — если он по обеим сторонам получается ``O/L``, то в одну строчку».
+
+    Целая сторона объекта лежит на линии границы → ОДНА строка простым текстом вдоль стены, без
+    выноски и без числа: ``BLDG O/L`` (378 Mother Gaston: Text h 1.1, rot 359.97°, в 2.1 ft от
+    ``M-ROW-LINE`` и в 4.3 ft от середины стены 24.75 ft; 1412 East 64th: ``BLDG GEN. O/L``,
+    rot 90°, в 1.0 ft от стены 59.0 ft). Угол остаётся двухстрочным (``BLDG`` / ``O/L``).
+
+    Замер 4.37 по шести парам: подписей 84, совпадений 47, предупреждений 2 — с флагом и без
+    (подписи «O/L» не числовые, в эталон не входят; всего подписей 90 → 92). Срабатывает дважды:
+
+    * 1412 East 64th — стена 59.0 ft, наша подпись в 2.96 ft от его ``BLDG GEN. O/L`` и в 0.9 ft
+      от стены при его 1.0 ft: верно;
+    * 192 Geldner — стена 20.9 ft на тыльной линии, у заказчика там ничего: лишняя подпись.
+
+    Его собственный пример (378 Mother Gaston, ``BLDG O/L`` вдоль стены 24.75 ft) не
+    воспроизводится: фрагмент стены — два ребра, и оба на линии, а фильтр «объект не есть сам
+    контур участка» такой фрагмент отсекает. Без фильтра подписи легли бы на контур, обведённый
+    как объект: 1373 Brooklyn «дом» 46.0 × 18.0 × 100.0 ft (три ребра на трёх линиях) и 24 Alvine
+    «дом» 174.9 × 45.3 × 153.6 ft — у заказчика там подписей нет. Вариант фильтра «все края на
+    одной линии» возвращает Gaston, но теряет East 64th (у того края на двух линиях) и добавляет
+    две подписи на стенах 38.7 ft у 192 Geldner. Итог: одна верная подпись при одной лишней —
+    не улучшение, флаг ВЫКЛЮЧЕН до ответа на вопрос §13.10.
+    """
+    assert off.ONLINE_SIDE_LABELS is False
+    assert off.ONLINE_SIDE_MIN_FT == pytest.approx(20.0)
+    assert off.ONLINE_SIDE_KINDS == ("house", "wall")
+    assert off.online_side_text("house") == "BLDG O/L"
+    assert off.online_side_text("wall") == "WALL O/L"
+    # У забора форма однострочная и без R25, и ставит он её в точке пересечения, а не посреди пролёта.
+    assert off.online_side_text("fence") == off.ONLINE_FENCE_TEXT == "FE.O/L"
+    paths = [PRIMER3, PRIMER2, PRIMER1, PRIMER4, PRIMER5, PRIMER7]
+    names = ["Geldner", "Brooklyn", "Alvine", "Gaston", "Zoe", "East 64th"]
+
+    def totals():
+        labels = hits = warnings = 0
+        fired = {}
+        east = None
+        for name, path in zip(names, paths):
+            before, after = load_pair(path)
+            data, _nikolai = field_plan(before, after)
+            plan = data["plan"]
+            warnings += len(plan.warnings)
+            got = plan_labels(plan)
+            labels += len(got)
+            hits += score_labels(got, nikolai_labels(before, after))
+            side = [item for item in plan.items if item.online_side]
+            fired[name] = len(side)
+            if name == "East 64th" and side:
+                # Его «BLDG GEN. O/L» (Text, rot 90°) в системе «до»: (4980.01, 5049.03).
+                east = min(math.dist(item.point, (4980.01, 5049.03)) for item in side)
+        return labels, hits, warnings, fired, east
+
+    off.ONLINE_SIDE_LABELS = True
+    try:
+        wide = totals()
+    finally:
+        off.ONLINE_SIDE_LABELS = False
+    base = totals()
+    assert base[:3] == (84, 47, 2), base
+    assert wide[:3] == base[:3], wide
+    assert wide[3] == {"Geldner": 1, "Brooklyn": 0, "Alvine": 0, "Gaston": 0, "Zoe": 0, "East 64th": 1}
+    assert base[3] == dict.fromkeys(names, 0)
+    # Единственная верная подпись — рядом с подписью заказчика и с той же стороны от стены.
+    assert wide[4] is not None and wide[4] < 3.5, wide
+
+
+def test_fence_text_stands_off_the_lot_line_like_the_customer():
+    """
+    R26 (4.38): выноска забора и стены идёт через линию участка наружу — подпись стоит по
+    другую сторону линии от объекта, краем блока в 1.5–2.6 ft от неё, как у Николая.
+
+    Замер по шести парам (прямоугольник текста до ближайшей линии участка, `bbox` его подписей
+    против нашего габарита): у него снаружи контура 36 подписей забора из 45, просвет медиана
+    **2.23** (p10 1.50, p90 4.63), внутри 9 (медиана 1.87); у нас до правила снаружи 40 из 55 с
+    просветом **1.62** — блок прилипал к линии. С R26: снаружи медиана **2.05**, внутри **1.76**.
+    Совпадения и предупреждения не меняются (90 / 84 / **47** / **2**): правило двигает текст
+    в пределах радиуса сопоставления (6 ft), поэтому метрика совпадений к нему не чувствительна,
+    а чертёж становится похож на его. Тест держит и то, и другое: совпадения те же, просвет
+    снаружи ближе к его медиане, чем без правила.
+    """
+    paths = [PRIMER3, PRIMER2, PRIMER1, PRIMER4, PRIMER5, PRIMER7]
+
+    def gap(width_of):
+        import math as _math
+
+        def rect_of(item):
+            w, h = off._text_block(item.text, item.height_ft, width_of)
+            return off._rect_at(item.point, w, h)
+
+        def dist(rect, side):
+            return min(
+                off._point_segment_distance(p, (side.a, side.b))
+                for p in ((rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3]))
+            )
+
+        totals = labels = hits = warnings = 0
+        outside = []
+        for path in paths:
+            before, after = load_pair(path)
+            polygon = _lot_polygon(before)
+            ring = [(float(x), float(y)) for x, y in polygon.exterior.coords]
+            sides = off.side_lines(ring, front_lines(before), north_deg(before))
+            data, _nikolai = field_plan(before, after)
+            plan = data["plan"]
+            warnings += len(plan.warnings)
+            got = plan_labels(plan)
+            labels += len(got)
+            hits += score_labels(got, nikolai_labels(before, after))
+            for item in plan.items:
+                if item.kind not in ("fence", "wall"):
+                    continue
+                rect = rect_of(item)
+                side = min(sides, key=lambda s: dist(rect, s))
+                if not off.point_in_polygon(item.point, ring):
+                    outside.append(dist(rect, side))
+        outside.sort()
+        return (labels, hits, warnings), statistics.median(outside)
+
+    width_of = lambda text, height: len(text) * height * off.TEXT_CHAR_WIDTH
+    saved = off.FENCE_TEXT_ACROSS_LINE
+    off.FENCE_TEXT_ACROSS_LINE = True
+    try:
+        across, gap_across = gap(width_of)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = False
+    try:
+        plain, gap_plain = gap(width_of)
+    finally:
+        off.FENCE_TEXT_ACROSS_LINE = saved
+    assert across == (84, 47, 2), across  # plan_labels считает числовые подписи
+    assert plain == across, plain
+    # Его медиана просвета снаружи 2.23: с правилом мы ближе к ней, чем без правила (1.62).
+    assert gap_across == pytest.approx(2.05, abs=0.15), gap_across
+    assert gap_plain < gap_across - 0.2, (gap_plain, gap_across)

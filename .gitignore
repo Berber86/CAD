@@ -21,3 +21,9 @@ config.local.json
 # кэш снимков участка (Google/Mapillary/ортофото) — см. docs/site_imagery_plan.md
 imagery_cache/
 *_site/
+
+# Диагностика разработчика по документам (локальные данные, не хранить в Git)
+*.page-search.json
+
+# Разбор нескольких описаний: локальные результаты и диагностика
+*.multi-parse.json

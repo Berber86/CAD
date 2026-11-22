@@ -159,7 +159,7 @@ def test_neighbour_distance_label_has_no_from_corner():
     label = AcadBuilder(load_config())._neighbor_label_item(
         model, [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], 1.0, None, None
     )
-    assert label.text == "NEIGHBOR (200')"
+    assert label.text == "LOT ?"
 
 
 # ------------------------------------------------------------------ ширина улицы

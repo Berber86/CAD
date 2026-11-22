@@ -2396,6 +2396,10 @@ CRITICAL SURVEY RULES
    - `cross_street`: exact name as read for the intersecting street, else null. `cross_street_corrected`: corrected spelling if changed, otherwise null; never replace the original in `cross_street`.
    - `cross_street_side_index`: 0-based index in `segments` of the side abutting `cross_street` ONLY if this is a corner lot (`distance_to_corner_ft == 0`), else null.
    - `block_number`, `lot_number`, `borough_or_city`: extract NYC/county Block, Lot, and Borough/City if present, else null.
+7. COURSE_NOTE FOR FRONTAGE SEGMENT (street side of the lot):
+   - For the segment at `front_segment_index` (the lot side fronting `main_street`), `course_note` must contain ONLY the exact street name as printed — e.g. "Hylan Boulevard", "East 64th Street", "Fort Hamilton Parkway".
+   - NEVER include explanatory phrases like "along the northerly side of", "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...", "side of", "the", or any direction words in `course_note` for the frontage segment. The CAD engine prints only the street name there; bearing and distance are printed separately.
+   - For all OTHER segments (non-frontage), keep `course_note` verbatim as printed (e.g. "PARALLEL WITH 1st ST", "AT RIGHT ANGLES TO QUEENS MIDTOWN EXPRESSWAY").
 6. Curves: use chord bearing + chord distance as one straight segment. Never invent calls; return strict JSON only.""" + "\n\n" + NYC_STREET_INSTRUCTION
 
 USER_PROMPT_TEMPLATE = """LEGAL DESCRIPTION:

@@ -181,7 +181,13 @@ class _TextStyles:
     def __init__(self):
         self._items = {}
 
+    @property
+    def Count(self):
+        return len(self._items)
+
     def Item(self, name):
+        if isinstance(name, int):
+            return list(self._items.values())[name]
         return self._items[name]
 
     def Add(self, name):
@@ -519,39 +525,78 @@ def test_ambiguous_party_wall_is_not_guessed():
     assert any("PARTY WALL" in warning for warning in warnings)
 
 
-def test_print_draft_letter_heights_and_existing_style_are_not_modified(fake_autocad):
+def test_print_draft_street_names_and_other_labels_use_template_layers_and_styles(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     draft = make_print_draft(plan, {})
     builder, doc = fake_autocad(plan)
-    style = doc.TextStyles.Add("LETTER")
-    style.fontFile, style.Height = "customer.shx", 0
+    street_style = doc.TextStyles.Add("MtXpl_Times_New_Roma")
+    street_style.fontFile, street_style.Height = "customer-times.ttf", 0
+    # В шаблоне заказчика стиль называется ROMANS (верхний регистр).
+    other_style = doc.TextStyles.Add("ROMANS")
+    other_style.fontFile, other_style.Height = "customer-romans.shx", 0
+    letter = doc.Layers.Add("LETTER")
+    letter.color = 42
     result = builder.draw_plan(draft)
-    assert (style.fontFile, style.Height) == ("customer.shx", 0)
+    assert (street_style.fontFile, street_style.Height) == ("customer-times.ttf", 0)
+    assert (other_style.fontFile, other_style.Height) == ("customer-romans.shx", 0)
+    assert letter.color == 42
     assert result.layers["print_boundary_text"] == "M-TAX-DIM"
+    assert result.layers["print_street_text"] == "LETTER"
+    assert result.styles == {"street": "MtXpl_Times_New_Roma", "other": "ROMANS"}
+    assert "названия улиц — MtXpl_Times_New_Roma" in result.summary()
+    assert "остальные надписи — ROMANS" in result.summary()
     assert len(doc.ModelSpace.texts) == len(draft.items)
     for spec, entity in zip(draft.items, doc.ModelSpace.texts):
         assert entity.Height == spec.height
-        assert entity.StyleName == "LETTER" and entity.Layer == "M-TAX-DIM"
         if spec.kind in {"main-street", "cross-street"}:
+            assert entity.Layer == "LETTER"
+            assert entity.StyleName == "MtXpl_Times_New_Roma"
             assert entity.Height == 4
-        elif spec.kind.startswith("side-"):
-            assert entity.Height == 2
         else:
-            assert entity.Height == 1.6
+            assert entity.Layer == "M-TAX-DIM"
+            assert entity.StyleName == "ROMANS"
+            if spec.kind.startswith("side-"):
+                assert entity.Height == 2
+            else:
+                assert entity.Height == 1.6
+    # Существующий ROMANS переиспользован, дубль с другим регистром не создан.
+    assert "Romans" not in doc.TextStyles._items
+
+
+def test_print_draft_other_labels_include_former_names_and_side_notes(fake_autocad):
+    text = llm_parser.ASPENWALL_SAMPLES["Aspenwall St — 420' (Основной участок)"]
+    text = text.replace("149th Street;", "149th Street (formerly Birch Avenue);")
+    model, _ = llm_parser.parse_with_regex(text)
+    draft = make_print_draft(AcadBuilder(_cfg()).plan(model, scale=16), {})
+    builder, doc = fake_autocad(draft)
+    result = builder.draw_plan(draft)
+    assert result.text_count == len(draft.items)
+    street_names = [t for t in doc.ModelSpace.texts if t.TextString.startswith("149th")]
+    former = [t for t in doc.ModelSpace.texts if "FORMERLY" in t.TextString]
+    assert len(street_names) == 1 and street_names[0].Layer == "LETTER"
+    assert street_names[0].StyleName == "MtXpl_Times_New_Roma"
+    assert len(former) == 1 and former[0].Layer == "M-TAX-DIM"
+    assert former[0].StyleName == "Romans"
+    assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "Romans"
+               for t in doc.ModelSpace.texts if "feet" in t.TextString or "'" in t.TextString)
 
 
 def test_new_style_and_missing_style_error_are_reported(fake_autocad):
     plan = _plan("lot72_render_e600.txt")
     builder, doc = fake_autocad(plan)
     result = builder.draw_plan(make_print_draft(plan, {}))
-    assert doc.TextStyles.Item("LETTER").fontFile == "romans.shx"
-    assert any("LETTER" in w and "запасным" in w for w in result.warnings)
+    assert doc.TextStyles.Item("Romans").fontFile == "romans.shx"
+    assert doc.TextStyles.Item("MtXpl_Times_New_Roma").font[0] == "Times New Roman"
+    assert doc.Layers.Item("LETTER").color == 7
+    assert any("MtXpl_Times_New_Roma" in w and "создан" in w for w in result.warnings)
+    assert any("Romans" in w and "создан" in w for w in result.warnings)
+    assert any("LETTER" in w and "создан" in w for w in result.warnings)
     builder2, doc2 = fake_autocad(plan)
     class BrokenStyles:
         def Item(self, name): raise KeyError(name)
         def Add(self, name): raise RuntimeError("style unavailable")
     doc2.TextStyles = BrokenStyles()
-    with pytest.raises(module.AcadDrawError, match="LETTER"):
+    with pytest.raises(module.AcadDrawError, match="MtXpl_Times_New_Roma"):
         builder2.draw_plan(make_print_draft(plan, {}))
     assert not doc2.ModelSpace.texts and not doc2.ModelSpace.lines
 
@@ -661,8 +706,17 @@ def test_old_settings_do_not_override_boundary_layer_or_style(fake_autocad):
         result = builder.draw_plan(scene)
         created = doc.ModelSpace.texts[before:]
         assert len(created) == len(scene.items) == result.text_count
-        assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "LETTER" for t in created)
-        assert result.layers["print_boundary_text" if scene.print_draft else "boundary_text"] == "M-TAX-DIM"
+        if scene.print_draft:
+            street, other = [], []
+            for item, text in zip(scene.items, created):
+                (street if item.kind in {"main-street", "cross-street"} else other).append(text)
+            assert all(t.Layer == "LETTER" and t.StyleName == "MtXpl_Times_New_Roma" for t in street)
+            assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "Romans" for t in other)
+            assert result.layers["print_boundary_text"] == "M-TAX-DIM"
+            assert result.layers["print_street_text"] == "LETTER"
+        else:
+            assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "LETTER" for t in created)
+            assert result.layers["boundary_text"] == "M-TAX-DIM"
     assert style.fontFile == "customer-letter.shx"
 
 
@@ -741,6 +795,6 @@ def test_draw_compacts_printed_bearing_using_cad_measurements_only_in_draft(fake
     item, entity = draft.items[idx], entities[idx]
     assert len(entity.TextString) < len(item.text)
     assert re.sub(r" +", " ", entity.TextString) == re.sub(r" +", " ", item.text)
-    assert entity.Height == 2 and entity.StyleName == "LETTER" and entity.Layer == "M-TAX-DIM"
+    assert entity.Height == 2 and entity.StyleName == "Romans" and entity.Layer == "M-TAX-DIM"
     assert entity.Rotation == pytest.approx(item.rotation)
     assert not any("не удалось измерить" in warning for warning in draft_result.warnings)

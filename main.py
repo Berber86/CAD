@@ -3161,7 +3161,7 @@ class SurveyApp(ctk.CTk):
                 "Staten Island — Richmond County: список документов участка, Deed новее 2015 года, "
                 "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
                 "документ (старый Deed), сосед — только свежий. "
-                "Имена: OUR 32 NEW.pdf, OUR 32 OLD.pdf, LOT 30 NEW.pdf. "
+                "Имена: OUR LOT 32 NEW.pdf, OUR LOT 32 OLD.pdf, LOT 30 NEW.pdf. "
                 "Block/Lot и Borough читает локальный OCR. Vision получает карту и адрес; "
                 "при неудаче OCR надёжный режим может отправить левую половину карточки, "
                 "включая видимые персональные данные, для одного дополнительного запроса."
@@ -11831,17 +11831,20 @@ class SurveyApp(ctk.CTk):
                 risks.append(f"• {name}: {'; '.join(reasons)}")
         if self._neighbor_report is not None and self._neighbor_report.has_issues:
             risks.append("• " + self._neighbor_report.headline())
-        if risks and self.ask_on_doubt_var.get():
-            from tkinter import messagebox
-
-            if not messagebox.askyesno(
-                "Подтвердите отрисовку",
-                "В рассчитанной схеме есть замечания:\n\n" + "\n".join(risks)
-                + "\n\nСверьте данные с документом. Начертить именно показанную схему без изменений?",
-                default="no", parent=self,
-            ):
-                self._set_status("Отрисовка отменена; рассчитанная схема сохранена.", warn=True)
-                return
+        # Чертеж строится в любом случае — даже если программа сигнализирует об
+        # ошибках/неточностях участка (опечатки, подозрения, предупреждения,
+        # невязка замыкания). Криво, косо, неполно — главное, что чертеж построен.
+        # Замечания только сообщаем, но не блокируем и не отменяем отрисовку.
+        if risks:
+            self._log_line(
+                "Замечания к схеме (отрисовка выполняется в любом случае):\n"
+                + "\n".join(risks),
+                level=log_mode.LEVEL_WARN,
+            )
+            self._set_status(
+                "В схеме есть замечания к участку, но чертеж будет построен без изменений.",
+                warn=True,
+            )
 
         cfg, _provider, _model, _key, _secret = self._build_runtime_config()
         self._busy = True

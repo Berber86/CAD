@@ -42,6 +42,7 @@ import json
 import math
 import re
 import sys
+from decimal import ROUND_HALF_EVEN, Decimal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -717,9 +718,9 @@ DIAGONAL_SHEET_AXES = True
 DIAGONAL_TOL_DEG = 10.0
 
 #: Шаг строк многострочной подписи в высотах текста — тот же, что у подписей объектов
-#: (`mtext_line_spacing_factor` = 1.67 в настройках). С шагом 1.0 двухстрочный блок
-#: считался ниже, чем он есть, и при раскладке наезжал на соседние надписи.
-TEXT_LINE_SPACING = 1.67
+#: (`mtext_line_spacing_factor` = 0.9 в настройках). С шагом 0.9 строки многострочного
+#: текста оффсета расположены плотнее, по требованию Николая (межстрочный интервал 0,9).
+TEXT_LINE_SPACING = 0.9
 
 #: Зазор между подписями при раскладке, в высотах текста. Шрифт в AutoCAD шире нашей оценки
 #: (0.6 высоты на знак), поэтому блоки, проверенные «впритык», в чертеже слипались.
@@ -852,8 +853,14 @@ Rect = tuple[float, float, float, float]
 
 
 def round_offset_ft(distance_ft: float) -> float:
-    """Расстояние в подписи — до 0.1 фута, половина вверх (как у заказчика: 0.4, 3.2, 14.6)."""
-    return math.floor(distance_ft * 10.0 + 0.5) / 10.0
+    """Расстояние в подписи — до 0.1 фута, геодезическое округление (5 в чётную).
+
+    По правилам геодезии Нью-Йорка: если сотая равна 5, округляем так, чтобы
+    десятая была чётной. 0.05 → 0.0, 0.15 → 0.2, 0.25 → 0.2, 0.35 → 0.4,
+    0.45 → 0.4, 0.55 → 0.6, 0.65 → 0.6, 0.75 → 0.8, 0.85 → 0.8, 0.95 → 1.0.
+    Диапазон 0.15–0.25 округляется до десятой 0.2.
+    """
+    return float(Decimal(str(distance_ft)).quantize(Decimal("0.1"), rounding=ROUND_HALF_EVEN))
 
 
 def compass_letter(dx: float, dy: float, north_deg: float = 90.0) -> str:
@@ -1034,12 +1041,26 @@ def offset_prefix(kind: str) -> str:
     return ""
 
 
+#: Политически значимое округление для заборов: диапазон 0.86–1.15 ft
+#: округляется до 0.9 ft, чтобы чертёж был принят title company.
+#: Применяется только к оффсетам заборов (kind == "fence").
+FENCE_OFFSET_SPECIAL_ROUND = (0.86, 1.15, 0.9)
+
+
 def offset_text(kind: str, value_ft: float, direction: str, *, leader: bool = False) -> str:
     """
     Текст оффсета в форме заказчика: ``FE.0.4'N``, ``WALL 0.5'E``. Дом без выноски — ``3.2'S``,
     дом с выноской — ``BLDG 2.5'S`` (так у заказчика в Alvine).
+
+    Для заборов: значения в диапазоне 0.86–1.15 ft отображаются как 0.9 ft
+    (требование title company — не математическое и не геодезическое округление).
     """
-    value = f"{value_ft:.1f}'{direction}"
+    display_ft = value_ft
+    if kind == "fence":
+        low, high, special = FENCE_OFFSET_SPECIAL_ROUND
+        if low <= value_ft <= high:
+            display_ft = special
+    value = f"{display_ft:.1f}'{direction}"
     if kind == "fence":
         return f"FE.{value}"
     if kind == "wall":
@@ -2244,7 +2265,8 @@ def plan_offsets(
                     height_ft=height, anchor=best.vertex, target=best.foot, text=text,
                     point=beside, leader=None,
                     rotation_deg=(
-                        _boundary_angle_deg(best.foot, boundary_segs) if TEXT_FOLLOWS_BOUNDARY else 0.0
+                        0.0 if feature.kind == "house"
+                        else (_boundary_angle_deg(best.foot, boundary_segs) if TEXT_FOLLOWS_BOUNDARY else 0.0)
                     ),
                 )
             else:
@@ -2528,6 +2550,11 @@ def _plan_edge_labels(
         if TEXT_FOLLOWS_BOUNDARY and TEXT_ROTATION_OBJECT:
             # R21: вдоль объекта, который подписываем (ответ заказчика 19.11.2026, вопрос 5).
             rotation = _object_edge_angle(feature, vertex, rotation)
+        # R28: подпись дома на Шаге 2 читается «как в книге» — поворот текста всегда 0,
+        # независимо от наклона границы участка или грани объекта (R10/R21 не действуют
+        # для feature.kind == "house").
+        if feature.kind == "house":
+            rotation = 0.0
         # R16: у дома первым пробуется место снаружи контура участка (HOUSE_TEXT_OUTSIDE).
         # R19: ступени места — сначала с просветом до границы, затем прежние (зазор между
         # подписями, без зазора): подпись, которой не хватило просвета, ставится как раньше.

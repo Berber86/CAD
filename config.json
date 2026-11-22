@@ -246,6 +246,7 @@
     ],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
+    "offset_output_layer_color": 1,
     "house_label_layer": "0",
     "house_label_text_style": "RDS",
     "house_label_style_definition": {
@@ -717,6 +718,14 @@
       },
       {
         "match": [
+          "CHIMNEY",
+          "CHIMN"
+        ],
+        "label": "CHIMN",
+        "category": "chimney"
+      },
+      {
+        "match": [
           "BLC*",
           "BL",
           "TTP*",
@@ -823,7 +832,8 @@
     "obstacle_layer_exclude": [],
     "text_obstacle_layers": [
       "BOUNDARY_TEXT*",
-      "M-TAX-DIM"
+      "M-TAX-DIM",
+      "LETTER"
     ],
     "point_labels_as_obstacles": false,
     "skip_existing_labels": true,
@@ -950,7 +960,7 @@
     "text_clearance_factor": 0.3,
     "line_clearance_factor": 0.3,
     "inside_clearance_factor": 0.3,
-    "mtext_line_spacing_factor": 1.67,
+    "mtext_line_spacing_factor": 0.9,
     "char_width_factor": 0.92,
     "space_width_factor": 1.0,
     "narrow_char_width_factor": 0.48,
@@ -974,7 +984,7 @@
     "leader_max_length_factor": 12.0,
     "leader_landing_factor": 1.0,
     "leader_text_gap_factor": 0.333,
-    "leader_arrow_size_factor": 0.8,
+    "leader_arrow_size_factor": 1.36,
     "leader_object_arrow_factor": 1.333,
     "leader_attach_annotation": true,
     "leader_stacked_penalty": 2.0,

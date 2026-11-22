@@ -133,24 +133,24 @@ def _collect(tmp_path, **kwargs):
 def test_our_lot_gets_newest_and_oldest_deed(tmp_path):
     outcome = _collect(tmp_path)
     names = [record.file for record in outcome.records]
-    assert names == ["OUR 32 NEW.pdf", "OUR 32 OLD.pdf"]
+    assert names == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]
     assert outcome.ok
     records = {record.file: record for record in deed_store.read_records(outcome.folder)}
-    assert records["OUR 32 NEW.pdf"].endorsement_id == str(OUR_NEW)
-    assert records["OUR 32 OLD.pdf"].endorsement_id == str(OUR_OLD)
-    assert records["OUR 32 NEW.pdf"].pages == "2"
+    assert records["OUR LOT 32 NEW.pdf"].endorsement_id == str(OUR_NEW)
+    assert records["OUR LOT 32 OLD.pdf"].endorsement_id == str(OUR_OLD)
+    assert records["OUR LOT 32 NEW.pdf"].pages == "2"
 
 
 def test_whole_document_and_trimmed_copy_and_recognised_text_are_next_to_each_other(tmp_path):
     outcome = _collect(tmp_path)
     folder = outcome.folder
-    assert (folder / "OUR 32 NEW.pdf").is_file()
-    assert (folder / "OUR 32 NEW_p2.pdf").is_file()
-    text_file = folder / "OUR 32 NEW_text.txt"
+    assert (folder / "OUR LOT 32 NEW.pdf").is_file()
+    assert (folder / "OUR LOT 32 NEW_p2.pdf").is_file()
+    text_file = folder / "OUR LOT 32 NEW_text.txt"
     assert "174.89" in text_file.read_text(encoding="utf-8")
     record = deed_store.read_records(folder)[0]
-    assert record.trimmed == "OUR 32 NEW_p2.pdf"
-    assert record.text_file == "OUR 32 NEW_text.txt"
+    assert record.trimmed == "OUR LOT 32 NEW_p2.pdf"
+    assert record.text_file == "OUR LOT 32 NEW_text.txt"
     assert record.source_url.endswith(f"p_endorsementId={OUR_NEW}")
 
 
@@ -160,7 +160,7 @@ def test_manifest_puts_our_lot_first_and_remembers_the_missing_items(tmp_path):
     assert manifest["block"] == str(BLOCK) and manifest["lot"] == str(LOT)
     roles = [item["role"] for item in manifest["items"]]
     assert roles[0] == "our"
-    assert [item["file"] for item in manifest["items"]][:2] == ["OUR 32 NEW.pdf", "OUR 32 OLD.pdf"]
+    assert [item["file"] for item in manifest["items"]][:2] == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]
 
 
 def test_deed_wins_over_a_newer_mortgage(tmp_path):
@@ -206,15 +206,15 @@ def test_cloudflare_on_the_list_does_not_stop_the_other_lots(tmp_path):
     outcome = _collect(
         tmp_path, neighbours="30", fetch_list=_fetch(fail_lots={NEIGHBOUR}),
     )
-    assert [item.file for item in outcome.records] == ["OUR 32 NEW.pdf", "OUR 32 OLD.pdf"]
+    assert [item.file for item in outcome.records] == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]
     assert any("сосед (лот 30)" in item and "Cloudflare" in item for item in outcome.missing)
 
 
 def test_manual_step_for_one_document_keeps_the_other_one(tmp_path):
     download = _downloader(tmp_path, fail_ids={str(OUR_NEW)})
     outcome = _collect(tmp_path, downloader=download)
-    assert [item.file for item in outcome.records] == ["OUR 32 OLD.pdf"]
-    assert any("OUR 32 NEW" in item and "p_endorsementId" in item for item in outcome.missing)
+    assert [item.file for item in outcome.records] == ["OUR LOT 32 OLD.pdf"]
+    assert any("OUR LOT 32 NEW" in item and "p_endorsementId" in item for item in outcome.missing)
     assert not outcome.ok or outcome.our_records  # собранное не потеряно
 
 
@@ -236,7 +236,7 @@ def test_stop_interrupts_the_run_and_keeps_what_was_collected(tmp_path):
 
     with pytest.raises(deed_intake.IntakeCancelled):
         _collect(tmp_path, neighbours="30", should_stop=should_stop)
-    assert (tmp_path / "01_описания" / "OUR 32 NEW.pdf").is_file()
+    assert (tmp_path / "01_описания" / "OUR LOT 32 NEW.pdf").is_file()
 
 
 # ----------------------------------------------------- лестница и ручные шаги
@@ -261,9 +261,9 @@ def test_newest_pdf_from_downloads_is_adopted(tmp_path):
     record = deed_intake.adopt_downloads(
         folder, role="our", lot=LOT, block=BLOCK, downloads=downloads,
     )
-    assert record is not None and record.file == "OUR 32 NEW.pdf"
+    assert record is not None and record.file == "OUR LOT 32 NEW.pdf"
     assert any("ViewContent.pdf".replace(".pdf", "") in note for note in record.notes)
-    assert (folder / "OUR 32 NEW.pdf").is_file()
+    assert (folder / "OUR LOT 32 NEW.pdf").is_file()
     assert newest.is_file()  # из загрузок файл не удаляется
 
 
@@ -284,7 +284,7 @@ def test_folder_for_an_address_is_inside_the_project(tmp_path):
 def test_report_lists_files_and_gaps(tmp_path):
     outcome = _collect(tmp_path, neighbours="30", fetch_list=_fetch(fail_lots={NEIGHBOUR}))
     report = outcome.report()
-    assert "OUR 32 NEW.pdf" in report and "ЛОТ" not in report
+    assert "OUR LOT 32 NEW.pdf" in report and "ЛОТ" not in report
     assert "Чего не хватает" in report and "LOT 30" not in report
     assert "01_описания" in report
 
@@ -420,10 +420,10 @@ def test_saved_page_from_docs_folder_parses_if_it_is_there():
 
 def test_sidecar_of_a_stored_document_is_readable_back(tmp_path):
     outcome = _collect(tmp_path)
-    raw = json.loads((outcome.folder / "OUR 32 NEW.json").read_text(encoding="utf-8"))
+    raw = json.loads((outcome.folder / "OUR LOT 32 NEW.json").read_text(encoding="utf-8"))
     assert raw["endorsement_id"] == str(OUR_NEW)
-    assert raw["trimmed"] == "OUR 32 NEW_p2.pdf"
-    assert raw["text_file"] == "OUR 32 NEW_text.txt"
+    assert raw["trimmed"] == "OUR LOT 32 NEW_p2.pdf"
+    assert raw["text_file"] == "OUR LOT 32 NEW_text.txt"
 
 
 def test_collect_passes_selected_dpi_to_default_page_search(tmp_path, monkeypatch):
@@ -452,10 +452,10 @@ def test_old_deed_and_fresh_mortgage_flow_saves_mortgage_as_new_and_deed_as_old(
     )}
     outcome = _collect(tmp_path, fetch_list=_fetch(table))
     records = {record.file: record for record in deed_store.read_records(outcome.folder)}
-    assert set(records) == {"OUR 32 NEW.pdf", "OUR 32 OLD.pdf"}
-    assert records["OUR 32 NEW.pdf"].endorsement_id == "111333"
-    assert records["OUR 32 NEW.pdf"].doc_type == "MORTGAGE"
-    assert records["OUR 32 OLD.pdf"].endorsement_id == str(OUR_OLD)
+    assert set(records) == {"OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"}
+    assert records["OUR LOT 32 NEW.pdf"].endorsement_id == "111333"
+    assert records["OUR LOT 32 NEW.pdf"].doc_type == "MORTGAGE"
+    assert records["OUR LOT 32 OLD.pdf"].endorsement_id == str(OUR_OLD)
 
 
 def test_portal_values_are_kept_per_file_and_survive_step1_read(tmp_path):
@@ -470,7 +470,7 @@ def test_portal_values_are_kept_per_file_and_survive_step1_read(tmp_path):
                                                      "Example address", ("Example address", portal))
     result = _collect(tmp_path, borough="Staten Island", neighbours=[NEIGHBOUR], identity_by_lot=identities)
     records = {r.file: r for r in deed_store.read_records(result.folder)}
-    ours, neighbor = records["OUR 32 NEW.pdf"], records["LOT 30 NEW.pdf"]
+    ours, neighbor = records["OUR LOT 32 NEW.pdf"], records["LOT 30 NEW.pdf"]
     assert ours.borough == neighbor.borough == "Staten Island"
     assert any(e["source"] == "portal" and e["method"] == "vision" for e in ours.identity["block"])
     assert any(e["value"] == "32" and e["source"] == "portal" for e in ours.identity["lot"])

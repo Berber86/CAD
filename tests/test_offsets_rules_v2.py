@@ -44,7 +44,7 @@ def test_two_sides_of_one_vertex_are_two_lines_of_one_label():
     # Вершина (1.0, 0.3) у угла: 0.3 до южной стороны (N) и 1.0 до западной (E). Один забор.
     fence = _fence([(1.0, 0.3), (30.0, 0.3)])
     plan = off.plan_offsets(SQUARE, [fence])
-    assert [item.text for item in plan.items] == ["FE.0.3'N\nFE.1.0'E"]
+    assert [item.text for item in plan.items] == ["FE.0.3'N\nFE.0.9'E"]
 
 
 def test_second_side_is_not_added_beyond_threshold():

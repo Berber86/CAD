@@ -156,6 +156,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "step_tread_layers": ["*TREADS*"],
     "label_output_layer": "D-TOPO-TEXT",
     "label_output_layer_color": 7,
+    #: Цвет слоя оффсетов (D-TOPO-TEXT): красный (1 в AutoCAD), как требует Николая.
+    "offset_output_layer_color": 1,
     #: Описание основного дома в итоговых чертежах заказчика — MText в слое 0,
     #: стиль RDS, высота 1.5 ft при подписях 0.9 ft. Стиль берётся, если он есть
     #: в чертеже (иначе — общий стиль подписей). Пустой слой — как все подписи.
@@ -321,6 +323,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
         # кромка тротуара/дорожки: материал покрытия заказчик берёт с фотографий.
         # COLUMN — колонна у входа, BBC — точка бортового камня: в итоговых
         # чертежах заказчика не подписаны.
+        # CHIMNEY / CHIMN — дымоход: подпись «CHIMN» по требованию Николая.
+        {"match": ["CHIMNEY", "CHIMN"], "label": "CHIMN", "category": "chimney"},
         # W U P — столб: подписывается его условный знак (symbol_block_labels).
         {
             "match": [
@@ -435,7 +439,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # Тексты-препятствия — только те, что остаются в итоговом чертеже: готовые
     # подписи (existing_label_layers) и подписи границы Шага 1. Tax-тексты
     # полевого чертежа («#87 LOT 70», румбы красных линий) подписям не мешают.
-    "text_obstacle_layers": ["BOUNDARY_TEXT*", "M-TAX-DIM"],
+    # LETTER — названия улиц печатного черновика (4.80.14).
+    "text_obstacle_layers": ["BOUNDARY_TEXT*", "M-TAX-DIM", "LETTER"],
     "point_labels_as_obstacles": False,
     # --- дедупликация --------------------------------------------------------
     "skip_existing_labels": True,
@@ -524,7 +529,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "text_clearance_factor": 0.3,
     "line_clearance_factor": 0.3,
     "inside_clearance_factor": 0.3,
-    "mtext_line_spacing_factor": 1.67,
+    "mtext_line_spacing_factor": 0.9,
     #: Ширина символов шрифта подписей в высотах текста (чертёжный SHX-шрифт
     #: заказчика): буква/цифра, пробел, узкий знак. В AutoCAD эти значения
     #: уточняются измерением пробного текста (measure_text_in_autocad).
@@ -574,7 +579,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     #: зазор между концом выноски и текстом (у заказчика 0.30 ft при тексте 0.9 ft)
     "leader_text_gap_factor": 0.333,
     #: стрелка-клин полилинии, в высотах текста
-    "leader_arrow_size_factor": 0.8,
+    "leader_arrow_size_factor": 1.36,
     #: стрелка объекта Leader берётся из размерного стиля чертежа (у заказчика
     #: CURB-DIM 1-16: 1.2 ft при тексте 0.9 ft); если она меньше 0.6 или больше
     #: 2.2 высоты текста — ставится такая, в высотах текста
@@ -1097,9 +1102,12 @@ class LayerClassifier:
         self._obstacle = _as_patterns(fcfg.get("obstacle_layers"))
         self._obstacle_exclude = _as_patterns(fcfg.get("obstacle_layer_exclude"))
         self._text_obstacle = _as_patterns(fcfg.get("text_obstacle_layers"))
-        # Обязательный слой подписей Шага 1, в том числе при старых настройках.
+        # Обязательные слои подписей Шага 1, в том числе при старых настройках:
+        # M-TAX-DIM — румбы/длины черновика, LETTER — названия улиц черновика.
         if not layer_matches("M-TAX-DIM", self._text_obstacle):
             self._text_obstacle.append("M-TAX-DIM")
+        if not layer_matches("LETTER", self._text_obstacle):
+            self._text_obstacle.append("LETTER")
         self._code_linework = _as_patterns(fcfg.get("code_linework_layers"))
         self._cache: dict[tuple[str, str], Any] = {}
 

@@ -72,8 +72,8 @@ def _three_lots(tmp_path):
         ("bruklin250_p2_5.pdf", (2, 5)),
         ("LOT_12_P3.PDF", (3, 3)),
         ("a_p5_2.pdf", (2, 5)),  # перепутанный порядок исправляется
-        # Шаг 0 кладёт копию описания как OUR 32 NEW_p4-6.pdf — дефис тоже читается.
-        ("OUR 32 NEW_p4-6.pdf", (4, 6)),
+        # Шаг 0 кладёт копию описания как OUR LOT 32 NEW_p4-6.pdf — дефис тоже читается.
+        ("OUR LOT 32 NEW_p4-6.pdf", (4, 6)),
         ("LOT 30 OLD_p2-2.pdf", (2, 2)),
         ("lot 12_p4 .pdf", (4, 4)),
         ("plain.pdf", None),
@@ -433,11 +433,14 @@ def test_disagreeing_ai_passes_keep_the_lot_and_flag_it(gui, tmp_path, monkeypat
     assert "построен с замечаниями" in report and "проходы ИИ разошлись" in report
     assert "с замечаниями: 1" in app.status_var.get()
     assert "⚠ сосед" in app.neighbor_pdf_summary.cget("text")
-    # Перед отрисовкой программа спрашивает подтверждение и называет замечание.
+    # Замечание не блокирует отрисовку — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
     asked = []
     monkeypatch.setattr(messagebox, "askyesno", lambda _title, text, **kw: asked.append(text) or False)
     app._start(parse_only=False)
-    assert asked and "neighbor_scan.pdf" in asked[0] and "Отрисовка отменена" in app.status_var.get()
+    _wait(app)
+    assert not asked
+    assert "отменена" not in app.status_var.get()
     app._on_close()
 
 

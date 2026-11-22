@@ -2458,12 +2458,11 @@ def test_suspicious_neighbor_is_not_silently_drawn_in_batch(gui, tmp_path, monke
     assert all(any("Возможная опечатка" in item.title for item in app._plan_diagnostic_items(plan))
                for plan in app._preview_neighbor_plans)
     app._start(parse_only=False)
-    assert draws == [] and prompts and "опечатка" in prompts[0]
-    assert "Отрисовка отменена" in app.status_var.get()
-    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **kw: True)
-    app._start(parse_only=False)
     _wait_for_gui_worker(app)
-    assert draws == app._preview_neighbor_plans and len(calls) == 2
+    # Подозрительный сосед рисуется в любом случае — без подтверждения и без отмены.
+    assert not prompts
+    assert draws == app._preview_neighbor_plans
+    assert "отменена" not in app.status_var.get()
     app._on_close()
 
 
@@ -3855,7 +3854,7 @@ def test_step0_success_enables_handover_to_step1(gui, tmp_path):
     outcome = gui.deed_intake.IntakeOutcome(
         folder=folder,
         records=[
-            gui.deed_store.StoredDeed(file="OUR 32 NEW.pdf", role="our", lot="32", pages="2"),
+            gui.deed_store.StoredDeed(file="OUR LOT 32 NEW.pdf", role="our", lot="32", pages="2"),
         ],
     )
     saved = gui.deed_intake.collect_deeds
@@ -3867,7 +3866,7 @@ def test_step0_success_enables_handover_to_step1(gui, tmp_path):
     finally:
         gui.deed_intake.collect_deeds = saved
     assert app.step0_to_step1_button.cget("state") == "normal"
-    assert "OUR 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
+    assert "OUR LOT 32 NEW.pdf" in app.step0_report_box.get("1.0", "end")
     assert "собрано документов — 1" in app.status_var.get()
 
 
@@ -3949,8 +3948,8 @@ def test_step0_handover_opens_step1_with_the_trimmed_copies(gui, tmp_path):
     app._step0_to_step1()
     assert app._pdf_set_dialog is not None
     items = app._pdf_set_dialog.items
-    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
-    trimmed = next(item for item in items if item.path.name == "OUR 32 NEW_p2.pdf")
+    assert sorted(item.path.name for item in items) == ["LOT 30 NEW.pdf", "OUR LOT 32 NEW_p2.pdf"]
+    trimmed = next(item for item in items if item.path.name == "OUR LOT 32 NEW_p2.pdf")
     assert trimmed.name_pages == (2, 2)
     assert trimmed.is_main
     assert next(item for item in items if item.path.name == "LOT 30 NEW.pdf").is_main is False
@@ -4027,7 +4026,7 @@ def test_handover_recovers_neighbour_from_its_passport_when_manifest_misses_it(g
     app._step0_to_step1()
     names = sorted(item.path.name for item in app._pdf_set_dialog.items)
     # Старый документ нашего участка хранится в папке, но в набор Шага 1 не передаётся (решение пользователя).
-    assert names == ["LOT 30 NEW.pdf", "OUR 32 NEW_p2.pdf"]
+    assert names == ["LOT 30 NEW.pdf", "OUR LOT 32 NEW_p2.pdf"]
     assert any("В manifest не было LOT 30 NEW.pdf" in line for line in _step0_texts(app))
     assert any("Отправляю в Шаг 1 (2 PDF)" in line for line in _step0_texts(app))
 
@@ -5238,8 +5237,11 @@ def test_auto_fix_does_not_open_typo_question_but_independent_risk_can_prompt(gu
     prompts = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
     app._start(parse_only=False)
-    assert prompts and "невязка" in prompts[0].lower()
-    assert "Отрисовка отменена" in app.status_var.get()
+    _wait_for_gui_worker(app)
+    # Рисование не блокируется невязкой — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
+    assert not prompts
+    assert "отменена" not in app.status_var.get()
 
 
 def test_doubt_checkbox_atomic_failure_does_not_damage_other_local_data(gui, monkeypatch):
@@ -5282,8 +5284,11 @@ def test_checked_ambiguous_109_not_modified_and_warns_before_drawing(gui, monkey
     prompts = []
     monkeypatch.setattr(messagebox, "askyesno", lambda title, text, **kw: prompts.append(text) or False)
     app._start(parse_only=False)
-    assert len(prompts) == 1 and "невязка" in prompts[0].lower()
-    assert "Отрисовка отменена" in app.status_var.get()
+    _wait_for_gui_worker(app)
+    # Рисование не блокируется невязкой — подтверждение не запрашивается,
+    # чертеж строится в любом случае.
+    assert not prompts
+    assert "отменена" not in app.status_var.get()
 
 
 @pytest.mark.parametrize("ask,good_provider", [(True, "hydra"), (False, "openrouter")])
@@ -5973,6 +5978,6 @@ def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_
     dialog = app._pdf_set_dialog
     assert dialog is not None and dialog.multi_mode
     assert {item.path.name: item.is_main for item in dialog.items} == {
-        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+        'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
     assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
-        'OUR 32 NEW.pdf': True, 'OUR 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+        'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}

@@ -11,7 +11,7 @@
    сам PDF ``/ViewVscmsDocument/ViewContent?p_endorsementId=<id>``;
 4. для **нашего** лота качаются самый свежий и самый старый документ, для
    **соседей** — только свежий;
-5. имя файла: ``OUR 32 NEW.pdf`` / ``OUR 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``).
+5. имя файла: ``OUR LOT 32 NEW.pdf`` / ``OUR LOT 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``).
 
 Важно: Staten Island — это Richmond County, и его документы лежат **не в ACRIS**
 (ACRIS покрывает остальные четыре района). Поэтому Шаг 0 по районам разный:
@@ -446,11 +446,12 @@ def choose_documents(
 
 def document_file_name(role: str, lot: int | str, tag: str) -> str:
     """
-    Имя файла по схеме Коли: ``OUR 32 NEW.pdf``, ``OUR 32 OLD.pdf``,
-    ``LOT 30 NEW.pdf``. Шаг 1 узнаёт страницы по ``_p4-6`` — этот суффикс
-    добавляется отдельно, когда найдены страницы с описанием.
+    Имя файла по схеме Коли: ``OUR LOT 32 NEW.pdf``, ``OUR LOT 32 OLD.pdf``
+    (наш лот — слово OUR в начале), ``LOT 30 NEW.pdf`` (сосед — без OUR).
+    Шаг 1 узнаёт страницы по ``_p4-6`` — этот суффикс добавляется отдельно,
+    когда найдены страницы с описанием.
     """
-    prefix = OUR_PREFIX if role == "our" else NEIGHBOUR_PREFIX
+    prefix = "OUR LOT" if role == "our" else NEIGHBOUR_PREFIX
     return f"{prefix} {int(lot)} {tag}.pdf"
 
 

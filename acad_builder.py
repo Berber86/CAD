@@ -170,6 +170,16 @@ _INSUNITS_NAMES = {
 #: допуск невязки от округления длин до 0.01 ft (ALTA/NSPS: ~0.02 ft = 1/4")
 CLOSURE_TOLERANCE_FT = 0.02
 
+# --- печатный черновик: слои и стили подписей (правило заказчика) ------------
+#: Названия улиц (фасадная и пересекаемая) — слой LETTER, стиль MtXpl_Times_New_Roma.
+#: Все остальные надписи черновика (румбы, длины, пояснения сторон, старые
+#: названия улиц) — слой M-TAX-DIM, стиль Romans. Имена берутся из шаблона
+#: заказчика; существующие объекты и настройки стилей не изменяются.
+PRINT_STREET_LAYER = "LETTER"
+PRINT_STREET_STYLE = "MtXpl_Times_New_Roma"
+PRINT_TEXT_STYLE = "Romans"
+PRINT_STREET_TEXT_COLOR = 7
+
 
 # ---------------------------------------------------------------------------
 # Ошибки
@@ -763,16 +773,21 @@ def format_bearing(segment: Segment, use_control_code: bool = True) -> str:
     """
     Каноничная подпись румба: ``N 75°20'20" E``.
 
+    Все значения — градусы, минуты, секунды — даются двумя цифрами:
+    при значении от 0 до 9 ставится ведущий ноль (``N 04°09'00" W``).
     В DBTEXT через COM код градуса надёжнее задавать как %%d — AutoCAD
     превратит его в символ градуса при любом стиле и кодировке.
     """
     degrees = "%%d" if use_control_code else "°"
     seconds = f"{segment.seconds:.2f}".rstrip("0").rstrip(".")
-    head = f"{segment.ns} {int(segment.degrees)}{degrees}{int(segment.minutes):02d}'"
-    if seconds in {"0", ""}:
-        # Ровные минуты: «N 45%%d00' E» — без лишних 0".
-        return f"{head} {segment.ew}"
-    return f"{head}{seconds}\" {segment.ew}"
+    # Ведущий ноль на целой части секунд (0 → 00, 5 → 05, 40 → 40)
+    if "." in seconds:
+        sec_int, sec_frac = seconds.split(".")
+        seconds = f"{int(sec_int):02d}.{sec_frac}"
+    else:
+        seconds = f"{int(seconds):02d}"
+    head = f"{segment.ns} {int(segment.degrees):02d}{degrees}{int(segment.minutes):02d}'{seconds}\""
+    return f"{head} {segment.ew}"
 
 
 def text_rotation(line_angle_rad: float) -> float:
@@ -875,7 +890,7 @@ def format_dms_angle(angle_deg: float, use_control_code: bool = True) -> str:
     else:
         sec_str = f"{tenths_sec / 10.0:04.1f}" if tenths_sec < 100 else f"{tenths_sec / 10.0:.1f}"
     deg_symbol = "%%d" if use_control_code else "°"
-    return f"{deg}{deg_symbol}{minutes:02d}'{sec_str}\""
+    return f"{deg:02d}{deg_symbol}{minutes:02d}'{sec_str}\""
 
 
 _DMS_PARSE_RE = re.compile(
@@ -1321,6 +1336,7 @@ class DrawResult:
     plan: DrawPlan
     text_count: int
     layers: dict[str, str]
+    styles: dict[str, str] = field(default_factory=dict)
     handle: str | None = None
     warnings: list[str] = field(default_factory=list)
     boundary_line_count: int = 0
@@ -1366,7 +1382,13 @@ class DrawResult:
         layer_summary = (
             f"Слой соседа: {self.layers.get('neighbor_lot', 'NEIGHBOR_LOT')}"
             if self.is_neighbor
-            else f"Слои: {self.layers.get('property_line')} / {self.layers.get('boundary_text')}"
+            else (
+                f"Слои: {self.layers.get('print_property_line')} / "
+                f"{self.layers.get('print_boundary_text')} / "
+                f"названия улиц — {self.layers.get('print_street_text')}"
+                if self.plan.print_draft
+                else f"Слои: {self.layers.get('property_line')} / {self.layers.get('boundary_text')}"
+            )
         )
         n_segs = self.boundary_line_count or self.segment_count
         lines = [
@@ -1377,6 +1399,11 @@ class DrawResult:
             self.closure.report(),
             layer_summary,
         ]
+        if self.plan.print_draft and self.styles:
+            lines.append(
+                f"Стили: названия улиц — {self.styles.get('street')}; "
+                f"остальные надписи — {self.styles.get('other')}"
+            )
         if self.plan.gap_points is not None:
             g0, g1 = self.plan.gap_points
             lines.append(
@@ -1853,11 +1880,20 @@ class AcadBuilder:
                 continue
 
             display_segment = segment
-            if index == front_index and not segment.has_bearing and segment.course_note:
-                # Only remove the frontage's along-the-street phrase; retain other notes.
-                note = re.sub(r"\balong\s+[^,;]+", "", segment.course_note,
-                              flags=re.IGNORECASE).strip(" ,;:-")
-                display_segment = segment.model_copy(update={"course_note": note or None})
+            if index == front_index and segment.course_note:
+                # Frontage line: keep ONLY the street name (e.g. "Hylan
+                # Boulevard"), drop ALL other explanatory notes — "along ...
+                # side of", "PARALLEL WITH ...", "AT RIGHT ANGLES TO ...",
+                # etc. The side is described only by bearing and distance.
+                main_street = str(getattr(description, "main_street", "") or "").strip()
+                note = segment.course_note
+                if main_street and main_street.lower() in note.lower():
+                    # Оставляем только название улицы из course_note
+                    note = main_street
+                else:
+                    # Названия улицы нет в course_note — убираем все пояснения
+                    note = None
+                display_segment = segment.model_copy(update={"course_note": note})
             lines, _ = build_side_lines(display_segment, text_height, length, cfg, feet_inches=feet_inches)
             angle = math.atan2(end[1] - start[1], end[0] - start[0])
             rot = text_rotation(angle)
@@ -2955,6 +2991,90 @@ class AcadBuilder:
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль LETTER: {exc}") from exc
 
+    @staticmethod
+    def _find_text_style(styles: Any, name: str) -> Any | None:
+        """Найти стиль по имени без учёта регистра (в шаблоне заказчика ROMANS)."""
+        try:
+            return styles.Item(name)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            count = int(styles.Count)
+        except Exception:  # noqa: BLE001 - коллекция без Count (или тестовая)
+            return None
+        target = name.casefold()
+        for index in range(count):
+            try:
+                style = styles.Item(index)
+            except Exception:  # noqa: BLE001
+                continue
+            if str(getattr(style, "Name", "")).casefold() == target:
+                return style
+        return None
+
+    def _ensure_named_text_style(
+        self,
+        doc: Any,
+        name: str,
+        warnings: list[str],
+        *,
+        font_file: str | None = None,
+        typeface: str | None = None,
+    ) -> str:
+        """Вернуть существующий стиль без изменений; если его нет — создать с запасным шрифтом.
+
+        Имя может отличаться регистром от имени в DWG (``Romans`` / ``ROMANS``):
+        возвращается фактическое имя найденного стиля, новый дубль не создаётся.
+        """
+        try:
+            styles = doc.TextStyles
+            existing = self._find_text_style(styles, name)
+            if existing is not None:
+                return str(getattr(existing, "Name", name) or name)
+            style = _com_retry(styles.Add, name)
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"Не удалось получить или создать стиль {name}: {exc}") from exc
+
+        configured = False
+        font_error = None
+        used_font = ""
+        try:
+            if typeface:
+                style.SetFont(typeface, False, False, 0, 0)
+                configured = True
+                used_font = typeface
+            elif font_file:
+                style.fontFile = font_file
+                configured = True
+                used_font = font_file
+        except Exception as exc:  # noqa: BLE001
+            font_error = str(exc)
+            if typeface and font_file:
+                try:
+                    style.fontFile = font_file
+                    configured = True
+                    used_font = font_file
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            style.Height = 0.0
+            style.Width = 1.0
+        except Exception:  # noqa: BLE001
+            pass
+        if configured:
+            warnings.append(
+                f"Стиль {name} отсутствовал и создан с шрифтом {used_font}; "
+                "проверьте его по шаблону заказчика"
+            )
+        else:
+            detail = f" ({font_error})" if font_error else ""
+            warnings.append(
+                f"Стиль {name} отсутствовал и создан, но шрифт настроить не удалось{detail}; "
+                "проверьте его по шаблону заказчика"
+            )
+        return name
+
+
     # -- создание объектов --------------------------------------------------
     def _add_polyline(
         self,
@@ -3211,7 +3331,33 @@ class AcadBuilder:
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 
-            style = self._ensure_boundary_text_style(doc, warnings)
+            # Печатный черновик: названия улиц — слой LETTER и стиль
+            # MtXpl_Times_New_Roma, остальные надписи — M-TAX-DIM и Romans.
+            # Основной план и соседи сохраняют прежний стиль LETTER.
+            draft_street_layer = None
+            draft_street_style = None
+            draft_text_style = None
+            if geo.print_draft:
+                try:
+                    doc.Layers.Item(PRINT_STREET_LAYER)
+                except Exception:  # noqa: BLE001 - слоя нет, создадим ниже
+                    warnings.append(
+                        f"Слой {PRINT_STREET_LAYER} отсутствовал и создан для названий улиц черновика; "
+                        "проверьте его цвет по шаблону заказчика"
+                    )
+                draft_street_layer = self._ensure_survey_layer(
+                    doc, PRINT_STREET_LAYER, PRINT_STREET_TEXT_COLOR, warnings
+                )
+                draft_street_style = self._ensure_named_text_style(
+                    doc, PRINT_STREET_STYLE, warnings,
+                    typeface="Times New Roman", font_file="romans.shx",
+                )
+                draft_text_style = self._ensure_named_text_style(
+                    doc, PRINT_TEXT_STYLE, warnings, font_file="romans.shx"
+                )
+                style = draft_text_style
+            else:
+                style = self._ensure_boundary_text_style(doc, warnings)
 
             if is_neighbor:
                 neighbor_layer = self._ensure_layer(
@@ -3344,17 +3490,27 @@ class AcadBuilder:
             created = 0
             for item in geo.items:
                 try:
+                    if geo.print_draft:
+                        # Две группы надписей черновика: названия улиц (фасадная
+                        # и пересекаемая) и всё остальное (румбы, длины, пояснения
+                        # сторон, старые названия улиц).
+                        is_street_name = item.kind in {"main-street", "cross-street"}
+                        item_layer = draft_street_layer if is_street_name else text_target_layer
+                        item_style = draft_street_style if is_street_name else draft_text_style
+                    else:
+                        item_layer = text_target_layer
+                        item_style = style
                     if not geo.print_draft and (item.correction_indices or item.correction_deleted):
                         try:
                             entity = self._add_corrected_street_text(
-                                model_space, item, geo.text_height, text_target_layer, style)
+                                model_space, item, geo.text_height, item_layer, item_style)
                         except Exception as exc:  # noqa: BLE001
                             warnings.append(f"не удалось выделить исправление улицы «{item.text}»: {exc}")
-                            entity = self._add_text(model_space, item, geo.text_height, text_target_layer,
-                                                    style, strict_style=True)
+                            entity = self._add_text(model_space, item, geo.text_height, item_layer,
+                                                    item_style, strict_style=True)
                     else:
                         entity = self._add_text(
-                            model_space, item, geo.text_height, text_target_layer, style,
+                            model_space, item, geo.text_height, item_layer, item_style,
                             strict_style=True,
                         )
                     created += 1
@@ -3464,13 +3620,21 @@ class AcadBuilder:
                 result_layers = {
                     "print_property_line": poly_target_layer,
                     "print_boundary_text": text_target_layer,
+                    "print_street_text": draft_street_layer,
                     "print_street_row": street_row_layer,
                 }
+
+            result_styles = (
+                {"street": draft_street_style, "other": draft_text_style}
+                if geo.print_draft
+                else {"boundary": style}
+            )
 
             return DrawResult(
                 plan=plan,
                 text_count=created,
                 layers=result_layers,
+                styles=result_styles,
                 handle=handle,
                 warnings=warnings,
                 boundary_line_count=created_boundary_lines,
@@ -4134,7 +4298,7 @@ class AcadBuilder:
         """
         fcfg = fcfg if fcfg is not None else feature_settings(self.cfg)
         lines = [line for line in item.text.split("\n") if line.strip()] or [item.single_line]
-        spacing = float(fcfg.get("mtext_line_spacing_factor") or 1.67) * float(item.height)
+        spacing = float(fcfg.get("mtext_line_spacing_factor") or 0.9) * float(item.height)
         # «Вверх» повёрнутого текста: rotation отсчитывается от +X против часовой.
         up = (-math.sin(float(item.rotation)), math.cos(float(item.rotation)))
         offset = spacing * (len(lines) - 1) / 2.0
@@ -4620,7 +4784,7 @@ class AcadBuilder:
         style, result.text_style_native = self._label_text_style(doc)
         result.text_style = style
         layer = self._ensure_feature_layer(
-            doc, offsets.OFFSET_LAYER, int(fcfg.get("label_output_layer_color") or 7)
+            doc, offsets.OFFSET_LAYER, int(fcfg.get("offset_output_layer_color") or 1)
         )
         if layer == "0":
             result.warnings.append(
@@ -7979,7 +8143,7 @@ class _LabelPlacer:
         width = max(
             feature_text_width(line, self.h, self.fcfg, self.width_scale) for line in lines
         )
-        spacing = float(self.fcfg.get("mtext_line_spacing_factor") or 1.67)
+        spacing = float(self.fcfg.get("mtext_line_spacing_factor") or 0.9)
         height = self.h * (1.0 + (len(lines) - 1) * spacing)
         return max(width, self.h * 0.5), height
 

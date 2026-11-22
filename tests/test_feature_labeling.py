@@ -1662,14 +1662,15 @@ def test_object_labels_are_single_line_text_centered_for_other_cad(com):
     # Каждый TEXT выровнен по центру и имеет точку выравнивания — не по левой линии.
     assert all(entity.Alignment == ab.AC_ALIGNMENT_MIDDLE_CENTER for entity in texts)
     assert all(entity.TextAlignmentPoint for entity in texts)
-    # Калитка «V.FE. / GATE»: две строки на расстоянии 1.67 высоты, верхняя — V.FE.
+    # Калитка «V.FE. / GATE»: две строки на расстоянии 0.9 высоты (межстрочный
+    # интервал оффсета), верхняя — V.FE.
     height = result.plan.text_height
     vinyl = next(e for e in texts if e.TextString == "V.FE." and e.Rotation == 0.0)
     gate = next(
         e for e in texts
         if e.TextString == "GATE" and abs(e.TextAlignmentPoint[0] - vinyl.TextAlignmentPoint[0]) < 1e-6
     )
-    assert vinyl.TextAlignmentPoint[1] - gate.TextAlignmentPoint[1] == pytest.approx(1.67 * height)
+    assert vinyl.TextAlignmentPoint[1] - gate.TextAlignmentPoint[1] == pytest.approx(0.9 * height)
     # Сводной строки «чем созданы подписи» в отчёте больше нет (заказчик, 15.11.2026):
     # осталась короткая строка счётчиков «создано в AutoCAD: AddText — …».
     report = result.report()
@@ -2127,6 +2128,8 @@ def ilion_features(result, label, kind=None):
         ("BL", ("", "")),               # building line: точка на стене, угол не снят
         ("EDG  DWY", ("DRIVEWAY", "surface")),
         ("BOT WALL", ("WALL", "wall")),
+        ("CHIMNEY", ("CHIMN", "chimney")),
+        ("CHIMN", ("CHIMN", "chimney")),
         ("BLC DW", ("", "")),           # угол дома: точка известна, подпись не нужна
         ("BLC5", ("", "")),
         ("SPOT GRADE PAV.", ("", "")),
@@ -3044,7 +3047,7 @@ ASPINWALL_FINAL_LABELS = [
     ("V.FE.", "VIN.FE.", (915532.8, 122496.6), 0.0, 2.5),   # у заказчика ещё GATE над линией
     ("V.FE.", "VIN.FE.", (915471.5, 122510.4), 0.0, 2.5),   # и здесь
     ("WALL W./COLUMNS", "BRICK WALL W./COLUMNS", (915501.9, 122565.1), 0.0, 8.0),
-    ("ROOFED O.P.", "ROOFED O.P.", (915502.8, 122491.8), 0.0, 3.0),
+    ("ROOFED O.P.", "ROOFED O.P.", (915502.8, 122491.8), 0.0, 4.0),
     ("O.P.", "O.P.", (915523.0, 122510.6), 0.0, 1.0),
     ("O.P.", "FRAME DECK", (915502.6, 122538.7), 0.0, 2.5),  # геодезист записал O PORCH
     ("PLANT.", "PLANT.", (915492.1, 122561.1), 0.0, 3.5),
@@ -3920,6 +3923,7 @@ def test_step1_tax_text_is_obstacle_even_with_old_settings():
     cfg["text_obstacle_layers"] = ["BOUNDARY_TEXT*"]
     classifier = LayerClassifier(cfg)
     assert classifier.is_text_obstacle("M-TAX-DIM")
+    assert classifier.is_text_obstacle("LETTER")
     assert classifier.is_text_obstacle("BOUNDARY_TEXT_AI")
     assert not classifier.is_field_note("M-TAX-DIM")
 

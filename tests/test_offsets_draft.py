@@ -10,6 +10,7 @@ import math
 import pytest
 
 import offsets as off
+from acad_builder import format_bearing, format_dms_angle
 
 RING = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
 FRONT = [[(0.0, 0.0), (100.0, 0.0)]]
@@ -30,11 +31,24 @@ def _inside_ring(point):
 # ------------------------------------------------------------ значения и буквы
 
 
-def test_round_offset_to_tenth_half_up():
-    assert off.round_offset_ft(0.44) == pytest.approx(0.4)
-    assert off.round_offset_ft(0.46) == pytest.approx(0.5)
-    assert off.round_offset_ft(14.649) == pytest.approx(14.6)
-    assert off.round_offset_ft(0.02) == pytest.approx(0.0)
+def test_round_offset_to_tenth_banker():
+    """Геодезическое округление (5 в чётную): 0.05→0.0, 0.15→0.2, 0.25→0.2 и т.д."""
+    assert off.round_offset_ft(0.44) == pytest.approx(0.4)   # 4 < 5 → вниз
+    assert off.round_offset_ft(0.46) == pytest.approx(0.5)   # 6 > 5 → вверх
+    assert off.round_offset_ft(14.649) == pytest.approx(14.6)  # 4 < 5 → вниз
+    assert off.round_offset_ft(0.02) == pytest.approx(0.0)   # 2 < 5 → вниз
+    # Сотая = 5, десятая чётная — остаёмся:
+    assert off.round_offset_ft(0.05) == pytest.approx(0.0)   # 0.0 (O/L)
+    assert off.round_offset_ft(0.25) == pytest.approx(0.2)   # 2 — чётная
+    assert off.round_offset_ft(0.45) == pytest.approx(0.4)   # 4 — чётная
+    assert off.round_offset_ft(0.65) == pytest.approx(0.6)   # 6 — чётная
+    assert off.round_offset_ft(0.85) == pytest.approx(0.8)   # 8 — чётная
+    # Сотая = 5, десятая нечётная — округляем до чётной:
+    assert off.round_offset_ft(0.15) == pytest.approx(0.2)   # 1 → 2
+    assert off.round_offset_ft(0.35) == pytest.approx(0.4)   # 3 → 4
+    assert off.round_offset_ft(0.55) == pytest.approx(0.6)   # 5 → 6
+    assert off.round_offset_ft(0.75) == pytest.approx(0.8)   # 7 → 8
+    assert off.round_offset_ft(0.95) == pytest.approx(1.0)   # 9 → 1.0
 
 
 def test_compass_letters_with_default_north_is_plus_y():
@@ -55,6 +69,23 @@ def test_offset_text_forms_match_customer_examples():
     assert off.offset_text("fence", 0.4, "N") == "FE.0.4'N"
     assert off.offset_text("wall", 0.5, "E") == "WALL 0.5'E"
     assert off.offset_text("house", 3.2, "S") == "3.2'S"
+
+
+def test_fence_offset_special_round_to_0_9():
+    """Политически значимое округление заборов: 0.86–1.15 ft → 0.9 ft (title company)."""
+    assert off.offset_text("fence", 0.86, "N") == "FE.0.9'N"
+    assert off.offset_text("fence", 0.90, "N") == "FE.0.9'N"
+    assert off.offset_text("fence", 0.95, "N") == "FE.0.9'N"
+    assert off.offset_text("fence", 1.00, "N") == "FE.0.9'N"
+    assert off.offset_text("fence", 1.15, "N") == "FE.0.9'N"
+    # Вне диапазона — обычное геодезическое округление:
+    assert off.offset_text("fence", 0.85, "N") == "FE.0.8'N"   # 8 — чётная
+    assert off.offset_text("fence", 1.16, "N") == "FE.1.2'N"   # 6 > 5 → вверх
+    assert off.offset_text("fence", 0.84, "N") == "FE.0.8'N"   # 4 < 5 → вниз
+    # Не-заборы не подвержены специальному округлению (значения уже округлены round_offset_ft):
+    assert off.offset_text("wall", 1.0, "E") == "WALL 1.0'E"   # 0.95 → 1.0 (банкерское)
+    assert off.offset_text("house", 1.0, "S") == "1.0'S"       # 0.95 → 1.0 (банкерское)
+    assert off.offset_text("wall", 0.8, "E") == "WALL 0.8'E"   # 0.85 → 0.8 (банкерское)
 
 
 # ------------------------------------------------------------ план
@@ -187,3 +218,24 @@ def test_scale_changes_heights_only_not_values():
     small = off.plan_offsets(RING, [_house()], front=FRONT, scale=20)
     assert small.items[0].text == "10.0'N"
     assert small.items[0].height_ft == pytest.approx(1.375)
+
+
+def test_bearing_degrees_minutes_seconds_are_two_digits():
+    """Градусы, минуты и секунды в беринге — всегда две цифры с ведущим нулём."""
+    from llm_parser import Segment
+
+    # Все значения > 9 — без изменений:
+    assert format_bearing(Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100)) == "N 14%%d39'40\" W"
+    assert format_bearing(Segment(ns="N", degrees=14, minutes=39, seconds=40, ew="W", distance_ft=100), use_control_code=False) == "N 14°39'40\" W"
+
+    # Значения 0–9 — с ведущим нулём, секунды 0 → 00":
+    assert format_bearing(Segment(ns="N", degrees=4, minutes=9, seconds=0, ew="W", distance_ft=100)) == "N 04%%d09'00\" W"
+    assert format_bearing(Segment(ns="N", degrees=4, minutes=9, seconds=0, ew="W", distance_ft=100), use_control_code=False) == "N 04°09'00\" W"
+
+    # Ноль градусов:
+    assert format_bearing(Segment(ns="S", degrees=0, minutes=5, seconds=3.5, ew="E", distance_ft=100)) == "S 00%%d05'03.5\" E"
+
+    # format_dms_angle тоже дополняет градусы до двух цифр:
+    assert format_dms_angle(4.25) == "04%%d15'00\""
+    assert format_dms_angle(4.25, use_control_code=False) == "04°15'00\""
+    assert format_dms_angle(0.5) == "00%%d30'00\""

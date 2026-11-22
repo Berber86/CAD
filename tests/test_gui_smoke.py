@@ -3757,6 +3757,7 @@ def _step0_pdf(path):
 
 
 def _fill_step0(app, *, block="6323", lot="32", neighbours="30", folder=""):
+    app.step0_borough_var.set("Staten Island")
     app.step0_block_var.set(block)
     app.step0_lot_var.set(lot)
     app.step0_neighbours_var.set(neighbours)
@@ -5938,8 +5939,8 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     app = gui.SurveyApp()
     _fill_step0(app, neighbours="30, 40", folder=tmp_path)
     app.step0_address_var.set("Example address")
-    app.step0_borough_var.set("Queens")
-    portal = SimpleNamespace(block="6323", lot="32", borough="Queens", neighbours=["30"], details_source="vision")
+    app.step0_borough_var.set("Staten Island")
+    portal = SimpleNamespace(block="6323", lot="32", borough="Staten Island", neighbours=["30"], details_source="vision")
     app._step0_lookup_snapshot = ("Example address", portal)
     seen = {}
     def collect(**kwargs):
@@ -5948,7 +5949,7 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
     app._start_step0_intake()
     _wait_step0(app)
-    assert seen["borough"] == "Queens"
+    assert seen["borough"] == "Staten Island"
     assert seen["identity_by_lot"]["32"]["block"][0]["source"] == "portal"
     assert seen["identity_by_lot"]["30"]["lot"][0]["method"] == "vision map (unverified)"
     assert seen["identity_by_lot"]["40"]["lot"][0]["source"] == "manual"

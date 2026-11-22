@@ -25,6 +25,7 @@ Python: 3.11+, Windows, запущенный AutoCAD.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import math
 import re
 import threading
@@ -1681,6 +1682,7 @@ class AcadBuilder:
         self._doc: Any | None = None
         self._com_thread_id: int | None = None
         self._com_owned: bool = False
+        self._hold_connection: bool = False
         self._unit_warning: str | None = None
         self._unit_code: int | None = None
         self._front_warning: str | None = None
@@ -2784,6 +2786,24 @@ class AcadBuilder:
         self._warn_about_units(doc)
         return app, doc
 
+    @contextmanager
+    def drawing_session(self):
+        """Keep the same COM document for a multi-plan draw and its SaveAs."""
+        if self._hold_connection:
+            raise AcadConnectionError("сеанс AutoCAD уже открыт")
+        app, doc = self.connect()
+        self._hold_connection = True
+        try:
+            yield app, doc
+        finally:
+            self._hold_connection = False
+            if self._com_owned:
+                self._app = None
+                self._doc = None
+                self._com_owned = False
+                self._com_thread_id = None
+                _co_uninitialize()
+
     def _warn_about_units(self, doc: Any) -> None:
         self._unit_warning = None
         self._unit_code = None
@@ -3456,7 +3476,7 @@ class AcadBuilder:
                 boundary_line_count=created_boundary_lines,
             )
         finally:
-            if self._com_owned:
+            if self._com_owned and not self._hold_connection:
                 self._app = None
                 self._doc = None
                 self._com_owned = False

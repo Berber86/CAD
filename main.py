@@ -67,6 +67,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
 
 import app_updater
+import auto_dwg_save
 import lot_identity
 import file_metadata
 import legal_page_search
@@ -620,6 +621,10 @@ class SurveyApp(ctk.CTk):
         self._step0_running = False
         self._step0_outcome: deed_intake.IntakeOutcome | None = None
         self._step0_stop = threading.Event()
+        self._step0_auto_stage: str | None = None
+        self._step0_auto_address = ""
+        self._step0_auto_identity: tuple[str, str, str, str] | None = None
+        self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
         self.house_text_var = ctk.StringVar(value="")
         self.feature_text_height_var = ctk.StringVar(value="")
         # Настройки Шага 2 читаются один раз: раньше каждый переключатель заново
@@ -3258,8 +3263,15 @@ class SurveyApp(ctk.CTk):
         )
         self.step0_run_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(12, 4))
 
+        self.step0_auto_button = ctk.CTkButton(
+            panel, text="▶ Автопоток Staten Island · ИИ · DWG после отрисовки", height=38,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"), command=self._start_step0_auto,
+        )
+        self.step0_auto_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(4, 4))
+
         run_row = ctk.CTkFrame(panel, fg_color="transparent")
-        run_row.grid(row=6, column=0, sticky="ew", padx=16)
+        run_row.grid(row=7, column=0, sticky="ew", padx=16)
         run_row.grid_columnconfigure(0, weight=1)
         run_row.grid_columnconfigure(1, weight=1)
         self.step0_stop_button = ctk.CTkButton(
@@ -3279,7 +3291,7 @@ class SurveyApp(ctk.CTk):
             panel, fg_color=THEME["bg_field"], corner_radius=8,
             border_width=1, border_color=THEME["border_subtle"],
         )
-        manual.grid(row=7, column=0, sticky="ew", padx=16, pady=(12, 14))
+        manual.grid(row=8, column=0, sticky="ew", padx=16, pady=(12, 14))
         manual.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             manual, text="Файл скачан вручную", font=ctk.CTkFont(size=11, weight="bold"),
@@ -3428,6 +3440,44 @@ class SurveyApp(ctk.CTk):
             )
         return value
 
+    def _start_step0_auto(self) -> None:
+        """Explicit paid opt-in: address → Richmond downloads → all descriptions."""
+        if (self._busy or self._step0_running or self._step0_portal_running
+                or self._step0_auto_stage or getattr(self, "_source_role_dialog", None)):
+            self._set_status("Дождитесь завершения текущей работы.", warn=True)
+            return
+        if (self.pdf_set or self._scene_plans() or self.pending_conflict is not None
+                or self.pending_doubt is not None):
+            self._set_status("Для автопотока сначала сбросьте текущий набор или схему.", warn=True)
+            return
+        address = str(self.step0_address_var.get() or "").strip()
+        if not address:
+            self._set_status("Сначала введите адрес объекта.", error=True)
+            return
+        if self.step0_fast_mode_var.get():
+            self._set_status("Для автопотока выберите надёжный или оптимальный поиск: быстрый режим может не проверить адрес и CAPTCHA.", warn=True)
+            return
+        self._step0_auto_stage = "portal"
+        self._step0_auto_address = address
+        self._step0_auto_identity = None
+        self._step0_stop.clear()
+        self._start_step0_portal_lookup()
+        if not self._step0_portal_running:
+            self._step0_auto_stage = None
+            return
+        self.step0_auto_button.configure(state="disabled")
+        self.step0_stop_button.configure(state="normal")
+        self._step0_log("Автопоток: поиск адреса → сбор PDF → поиск и разбор описаний; возможны платные запросы. AutoCAD не запускается автоматически. После ручной отрисовки активный документ сохраняется под новым именем в папке описаний, даже если результат неполный.", level=log_mode.LEVEL_KEY)
+
+    def _stop_auto_transition(self, message: str) -> None:
+        self._step0_auto_stage = None
+        self._step0_auto_identity = None
+        self.step0_auto_button.configure(state="normal")
+        if not self._step0_running:
+            self.step0_stop_button.configure(state="disabled")
+        self._step0_log(message, level=log_mode.LEVEL_ERROR)
+        self._set_status(message, warn=True)
+
     def _start_step0_portal_lookup(self) -> None:
         """Address → NYC Portal → one user-initiated Vision extraction call."""
         if self._step0_portal_running or self._step0_running:
@@ -3491,15 +3541,11 @@ class SurveyApp(ctk.CTk):
             )))
         self._render_step0_log()
         self._set_status("Шаг 0: ищу адрес в текущем окне браузера…")
-        worker = threading.Thread(
-            target=self._step0_portal_worker,
-            args=(
-                address, folder, cfg, provider, model, target["api_key"], key_secret,
-                bool(self.step0_fast_mode_var.get()), fast_pause, bool(self.step0_optimal_mode_var.get()),
-            ),
-            daemon=True,
+        self._start_background(
+            self._step0_portal_worker,
+            args=(address, folder, cfg, provider, model, target["api_key"], key_secret,
+                  bool(self.step0_fast_mode_var.get()), fast_pause, bool(self.step0_optimal_mode_var.get())),
         )
-        worker.start()
 
     def _step0_portal_worker(
         self,
@@ -3515,8 +3561,6 @@ class SurveyApp(ctk.CTk):
         optimal_mode: bool = False,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
-        self._worker_context.generation = self._generation
-
         def progress(line: str) -> None:
             important = line.startswith((
                 "для этого окна нет подходящих координат",
@@ -3559,10 +3603,24 @@ class SurveyApp(ctk.CTk):
         except Exception:  # noqa: BLE001 - a closing window needs no focus restoration
             pass
         if status != "ok":
+            if self._step0_auto_stage == "portal_cancelled":
+                self._step0_auto_stage = None
+                return
+            if self._step0_auto_stage == "portal":
+                self._stop_auto_transition(f"Автопоток остановлен: поиск адреса не завершён — {payload}")
+                return
             self._step0_log(f"Поиск участка не завершён: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
         result = payload
+        if self._step0_auto_stage == "portal_cancelled":
+            self._step0_auto_stage = None
+            self._set_status("Автопоток остановлен.", warn=True)
+            return
+        if (self._step0_auto_stage == "portal"
+                and str(self.step0_address_var.get() or "").strip() != self._step0_auto_address):
+            self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
+            return
         self._step0_lookup_snapshot = (self._step0_lookup_address, result)
         self.step0_borough_var.set(result.borough or "")
         self.step0_block_var.set(result.block)
@@ -3580,6 +3638,23 @@ class SurveyApp(ctk.CTk):
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
         self._step0_log(f"Vision получил обрезку карты: {result.map_image}; адрес передан текстом.")
+        if self._step0_auto_stage == "portal":
+            if str(self.step0_address_var.get() or "").strip() != self._step0_auto_address:
+                self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
+                return
+            if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
+                self._stop_auto_transition("Автопоток остановлен: низкая уверенность при поиске соседей. Проверьте карту и запустите сбор вручную.")
+                return
+            if not deed_intake.is_richmond_borough(result.borough):
+                self._stop_auto_transition("Автопоток остановлен: сайт Richmond County работает только для Staten Island; район не подтверждён или пока не поддерживается.")
+                return
+            self._step0_auto_identity = (self._step0_auto_address, str(result.borough), str(result.block), str(result.lot))
+            self._step0_auto_stage = "intake"
+            self._step0_log("Автопоток: район, Block и Lot получены; собираю документы Staten Island.", level=log_mode.LEVEL_KEY)
+            self._start_step0_intake()
+            if not self._step0_running:
+                self._stop_auto_transition("Автопоток остановлен: не удалось начать сбор документов.")
+            return
         self._set_status(
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
             "проверьте Borough, Block, Lot и соседей, затем нажмите «Собрать описания».",
@@ -3589,17 +3664,27 @@ class SurveyApp(ctk.CTk):
 
     def _start_step0_intake(self) -> None:
         """Собирает описания в фоне: окно не замирает на Cloudflare и OCR."""
+        if self._busy:
+            self._set_status("Дождитесь окончания текущего разбора перед сбором документов.", warn=True)
+            return
         if self._step0_portal_running:
             self._set_status("Сначала дождитесь завершения поиска адреса на портале.", warn=True)
             return
         if self._step0_running:
             self._set_status("Шаг 0: сбор уже идёт — дождитесь конца или нажмите «Стоп».")
             return
+        borough = str(self.step0_borough_var.get() or "").strip()
+        if not deed_intake.is_richmond_borough(borough):
+            self._set_status("Сбор на сайте Richmond County доступен только для Staten Island. Укажите распознанный район; другие районы пока не поддерживаются.", error=True)
+            return
         try:
             block = int(str(self.step0_block_var.get() or "").strip())
             lot = int(str(self.step0_lot_var.get() or "").strip())
         except (TypeError, ValueError):
             self._set_status("Шаг 0: впишите block и lot цифрами (например, 6323 и 32).", error=True)
+            return
+        if block <= 0 or lot <= 0:
+            self._set_status("Шаг 0: block и lot должны быть положительными числами.", error=True)
             return
         try:
             neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
@@ -3656,16 +3741,12 @@ class SurveyApp(ctk.CTk):
         identities = file_metadata.intake_observations(
             block, lot, borough, neighbours, str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
         )
-        worker = threading.Thread(
-            target=self._step0_worker,
-            args=(
-                block, lot, neighbours, folder,
-                bool(self.step0_old_neighbour_var.get()), ocr_dpi,
-                bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-            ),
-            daemon=True,
+        self._start_background(
+            self._step0_worker,
+            args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
+                  bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
+                  self._step0_auto_stage == "intake"),
         )
-        worker.start()
 
     def _step0_worker(
         self,
@@ -3679,10 +3760,9 @@ class SurveyApp(ctk.CTk):
         fast_pause: float = nyc_portal.FAST_SCREEN_CHECK_PAUSE_SEC,
         borough: str = "",
         identities: dict[str, dict] | None = None,
+        skip_page_search: bool = False,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
-        self._worker_context.generation = self._generation
-
         def progress(line: str) -> None:
             self._post("step0_progress", self._step0_timestamp(line))
 
@@ -3701,7 +3781,10 @@ class SurveyApp(ctk.CTk):
             progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
         else:
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
-        progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
+        if skip_page_search:
+            progress("старый поиск страниц пропущен: полный PDF пойдёт в поиск всех описаний")
+        else:
+            progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -3716,6 +3799,7 @@ class SurveyApp(ctk.CTk):
                 should_stop=self._step0_stop.is_set,
                 auto_save=auto_save,
                 ocr_dpi=ocr_dpi,
+                search_pages=not skip_page_search,
                 downloads_dir=downloads,
             )
         except deed_intake.IntakeCancelled:
@@ -3727,6 +3811,24 @@ class SurveyApp(ctk.CTk):
         self._post("step0_done", ("ok", outcome))
 
     def _stop_step0_intake(self) -> None:
+        if self._step0_auto_stage == "portal_cancelled":
+            return
+        if self._step0_auto_stage:
+            stage = self._step0_auto_stage
+            self._step0_stop.set()
+            self._step0_auto_stage = "portal_cancelled" if stage == "portal" else None
+            self._step0_auto_identity = None
+            self.step0_auto_button.configure(state="normal")
+            if stage == "parse":
+                self._generation += 1
+                self._finish_busy()
+                self._ready_source_signature = None
+                self._input_incomplete = True
+            if not self._step0_running:
+                self.step0_stop_button.configure(state="disabled")
+            self._step0_log("Автопоток остановлен; уже отправленный запрос может завершиться и быть платным.", level=log_mode.LEVEL_KEY)
+            self._set_status("Автопоток остановлен; отправленный запрос может завершиться и быть платным.", warn=True)
+            return
         if not self._step0_running:
             return
         self._step0_stop.set()
@@ -3739,10 +3841,16 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.configure(state="normal", text="📥 Собрать описания")
         self.step0_stop_button.configure(state="disabled")
         if status == "cancelled":
+            if self._step0_auto_stage == "intake":
+                self._stop_auto_transition("Автопоток остановлен; собранные документы сохранены.")
+                return
             self._step0_log("Сбор остановлен — собранное осталось в папке.", level=log_mode.LEVEL_KEY)
             self._set_status("Шаг 0: сбор остановлен.", warn=True)
             return
         if status == "error":
+            if self._step0_auto_stage == "intake":
+                self._stop_auto_transition(f"Автопоток остановлен: ошибка сбора — {payload}")
+                return
             self._step0_log(f"Ошибка: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
             return
@@ -3765,6 +3873,66 @@ class SurveyApp(ctk.CTk):
                 "Шаг 0: наш участок не собран — смотрите отчёт и «Чего не хватает».",
                 error=True,
             )
+        if self._step0_auto_stage == "intake":
+            self._auto_submit_step0_outcome(outcome)
+
+    def _auto_submit_step0_outcome(self, outcome: Any) -> None:
+        expected = self._step0_auto_identity
+        current = (str(self.step0_address_var.get() or "").strip(),
+                   str(self.step0_borough_var.get() or "").strip(),
+                   str(self.step0_block_var.get() or "").strip(),
+                   str(self.step0_lot_var.get() or "").strip())
+        if expected != current or not deed_intake.is_richmond_borough(current[1]):
+            self._stop_auto_transition("Автопоток остановлен: адрес, район, Block или Lot изменились во время сбора.")
+            return
+        if not outcome.ok or outcome.missing:
+            self._stop_auto_transition("Автопоток остановлен: сбор неполный; проверьте раздел «Чего не хватает» и завершите ручные шаги.")
+            return
+        folder = Path(outcome.folder)
+        paths: list[Path] = []
+        roles: dict[Path, bool] = {}
+        for record in outcome.records:
+            name = str(record.file or "")
+            if not name or Path(name).name != name:
+                self._stop_auto_transition("Автопоток остановлен: недопустимое имя собранного PDF.")
+                return
+            path = folder / name
+            if not path.is_file() or path.resolve().parent != folder.resolve():
+                self._stop_auto_transition(f"Автопоток остановлен: собранный PDF недоступен: {name}")
+                return
+            if path not in paths:
+                paths.append(path)
+            roles[path] = record.role == "our" or lot_identity.has_our_prefix(path)
+        if not paths or not any(roles.values()):
+            self._stop_auto_transition("Автопоток остановлен: нет доступного PDF нашего участка.")
+            return
+        # The explicit auto button opts into this mode for the current session only.
+        self.multi_pdf_mode_var.set(True)
+        self._on_multi_pdf_mode_changed()
+        if not self._multi_pdf_enabled():
+            self._stop_auto_transition("Автопоток остановлен: многоконтурный режим недоступен.")
+            return
+        items, errors = self._make_pdf_set_items(paths)
+        for item in items:
+            item.is_main = roles[item.path]
+        for error in errors:
+            self._step0_log(f"Не открыт собранный PDF: {error}", level=log_mode.LEVEL_ERROR)
+        if errors or len(items) != len(paths) or not items or not any(item.is_main for item in items):
+            self._stop_auto_transition("Автопоток остановлен: не все собранные PDF открылись.")
+            return
+        self._step0_auto_stage = "parse"
+        self._step0_log(f"Автопоток: передаю {len(items)} полных PDF на поиск всех описаний. AutoCAD не запускаю.", level=log_mode.LEVEL_KEY)
+        try:
+            self._submit_pdf_set(items, scene_mode="update", fresh=True)
+        except Exception as exc:  # noqa: BLE001 - invalid configuration or failed worker startup
+            if self._busy:
+                self._finish_busy()
+            self._stop_auto_transition(f"Автопоток остановлен: не удалось запустить разбор ({type(exc).__name__}). Проверьте настройки.")
+            return
+        if not self._busy:
+            self._stop_auto_transition("Автопоток остановлен: разбор PDF не запущен.")
+            return
+        self.step0_stop_button.configure(state="normal")
 
     def _open_step0_folder(self) -> None:
         folder = self._step0_folder()
@@ -7094,6 +7262,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=2)
 
     def _clear_preview_scene(self) -> None:
+        self._auto_dwg_context = None
         self._multi_scene_handoff = None
         self._preview_main_plan = None
         self._slide_undo = []
@@ -7995,6 +8164,7 @@ class SurveyApp(ctk.CTk):
             page.close()
         self._persist_ai_preferences(report_error=False)
         self._closing = True
+        self._step0_stop.set()
         self._generation += 1
         try:
             self.destroy()
@@ -8248,6 +8418,14 @@ class SurveyApp(ctk.CTk):
     def _reset_session(self) -> None:
         """Очищает текущую работу, не меняя настройки, ключи и файлы на диске."""
         was_busy = self._busy
+        if self._step0_auto_stage:
+            self._step0_stop.set()
+            self._step0_auto_stage = "portal_cancelled" if self._step0_portal_running else None
+            self._step0_auto_identity = None
+            self.step0_auto_button.configure(state="normal")
+        self._step0_stop.set()
+        if self._step0_portal_running:
+            self._step0_auto_stage = "portal_cancelled"
         self._generation += 1
         self._dismiss_conflict_ui()
         self._close_pdf_set_dialog()
@@ -8257,11 +8435,18 @@ class SurveyApp(ctk.CTk):
             except Exception:  # noqa: BLE001
                 pass
         self._session_windows.clear()
+        completed_portal = completed_intake = False
         while True:
             try:
-                self._events.get_nowait()
+                _generation, kind, _payload = self._events.get_nowait()
             except queue.Empty:
                 break
+            completed_portal |= kind == "step0_portal_done"
+            completed_intake |= kind == "step0_done"
+        if completed_portal and self._step0_portal_running:
+            self._finish_step0_portal_lookup("error", "поиск отменён")
+        if completed_intake and self._step0_running:
+            self._finish_step0("cancelled", None)
         self._finish_busy()
         self.text_box.delete("1.0", "end")
         self._reset_visual_sources()
@@ -8691,6 +8876,7 @@ class SurveyApp(ctk.CTk):
         from multiple_description_runtime import FileJob
         if self._busy or not self.pdf_set:
             return
+        self._auto_dwg_context = None
         cfg, provider, model, key, secret = self._build_runtime_config()
         cfg["multiple_description_search"] = copy.deepcopy(self.config_data["multiple_description_search"])
         cfg["multiple_description_search"]["enabled"] = True  # this run only
@@ -8836,7 +9022,16 @@ class SurveyApp(ctk.CTk):
 
     def _handle_multi_pdf_done(self, view: Any, signature: Any) -> None:
         from multiple_description_handoff import InvalidHandoff
+        was_auto = self._step0_auto_stage == "parse"
+        auto_identity = self._step0_auto_identity if was_auto else None
+        if was_auto:
+            self._step0_auto_stage = None
+            self._step0_auto_identity = None
+            self.step0_auto_button.configure(state="normal")
+            self.step0_stop_button.configure(state="disabled")
         self._finish_busy()
+        if was_auto:
+            self._step0_log("Автопоток: обработка PDF остановилась; AutoCAD не запускался. Проверьте результат в журнале.", level=log_mode.LEVEL_KEY)
         if signature != self._source_signature(mode="📄 PDF"):
             self._ready_source_signature = None
             self._input_incomplete = True
@@ -8864,17 +9059,29 @@ class SurveyApp(ctk.CTk):
             self._input_incomplete = True
             self._set_status("PDF изменился; повторите обработку.", warn=True)
             return
+        if was_auto:
+            # Use the portal lot captured for these PDFs even if the deed does
+            # not confirm it; it is a filename label, not a claim of accuracy.
+            if auto_identity and self._step0_outcome is not None:
+                folder = Path(self._step0_outcome.folder).resolve()
+                self._auto_dwg_context = (auto_identity, folder, signature, view)
+                note = "После ручной отрисовки DWG сохраняется в папке описаний, даже если результат неполный."
+                self._step0_log(note, level=log_mode.LEVEL_KEY)
+                self._log_line(note, level=log_mode.LEVEL_KEY)
+            self._select_step_tab(STEP_TAB_BOUNDARY)
         self._ready_source_signature = signature if view.drawable else None
         self._input_incomplete = not bool(view.drawable)
         self._refresh_pdf_selection_ui()
         self._refresh_parse_actions()
         self._refresh_stepper()
         unlocated = sum(not entry.placement_known for entry in view.drawable)
+        auto_note = (" После ручной отрисовки текущий документ AutoCAD будет сохранён в папке описаний."
+                     if was_auto and self._auto_dwg_context is not None else "")
         if unlocated:
             self._set_status(
-                f"Подготовлено контуров: {len(view.drawable)}. Отдельно размещено: {unlocated}.", key=True)
+                f"Подготовлено контуров: {len(view.drawable)}. Отдельно размещено: {unlocated}." + auto_note, key=True)
         else:
-            self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой.", key=True)
+            self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой." + auto_note, key=True)
 
     def _parse_pdf_set_job(
         self, job: PdfSetJob, cfg: dict[str, Any], provider_id: str, model_name: str,
@@ -10565,8 +10772,15 @@ class SurveyApp(ctk.CTk):
     def _post(self, kind: str, payload: Any, *, generation: int | None = None) -> None:
         if generation is None:
             generation = getattr(self._worker_context, "generation", self._generation)
-        if not self._closing and generation == self._generation:
+        if self._closing:
+            return
+        if generation == self._generation:
             self._events.put((generation, kind, payload))
+        elif kind == "step0_portal_done":
+            # After a reset, release the browser/UI lock but discard the stale result.
+            self._events.put((self._generation, kind, ("error", "поиск отменён")))
+        elif kind == "step0_done":
+            self._events.put((self._generation, kind, ("cancelled", None)))
 
     def _worker_poster(self) -> Any:
         # Привязать поколение здесь: callbacks консенсуса могут работать в других потоках.
@@ -10592,6 +10806,11 @@ class SurveyApp(ctk.CTk):
                 except queue.Empty:
                     break
                 if generation != self._generation:
+                    # A completion can race reset between its generation check and enqueue.
+                    if kind == "step0_portal_done" and self._step0_portal_running:
+                        self._finish_step0_portal_lookup("error", "поиск отменён")
+                    elif kind == "step0_done" and self._step0_running:
+                        self._finish_step0("cancelled", None)
                     continue
                 try:
                     self._handle_event(kind, payload)
@@ -10677,7 +10896,8 @@ class SurveyApp(ctk.CTk):
                 except Exception:  # noqa: BLE001
                     self._update_closure_badge(self._closure_text(outcome), None)
         elif kind == "multi_scene_drawn":
-            completed, error = payload
+            completed, error = payload[:2]
+            save_result = payload[2] if len(payload) > 2 else None
             self._finish_busy()
             if completed:
                 self.draw_result = completed[-1][1]
@@ -10688,8 +10908,30 @@ class SurveyApp(ctk.CTk):
                 self._record_multi_cad_diagnostic("cad_marking_failed")
             if error:
                 self._record_multi_cad_diagnostic("cad_draw_failed")
-                self._set_status(f"Отрисовка остановлена; завершено планов: {len(completed)}. "
-                                 "Могли остаться отдельные объекты; повтор может создать дубли.", error=True)
+                detail = ""
+                if save_result and save_result[0] == "saved":
+                    detail = f" Неполный DWG сохранён: {save_result[1]}"
+                    self._log_line(detail.strip(), level=log_mode.LEVEL_KEY)
+                elif save_result:
+                    detail = f" DWG не сохранён: {save_result[1]}"
+                    self._log_line(detail.strip(), level=log_mode.LEVEL_ERROR)
+                self._set_status(f"Отрисовка неполная ({error}); завершено планов: {len(completed)}. "
+                                 "Повтор может создать дубли." + detail, error=True)
+            elif save_result and save_result[0] == "saved":
+                path = save_result[1]
+                self._log_line(f"DWG сохранён: {path}", level=log_mode.LEVEL_KEY)
+                failure = next((str(w) for _, result in completed for w in result.warnings
+                                if any(part in str(w).lower() for part in (
+                                    "не удалось создать", "не удалось выделить",
+                                    "не удалось подготовить", "недоступен —"))), None)
+                if failure:
+                    self._set_status(f"DWG сохранён: {path}. Отрисовка неполная: {failure}", warn=True)
+                else:
+                    self._set_status(f"Отрисовка завершена: {len(completed)} планов. DWG сохранён: {path}", key=True)
+            elif save_result:
+                detail = save_result[1]
+                self._log_line(f"DWG не сохранён автоматически: {detail}", level=log_mode.LEVEL_ERROR)
+                self._set_status(f"Отрисовка завершена, но DWG не сохранён автоматически: {detail}", warn=True)
             else:
                 self._set_status(f"Отрисовка завершена: {len(completed)} планов.", key=True)
             self._refresh_stepper()
@@ -11548,18 +11790,33 @@ class SurveyApp(ctk.CTk):
         if not plans:
             self._set_status("Нет подготовленных контуров.")
             return
+        draft_error = ""
         try:
             drafts = [] if neighbors_only else self._print_draft_plans()
-        except Exception:
+        except Exception as exc:
             self._record_multi_cad_diagnostic("cad_draw_failed")
-            self._set_status("Отрисовка не начата.")
-            return
+            if self._auto_dwg_context is None or neighbors_only:
+                self._set_status("Отрисовка не начата.")
+                return
+            drafts = []
+            draft_error = f"не подготовлен печатный черновик: {exc}"
+            self._log_line(draft_error, level=log_mode.LEVEL_ERROR)
         cfg, _provider, _model, _key, _secret = self._build_runtime_config()
         self._busy = True
         self._set_controls_busy(True)
         self.progress.start()
-        self._set_status(f"Рисую подготовленные контуры: {len(plans)}…")
-        self._start_background(self._draw_scene_worker, args=(drafts + plans, cfg, True))
+        auto_save = None
+        save_notice = ""
+        context = self._auto_dwg_context
+        if context is not None and not neighbors_only:
+            identity, folder, saved_signature, saved_view = context
+            if saved_signature != signature or saved_view is not self._multi_scene_handoff:
+                save_notice = "Автосохранение DWG пропущено: схема больше не относится к результату автопотока."
+            else:
+                auto_save = (folder, identity[3])
+        self._set_status(f"Рисую подготовленные контуры: {len(plans)}…"
+                         + (" Затем сохраню активный DWG под новым именем." if auto_save else ""))
+        self._start_background(self._draw_scene_worker, args=(drafts + plans, cfg, True, auto_save, save_notice, draft_error))
 
     def _record_multi_cad_diagnostic(self, reason: str) -> None:
         import multiple_description_cache as multi_cache
@@ -11587,10 +11844,13 @@ class SurveyApp(ctk.CTk):
         return [(f"Черновик для печати: {label}", make_print_draft(main, print_cfg, builder_cfg=self.config_data))]
 
     def _draw_scene_worker(self, plans: list[tuple[str, DrawPlan]], cfg: dict[str, Any],
-                           multi: bool = False) -> None:
+                           multi: bool = False, auto_save: tuple[Path, str] | None = None,
+                           save_notice: str = "", draft_error: str = "") -> None:
+        from contextlib import nullcontext
         post = self._worker_poster()
         completed: list[tuple[str, DrawResult]] = []
-        error = ""
+        error = draft_error
+        save_result: tuple[str, str] | None = ("skipped", save_notice) if save_notice else None
         try:
             if sys.platform != "win32":
                 raise AcadConnectionError(
@@ -11598,17 +11858,38 @@ class SurveyApp(ctk.CTk):
                     f"(текущая ОС: {sys.platform})"
                 )
             builder = AcadBuilder(cfg)
-            for index, (name, plan) in enumerate(plans, 1):
-                if not self._worker_is_current():
-                    return
-                post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
-                result = self._draw_if_current(builder, plan)
-                if result is None:
-                    return
-                completed.append((name, result))
-        except Exception as exc:  # noqa: BLE001
-            error = str(exc)
-        post("multi_scene_drawn" if multi else "scene_drawn", (completed, error))
+            # Pin the document receiving the geometry even if the active tab changes.
+            session = builder.drawing_session() if auto_save else nullcontext(None)
+            with session as connected:
+                try:
+                    for index, (name, plan) in enumerate(plans, 1):
+                        if not self._worker_is_current():
+                            return
+                        post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
+                        result = self._draw_if_current(builder, plan)
+                        if result is None:
+                            return
+                        completed.append((name, result))
+                except Exception as exc:  # noqa: BLE001 - save even a partially drawn document
+                    error = "; ".join(x for x in (error, str(exc)) if x)
+                if auto_save:
+                    with self._draw_lock:
+                        if not self._worker_is_current():
+                            return
+                        try:
+                            path = auto_dwg_save.save_new_dwg(connected[1], *auto_save)
+                        except Exception as exc:  # noqa: BLE001 - retain partial DWG, report error
+                            save_result = ("failed", str(exc))
+                        else:
+                            save_result = ("saved", str(path))
+        except Exception as exc:  # noqa: BLE001 - connection/session failed
+            error = "; ".join(x for x in (error, str(exc)) if x)
+            if auto_save and save_result is None:
+                save_result = ("failed", "не удалось подключиться к документу AutoCAD")
+        if multi:
+            post("multi_scene_drawn", (completed, error, save_result))
+        else:
+            post("scene_drawn", (completed, error))
         post("done", None)
 
     def _start(

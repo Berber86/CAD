@@ -1,0 +1,294 @@
+"""Safe DWG persistence: no AutoCAD, network, or real user drawings required."""
+from pathlib import Path
+import threading
+
+import pytest
+
+import auto_dwg_save
+import test_gui_smoke as smoke
+from test_multiple_description_gui_flow import setup_app
+from test_multiple_description_parse import answer
+from test_multiple_description_runtime import described
+from test_print_draft import fake_autocad  # noqa: F401
+import test_step0_intake_flow as intake
+from test_step0_automatic import fake_portal, parcel, wait_all
+
+gui = smoke.gui
+
+
+class Doc:
+    def __init__(self):
+        self.calls = []
+    def SaveAs(self, path):
+        self.calls.append(path)
+        Path(path).write_bytes(b"DWG mock")
+
+
+def test_unique_dwg_files_in_descriptions_folder_preserve_prior_files(tmp_path):
+    doc = Doc()
+    old = tmp_path / "lot_30.dwg"
+    old.write_bytes(b"old")
+    first = auto_dwg_save.save_new_dwg(doc, tmp_path, "0030")
+    second = auto_dwg_save.save_new_dwg(doc, tmp_path, "30")
+    assert first != second and first.parent == second.parent == tmp_path
+    assert first.name.startswith("lot_30_") and first.suffix == ".dwg"
+    assert old.read_bytes() == b"old" and first.read_bytes() == second.read_bytes() == b"DWG mock"
+
+
+@pytest.mark.parametrize("lot", ["", "0", "-1", "../30", "30 and 31", "30/31"])
+def test_unknown_lot_still_saves_without_using_unsafe_name(tmp_path, lot):
+    result = auto_dwg_save.save_new_dwg(Doc(), tmp_path, lot)
+    assert result.parent == tmp_path and result.name.startswith("lot_unknown_")
+
+
+def test_existing_dwg_and_reservation_are_never_overwritten(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    ids = iter(["existing", "locked", "fresh"])
+    monkeypatch.setattr(auto_dwg_save, "uuid4", lambda: SimpleNamespace(hex=next(ids)))
+    target = tmp_path / "lot_30_existing.dwg"
+    target.write_bytes(b"untouched")
+    lock = tmp_path / ".lot_30_locked.dwg.reserve"
+    lock.write_bytes(b"someone else's lock")
+    doc = Doc()
+    result = auto_dwg_save.save_new_dwg(doc, tmp_path, "30")
+    assert target.read_bytes() == b"untouched" and lock.read_bytes() == b"someone else's lock"
+    assert result.name == "lot_30_fresh.dwg" and len(doc.calls) == 1
+    assert not (tmp_path / ".lot_30_existing.dwg.reserve").exists()
+    assert not (tmp_path / ".lot_30_fresh.dwg.reserve").exists()
+
+
+def test_failed_save_reports_location_and_preserves_partial_data(tmp_path):
+    class Failed:
+        def SaveAs(self, path):
+            Path(path).write_bytes(b"partial")
+            raise RuntimeError("disk problem")
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="disk problem") as err:
+        auto_dwg_save.save_new_dwg(Failed(), tmp_path, "30")
+    partial, = tmp_path.glob("lot_30_*.dwg")
+    assert partial.read_bytes() == b"partial" and str(partial) in str(err.value)
+
+
+def test_save_confirmation_requires_a_nonempty_file(tmp_path):
+    class NoFile:
+        def SaveAs(self, path):
+            pass
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="не создал"):
+        auto_dwg_save.save_new_dwg(NoFile(), tmp_path, "30")
+
+
+def test_pinned_com_session_keeps_the_document_across_draws(fake_autocad, monkeypatch):
+    import acad_builder
+    builder, doc = fake_autocad(None)
+    calls = []
+    builder._com_owned = True
+    builder._com_thread_id = threading.get_ident()
+    monkeypatch.setattr(acad_builder, "_co_uninitialize", lambda: calls.append("release"))
+    with builder.drawing_session() as (app, current):
+        assert current is doc
+        app.doc = Doc()  # user switched the active AutoCAD tab
+        assert builder.connect()[1] is doc
+        assert calls == []
+    assert calls == ["release"] and builder._doc is None
+
+
+def prepare_auto(gui, tmp_path, monkeypatch, *, parsed_lot="32", complete=True):
+    app, calls = setup_app(gui, monkeypatch, tmp_path,
+                           parse=lambda images, context: answer([described(parsed_lot, 55.42)], complete=complete))
+    app.multi_pdf_mode_var.set(False)
+    app._on_multi_pdf_mode_changed()
+    app.step0_address_var.set("Address")
+    app.step0_folder_var.set(str(tmp_path / "project" / "01_описания"))
+    fake_portal(app, monkeypatch)
+    actual = gui.deed_intake.collect_deeds
+    def collect(**kwargs):
+        kwargs.update(fetch_list=intake._fetch(), downloader=intake._downloader(tmp_path))
+        return actual(**kwargs)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    wait_all(app)
+    return app
+
+
+def test_auto_pipeline_manually_draws_then_saves_same_document(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    assert app._auto_dwg_context
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert result.read_bytes() == b"DWG simulated" and len(doc.ModelSpace.lines) > 0
+    assert str(result) in app.status_var.get() and "сохранён" in app.status_var.get()
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 2
+
+
+def test_mismatched_lot_still_saves_using_portal_number(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch, parsed_lot="5")
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    files = list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))
+    assert len(files) == 1 and "сохранён" in app.status_var.get()
+
+
+def test_drawing_failure_still_saves_partial_document(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    def partial_draw(plan):
+        doc.ModelSpace.AddLine((0, 0, 0), (1, 1, 0))
+        raise RuntimeError("CAD failed")
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"partial DWG")
+    monkeypatch.setattr(builder, "draw_plan", partial_draw)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert result.read_bytes() == b"partial DWG"
+    assert "неполная" in app.status_var.get() and str(result) in app.status_var.get()
+
+
+def test_save_error_is_not_reported_as_drawing_error(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    def fail(path):
+        raise RuntimeError("save failed")
+    doc.SaveAs = fail
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    assert "Отрисовка завершена" in app.status_var.get()
+    assert "не сохранён" in app.status_var.get() and "save failed" in app.status_var.get()
+
+
+def test_edited_portal_field_keeps_original_lot_for_result(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    app.step0_lot_var.set("31")
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 1
+
+
+def test_reset_during_drawing_prevents_not_yet_started_save(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: pytest.fail("saved after reset")
+    started, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    real_draw = builder.draw_plan
+    def slow(plan):
+        started.set()
+        assert resume.wait(5)
+        try:
+            return real_draw(plan)
+        finally:
+            finished.set()
+    monkeypatch.setattr(builder, "draw_plan", slow)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    assert started.wait(5)
+    app._reset_session()
+    resume.set()
+    assert finished.wait(5)
+    assert not list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))
+
+
+def test_reported_entity_creation_failure_still_saves(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    real_draw = builder.draw_plan
+    def draw_with_warning(plan):
+        result = real_draw(plan)
+        result.warnings.append("не удалось создать текст: test failure")
+        return result
+    monkeypatch.setattr(builder, "draw_plan", draw_with_warning)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 1
+    assert "сохранён" in app.status_var.get()
+
+
+def test_saves_partial_parse_result(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch, complete=False)
+    assert any(not doc.complete for doc in app._multi_scene_handoff.documents)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"partial parse DWG")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert result.read_bytes() == b"partial parse DWG"
+
+
+def test_draft_failure_continues_drawing_and_saves(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"no draft")
+    monkeypatch.setattr(app, "_print_draft_plans", lambda: (_ for _ in ()).throw(RuntimeError("draft failed")))
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert doc.ModelSpace.lines and result.read_bytes() == b"no draft"
+    assert "неполная" in app.status_var.get() and str(result) in app.status_var.get()
+
+
+def test_reports_both_drawing_and_save_failure(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    monkeypatch.setattr(builder, "draw_plan", lambda p: (_ for _ in ()).throw(RuntimeError("draw failure")))
+    def save(path):
+        Path(path).write_bytes(b"partial")
+        raise RuntimeError("save failure")
+    doc.SaveAs = save
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    status = app.status_var.get()
+    partial, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert "draw failure" in status and "save failure" in status and str(partial) in status
+    assert partial.read_bytes() == b"partial"
+
+
+def test_parallel_saves_use_different_names_in_same_folder(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(lambda _: auto_dwg_save.save_new_dwg(Doc(), tmp_path, "30"), range(24)))
+    assert len(set(paths)) == 24
+    assert all(p.parent == tmp_path and p.read_bytes() == b"DWG mock" for p in paths)
+    assert len(list(tmp_path.iterdir())) == 24
+
+
+def test_unavailable_autocad_reports_unsaved_file(gui, tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    class Unavailable:
+        @contextmanager
+        def drawing_session(self):
+            raise RuntimeError("AutoCAD unavailable")
+            yield
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: Unavailable())
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    assert "AutoCAD unavailable" in app.status_var.get() and "DWG не сохранён" in app.status_var.get()
+    assert not list((tmp_path / "project" / "01_описания").glob("*.dwg"))

@@ -435,7 +435,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     # Тексты-препятствия — только те, что остаются в итоговом чертеже: готовые
     # подписи (existing_label_layers) и подписи границы Шага 1. Tax-тексты
     # полевого чертежа («#87 LOT 70», румбы красных линий) подписям не мешают.
-    "text_obstacle_layers": ["BOUNDARY_TEXT*", "M-TAX-DIM"],
+    "text_obstacle_layers": ["BOUNDARY_TEXT*", "M-TAX-DIM", "LETTER"],
     "point_labels_as_obstacles": False,
     # --- дедупликация --------------------------------------------------------
     "skip_existing_labels": True,
@@ -1097,9 +1097,10 @@ class LayerClassifier:
         self._obstacle = _as_patterns(fcfg.get("obstacle_layers"))
         self._obstacle_exclude = _as_patterns(fcfg.get("obstacle_layer_exclude"))
         self._text_obstacle = _as_patterns(fcfg.get("text_obstacle_layers"))
-        # Обязательный слой подписей Шага 1, в том числе при старых настройках.
-        if not layer_matches("M-TAX-DIM", self._text_obstacle):
-            self._text_obstacle.append("M-TAX-DIM")
+        # Обязательные слои подписей Шага 1, в том числе при старых настройках.
+        for required_layer in ("M-TAX-DIM", "LETTER"):
+            if not layer_matches(required_layer, self._text_obstacle):
+                self._text_obstacle.append(required_layer)
         self._code_linework = _as_patterns(fcfg.get("code_linework_layers"))
         self._cache: dict[tuple[str, str], Any] = {}
 

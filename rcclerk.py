@@ -11,7 +11,7 @@
    сам PDF ``/ViewVscmsDocument/ViewContent?p_endorsementId=<id>``;
 4. для **нашего** лота качаются самый свежий и самый старый документ, для
    **соседей** — только свежий;
-5. имя файла: ``OUR 32 NEW.pdf`` / ``OUR 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``).
+5. имя файла: ``OUR LOT 32 NEW.pdf`` / ``OUR LOT 32 OLD.pdf`` (сосед — ``LOT 30 NEW.pdf``).
 
 Важно: Staten Island — это Richmond County, и его документы лежат **не в ACRIS**
 (ACRIS покрывает остальные четыре района). Поэтому Шаг 0 по районам разный:
@@ -88,7 +88,7 @@ def classify_document(doc_type: str) -> str:
     return KIND_OTHER
 
 #: Как называются файлы (§5 схемы Коли).
-OUR_PREFIX = "OUR"
+OUR_PREFIX = "OUR LOT"
 NEIGHBOUR_PREFIX = "LOT"
 NEW_TAG = "NEW"
 OLD_TAG = "OLD"
@@ -446,7 +446,7 @@ def choose_documents(
 
 def document_file_name(role: str, lot: int | str, tag: str) -> str:
     """
-    Имя файла по схеме Коли: ``OUR 32 NEW.pdf``, ``OUR 32 OLD.pdf``,
+    Имя файла по схеме Коли: ``OUR LOT 32 NEW.pdf``, ``OUR LOT 32 OLD.pdf``,
     ``LOT 30 NEW.pdf``. Шаг 1 узнаёт страницы по ``_p4-6`` — этот суффикс
     добавляется отдельно, когда найдены страницы с описанием.
     """

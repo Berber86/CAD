@@ -3920,17 +3920,20 @@ def test_step1_tax_text_is_obstacle_even_with_old_settings():
     cfg["text_obstacle_layers"] = ["BOUNDARY_TEXT*"]
     classifier = LayerClassifier(cfg)
     assert classifier.is_text_obstacle("M-TAX-DIM")
+    assert classifier.is_text_obstacle("LETTER")
     assert classifier.is_text_obstacle("BOUNDARY_TEXT_AI")
     assert not classifier.is_field_note("M-TAX-DIM")
+    assert not classifier.is_field_note("LETTER")
 
 
 def test_step2_avoids_actual_tax_boundary_text_with_old_config():
     cfg = {"feature_labeling": {"text_obstacle_layers": ["BOUNDARY_TEXT*"]}}
     baseline = make_plan(build_stafford_scene(), house=STAFFORD_HOUSE, cfg=cfg)
     shed = item_for(baseline, "SUBJECT_SHED_OUTLINE")
-    snap = build_stafford_scene()
-    snap.texts.append(DrawingText("M-TAX-DIM", "N 56°36'12\" W", shed.point, height=1.0))
-    changed = make_plan(snap, house=STAFFORD_HOUSE, cfg=cfg)
-    moved = item_for(changed, "SUBJECT_SHED_OUTLINE")
-    assert moved.point != pytest.approx(shed.point)
-    assert not moved.box.intersects(ab._existing_text_box(snap.texts[-1], 1.0, {}))
+    for layer, text in (("M-TAX-DIM", "N 56°36'12\" W"), ("LETTER", "STAFFORD  AVENUE")):
+        snap = build_stafford_scene()
+        snap.texts.append(DrawingText(layer, text, shed.point, height=1.0))
+        changed = make_plan(snap, house=STAFFORD_HOUSE, cfg=cfg)
+        moved = item_for(changed, "SUBJECT_SHED_OUTLINE")
+        assert moved.point != pytest.approx(shed.point)
+        assert not moved.box.intersects(ab._existing_text_box(snap.texts[-1], 1.0, {}))

@@ -1100,6 +1100,19 @@ def translate_plan_in_place(plan: DrawPlan, dx: float, dy: float) -> None:
         plan.__dict__.update(moved.__dict__)
 
 
+def _is_primary_street_label_kind(kind: str) -> bool:
+    """Названия фасадной и пересекаемых улиц (группа 1 на печатном черновике).
+
+    Включает основные имена улиц (`main-street`, `cross-street` и пронумерованные
+    `main-street-2`, `cross-street-2`, … для будущих описаний с несколькими
+    пересечениями), исключая ширины, пометки `(FORMERLY ...)` и привязки.
+    """
+    key = str(kind or "").strip().lower()
+    if key in {"main-street", "cross-street"}:
+        return True
+    return bool(re.fullmatch(r"(?:main|cross)-street-\d+", key))
+
+
 def make_print_draft(
     plan: DrawPlan, print_cfg: dict[str, Any], *, builder_cfg: dict[str, Any] | None = None
 ) -> DrawPlan:
@@ -1210,7 +1223,7 @@ def make_print_draft(
             point = corner_pt(item.point)
         else:
             point = lot_pt(item.point)
-        is_street = item.kind in {"main-street", "cross-street"}
+        is_street = _is_primary_street_label_kind(item.kind)
         side_match = re.match(r"^side-(\d+)", item.kind)
         is_side_dimension = bool(side_match)
         if side_match and "-note" in item.kind:
@@ -2955,6 +2968,121 @@ class AcadBuilder:
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль LETTER: {exc}") from exc
 
+    @staticmethod
+    def _find_text_style_ci(
+        styles: Any, target_name: str, aliases: Sequence[str] = (),
+    ) -> str | None:
+        """Ищет стиль текста без учёта регистра; возвращает фактическое имя из DWG."""
+        wanted = str(target_name or "").strip().casefold()
+        if not wanted:
+            return None
+        try:
+            for existing in AcadBuilder._iter_com(styles):
+                name = getattr(existing, "Name", None)
+                if name and str(name).strip().casefold() == wanted:
+                    return str(name)
+        except Exception:  # noqa: BLE001 - коллекция-заглушка может не итерироваться
+            pass
+        candidates: list[str] = []
+        for cand in (
+            target_name, *aliases, target_name.upper(), target_name.lower(), target_name.title()
+        ):
+            text = str(cand or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        for cand in candidates:
+            try:
+                found = styles.Item(cand)
+            except Exception:  # noqa: BLE001
+                continue
+            name = getattr(found, "Name", None)
+            return str(name) if name else cand
+        return None
+
+    def _ensure_named_text_style(
+        self,
+        doc: Any,
+        name: str,
+        warnings: list[str],
+        *,
+        aliases: Sequence[str] = (),
+        truetype_face: str | None = None,
+        font_file: str = "romans.shx",
+    ) -> str:
+        """Использовать существующий стиль (без учёта регистра) без правки; при отсутствии создать."""
+        try:
+            styles = doc.TextStyles
+            existing = self._find_text_style_ci(styles, name, aliases=aliases)
+            if existing is not None:
+                return existing
+            style = _com_retry(styles.Add, name)
+            font_desc = f"{truetype_face} ({font_file})" if truetype_face else font_file
+            try:
+                if truetype_face:
+                    font_configured = False
+                    last_exc: Exception | None = None
+                    for setup in (
+                        lambda: style.SetFont(truetype_face, False, False, 0, 18),
+                        lambda: style.SetFont(truetype_face, False, False, 0, 0),
+                        lambda: setattr(style, "fontFile", font_file),
+                    ):
+                        try:
+                            setup()
+                            font_configured = True
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            last_exc = exc
+                    if not font_configured:
+                        raise last_exc or RuntimeError(f"не удалось назначить шрифт {font_desc}")
+                else:
+                    try:
+                        style.fontFile = font_file
+                        try:
+                            style.BigFontFile = ""
+                        except Exception:  # noqa: BLE001
+                            pass
+                    except Exception:  # noqa: BLE001
+                        style.SetFont(font_file, False, False, 0, 0)
+                style.Height = 0.0
+                try:
+                    style.Width = 1.0
+                    style.ObliqueAngle = 0.0
+                except Exception:  # noqa: BLE001 - заглушка может не иметь Width/ObliqueAngle
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"Создан стиль {name}, но шрифт/высоту не удалось настроить: {exc}; "
+                    "проверьте стиль в AutoCAD"
+                )
+            else:
+                warnings.append(
+                    f"Стиль {name} отсутствовал и создан со шрифтом {font_desc}; "
+                    "проверьте его по шаблону заказчика"
+                )
+            return name
+        except Exception as exc:  # noqa: BLE001
+            raise AcadDrawError(f"Не удалось получить или создать стиль {name}: {exc}") from exc
+
+    def _ensure_print_draft_street_style(self, doc: Any, warnings: list[str]) -> str:
+        """Стиль MtXpl_Times_New_Roma для названий улиц на печатном черновике."""
+        return self._ensure_named_text_style(
+            doc,
+            "MtXpl_Times_New_Roma",
+            warnings,
+            truetype_face="Times New Roman",
+            font_file="times.ttf",
+        )
+
+    def _ensure_print_draft_other_style(self, doc: Any, warnings: list[str]) -> str:
+        """Стиль Romans / ROMANS для остальных подписей границ на печатном черновике."""
+        return self._ensure_named_text_style(
+            doc,
+            "ROMANS",
+            warnings,
+            aliases=("Romans", "romans"),
+            font_file="romans.shx",
+        )
+
     # -- создание объектов --------------------------------------------------
     def _add_polyline(
         self,
@@ -3211,7 +3339,21 @@ class AcadBuilder:
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 
-            style = self._ensure_boundary_text_style(doc, warnings)
+            if geo.print_draft and not is_neighbor:
+                has_street_labels = any(_is_primary_street_label_kind(item.kind) for item in geo.items)
+                has_other_labels = any(not _is_primary_street_label_kind(item.kind) for item in geo.items)
+                street_text_style = (
+                    self._ensure_print_draft_street_style(doc, warnings) if has_street_labels else None
+                )
+                other_text_style = (
+                    self._ensure_print_draft_other_style(doc, warnings) if has_other_labels else None
+                )
+                style = other_text_style or street_text_style or "ROMANS"
+            else:
+                has_street_labels = False
+                street_text_style = None
+                other_text_style = None
+                style = self._ensure_boundary_text_style(doc, warnings)
 
             if is_neighbor:
                 neighbor_layer = self._ensure_layer(
@@ -3224,6 +3366,7 @@ class AcadBuilder:
                 poly_target_layer = neighbor_layer
                 text_target_layer = neighbor_layer
                 street_row_layer = neighbor_layer
+                street_text_layer: str | None = None
             else:
                 # Настройки защищены от обновления: новые правила имён и цветов
                 # задаём здесь независимо от старого config.json пользователя.
@@ -3235,6 +3378,13 @@ class AcadBuilder:
                 )
                 street_row_layer = self._ensure_survey_layer(
                     doc, "M-ROW-LINE", 1, warnings, linetype="Continuous"
+                )
+                street_text_layer = (
+                    self._ensure_survey_layer(
+                        doc, "LETTER", int(colors.get("street_text", 7)), warnings, linetype="Continuous"
+                    )
+                    if (geo.print_draft and has_street_labels)
+                    else None
                 )
                 if line_layer == "0":
                     warnings.append(
@@ -3344,17 +3494,28 @@ class AcadBuilder:
             created = 0
             for item in geo.items:
                 try:
+                    if geo.print_draft and not is_neighbor:
+                        if _is_primary_street_label_kind(item.kind):
+                            item_layer = street_text_layer or "LETTER"
+                            item_style = street_text_style or "MtXpl_Times_New_Roma"
+                        else:
+                            item_layer = text_target_layer
+                            item_style = other_text_style or "ROMANS"
+                    else:
+                        item_layer = text_target_layer
+                        item_style = style
+
                     if not geo.print_draft and (item.correction_indices or item.correction_deleted):
                         try:
                             entity = self._add_corrected_street_text(
-                                model_space, item, geo.text_height, text_target_layer, style)
+                                model_space, item, geo.text_height, item_layer, item_style)
                         except Exception as exc:  # noqa: BLE001
                             warnings.append(f"не удалось выделить исправление улицы «{item.text}»: {exc}")
-                            entity = self._add_text(model_space, item, geo.text_height, text_target_layer,
-                                                    style, strict_style=True)
+                            entity = self._add_text(model_space, item, geo.text_height, item_layer,
+                                                    item_style, strict_style=True)
                     else:
                         entity = self._add_text(
-                            model_space, item, geo.text_height, text_target_layer, style,
+                            model_space, item, geo.text_height, item_layer, item_style,
                             strict_style=True,
                         )
                     created += 1
@@ -3460,12 +3621,14 @@ class AcadBuilder:
             if callout_count:
                 result_layers["risk_warnings"] = drawing_warnings.LAYER
 
-            if geo.print_draft:
+            if geo.print_draft and not is_neighbor:
                 result_layers = {
                     "print_property_line": poly_target_layer,
                     "print_boundary_text": text_target_layer,
                     "print_street_row": street_row_layer,
                 }
+                if street_text_layer:
+                    result_layers["print_street_text"] = street_text_layer
 
             return DrawResult(
                 plan=plan,

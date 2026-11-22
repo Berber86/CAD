@@ -6,8 +6,8 @@ import re
 from pathlib import PurePath
 from typing import Any
 
-# Step 0 creates OUR 32 NEW_p4-6.pdf and LOT 30 NEW.pdf. Avoid interpreting
-# an arbitrary address, page, block, year, or bare number as a lot.
+# Step 0 creates OUR LOT 32 NEW_p4-6.pdf and LOT 30 NEW.pdf (and legacy OUR 32 NEW_p4-6.pdf).
+# Avoid interpreting an arbitrary address, page, block, year, or bare number as a lot.
 _MARKED = re.compile(r"(?<![A-Za-z0-9А-Яа-я])(?:LOT|OUR|ЛОТ)[\s_#№-]*(\d+[A-Za-z]?)(?![A-Za-z0-9]|[-–]\d)", re.IGNORECASE)
 _PAGES = re.compile(r"_p\d+(?:[_,-]\d+)*$", re.IGNORECASE)
 

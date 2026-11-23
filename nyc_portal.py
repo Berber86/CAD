@@ -14,12 +14,14 @@ import tempfile
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import browser_save
+import front_street
+import map_angle_cache
 import ocr_pages
 import portal_layout_cache
 from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
@@ -87,6 +89,10 @@ class ParcelLookup:
     usage: TokenUsage
     details_source: str = "ocr"
     details_usage: TokenUsage | None = None
+    #: Угол фронтальной улицы к северу от Vision и программных оценок
+    #: (front_street.py); значения дублируются в JSON-кэш снимка карты.
+    front_street_angle_deg: float | None = None
+    front_street_angles: dict[str, float | None] = field(default_factory=dict)
 
     @property
     def neighbours(self) -> list[str]:
@@ -916,21 +922,37 @@ def _integer_or_none(value: Any, name: str) -> str | None:
     return text
 
 
+def _angle_or_none(value: Any) -> float | None:
+    """Угол улицы из ответа Vision: число/«35°»/«35 deg» -> [0, 180), иначе None."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().lower().replace("°", " ").replace("deg", " ").strip()
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return round(front_street.normalize_line_angle(number), 1)
+
+
 def parse_neighbour_result(
     data: dict[str, Any],
-) -> tuple[str | None, str | None, str, str]:
-    """Validate map-only Vision output: two adjacent lot labels, without BBL fields."""
+) -> tuple[str | None, str | None, str, str, float | None]:
+    """Validate map-only Vision output: neighbour labels + front street angle."""
     left = _integer_or_none(data.get("left_neighbor_lot"), "сосед слева")
     right = _integer_or_none(data.get("right_neighbor_lot"), "сосед справа")
     if left and right and left == right:
         right = None
     confidence = str(data.get("confidence") or "не указана").strip()[:40]
     notes = str(data.get("notes") or "").strip()[:600]
-    return left, right, confidence, notes
+    angle = _angle_or_none(data.get("front_street_angle_deg"))
+    return left, right, confidence, notes, angle
 
 
 VISION_SYSTEM_PROMPT = """You inspect ONLY a cropped NYC tax-map image. The selected parcel is highlighted in cyan.
-Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, confidence, notes.
+Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, front_street_angle_deg, confidence, notes.
+Also report front_street_angle_deg: the orientation in degrees of the street that the cyan parcel fronts onto (the street along its frontage side), measured clockwise from geographic north. North points straight up in this image. Report 0 for a street running north-south, 90 for east-west, a value from 0 to under 180; if the front street is unclear, return null for it and never guess.
 Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If the map is rotated or labels/boundaries are unclear, return null for uncertain neighbours and explain briefly in notes. confidence is low, medium, or high. Never guess. Do not include markdown."""
 
 
@@ -1024,9 +1046,31 @@ def lookup_parcel(
         attempts=1,
         single_request=True,
     )
-    left, right, confidence, notes = parse_neighbour_result(response)
+    left, right, confidence, notes, llm_angle = parse_neighbour_result(response)
+    # Тот же угол — кодом, двумя способами; все три значения клиент сравнит
+    # сам (программа выбор не делает). Кэш — JSON рядом со снимком карты.
+    estimates = front_street.estimate_all(capture.map_image)
+    angles: dict[str, float | None] = {"llm": llm_angle, **estimates}
+    cache_name = ""
+    try:
+        cache_path = map_angle_cache.write_angles(
+            capture.map_image, llm_angle=llm_angle, python_angles=estimates,
+            address=clean_address, block=capture.block, lot=capture.lot,
+        )
+        cache_name = cache_path.name
+    except Exception:  # noqa: BLE001 - кэш не должен губить поиск участка
+        cache_name = ""
+    if progress:
+        progress(
+            "угол фронтальной улицы к северу: "
+            f"ИИ — {map_angle_cache.fmt_angle(angles.get('llm'))}, "
+            f"код (отрезки) — {map_angle_cache.fmt_angle(angles.get('python_hough_lines'))}, "
+            f"код (градиенты) — {map_angle_cache.fmt_angle(angles.get('python_structure_tensor'))}"
+            + (f"; все значения — в {cache_name}" if cache_name else "")
+        )
     return ParcelLookup(
         capture.block, capture.lot, capture.borough, left, right,
         confidence, notes, capture.map_image, usage, capture.details_source,
         details_usages[0] if details_usages else None,
+        llm_angle, angles,
     )

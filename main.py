@@ -3776,6 +3776,15 @@ class SurveyApp(ctk.CTk):
         )
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
+        _angles = getattr(result, "front_street_angles", None) or {}
+        if any(value is not None for value in _angles.values()):
+            _labels = {"llm": "ИИ", "python_hough_lines": "код (отрезки)",
+                       "python_structure_tensor": "код (градиенты)"}
+            _shown = ", ".join(
+                f"{_labels.get(key, key)} {value:.0f}°" if value is not None else f"{_labels.get(key, key)} —"
+                for key, value in _angles.items()
+            )
+            self._step0_log(f"Угол фронтальной улицы к северу: {_shown} — значения в JSON-кэше снимка карты.")
         self._step0_log(f"Vision получил обрезку карты: {result.map_image}; адрес передан текстом.")
         if self._step0_auto_stage == "portal":
             if str(self.step0_address_var.get() or "").strip() != self._step0_auto_address:

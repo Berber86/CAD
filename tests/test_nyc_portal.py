@@ -32,9 +32,26 @@ def test_parse_neighbour_result_keeps_only_numeric_map_labels():
     assert nyc_portal.parse_neighbour_result({
         "left_neighbor_lot": "68", "right_neighbor_lot": 72,
         "confidence": "high", "notes": "Labels visible.",
-    }) == ("68", "72", "high", "Labels visible.")
+    }) == ("68", "72", "high", "Labels visible.", None)
     with pytest.raises(nyc_portal.PortalLookupError, match="нечисловое"):
         nyc_portal.parse_neighbour_result({"left_neighbor_lot": "6?", "right_neighbor_lot": 72})
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (35, 35.0), ("35", 35.0), ("35°", 35.0), ("35 deg", 35.0), (190, 10.0),
+    (-10, 170.0), (None, None), ("unclear", None), (True, None),
+])
+def test_parse_neighbour_result_reads_front_street_angle(raw, expected):
+    *_rest, angle = nyc_portal.parse_neighbour_result({
+        "left_neighbor_lot": "68", "right_neighbor_lot": "72",
+        "front_street_angle_deg": raw,
+    })
+    assert angle == expected
+
+
+def test_vision_prompt_asks_for_front_street_angle():
+    assert "front_street_angle_deg" in nyc_portal.VISION_SYSTEM_PROMPT
+    assert "clockwise from geographic north" in nyc_portal.VISION_SYSTEM_PROMPT
 
 
 def test_local_portal_ocr_extracts_borough_block_and_lot():
@@ -80,6 +97,7 @@ def test_lookup_uses_local_bbl_and_sends_only_map_to_one_vision_request(tmp_path
         return ({
             "left_neighbor_lot": "68", "right_neighbor_lot": "72",
             "confidence": "high", "notes": "Labels visible.",
+            "front_street_angle_deg": 35,
         }, usage)
 
     monkeypatch.setattr(nyc_portal, "_drive_portal", drive)
@@ -91,6 +109,17 @@ def test_lookup_uses_local_bbl_and_sends_only_map_to_one_vision_request(tmp_path
     )
     assert (result.borough, result.block, result.lot) == ("Staten Island", "5712", "70")
     assert result.neighbours == ["68", "72"]
+    # Угол фронтальной улицы: Vision + две программные оценки + JSON-кэш.
+    assert result.front_street_angle_deg == 35.0
+    assert result.front_street_angles["llm"] == 35.0
+    assert set(result.front_street_angles) == {
+        "llm", "python_hough_lines", "python_structure_tensor"}
+    cache = tmp_path / "NYC_Portal_map_angles.json"
+    assert cache.is_file()
+    import json as _json
+    cached = _json.loads(cache.read_text(encoding="utf-8"))
+    assert cached["front_street_angle_deg"]["llm"] == 35.0
+    assert cached["block"] == "5712" and cached["lot"] == "70"
     assert result.map_image == map_image and result.map_image.is_file()
     assert result.usage is usage
     assert calls["ask_options"]["attempts"] == 1

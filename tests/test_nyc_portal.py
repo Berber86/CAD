@@ -140,7 +140,7 @@ def test_portal_driver_uses_current_window_and_address_suggestion_keys(tmp_path,
         [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
         [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
                                (20, 160, 550, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island", (30, 255, 500, 275))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (30, 255, 500, 275))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
@@ -235,7 +235,7 @@ def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypat
         # Confirms the dropdown actually opened before Down/Down/Enter are sent.
         [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
         [nyc_portal.ScreenText("Address (Enter an Address)", (20, 160, 550, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island", (30, 255, 500, 275))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (30, 255, 500, 275))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
@@ -319,7 +319,7 @@ def test_portal_driver_does_not_close_a_select_menu_left_open(tmp_path, monkeypa
          nyc_portal.ScreenText("Borough/Block", (10, 40, 200, 60)),
          nyc_portal.ScreenText("Address", (10, 70, 100, 90))],
         [nyc_portal.ScreenText("Address (Enter an Address)", (20, 160, 550, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island", (30, 255, 500, 275))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (30, 255, 500, 275))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
@@ -639,16 +639,18 @@ def test_normal_suggestion_takes_first_row_below_field_not_the_input(monkeypatch
     label = [nyc_portal.ScreenText("Enter an Address", (10, 160, 300, 180))]
     row = lambda text, y: nyc_portal.ScreenText(text, (20, y, 300, y + 15))
     input_value = row("87 Stafford Avenue", 210)
-    correct = row("87 Stafford Avenue, Staten Island", 250)
+    correct = row("87 Stafford Avenue, Staten Island, NY, USA", 250)
     incorrect = row("88 Stafford Avenue, Staten Island", 250)
     later_match = row("87 Stafford Avenue", 280)
-    assert nyc_portal._first_suggestion([input_value], label, typed="87 Stafford Ave") is None
+    assert nyc_portal._suggestion_row([input_value]) is None
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
-    monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [input_value, correct])
-    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == correct
+    correct_ny = row("87 Stafford Avenue, Staten Island, NY, USA", 250)
+    incorrect_ny = row("88 Stafford Avenue, Staten Island, NY, USA", 250)
+    monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [input_value, correct_ny])
+    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == correct_ny
     # Даже «чужая» первая строка берётся как есть: проверка текста убрана.
-    monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [incorrect, later_match])
-    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == incorrect
+    monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [incorrect_ny, later_match])
+    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == incorrect_ny
 
 
 @pytest.mark.parametrize("start", ["select", "address", "previous"])
@@ -776,12 +778,12 @@ def test_fast_card_missing_data_stops_without_guess_or_vision(tmp_path, monkeypa
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="hydra", model="test", fast_mode=True)
 
 
-def test_address_suggestion_ignores_map_numbers_to_the_right():
-    label = [nyc_portal.ScreenText("Enter an Address", (10, 160, 250, 180))]
+def test_suggestion_row_ignores_map_numbers_and_typed_text():
     number_on_map = nyc_portal.ScreenText("70", (420, 250, 445, 275))
-    suggestion = nyc_portal.ScreenText("87 Stafford Ave", (20, 260, 180, 280))
-    assert nyc_portal._first_suggestion([number_on_map, suggestion], label) == suggestion
-    assert nyc_portal._first_suggestion([number_on_map], label) is None
+    typed = nyc_portal.ScreenText("417 WEST 33RD STREET", (43, 249, 203, 264))
+    suggestion = nyc_portal.ScreenText("417 W 33 ST, MANHATTAN, NY, 10001, USA", (16, 281, 298, 295))
+    assert nyc_portal._suggestion_row([number_on_map, typed, suggestion]) == suggestion
+    assert nyc_portal._suggestion_row([number_on_map, typed]) is None
 
 
 def test_warmup_initializes_in_background_and_shares_result(monkeypatch):
@@ -842,7 +844,7 @@ def test_reliable_reads_card_left_from_final_capture_and_keeps_map_crop_anchors(
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda n: sleeps.append(n))
     screens = iter([
         [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block", (20, 300, 70, 320)),
@@ -875,7 +877,7 @@ def test_reliable_unreadable_bbl_asks_vision_once_and_stops_if_unusable(tmp_path
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
     screens = iter([
         [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block", (20, 300, 150, 330)),
@@ -958,7 +960,7 @@ def test_reliable_missing_borough_uses_vision_on_same_left_half(tmp_path, monkey
     sizes = []
     screens = iter([
         [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-        [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+        [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
         [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
          nyc_portal.ScreenText("Borough", (20, 260, 180, 280)),
          nyc_portal.ScreenText("Block 5712", (20, 300, 150, 320)),
@@ -988,7 +990,7 @@ def test_reliable_missing_borough_uses_vision_on_same_left_half(tmp_path, monkey
 def test_reliable_suggestion_takes_first_screen_with_a_list(monkeypatch):
     """Сверки текста нет: первый же снимок с выпавшим списком — и выбираем."""
     label = [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))]
-    first = nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))
+    first = nyc_portal.ScreenText("88 Stafford Avenue, Staten Island, NY, USA", (20, 250, 260, 270))
     clock = _FakeClock()
     monkeypatch.setattr(nyc_portal, "time", clock)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
@@ -1068,7 +1070,7 @@ def _optimal_card():
 def test_reliable_teaches_cache_then_optimal_uses_smaller_ocr_and_verifies_suggestion(tmp_path, monkeypatch):
     q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
     label = nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))
-    suggestion = nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))
+    suggestion = nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Address", (20, 130, 80, 150))], [label], [suggestion], _optimal_card(), _optimal_card()])
     reliable = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "one.png")
@@ -1095,7 +1097,7 @@ def test_optimised_stale_layout_falls_back_to_full_same_snapshot(tmp_path, monke
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
               [nyc_portal.ScreenText("Enter an Address", (100, 400, 400, 420))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
     result = nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert result.block == "5712" and ("87 Stafford Ave", (100, 400, 400, 420)) in clicks
     assert scans[:3] == [(500, 400), (350, 200), (1000, 800)]
@@ -1109,7 +1111,7 @@ def test_optimal_missing_or_other_browser_cache_runs_reliable_and_learns(tmp_pat
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
               [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], _optimal_card(), _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))], _optimal_card(), _optimal_card()])
     logs = []
     nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
     assert len(captures) == 6 and scans[1] == (650, 640)
@@ -1217,7 +1219,7 @@ def test_optimised_updates_verified_cache_then_fast_uses_it_without_teaching(tmp
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old_box)
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Enter an Address", (40, 85, 260, 105))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (40, 260, 200, 280))], _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (40, 260, 200, 280))], _optimal_card()])
     nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "optimal.png", optimal_mode=True)
     assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == new_box
     initial_data = nyc_portal.portal_layout_cache.cache_path().read_bytes()
@@ -1252,7 +1254,7 @@ def test_stale_optimal_region_switches_remaining_actions_to_reliable_and_refresh
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), old)
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))], [],
               [nyc_portal.ScreenText("Enter an Address", new)],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (100, 490, 300, 510))], _optimal_card(), _optimal_card()])
     logs = []
     nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", logs.append, optimal_mode=True)
     assert any("оставшиеся действия" in line and "надёжному" in line for line in logs)
@@ -1319,7 +1321,7 @@ def test_reliable_final_snapshot_saves_right_first_then_reads_left_locally(tmp_p
     q, _, _, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
     map_path = tmp_path / "map.png"
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
               [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
                nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
@@ -1344,7 +1346,7 @@ def test_reliable_vision_fallback_sends_only_left_once_and_separately_sends_map(
     from PIL import Image
     q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
               [nyc_portal.ScreenText("Block", (20, 300, 150, 330))]])
     images, calls = [], []
@@ -1390,7 +1392,7 @@ def test_vision_details_rejects_unclear_or_non_numeric_values(data):
 def test_reliable_card_ocr_exception_uses_vision_once(tmp_path, monkeypatch):
     q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))]])
     original = nyc_portal._screen_ocr
     def ocr(path):
@@ -1409,7 +1411,7 @@ def test_reliable_card_ocr_exception_uses_vision_once(tmp_path, monkeypatch):
 def test_reliable_detected_challenge_on_left_never_calls_vision(tmp_path, monkeypatch):
     q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
               [nyc_portal.ScreenText("captcha", (20, 200, 150, 220))]])
     with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
@@ -1421,7 +1423,7 @@ def test_reliable_detected_challenge_on_left_never_calls_vision(tmp_path, monkey
 def test_unrecognized_local_borough_requests_vision(tmp_path, monkeypatch):
     q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))],
               [nyc_portal.ScreenText("Borough Sttaten lsIand", (20, 260, 180, 280)),
                nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
@@ -1437,7 +1439,7 @@ def test_unrecognized_local_borough_requests_vision(tmp_path, monkeypatch):
 def test_reliable_failed_vision_request_not_retried_or_followed_by_map_request(tmp_path, monkeypatch):
     q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))],
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))],
               [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115))], []])
     calls = []
     monkeypatch.setattr(nyc_portal, "render_image_files_base64", lambda *a, **kw: (["image"], []))
@@ -1453,26 +1455,21 @@ def test_reliable_failed_vision_request_not_retried_or_followed_by_map_request(t
 def test_reliable_without_confirmed_card_does_not_send_screenshot(tmp_path, monkeypatch):
     q, _, _, _, captures, _ = _optimal_setup(monkeypatch, tmp_path)
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))], [], []])
+              [nyc_portal.ScreenText("87 Stafford Avenue, Staten Island, NY, USA", (20, 250, 200, 270))], [], []])
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("страница не подтверждена"))
     with pytest.raises(nyc_portal.PortalLookupError, match="карточку объекта"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y")
     assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))
 
 
-def test_first_suggestion_on_live_screenshot_geometry():
-    """Живой случай 2026-11-23: рамки со скриншота пользователя (окно 958 px).
-
-    Прежняя геометрия оставляла запас 6 px и отсекала настоящую подсказку;
-    проверка текста теперь убрана вовсе (решение пользователя)."""
-    label = [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)", (12, 206, 373, 224))]
+def test_suggestion_row_on_live_screenshot_rows():
+    """Живые строки OCR со скриншота 2026-11-23: подсказка узнаётся по тексту."""
     input_row = nyc_portal.ScreenText("417 WEST 33RD STREET", (43, 249, 203, 264))
     suggestion = nyc_portal.ScreenText("417 W 33 ST, MANHATTAN, NY, 10001, USA", (16, 281, 298, 295))
+    brooklyn = nyc_portal.ScreenText("W 33 ST, BROOKLYN, NY, 10112, USA", (16, 311, 258, 326))
     map_3d = nyc_portal.ScreenText("3D", (635, 127, 658, 144))
-    rows = [label[0], input_row, suggestion, map_3d]
-    assert nyc_portal._first_suggestion(rows, label, typed="417 WEST 33RD STREET") == suggestion
-    # Само поле ввода подсказкой не считается, даже без typed оно ниже запаса.
-    assert nyc_portal._first_suggestion([input_row], label, typed="417 WEST 33RD STREET") is None
+    assert nyc_portal._suggestion_row([input_row, suggestion, brooklyn, map_3d]) == suggestion
+    assert nyc_portal._suggestion_row([input_row, map_3d]) is None
 
 
 def test_wait_takes_whatever_first_suggestion_shows(monkeypatch):

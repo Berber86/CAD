@@ -3452,7 +3452,7 @@ class SurveyApp(ctk.CTk):
             border_color=THEME["border_card"], font=ctk.CTkFont(size=11),
         ).grid(row=0, column=2, sticky="w")
         ctk.CTkButton(
-            manual, text="📂 Забрать свежий PDF из «Загрузок»", height=30,
+            manual, text="📂 Загрузки", height=30,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             command=self._adopt_step0_download,
         ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
@@ -3473,7 +3473,7 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_main"], anchor="w",
         ).grid(row=0, column=0, sticky="w")
         self.step0_to_step1_button = ctk.CTkButton(
-            head, text="→ Передать в Шаг 1", height=28, width=170,
+            head, text="→ В Шаг 1", height=28, width=170,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11), state="disabled",
             command=self._step0_to_step1,

@@ -398,27 +398,15 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
         raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
 
 
-def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText],
-                      typed: str = "") -> ScreenText | None:
-    """
-    Первая строка выпавшего списка подсказок — сам факт, что список открылся.
+#: Подсказку портала узнаём по её собственному тексту: «..., NY ... USA».
+#: Геометрию после трёх живых остановок не используем совсем (решение
+#: пользователя 2026-11-23): у поля ввода и чисел карты такого текста нет.
+_SUGGESTION_ROW_RE = re.compile(r",\s*NY\b|\bUSA\b", re.IGNORECASE)
 
-    Текст НЕ сверяется с вводом (решение пользователя 2026-11-23: строгая
-    сверка трижды останавливала живой автопоток, а риск невелик — дальше
-    карточка участка и поля Шага 0, которые человек видит). Отсекаем только
-    само поле ввода (его текст равен введённому) и числа на карте справа.
-    Запас по высоте — чуть больше высоты подписи: прежние «две высоты + 15»
-    оставили запас всего 6 px и отсекли настоящую подсказку на живом окне.
-    """
-    label = next((r for r in address_rows if "enter an address" in r.text.lower()), None)
-    if label is None:
-        return None
-    x0, y0, x1, y1 = label.box
-    min_y = y1 + max(36, (y1 - y0) * 2)
-    max_x = x0 + max(160, x1 - x0)
-    typed_norm = _normalise(typed)
-    candidates = [row for row in rows if row.box[1] >= min_y and x0 - 12 <= row.box[0] <= max_x
-                  and re.match(r"^\s*\d", row.text) and _normalise(row.text) != typed_norm]
+
+def _suggestion_row(items: Sequence[ScreenText]) -> ScreenText | None:
+    """Верхняя строка выпавшего списка подсказок — по тексту, без геометрии."""
+    candidates = [row for row in items if _SUGGESTION_ROW_RE.search(row.text)]
     return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
 
 
@@ -430,7 +418,7 @@ def _suggestion_screen_hint(handle: int, address: str, address_rows: Sequence[Sc
             path = Path(directory) / "screen.png"
             _save_window_capture(handle, path)
             rows = _screen_ocr_region(path, _FORM_REGION)
-        suggestion = _first_suggestion(rows, address_rows)
+        suggestion = _suggestion_row(rows)
         if suggestion is not None:
             return f" На снимке первая подсказка: «{suggestion.text}»; жду «{address}»."
         digit_rows = [row.text for row in rows if re.match(r"^\s*\d", row.text)][:3]
@@ -446,16 +434,17 @@ def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[
     """
     Ждём, пока портал покажет список подсказок, и возвращаем первую строку.
 
-    Что в ней написано — не проверяем (решение пользователя 2026-11-23,
-    см. ``_first_suggestion``): выбирается она клавишами Down+Enter, а не
-    кликом по координатам. Нет списка после повторных проверок — остановка
-    с диагностикой, что OCR видит под полем.
+    Что в ней написано — не проверяем (решение пользователя 2026-11-23):
+    выбирается она клавишами Down+Enter, а не кликом по координатам.
+    Признак списка — текст подсказки («…, NY … USA»), геометрию не смотрим:
+    она трижды отсекала настоящий список на живом окне. Нет списка после
+    повторных проверок — остановка с диагностикой, что OCR видит под полем.
     """
     def present(items: Sequence[ScreenText]) -> bool:
-        return _first_suggestion(items, address_rows, typed=address) is not None
+        return _suggestion_row(items) is not None
 
     rows: list[ScreenText] | None = None
-    for attempt, delay in enumerate((first_delay, RELIABLE_RETRY_DELAY)):
+    for attempt, delay in enumerate((first_delay, RELIABLE_SUGGESTION_DELAY)):
         try:
             rows = _wait_screen(handle, present,
                                 first_delay=delay, description="список подсказок адреса",
@@ -473,7 +462,7 @@ def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[
             "после повторных проверок."
             + _suggestion_screen_hint(handle, address, address_rows)
         )
-    return _first_suggestion(rows, address_rows, typed=address)
+    return _suggestion_row(rows)
 
 
 def _type_focused_address(handle: int, address: str) -> None:

@@ -6012,3 +6012,14 @@ def test_reasoning_switches_follow_hydra_models(gui):
     app.select_provider("OpenRouter")
     assert app.current_reasoning_effort() is None
     assert not getattr(app.reasoning_switch_main, "_gridded", True)
+
+
+def test_expensive_model_selection_warns(gui):
+    """Модель дороже 1000 ₽ за миллион выходных токенов — «это будет дорого»."""
+    app = gui.SurveyApp()
+    assert app.current_model() == "grok-4.7"
+    app._on_model_selected("gpt-6-luna")  # 20 ₽/1M — предупреждения нет
+    assert "дорого" not in app.status_var.get()
+    app._on_model_selected("gpt-6-astra")  # 2000 ₽/1M — дорого
+    assert "Это будет дорого" in app.status_var.get()
+    assert "gpt-6-astra" in app.status_var.get()

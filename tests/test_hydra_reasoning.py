@@ -31,13 +31,19 @@ def test_hydra_catalog_only_vision_reasoning_models():
         assert default in choices and len(choices) >= 3
         # Цена миллиона выходных токенов записана для каждой модели.
         assert lp.HYDRA_MODEL_REASONING[model]["out_rub_per_m"] > 0
-    # Семейство GPT-6 в списке есть и идёт сразу за моделью по умолчанию.
-    assert models[1:8] == [
-        "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra",
-        "gpt-6-sol", "gpt-6-luna", "gpt-6-astra",
-    ]
+    # Грок — первым; остальные упорядочены по цене выхода по возрастанию,
+    # самые дорогие — в самом низу списка.
+    assert models[0] == "grok-4.7"
+    prices = [lp.HYDRA_MODEL_REASONING[m]["out_rub_per_m"] for m in models[1:]]
+    assert prices == sorted(prices)
+    assert models[-1] == "gpt-6-astra"
     assert lp.HYDRA_MODEL_REASONING["gpt-6-luna"]["out_rub_per_m"] == 20
     assert lp.HYDRA_MODEL_REASONING["gpt-6.2-astra"]["out_rub_per_m"] == 1600
+    # Порог предупреждения «это будет дорого»
+    assert lp.EXPENSIVE_OUT_RUB_PER_M == 1000
+    assert lp.model_output_price_rub("hydra", "gpt-6-astra") == 2000
+    assert lp.model_output_price_rub("hydra", "grok-4.7") == 240
+    assert lp.model_output_price_rub("openrouter", "gpt-6-astra") is None
 
 
 def test_resolve_reasoning_defaults_and_stored_choice():

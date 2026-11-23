@@ -144,6 +144,7 @@ from llm_parser import (
     parse_page_range,
     parse_with_regex,
     prepare_survey_image_bytes,
+    model_output_price_rub,
     protect_api_key,
     reasoning_spec,
     resolve_reasoning_effort,
@@ -5869,6 +5870,31 @@ class SurveyApp(ctk.CTk):
                 main_label.grid_remove()
                 main_switch.grid_remove()
 
+    def _warn_expensive_models(self) -> None:
+        """Предупреждение «это будет дорого» для моделей дороже порога цены выхода.
+
+        Срабатывает при выборе модели в любом используемом проходе: цена
+        миллиона выходных токенов выше EXPENSIVE_OUT_RUB_PER_M (1000 ₽) —
+        сейчас это gpt-5.5, gpt-5.6-sol, gpt-6.2-astra и gpt-6-astra.
+        """
+        from llm_parser import EXPENSIVE_OUT_RUB_PER_M
+        passes = self.current_passes_count()
+        expensive: list[str] = []
+        for slot in (1, 2, 3):
+            if slot > passes:
+                continue
+            pid, model = self._reasoning_target(slot)
+            price = model_output_price_rub(pid, model)
+            if price is not None and price > EXPENSIVE_OUT_RUB_PER_M and model not in expensive:
+                expensive.append(model)
+        if expensive:
+            names = ", ".join(expensive)
+            self._set_status(
+                f"⚠ Это будет дорого: модель {names} — больше 1000 ₽ "
+                "за миллион выходных токенов.",
+                warn=True,
+            )
+
     def _on_reasoning_changed(self, slot: int, value: str) -> None:
         """Пользователь выбрал уровень рассуждений модели слота — сохранить."""
         pid, model = self._reasoning_target(slot)
@@ -6021,6 +6047,7 @@ class SurveyApp(ctk.CTk):
         self.model_combo.set(chosen)
         self._refresh_provider_highlights()
         self._refresh_reasoning_controls()
+        self._warn_expensive_models()
         self._persist_ai_preferences()
 
     def _on_model_selected(self, chosen_model: str) -> None:
@@ -6030,6 +6057,7 @@ class SurveyApp(ctk.CTk):
             self._selected_models[self._active_provider_id] = clean
             self._refresh_reasoning_controls()
             self._persist_ai_preferences()
+            self._warn_expensive_models()
 
     def _refresh_provider_highlights(self) -> None:
         active = self._active_provider_id
@@ -6388,6 +6416,7 @@ class SurveyApp(ctk.CTk):
             (self.pass2_model_var if slot == 2 else self.pass3_model_var).set(value)
             self._refresh_reasoning_controls()
             self._persist_ai_preferences()
+            self._warn_expensive_models()
 
     def _bind_update_source_autosave(self) -> None:
         """Persist the GitHub update source as soon as the field loses focus or Enter is hit."""

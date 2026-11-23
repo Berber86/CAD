@@ -86,7 +86,9 @@ __all__ = [
     "build_typo_suspicion_focus_prompt",
     "clean_provider_key",
     "compare_legal_descriptions",
+    "EXPENSIVE_OUT_RUB_PER_M",
     "HYDRA_MODEL_REASONING",
+    "model_output_price_rub",
     "reasoning_spec",
     "resolve_reasoning_effort",
     "detect_typo_suspicions",
@@ -171,34 +173,34 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         # ``reasoning_by_model`` рядом с выбранной моделью.
         "models": [
             "grok-4.7",
-            "gpt-6.2-sol",
-            "gpt-6.2-astra",
-            "gpt-6.1-sol",
-            "gpt-6.1-terra",
-            "gpt-6-sol",
             "gpt-6-luna",
-            "gpt-6-astra",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
+            "minimax-m3.1-flash",
+            "pro/glm-5.3-flash",
             "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
+            "pro/deepseek-v4.1-flash-1017",
             "gpt-5.4-nano",
-            "gpt-5.3-codex",
-            "gpt-5.2",
-            "gpt-5.1",
-            "gpt-5-mini",
-            "gemini-3.1-pro",
-            "gemini-3.8-flash",
-            "gemini-3-flash",
-            "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
+            "gpt-5-mini",
+            "gemini-3.5-flash-lite",
+            "gemini-3-flash",
+            "gemini-3.8-flash",
+            "gpt-5.4-mini",
+            "gpt-6.1-terra",
+            "gpt-5.1",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.2-sol",
             "claude-sonnet-5",
             "claude-sonnet-5.5",
-            "minimax-m3.1-flash",
-            "pro/deepseek-v4.1-flash-1017",
-            "pro/glm-5.3-flash",
+            "gemini-3.1-pro",
+            "gpt-5.6-terra",
+            "gpt-5.2",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-6.2-astra",
+            "gpt-6-astra",
         ],
         "reasoning_by_model": {},
     },
@@ -334,6 +336,22 @@ def resolve_reasoning_effort(
     stored = stored_map.get(str(model or "").strip()) if isinstance(stored_map, dict) else None
     stored = str(stored or "").strip()
     return stored if stored in choices else default
+
+
+#: Порог цены миллиона выходных токенов (₽), выше которого программа
+#: предупреждает «это будет дорого» перед использованием модели.
+EXPENSIVE_OUT_RUB_PER_M = 1000
+
+
+def model_output_price_rub(provider: str | None, model: str | None) -> float | None:
+    """Цена 1 млн выходных токенов модели Hydra в рублях или None, если неизвестна."""
+    if str(provider or "").strip().lower() != "hydra":
+        return None
+    spec = HYDRA_MODEL_REASONING.get(str(model or "").strip())
+    if not isinstance(spec, dict):
+        return None
+    price = spec.get("out_rub_per_m")
+    return float(price) if isinstance(price, (int, float)) else None
 
 
 DEFAULT_CONFIG: dict[str, Any] = {

@@ -1518,7 +1518,7 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(help_card, text="🆘 ПОМОЩЬ И ОБРАТНАЯ СВЯЗЬ",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#fbbf24", anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
-        ctk.CTkLabel(help_card, text="Столкнулись с ошибкой? Нажмите «Пожаловаться» — к разработчику уйдут только последние записи журнала и ваш комментарий. Без нажатия ничего не отправляется.",
+        ctk.CTkLabel(help_card, text="🐞 Пожаловаться — отправить журнал разработчику",
                      font=ctk.CTkFont(size=10), text_color=THEME["text_dim"], anchor="w", justify="left", wraplength=400).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
         ctk.CTkButton(help_card, text="🐛 Пожаловаться разработчику",
                       height=32, fg_color="#ea580c", hover_color="#c2410c",
@@ -1569,7 +1569,7 @@ class SurveyApp(ctk.CTk):
         self.ask_on_doubt_check.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
         ctk.CTkLabel(
             self.doubt_settings_card,
-            text="Включено: спрашивать при оставшихся сомнениях. Выключено: показывать замечания без вопросов. Однозначные автоисправления отмечаются на чертеже.",
+            text="Спрашивать при сомнениях",
             font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -3277,9 +3277,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
         ctk.CTkLabel(
             panel,
-            text=("Папки работ вида «1234A#417 WEST 33RD STREET» проходят весь "
-                  "автопоток по очереди: сбор PDF, разбор и новый DWG — всё в "
-                  "подпапке data каждой папки."),
+            text="Папки «номер#адрес» — по очереди: PDF → DWG, всё в data.",
             font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))

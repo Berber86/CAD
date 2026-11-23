@@ -3255,24 +3255,6 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_main"],
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
-        ctk.CTkLabel(
-            panel,
-            text=(
-                "По району: Staten Island — Richmond County Clerk, Manhattan/Bronx/Brooklyn/Queens — ACRIS. "
-                "Список документов участка, Deed новее 2015 года, "
-                "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
-                "документ (старый Deed), сосед — только свежий. "
-                "Имена: OUR LOT 32 NEW.pdf, OUR LOT 32 OLD.pdf, LOT 30 NEW.pdf. "
-                "Block/Lot и Borough читает локальный OCR. Vision получает карту и адрес; "
-                "при неудаче OCR надёжный режим может отправить левую половину карточки, "
-                "включая видимые персональные данные, для одного дополнительного запроса."
-            ),
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_dim"],
-            anchor="w",
-            justify="left",
-            wraplength=430,
-        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
 
         fields = ctk.CTkFrame(panel, fg_color="transparent")
         fields.grid(row=2, column=0, sticky="ew", padx=16)
@@ -3302,7 +3284,7 @@ class SurveyApp(ctk.CTk):
               "87 Stafford Ave")
         field(1, "Borough (район Нью-Йорка)", self.step0_borough_var, "Staten Island")
         self.step0_portal_button = ctk.CTkButton(
-            fields, text="🌐 Найти по адресу + анализ карты", height=32,
+            fields, text="🌐 Адрес → Block/Lot", height=32,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._start_step0_portal_lookup,
@@ -3411,7 +3393,7 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(12, 4))
 
         self.step0_auto_button = ctk.CTkButton(
-            panel, text="▶ Автопоток Staten Island · ИИ · DWG после отрисовки", height=38,
+            panel, text="▶ Автопоток", height=38,
             fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
             font=ctk.CTkFont(size=11, weight="bold"), command=self._start_step0_auto,
         )
@@ -3752,7 +3734,7 @@ class SurveyApp(ctk.CTk):
             self.attributes("-topmost", self._step0_portal_restore_topmost)
             self._step0_portal_restore_topmost = None
         self.step0_portal_button.configure(
-            state="normal", text="🌐 Найти по адресу + анализ карты",
+            state="normal", text="🌐 Адрес → Block/Lot",
         )
         self.step0_run_button.configure(state="normal")
         try:

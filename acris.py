@@ -20,6 +20,13 @@ Staten Island сюда НЕ ходит: там Richmond County Clerk (``rcclerk.
    Человеку приходится выбирать 99 руками; в прямом запросе это просто
    ``hid_max_rows=99``, а дальше — ``hid_page`` постранично.
 
+4. Кнопка IMG открывает ``DocumentImageView?doc_id=<16 цифр>``; внутри —
+   читалка Acordex VTU (страницы по одной, Print и дискета Save). Диалог
+   Save открывается с уже выбранным All: дискета → OK качает весь документ
+   PDF в «Загрузки» (скриншот пользователя — ``docs/acris/acris_save_dialog.png``;
+   автоматика этих двух кликов — ``acris_viewer.py``). Сам ``document_id``
+   по CRFN строки даёт NYC Open Data (ACRIS Master), без стены для роботов.
+
 Из песочницы разработки ACRIS automated-доступ режет («Further access to
 ACRIS is denied… automated scripts/robots»), поэтому живая проверка прямого
 POST — только на машине пользователя. Если прямой запрос зарежут и там,

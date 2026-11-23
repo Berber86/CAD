@@ -11,7 +11,7 @@
     "provider": "hydra",
     "api_key": "",
     "base_url": "https://api.hydraai.ru/v1",
-    "model": "glm-5.2",
+    "model": "grok-4.7",
     "temperature": 0.0,
     "timeout_sec": 500,
     "max_retries": 2,
@@ -27,14 +27,25 @@
         "base_url": "https://api.hydraai.ru/v1",
         "api_key": "",
         "env_key": "HYDRA_API_KEY",
-        "default_model": "glm-5.2",
-        "selected_model": "glm-5.2",
+        "default_model": "grok-4.7",
+        "selected_model": "grok-4.7",
         "models": [
-          "glm-5.2",
-          "hydra-gemini-pro",
-          "hydra-gemini-3-pro",
-          "hydra-gemini"
-        ]
+          "grok-4.7",
+          "gemini-3.1-pro",
+          "gemini-3.8-flash",
+          "gemini-3-flash",
+          "gemini-3.1-flash-lite",
+          "gpt-5.2",
+          "gpt-5.1",
+          "gpt-5.4-mini",
+          "gpt-5.4-nano",
+          "gpt-5.6-luna",
+          "claude-sonnet-5",
+          "minimax-m3.1-flash",
+          "pro/deepseek-v4.1-flash-1017",
+          "pro/glm-5.3-flash"
+        ],
+        "reasoning_by_model": {}
       },
       "openrouter": {
         "label": "OpenRouter",

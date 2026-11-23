@@ -36,10 +36,22 @@ def _content(completion: Any) -> str:
     return content
 
 
-def _call(client: Any, model: str, messages: list[dict[str, Any]]) -> str:
+def _call(client: Any, model: str, messages: list[dict[str, Any]],
+          reasoning_effort: str | None = None) -> str:
+    kwargs: dict[str, Any] = {}
+    if reasoning_effort:
+        kwargs['extra_body'] = {'reasoning_effort': reasoning_effort}
     try:
-        completion = client.chat.completions.create(model=model, messages=messages)
+        completion = client.chat.completions.create(model=model, messages=messages, **kwargs)
     except Exception as exc:
+        if kwargs and ('reasoning' in str(exc).lower()):
+            # Провайдер отверг уровень рассуждений — один повтор без него.
+            try:
+                completion = client.chat.completions.create(model=model, messages=messages)
+            except Exception as retry_exc:
+                exc = retry_exc
+            else:
+                return _content(completion)
         # Only a clear HTTP 413 establishes a request-size rejection; generic
         # 400/timeout/network failures must not cause automatic reduction.
         if getattr(exc, 'status_code', None) == 413:
@@ -59,7 +71,7 @@ def create_client(target: Mapping[str, str], *, timeout: float = 500) -> Any:
                                    'X-Title': 'Title Survey AI'})
 
 
-def make_sender(client: Any, model: str):
+def make_sender(client: Any, model: str, reasoning_effort: str | None = None):
     """Return the parser's ``send`` callback, one request per invocation."""
     system = system_instruction()
 
@@ -70,11 +82,11 @@ def make_sender(client: Any, model: str):
         user = [{'type': 'text', 'text': 'Lot context (not an answer filter): ' +
                  json.dumps(labels, ensure_ascii=False)}, *_images(pages)]
         return _call(client, model, [{'role': 'system', 'content': system},
-                                    {'role': 'user', 'content': user}])
+                                    {'role': 'user', 'content': user}], reasoning_effort)
     return send
 
 
-def make_selector(client: Any, model: str):
+def make_selector(client: Any, model: str, reasoning_effort: str | None = None):
     """Return an optional one-call tie selector; indices are zero-based."""
     def choose(pages: Sequence[PageImage], attempts: Sequence[Attempt]) -> int:
         variants = [{'index': idx, 'pages': list(attempt.pages),
@@ -84,7 +96,7 @@ def make_selector(client: Any, model: str):
         instruction = COMPARISON_INSTRUCTION
         content = [{'type': 'text', 'text': json.dumps(variants, ensure_ascii=False)}, *_images(pages)]
         raw = _call(client, model, [{'role': 'system', 'content': instruction},
-                                    {'role': 'user', 'content': content}])
+                                    {'role': 'user', 'content': content}], reasoning_effort)
         answer = json.loads(raw)
         if not isinstance(answer, dict) or set(answer) != {'selected'}:
             raise ValueError('invalid selection')

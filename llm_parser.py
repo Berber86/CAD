@@ -86,6 +86,9 @@ __all__ = [
     "build_typo_suspicion_focus_prompt",
     "clean_provider_key",
     "compare_legal_descriptions",
+    "HYDRA_MODEL_REASONING",
+    "reasoning_spec",
+    "resolve_reasoning_effort",
     "detect_typo_suspicions",
     "detect_visual_orientations_llm",
     "dms_to_degrees",
@@ -158,14 +161,31 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         "base_url": "https://api.hydraai.ru/v1",
         "api_key": "",
         "env_key": "HYDRA_API_KEY",
-        "default_model": "glm-5.2",
-        "selected_model": "glm-5.2",
+        "default_model": "grok-4.7",
+        "selected_model": "grok-4.7",
+        # Только модели с визуальным входом (text+image) и настраиваемым
+        # уровнем рассуждений — по публичному каталогу Hydra (GET /v1/models,
+        # проверка 2026-11-23). Текстовые glm-5.2 / hydra-gemini* удалены:
+        # сканы и фото чертежей они не видят. Уровни каждой модели —
+        # HYDRA_MODEL_REASONING ниже; выбор пользователя хранится в
+        # ``reasoning_by_model`` рядом с выбранной моделью.
         "models": [
-            "glm-5.2",
-            "hydra-gemini-pro",
-            "hydra-gemini-3-pro",
-            "hydra-gemini",
+            "grok-4.7",
+            "gemini-3.1-pro",
+            "gemini-3.8-flash",
+            "gemini-3-flash",
+            "gemini-3.1-flash-lite",
+            "gpt-5.2",
+            "gpt-5.1",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.6-luna",
+            "claude-sonnet-5",
+            "minimax-m3.1-flash",
+            "pro/deepseek-v4.1-flash-1017",
+            "pro/glm-5.3-flash",
         ],
+        "reasoning_by_model": {},
     },
     "openrouter": {
         "label": "OpenRouter",
@@ -204,6 +224,82 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+#: Уровни рассуждений (``reasoning_effort``) моделей Hydra из каталога выше:
+#: значение по умолчанию у провайдера и допустимые значения переключателя.
+#: Данные — публичный каталог Hydra (GET https://api.hydraai.ru/v1/models,
+#: проверка 2026-11-23): у каждой модели вход text+image и есть
+#: ``reasoning_effort`` с выбором. Моделей без этих данных здесь нет, и
+#: параметр им не отправляется (часть провайдеров отвечает на него HTTP 400).
+HYDRA_MODEL_REASONING: dict[str, dict[str, Any]] = {
+    "grok-4.7": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "gemini-3.1-pro": {"default": "low", "choices": ["low", "medium", "high"]},
+    "gemini-3.8-flash": {"default": "low", "choices": ["low", "medium", "high"]},
+    "gemini-3-flash": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"]},
+    "gemini-3.1-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"]},
+    "gpt-5.2": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "gpt-5.1": {"default": "none", "choices": ["none", "low", "medium", "high"]},
+    "gpt-5.4-mini": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "gpt-5.4-nano": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "gpt-5.6-luna": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "claude-sonnet-5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
+    "minimax-m3.1-flash": {"default": "low", "choices": ["low", "medium", "high", "xhigh", "max"]},
+    "pro/deepseek-v4.1-flash-1017": {"default": "none", "choices": ["none", "low", "high", "max"]},
+    "pro/glm-5.3-flash": {"default": "low", "choices": ["low", "high", "max"]},
+}
+
+#: Модели Hydra прежнего списка без визуального входа: удаляются миграцией
+#: ``load_config`` из пользовательских списков (см. там же).
+LEGACY_HYDRA_TEXT_MODELS: tuple[str, ...] = (
+    "glm-5.2",
+    "hydra-gemini-pro",
+    "hydra-gemini-3-pro",
+    "hydra-gemini",
+)
+
+
+def reasoning_spec(provider: str | None, model: str | None) -> tuple[str, list[str]] | None:
+    """(дефолт провайдера, допустимые уровни) для модели или None.
+
+    Настраиваемые рассуждения пока описаны только для каталога Hydra;
+    для остальных провайдеров и ручных имён моделей возвращается None, и
+    параметр ``reasoning_effort`` в запрос не добавляется.
+    """
+    if str(provider or "").strip().lower() != "hydra":
+        return None
+    spec = HYDRA_MODEL_REASONING.get(str(model or "").strip())
+    if not isinstance(spec, dict):
+        return None
+    choices = [str(v) for v in (spec.get("choices") or []) if str(v).strip()]
+    default = str(spec.get("default") or "").strip()
+    if not choices or default not in choices:
+        return None
+    return default, choices
+
+
+def resolve_reasoning_effort(
+    cfg: dict[str, Any] | None,
+    *,
+    provider: str | None,
+    model: str | None,
+) -> str | None:
+    """Итоговый ``reasoning_effort`` запроса: выбор пользователя или дефолт Hydra.
+
+    Выбор хранится в ``api.providers.hydra.reasoning_by_model[модель]``;
+    невалидное или отсутствующее значение заменяется дефолтом провайдера
+    из каталога. None — параметр не отправлять.
+    """
+    spec = reasoning_spec(provider, model)
+    if spec is None:
+        return None
+    default, choices = spec
+    providers = ((cfg or {}).get("api") or {}).get("providers") or {}
+    hydra_cfg = providers.get("hydra") if isinstance(providers, dict) else None
+    stored_map = (hydra_cfg or {}).get("reasoning_by_model") if isinstance(hydra_cfg, dict) else None
+    stored = stored_map.get(str(model or "").strip()) if isinstance(stored_map, dict) else None
+    stored = str(stored or "").strip()
+    return stored if stored in choices else default
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "multiple_description_search": {
         "enabled": False,
@@ -213,7 +309,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "provider": "hydra",
         "api_key": "",
         "base_url": "https://api.hydraai.ru/v1",
-        "model": "glm-5.2",
+        "model": "grok-4.7",
         "temperature": 0.0,
         # 500 с: Vision-модели через агрегаторов (grok-4.7 у Hydra) реально
         # отвечают 300–450 с; прежние 180 с обрывали уже готовящийся ответ,
@@ -721,6 +817,40 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     if cfg.get("api", {}).get("timeout_sec") == 180:
         cfg["api"]["timeout_sec"] = 500
 
+    # Миграция 4.81.11: список моделей Hydra пересмотрен — прежние модели не
+    # имеют визуального входа, поэтому из списка удаляются, а Vision-модели
+    # из каталога добавляются. Пользовательский config.json обновлением не
+    # перезаписывается, поэтому вычищаем прямо здесь; пользовательские
+    # ручные имена моделей (если были добавлены) не трогаем.
+    hydra_cfg = (cfg.get("api", {}).get("providers") or {}).get("hydra")
+    if isinstance(hydra_cfg, dict):
+        removed_hydra = set(LEGACY_HYDRA_TEXT_MODELS)
+        old_models = [str(m) for m in (hydra_cfg.get("models") or []) if str(m).strip()]
+        kept = [m for m in old_models if m not in removed_hydra]
+        for catalog_model in PROVIDERS_CATALOG["hydra"]["models"]:
+            if catalog_model not in kept:
+                kept.append(catalog_model)
+        hydra_cfg["models"] = kept
+        fallback_model = str(
+            PROVIDERS_CATALOG["hydra"].get("default_model") or "grok-4.7"
+        )
+        if str(hydra_cfg.get("selected_model") or "").strip() in removed_hydra:
+            hydra_cfg["selected_model"] = fallback_model
+        if str(hydra_cfg.get("default_model") or "").strip() in removed_hydra:
+            hydra_cfg["default_model"] = fallback_model
+        if not isinstance(hydra_cfg.get("reasoning_by_model"), dict):
+            hydra_cfg["reasoning_by_model"] = {}
+        # Выброшенный топ-левел api.model и цели консенсуса на удалённых моделях
+        if str((cfg.get("api") or {}).get("provider") or "").strip().lower() == "hydra":
+            if str((cfg.get("api") or {}).get("model") or "").strip() in removed_hydra:
+                cfg["api"]["model"] = fallback_model
+        cons_cfg = (cfg.get("api") or {}).get("consensus")
+        if isinstance(cons_cfg, dict):
+            for key in ("pass2_model", "pass3_model"):
+                section_pid = str(cons_cfg.get(key.replace("model", "provider")) or "").strip().lower()
+                if section_pid == "hydra" and str(cons_cfg.get(key) or "").strip() in removed_hydra:
+                    cons_cfg[key] = fallback_model
+
     dotenv_vars = load_dotenv_dict() if path is None else {}
     api = cfg["api"]
     providers = api.setdefault("providers", copy.deepcopy(PROVIDERS_CATALOG))
@@ -781,7 +911,7 @@ def resolve_api_target(
             or p_cfg.get("selected_model")
             or p_cfg.get("default_model")
             or api_cfg.get("model")
-            or "glm-5.2"
+            or "grok-4.7"
         ).strip()
     else:
         base_url = str(p_cfg.get("base_url") or api_cfg.get("base_url") or "").strip()
@@ -790,7 +920,7 @@ def resolve_api_target(
             or api_cfg.get("model")
             or p_cfg.get("selected_model")
             or p_cfg.get("default_model")
-            or "glm-5.2"
+            or "grok-4.7"
         ).strip()
 
     raw_key = (
@@ -2562,15 +2692,48 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 def _call_with_temperature(func: Callable[..., Any], **kwargs: Any) -> Any:
-    """Некоторые модели (o-series, gpt-5, reasoning) не принимают temperature."""
+    """Вызов провайдера с автоснятием неподдерживаемых параметров.
+
+    Некоторые модели (o-series, gpt-5, reasoning) не принимают
+    temperature; часть провайдеров отвергает ``reasoning_effort`` —
+    в обоих случаях повторяем без спорного параметра (модель ответит
+    на своём дефолте). Для beta.parse ``extra_body`` не поддерживается
+    самим SDK, поэтому уровень уходит именованным параметром.
+    """
     try:
         return func(**kwargs)
+    except TypeError as exc:  # SDK не принял extra_body (beta.parse)
+        if "extra_body" in kwargs and "extra_body" in str(exc):
+            kwargs.pop("extra_body")
+            if "reasoning_effort" not in kwargs and "_reasoning_effort" in kwargs:
+                kwargs["reasoning_effort"] = kwargs.pop("_reasoning_effort")
+            kwargs.pop("_reasoning_effort", None)
+            return func(**kwargs)
+        raise
     except Exception as exc:  # noqa: BLE001
         message = str(exc).lower()
+        kwargs.pop("_reasoning_effort", None)
         if "temperature" in message and "temperature" in kwargs:
             kwargs.pop("temperature")
             return func(**kwargs)
+        if "reasoning" in message or "reasoning_effort" in message:
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("extra_body", None)
+            return func(**kwargs)
         raise
+
+
+def _reasoning_kwargs(cfg: dict[str, Any], provider: str | None, model: str | None) -> dict[str, Any]:
+    """Ключи запроса с уровнем рассуждений: {} — модель без настройки reasoning.
+
+    ``reasoning_effort`` уходит в ``extra_body``: OpenAI SDK не объявляет его
+    параметром chat.completions для произвольных провайдеров, а Hydra ждёт
+    его верхним уровнем JSON-запроса (по документации провайдера).
+    """
+    effort = resolve_reasoning_effort(cfg, provider=provider, model=model)
+    if not effort:
+        return {}
+    return {"extra_body": {"reasoning_effort": effort}}
 
 
 def _unwrap_llm_payload(obj: Any) -> Any:
@@ -2664,6 +2827,7 @@ def _extract_with_llm(
     key_secret: str = "",
     image_data_urls: Sequence[str] | None = None,
     focus_instruction: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[LegalDescription, str, TokenUsage]:
     """
     Возвращает (Pydantic-модель, режим Structured Outputs, TokenUsage).
@@ -2679,6 +2843,9 @@ def _extract_with_llm(
     provider_id = target["provider"]
     provider_label = target["provider_label"]
     temperature = api_cfg.get("temperature", 0.0)
+    reasoning_kw = _reasoning_kwargs(cfg, provider_id, model_name)
+    if reasoning_effort:
+        reasoning_kw = {"extra_body": {"reasoning_effort": str(reasoning_effort)}}
     client = _make_client(api_cfg, target=target)
     messages = _messages(
         text,
@@ -2726,6 +2893,7 @@ def _extract_with_llm(
                 messages=messages,
                 response_format=LegalDescription,
                 temperature=temperature,
+                **reasoning_kw,
             )
             record_usage(completion)
             message = completion.choices[0].message
@@ -2761,6 +2929,7 @@ def _extract_with_llm(
                     "schema": schema,
                 },
             },
+            **reasoning_kw,
         )
         record_usage(completion)
         content = completion.choices[0].message.content or ""
@@ -2795,6 +2964,7 @@ def _extract_with_llm(
             messages=guided_messages,
             temperature=temperature,
             response_format={"type": "json_object"},
+            **reasoning_kw,
         )
         record_usage(completion)
         content = completion.choices[0].message.content or ""
@@ -2818,6 +2988,7 @@ def _extract_with_llm(
             model=model_name,
             messages=guided_messages,
             temperature=temperature,
+            **reasoning_kw,
         )
         record_usage(completion)
         content = completion.choices[0].message.content or ""
@@ -2836,7 +3007,7 @@ def _extract_with_llm(
     detail = " | ".join(errors[-3:])
     vision_hint = (
         " (для PDF без текстового слоя убедитесь, что выбрана Vision-модель: "
-        "например hydra-gemini-pro, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)"
+        "например grok-4.7, nvidia/nemotron-3.5-super-vl:free или openai/gpt-4.1)"
         if image_data_urls
         else ""
     )
@@ -2945,6 +3116,7 @@ def ask_llm_json(
     )
     model_name = target["model"]
     provider_label = target["provider_label"]
+    reasoning_kw = _reasoning_kwargs(cfg, target["provider"], model_name)
     client = _make_client(api_cfg, target=target)
     images = list(image_data_urls or [])
     if images:
@@ -3000,6 +3172,7 @@ def ask_llm_json(
                     model=model_name,
                     messages=messages_for(text_round),
                     temperature=api_cfg.get("temperature", 0.0),
+                    **reasoning_kw,
                     **extra,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -5705,6 +5878,7 @@ def detect_visual_orientations_llm(
                 messages=messages,
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                **_reasoning_kwargs(cfg, target["provider"], target["model"]),
             )
         except Exception as inner_exc:  # noqa: BLE001
             if _is_auth_error(inner_exc):
@@ -5714,6 +5888,7 @@ def detect_visual_orientations_llm(
                 model=target["model"],
                 messages=messages,
                 temperature=0.0,
+                **_reasoning_kwargs(cfg, target["provider"], target["model"]),
             )
     except Exception as exc:  # noqa: BLE001
         if _is_auth_error(exc):
@@ -6689,7 +6864,7 @@ def build_pass_targets(
     p1_default_model = (
         (providers_map.get(p1_prov) or {}).get("selected_model")
         or api_cfg.get("model")
-        or "glm-5.2"
+        or "grok-4.7"
     )
     p1_model = str(primary_model or p1_default_model).strip()
     targets = [
@@ -6706,7 +6881,12 @@ def build_pass_targets(
         p2_model = str(cons_cfg.get("pass2_model") or p2_def).strip()
         p2_key = primary_api_key if p2_prov == p1_prov else None
         targets.append(
-            PassTarget(pass_index=2, provider=p2_prov, model=p2_model, api_key=p2_key)
+            PassTarget(
+                pass_index=2,
+                provider=p2_prov,
+                model=p2_model,
+                api_key=p2_key,
+            )
         )
     if count >= 3:
         p3_prov = str(cons_cfg.get("pass3_provider") or p1_prov).strip().lower()
@@ -6714,7 +6894,12 @@ def build_pass_targets(
         p3_model = str(cons_cfg.get("pass3_model") or p3_def).strip()
         p3_key = primary_api_key if p3_prov == p1_prov else None
         targets.append(
-            PassTarget(pass_index=3, provider=p3_prov, model=p3_model, api_key=p3_key)
+            PassTarget(
+                pass_index=3,
+                provider=p3_prov,
+                model=p3_model,
+                api_key=p3_key,
+            )
         )
     return targets
 

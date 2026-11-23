@@ -817,7 +817,7 @@ def test_gui_builds_and_reports(gui):
     assert app.provider_ids == ["hydra", "openrouter", "routerai"]
     assert app.provider_labels == ["Hydra AI", "OpenRouter", "RouterAI"]
     assert app.current_provider_id() == "hydra"
-    assert app.current_model() == "glm-5.2"
+    assert app.current_model() == "grok-4.7"
     assert "активен" in app.provider_key_labels["hydra"].cget("text")
 
     # Меняем модель в Hydra, переключаемся в OpenRouter и RouterAI, затем назад
@@ -5981,3 +5981,34 @@ def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_
         'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
     assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
         'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+
+
+def test_reasoning_switches_follow_hydra_models(gui):
+    """Переключатель рассуждений: в настройках и в главном окне при 1 проходе."""
+    app = gui.SurveyApp()
+    assert app.current_provider_id() == "hydra"
+    assert app.current_model() == "grok-4.7"
+    # Hydra grok-4.7: дефолт провайдера none, уровни из каталога Hydra.
+    assert app.reasoning_switch.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+    assert app.reasoning_var.get() == "none"
+    assert app.current_reasoning_effort() == "none"
+    # Главный переключатель виден при одном проходе.
+    assert getattr(app.reasoning_switch_main, "_gridded", False)
+    assert app.reasoning_switch_main.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+
+    app._on_reasoning_changed(1, "high")
+    assert app.current_reasoning_effort() == "high"
+    cfg_rt, active_pid, active_model, _key, _secret = app._build_runtime_config()
+    assert active_pid == "hydra" and active_model == "grok-4.7"
+    assert cfg_rt["api"]["providers"]["hydra"]["reasoning_by_model"]["grok-4.7"] == "high"
+
+    # При двух проходах главный переключатель скрыт (у каждого слота свой в настройках).
+    app.select_passes(2)
+    assert not getattr(app.reasoning_switch_main, "_gridded", True)
+    app.select_passes(1)
+    assert getattr(app.reasoning_switch_main, "_gridded", False)
+
+    # Модель другого провайдера без настраиваемых рассуждений — переключателя нет.
+    app.select_provider("OpenRouter")
+    assert app.current_reasoning_effort() is None
+    assert not getattr(app.reasoning_switch_main, "_gridded", True)

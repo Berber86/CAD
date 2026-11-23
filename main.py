@@ -145,6 +145,8 @@ from llm_parser import (
     parse_with_regex,
     prepare_survey_image_bytes,
     protect_api_key,
+    reasoning_spec,
+    resolve_reasoning_effort,
     recheck_consensus_discrepancies,
     recheck_typo_suspicion,
     resolve_api_target,
@@ -691,7 +693,7 @@ class SurveyApp(ctk.CTk):
             if default_m and default_m not in models:
                 models.insert(0, default_m)
             if not models:
-                models = [default_m or "glm-5.2"]
+                models = [default_m or "grok-4.7"]
             self._provider_models[pid] = models
             self._selected_models[pid] = default_m or models[0]
 
@@ -737,6 +739,16 @@ class SurveyApp(ctk.CTk):
         init_passes = max(1, min(3, int(cons_cfg.get("passes") or 1)))
         self.passes_options = ["1 проход", "2 прохода", "3 прохода"]
         self.passes_label_var = ctk.StringVar(value=self.passes_options[init_passes - 1])
+
+        # Уровни рассуждений моделей Hydra: выбор пользователя на каждую модель
+        hydra_reasoning_cfg = ((self.config_data["api"].get("providers") or {}).get("hydra") or {}).get("reasoning_by_model")
+        self._reasoning_by_model: dict[str, str] = (
+            {str(k): str(v) for k, v in hydra_reasoning_cfg.items() if str(k).strip() and str(v).strip()}
+            if isinstance(hydra_reasoning_cfg, dict) else {}
+        )
+        self.reasoning_var = ctk.StringVar(value="")
+        self.pass2_reasoning_var = ctk.StringVar(value="")
+        self.pass3_reasoning_var = ctk.StringVar(value="")
 
         p2_pid = str(cons_cfg.get("pass2_provider") or "openrouter").strip().lower()
         if p2_pid not in self._pid_to_label:
@@ -1670,6 +1682,28 @@ class SurveyApp(ctk.CTk):
         )
         self.model_combo.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
 
+        self.reasoning_label = ctk.CTkLabel(
+            pass1_card,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.reasoning_label.grid(row=5, column=0, sticky="w", padx=10)
+        self.reasoning_switch = ctk.CTkSegmentedButton(
+            pass1_card,
+            values=[],
+            variable=self.reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.reasoning_switch.grid(row=6, column=0, sticky="ew", padx=10, pady=(2, 9))
+
         # Слот Прохода #2 (независимая сверка)
         self.pass2_row = _slot_card(3, "Проход #2", "независимая сверка", THEME["sky"])
         self.pass2_provider_switch = ctk.CTkSegmentedButton(
@@ -1698,6 +1732,28 @@ class SurveyApp(ctk.CTk):
         )
         self.pass2_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
+        self.pass2_reasoning_label = ctk.CTkLabel(
+            self.pass2_row,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.pass2_reasoning_label.grid(row=3, column=0, sticky="w", padx=10)
+        self.pass2_reasoning_switch = ctk.CTkSegmentedButton(
+            self.pass2_row,
+            values=[],
+            variable=self.pass2_reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(2, val),
+        )
+        self.pass2_reasoning_switch.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
+
         # Слот Прохода #3 (арбитражный)
         self.pass3_row = _slot_card(4, "Проход #3", "арбитражный слот", THEME["ok"])
         self.pass3_provider_switch = ctk.CTkSegmentedButton(
@@ -1725,6 +1781,28 @@ class SurveyApp(ctk.CTk):
             command=lambda val: self._on_pass_model_selected(3, val),
         )
         self.pass3_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
+
+        self.pass3_reasoning_label = ctk.CTkLabel(
+            self.pass3_row,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.pass3_reasoning_label.grid(row=3, column=0, sticky="w", padx=10)
+        self.pass3_reasoning_switch = ctk.CTkSegmentedButton(
+            self.pass3_row,
+            values=[],
+            variable=self.pass3_reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(3, val),
+        )
+        self.pass3_reasoning_switch.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
 
         # 3. Левая колонка «1 Источник»: шапка панели + вкладки Текст / PDF / Фото
         workspace = self.left_panel
@@ -2319,6 +2397,27 @@ class SurveyApp(ctk.CTk):
             command=self._on_passes_changed,
         )
         self.passes_switch_mini.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
+
+        self.reasoning_main_label = ctk.CTkLabel(
+            engine_card,
+            text="Рассужд.",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        )
+        self.reasoning_main_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.reasoning_switch_main = ctk.CTkSegmentedButton(
+            engine_card,
+            values=[],
+            variable=self.reasoning_var,
+            height=24,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.reasoning_switch_main.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
 
         # Блок главного действия в источнике (Spectrum: «Разобрать и проверить» + regex)
         run_box = ctk.CTkFrame(input_frame, fg_color=THEME["bg_header"], corner_radius=0)
@@ -5238,6 +5337,10 @@ class SurveyApp(ctk.CTk):
         passes = self.current_passes_count()
         provider = self._pid_to_label.get(self._active_provider_id, self._active_provider_id)
         extra = f" + ещё {passes - 1}" if passes > 1 else ""
+        if passes == 1:
+            effort = self.current_reasoning_effort()
+            if effort:
+                extra += f"  ·  рассужд. {effort}"
         self.engine_model_var.set(f"{model}  ·  {provider}{extra}")
         badge = getattr(self, "ask_on_doubt_badge", None)
         if badge is not None:
@@ -5698,8 +5801,94 @@ class SurveyApp(ctk.CTk):
     def _on_passes_changed(self, _selected_label: str = "") -> None:
         self._refresh_consensus_rows()
 
+    def _reasoning_target(self, slot: int) -> tuple[str, str]:
+        """(провайдер, модель) слота прохода 1/2/3 для переключателя рассуждений."""
+        if slot == 2:
+            return self.current_pass2_provider_id(), self.current_pass2_model()
+        if slot == 3:
+            return self.current_pass3_provider_id(), self.current_pass3_model()
+        return self.current_provider_id(), self.current_model()
+
+    def current_reasoning_effort(self) -> str | None:
+        """Выбранный уровень рассуждений активной модели (None — параметр не шлётся)."""
+        pid, model = self._reasoning_target(1)
+        spec = reasoning_spec(pid, model)
+        if spec is None:
+            return None
+        default, choices = spec
+        stored = str(self._reasoning_by_model.get(model) or "").strip()
+        return stored if stored in choices else default
+
+    def _refresh_reasoning_controls(self) -> None:
+        """Синхронизирует переключатели рассуждений с выбранными моделями.
+
+        Показывает переключатель только для моделей с настраиваемым уровнем
+        (сейчас это каталог Hydra); главный переключатель в карточке движка —
+        только при одном проходе, настройки слотов — всегда.
+        """
+        slots = (
+            (1, self.reasoning_var, getattr(self, "reasoning_switch", None),
+             getattr(self, "reasoning_label", None), (6, 5)),
+            (2, self.pass2_reasoning_var, getattr(self, "pass2_reasoning_switch", None),
+             getattr(self, "pass2_reasoning_label", None), (4, 3)),
+            (3, self.pass3_reasoning_var, getattr(self, "pass3_reasoning_switch", None),
+             getattr(self, "pass3_reasoning_label", None), (4, 3)),
+        )
+        use_llm = bool(self.use_llm_var.get())
+        for slot, var, switch, label, rows in slots:
+            if switch is None or label is None:
+                continue
+            pid, model = self._reasoning_target(slot)
+            spec = reasoning_spec(pid, model)
+            if spec is None:
+                var.set("")
+                switch.grid_remove()
+                label.grid_remove()
+                continue
+            default, choices = spec
+            stored = str(self._reasoning_by_model.get(model) or "").strip()
+            var.set(stored if stored in choices else default)
+            switch.configure(values=list(choices))
+            state = "normal" if use_llm else "disabled"
+            switch.configure(state=state)
+            label.grid(row=rows[1], column=0, sticky="w", padx=10)
+            switch.grid(row=rows[0], column=0, sticky="ew", padx=10, pady=(2, 9))
+        main_switch = getattr(self, "reasoning_switch_main", None)
+        main_label = getattr(self, "reasoning_main_label", None)
+        if main_switch is not None and main_label is not None:
+            spec1 = reasoning_spec(*self._reasoning_target(1))
+            show_main = (
+                use_llm and self.current_passes_count() == 1 and spec1 is not None
+            )
+            if spec1 is not None:
+                main_switch.configure(values=list(spec1[1]))
+            if show_main:
+                main_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+                main_switch.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
+            else:
+                main_label.grid_remove()
+                main_switch.grid_remove()
+
+    def _on_reasoning_changed(self, slot: int, value: str) -> None:
+        """Пользователь выбрал уровень рассуждений модели слота — сохранить."""
+        pid, model = self._reasoning_target(slot)
+        spec = reasoning_spec(pid, model)
+        clean = str(value or "").strip()
+        if spec is None or clean not in spec[1] or not model:
+            return
+        self._reasoning_by_model[model] = clean
+        self._persist_ai_preferences()
+        self._refresh_engine_card()
+
+    def select_reasoning(self, value: str) -> None:
+        """Программный выбор уровня рассуждений активной модели (для тестов/вызовов)."""
+        self._on_reasoning_changed(1, value)
+        if str(value or "").strip():
+            self.reasoning_var.set(str(value).strip())
+
     def _refresh_consensus_rows(self) -> None:
         self._refresh_parse_actions()
+        self._refresh_reasoning_controls()
         use_llm = bool(self.use_llm_var.get())
         count = self.current_passes_count() if use_llm else 1
         state = "normal" if use_llm else "disabled"
@@ -5766,6 +5955,7 @@ class SurveyApp(ctk.CTk):
         self.pass2_model_combo.configure(values=models)
         self.pass2_model_var.set(chosen)
         self.pass2_model_combo.set(chosen)
+        self._refresh_reasoning_controls()
         self._persist_ai_preferences()
 
     def _on_pass3_provider_changed(self, selected_label: str) -> None:
@@ -5778,6 +5968,7 @@ class SurveyApp(ctk.CTk):
         self.pass3_model_combo.configure(values=models)
         self.pass3_model_var.set(chosen)
         self.pass3_model_combo.set(chosen)
+        self._refresh_reasoning_controls()
         self._persist_ai_preferences()
 
     def select_pass2_target(
@@ -5829,6 +6020,7 @@ class SurveyApp(ctk.CTk):
         self.model_var.set(chosen)
         self.model_combo.set(chosen)
         self._refresh_provider_highlights()
+        self._refresh_reasoning_controls()
         self._persist_ai_preferences()
 
     def _on_model_selected(self, chosen_model: str) -> None:
@@ -5836,6 +6028,7 @@ class SurveyApp(ctk.CTk):
         if clean:
             self.model_var.set(clean)
             self._selected_models[self._active_provider_id] = clean
+            self._refresh_reasoning_controls()
             self._persist_ai_preferences()
 
     def _refresh_provider_highlights(self) -> None:
@@ -6168,6 +6361,8 @@ class SurveyApp(ctk.CTk):
                 models = [str(value) for value in (provider_cfg.get("models") or [])]
                 if model and model not in models:
                     provider_cfg["models"] = [model, *models]
+            hydra_persist = providers.setdefault("hydra", {})
+            hydra_persist["reasoning_by_model"] = dict(self._reasoning_by_model)
             api["consensus"] = {
                 "passes": self.current_passes_count(),
                 "pass2_provider": pass2_pid,
@@ -6191,6 +6386,7 @@ class SurveyApp(ctk.CTk):
         value = str(chosen_model or "").strip()
         if value:
             (self.pass2_model_var if slot == 2 else self.pass3_model_var).set(value)
+            self._refresh_reasoning_controls()
             self._persist_ai_preferences()
 
     def _bind_update_source_autosave(self) -> None:
@@ -10488,6 +10684,8 @@ class SurveyApp(ctk.CTk):
                 if extra_m not in m_list:
                     m_list.insert(0, extra_m)
                     providers[extra_pid]["models"] = m_list
+        hydra_runtime = providers.setdefault("hydra", {})
+        hydra_runtime["reasoning_by_model"] = dict(self._reasoning_by_model)
         cfg["api"]["consensus"] = {
             "passes": self.current_passes_count(),
             "pass2_provider": p2_pid,
@@ -13168,7 +13366,7 @@ class SurveyApp(ctk.CTk):
                         "plan": plan,
                         "cfg": cfg,
                         "provider_id": str(cfg.get("api", {}).get("provider") or "hydra"),
-                        "model_name": str(cfg.get("api", {}).get("model") or "glm-5.2"),
+                        "model_name": str(cfg.get("api", {}).get("model") or "grok-4.7"),
                         "api_key": None,
                         "key_secret": key_secret,
                         "use_llm": True,

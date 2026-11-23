@@ -367,7 +367,9 @@ def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
     timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
-    return transport.make_sender(client, target.model), transport.make_selector(client, target.model)
+    effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
+    return (transport.make_sender(client, target.model, effort),
+            transport.make_selector(client, target.model, effort))
 
 
 @contextmanager
@@ -376,8 +378,10 @@ def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
     timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
+    effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
     try:
-        yield transport.make_sender(client, target.model), transport.make_selector(client, target.model)
+        yield (transport.make_sender(client, target.model, effort),
+               transport.make_selector(client, target.model, effort))
     finally:
         client.close()
 

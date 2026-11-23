@@ -215,7 +215,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.hydraai.ru/v1",
         "model": "glm-5.2",
         "temperature": 0.0,
-        "timeout_sec": 180,
+        # 500 с: Vision-модели через агрегаторов (grok-4.7 у Hydra) реально
+        # отвечают 300–450 с; прежние 180 с обрывали уже готовящийся ответ,
+        # а повторы SDK заново списывали входные токены у провайдера.
+        "timeout_sec": 500,
         "max_retries": 2,
         "max_input_chars": 60000,
         "vision_dpi": 220,
@@ -709,6 +712,14 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         _deep_update(cfg, _read_json_dict(cfg_path))
     if path is None and LOCAL_CONFIG_PATH.exists():
         _deep_update(cfg, _read_json_dict(LOCAL_CONFIG_PATH))
+
+    # Миграция 4.81.10: значение 180 — прежний поставляемый таймаут ожидания
+    # ответа LLM. Обновление не перезаписывает пользовательский config.json
+    # (защищён в app_updater), поэтому старый дефолт поднимаем здесь до 500 с:
+    # ответы Vision-моделей дольше 180 с клиент просто не дожидался и платил
+    # за повторы. Явно заданные другие значения не трогаем.
+    if cfg.get("api", {}).get("timeout_sec") == 180:
+        cfg["api"]["timeout_sec"] = 500
 
     dotenv_vars = load_dotenv_dict() if path is None else {}
     api = cfg["api"]
@@ -2533,7 +2544,7 @@ def _make_client(
     return OpenAI(
         api_key=key,
         base_url=base_url,
-        timeout=float(api_cfg.get("timeout_sec") or 180),
+        timeout=float(api_cfg.get("timeout_sec") or 500),
         max_retries=int(api_cfg.get("max_retries") or 0),
         default_headers={
             "HTTP-Referer": "https://github.com/Berber86/CAD",

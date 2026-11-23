@@ -48,7 +48,7 @@ def _call(client: Any, model: str, messages: list[dict[str, Any]]) -> str:
     return _content(completion)
 
 
-def create_client(target: Mapping[str, str], *, timeout: float = 180) -> Any:
+def create_client(target: Mapping[str, str], *, timeout: float = 500) -> Any:
     """Construct an SDK client with retries disabled; no network call is made."""
     from openai import OpenAI
     if not target.get('api_key') or not target.get('base_url'):

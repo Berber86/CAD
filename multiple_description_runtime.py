@@ -365,7 +365,7 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
 
 def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
-    timeout = float(api.get('timeout_sec') or 180)
+    timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
     return transport.make_sender(client, target.model), transport.make_selector(client, target.model)
 
@@ -374,7 +374,7 @@ def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
 def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
     """Own the transport client for one job and close it even on cancellation."""
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
-    timeout = float(api.get('timeout_sec') or 180)
+    timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
     try:
         yield transport.make_sender(client, target.model), transport.make_selector(client, target.model)

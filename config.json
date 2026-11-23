@@ -13,7 +13,7 @@
     "base_url": "https://api.hydraai.ru/v1",
     "model": "glm-5.2",
     "temperature": 0.0,
-    "timeout_sec": 180,
+    "timeout_sec": 500,
     "max_retries": 2,
     "max_input_chars": 60000,
     "vision_dpi": 220,

@@ -27,6 +27,16 @@ DIALOG_ROWS = READY_ROWS + [
     ScreenText("OK", (242, 194, 270, 214)),
 ]
 
+#: Живой прогон 2026-11-23: тулбар читалки есть, а вместо страницы — ошибка.
+ERROR_ROWS = READY_ROWS + [
+    ScreenText("HTTP 405 Method Not Allowed", (60, 300, 330, 318)),
+]
+
+DOC_URL = ("https://a836-acris.nyc.gov/DS/DocumentSearch/"
+           "DocumentImageView?doc_id=2024101000085001")
+WARM_URL = ("https://a836-acris.nyc.gov/DS/DocumentSearch/"
+            "BBL?borough=1&block=731&lot=53")
+
 
 def test_looks_like_viewer_and_dialog():
     assert acris_viewer.looks_like_viewer(READY_ROWS)
@@ -151,6 +161,121 @@ def test_manual_step_when_viewer_never_opens(tmp_path):
             sleep=clock.sleep, monotonic=clock.monotonic,
             viewer_wait_sec=1, dialog_wait_sec=1, download_wait_sec=1, poll_sec=0.1,
         )
+
+
+def test_http_error_text_detects_405_not_document_numbers():
+    assert "405" in acris_viewer.http_error_text(ERROR_ROWS)
+    assert acris_viewer.http_error_text(READY_ROWS) is None
+    # Голая цифра в тексте самого документа — не серверная ошибка.
+    assert acris_viewer.http_error_text([ScreenText("405", (0, 0, 30, 10))]) is None
+    # OCR может разрезать фразу на две строки — склейка тоже проверяется.
+    split = [ScreenText("Method", (0, 0, 60, 10)), ScreenText("Not Allowed", (70, 0, 160, 10))]
+    assert acris_viewer.http_error_text(split) is not None
+
+
+def test_warmup_search_recovers_from_http_405(tmp_path):
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    target = tmp_path / "out" / "OUR LOT 53 NEW.pdf"
+    clock = _Clock()
+    opened: list[str] = []
+    clicks: list[tuple[int, int]] = []
+    state = {"dialog": False}
+
+    def capture(_handle):
+        if state["dialog"]:
+            return DIALOG_ROWS
+        # Пока документ открывали только напрямую — читалка показывает 405;
+        # после прогрева поиском (третье открытие) страница живая.
+        return READY_ROWS if len(opened) >= 3 else ERROR_ROWS
+
+    def click(_handle, x, y):
+        clicks.append((x, y))
+        if len(clicks) == 1:
+            state["dialog"] = True
+        else:
+            (downloads / "2024101000085001.pdf").write_bytes(b"%PDF-1.4 fake")
+        return True
+
+    saved, rung = acris_viewer.download_pdf_via_viewer(
+        DOC_URL, target,
+        downloads_dir=downloads, warmup_url=WARM_URL,
+        open_browser=opened.append,
+        windows_fn=lambda: [_window()],
+        active_fn=lambda: 7,
+        bounds_fn=lambda _h: (0, 0, 1600, 900),
+        capture_rows_fn=capture,
+        click_fn=click,
+        focus_fn=lambda _h: True,
+        sleep=clock.sleep, monotonic=clock.monotonic,
+        viewer_wait_sec=30, dialog_wait_sec=5, download_wait_sec=30, poll_sec=0.1,
+    )
+    assert (saved, rung) == (target, "browser")
+    assert target.read_bytes().startswith(b"%PDF-")
+    # Порядок открытий: документ (405) → прогрев поиском → документ ещё раз.
+    assert opened == [DOC_URL, WARM_URL, DOC_URL]
+    assert clicks[0] == (425, 103)
+    assert clicks[1] == (256, 204)
+
+
+def test_http_405_after_warmup_goes_manual_with_search_hint(tmp_path):
+    clock = _Clock()
+    opened: list[str] = []
+    with pytest.raises(rcclerk.ManualStepNeeded) as caught:
+        acris_viewer.download_pdf_via_viewer(
+            DOC_URL, tmp_path / "x.pdf",
+            downloads_dir=tmp_path, warmup_url=WARM_URL,
+            open_browser=opened.append,
+            windows_fn=lambda: [_window()],
+            active_fn=lambda: 7,
+            bounds_fn=lambda _h: (0, 0, 1600, 900),
+            capture_rows_fn=lambda _h: ERROR_ROWS,
+            click_fn=lambda _h, _x, _y: True,
+            focus_fn=lambda _h: True,
+            sleep=clock.sleep, monotonic=clock.monotonic,
+            viewer_wait_sec=30, dialog_wait_sec=1, download_wait_sec=1, poll_sec=0.1,
+        )
+    # Ручной шаг объясняет: документ открывать из результатов поиска.
+    assert "405" in str(caught.value)
+    assert "поиск по Block/Lot" in str(caught.value)
+    assert opened == [DOC_URL, WARM_URL, DOC_URL]
+
+
+def test_http_405_during_pdf_wait_stops_early(tmp_path):
+    clock = _Clock()
+    state = {"dialog": False, "ok": False}
+    clicks = {"n": 0}
+
+    def capture(_handle):
+        if state["ok"]:
+            return ERROR_ROWS
+        return DIALOG_ROWS if state["dialog"] else READY_ROWS
+
+    def click(_handle, _x, _y):
+        clicks["n"] += 1
+        if clicks["n"] == 1:
+            state["dialog"] = True
+        else:
+            state["ok"] = True
+        return True
+
+    with pytest.raises(rcclerk.ManualStepNeeded) as caught:
+        acris_viewer.download_pdf_via_viewer(
+            DOC_URL, tmp_path / "x.pdf",
+            downloads_dir=tmp_path,
+            open_browser=lambda _url: None,
+            windows_fn=lambda: [_window()],
+            active_fn=lambda: 7,
+            bounds_fn=lambda _h: (0, 0, 1600, 900),
+            capture_rows_fn=capture,
+            click_fn=click,
+            focus_fn=lambda _h: True,
+            sleep=clock.sleep, monotonic=clock.monotonic,
+            viewer_wait_sec=5, dialog_wait_sec=5, download_wait_sec=300, poll_sec=0.1,
+        )
+    assert "405" in str(caught.value)
+    # Не висели полные 300 секунд ожидания PDF.
+    assert clock.now < 60
 
 
 def test_stop_raises_download_stopped(tmp_path):

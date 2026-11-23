@@ -121,6 +121,17 @@ def test_fetch_with_fake_opener_returns_html(results_html):
 _MASTER_JSON = b'[{"crfn": "2024000265906", "document_id": "2024101000085001"}]'
 
 
+def test_search_form_url_is_browser_warmup_deep_link():
+    # Ссылка прогрева сессии для читалки: поиск по BBL прямо в браузере.
+    assert acris.search_form_url(1, 731, 53) == (
+        "https://a836-acris.nyc.gov/DS/DocumentSearch/BBL?borough=1&block=731&lot=53"
+    )
+    assert acris.search_form_url("Queens", "3123", "40").endswith(
+        "BBL?borough=4&block=3123&lot=40")
+    with pytest.raises(ValueError):
+        acris.search_form_url("Staten Island", 100, 1)
+
+
 def test_document_image_url():
     assert acris.document_image_url("2024101000085001") == (
         "https://a836-acris.nyc.gov/DS/DocumentSearch/DocumentImageView"

@@ -3536,7 +3536,7 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     assert app.hide_field_notes_var.get() is True
     assert "FENCE_NOTE" in app.step2_notes_hint.cget("text")
     assert app.feature_auto_button.cget("text") == "🔎 Автопоиск и подписание"
-    assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
+    assert app.feature_pick_button.cget("text") == "🖱 Указать границу и подписать"
     assert "0.900 ft" in app.step2_height_label.cget("text")
     assert app.step2_height_entry.cget("placeholder_text") == "авто"
     assert app.feature_text_height_var.get() == ""
@@ -3716,7 +3716,7 @@ def test_step2_error_is_shown_in_report_and_status(gui, monkeypatch):
     report = app.step2_report_box.get("1.0", "end")
     assert report.startswith("ШАГ 2 НЕ ВЫПОЛНЕН")
     assert "не найден замкнутый контур участка" in report
-    assert "Указать границу участка в AutoCAD" in report  # подсказка для автопоиска
+    assert "Указать границу и подписать" in report  # подсказка для автопоиска
     assert "Шаг 2 не выполнен" in app.status_var.get()
     assert app.feature_label_result is None
     assert app._busy is False

@@ -1940,7 +1940,7 @@ class SurveyApp(ctk.CTk):
 
         self.load_pdf_button = ctk.CTkButton(
             self.pdf_mode_card,
-            text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O",
+            text="⭱ Выберите PDF · Ctrl+O",
             height=64,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -4456,7 +4456,7 @@ class SurveyApp(ctk.CTk):
         self.feature_auto_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.feature_pick_button = ctk.CTkButton(
             panel,
-            text="🖱  Указать границу участка в AutoCAD и подписать объекты",
+            text="🖱 Указать границу и подписать",
             height=38,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
@@ -5031,7 +5031,7 @@ class SurveyApp(ctk.CTk):
             hint = (
                 "" if mode == "pick" else
                 "\n\nЕсли участок не находится автоматически, нажмите "
-                "«Указать границу участка в AutoCAD и подписать объекты»."
+                "«Указать границу и подписать»."
             )
             self._set_step2_report(f"ШАГ 2 НЕ ВЫПОЛНЕН\n\n{message}{hint}")
             for var in self.step2_stat_vars.values():
@@ -8575,7 +8575,7 @@ class SurveyApp(ctk.CTk):
                 self.neighbor_pdf_summary.grid_remove()
         else:
             self.load_pdf_button.configure(
-                text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O"
+                text="⭱ Выберите PDF · Ctrl+O"
             )
             self.pdf_info_label.grid()
             self.load_images_button.grid()

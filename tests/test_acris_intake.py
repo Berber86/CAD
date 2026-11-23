@@ -134,3 +134,19 @@ def test_make_acris_downloader_opens_viewer_url(tmp_path):
     assert rung == "browser"
     assert seen["url"].endswith(f"DocumentImageView?doc_id={DOC_ID}")
     assert seen["downloads_dir"] == tmp_path / "dl"
+
+
+def test_make_acris_downloader_passes_warmup_url(tmp_path):
+    seen = {}
+
+    def viewer(url, destination, **kwargs):
+        seen.update(kwargs)
+        return Path(destination), "browser"
+
+    warm = "https://a836-acris.nyc.gov/DS/DocumentSearch/BBL?borough=1&block=731&lot=53"
+    download = deed_intake.make_acris_downloader(
+        downloads_dir=tmp_path / "dl", viewer_download=viewer, warmup_url=warm,
+    )
+    row = rcclerk.DeedRow(endorsement_id=DOC_ID, doc_type="DEED")
+    download(row, tmp_path / "x.pdf")
+    assert seen["warmup_url"] == warm

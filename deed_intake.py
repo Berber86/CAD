@@ -179,18 +179,28 @@ def make_acris_downloader(
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
     viewer_download=None,
+    warmup_url: str | None = None,
 ):
     """
     Загрузчик ACRIS: читалка в настоящем браузере (дискета Save → OK),
     PDF забирается из «Загрузок». Строка здесь — адаптированная
     ``rcclerk.DeedRow``, у которой ``endorsement_id`` — это ``document_id``.
+    ``warmup_url`` — глубокая ссылка поиска по этому лоту: если читалка по
+    прямой ссылке покажет HTTP 405 (нет серверной сессии поиска), загрузчик
+    сначала откроет поиск в браузере и повторит.
     """
     download_it = viewer_download or acris_viewer.download_pdf_via_viewer
 
     def download(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, str]:
+        options: dict = {
+            "downloads_dir": downloads_dir,
+            "progress": progress,
+            "should_stop": should_stop,
+        }
+        if warmup_url:
+            options["warmup_url"] = warmup_url
         return download_it(
-            acris.document_image_url(row.endorsement_id), destination,
-            downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
+            acris.document_image_url(row.endorsement_id), destination, **options,
         )
 
     return download
@@ -485,9 +495,6 @@ def _collect_deeds_acris(
         lambda c, b, l, pg: acris.fetch_results_html(c, b, l, page=pg)
     )
     resolve_id = acris_id_fetcher or acris.fetch_document_id
-    download = acris_downloader or make_acris_downloader(
-        downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
-    )
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
     )
@@ -542,6 +549,12 @@ def _collect_deeds_acris(
                 f"(строки: {', '.join(row.doc_type or '?' for row in rows[:6])})"
             )
             continue
+        # Загрузчик — на каждый лот свой: ссылка прогрева сессии поиска
+        # в браузере относится именно к этому лоту (см. acris_viewer).
+        lot_download = acris_downloader or make_acris_downloader(
+            downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
+            warmup_url=acris.search_form_url(code, block_no, lot_value),
+        )
         for clerk_row, tag in chosen:
             check_stop()
             row = by_adapted[id(clerk_row)]
@@ -558,7 +571,7 @@ def _collect_deeds_acris(
                 row=_acris_as_clerk_row(row, 0), tag=tag,
                 borough=borough, identity=(identity_by_lot or {}).get(str(lot_value)),
                 target_dir=target_dir, base_url=acris.BASE_URL,
-                download=download, find_pages=find_pages if search_pages else None,
+                download=lot_download, find_pages=find_pages if search_pages else None,
                 ocr_dpi=ocr_dpi, say=say, missing=outcome.missing,
                 source_url=row.image_url,
                 extra_notes=[f"ACRIS: CRFN {row.crfn}"],

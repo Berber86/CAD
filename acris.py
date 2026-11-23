@@ -118,6 +118,23 @@ def search_page_url(*, base: str = BASE_URL) -> str:
     return f"{base}{BBL_PAGE_PATH}"
 
 
+def search_form_url(borough: object, block: int | str, lot: int | str, *, base: str = BASE_URL) -> str:
+    """
+    Глубокая ссылка на поиск по BBL с заполненными районом/блоком/лотом.
+
+    Нужна браузерной ступени: открытая в браузере, она выполняет поиск и
+    создаёт серверную сессию с критериями. Без такой сессии читалка
+    документа (DocumentImageVtu) открывается, но страницы не отдаёт —
+    вместо них «HTTP 405 Method Not Allowed» (живой прогон 2026-11-23).
+    """
+    code = borough_code(borough)
+    block_no = int(block)
+    lot_no = int(lot)
+    if block_no <= 0 or lot_no <= 0:
+        raise ValueError("block and lot must be positive")
+    return f"{base}{BBL_PAGE_PATH}?borough={code}&block={block_no}&lot={lot_no}"
+
+
 def search_post_data(
     borough: object,
     block: int | str,

@@ -239,7 +239,7 @@ STEP2_EMPTY_REPORT = (
     "Отчёт появится после запуска.\n\n"
     "1. Откройте в AutoCAD чертёж, в котором уже посажена граница участка (Шаг 1).\n"
     "2. При необходимости введите текст для основного дома.\n"
-    "3. Нажмите «Автопоиск участка и подписание объектов» либо укажите границу в AutoCAD.\n\n"
+    "3. Нажмите «Автопоиск и подписание» либо укажите границу в AutoCAD.\n\n"
     "Заметки полевого чертёжника переводятся в формулировки заказчика (WOOD PORCH → FRAME DECK, "
     "PAVERS → DECO. PAVERS, CHAIN LINK GATE → C.L.F. / GATE) и ставятся в слой D-TOPO-TEXT.\n"
     "В отчёте будет показано, сколько объектов найдено по заметкам, по кодам точек "
@@ -1996,7 +1996,7 @@ class SurveyApp(ctk.CTk):
 
         self.load_images_button = ctk.CTkButton(
             self.pdf_mode_card,
-            text="📷 Загрузить фото чертежа · Ctrl+I",
+            text="📷 Фото",
             height=30,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -3319,7 +3319,7 @@ class SurveyApp(ctk.CTk):
         checks.grid_columnconfigure(0, weight=1)
         ctk.CTkCheckBox(
             checks,
-            text="докачать старый документ соседей (если межа соседа спорная)",
+            text="докачать старый документ соседей",
             variable=self.step0_old_neighbour_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
@@ -4446,7 +4446,7 @@ class SurveyApp(ctk.CTk):
 
         self.feature_auto_button = ctk.CTkButton(
             panel,
-            text="🔎  Автопоиск участка и подписание объектов",
+            text="🔎 Автопоиск и подписание",
             height=42,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],

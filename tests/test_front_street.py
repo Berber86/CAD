@@ -38,6 +38,62 @@ def test_both_estimators_find_known_street_angle(theta):
     assert tensor is not None and front_street.angle_difference(tensor, theta) <= 2.0
 
 
+def _tax_map_image(theta_deg: float, size=(1100, 800)) -> Image.Image:
+    """
+    Похожая на настоящую tax map картинка: серая полоса улицы, белые участки
+    чёрными межами по обе стороны (ДВА перпендикулярных семейства линий) и
+    голубой «наш» участок фасадом на улицу под углом theta к северу.
+    """
+    image = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(image)
+    theta = math.radians(theta_deg)
+    ux, uy = math.sin(theta), -math.cos(theta)   # вдоль улицы
+    vx, vy = math.cos(theta), math.sin(theta)    # поперёк улицы
+    cx, cy = size[0] / 2, size[1] / 2
+
+    def point(along: float, across: float) -> tuple[float, float]:
+        return (cx + ux * along + vx * across, cy + uy * along + vy * across)
+
+    def rect(along0, along1, across0, across1, **kwargs):
+        draw.polygon([point(along0, across0), point(along1, across0),
+                      point(along1, across1), point(along0, across1)], **kwargs)
+
+    # Полоса улицы (серая заливка) и ряды участков по обе стороны.
+    rect(-800, 800, -45, 45, fill=(218, 218, 218))
+    for side in (-1, 1):
+        near = side * 45
+        far = side * (45 + 150)
+        for i in range(-6, 6):
+            a0, a1 = i * 100, i * 100 + 100
+            if side < 0 and i == 0:
+                continue  # место нашего участка
+            rect(a0, a1, near, far, fill="white", outline="black", width=3)
+    # Наш участок: голубой, фасадом на улицу (верхняя сторона полосы).
+    rect(0, 100, -195, -45, fill=(164, 227, 227), outline="black", width=3)
+    return image
+
+
+@pytest.mark.parametrize("theta", [35, 118])
+def test_tax_map_picks_front_street_family_not_the_cross_one(theta):
+    image = _tax_map_image(theta)
+    hough = front_street.estimate_hough_lines(image)
+    tensor = front_street.estimate_structure_tensor(image)
+    assert hough is not None and front_street.angle_difference(hough, theta) <= 3.5
+    assert tensor is not None and front_street.angle_difference(tensor, theta) <= 3.5
+
+
+def test_real_manhattan_tax_map_matches_measured_street():
+    # Настоящий снимок портала (Manhattan, block 731, lot 53, фронт на W 33 ST).
+    # Эталон 119.0° — замер по длинным отрезкам бордюров на том же снимке;
+    # Vision на живом прогоне дала 117°, прежние оценки кодом — 105°/169°.
+    path = __file__.replace("test_front_street.py", "data/tax_map_manhattan_731_53.png")
+    result = front_street.estimate_all(path)
+    assert result["python_hough_lines"] is not None
+    assert result["python_structure_tensor"] is not None
+    assert front_street.angle_difference(result["python_hough_lines"], 119.0) <= 4.0
+    assert front_street.angle_difference(result["python_structure_tensor"], 119.0) <= 4.0
+
+
 def test_blank_image_has_no_angle():
     blank = Image.new("RGB", (400, 300), "white")
     assert front_street.estimate_hough_lines(blank) is None

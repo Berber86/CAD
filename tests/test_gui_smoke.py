@@ -1059,7 +1059,7 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
 
     app = gui.SurveyApp()
     assert not app.is_neighbor_mode()
-    assert "Начертить схему в AutoCAD" in app.draw_button.cget("text")
+    assert app.draw_button.cget("text") == "▶ В AutoCAD"
     app.neighbor_lot_radio.select()
     assert app.is_neighbor_mode()
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")

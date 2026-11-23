@@ -2427,7 +2427,7 @@ class SurveyApp(ctk.CTk):
 
         self.parse_button = ctk.CTkButton(
             run_box,
-            text="✨ Разобрать с ИИ · Ctrl+Enter",
+            text="✨ ИИ-разбор",
             height=44,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
@@ -3174,7 +3174,7 @@ class SurveyApp(ctk.CTk):
 
         self.draw_button = ctk.CTkButton(
             footer,
-            text="▶  Начертить схему в AutoCAD   F5",
+            text="▶ В AutoCAD",
             height=42,
             width=300,
             fg_color=THEME["btn_primary"],
@@ -3410,7 +3410,7 @@ class SurveyApp(ctk.CTk):
         )
         self.step0_stop_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.step0_open_button = ctk.CTkButton(
-            run_row, text="📂 Открыть папку", height=30, fg_color=THEME["btn_secondary"],
+            run_row, text="📂", height=30, fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"], command=self._open_step0_folder,
         )
         self.step0_open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
@@ -5281,7 +5281,7 @@ class SurveyApp(ctk.CTk):
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
         economy_on = bool(self.economy_var.get())
         if use_llm:
-            primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
+            primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ-разбор"
             alternative = "⚡ Локальный разбор без ИИ · бесплатно"
         elif economy_on:
             primary = "⚖ Разобрать экономно · Ctrl+Enter"

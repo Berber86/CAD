@@ -1994,10 +1994,7 @@ class SurveyApp(ctk.CTk):
         self.pdf_pages_entry.grid(row=0, column=1, sticky="e", padx=10, pady=7)
         self.pdf_info_label = ctk.CTkLabel(
             self.pdf_mode_card,
-            text=(
-                "После выбора откроется список: отметьте наш участок и страницы с границами. "
-                "Текст обхода — бесплатно и локально, скан — через ИИ/Vision."
-            ),
+            text="☰",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -6129,11 +6126,7 @@ class SurveyApp(ctk.CTk):
         if not plans:
             ctk.CTkLabel(
                 holder,
-                text=(
-                    "Проверок пока нет — разберите описание.\n"
-                    "Замыкание, сумма углов, самопересечения и потерянные точки "
-                    "проверяются автоматически."
-                ),
+                text="Проверок пока нет — разберите описание.",
                 font=self._result_fonts["body"], text_color=THEME["text_dim"],
                 justify="left", wraplength=self._result_wrap_length(),
             ).grid(row=0, column=0, sticky="ew", pady=14)

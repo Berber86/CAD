@@ -1293,12 +1293,7 @@ class SurveyApp(ctk.CTk):
         self.update_progress_bar.grid_remove()  # показываем только во время обновления
         ctk.CTkLabel(
             update_row,
-            text=(
-                "Архив скачивается и принудительно разворачивается в папку программы "
-                "(совпадающие файлы заменяются); config.json, config.local.json и .env "
-                "не трогаются — ваш выбор провайдера/моделей и ключи сохранятся. "
-                "После обновления перезапустите программу."
-            ),
+            text="🔄",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1431,7 +1426,7 @@ class SurveyApp(ctk.CTk):
         self.secret_eye_button.grid(row=1, column=1, padx=(5, 2), pady=(3, 0), sticky="w")
         ctk.CTkLabel(
             vault_row,
-            text="На диске хранится только зашифрованный токен tsai1:… (MachineGuid + DPAPI + PIN)",
+            text="🔒",
             anchor="w",
             justify="left",
             wraplength=410,
@@ -1502,7 +1497,7 @@ class SurveyApp(ctk.CTk):
         self.start_source_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
         ctk.CTkLabel(
             start_card,
-            text="Что открывать при запуске программы. Действует со следующего запуска.",
+            text="При запуске открывать",
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -2082,7 +2077,7 @@ class SurveyApp(ctk.CTk):
         self.photo_empty_card.grid_columnconfigure(0, weight=1)
         self.photo_load_button = ctk.CTkButton(
             self.photo_empty_card,
-            text="📷  Выберите фото чертежа\nJPG · PNG · TIFF · несколько кадров · Ctrl+I",
+            text="📷",
             height=132,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -3224,16 +3219,7 @@ class SurveyApp(ctk.CTk):
                 padx=(16 if column == 0 else 6, 0), pady=(8, 8),
             )
             self.step_tab_buttons[label] = button
-        ctk.CTkLabel(
-            bar,
-            text=(
-                "Порядок работы: 0 — документы участка → 1 — посадка границы → "
-                "2 — подписи объектов → 4 — оффсеты"
-            ),
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_dim"],
-            anchor="e",
-        ).grid(row=0, column=len(STEP_TABS), sticky="e", padx=(8, 16))
+
 
     # --------------------------------------------------- Страница «Данные» ---
     _JOB_AUTOFLOW_TIMEOUT_SEC = 3600.0
@@ -3858,8 +3844,7 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
         ctk.CTkLabel(
-            checks, text="Быстрый режим пропускает проверки адресной подсказки; проверьте адрес, "
-            "Borough, Block и Lot. Он также меняет ожидания при сохранении PDF.",
+            checks, text="⚡",
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
         ).grid(row=4, column=0, sticky="w", pady=(4, 0))
@@ -3928,7 +3913,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
         ctk.CTkLabel(
             manual,
-            text="PDF уже лежит в «Загрузках» — программа назовёт его по схеме и добавит в папку.",
+            text="📥 Из «Загрузок»",
             font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
@@ -4964,12 +4949,7 @@ class SurveyApp(ctk.CTk):
         self.feature_pick_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
         ctk.CTkLabel(
             panel,
-            text=(
-                "Автопоиск берёт замкнутый контур в слоях границы (PROPERTY_LINE, PL, "
-                "M-TAX-LINE…). Если контуров несколько или граница не найдена — укажите её "
-                "в AutoCAD: выберите полилинию или все стороны участка и нажмите Enter. "
-                "Все подписи одного запуска отменяются в AutoCAD одним Ctrl+Z."
-            ),
+            text="Автопоиск ищет контур границы; не найдёт — укажите полилинию в AutoCAD.",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -5305,11 +5285,7 @@ class SurveyApp(ctk.CTk):
         status = getattr(self, "step4_status_label", None)
         if status is not None:
             status.configure(
-                text=(
-                    "Заранее выделите в AutoCAD рамкой область (или замкнутую полилинию по её "
-                    "контуру), затем нажмите кнопку здесь. Оффсеты появятся в ней, в слое "
-                    "D-TOPO-TEXT; один Undo отменяет запись."
-                ),
+                text="Сначала выделите область в AutoCAD.",
             )
 
     def _set_step4_report(self, content: str) -> None:
@@ -8337,7 +8313,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text="Исходное изображение не загружено.\nНажмите «📷 Фото (JPG)…» (Ctrl+I) или «📄 PDF…» (Ctrl+O)",
+                text="🖼",
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",

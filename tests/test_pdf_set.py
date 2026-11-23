@@ -207,7 +207,7 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
     assert not app._busy
 
     dialog.submit()
-    assert app._pdf_set_dialog is dialog and "отметьте наш участок" in dialog.message.cget("text")
+    assert app._pdf_set_dialog is dialog and "отметьте наш" in dialog.message.cget("text")
     dialog.rows[0]["radio"].select()
     app._select_result_tab("📋 Ведомость")  # перед стартом разбора вкладка другая
     dialog.submit()

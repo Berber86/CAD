@@ -3528,7 +3528,7 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     # Элементы вкладки Шага 2 из постановки задачи.
     assert app.house_text_entry.cget("placeholder_text") == "например: 2 STY. BRK. & FR."
     assert app.skip_existing_labels_check.cget("text") == (
-        "Не дублировать уже существующие на чертеже надписи"
+        "Не дублировать надписи"
     )
     assert app.skip_existing_labels_var.get() is True
     assert app.hide_field_notes_check.cget("text") == (

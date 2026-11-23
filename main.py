@@ -2675,7 +2675,7 @@ class SurveyApp(ctk.CTk):
 
         self.canvas_hint_label = ctk.CTkLabel(
             canvas_wrap,
-            text="Колесо — зум · ЛКМ — панорама · 2× клик — вписать",
+            text="Колесо — зум, ЛКМ — панорама",
             font=ctk.CTkFont(size=10),
             fg_color=THEME["bg_header"],
             text_color=THEME["text_dim"],
@@ -3421,8 +3421,7 @@ class SurveyApp(ctk.CTk):
             child.destroy()
         if not self._job_tasks:
             ctk.CTkLabel(
-                frame, text="Список пуст. Папки вида «1234A#417 WEST 33RD STREET» "
-                            "появятся здесь со статусами.",
+                frame, text="Папок пока нет",
                 font=ctk.CTkFont(size=11), text_color=THEME["text_dim"],
                 anchor="w", justify="left", wraplength=640,
             ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
@@ -4814,7 +4813,7 @@ class SurveyApp(ctk.CTk):
         house_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             house_card,
-            text="Текст для основного дома (например: 2 STY. BRK. & FR.)",
+            text="Основной дом (напр.: 2 STY. BRK. & FR.)",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_main"],
             anchor="w",
@@ -4843,7 +4842,7 @@ class SurveyApp(ctk.CTk):
 
         self.skip_existing_labels_check = ctk.CTkCheckBox(
             panel,
-            text="Не дублировать уже существующие на чертеже надписи",
+            text="Не дублировать надписи",
             variable=self.skip_existing_labels_var,
             checkbox_width=18,
             checkbox_height=18,
@@ -8508,11 +8507,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text=(
-                    "Здесь появится интерактивная CAD-схема участка,\n"
-                    "красных линий улиц, точки POB и соседних лотов от (0, 0)\n"
-                    "(колесо мыши — масштаб, зажатая ЛКМ — панорама)"
-                ),
+                text="Здесь будет схема участка",
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",
@@ -14091,8 +14086,8 @@ class PdfSetDialog:
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            head, text=("Отметьте наши документы — остальные файлы будут соседями" if self.multi_mode
-                        else "Отметьте наш участок — остальные файлы будут соседями"),
+            head, text=("Отметьте наши" if self.multi_mode
+                        else "Отметьте наш"),
             font=ctk.CTkFont(size=15, weight="bold"), text_color=THEME["text_main"], anchor="w",
         ).grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(
@@ -14115,7 +14110,7 @@ class PdfSetDialog:
         foot.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 14))
         foot.grid_columnconfigure(0, weight=1)
         self.no_main_radio = ctk.CTkRadioButton(
-            foot, text="Нашего участка в этом наборе нет — все файлы соседи",
+            foot, text="Нашего нет — все соседи",
             variable=self.main_var, value=self.NO_MAIN, command=self._refresh_notes,
             font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
         )
@@ -14564,7 +14559,7 @@ class PdfSetDialog:
         if self.legacy_multi_roles and sum(item.is_main for item in self.items) > 1:
             problems.append("обычный режим поддерживает только один наш документ; выберите один или включите режим всех описаний")
         if not self.multi_mode and not self.legacy_multi_roles and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
-            problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
+            problems.append("отметьте наш или пункт «Нашего нет — все соседи»")
         scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
         if self.multi_mode and scene_mode == "add" and not self.app._multi_scene_can_add():
             scene_mode = ""

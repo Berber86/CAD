@@ -416,11 +416,42 @@ def _address_tokens(text: str) -> list[str]:
     """
     tokens: list[str] = []
     for token in re.findall(r"[a-z0-9]+", text.lower()):
+        glued = re.fullmatch(r"(\d+)([wens])", token)
+        if glued:  # OCR склеил номер дома с направлением: «417w»
+            tokens.append(glued.group(1))
+            token = glued.group(2)
         token = _ADDRESS_SUFFIXES.get(token, token)
         token = _ADDRESS_DIRECTIONS.get(token, token)
         ordinal = _ORDINAL_TOKEN_RE.match(token)
         tokens.append(ordinal.group(1) if ordinal else token)
     return tokens
+
+
+#: Тип улицы — единственный токен, который подсказке позволено потерять:
+#: номер дома, направление и номер/название улицы сверяются всегда.
+_STREET_TYPE_TOKENS = {"street", "avenue", "road", "drive", "lane", "place",
+                       "court", "boulevard", "parkway"}
+
+
+def _suggestion_matches(expected: list[str], actual: list[str]) -> bool:
+    """
+    Та ли это подсказка: точный префикс — или ключевые токены по порядку.
+
+    OCR может потерять тип улицы («St») или склеить слова; чужая улица при
+    этом не пройдёт: номер дома, направление и номер улицы должны совпасть.
+    """
+    if not expected or not actual:
+        return False
+    if actual[:len(expected)] == expected:
+        return True
+    keys = [token for token in expected if token not in _STREET_TYPE_TOKENS]
+    if not keys or actual[0] != expected[0]:
+        return False
+    pos = 0
+    for token in actual[:len(expected) + 2]:
+        if pos < len(keys) and token == keys[pos]:
+            pos += 1
+    return pos == len(keys)
 
 
 def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText]) -> ScreenText | None:
@@ -436,21 +467,54 @@ def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenT
     return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
 
 
+def _suggestion_screen_hint(handle: int, address: str, address_rows: Sequence[ScreenText]) -> str:
+    """Что OCR видит под полем адреса при неудаче — для журнала, а не для клика."""
+    try:
+        _focus(handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_hint_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(handle, path)
+            rows = _screen_ocr_region(path, _FORM_REGION)
+        suggestion = _first_suggestion(rows, address_rows)
+        if suggestion is not None:
+            return f" На снимке первая подсказка: «{suggestion.text}»; жду «{address}»."
+        digit_rows = [row.text for row in rows if re.match(r"^\s*\d", row.text)][:3]
+        if digit_rows:
+            return f" На снимке строки с цифрами: {'; '.join(digit_rows)}."
+        return " Подсказок на снимке не видно."
+    except Exception:  # noqa: BLE001 - диагностика не должна ломать остановку
+        return ""
+
+
 def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText], *,
                               first_delay: float = RELIABLE_SUGGESTION_DELAY) -> None:
     """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
     expected = _address_tokens(address)
     def matches(items: Sequence[ScreenText]) -> bool:
         suggestion = _first_suggestion(items, address_rows)
-        actual = _address_tokens(suggestion.text if suggestion else "")
-        return bool(expected) and actual[:len(expected)] == expected
+        return _suggestion_matches(expected, _address_tokens(suggestion.text if suggestion else ""))
 
-    rows = _wait_screen(handle, matches,
-                        first_delay=first_delay, description="совпадающую первую подсказку адреса",
-                        region=_FORM_REGION)
+    rows: list[ScreenText] | None = None
+    for attempt, delay in enumerate((first_delay, RELIABLE_RETRY_DELAY)):
+        try:
+            rows = _wait_screen(handle, matches,
+                                first_delay=delay, description="совпадающую первую подсказку адреса",
+                                region=_FORM_REGION)
+            break
+        except _ScreenNotFound:
+            if attempt == 0:
+                # Подсказки портала иногда грузятся дольше двух проверок
+                # (живой случай 2026-11-23: список уже открыт, а проверки
+                # успели закончиться). Ещё один цикл — и честная остановка.
+                time.sleep(RELIABLE_RETRY_DELAY)
+    if rows is None:
+        raise PortalLookupError(
+            "Не дождался совпадающую первую подсказку адреса на NYC Portal "
+            "после повторных проверок."
+            + _suggestion_screen_hint(handle, address, address_rows)
+        )
     suggestion = _first_suggestion(rows, address_rows)
-    actual = _address_tokens(suggestion.text if suggestion else "")
-    if not expected or actual[:len(expected)] != expected:
+    if not _suggestion_matches(expected, _address_tokens(suggestion.text if suggestion else "")):
         raise PortalLookupError("Первая подсказка адреса не совпадает с запросом; проверьте ввод и повторите.")
 
 

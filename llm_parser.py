@@ -171,16 +171,31 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         # ``reasoning_by_model`` рядом с выбранной моделью.
         "models": [
             "grok-4.7",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.3-codex",
+            "gpt-5.2",
+            "gpt-5.1",
+            "gpt-5-mini",
             "gemini-3.1-pro",
             "gemini-3.8-flash",
             "gemini-3-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
-            "gpt-5.2",
-            "gpt-5.1",
-            "gpt-5.4-mini",
-            "gpt-5.4-nano",
-            "gpt-5.6-luna",
             "claude-sonnet-5",
+            "claude-sonnet-5.5",
             "minimax-m3.1-flash",
             "pro/deepseek-v4.1-flash-1017",
             "pro/glm-5.3-flash",
@@ -231,20 +246,41 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 #: ``reasoning_effort`` с выбором. Моделей без этих данных здесь нет, и
 #: параметр им не отправляется (часть провайдеров отвечает на него HTTP 400).
 HYDRA_MODEL_REASONING: dict[str, dict[str, Any]] = {
-    "grok-4.7": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "gemini-3.1-pro": {"default": "low", "choices": ["low", "medium", "high"]},
-    "gemini-3.8-flash": {"default": "low", "choices": ["low", "medium", "high"]},
-    "gemini-3-flash": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"]},
-    "gemini-3.1-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"]},
-    "gpt-5.2": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "gpt-5.1": {"default": "none", "choices": ["none", "low", "medium", "high"]},
-    "gpt-5.4-mini": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "gpt-5.4-nano": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "gpt-5.6-luna": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "claude-sonnet-5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"]},
-    "minimax-m3.1-flash": {"default": "low", "choices": ["low", "medium", "high", "xhigh", "max"]},
-    "pro/deepseek-v4.1-flash-1017": {"default": "none", "choices": ["none", "low", "high", "max"]},
-    "pro/glm-5.3-flash": {"default": "low", "choices": ["low", "high", "max"]},
+    # out_rub_per_m — цена миллиона ВЫХОДНЫХ токенов в рублях из каталога Hydra
+    # (проверка 2026-11-23; у grok-4.7 базовая, при входе >200k токенов — 480).
+    "grok-4.7": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 240},
+    "gpt-6.2-sol": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 400},
+    "gpt-6.2-astra": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 1600},
+    "gpt-6.1-sol": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 400},
+    "gpt-6.1-terra": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 200},
+    "gpt-6-sol": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 400},
+    "gpt-6-luna": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 20},
+    "gpt-6-astra": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 2000},
+    "gpt-5.6-sol": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 1200},
+    "gpt-5.6-terra": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 480},
+    "gpt-5.6-luna": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 48},
+    "gpt-5.5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 1200},
+    "gpt-5.4": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 600},
+    "gpt-5.4-mini": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 180},
+    "gpt-5.4-nano": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 50},
+    "gpt-5.3-codex": {"default": "none", "choices": ["none", "low", "medium", "high"], "out_rub_per_m": 560},
+    "gpt-5.2": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 520},
+    "gpt-5.1": {"default": "none", "choices": ["none", "low", "medium", "high"], "out_rub_per_m": 400},
+    "gpt-5-mini": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 80},
+    "gemini-3.1-pro": {"default": "low", "choices": ["low", "medium", "high"], "out_rub_per_m": 480},
+    "gemini-3.8-flash": {"default": "low", "choices": ["low", "medium", "high"], "out_rub_per_m": 150},
+    "gemini-3-flash": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 120},
+    "gemini-3.5-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 100},
+    "gemini-3.1-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 60},
+    "claude-sonnet-5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 470},
+    # В карточке claude-sonnet-5.5 у Hydra противоречие: поле reasoning_effort
+    # есть, а в описании сказано «Управлять уровнем рассуждений нельзя!».
+    # Оставлена по формальному полю каталога; при отказе провайдера параметр
+    # снимется автоматически (см. _call_with_temperature).
+    "claude-sonnet-5.5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 470},
+    "minimax-m3.1-flash": {"default": "low", "choices": ["low", "medium", "high", "xhigh", "max"], "out_rub_per_m": 24},
+    "pro/deepseek-v4.1-flash-1017": {"default": "none", "choices": ["none", "low", "high", "max"], "out_rub_per_m": 48},
+    "pro/glm-5.3-flash": {"default": "low", "choices": ["low", "high", "max"], "out_rub_per_m": 36},
 }
 
 #: Модели Hydra прежнего списка без визуального входа: удаляются миграцией
@@ -826,10 +862,12 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     if isinstance(hydra_cfg, dict):
         removed_hydra = set(LEGACY_HYDRA_TEXT_MODELS)
         old_models = [str(m) for m in (hydra_cfg.get("models") or []) if str(m).strip()]
-        kept = [m for m in old_models if m not in removed_hydra]
-        for catalog_model in PROVIDERS_CATALOG["hydra"]["models"]:
-            if catalog_model not in kept:
-                kept.append(catalog_model)
+        catalog_models = [str(m) for m in PROVIDERS_CATALOG["hydra"]["models"]]
+        # Порядок списка задаёт каталог (новые модели видны сразу, а не в хвосте);
+        # ручные имена пользователя, которых нет в каталоге, сохраняются после.
+        kept = list(catalog_models) + [
+            m for m in old_models if m not in removed_hydra and m not in catalog_models
+        ]
         hydra_cfg["models"] = kept
         fallback_model = str(
             PROVIDERS_CATALOG["hydra"].get("default_model") or "grok-4.7"

@@ -29,6 +29,15 @@ def test_hydra_catalog_only_vision_reasoning_models():
     for model in models:
         default, choices = lp.reasoning_spec("hydra", model)
         assert default in choices and len(choices) >= 3
+        # Цена миллиона выходных токенов записана для каждой модели.
+        assert lp.HYDRA_MODEL_REASONING[model]["out_rub_per_m"] > 0
+    # Семейство GPT-6 в списке есть и идёт сразу за моделью по умолчанию.
+    assert models[1:8] == [
+        "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+        "gpt-6-sol", "gpt-6-luna", "gpt-6-astra",
+    ]
+    assert lp.HYDRA_MODEL_REASONING["gpt-6-luna"]["out_rub_per_m"] == 20
+    assert lp.HYDRA_MODEL_REASONING["gpt-6.2-astra"]["out_rub_per_m"] == 1600
 
 
 def test_resolve_reasoning_defaults_and_stored_choice():

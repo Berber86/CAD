@@ -528,6 +528,9 @@ def _collect_deeds_acris(
             for row in rows
         )
         say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}: {listed}")
+        if all(row.doc_date is None and row.recorded is None for row in rows):
+            say(f"{who} (лот {lot_value}): ACRIS не отдал даты в привычном виде — "
+                f"образец строки: {rows[0].raw[:180]}")
         adapted_rows = [_acris_as_clerk_row(row, idx) for idx, row in enumerate(rows)]
         by_adapted = {id(clerk_row): row for clerk_row, row in zip(adapted_rows, rows)}
         chosen = rcclerk.choose_documents(

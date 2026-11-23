@@ -158,3 +158,61 @@ def test_image_view_fixture_points_to_vtu_with_doc_id():
     page = (DATA / "acris_document_image_view.html").read_text(encoding="utf-8")
     assert "2024101000085001" in page  # doc_id в адресе обёртки документа
     assert 'iframe name="mainframe"' in page  # внутри — читалка Acordex VTU
+
+
+def test_live_header_spelling_still_gives_dates(results_html):
+    """Живой POST может писать заголовки иначе («Recorded/Filed», «DocDate»)."""
+    variant = results_html.replace("Recorded / Filed", "Recorded/Filed").replace(
+        "Doc Date", "DocDate")
+    page = acris.parse_result_page(variant)
+    assert len(page.rows) == 6
+    assert page.rows[0].doc_date == date(2026, 11, 5)
+    assert page.rows[0].recorded == datetime(2026, 11, 17, 10, 22, 4)
+    assert page.rows[0].raw.startswith("DET IMG") or page.rows[0].raw
+
+
+def test_parse_date_formats():
+    assert acris._parse_date("11/5/2026") == date(2026, 11, 5)
+    assert acris._parse_date("2026-11-05") == date(2026, 11, 5)
+    assert acris._parse_date("05.11.2026") == date(2026, 11, 5)
+    assert acris._parse_date("Nov 5, 2026") == date(2026, 11, 5)
+    assert acris._parse_date("5 November 2026") == date(2026, 11, 5)
+    assert acris._parse_date("без даты") is None
+
+
+def test_open_data_retries_with_certifi_on_cert_failure(monkeypatch):
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    attempts = {"n": 0}
+
+    def flaky(request, timeout=None, context=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                "certificate verify failed: unable to get local issuer certificate"))
+        assert context is not None  # повтор — уже с certifi CA
+        return _FakeResponse(_MASTER_JSON)
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    assert acris.fetch_document_id("2024000265906") == "2024101000085001"
+    assert attempts["n"] == 2
+
+
+def test_sort_widget_without_tbody_keeps_doc_date():
+    """Виджет сортировки в заголовке может быть и без <tbody> — даты целы."""
+    html = (
+        "<html><body>Records 1 - 1 <table><tr>"
+        "<td>CRFN</td><td>Lot</td><td>Partial</td>"
+        '<td><table><tr><td><font>Doc Date</font></td>'
+        '<td><img src="s.png"></td></tr></table></td>'
+        "<td>Recorded/Filed</td><td>Document Type</td><td>Pages</td></tr>"
+        "<tr><td>2024000000001</td><td>53</td><td>ENTIRE LOT</td><td>9/11/2024</td>"
+        "<td>10/10/2024 3:00:18 PM</td><td>DEED</td><td>8</td></tr>"
+        "</table></body></html>"
+    )
+    page = acris.parse_result_page(html)
+    assert len(page.rows) == 1
+    assert page.rows[0].doc_date == date(2024, 9, 11)
+    assert page.rows[0].recorded == datetime(2024, 10, 10, 15, 0, 18)

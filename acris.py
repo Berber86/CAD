@@ -161,6 +161,50 @@ def document_image_url(doc_id: str | int, *, base: str = BASE_URL) -> str:
     return f"{base}{IMAGE_VIEW_PATH}?doc_id={int(doc_id)}"
 
 
+def _certifi_context():
+    """TLS-контекст на bundled certifi CA — запасной, как в ``app_updater``."""
+    try:
+        import certifi
+        import ssl
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 - certifi может не стоять: тогда только системный
+        return None
+
+
+def _is_cert_failure(exc: BaseException) -> bool:
+    import ssl
+    import urllib.error
+
+    reason = getattr(exc, "reason", exc) if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    return isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason)
+
+
+def _open(request, *, timeout: float, opener=None):
+    """
+    Открывает запрос; при отказе проверки сертификата повторяет один раз с
+    certifi CA. На части Windows-машин системное хранилище не знает издателя
+    сертификата data.cityofnewyork.us (живой случай 2026-11-23), хотя тот же
+    запрос в браузере проходит.
+    """
+    import urllib.error
+    import urllib.request
+
+    if opener is not None:
+        return opener(request, timeout=timeout)
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not _is_cert_failure(exc):
+            raise
+        context = _certifi_context()
+        if context is None:
+            raise
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+
+
 def _fetch_master_json(params: dict[str, str], *, opener=None, timeout: float = 45.0) -> list:
     import urllib.error
     import urllib.parse
@@ -174,9 +218,8 @@ def _fetch_master_json(params: dict[str, str], *, opener=None, timeout: float = 
         ),
         "Accept": "application/json",
     })
-    open_it = opener or urllib.request.urlopen
     try:
-        with open_it(request, timeout=timeout) as response:
+        with _open(request, timeout=timeout, opener=opener) as response:
             payload = response.read()
     except urllib.error.HTTPError as exc:
         raise AcrisError(f"NYC Open Data ответил {exc.code} вместо данных ACRIS Master") from exc
@@ -264,9 +307,8 @@ def fetch_results_html(
         "Content-Type": "application/x-www-form-urlencoded",
         "Referer": search_page_url(base=base),
     })
-    open_it = opener or urllib.request.urlopen
     try:
-        with open_it(request, timeout=timeout) as response:
+        with _open(request, timeout=timeout, opener=opener) as response:
             charset = ""
             try:
                 charset = str(response.headers.get_content_charset() or "")
@@ -305,7 +347,7 @@ _CRITERIA_RE = re.compile(
 
 #: Вложенная таблица-виджет сортировки в заголовке «Doc Date» (текст + картинка).
 _SORT_TABLE_RE = re.compile(
-    r"<table[^>]*>\s*<tbody>\s*<tr>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>.*?</tr>\s*</tbody>\s*</table>",
+    r"<table[^>]*>\s*(?:<tbody>\s*)?<tr>\s*<td[^>]*>((?:(?!</td>).)*)</td>\s*<td[^>]*>(?:(?!</td>).)*</td>\s*</tr>\s*(?:</tbody>\s*)?</table>",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -374,21 +416,41 @@ def _extract_rows(html: str) -> list[list[str]]:
     parser.feed(html)
     return parser.rows
 
-#: Заголовок таблицы -> поле строки.
-_HEADER_FIELDS = {
-    "reel/pg/file": "reel_pg_file",
-    "crfn": "crfn",
-    "lot": "lot",
-    "partial": "partial",
-    "doc date": "doc_date",
-    "recorded / filed": "recorded",
-    "document type": "doc_type",
-    "pages": "pages",
-    "party1": "party1",
-    "party2": "party2",
-    "party 3/ other": "party3",
-    "doc amount": "amount",
-}
+def _header_field(key: str) -> str:
+    """
+    Заголовок колонки -> поле строки, терпимо к оформлению.
+
+    Живая страница (прямой POST) не обязана повторять сохранённый образец
+    буква в букву: «Recorded/Filed» без пробелов, «Doc Date» с виджетом
+    сортировки и т.п. Дословное сравнение в 4.81.14 оставило все даты
+    пустыми при живых строках. Сравниваем по сжатому виду и началу слова.
+    """
+    compact = re.sub(r"[^a-z0-9]", "", key.lower())
+    if compact == "crfn":
+        return "crfn"
+    if compact.startswith("reel"):
+        return "reel_pg_file"
+    if compact == "lot":
+        return "lot"
+    if compact.startswith("partial"):
+        return "partial"
+    if compact.startswith("docdate"):
+        return "doc_date"
+    if compact.startswith("recorded"):
+        return "recorded"
+    if compact.startswith("documenttype"):
+        return "doc_type"
+    if compact == "pages":
+        return "pages"
+    if compact.startswith("party3"):
+        return "party3"
+    if compact.startswith("party1"):
+        return "party1"
+    if compact.startswith("party2"):
+        return "party2"
+    if compact.startswith("docamount") or compact == "amount":
+        return "amount"
+    return ""
 
 
 def _cell_text(raw: str) -> str:
@@ -399,14 +461,51 @@ def _header_key(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
 def _parse_date(text: str) -> Optional[date]:
-    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", text or "")
-    if not m:
-        return None
-    try:
-        return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
-    except ValueError:
-        return None
+    raw = " ".join(str(text or "").split())
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
+    if m:  # месяц/день/год, как пишет сам ACRIS
+        try:
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:  # ISO: 2026-11-05
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", raw)
+    if m:  # точки — день.месяц (так страницу показывает переведённый браузер)
+        for day, month in ((m.group(1), m.group(2)), (m.group(2), m.group(1))):
+            try:
+                return date(int(m.group(3)), int(month), int(day))
+            except ValueError:
+                continue
+    m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", raw)
+    if m and m.group(1).lower()[:4] in _MONTH_NAMES or (m and m.group(1).lower()[:3] in _MONTH_NAMES):
+        name = m.group(1).lower()
+        month = _MONTH_NAMES.get(name[:4]) or _MONTH_NAMES.get(name[:3])
+        try:
+            return date(int(m.group(3)), int(month), int(m.group(2)))
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})", raw)
+    if m:
+        name = m.group(2).lower()
+        month = _MONTH_NAMES.get(name[:4]) or _MONTH_NAMES.get(name[:3])
+        if month:
+            try:
+                return date(int(m.group(3)), month, int(m.group(1)))
+            except ValueError:
+                pass
+    return None
 
 
 def _parse_datetime(text: str) -> Optional[datetime]:
@@ -423,6 +522,23 @@ def _parse_datetime(text: str) -> Optional[datetime]:
     try:
         return datetime(int(m.group(3)), int(m.group(1)), int(m.group(2)),
                         hour, int(m.group(5)), int(m.group(6) or 0))
+    except ValueError:
+        pass
+    # Дата другим форматом (ISO, точки, месяц словом) + время отдельно.
+    day = _parse_date(text)
+    if day is None:
+        return None
+    t = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?", text or "", re.IGNORECASE)
+    if not t:
+        return datetime(day.year, day.month, day.day)
+    hour = int(t.group(1))
+    ampm = (t.group(4) or "").upper()
+    if ampm == "PM" and hour < 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    try:
+        return datetime(day.year, day.month, day.day, hour, int(t.group(2)), int(t.group(3) or 0))
     except ValueError:
         return None
 
@@ -444,6 +560,7 @@ class AcrisRow:
     party3: str = ""
     amount: str = ""
     document_id: str = ""
+    raw: str = ""
 
     @property
     def image_url(self) -> str:
@@ -493,7 +610,7 @@ def parse_result_page(html: str) -> AcrisPage:
         keys = [_header_key(c) for c in cells]
         if "crfn" in keys and any(k.startswith("document") for k in keys):
             header_at = idx
-            columns = {i: _HEADER_FIELDS[k] for i, k in enumerate(keys) if k in _HEADER_FIELDS}
+            columns = {i: field for i, k in enumerate(keys) if (field := _header_field(k))}
             break
     if header_at is None:
         return page
@@ -521,6 +638,7 @@ def parse_result_page(html: str) -> AcrisPage:
             party2=values.get("party2", ""),
             party3=values.get("party3", ""),
             amount=values.get("amount", ""),
+            raw=" | ".join(cells)[:300],
         ))
     return page
 

@@ -116,3 +116,45 @@ def test_fetch_with_fake_opener_returns_html(results_html):
     assert "hid_max_rows=99" in seen["body"]
     assert "hid_borough=1" in seen["body"]
     assert acris.parse_result_rows(html)[0].crfn == "2026000324679"
+
+
+_MASTER_JSON = b'[{"crfn": "2024000265906", "document_id": "2024101000085001"}]'
+
+
+def test_document_image_url():
+    assert acris.document_image_url("2024101000085001") == (
+        "https://a836-acris.nyc.gov/DS/DocumentSearch/DocumentImageView"
+        "?doc_id=2024101000085001"
+    )
+
+
+def test_fetch_document_id_via_open_data():
+    seen = {}
+
+    def opener(request, timeout):
+        seen["url"] = request.full_url
+        return _FakeResponse(_MASTER_JSON)
+
+    assert acris.fetch_document_id("2024000265906", opener=opener) == "2024101000085001"
+    assert "crfn" in seen["url"]
+
+
+def test_attach_document_ids_to_real_rows(results_html):
+    rows = acris.parse_result_rows(results_html)
+
+    def opener(request, timeout):
+        return _FakeResponse(_MASTER_JSON)
+
+    acris.attach_document_ids(rows, opener=opener)
+    deed = [r for r in rows if r.crfn == "2024000265906"]
+    assert len(deed) == 1
+    assert deed[0].document_id == "2024101000085001"
+    assert deed[0].image_url.endswith("doc_id=2024101000085001")
+    # Остальных CRFN в фейковом Master нет — честно остаются без id.
+    assert all(r.document_id == "" for r in rows if r.crfn != "2024000265906")
+
+
+def test_image_view_fixture_points_to_vtu_with_doc_id():
+    page = (DATA / "acris_document_image_view.html").read_text(encoding="utf-8")
+    assert "2024101000085001" in page  # doc_id в адресе обёртки документа
+    assert 'iframe name="mainframe"' in page  # внутри — читалка Acordex VTU

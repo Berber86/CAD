@@ -31,6 +31,7 @@ POST — только на машине пользователя. Если пр�
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -44,6 +45,13 @@ import rcclerk
 BASE_URL = "https://a836-acris.nyc.gov"
 BBL_PAGE_PATH = "/DS/DocumentSearch/BBL"
 RESULTS_PATH = "/DS/DocumentSearch/BBLResult"
+IMAGE_VIEW_PATH = "/DS/DocumentSearch/DocumentImageView"
+
+#: Официальный NYC Open Data: ACRIS Real Property Master. По CRFN из строки
+#: результатов даёт ``document_id`` — тот самый, что сайт подставляет в
+#: ``DocumentImageView?doc_id=...`` (проверено на образце пользователя:
+#: CRFN 2024000265906 -> 2024101000085001). Доступен без стены для роботов.
+OPEN_DATA_MASTER_URL = "https://data.cityofnewyork.us/resource/bnx9-e6tj.json"
 
 #: Код района -> подпись в форме ACRIS (она же hid_borough_name).
 BOROUGH_NAMES: dict[int, str] = {
@@ -139,6 +147,79 @@ def search_post_data(
         "hid_SearchType": "BBL",
         "hid_ISIntranet": "N",
     }
+
+
+def document_image_url(doc_id: str | int, *, base: str = BASE_URL) -> str:
+    """Адрес обёртки документа (кнопка IMG): PDF-читалка Acordex VTU."""
+    return f"{base}{IMAGE_VIEW_PATH}?doc_id={int(doc_id)}"
+
+
+def _fetch_master_json(params: dict[str, str], *, opener=None, timeout: float = 45.0) -> list:
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = f"{OPEN_DATA_MASTER_URL}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    })
+    open_it = opener or urllib.request.urlopen
+    try:
+        with open_it(request, timeout=timeout) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise AcrisError(f"NYC Open Data ответил {exc.code} вместо данных ACRIS Master") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise AcrisError(f"не удалось спросить NYC Open Data: {exc}") from exc
+    try:
+        data = json.loads(payload.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        raise AcrisError("NYC Open Data вернул не JSON") from exc
+    if not isinstance(data, list):
+        raise AcrisError("NYC Open Data вернул неожиданный ответ")
+    return data
+
+
+def fetch_document_ids(crfns, *, opener=None, timeout: float = 45.0) -> dict[str, str]:
+    """CRFN -> document_id по ACRIS Master (NYC Open Data), одним запросом."""
+    wanted = [str(c).strip() for c in crfns if str(c).strip()]
+    if not wanted:
+        return {}
+    where = "crfn in(" + ",".join(f"'{c}'" for c in wanted) + ")"
+    rows = _fetch_master_json(
+        {"$where": where, "$select": "crfn,document_id", "$limit": "5000"},
+        opener=opener, timeout=timeout,
+    )
+    found: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        crfn = str(row.get("crfn") or "").strip()
+        doc_id = str(row.get("document_id") or "").strip()
+        if crfn and re.fullmatch(r"\d{16}", doc_id):
+            found[crfn] = doc_id
+    return found
+
+
+def fetch_document_id(crfn: str, *, opener=None, timeout: float = 45.0) -> str:
+    """document_id одного документа по его CRFN; нет такого — ``AcrisError``."""
+    found = fetch_document_ids([crfn], opener=opener, timeout=timeout)
+    doc_id = found.get(str(crfn).strip())
+    if not doc_id:
+        raise AcrisError(f"NYC Open Data не знает CRFN {crfn} — document_id не получить")
+    return doc_id
+
+
+def attach_document_ids(rows, *, opener=None, timeout: float = 45.0) -> list:
+    """Проставляет ``document_id`` строкам по их CRFN (кого нет в Master — пустой)."""
+    ids = fetch_document_ids([r.crfn for r in rows], opener=opener, timeout=timeout)
+    for row in rows:
+        row.document_id = ids.get(row.crfn, "")
+    return rows
 
 
 def fetch_results_html(
@@ -355,6 +436,12 @@ class AcrisRow:
     party2: str = ""
     party3: str = ""
     amount: str = ""
+    document_id: str = ""
+
+    @property
+    def image_url(self) -> str:
+        """Адрес обёртки документа (IMG); пусто, пока document_id не получен."""
+        return document_image_url(self.document_id) if self.document_id else ""
 
     @property
     def kind(self) -> str:

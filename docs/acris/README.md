@@ -6,10 +6,33 @@
   (район / блок / лот), https://a836-acris.nyc.gov/DS/DocumentSearch/BBL
 - `ACRIS Search Results By Parcel Identifier2.mhtml` — результаты по
   Manhattan, block 731, lot 53 (6 записей, MORTGAGE/DEED и др.)
+- `New York Web Public Inquiry.mhtml` — обёртка документа по кнопке IMG:
+  `DocumentImageView?doc_id=2024101000085001`, внутри читалка Acordex VTU
+  (страницы по одной, кнопки Prev/Next, Print и Save-дискета).
 
 Вынутые из них HTML лежат фикстурами в `tests/data/`
-(`acris_search_form.html`, `acris_results_manhattan_731_53.html`) — на них
-проверяется разбор в `tests/test_acris.py`. Скрипты страниц в MHTML не
-попали, поэтому как кнопки DET/IMG внутри вызывают документ (doc_id),
-по этим образцам не видно — нужен ещё один образец: страница по кнопке DET
-или IMG одного документа.
+(`acris_search_form.html`, `acris_results_manhattan_731_53.html`,
+`acris_document_image_view.html`) — на них проверяется разбор в
+`tests/test_acris.py`.
+
+## Как устроена цепочка (установлено по образцам)
+
+1. Список: прямой POST на `BBLResult` (`hid_*`, сразу `hid_max_rows=99`)
+   -> строки с CRFN — `acris.fetch_results_html` / `parse_result_page`.
+2. CRFN -> `document_id`: официальный NYC Open Data (ACRIS Real Property
+   Master, `bnx9-e6tj`) — без стены для роботов. Проверено: CRFN
+   2024000265906 -> 2024101000085001 (тот самый doc_id из образца IMG).
+   `acris.fetch_document_id(s)` / `attach_document_ids`.
+3. Документ: `DocumentImageView?doc_id=...` — `acris.document_image_url`.
+   Внутри VTU-читалка: гулять по страницам нам НЕ надо.
+4. Скачивание (как делает человек): кнопка Save (дискета) в читалке ->
+   выбрать «все страницы» (All) -> браузер качает весь документ PDF в
+   «Загрузки». Отсюда сценарии сходятся с Ричмондом в одно русло:
+   `deed_intake.adopt_downloads` забирает свежий PDF из «Загрузок» и кладёт
+   по схеме имён с паспортом.
+
+## Что ещё нужно
+
+Скриншот диалога, который открывается по дискете Save в читалке (что там за
+варианты «текущая / все страницы» и как подтверждается), — по нему сделаем
+автоматический клик «All» браузерной ступенью, как у портала NYC.

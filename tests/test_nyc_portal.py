@@ -1456,3 +1456,22 @@ def test_reliable_without_confirmed_card_does_not_send_screenshot(tmp_path, monk
     with pytest.raises(nyc_portal.PortalLookupError, match="карточку объекта"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y")
     assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))
+
+
+def test_address_tokens_match_portal_abbreviations():
+    """Живой случай 2026-11-23: подсказка «417 W 33 St…» — та самая улица."""
+    assert nyc_portal._address_tokens("417 WEST 33RD STREET") == ["417", "west", "33", "street"]
+    assert nyc_portal._address_tokens("417 W 33 St, MANHATTAN, NY, 10001, USA")[:4] == [
+        "417", "west", "33", "street",
+    ]
+    assert nyc_portal._address_tokens("5TH AVENUE") == ["5", "avenue"]
+    # Чужая улица по-прежнему не совпадает: номер дома и улица проверяются.
+    assert nyc_portal._address_tokens("W 33 St, BROOKLYN, NY")[:3] != ["417", "west", "33"]
+
+
+def test_suggestion_wait_accepts_abbreviated_first_suggestion(monkeypatch):
+    label = [nyc_portal.ScreenText("Enter an Address", (10, 160, 300, 180))]
+    suggestion = nyc_portal.ScreenText("417 W 33 St, MANHATTAN, NY, 10001, USA", (20, 250, 300, 265))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
+    monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [suggestion])
+    nyc_portal._wait_after_address_input(42, "417 WEST 33RD STREET", label)

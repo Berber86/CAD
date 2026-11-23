@@ -401,10 +401,26 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
 _ADDRESS_SUFFIXES = {"st": "street", "str": "street", "ave": "avenue", "av": "avenue",
                      "rd": "road", "blvd": "boulevard", "dr": "drive", "ln": "lane",
                      "pl": "place", "ct": "court", "pkwy": "parkway"}
+_ADDRESS_DIRECTIONS = {"w": "west", "e": "east", "n": "north", "s": "south"}
+_ORDINAL_TOKEN_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$")
 
 
 def _address_tokens(text: str) -> list[str]:
-    return [_ADDRESS_SUFFIXES.get(token, token) for token in re.findall(r"[a-z0-9]+", text.lower())]
+    """
+    Токены адреса для сравнения «ввод ↔ подсказка портала».
+
+    Портал подсказывает сокращениями, а человек пишет полностью: «417 WEST
+    33RD STREET» против «417 W 33 St, MANHATTAN, NY, 10001, USA» (живой
+    случай 2026-11-23). Поэтому направления (W→west) и порядковые номера
+    (33rd→33) приводятся к одному виду, как и суффиксы улиц (St→street).
+    """
+    tokens: list[str] = []
+    for token in re.findall(r"[a-z0-9]+", text.lower()):
+        token = _ADDRESS_SUFFIXES.get(token, token)
+        token = _ADDRESS_DIRECTIONS.get(token, token)
+        ordinal = _ORDINAL_TOKEN_RE.match(token)
+        tokens.append(ordinal.group(1) if ordinal else token)
+    return tokens
 
 
 def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText]) -> ScreenText | None:

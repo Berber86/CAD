@@ -6164,3 +6164,24 @@ def test_job_queue_draw_phase_saves_dwg_and_closes_document(gui, tmp_path):
     assert closed.get("yes") is True
     assert "Итог: готово" in (data_dir / "session_log.txt").read_text(encoding="utf-8")
     assert app._job_runner_active is False
+
+
+def test_model_test_window_opens_by_triple_click_on_canvas(gui):
+    app = gui.SurveyApp()
+    assert "<Triple-Button-1>" in app.preview_canvas._bindings
+    assert not getattr(app, "_model_test_window", None)
+
+    app.preview_canvas._bindings["<Triple-Button-1>"](None)
+    page = app._model_test_window
+    assert page is not None
+    assert len(page.slot_rows) == 4
+    assert len(page.slots) == 4
+    assert page.slots[0].model  # первый слот — активная модель программы
+
+    # Повторный тройной щелчок не плодит окна.
+    app._open_model_test_window()
+    assert app._model_test_window is page
+
+    page.close()
+    assert app._model_test_window is None
+    assert page._closed is True

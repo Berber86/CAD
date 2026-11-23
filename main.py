@@ -2620,6 +2620,7 @@ class SurveyApp(ctk.CTk):
                 bind_fn("<B1-Motion>", self._on_canvas_drag_move)
                 bind_fn("<ButtonRelease-1>", self._on_canvas_drag_end)
                 bind_fn("<Double-Button-1>", lambda _ev: self.reset_viewport_zoom())
+                bind_fn("<Triple-Button-1>", self._open_model_test_window)
                 bind_fn("<Motion>", self._on_canvas_hover)
                 bind_fn("<Leave>", self._on_canvas_leave)
 
@@ -7072,6 +7073,16 @@ class SurveyApp(ctk.CTk):
                 level=log_mode.LEVEL_INFO,
             )
 
+    def _open_model_test_window(self, _event: Any = None) -> None:
+        """Секретное окно теста моделей: только тройной щелчок по схеме участка."""
+        page = getattr(self, "_model_test_window", None)
+        if page is not None and not page._closed:
+            page.window.lift()
+            return
+        from model_test_ui import ModelTestWindow
+
+        self._model_test_window = ModelTestWindow(self, ctk, THEME)
+
     def _open_developer_chat(self, _event: Any = None) -> None:
         page = getattr(self, "_developer_chat", None)
         if page is not None and not page._closed:
@@ -8904,6 +8915,9 @@ class SurveyApp(ctk.CTk):
         page = getattr(self, "_developer_chat", None)
         if page is not None:
             page.close()
+        test_page = getattr(self, "_model_test_window", None)
+        if test_page is not None:
+            test_page.close()
         self._persist_ai_preferences(report_error=False)
         # В режиме «по кнопке» на закрытии ничего не шлём — только если стоит auto_send.
         try:

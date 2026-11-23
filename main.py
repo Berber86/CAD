@@ -37,6 +37,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -159,6 +160,7 @@ import browser_save
 import console_window
 import deed_intake
 import deed_store
+import job_queue
 import nyc_portal
 import ocr_pages
 import rcclerk
@@ -206,13 +208,15 @@ CENTER_PANEL_MIN_WIDTH = 260
 RESULT_SPLITTER_WIDTH = 12
 
 # Глобальные вкладки окна: шаги технологической цепочки Title Survey.
-# Шаг 0 стоит перед Шагом 1: сначала документы участка, потом посадка границы.
-STEP_TAB_DEEDS = "Шаг 0. Документы участка"
+# «Данные» стоят перед Шагом 0: очередь папок-задач, дальше — как обычно:
+# Шаг 0 документы участка, потом посадка границы.
+STEP_TAB_DATA = "Данные"
+STEP_TAB_DEEDS = "Шаг 0. Документы"
 STEP_TAB_BOUNDARY = "Шаг 1. Граница участка (Legal Description)"
 STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
 # Шага 3 в программе пока нет (пропущен в постановке): после Шага 2 идёт Шаг 4.
 STEP_TAB_OFFSETS = "Шаг 4. Оффсеты"
-STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
+STEP_TABS = (STEP_TAB_DATA, STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
 #: Роль файла, который человек докачал сам: наш участок или сосед.
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
 STEP0_PORTAL_RELIABLE = "Надёжный"
@@ -637,6 +641,18 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_address = ""
         self._step0_auto_identity: tuple[str, str, str, str] | None = None
         self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
+        # Страница «Данные»: очередь папок-задач («номер…#адрес») через
+        # автопоток; каждая задача — подпапка data и лог сессии в ней.
+        self._job_tasks: list[dict[str, Any]] = []
+        self._job_runner_active = False
+        self._job_current = -1
+        self._job_phase = ""
+        self._job_stop_requested = False
+        self._job_phase_deadline = 0.0
+        self._job_created_doc: Any = None
+        self._job_dwg_before: set[str] = set()
+        self._job_log_sink: list[tuple[str, str, str, str]] | None = None
+        self._job_started_at = ""
         self.house_text_var = ctk.StringVar(value="")
         self.feature_text_height_var = ctk.StringVar(value="")
         # Настройки Шага 2 читаются один раз: раньше каждый переключатель заново
@@ -3188,6 +3204,7 @@ class SurveyApp(ctk.CTk):
         self._build_step0_page()
         self._build_step2_page()
         self._build_step4_page()
+        self._build_data_page()
         self._switch_step_tab()
 
     # ------------------------------------------- глобальные вкладки шагов ---
@@ -3224,6 +3241,498 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_dim"],
             anchor="e",
         ).grid(row=0, column=len(STEP_TABS), sticky="e", padx=(8, 16))
+
+    # --------------------------------------------------- Страница «Данные» ---
+    _JOB_AUTOFLOW_TIMEOUT_SEC = 3600.0
+    _JOB_DRAW_TIMEOUT_SEC = 900.0
+    _JOB_STATUS_ICON = {
+        "ожидает": "•", "выполняется": "▶", "готово": "✔", "ошибка": "✖",
+        "не подходит": "⚠", "остановлено": "⏹", "пропущено": "—",
+    }
+
+    def _build_data_page(self) -> None:
+        """
+        Страница «Данные»: очередь папок-задач «номер…#адрес».
+
+        Каждая подходящая папка проходит весь автопоток (адрес → сбор PDF →
+        разбор → новый DWG в AutoCAD) в своей подпапке ``data``; сбой одного
+        задания не останавливает остальные. Здесь же — основная ИИ-модель и
+        её уровень рассуждений (те же настройки, что на Шаге 1 и в Настройках).
+        """
+        page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
+        page.grid(row=2, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=0)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        self.data_page = page
+
+        panel = ctk.CTkFrame(
+            page, width=440, fg_color=THEME["bg_card"], corner_radius=10,
+            border_width=1, border_color=THEME["border_card"],
+        )
+        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            panel, text=STEP_TAB_DATA,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=THEME["text_main"], anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            panel,
+            text=("Папки работ вида «1234A#417 WEST 33RD STREET» проходят весь "
+                  "автопоток по очереди: сбор PDF, разбор и новый DWG — всё в "
+                  "подпапке data каждой папки."),
+            font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
+            anchor="w", justify="left", wraplength=400,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(
+            panel, text="Основная ИИ-модель:",
+            font=ctk.CTkFont(size=11), text_color=THEME["text_dim"], anchor="w",
+        ).grid(row=2, column=0, sticky="w", padx=16)
+        self.data_model_combo = ctk.CTkComboBox(
+            panel, values=[], variable=self.model_var, height=30,
+            fg_color=THEME["bg_editor"], border_color=THEME["border_card"],
+            button_color=THEME["btn_secondary"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(family="Consolas", size=11),
+            command=self._on_model_selected,
+        )
+        self.data_model_combo.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 6))
+        ctk.CTkLabel(
+            panel, text="Рассуждения модели:",
+            font=ctk.CTkFont(size=11), text_color=THEME["text_dim"], anchor="w",
+        ).grid(row=4, column=0, sticky="w", padx=16)
+        self.data_reasoning_switch = ctk.CTkSegmentedButton(
+            panel, values=["—"], height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.data_reasoning_switch.grid(row=5, column=0, sticky="ew", padx=16, pady=(2, 12))
+
+        self.data_scan_button = ctk.CTkButton(
+            panel, text="📂 Сканировать каталог…", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_scan_catalog_clicked,
+        )
+        self.data_scan_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 6))
+        row_buttons = ctk.CTkFrame(panel, fg_color="transparent")
+        row_buttons.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 6))
+        row_buttons.grid_columnconfigure(0, weight=1)
+        row_buttons.grid_columnconfigure(1, weight=1)
+        self.data_add_button = ctk.CTkButton(
+            row_buttons, text="➕ Папку…", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_add_folder_clicked,
+        )
+        self.data_add_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.data_clear_button = ctk.CTkButton(
+            row_buttons, text="🧹 Очистить", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_clear_tasks,
+        )
+        self.data_clear_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.data_run_button = ctk.CTkButton(
+            panel, text="▶ Запустить очередь", height=38,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._start_job_queue,
+        )
+        self.data_run_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(6, 6))
+        self.data_stop_button = ctk.CTkButton(
+            panel, text="⏹ Остановить очередь", height=32, state="disabled",
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._stop_job_queue,
+        )
+        self.data_stop_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        right = ctk.CTkFrame(
+            page, fg_color=THEME["bg_card"], corner_radius=10,
+            border_width=1, border_color=THEME["border_card"],
+        )
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        self.data_status_var = ctk.StringVar(value="Добавьте папки работ: сканированием каталога или по одной.")
+        ctk.CTkLabel(
+            right, textvariable=self.data_status_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"], anchor="w", justify="left", wraplength=700,
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
+        self.data_list_frame = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        self.data_list_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 10))
+        self.data_list_frame.grid_columnconfigure(0, weight=1)
+        self._refresh_data_task_list()
+
+    def _refresh_data_controls(self) -> None:
+        """Модель и рассуждения на странице «Данные» = общие настройки ИИ."""
+        if not hasattr(self, "data_model_combo"):
+            return
+        try:
+            pid = self.current_provider_id()
+            self.data_model_combo.configure(values=self._provider_models.get(pid, []))
+            spec = reasoning_spec(*self._reasoning_target(1))
+            if spec is None:
+                self.data_reasoning_switch.configure(values=["—"], state="disabled")
+                self.data_reasoning_switch.set("—")
+            else:
+                default, choices = spec
+                stored = str(self._reasoning_by_model.get(self.current_model()) or "").strip()
+                self.data_reasoning_switch.configure(values=list(choices), state="normal")
+                self.data_reasoning_switch.set(stored if stored in choices else default)
+        except Exception:  # noqa: BLE001 - страница не должна ронять настройки
+            pass
+
+    def _data_add_folders(self, paths) -> None:
+        known = {str(task["path"]) for task in self._job_tasks}
+        added = 0
+        for raw in paths or []:
+            folder = Path(raw)
+            if str(folder) in known or not folder.is_dir():
+                continue
+            known.add(str(folder))
+            info = job_queue.describe_job_folder(folder)
+            self._job_tasks.append({
+                "path": folder,
+                "info": info,
+                "reason": "" if info else job_queue.invalid_reason(folder.name),
+                "status": "ожидает" if info else "не подходит",
+                "detail": "",
+            })
+            added += 1
+        self._refresh_data_task_list()
+        if added:
+            valid = sum(1 for task in self._job_tasks if task["info"])
+            self.data_status_var.set(
+                f"Папок в списке: {len(self._job_tasks)}; в очередь пойдут: {valid}.")
+
+    def _data_scan_catalog_clicked(self) -> None:
+        from tkinter import filedialog
+
+        chosen = filedialog.askdirectory(title="Каталог с папками работ")
+        if chosen:
+            self._data_add_folders(job_queue.scan_catalog(chosen))
+
+    def _data_add_folder_clicked(self) -> None:
+        from tkinter import filedialog
+
+        chosen = filedialog.askdirectory(title="Папка работы (номер#адрес)")
+        if chosen:
+            self._data_add_folders([chosen])
+
+    def _data_remove_task(self, index: int) -> None:
+        if self._job_runner_active:
+            return
+        if 0 <= index < len(self._job_tasks):
+            del self._job_tasks[index]
+        self._refresh_data_task_list()
+
+    def _data_clear_tasks(self) -> None:
+        if self._job_runner_active:
+            return
+        self._job_tasks.clear()
+        self._refresh_data_task_list()
+
+    _JOB_STATUS_COLOR = {
+        "готово": "ok", "ошибка": "warn", "не подходит": "warn",
+        "выполняется": "text_main", "ожидает": "text_muted",
+        "остановлено": "warn", "пропущено": "text_dim",
+    }
+
+    def _refresh_data_task_list(self) -> None:
+        frame = getattr(self, "data_list_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if not self._job_tasks:
+            ctk.CTkLabel(
+                frame, text="Список пуст. Папки вида «1234A#417 WEST 33RD STREET» "
+                            "появятся здесь со статусами.",
+                font=ctk.CTkFont(size=11), text_color=THEME["text_dim"],
+                anchor="w", justify="left", wraplength=640,
+            ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+            return
+        for index, task in enumerate(self._job_tasks):
+            info = task["info"]
+            status = task["status"]
+            color = THEME[self._JOB_STATUS_COLOR.get(status, "text_muted")]
+            row = ctk.CTkFrame(frame, fg_color=THEME["bg_field"], corner_radius=8)
+            row.grid(row=index, column=0, sticky="ew", padx=4, pady=3)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                row, text=f"{self._JOB_STATUS_ICON.get(status, '•')} {status}",
+                font=ctk.CTkFont(size=11, weight="bold"), text_color=color,
+                anchor="w", width=110,
+            ).grid(row=0, column=0, sticky="nw", padx=(10, 4), pady=(7, 1))
+            title = info.title if info else task["path"].name
+            ctk.CTkLabel(
+                row, text=title, font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=THEME["text_main"], anchor="w", justify="left", wraplength=640,
+            ).grid(row=0, column=1, sticky="ew", pady=(7, 1))
+            detail = task["detail"] or (task["reason"] if not info else str(task["path"]))
+            ctk.CTkLabel(
+                row, text=detail, font=ctk.CTkFont(size=10),
+                text_color=THEME["text_dim"], anchor="w", justify="left", wraplength=640,
+            ).grid(row=1, column=1, sticky="ew", pady=(0, 7))
+            remove = ctk.CTkButton(
+                row, text="✕", width=30, height=30,
+                fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+                font=ctk.CTkFont(size=11),
+                state="disabled" if self._job_runner_active else "normal",
+                command=lambda i=index: self._data_remove_task(i),
+            )
+            remove.grid(row=0, column=2, rowspan=2, padx=(4, 10), pady=7)
+
+    def _data_set_controls(self, *, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for widget in (self.data_scan_button, self.data_add_button,
+                       self.data_clear_button, self.data_run_button):
+            widget.configure(state=state)
+        self.data_stop_button.configure(state="normal" if running else "disabled")
+        self._refresh_data_task_list()
+
+    # --- Очередь заданий: автопоток → новый DWG, что бы ни случилось дальше ---
+
+    def _sink_job(self, source: str, message: str, level: str = log_mode.LEVEL_INFO) -> None:
+        if self._job_log_sink is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), source, level, str(message)))
+
+    def _job_last_error_line(self) -> str:
+        for _stamp, _src, level, text in reversed(self._job_log_sink or []):
+            if level == log_mode.LEVEL_ERROR and text:
+                return text
+        return ""
+
+    def _start_job_queue(self) -> None:
+        if self._job_runner_active:
+            return
+        if (self._busy or self._step0_running or self._step0_portal_running
+                or self._step0_auto_stage):
+            self._set_status("Дождитесь завершения текущей работы.", warn=True)
+            return
+        if not any(task["info"] and task["status"] != "готово" for task in self._job_tasks):
+            self._set_status("В списке нет подходящих папок для очереди.", warn=True)
+            return
+        if self.step0_fast_mode_var.get():
+            self._set_status("Для очереди выключите быстрый режим поиска на Шаге 0.", warn=True)
+            return
+        for task in self._job_tasks:
+            if task["info"] and task["status"] != "готово":
+                task["status"] = "ожидает"
+                task["detail"] = ""
+        self._job_runner_active = True
+        self._job_stop_requested = False
+        self._job_current = -1
+        self._job_phase = ""
+        self._data_set_controls(running=True)
+        total = sum(1 for task in self._job_tasks if task["info"])
+        self.data_status_var.set(f"Очередь запущена: заданий — {total}.")
+        self._job_advance()
+
+    def _stop_job_queue(self) -> None:
+        if self._job_runner_active:
+            self._job_stop_requested = True
+            self.data_status_var.set("Останавливаю очередь после текущего шага…")
+
+    def _job_advance(self) -> None:
+        if self._job_stop_requested:
+            self._job_finish_queue()
+            return
+        nxt = next((i for i, task in enumerate(self._job_tasks)
+                    if task["info"] and task["status"] == "ожидает"), None)
+        if nxt is None:
+            self._job_finish_queue()
+            return
+        self._job_current = nxt
+        self._job_start_task(self._job_tasks[nxt])
+        if self._job_runner_active and self._job_phase:
+            self.after(400, self._job_queue_tick)
+
+    def _job_start_task(self, task: dict[str, Any]) -> None:
+        info = task["info"]
+        data_dir = job_queue.data_dir_for(task["path"])
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            task["status"] = "ошибка"
+            task["detail"] = f"не создал data: {exc}"
+            self._refresh_data_task_list()
+            self.after(50, self._job_advance)
+            return
+        task["status"] = "выполняется"
+        task["detail"] = "автопоток: адрес → PDF → разбор…"
+        self._job_log_sink = []
+        self._job_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._sink_job("очередь", f"Задание {info.title}; папка {task['path']}")
+        # Чистый сеанс и поля Шага 0 под это задание: адрес из имени папки,
+        # папка описаний — data (все PDF, обрезки, кэш и JSON падают туда).
+        self._reset_session()
+        self._auto_dwg_context = None
+        self._step0_outcome = None
+        self.step0_address_var.set(info.address)
+        self.step0_borough_var.set("")
+        self.step0_block_var.set("")
+        self.step0_lot_var.set("")
+        self.step0_folder_var.set(str(data_dir))
+        self._select_step_tab(STEP_TAB_DEEDS)
+        done = sum(1 for t in self._job_tasks if t["status"] == "готово")
+        total = sum(1 for t in self._job_tasks if t["info"])
+        self.data_status_var.set(
+            f"Очередь: задание {done + 1} из {total} — {info.title} (автопоток…)")
+        self._refresh_data_task_list()
+        self._job_phase = "autoflow"
+        self._job_phase_deadline = time.monotonic() + self._JOB_AUTOFLOW_TIMEOUT_SEC
+        self._start_step0_auto()
+        if not self._step0_auto_stage and not self._step0_portal_running:
+            self._job_fail_task("автопоток не запустился (см. журнал Шага 0)")
+
+    def _job_queue_tick(self) -> None:
+        if not self._job_runner_active or self._job_current < 0:
+            return
+        if self._job_stop_requested:
+            self._job_abort_current()
+            return
+        if self._job_phase and time.monotonic() > self._job_phase_deadline:
+            self._job_fail_task("тайм-аут этапа")
+            return
+        task = self._job_tasks[self._job_current]
+        if self._job_phase == "autoflow":
+            if (self._step0_auto_stage is None and not self._step0_portal_running
+                    and not self._step0_running and not self._busy):
+                self._job_after_autoflow(task)
+        elif self._job_phase == "draw":
+            if not self._busy:
+                self._job_after_draw(task)
+        if self._job_runner_active and self._job_phase:
+            self.after(400, self._job_queue_tick)
+
+    def _job_after_autoflow(self, task: dict[str, Any]) -> None:
+        context = self._auto_dwg_context
+        data_dir = job_queue.data_dir_for(task["path"])
+        if context is None or Path(context[1]).resolve() != data_dir.resolve():
+            self._job_fail_task(
+                self._job_last_error_line() or "автопоток остановился до разбора")
+            return
+        task["detail"] = "отрисовка: новый DWG в AutoCAD…"
+        self._refresh_data_task_list()
+        self._job_dwg_before = {p.name for p in data_dir.glob("*.dwg")}
+        try:
+            self._job_created_doc = self._job_new_acad_document()
+        except Exception as exc:  # noqa: BLE001 - AutoCAD закрыт/недоступен
+            self._job_fail_task(f"AutoCAD: не создал новый документ — {exc}")
+            return
+        self._sink_job("очередь", "Создан новый документ AutoCAD; рисую схему…")
+        self._job_phase = "draw"
+        self._job_phase_deadline = time.monotonic() + self._JOB_DRAW_TIMEOUT_SEC
+        self._start(parse_only=False)
+        if not self._busy:
+            self._job_fail_task("отрисовка не запустилась (см. журнал)")
+
+    def _job_new_acad_document(self) -> Any:
+        """Новый пустой документ запущенного AutoCAD для задания очереди."""
+        builder = AcadBuilder(self.config_data)
+        app, _doc = builder.connect()
+        doc = app.Documents.Add()
+        try:
+            doc.SetVariable("INSUNITS", 2)  # футы, как ждут координаты схемы
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            app.ActiveDocument = doc
+        except Exception:  # noqa: BLE001 - Add обычно и так активирует документ
+            pass
+        return doc
+
+    def _job_after_draw(self, task: dict[str, Any]) -> None:
+        data_dir = job_queue.data_dir_for(task["path"])
+        new_dwgs = sorted(
+            p.name for p in data_dir.glob("*.dwg") if p.name not in self._job_dwg_before)
+        if not new_dwgs:
+            self._job_fail_task("DWG не сохранён в data (см. журнал)")
+            return
+        doc, self._job_created_doc = self._job_created_doc, None
+        if doc is not None:
+            try:
+                doc.Close()
+            except Exception:  # noqa: BLE001 - файл уже на диске; открытый не страшен
+                pass
+        self._job_succeed_task(f"DWG: {', '.join(new_dwgs)}")
+
+    def _job_abort_current(self) -> None:
+        self._step0_stop.set()
+        if getattr(self, "_step0_running", False):
+            self._stop_step0_intake()
+        task = self._job_tasks[self._job_current]
+        task["status"] = "остановлено"
+        task["detail"] = "остановлено пользователем"
+        self._sink_job("очередь", "Остановлено пользователем.")
+        self._job_close_task()
+
+    def _job_fail_task(self, detail: str) -> None:
+        task = self._job_tasks[self._job_current]
+        task["status"] = "ошибка"
+        task["detail"] = detail
+        self._sink_job("очередь", f"Задание завершено с ошибкой: {detail}",
+                       log_mode.LEVEL_ERROR)
+        self._job_close_task()
+
+    def _job_succeed_task(self, detail: str) -> None:
+        task = self._job_tasks[self._job_current]
+        task["status"] = "готово"
+        task["detail"] = detail
+        self._sink_job("очередь", f"Задание готово: {detail}")
+        self._job_close_task()
+
+    def _job_close_task(self) -> None:
+        self._job_write_log()
+        self._job_log_sink = None
+        self._job_created_doc = None
+        self._job_phase = ""
+        self._refresh_data_task_list()
+        if self._job_stop_requested:
+            self._job_finish_queue()
+        else:
+            self.after(300, self._job_advance)
+
+    def _job_write_log(self) -> None:
+        if not (0 <= self._job_current < len(self._job_tasks)):
+            return
+        task = self._job_tasks[self._job_current]
+        info = task["info"]
+        lines = [
+            f"Задание: {task['path'].name}",
+            f"Папка: {task['path']}",
+            f"Адрес: {info.address if info else '—'}",
+            f"Старт: {self._job_started_at} · финиш: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Итог: {task['status']} · {task['detail']}",
+            f"Модель: {self.current_model()}",
+            "-" * 60,
+        ]
+        lines += [
+            f"[{stamp}] [{source}] {text}"
+            for stamp, source, _level, text in (self._job_log_sink or [])
+        ]
+        try:
+            job_queue.session_log_path(task["path"]).write_text(
+                "\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def _job_finish_queue(self) -> None:
+        for task in self._job_tasks:
+            if task["info"] and task["status"] == "ожидает":
+                task["status"] = "пропущено"
+        self._job_runner_active = False
+        self._job_phase = ""
+        self._job_current = -1
+        self._data_set_controls(running=False)
+        done = sum(1 for t in self._job_tasks if t["status"] == "готово")
+        failed = sum(1 for t in self._job_tasks if t["status"] == "ошибка")
+        self.data_status_var.set(f"Очередь завершена: готово — {done}, ошибок — {failed}.")
+        self._refresh_data_task_list()
 
     # ----------------------------------------------- Шаг 0: документы участка ---
     def _build_step0_page(self) -> None:
@@ -3518,6 +4027,10 @@ class SurveyApp(ctk.CTk):
     def _step0_log(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         self._step0_lines.append((level, self._step0_timestamp(message)))
         self._render_step0_log()
+        # Полный лог сессии задания очереди («Данные») пишется в его data.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), "шаг0", level, str(message)))
         try:
             tel = getattr(self, "_telemetry", None)
             if tel is not None and tel.active:
@@ -4658,7 +5171,8 @@ class SurveyApp(ctk.CTk):
         on_step2 = tab == STEP_TAB_LABELS
         on_step0 = tab == STEP_TAB_DEEDS
         on_step4 = tab == STEP_TAB_OFFSETS
-        if on_step2 or on_step0 or on_step4:
+        on_data = tab == STEP_TAB_DATA
+        if on_step2 or on_step0 or on_step4 or on_data:
             self.main_wrap.grid_remove()
             # Кнопки отрисовки границы относятся только к Шагу 1.
             self.add_neighbor_button.grid_remove()
@@ -4681,6 +5195,11 @@ class SurveyApp(ctk.CTk):
             self._refresh_step4_report()
         else:
             self.step4_page.grid_remove()
+        if on_data:
+            self.data_page.grid(row=2, column=0, sticky="nsew")
+            self._refresh_data_controls()
+        else:
+            self.data_page.grid_remove()
         for label, button in getattr(self, "step_tab_buttons", {}).items():
             active = label == tab
             button.configure(
@@ -5900,6 +6419,8 @@ class SurveyApp(ctk.CTk):
         self._reasoning_by_model[model] = clean
         self._persist_ai_preferences()
         self._refresh_engine_card()
+        if hasattr(self, "data_model_combo"):
+            self._refresh_data_controls()
 
     def select_reasoning(self, value: str) -> None:
         """Программный выбор уровня рассуждений активной модели (для тестов/вызовов)."""
@@ -6053,6 +6574,8 @@ class SurveyApp(ctk.CTk):
             self._refresh_reasoning_controls()
             self._persist_ai_preferences()
             self._warn_expensive_models()
+            if hasattr(self, "data_model_combo"):
+                self._refresh_data_controls()
 
     def _refresh_provider_highlights(self) -> None:
         active = self._active_provider_id
@@ -10981,6 +11504,9 @@ class SurveyApp(ctk.CTk):
             self._log = []
         stamp = __import__("datetime").datetime.now().strftime("%H:%M:%S")
         self._log.append((level, f"{stamp}  {message}"))
+        # Полный лог сессии задания очереди («Данные») пишется в его data.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append((stamp, "шаг1", level, str(message)))
         del self._log[:-400]
         if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
             self._refresh_log_view()

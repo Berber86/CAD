@@ -3510,9 +3510,10 @@ def test_step4_run_reports_error_and_result(gui):
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
-    # Шаг 0 стоит перед Шагом 1: документы участка собираются до посадки границы.
+    # «Данные» стоят перед Шагом 0 (очередь работ), дальше — прежний порядок.
     assert gui.STEP_TABS == (
-        "Шаг 0. Документы участка",
+        "Данные",
+        "Шаг 0. Документы",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
         "Шаг 4. Оффсеты",
@@ -3781,7 +3782,7 @@ def test_step0_tab_is_first_and_hides_step1_workspace(gui):
     app = gui.SurveyApp()
     assert app.step0_page._gridded is False
     app._select_step_tab(gui.STEP_TAB_DEEDS)
-    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы участка"
+    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы"
     assert app.step0_page._gridded is True
     assert app.main_wrap._gridded is False
     assert app.step2_page._gridded is False
@@ -6053,3 +6054,113 @@ def test_expensive_model_selection_warns(gui):
     app._on_model_selected("gpt-6-astra")  # 2000 ₽/1M — дорого
     assert "Это будет дорого" in app.status_var.get()
     assert "gpt-6-astra" in app.status_var.get()
+
+
+def test_data_page_is_first_tab_with_queue_controls(gui, tmp_path):
+    # «Данные» — первая вкладка: список папок, модель+рассуждения, очередь.
+    app = gui.SurveyApp()
+    assert list(app.step_tab_buttons)[0] == gui.STEP_TAB_DATA == "Данные"
+
+    app._select_step_tab(gui.STEP_TAB_DATA)
+    assert app.data_page._gridded is True
+    assert app.main_wrap._gridded is False
+    assert app.draw_button._gridded is False
+    # Модель и рассуждения на «Данных» — те же настройки, что везде.
+    assert app.current_model() in app.data_model_combo.cget("values")
+    assert app.data_reasoning_switch.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+
+    good = tmp_path / "1234A#417 WEST 33RD STREET"
+    good.mkdir()
+    bad = tmp_path / "просто папка"
+    bad.mkdir()
+    app._data_add_folders([good, bad, good])
+    assert len(app._job_tasks) == 2
+    by_status = {task["path"].name: task["status"] for task in app._job_tasks}
+    assert by_status["1234A#417 WEST 33RD STREET"] == "ожидает"
+    assert by_status["просто папка"] == "не подходит"
+    assert "«#»" in app._job_tasks[1]["reason"]
+
+    app._data_remove_task(1)
+    assert len(app._job_tasks) == 1
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.data_page._gridded is False
+    assert app.main_wrap._gridded is True
+
+
+def test_job_queue_failed_autoflow_marks_error_writes_log_and_moves_on(gui, tmp_path):
+    # Автопоток не запустился (заглушка): задание — ошибка, лог в data,
+    # следующее задание всё равно стартует, очередь завершается.
+    app = gui.SurveyApp()
+    folders = []
+    for name in ("1001#10 FIRST ST", "1002#20 SECOND ST"):
+        folder = tmp_path / name
+        folder.mkdir()
+        folders.append(folder)
+    bad = tmp_path / "без номера"
+    bad.mkdir()
+    app._data_add_folders([*folders, bad])
+    app._start_step0_auto = lambda: None  # автопоток отказывается стартовать
+
+    app._start_job_queue()
+    while app._job_runner_active:
+        app._job_advance()
+
+    statuses = {task["path"].name: task["status"] for task in app._job_tasks}
+    assert statuses["1001#10 FIRST ST"] == "ошибка"
+    assert statuses["1002#20 SECOND ST"] == "ошибка"
+    assert statuses["без номера"] == "не подходит"
+    for folder in folders:
+        log = folder / "data" / "session_log.txt"
+        assert log.is_file()
+        text = log.read_text(encoding="utf-8")
+        assert "Итог: ошибка" in text and "автопоток не запустился" in text
+    assert app._job_runner_active is False
+
+
+def test_job_queue_draw_phase_saves_dwg_and_closes_document(gui, tmp_path):
+    # Полный проход задания: автопоток (заглушка) -> новый документ AutoCAD ->
+    # отрисовка (заглушка пишет DWG в data) -> документ закрыт, задание готово.
+    app = gui.SurveyApp()
+    folder = tmp_path / "1234#417 WEST 33RD STREET"
+    folder.mkdir()
+    app._data_add_folders([folder])
+
+    def fake_auto():
+        app._step0_auto_stage = "portal"  # автопоток как будто стартовал
+
+    app._start_step0_auto = fake_auto
+
+    closed = {}
+
+    class _Doc:
+        def Close(self):
+            closed["yes"] = True
+
+    app._job_new_acad_document = lambda: _Doc()
+
+    def fake_start(parse_only=False, **_kwargs):
+        app._busy = True
+        from pathlib import Path as _P
+        (_P(app.step0_folder_var.get()) / "lot_53_fake.dwg").write_bytes(b"dwg")
+
+    app._start = fake_start
+
+    app._start_job_queue()
+    assert app._job_phase == "autoflow"
+    # Автопоток «завершился»: контекст DWG указывает на data этого задания.
+    data_dir = folder / "data"
+    app._auto_dwg_context = (("417 WEST 33RD STREET", "Manhattan", "731", "53"),
+                             data_dir, None, object())
+    app._step0_auto_stage = None
+    app._job_queue_tick()
+    assert app._job_phase == "draw"
+    app._busy = False
+    app._job_queue_tick()
+    app._job_advance()
+
+    task = app._job_tasks[0]
+    assert task["status"] == "готово"
+    assert "lot_53_fake.dwg" in task["detail"]
+    assert closed.get("yes") is True
+    assert "Итог: готово" in (data_dir / "session_log.txt").read_text(encoding="utf-8")
+    assert app._job_runner_active is False

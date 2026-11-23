@@ -67,7 +67,7 @@ def test_auto_complete_uses_collected_full_pdfs_only_and_never_draws(gui, tmp_pa
     assert app._step0_auto_stage is None and app._multi_scene_handoff is not None
 
 
-@pytest.mark.parametrize("borough", [None, "Queens", "Staten Island Queens"])
+@pytest.mark.parametrize("borough", [None, "Staten Island Queens"])
 def test_auto_never_collects_other_or_unknown_borough(gui, tmp_path, monkeypatch, borough):
     app = gui.SurveyApp()
     app.step0_address_var.set("Address")
@@ -79,13 +79,13 @@ def test_auto_never_collects_other_or_unknown_borough(gui, tmp_path, monkeypatch
     assert "район" in app.status_var.get().lower()
 
 
-def test_manual_collection_rejects_other_borough(gui, tmp_path, monkeypatch):
+def test_manual_collection_rejects_unknown_borough(gui, tmp_path, monkeypatch):
     app = gui.SurveyApp()
     smoke._fill_step0(app, folder=tmp_path)
-    app.step0_borough_var.set("Queens")
+    app.step0_borough_var.set("Westchester")
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", lambda **kw: pytest.fail("wrong site"))
     app._start_step0_intake()
-    assert not app._step0_running and "Staten Island" in app.status_var.get()
+    assert not app._step0_running and "ACRIS" in app.status_var.get()
 
 
 def test_auto_stops_on_partial_collection(gui, tmp_path, monkeypatch):

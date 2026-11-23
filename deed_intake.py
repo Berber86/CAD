@@ -1,9 +1,18 @@
 """
 Шаг 0: собрать описания участка — одна кнопка от block/lot до папки файлов.
 
-Модуль связывает четыре уже готовых куска в один проход:
+Модуль связывает готовые куски в один проход. Источник — по району, и
+правила одного сайта на другой не переносятся:
 
-1. ``rcclerk.results_url`` → страница списка документов участка;
+* Staten Island / Richmond County → Richmond County Clerk (``rcclerk.py``,
+  первый настроенный вариант): ``rcclerk.results_url`` → страница списка;
+* Manhattan, Bronx, Brooklyn, Queens → ACRIS (``acris.py`` + читалка
+  ``acris_viewer.py``): прямой запрос списка сразу по 99 строк, документ —
+  дискета Save → OK в настоящем браузере, PDF — из «Загрузок».
+
+Дальше русло одно:
+
+1. страница списка документов участка;
 2. ``rcclerk.parse_document_rows`` + ``rcclerk.choose_documents`` → что качать
    (Deed новее 2015 года, иначе свежая Mortgage с 2015 года и древний Deed как старый;
    нашему лоту — свежий и старый, соседу — свежий);
@@ -27,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import acris
+import acris_viewer
 import deed_pages
 import deed_store
 import ocr_pages
@@ -44,6 +55,10 @@ Downloader = Callable[[rcclerk.DeedRow, Path], object]
 ListFetcher = Callable[[int, int], str]
 #: ``page_finder(pdf)`` → ``deed_pages.DescriptionPages``.
 PageFinder = Callable[[Path], deed_pages.DescriptionPages]
+#: ``acris_fetch_page(код района, block, lot, страница)`` → HTML результатов ACRIS.
+AcrisPageFetcher = Callable[[int, int, int, int], str]
+#: ``acris_id_fetcher(crfn)`` → document_id документа ACRIS.
+AcrisIdFetcher = Callable[[str], str]
 
 
 class IntakeCancelled(RuntimeError):
@@ -158,6 +173,29 @@ def make_downloader(
     return download
 
 
+def make_acris_downloader(
+    *,
+    downloads_dir: str | Path | None = None,
+    progress: Progress | None = None,
+    should_stop: StopCheck | None = None,
+    viewer_download=None,
+):
+    """
+    Загрузчик ACRIS: читалка в настоящем браузере (дискета Save → OK),
+    PDF забирается из «Загрузок». Строка здесь — адаптированная
+    ``rcclerk.DeedRow``, у которой ``endorsement_id`` — это ``document_id``.
+    """
+    download_it = viewer_download or acris_viewer.download_pdf_via_viewer
+
+    def download(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, str]:
+        return download_it(
+            acris.document_image_url(row.endorsement_id), destination,
+            downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
+        )
+
+    return download
+
+
 def _default_page_finder(
     pdf: Path, *, dpi: int = ocr_pages.DEFAULT_DPI, progress: Progress | None = None,
 ) -> deed_pages.DescriptionPages:
@@ -180,6 +218,23 @@ def is_richmond_borough(value: object) -> bool:
                     "richmond county", "richmond county, ny", "richmond county, new york"}
 
 
+def acris_borough_code(value: object) -> int | None:
+    """Код района ACRIS (1–4) или ``None``, если район не для ACRIS."""
+    try:
+        return acris.borough_code(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def step0_source_name(borough: object) -> str:
+    """Какой сайт собирает этот район: ``"Richmond County Clerk"``, ``"ACRIS"`` или ``""``."""
+    if is_richmond_borough(borough):
+        return "Richmond County Clerk"
+    if acris_borough_code(borough) is not None:
+        return "ACRIS"
+    return ""
+
+
 def collect_deeds(
     *,
     block: int | str,
@@ -192,6 +247,9 @@ def collect_deeds(
     with_old_for_neighbour: bool = False,
     fetch_list: ListFetcher | None = None,
     downloader: Downloader | None = None,
+    acris_fetch_page: AcrisPageFetcher | None = None,
+    acris_downloader: Downloader | None = None,
+    acris_id_fetcher: AcrisIdFetcher | None = None,
     auto_save=None,
     ocr_dpi: int = ocr_pages.DEFAULT_DPI,
     downloads_dir: str | Path | None = None,
@@ -210,15 +268,65 @@ def collect_deeds(
 
     ``auto_save`` — безопасный хук, который ждёт загруженный PDF в браузере и
     отправляет Ctrl+S однократно; ``downloads_dir`` — папка «Загрузки».
+
+    Источник выбирается по району: Staten Island / Richmond County — Клерк
+    округа Richmond (``rcclerk``), Manhattan/Bronx/Brooklyn/Queens — ACRIS
+    (``acris`` + ``acris_viewer``). Другой район — ``ValueError``: данные не
+    должны попадать на чужой сайт.
     """
-    if not is_richmond_borough(borough):
-        raise ValueError("Richmond County Clerk доступен только для Staten Island / Richmond County; укажите район")
     if not isinstance(search_pages, bool):
         raise ValueError("search_pages must be boolean")
     block_no = int(block)
     lot_no = int(lot)
     if block_no <= 0 or lot_no <= 0:
         raise ValueError("block and lot must be positive")
+    if is_richmond_borough(borough):
+        return _collect_deeds_richmond(
+            block_no=block_no, lot_no=lot_no, borough=borough,
+            identity_by_lot=identity_by_lot, neighbours=neighbours, folder=folder,
+            base_url=base_url, with_old_for_neighbour=with_old_for_neighbour,
+            fetch_list=fetch_list, downloader=downloader, auto_save=auto_save,
+            ocr_dpi=ocr_dpi, downloads_dir=downloads_dir, page_finder=page_finder,
+            search_pages=search_pages, progress=progress, should_stop=should_stop,
+        )
+    code = acris_borough_code(borough)
+    if code is None:
+        raise ValueError(
+            "укажите район: Staten Island / Richmond County (Richmond County Clerk) "
+            "или Manhattan, Bronx, Brooklyn, Queens (ACRIS)"
+        )
+    return _collect_deeds_acris(
+        code=code, block_no=block_no, lot_no=lot_no, borough=borough,
+        identity_by_lot=identity_by_lot, neighbours=neighbours, folder=folder,
+        with_old_for_neighbour=with_old_for_neighbour,
+        acris_fetch_page=acris_fetch_page, acris_downloader=acris_downloader,
+        acris_id_fetcher=acris_id_fetcher, downloads_dir=downloads_dir,
+        ocr_dpi=ocr_dpi, page_finder=page_finder,
+        search_pages=search_pages, progress=progress, should_stop=should_stop,
+    )
+
+
+def _collect_deeds_richmond(
+    *,
+    block_no: int,
+    lot_no: int,
+    borough: str = "",
+    identity_by_lot: dict[str, dict] | None = None,
+    neighbours: Sequence[int] | str = (),
+    folder: str | Path | None = None,
+    base_url: str = rcclerk.BASE_URL,
+    with_old_for_neighbour: bool = False,
+    fetch_list: ListFetcher | None = None,
+    downloader: Downloader | None = None,
+    auto_save=None,
+    ocr_dpi: int = ocr_pages.DEFAULT_DPI,
+    downloads_dir: str | Path | None = None,
+    page_finder: PageFinder | None = None,
+    search_pages: bool = True,
+    progress: Progress | None = None,
+    should_stop: StopCheck | None = None,
+) -> IntakeOutcome:
+    """Проход по Richmond County Clerk (Staten Island) — первый настроенный вариант."""
     neighbour_lots = parse_lot_list(neighbours)
     target_dir = Path(folder) if folder is not None else Path.cwd() / DESCR_DIR_NAME
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +412,169 @@ def collect_deeds(
     return outcome
 
 
+#: Сколько страниц результатов ACRIS подряд готовы листать (по 99 строк).
+_MAX_ACRIS_PAGES = 25
+
+
+def _acris_as_clerk_row(row: acris.AcrisRow, index: int) -> rcclerk.DeedRow:
+    """
+    Строка ACRIS в виде строки Клерка — чтобы выбор Deed/Mortgage шёл тем же
+    правилом (``rcclerk.choose_documents``). ``endorsement_id`` — document_id
+    (пока не получен — CRFN); дата свежести — Doc Date, иначе Recorded/Filed.
+    """
+    doc_date = row.doc_date or (row.recorded.date() if row.recorded else None)
+    return rcclerk.DeedRow(
+        endorsement_id=row.document_id or row.crfn,
+        doc_type=row.doc_type,
+        doc_date=doc_date,
+        index=index,
+    )
+
+
+def _fetch_acris_rows(
+    code: int, block_no: int, lot_no: int, fetch_page: AcrisPageFetcher,
+) -> list[acris.AcrisRow]:
+    """Все строки лота: страницы по 99, пока ACRIS говорит, что есть дальше."""
+    rows: list[acris.AcrisRow] = []
+    seen: set[str] = set()
+    for page_no in range(1, _MAX_ACRIS_PAGES + 1):
+        page = acris.parse_result_page(fetch_page(code, block_no, lot_no, page_no))
+        for row in page.rows:
+            if row.crfn in seen:
+                continue
+            seen.add(row.crfn)
+            rows.append(row)
+        if not page.has_next or not page.rows:
+            break
+    return rows
+
+
+def _collect_deeds_acris(
+    *,
+    code: int,
+    block_no: int,
+    lot_no: int,
+    borough: str = "",
+    identity_by_lot: dict[str, dict] | None = None,
+    neighbours: Sequence[int] | str = (),
+    folder: str | Path | None = None,
+    with_old_for_neighbour: bool = False,
+    acris_fetch_page: AcrisPageFetcher | None = None,
+    acris_downloader: Downloader | None = None,
+    acris_id_fetcher: AcrisIdFetcher | None = None,
+    downloads_dir: str | Path | None = None,
+    ocr_dpi: int = ocr_pages.DEFAULT_DPI,
+    page_finder: PageFinder | None = None,
+    search_pages: bool = True,
+    progress: Progress | None = None,
+    should_stop: StopCheck | None = None,
+) -> IntakeOutcome:
+    """
+    Проход по ACRIS (Manhattan, Bronx, Brooklyn, Queens).
+
+    Список — прямым запросом сразу по 99 строк; выбор Deed/Mortgage — тем же
+    правилом, что у Клерка; ``document_id`` — по CRFN через NYC Open Data;
+    документ — читалкой в браузере (дискета Save → OK, PDF из «Загрузок»).
+    Дальше русло общее с Ричмондом: страницы описания, имя, паспорт, manifest.
+    """
+    neighbour_lots = parse_lot_list(neighbours)
+    target_dir = Path(folder) if folder is not None else Path.cwd() / DESCR_DIR_NAME
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    fetch_page = acris_fetch_page or (
+        lambda c, b, l, pg: acris.fetch_results_html(c, b, l, page=pg)
+    )
+    resolve_id = acris_id_fetcher or acris.fetch_document_id
+    download = acris_downloader or make_acris_downloader(
+        downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
+    )
+    find_pages = page_finder or (
+        lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
+    )
+    outcome = IntakeOutcome(folder=target_dir, page_search_skipped=not search_pages)
+
+    def say(message: str) -> None:
+        outcome.notes.append(message)
+        if progress is not None:
+            progress(message)
+
+    def check_stop() -> None:
+        if should_stop is not None and should_stop():
+            raise IntakeCancelled("сбор описаний остановлен")
+
+    plans: list[tuple[str, int]] = [("our", lot_no)]
+    plans.extend(("neighbour", value) for value in neighbour_lots)
+
+    for role, lot_value in plans:
+        check_stop()
+        who = "наш участок" if role == "our" else "сосед"
+        say(f"{who}: блок {block_no}, лот {lot_value} — читаю список документов в ACRIS…")
+        try:
+            rows = _fetch_acris_rows(code, block_no, lot_value, fetch_page)
+        except acris.AcrisBlocked as exc:
+            outcome.missing.append(f"{who} (лот {lot_value}): список закрыт страницей отказа ACRIS — {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001 - сеть бывает разной
+            outcome.missing.append(f"{who} (лот {lot_value}): список не открылся — {exc}")
+            continue
+        if not rows:
+            outcome.missing.append(
+                f"{who} (лот {lot_value}): в ACRIS нет строк документов — "
+                f"проверьте block/lot: {acris.search_page_url()}"
+            )
+            continue
+        listed = "; ".join(
+            f"{row.doc_type or '?'} {row.doc_date.strftime('%d.%m.%Y') if row.doc_date else 'без даты'}"
+            for row in rows
+        )
+        say(f"{who} (лот {lot_value}): строк в списке — {len(rows)}: {listed}")
+        adapted_rows = [_acris_as_clerk_row(row, idx) for idx, row in enumerate(rows)]
+        by_adapted = {id(clerk_row): row for clerk_row, row in zip(adapted_rows, rows)}
+        chosen = rcclerk.choose_documents(
+            adapted_rows, role=role, with_old_for_neighbour=with_old_for_neighbour,
+        )
+        if not chosen:
+            outcome.missing.append(
+                f"{who} (лот {lot_value}): ни Deed, ни Mortgage в ACRIS нет "
+                f"(строки: {', '.join(row.doc_type or '?' for row in rows[:6])})"
+            )
+            continue
+        for clerk_row, tag in chosen:
+            check_stop()
+            row = by_adapted[id(clerk_row)]
+            if not row.document_id:
+                try:
+                    row.document_id = resolve_id(row.crfn)
+                except Exception as exc:  # noqa: BLE001
+                    outcome.missing.append(
+                        f"лот {lot_value}: не получил document_id по CRFN {row.crfn} — {exc}"
+                    )
+                    continue
+            outcome_item = _collect_one(
+                block_no=block_no, lot_value=lot_value, role=role,
+                row=_acris_as_clerk_row(row, 0), tag=tag,
+                borough=borough, identity=(identity_by_lot or {}).get(str(lot_value)),
+                target_dir=target_dir, base_url=acris.BASE_URL,
+                download=download, find_pages=find_pages if search_pages else None,
+                ocr_dpi=ocr_dpi, say=say, missing=outcome.missing,
+                source_url=row.image_url,
+                extra_notes=[f"ACRIS: CRFN {row.crfn}"],
+            )
+            if outcome_item is not None:
+                outcome.records.append(outcome_item)
+
+    if outcome.records:
+        deed_store.write_manifest(
+            target_dir,
+            block=block_no, lot=lot_no,
+            missing=[{"reason": item} for item in outcome.missing],
+        )
+        say(f"папка описаний собрана: {len(outcome.records)} документ(ов)")
+    if not outcome.ok and not any("наш участок" in item for item in outcome.missing):
+        outcome.missing.append("наш участок не собран")
+    return outcome
+
+
 def _collect_one(
     *,
     block_no: int,
@@ -320,6 +591,8 @@ def _collect_one(
     ocr_dpi: int,
     say: Progress,
     missing: list[str],
+    source_url: str = "",
+    extra_notes: Iterable[str] = (),
 ) -> deed_store.StoredDeed | None:
     """Один документ: скачать → найти описание → обрезать → положить с паспортом."""
     name = Path(rcclerk.document_file_name(role, lot_value, tag)).stem
@@ -370,6 +643,7 @@ def _collect_one(
             else:
                 say(f"  {name}: страницы описания не найдены — файл кладу целиком")
         notes = [f"ступень загрузки: {rung}"] if rung != "direct" else []
+        notes.extend(extra_notes)
         if row.clerk_number:
             notes.append(f"клерк: {row.clerk_number}")
         if row.doc_type and row.doc_type.upper() != row.kind:
@@ -379,7 +653,7 @@ def _collect_one(
             role=role, lot=lot_value, tag=tag, block=block_no, borough=borough, identity=identity,
             doc_type=row.kind, doc_date=row.doc_date,
             endorsement_id=row.endorsement_id,
-            source_url=rcclerk.document_pdf_url(row.endorsement_id, base=base_url),
+            source_url=source_url or rcclerk.document_pdf_url(row.endorsement_id, base=base_url),
             pages=pages, trimmed_source=trimmed_path, text=found.text, notes=notes,
         )
         return record

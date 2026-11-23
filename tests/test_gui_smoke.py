@@ -5961,6 +5961,36 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     app._on_close()
 
 
+def test_step0_intake_accepts_acris_borough(gui, tmp_path, monkeypatch):
+    """Manhattan идёт в сбор: источник выберет уже deed_intake (ACRIS)."""
+    app = gui.SurveyApp()
+    _fill_step0(app, block="731", lot="53", neighbours="", folder=tmp_path)
+    app.step0_borough_var.set("Manhattan")
+    seen = {}
+    def collect(**kwargs):
+        seen.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert seen["borough"] == "Manhattan"
+    assert (seen["block"], seen["lot"]) == (731, 53)
+    app._on_close()
+
+
+def test_step0_intake_rejects_unknown_borough(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    _fill_step0(app, block="731", lot="53", neighbours="", folder=tmp_path)
+    app.step0_borough_var.set("Westchester")
+    called = []
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", lambda **kw: called.append(kw))
+    app._start_step0_intake()
+    assert called == []
+    assert app._step0_running is False
+    assert "ACRIS" in app.status_var.get()
+    app._on_close()
+
+
 def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
     app = gui.SurveyApp()
     app.multi_pdf_mode_var.set(True)

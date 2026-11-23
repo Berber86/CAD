@@ -227,8 +227,8 @@ STEP0_EMPTY_REPORT = (
     "2. Проверьте Block, Lot и соседей слева/справа; поля можно исправить вручную. "
     "Каждый сосед получает роль «сосед» и файл, например LOT 30 NEW.pdf. "
     "Если портал/ИИ недоступен, значения можно ввести самостоятельно.\n"
-    "3. Нажмите «Собрать описания»: программа откроет список документов Richmond "
-    "County Clerk, возьмёт Deed (новее 2015 года; иначе свежую Mortgage с 2015 года), скачает свежий и старый "
+    "3. Нажмите «Собрать описания»: программа откроет список документов участка "
+    "(Staten Island — Richmond County Clerk, остальные районы — ACRIS), возьмёт Deed (новее 2015 года; иначе свежую Mortgage с 2015 года), скачает свежий и старый "
     "документ нашего участка, найдёт страницы описания и положит всё в папку "
     "01_описания вместе с паспортами и _manifest.json.\n\n"
     "Если сайт закрыт проверкой Cloudflare, программа открывает ссылку в браузере "
@@ -3258,7 +3258,8 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(
             panel,
             text=(
-                "Staten Island — Richmond County: список документов участка, Deed новее 2015 года, "
+                "По району: Staten Island — Richmond County Clerk, Manhattan/Bronx/Brooklyn/Queens — ACRIS. "
+                "Список документов участка, Deed новее 2015 года, "
                 "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
                 "документ (старый Deed), сосед — только свежий. "
                 "Имена: OUR LOT 32 NEW.pdf, OUR LOT 32 OLD.pdf, LOT 30 NEW.pdf. "
@@ -3597,7 +3598,7 @@ class SurveyApp(ctk.CTk):
         return value
 
     def _start_step0_auto(self) -> None:
-        """Explicit paid opt-in: address → Richmond downloads → all descriptions."""
+        """Explicit paid opt-in: address → Step 0 downloads (Clerk or ACRIS) → all descriptions."""
         if (self._busy or self._step0_running or self._step0_portal_running
                 or self._step0_auto_stage or getattr(self, "_source_role_dialog", None)):
             self._set_status("Дождитесь завершения текущей работы.", warn=True)
@@ -3801,12 +3802,12 @@ class SurveyApp(ctk.CTk):
             if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
                 self._stop_auto_transition("Автопоток остановлен: низкая уверенность при поиске соседей. Проверьте карту и запустите сбор вручную.")
                 return
-            if not deed_intake.is_richmond_borough(result.borough):
-                self._stop_auto_transition("Автопоток остановлен: сайт Richmond County работает только для Staten Island; район не подтверждён или пока не поддерживается.")
+            if not deed_intake.step0_source_name(result.borough):
+                self._stop_auto_transition("Автопоток остановлен: район не подтверждён или пока не поддерживается (нужен Staten Island, Manhattan, Bronx, Brooklyn или Queens).")
                 return
             self._step0_auto_identity = (self._step0_auto_address, str(result.borough), str(result.block), str(result.lot))
             self._step0_auto_stage = "intake"
-            self._step0_log("Автопоток: район, Block и Lot получены; собираю документы Staten Island.", level=log_mode.LEVEL_KEY)
+            self._step0_log(f"Автопоток: район, Block и Lot получены; собираю документы ({deed_intake.step0_source_name(result.borough)}).", level=log_mode.LEVEL_KEY)
             self._start_step0_intake()
             if not self._step0_running:
                 self._stop_auto_transition("Автопоток остановлен: не удалось начать сбор документов.")
@@ -3830,8 +3831,8 @@ class SurveyApp(ctk.CTk):
             self._set_status("Шаг 0: сбор уже идёт — дождитесь конца или нажмите «Стоп».")
             return
         borough = str(self.step0_borough_var.get() or "").strip()
-        if not deed_intake.is_richmond_borough(borough):
-            self._set_status("Сбор на сайте Richmond County доступен только для Staten Island. Укажите распознанный район; другие районы пока не поддерживаются.", error=True)
+        if not deed_intake.step0_source_name(borough):
+            self._set_status("Сбор доступен для Staten Island / Richmond County (Richmond County Clerk) и Manhattan, Bronx, Brooklyn, Queens (ACRIS). Укажите распознанный район; другие районы пока не поддерживаются.", error=True)
             return
         try:
             block = int(str(self.step0_block_var.get() or "").strip())
@@ -3923,6 +3924,8 @@ class SurveyApp(ctk.CTk):
             self._post("step0_progress", self._step0_timestamp(line))
 
         downloads = rcclerk.default_downloads_dir()
+        if deed_intake.step0_source_name(borough) == "ACRIS":
+            progress("ACRIS: список — прямым запросом сразу по 99 строк; документ открою в читалке браузера и нажму дискету (Save) → OK, PDF заберу из «Загрузок»")
         auto_save = None
         if browser_save.available():
             auto_save = browser_save.auto_save_hook(
@@ -3934,8 +3937,9 @@ class SurveyApp(ctk.CTk):
                 ),
             )
             mode_note = f" (быстрая работа: пауза {fast_pause:g} с)" if fast_mode else ""
-            progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
-        else:
+            if deed_intake.step0_source_name(borough) != "ACRIS":
+                progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
+        elif deed_intake.step0_source_name(borough) != "ACRIS":
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
         if skip_page_search:
             progress("старый поиск страниц пропущен: полный PDF пойдёт в поиск всех описаний")
@@ -4038,7 +4042,7 @@ class SurveyApp(ctk.CTk):
                    str(self.step0_borough_var.get() or "").strip(),
                    str(self.step0_block_var.get() or "").strip(),
                    str(self.step0_lot_var.get() or "").strip())
-        if expected != current or not deed_intake.is_richmond_borough(current[1]):
+        if expected != current or not deed_intake.step0_source_name(current[1]):
             self._stop_auto_transition("Автопоток остановлен: адрес, район, Block или Lot изменились во время сбора.")
             return
         if not outcome.ok or outcome.missing:

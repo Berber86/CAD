@@ -39,11 +39,18 @@
 
 Основные рабочие решения пользователя:
 
-1. **Автопоток скачивания сейчас только Staten Island / Richmond County.**
-   NYC Portal автоматически даёт Borough, Block и Lot. Если Borough другой или
-   неизвестен, данные не должны попадать на сайт Richmond County Clerk — это
-   относится и к ручному запуску сбора. Для других районов потребуется другой
-   источник и отдельные правила; не предполагайте Staten Island по умолчанию.
+1. **Скачивание Шага 0 — по району, у каждого района свой источник и свои
+   правила; не предполагайте Staten Island по умолчанию.**
+   NYC Portal автоматически даёт Borough, Block и Lot. Staten Island /
+   Richmond County собирает Richmond County Clerk (первый настроенный
+   вариант). С 4.81.14 Manhattan, Bronx, Brooklyn и Queens собирает ACRIS
+   (отдельный источник со своими правилами: список прямым запросом сразу по
+   99 строк, `document_id` по CRFN из NYC Open Data, документ — дискета
+   Save → OK в читалке браузера, PDF из «Загрузок»). Если Borough неизвестен
+   или не из этих пяти, данные не должны попадать ни на один из сайтов.
+   **Пользователь отдельно подчеркнул: сценариев автоматизации Шага 0 у него
+   три; пока прописан только первый — с новым сайтом ACRIS. Остальные два не
+   выдумывать и не смешивать с этим: он научит им по шагам сам.**
 2. Кнопка автопотока на Шаге 0 запускает поиск адреса, сбор и передачу **полных
    PDF текущего сбора** в многоконтурный поиск/разбор. В этом пути старый
    локальный поиск описания и обрезка пропускаются. Ручной путь остаётся
@@ -92,7 +99,7 @@
 | --- | --- |
 | GUI, переходы, отмена, состояние | `main.py`: `_start_step0_auto`, `_finish_step0_portal_lookup`, `_auto_submit_step0_outcome`, `_handle_multi_pdf_done`, `_start_draw_multi_scene`, `_draw_scene_worker` |
 | NYC Portal, OCR карточки и Vision карты | `nyc_portal.py`, `portal_layout_cache.py`, `browser_save.py` |
-| Сбор Richmond County и контроль Borough | `deed_intake.py`, `rcclerk.py`; оригинал, паспорт и manifest — `deed_store.py`, `file_metadata.py` |
+| Сбор Шага 0 и контроль Borough | `deed_intake.py` (диспетчер по району), `rcclerk.py` (Staten Island), `acris.py` + `acris_viewer.py` (остальные районы); оригинал, паспорт и manifest — `deed_store.py`, `file_metadata.py` |
 | Старый поиск и обрезка, обычный PDF-поток | `deed_pages.py`, `pdf_set.py`, `lot_identity.py` |
 | Поиск всех страниц и их разбор | `legal_page_search.py`, `multiple_description_pipeline.py`, `multiple_description_parse.py`, `multiple_description_runtime.py`, `multiple_description_transport.py` |
 | Кэш, геометрия и передача сцены | `multiple_description_cache.py`, `multiple_description_candidate.py`, `multiple_description_drawing.py`, `multiple_description_handoff.py` |

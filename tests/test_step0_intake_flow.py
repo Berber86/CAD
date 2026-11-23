@@ -489,14 +489,31 @@ def test_portal_values_are_kept_per_file_and_survive_step1_read(tmp_path):
     assert next(item for item in manifest["items"] if item["file"] == neighbor.file)["identity"] == passport["identity"]
 
 
-@pytest.mark.parametrize("borough", ["", "Queens", "Brooklyn", "Bronx", "Manhattan", "Staten Island Queens", None])
-def test_richmond_site_rejects_unknown_or_other_borough_before_any_side_effect(tmp_path, borough):
+@pytest.mark.parametrize("borough", ["", "Staten Island Queens", None])
+def test_unknown_borough_is_rejected_before_any_side_effect(tmp_path, borough):
     folder = tmp_path / "never-created"
     calls = []
     with pytest.raises(ValueError, match="Staten Island"):
         deed_intake.collect_deeds(block=BLOCK, lot=LOT, borough=borough, folder=folder,
-                                  fetch_list=lambda *args: calls.append(args))
+                                  fetch_list=lambda *args: calls.append(args),
+                                  acris_fetch_page=lambda *args: calls.append(args))
     assert not calls and not folder.exists()
+
+
+@pytest.mark.parametrize("borough", ["Queens", "Brooklyn", "Bronx", "Manhattan"])
+def test_other_boroughs_go_to_acris_never_to_richmond(tmp_path, borough):
+    """Районы ACRIS не должны попадать на сайт Клерка Ричмонда — у них свой."""
+    richmond_calls = []
+    outcome = deed_intake.collect_deeds(
+        block=BLOCK, lot=LOT, borough=borough, folder=tmp_path,
+        fetch_list=lambda *args: richmond_calls.append(args),
+        acris_fetch_page=lambda code, block, lot, page: "<html><body>нет строк</body></html>",
+        acris_downloader=lambda row, dest: pytest.fail("качать нечего"),
+        page_finder=lambda pdf: pytest.fail("страниц нет"),
+    )
+    assert richmond_calls == []
+    assert not outcome.ok
+    assert any("ACRIS" in item for item in outcome.missing)
 
 
 def test_full_pdf_only_path_skips_legacy_search_and_cropping(tmp_path, monkeypatch):

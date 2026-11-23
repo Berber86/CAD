@@ -1221,11 +1221,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         ctk.CTkLabel(
             update_row,
-            text=(
-                "Источник обновления. Оставьте пустым — программа сама найдёт ветку "
-                "с наибольшей версией (тестовые ветки пропускает). Ссылка нужна, только "
-                "если хотите конкретную ветку, репозиторий или .zip."
-            ),
+            text="Пусто = сама найдёт ветку",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1238,7 +1234,7 @@ class SurveyApp(ctk.CTk):
             height=30,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
-            placeholder_text="пусто = найти автоматически (или github.com/owner/repo/tree/branch)",
+            placeholder_text="пусто = авто",
         )
         self.update_source_entry.grid(row=2, column=0, sticky="ew", padx=(10, 4), pady=(0, 6))
         self.update_version_button = ctk.CTkButton(
@@ -1327,7 +1323,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkLabel(
             drawer_body,
-            text="API-КЛЮЧИ (НА ДИСК ПОПАДАЮТ ТОЛЬКО ШИФРОВАННЫЕ ТОКЕНЫ TSAI1:…)",
+            text="🔑",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1542,7 +1538,7 @@ class SurveyApp(ctk.CTk):
             command=self._on_theme_changed,
         )
         self.theme_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
-        ctk.CTkLabel(theme_card, text="Тема сохранится и применится после перезапуска программы.",
+        ctk.CTkLabel(theme_card, text="После перезапуска",
                      font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
                      anchor="w", justify="left", wraplength=400).grid(
                          row=2, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -2219,7 +2215,7 @@ class SurveyApp(ctk.CTk):
 
         self.enhance_scan_switch = ctk.CTkSwitch(
             visual_opts_card,
-            text="Чёткость фото 80-х  (контраст и резкость без искажения цветов)",
+            text="Резкость 80-х",
             variable=self.enhance_scan_var,
             font=ctk.CTkFont(size=11),
             command=self._redraw_preview_canvas,
@@ -2984,7 +2980,7 @@ class SurveyApp(ctk.CTk):
 
         self.sides_title_label = ctk.CTkLabel(
             self.sheet_tab_frame,
-            text="СТОРОНЫ КОНТУРА (наведите мышью на схеме — подсветка синхронна)",
+            text="СТОРОНЫ КОНТУРА",
             font=self._result_fonts["small_bold"],
             wraplength=self._result_wrap_length(),
             justify="left",
@@ -5012,7 +5008,7 @@ class SurveyApp(ctk.CTk):
         report_head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             report_head,
-            text="Отчёт Шага 2 (дублируется в «🧾 Журнал» на вкладке Шага 1)",
+            text="🧾",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_main"],
             anchor="w",
@@ -5098,8 +5094,7 @@ class SurveyApp(ctk.CTk):
             manual = self._feature_text_height_override()
         except ValueError:
             label.configure(
-                text="Высота текста: введите число в футах от 0.05 до 20 (например 0.5) "
-                     "или оставьте поле пустым.",
+                text="Высота: число 0.05–20 или пусто.",
                 text_color=THEME["warn"],
             )
             return
@@ -7244,7 +7239,7 @@ class SurveyApp(ctk.CTk):
             backups = []
         if not backups:
             label.configure(
-                text="Резервных копий нет: откат станет доступен после первого обновления.",
+                text="Резервных копий нет",
                 text_color=THEME["text_dim"],
             )
             self._set_rollback_enabled(False)
@@ -13693,7 +13688,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkButton(
             btn_bar,
-            text="🔄 Попробуй разобраться ещё раз (прицельно проверить спорные места)",
+            text="🔄 Ещё раз",
             height=38,
             fg_color=THEME["btn_amber"],
             hover_color=THEME["btn_amber_hover"],

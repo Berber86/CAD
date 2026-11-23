@@ -398,72 +398,27 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
         raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
 
 
-_ADDRESS_SUFFIXES = {"st": "street", "str": "street", "ave": "avenue", "av": "avenue",
-                     "rd": "road", "blvd": "boulevard", "dr": "drive", "ln": "lane",
-                     "pl": "place", "ct": "court", "pkwy": "parkway"}
-_ADDRESS_DIRECTIONS = {"w": "west", "e": "east", "n": "north", "s": "south"}
-_ORDINAL_TOKEN_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$")
-
-
-def _address_tokens(text: str) -> list[str]:
+def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText],
+                      typed: str = "") -> ScreenText | None:
     """
-    Токены адреса для сравнения «ввод ↔ подсказка портала».
+    Первая строка выпавшего списка подсказок — сам факт, что список открылся.
 
-    Портал подсказывает сокращениями, а человек пишет полностью: «417 WEST
-    33RD STREET» против «417 W 33 St, MANHATTAN, NY, 10001, USA» (живой
-    случай 2026-11-23). Поэтому направления (W→west) и порядковые номера
-    (33rd→33) приводятся к одному виду, как и суффиксы улиц (St→street).
+    Текст НЕ сверяется с вводом (решение пользователя 2026-11-23: строгая
+    сверка трижды останавливала живой автопоток, а риск невелик — дальше
+    карточка участка и поля Шага 0, которые человек видит). Отсекаем только
+    само поле ввода (его текст равен введённому) и числа на карте справа.
+    Запас по высоте — чуть больше высоты подписи: прежние «две высоты + 15»
+    оставили запас всего 6 px и отсекли настоящую подсказку на живом окне.
     """
-    tokens: list[str] = []
-    for token in re.findall(r"[a-z0-9]+", text.lower()):
-        glued = re.fullmatch(r"(\d+)([wens])", token)
-        if glued:  # OCR склеил номер дома с направлением: «417w»
-            tokens.append(glued.group(1))
-            token = glued.group(2)
-        token = _ADDRESS_SUFFIXES.get(token, token)
-        token = _ADDRESS_DIRECTIONS.get(token, token)
-        ordinal = _ORDINAL_TOKEN_RE.match(token)
-        tokens.append(ordinal.group(1) if ordinal else token)
-    return tokens
-
-
-#: Тип улицы — единственный токен, который подсказке позволено потерять:
-#: номер дома, направление и номер/название улицы сверяются всегда.
-_STREET_TYPE_TOKENS = {"street", "avenue", "road", "drive", "lane", "place",
-                       "court", "boulevard", "parkway"}
-
-
-def _suggestion_matches(expected: list[str], actual: list[str]) -> bool:
-    """
-    Та ли это подсказка: точный префикс — или ключевые токены по порядку.
-
-    OCR может потерять тип улицы («St») или склеить слова; чужая улица при
-    этом не пройдёт: номер дома, направление и номер улицы должны совпасть.
-    """
-    if not expected or not actual:
-        return False
-    if actual[:len(expected)] == expected:
-        return True
-    keys = [token for token in expected if token not in _STREET_TYPE_TOKENS]
-    if not keys or actual[0] != expected[0]:
-        return False
-    pos = 0
-    for token in actual[:len(expected) + 2]:
-        if pos < len(keys) and token == keys[pos]:
-            pos += 1
-    return pos == len(keys)
-
-
-def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText]) -> ScreenText | None:
     label = next((r for r in address_rows if "enter an address" in r.text.lower()), None)
     if label is None:
         return None
     x0, y0, x1, y1 = label.box
-    # Исключаем само поле и числа на карте справа: подсказка находится под полем.
-    min_y = y1 + max(24, (y1 - y0) * 2) + 15
-    max_x = x0 + max(120, (x1 - x0) // 2)
-    candidates = [row for row in rows if row.box[1] >= min_y and x0 - 10 <= row.box[0] <= max_x
-                  and re.match(r"^\s*\d", row.text)]
+    min_y = y1 + max(36, (y1 - y0) * 2)
+    max_x = x0 + max(160, x1 - x0)
+    typed_norm = _normalise(typed)
+    candidates = [row for row in rows if row.box[1] >= min_y and x0 - 12 <= row.box[0] <= max_x
+                  and re.match(r"^\s*\d", row.text) and _normalise(row.text) != typed_norm]
     return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
 
 
@@ -487,18 +442,23 @@ def _suggestion_screen_hint(handle: int, address: str, address_rows: Sequence[Sc
 
 
 def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText], *,
-                              first_delay: float = RELIABLE_SUGGESTION_DELAY) -> None:
-    """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
-    expected = _address_tokens(address)
-    def matches(items: Sequence[ScreenText]) -> bool:
-        suggestion = _first_suggestion(items, address_rows)
-        return _suggestion_matches(expected, _address_tokens(suggestion.text if suggestion else ""))
+                              first_delay: float = RELIABLE_SUGGESTION_DELAY) -> ScreenText | None:
+    """
+    Ждём, пока портал покажет список подсказок, и возвращаем первую строку.
+
+    Что в ней написано — не проверяем (решение пользователя 2026-11-23,
+    см. ``_first_suggestion``): выбирается она клавишами Down+Enter, а не
+    кликом по координатам. Нет списка после повторных проверок — остановка
+    с диагностикой, что OCR видит под полем.
+    """
+    def present(items: Sequence[ScreenText]) -> bool:
+        return _first_suggestion(items, address_rows, typed=address) is not None
 
     rows: list[ScreenText] | None = None
     for attempt, delay in enumerate((first_delay, RELIABLE_RETRY_DELAY)):
         try:
-            rows = _wait_screen(handle, matches,
-                                first_delay=delay, description="совпадающую первую подсказку адреса",
+            rows = _wait_screen(handle, present,
+                                first_delay=delay, description="список подсказок адреса",
                                 region=_FORM_REGION)
             break
         except _ScreenNotFound:
@@ -509,13 +469,11 @@ def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[
                 time.sleep(RELIABLE_RETRY_DELAY)
     if rows is None:
         raise PortalLookupError(
-            "Не дождался совпадающую первую подсказку адреса на NYC Portal "
+            "Не дождался список подсказок адреса на NYC Portal "
             "после повторных проверок."
             + _suggestion_screen_hint(handle, address, address_rows)
         )
-    suggestion = _first_suggestion(rows, address_rows)
-    if not _suggestion_matches(expected, _address_tokens(suggestion.text if suggestion else "")):
-        raise PortalLookupError("Первая подсказка адреса не совпадает с запросом; проверьте ввод и повторите.")
+    return _first_suggestion(rows, address_rows, typed=address)
 
 
 def _type_focused_address(handle: int, address: str) -> None:
@@ -796,8 +754,10 @@ def _drive_portal(
     if fast_mode:
         _fast_wait(window.handle, fast_pause_sec)
     else:
-        _wait_after_address_input(window.handle, address, rows,
-                                  first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+        picked = _wait_after_address_input(window.handle, address, rows,
+                                           first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+        if progress and picked is not None:
+            progress(f"первая подсказка портала: «{picked.text}» — выбираю её")
     check_layout_size()
     _key(window.handle, browser_save.VK_DOWN)
     time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)

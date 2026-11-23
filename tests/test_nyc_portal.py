@@ -634,20 +634,21 @@ def test_initial_screen_reuses_quarter_and_only_falls_back_if_needed(tmp_path, m
     assert seen == [(500, 400), (1000, 800)]
 
 
-def test_normal_suggestion_checks_first_address_not_input_or_later_match(monkeypatch):
+def test_normal_suggestion_takes_first_row_below_field_not_the_input(monkeypatch):
+    """Текст подсказки не сверяется (решение пользователя): первая строка списка."""
     label = [nyc_portal.ScreenText("Enter an Address", (10, 160, 300, 180))]
     row = lambda text, y: nyc_portal.ScreenText(text, (20, y, 300, y + 15))
     input_value = row("87 Stafford Avenue", 210)
     correct = row("87 Stafford Avenue, Staten Island", 250)
     incorrect = row("88 Stafford Avenue, Staten Island", 250)
     later_match = row("87 Stafford Avenue", 280)
-    assert nyc_portal._first_suggestion([input_value], label) is None
+    assert nyc_portal._first_suggestion([input_value], label, typed="87 Stafford Ave") is None
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
     monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [input_value, correct])
-    nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
+    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == correct
+    # Даже «чужая» первая строка берётся как есть: проверка текста убрана.
     monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [incorrect, later_match])
-    with pytest.raises(nyc_portal.PortalLookupError, match="не совпадает"):
-        nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
+    assert nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label) == incorrect
 
 
 @pytest.mark.parametrize("start", ["select", "address", "previous"])
@@ -984,10 +985,10 @@ def test_reliable_missing_borough_uses_vision_on_same_left_half(tmp_path, monkey
     assert len(captures) == 4  # форма, подсказка, карточка, финальная карта/карточка
 
 
-def test_reliable_suggestion_rechecks_wrong_first_suggestion_before_selecting(monkeypatch):
+def test_reliable_suggestion_takes_first_screen_with_a_list(monkeypatch):
+    """Сверки текста нет: первый же снимок с выпавшим списком — и выбираем."""
     label = [nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))]
-    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))]
-    correct = [nyc_portal.ScreenText("87 Stafford Avenue", (20, 250, 200, 270))]
+    first = nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))
     clock = _FakeClock()
     monkeypatch.setattr(nyc_portal, "time", clock)
     monkeypatch.setattr(nyc_portal, "_focus", lambda _: None)
@@ -996,10 +997,10 @@ def test_reliable_suggestion_rechecks_wrong_first_suggestion_before_selecting(mo
         captures.append(True)
         Path(path).write_bytes(str(len(captures)).encode())
     monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
-    screens = iter([wrong, correct])
-    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda *_: next(screens))
-    nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
-    assert len(captures) == 2 and clock.sleeps == [5.0, 2.0]
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda *_: [first])
+    picked = nyc_portal._wait_after_address_input(42, "87 Stafford Ave", label)
+    assert picked == first
+    assert len(captures) == 1 and clock.sleeps == [5.0]
 
 
 def test_reliable_initial_screen_failure_retries_once_but_challenge_does_not(tmp_path, monkeypatch):
@@ -1116,19 +1117,18 @@ def test_optimal_missing_or_other_browser_cache_runs_reliable_and_learns(tmp_pat
     assert any("надёжный поиск" in line for line in logs)
 
 
-def test_optimised_never_selects_mismatching_first_suggestion(tmp_path, monkeypatch):
+def test_optimised_stops_only_when_no_suggestion_list_at_all(tmp_path, monkeypatch):
+    """Проверки текста нет; стоп — только если список подсказок так и не выпал."""
     q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
-    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270)),
-             nyc_portal.ScreenText("87 Stafford Avenue", (20, 300, 200, 320))]
+    empty = [nyc_portal.ScreenText("No suggestions", (20, 250, 200, 270))]
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Enter an Address", (20, 80, 250, 100))],
-              wrong, wrong, wrong, wrong])  # два цикла ожидания по две проверки
-    with pytest.raises(nyc_portal.PortalLookupError, match="первую подсказку"):
+              empty, empty, empty, empty])  # два цикла ожидания по две проверки
+    with pytest.raises(nyc_portal.PortalLookupError, match="список подсказок"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert keys.count(nyc_portal.browser_save.VK_RETURN) == 1  # only menu, never select address
     assert not (tmp_path / "map.png").exists()
-    assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == (20, 160, 250, 180)
 
 
 def test_optimal_stops_if_window_size_changes_before_address_typing(tmp_path, monkeypatch):
@@ -1151,7 +1151,7 @@ def test_modes_cannot_both_be_enabled_before_touching_browser(tmp_path, monkeypa
 
 def test_no_coordinate_learning_after_failed_suggestion(tmp_path, monkeypatch):
     q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
-    wrong = [nyc_portal.ScreenText("88 Stafford Avenue", (20, 250, 200, 270))]
+    wrong = [nyc_portal.ScreenText("No suggestions", (20, 250, 200, 270))]
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
               wrong, wrong, wrong, wrong])  # два цикла ожидания по две проверки
     with pytest.raises(nyc_portal.PortalLookupError):
@@ -1460,36 +1460,28 @@ def test_reliable_without_confirmed_card_does_not_send_screenshot(tmp_path, monk
     assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))
 
 
-def test_address_tokens_match_portal_abbreviations():
-    """Живой случай 2026-11-23: подсказка «417 W 33 St…» — та самая улица."""
-    assert nyc_portal._address_tokens("417 WEST 33RD STREET") == ["417", "west", "33", "street"]
-    assert nyc_portal._address_tokens("417 W 33 St, MANHATTAN, NY, 10001, USA")[:4] == [
-        "417", "west", "33", "street",
-    ]
-    assert nyc_portal._address_tokens("5TH AVENUE") == ["5", "avenue"]
-    # Чужая улица по-прежнему не совпадает: номер дома и улица проверяются.
-    assert nyc_portal._address_tokens("W 33 St, BROOKLYN, NY")[:3] != ["417", "west", "33"]
+def test_first_suggestion_on_live_screenshot_geometry():
+    """Живой случай 2026-11-23: рамки со скриншота пользователя (окно 958 px).
+
+    Прежняя геометрия оставляла запас 6 px и отсекала настоящую подсказку;
+    проверка текста теперь убрана вовсе (решение пользователя)."""
+    label = [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)", (12, 206, 373, 224))]
+    input_row = nyc_portal.ScreenText("417 WEST 33RD STREET", (43, 249, 203, 264))
+    suggestion = nyc_portal.ScreenText("417 W 33 ST, MANHATTAN, NY, 10001, USA", (16, 281, 298, 295))
+    map_3d = nyc_portal.ScreenText("3D", (635, 127, 658, 144))
+    rows = [label[0], input_row, suggestion, map_3d]
+    assert nyc_portal._first_suggestion(rows, label, typed="417 WEST 33RD STREET") == suggestion
+    # Само поле ввода подсказкой не считается, даже без typed оно ниже запаса.
+    assert nyc_portal._first_suggestion([input_row], label, typed="417 WEST 33RD STREET") is None
 
 
-def test_suggestion_wait_accepts_abbreviated_first_suggestion(monkeypatch):
+def test_wait_takes_whatever_first_suggestion_shows(monkeypatch):
     label = [nyc_portal.ScreenText("Enter an Address", (10, 160, 300, 180))]
-    suggestion = nyc_portal.ScreenText("417 W 33 St, MANHATTAN, NY, 10001, USA", (20, 250, 300, 265))
+    suggestion = nyc_portal.ScreenText("417 W 33 ST, MANHATTAN, NY, 10001, USA", (20, 250, 300, 265))
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda _: None)
     monkeypatch.setattr(nyc_portal, "_wait_screen", lambda *args, **kw: [suggestion])
-    nyc_portal._wait_after_address_input(42, "417 WEST 33RD STREET", label)
-
-
-def test_suggestion_matches_tolerates_ocr_noise_but_not_wrong_street():
-    expected = nyc_portal._address_tokens("417 WEST 33RD STREET")
-    ok = nyc_portal._address_tokens("417 W 33 St, MANHATTAN, NY, 10001, USA")
-    assert nyc_portal._suggestion_matches(expected, ok)
-    assert nyc_portal._address_tokens("417W 33 St")[:3] == ["417", "west", "33"]
-    # Потерянный тип улицы допустим, чужие номер дома / улица / направление — нет.
-    assert nyc_portal._suggestion_matches(expected, nyc_portal._address_tokens("417 W 33, MANHATTAN"))
-    assert not nyc_portal._suggestion_matches(expected, nyc_portal._address_tokens("417 W 34 St, MANHATTAN"))
-    assert not nyc_portal._suggestion_matches(expected, nyc_portal._address_tokens("418 W 33 St, MANHATTAN"))
-    assert not nyc_portal._suggestion_matches(expected, nyc_portal._address_tokens("417 E 33 St, MANHATTAN"))
-    assert not nyc_portal._suggestion_matches(expected, [])
+    picked = nyc_portal._wait_after_address_input(42, "417 WEST 33RD STREET", label)
+    assert picked == suggestion
 
 
 def test_suggestion_wait_reports_what_ocr_saw(monkeypatch):

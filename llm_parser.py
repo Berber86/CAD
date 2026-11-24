@@ -167,21 +167,27 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         "selected_model": "grok-4.7",
         # Только модели с визуальным входом (text+image) и настраиваемым
         # уровнем рассуждений — по публичному каталогу Hydra (GET /v1/models,
-        # проверка 2026-11-23). Текстовые glm-5.2 / hydra-gemini* удалены:
+        # проверка 2026-11-23; 2026-11-24 добавлены «новые» с dashboard:
+        # cheap/gpt-6.1-sol, cheap/gpt-6.1-terra, claude-haiku-5.5,
+        # claude-opus-5.5; gpt-6.2-sol/astra там же «новые», но уже были).
+        # Текстовые glm-5.2 / hydra-gemini* удалены:
         # сканы и фото чертежей они не видят. Уровни каждой модели —
         # HYDRA_MODEL_REASONING ниже; выбор пользователя хранится в
         # ``reasoning_by_model`` рядом с выбранной моделью.
         "models": [
             "grok-4.7",
             "gpt-6-luna",
+            "claude-haiku-5.5",
             "minimax-m3.1-flash",
             "pro/glm-5.3-flash",
             "gpt-5.6-luna",
             "pro/deepseek-v4.1-flash-1017",
             "gpt-5.4-nano",
+            "cheap/gpt-6.1-terra",
             "gemini-3.1-flash-lite",
             "gpt-5-mini",
             "gemini-3.5-flash-lite",
+            "cheap/gpt-6.1-sol",
             "gemini-3-flash",
             "gemini-3.8-flash",
             "gpt-5.4-mini",
@@ -197,6 +203,7 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
             "gpt-5.2",
             "gpt-5.3-codex",
             "gpt-5.4",
+            "claude-opus-5.5",
             "gpt-5.5",
             "gpt-5.6-sol",
             "gpt-6.2-astra",
@@ -243,7 +250,7 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
 #: Уровни рассуждений (``reasoning_effort``) моделей Hydra из каталога выше:
 #: значение по умолчанию у провайдера и допустимые значения переключателя.
 #: Данные — публичный каталог Hydra (GET https://api.hydraai.ru/v1/models,
-#: проверка 2026-11-23): у каждой модели вход text+image и есть
+#: проверка 2026-11-23, дополнено 2026-11-24): у каждой модели вход text+image и есть
 #: ``reasoning_effort`` с выбором. Моделей без этих данных здесь нет, и
 #: параметр им не отправляется (часть провайдеров отвечает на него HTTP 400).
 HYDRA_MODEL_REASONING: dict[str, dict[str, Any]] = {
@@ -254,6 +261,10 @@ HYDRA_MODEL_REASONING: dict[str, dict[str, Any]] = {
     "gpt-6.2-astra": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 1600},
     "gpt-6.1-sol": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 400},
     "gpt-6.1-terra": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 200},
+    # Дешёвая ветка GPT-6.1 (фильтр «новые» на dashboard, 2026-11-24): те же
+    # рассуждения, что у обычных, но выход заметно дешевле (100 и 50 ₽/1M).
+    "cheap/gpt-6.1-sol": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 100},
+    "cheap/gpt-6.1-terra": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 50},
     "gpt-6-sol": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 400},
     "gpt-6-luna": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 20},
     "gpt-6-astra": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 2000},
@@ -273,6 +284,10 @@ HYDRA_MODEL_REASONING: dict[str, dict[str, Any]] = {
     "gemini-3-flash": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 120},
     "gemini-3.5-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 100},
     "gemini-3.1-flash-lite": {"default": "minimal", "choices": ["minimal", "low", "medium", "high"], "out_rub_per_m": 60},
+    # Claude 5.5 (фильтр «новые», 2026-11-24). У haiku цена базовая: при входе
+    # >100k токенов выход дорожает до 117.5 ₽/1M (overrides каталога).
+    "claude-haiku-5.5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 23.5},
+    "claude-opus-5.5": {"default": "low", "choices": ["low", "medium", "high", "xhigh"], "out_rub_per_m": 940},
     "claude-sonnet-5": {"default": "none", "choices": ["none", "low", "medium", "high", "xhigh"], "out_rub_per_m": 470},
     # В карточке claude-sonnet-5.5 у Hydra противоречие: поле reasoning_effort
     # есть, а в описании сказано «Управлять уровнем рассуждений нельзя!».

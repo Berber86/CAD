@@ -46,6 +46,26 @@ def test_hydra_catalog_only_vision_reasoning_models():
     assert lp.model_output_price_rub("openrouter", "gpt-6-astra") is None
 
 
+def test_hydra_catalog_includes_dashboard_new_models_2026_11_24():
+    # Фильтр «новые» на dashboard Hydra (2026-11-24): cheap/gpt-6.1-sol,
+    # cheap/gpt-6.1-terra, claude-haiku-5.5, claude-opus-5.5 добавлены по
+    # возрастанию цены выхода; gpt-6.2-sol/astra там же «новые», но уже были.
+    models = lp.PROVIDERS_CATALOG["hydra"]["models"]
+    reasoning = lp.HYDRA_MODEL_REASONING
+    assert reasoning["claude-haiku-5.5"]["out_rub_per_m"] == 23.5
+    assert reasoning["cheap/gpt-6.1-terra"]["out_rub_per_m"] == 50
+    assert reasoning["cheap/gpt-6.1-sol"]["out_rub_per_m"] == 100
+    assert reasoning["claude-opus-5.5"]["out_rub_per_m"] == 940
+    assert models.index("gpt-6-luna") < models.index("claude-haiku-5.5") < models.index("minimax-m3.1-flash")
+    assert models.index("gpt-5.4-nano") < models.index("cheap/gpt-6.1-terra") < models.index("gemini-3.1-flash-lite")
+    assert models.index("gemini-3.5-flash-lite") < models.index("cheap/gpt-6.1-sol") < models.index("gemini-3-flash")
+    assert models.index("gpt-5.4") < models.index("claude-opus-5.5") < models.index("gpt-5.5")
+    assert lp.reasoning_spec("hydra", "cheap/gpt-6.1-sol") == ("low", ["low", "medium", "high", "xhigh"])
+    assert lp.reasoning_spec("hydra", "claude-haiku-5.5") == (
+        "none", ["none", "low", "medium", "high", "xhigh"])
+    assert len(models) == 33
+
+
 def test_resolve_reasoning_defaults_and_stored_choice():
     cfg = _cfg_with_reasoning()
     assert lp.resolve_reasoning_effort(cfg, provider="hydra", model="grok-4.7") == "none"

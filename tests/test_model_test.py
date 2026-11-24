@@ -85,6 +85,63 @@ def _fake_outcome(data=None):
     )
 
 
+def test_plan_scene_carries_everything_for_acad():
+    plan = SimpleNamespace(
+        lines=[SimpleNamespace(start=(0, 0), end=(10, 0), kind="street-row")],
+        boundary_lines=[SimpleNamespace(start=(0, 0), end=(0, 10), kind="property")],
+        arcs=[SimpleNamespace(center=(0, 0), radius=5.0, start_angle=0.0, end_angle=1.5)],
+        items=[
+            SimpleNamespace(text="MAIN ST", point=(5, -2), kind="main-street", rotation=0.0),
+            SimpleNamespace(text="50.00", point=(0, 5), kind="side-dist", rotation=1.57),
+        ],
+    )
+    scene = mt.plan_scene(plan)
+    assert scene["lines"][0][2] == "street-row"
+    assert scene["boundary"][0][2] == "property"
+    assert scene["arcs"][0][1] == 5.0
+    assert [t[0] for t in scene["texts"]] == ["MAIN ST", "50.00"]
+    assert scene["texts"][1][3] == 1.57
+
+
+def test_grades_scale_and_aggregation_by_reasoning(tmp_path: Path):
+    assert mt.GRADES[0] == "2-" and mt.GRADES[-1] == "5+"
+    assert mt.grade_value("2-") < mt.grade_value("2") < mt.grade_value("5+")
+    assert mt.grade_value("6") is None
+
+    book = mt.RatingsBook(tmp_path / "ratings.json")
+    base = {"provider": "hydra", "model": "grok-4.7", "closure_ft": 0.03}
+    book.add({**base, "reasoning": "high", "grade": "5"})
+    book.add({**base, "reasoning": "high", "grade": "4"})
+    book.add({**base, "reasoning": "low", "grade": "3"})
+    rows = mt.aggregate_ratings(book.entries)
+    assert len(rows) == 2  # разрезы по уровню рассуждений — отдельными строками
+    high = next(r for r in rows if r["reasoning"] == "high")
+    assert high["count"] == 2
+    assert high["avg_grade"] == pytest.approx((mt.grade_value("5") + mt.grade_value("4")) / 2)
+    assert high["avg_closure_ft"] == pytest.approx(0.03)
+    assert rows[0]["reasoning"] == "high"  # лучшая средняя — первой
+
+    again = mt.RatingsBook(tmp_path / "ratings.json")
+    assert len(again.entries) == 3  # пережила перезапуск
+    book.update_grade(book.entries[0], "5+")
+    assert mt.RatingsBook(tmp_path / "ratings.json").entries[0]["grade"] == "5+"
+    book.clear()
+    assert mt.RatingsBook(tmp_path / "ratings.json").entries == []
+
+
+def test_make_rating_entry_freezes_metrics():
+    result = mt.SlotResult(
+        slot=mt.ModelTestSlot("hydra", "grok-4.7", "high"),
+        outcome=_fake_outcome(), plan=_FakeBuilder({}).plan(SimpleNamespace(segments=[1, 2])),
+        seconds=12.34)
+    entry = mt.make_rating_entry(result, "4+", "deed.pdf")
+    assert entry["grade"] == "4+"
+    assert entry["reasoning"] == "high"
+    assert entry["closure_ft"] == 0.012
+    assert entry["tokens"] == 42
+    assert entry["file"] == "deed.pdf"
+
+
 def test_run_all_slots_isolates_failures(monkeypatch):
     calls = []
 

@@ -6185,3 +6185,51 @@ def test_model_test_window_opens_by_triple_click_on_canvas(gui):
     page.close()
     assert app._model_test_window is None
     assert page._closed is True
+
+
+def test_model_test_window_grades_and_stats(gui):
+    from types import SimpleNamespace
+
+    import model_test as mt
+
+    app = gui.SurveyApp()
+    app._open_model_test_window()
+    page = app._model_test_window
+
+    plan = SimpleNamespace(
+        description=SimpleNamespace(segments=[SimpleNamespace(distance_ft=50.0)]),
+        vertices=[(0.0, 0.0), (50.0, 0.0), (50.0, 50.0)],
+        pob=(0.0, 0.0),
+        lines=[SimpleNamespace(start=(0, -10), end=(60, -10), kind="street-row")],
+        boundary_lines=[SimpleNamespace(start=(0, 0), end=(50, 0), kind="property")],
+        arcs=[],
+        items=[SimpleNamespace(text="MAIN ST", point=(25, -12),
+                               kind="main-street", rotation=0.0)],
+        closure=SimpleNamespace(distance=0.01, perimeter=150.0),
+        area_sqft=2500.0,
+    )
+    result = mt.SlotResult(slot=page.slots[0], outcome=SimpleNamespace(usage=None),
+                           plan=plan, seconds=3.0)
+    page.results[0] = result
+    page._on_slot_done(0, result)
+    page._select(0)
+    drawn_texts = [item[2].get("text") for item in page.canvas.items if item[0] == "text"]
+    assert "MAIN ST" in drawn_texts  # на холсте — весь план, не только контур
+
+    page._on_grade(0, "5")
+    assert len(page.ratings.entries) == 1
+    assert page.ratings.entries[0]["grade"] == "5"
+    page._on_grade(0, "4+")  # повторная оценка правит ту же запись
+    assert len(page.ratings.entries) == 1
+    assert page.ratings.entries[0]["grade"] == "4+"
+
+    page._open_stats()
+    stats = page._stats_window
+    assert stats is not None
+    body_text = stats.body.get("1.0", "end")
+    assert "Всего оценок: 1" in body_text
+    assert page.slots[0].model in body_text
+
+    app._on_close()
+    assert page._closed is True
+    assert stats._closed is True

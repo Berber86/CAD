@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math as _math
 import queue
 import threading
 import tkinter as tk
@@ -29,6 +30,8 @@ class ModelTestWindow:
         self.file_path: Path | None = None
         self.results: list[mt.SlotResult | None] = [None] * mt.SLOT_COUNT
         self.selected = 0
+        self.ratings = mt.RatingsBook()
+        self._rating_entries: dict[int, dict[str, Any]] = {}
 
         cfg, *_ = app._build_runtime_config()
         self.slots = mt.load_slots(cfg)
@@ -63,6 +66,8 @@ class ModelTestWindow:
         self.run_button = ctk.CTkButton(file_row, text="▶ Тест (4 платных запроса)",
                                         width=220, command=self._start_run)
         self.run_button.grid(row=0, column=2, sticky="e")
+        ctk.CTkButton(file_row, text="📊 Статистика", width=130,
+                      command=self._open_stats).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         slots_frame = ctk.CTkFrame(win, fg_color="transparent")
         slots_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 2))
@@ -123,11 +128,18 @@ class ModelTestWindow:
         acad_button = ctk.CTkButton(row, text="В AutoCAD", width=100, state="disabled",
                                     command=lambda i=index: self._send_to_acad(i))
         acad_button.grid(row=0, column=5, padx=(4, 8), pady=6)
+        grade_var = ctk.StringVar(value=NO_REASONING)
+        grade_combo = ctk.CTkComboBox(
+            row, variable=grade_var, width=70, state="disabled",
+            values=[NO_REASONING, *mt.GRADES],
+            command=lambda grade, i=index: self._on_grade(i, grade))
+        grade_combo.grid(row=0, column=6, padx=(4, 8), pady=6)
         return {
             "provider_var": provider_var, "model_var": model_var,
             "reasoning_var": reasoning_var, "model_combo": model_combo,
             "reasoning_combo": reasoning_combo, "status": status,
             "show_button": show_button, "acad_button": acad_button,
+            "grade_var": grade_var, "grade_combo": grade_combo,
         }
 
     def _reasoning_values(self, provider: str, model: str) -> list[str]:
@@ -212,7 +224,10 @@ class ModelTestWindow:
             row["status"].configure(text=f"Слот {index + 1}: выполняется…")
             row["show_button"].configure(state="disabled")
             row["acad_button"].configure(state="disabled")
+            row["grade_combo"].configure(state="disabled")
+            row["grade_var"].set(NO_REASONING)
             self.results[index] = None
+            self._rating_entries.pop(index, None)
 
         def worker() -> None:
             try:
@@ -235,7 +250,23 @@ class ModelTestWindow:
         if result.ok:
             row["show_button"].configure(state="normal")
             row["acad_button"].configure(state="normal")
+            row["grade_combo"].configure(state="normal")
         self._log_line(mt.metrics_text(result))
+
+    def _on_grade(self, index: int, grade: str) -> None:
+        """Оценка результата слота: запись в книгу статистики (повтор — правка той же)."""
+        result = self.results[index]
+        if result is None or not result.ok or grade == NO_REASONING:
+            return
+        entry = self._rating_entries.get(index)
+        if entry is None:
+            entry = self.ratings.add(mt.make_rating_entry(
+                result, grade, self.file_path.name if self.file_path else ""))
+            self._rating_entries[index] = entry
+            self._log_line(f"Слот {index + 1}: оценка {grade} сохранена.")
+        else:
+            self.ratings.update_grade(entry, grade)
+            self._log_line(f"Слот {index + 1}: оценка изменена на {grade}.")
 
     # -------------------------------------------------------------- отображение
     def _select(self, index: int) -> None:
@@ -243,6 +274,7 @@ class ModelTestWindow:
         self._draw_selected()
 
     def _draw_selected(self) -> None:
+        """Полный план результата: всё, что уйдёт в AutoCAD, а не только контур."""
         canvas = self.canvas
         canvas.delete("all")
         result = self.results[self.selected] if self.results else None
@@ -251,36 +283,60 @@ class ModelTestWindow:
             return
         plan = result.plan
         self.metrics_label.configure(text=mt.metrics_text(result))
-        vertices = list(plan.vertices)
-        if len(vertices) < 2:
+        scene = mt.plan_scene(plan)
+
+        points: list[tuple[float, float]] = [tuple(plan.pob)]
+        for start, end, _kind in scene["boundary"] + scene["lines"]:
+            points.extend([start, end])
+        for text, point, _kind, _rot in scene["texts"]:
+            points.append(point)
+        if len(points) < 2:
             return
         width = max(canvas.winfo_width(), 200)
         height = max(canvas.winfo_height(), 200)
-        xs = [p[0] for p in vertices]
-        ys = [p[1] for p in vertices]
-        span_x = max(max(xs) - min(xs), 1e-6)
-        span_y = max(max(ys) - min(ys), 1e-6)
-        margin = 40
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        span_x = max(max(xs) - min(xs), 10.0)
+        span_y = max(max(ys) - min(ys), 10.0)
+        margin = 46
         scale = min((width - 2 * margin) / span_x, (height - 2 * margin) / span_y)
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
 
         def proj(point: tuple[float, float]) -> tuple[float, float]:
-            return (
-                margin + (point[0] - min(xs)) * scale,
-                height - margin - (point[1] - min(ys)) * scale,
-            )
+            return (width / 2 + (point[0] - cx) * scale,
+                    height / 2 - (point[1] - cy) * scale)
 
-        points = [proj(p) for p in vertices]
-        closed = points + [points[0]]
-        canvas.create_line(*[c for p in closed for c in p], fill="#38bdf8", width=2)
-        segments = list(plan.description.segments)
-        for i, (a, b) in enumerate(zip(closed, closed[1:])):
-            canvas.create_oval(a[0] - 3, a[1] - 3, a[0] + 3, a[1] + 3,
-                               fill="#facc15", outline="")
-            if i < len(segments):
-                mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-                canvas.create_text(mid[0], mid[1] - 8,
-                                   text=f"{segments[i].distance_ft:.2f}",
-                                   fill="#e2e8f0", font=("Segoe UI", 8))
+        # Линии улиц и прочие вспомогательные отрезки плана.
+        for start, end, _kind in scene["lines"]:
+            a, b = proj(start), proj(end)
+            canvas.create_line(a[0], a[1], b[0], b[1], fill="#64748b", width=1)
+        # Контур участка.
+        for start, end, _kind in scene["boundary"]:
+            a, b = proj(start), proj(end)
+            canvas.create_line(a[0], a[1], b[0], b[1], fill="#38bdf8", width=2)
+        # Дуги внутренних углов.
+        for center, radius, start_a, end_a in scene["arcs"]:
+            x1, y1 = proj((center[0] - radius, center[1] + radius))
+            x2, y2 = proj((center[0] + radius, center[1] - radius))
+            canvas.create_arc(x1, y1, x2, y2, start=_math.degrees(start_a),
+                              extent=_math.degrees((end_a - start_a) % (2 * _math.pi)),
+                              style="arc", outline="#38bdf8", width=1)
+        # Все подписи плана: улицы, ширины, стороны, лот — на своих местах.
+        for text, point, kind, rotation in scene["texts"]:
+            x, y = proj(point)
+            color = "#fbbf24" if "street" in kind else (
+                "#facc15" if "lot" in kind else "#e2e8f0")
+            kwargs: dict[str, Any] = {"fill": color, "font": ("Segoe UI", 8, "bold")}
+            if rotation:
+                kwargs["angle"] = -_math.degrees(rotation)
+            try:
+                canvas.create_text(x, y, text=text, **kwargs)
+            except Exception:  # noqa: BLE001 — холст без поворота текста
+                kwargs.pop("angle", None)
+                canvas.create_text(x, y, text=text, **kwargs)
+        # Точка POB.
+        px, py = proj(tuple(plan.pob))
+        canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#f87171", outline="")
 
     # ---------------------------------------------------------------- AutoCAD
     def _send_to_acad(self, index: int) -> None:
@@ -343,14 +399,94 @@ class ModelTestWindow:
             pass
         self.window.after(120, self._drain)
 
+    def _open_stats(self) -> None:
+        stats = getattr(self, "_stats_window", None)
+        if stats is not None and not stats._closed:
+            stats.refresh()
+            stats.window.lift()
+            return
+        self._stats_window = ModelTestStatsWindow(self)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        stats = getattr(self, "_stats_window", None)
+        if stats is not None:
+            stats.close()
         self._sync_all_slots()
         self._save_slots()
         if getattr(self.app, "_model_test_window", None) is self:
             self.app._model_test_window = None
+        try:
+            self.window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class ModelTestStatsWindow:
+    """Накопленная статистика оценок по моделям и уровням рассуждений."""
+
+    def __init__(self, parent: ModelTestWindow) -> None:
+        self.parent = parent
+        self._closed = False
+        ctk = parent.ctk
+        win = ctk.CTkToplevel(parent.window)
+        self.window = win
+        win.title("Статистика теста моделей")
+        win.geometry("860x520")
+        win.minsize(560, 360)
+        win.configure(fg_color=parent.theme["bg_root"])
+        parent.app._attach_child_window(win)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        ctk.CTkButton(bar, text="↻ Обновить", width=120,
+                      command=self.refresh).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(bar, text="🗑 Сбросить историю", width=170,
+                      command=self._clear).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.body = ctk.CTkTextbox(win, wrap="word")
+        self.body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 12))
+        self.refresh()
+
+    def refresh(self) -> None:
+        book = self.parent.ratings
+        rows = mt.aggregate_ratings(book.entries)
+        lines = [f"Всего оценок: {len(book.entries)}"]
+        if not rows:
+            lines.append("Пока пусто: запустите тест и поставьте оценки в слотах.")
+        for row in rows:
+            avg = f"{row['avg_grade']:.2f}" if row["avg_grade"] is not None else "—"
+            closure = (f"{row['avg_closure_ft']:.3f} ft"
+                       if row["avg_closure_ft"] is not None else "—")
+            reasoning = row["reasoning"] or "без уровня"
+            lines.append(
+                f"{row['provider']} / {row['model']} · {reasoning} — "
+                f"оценок: {row['count']} · средняя: {avg} · "
+                f"замыкание ср.: {closure} · последняя: {row['last_grade']}")
+        try:
+            self.body.delete("1.0", "end")
+            self.body.insert("end", "\n".join(lines))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear(self) -> None:
+        from tkinter import messagebox
+
+        if messagebox.askyesno("Статистика", "Удалить все накопленные оценки?"):
+            self.parent.ratings.clear()
+            self.refresh()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if getattr(self.parent, "_stats_window", None) is self:
+            self.parent._stats_window = None
         try:
             self.window.destroy()
         except Exception:  # noqa: BLE001

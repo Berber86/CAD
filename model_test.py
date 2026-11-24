@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -197,6 +198,119 @@ def plan_metrics(plan: Any) -> dict[str, float]:
         "perimeter_ft": float(plan.closure.perimeter),
         "sides": float(len(segments)),
     }
+
+
+def plan_scene(plan: Any) -> dict[str, list]:
+    """Всё, что план унесёт в AutoCAD, plain-данными для отрисовки на холсте.
+
+    Не только контур: вспомогательные линии улиц, дуги углов и ВСЕ текстовые
+    элементы (названия улиц, ширины, расстояния, румбы, подпись лота) — с
+    позициями и поворотами, как они встанут в чертёж.
+    """
+    return {
+        "lines": [(tuple(l.start), tuple(l.end), str(l.kind)) for l in plan.lines],
+        "boundary": [(tuple(l.start), tuple(l.end), str(l.kind)) for l in plan.boundary_lines],
+        "arcs": [(tuple(a.center), float(a.radius), float(a.start_angle), float(a.end_angle))
+                 for a in plan.arcs],
+        "texts": [(str(t.text), tuple(t.point), str(t.kind), float(t.rotation or 0.0))
+                  for t in plan.items],
+    }
+
+
+# ------------------------------------------------------------- оценки юзера
+#: Шкала оценок пользователя: от «2-» до «5+».
+GRADES: list[str] = ["2-", "2", "2+", "3-", "3", "3+", "4-", "4", "4+", "5-", "5", "5+"]
+
+_GRADE_VALUES: dict[str, float] = {
+    grade: 2.0 + index / 3.0 for index, grade in enumerate(
+        ["2-", "2", "2+", "3-", "3", "3+", "4-", "4", "4+", "5-", "5", "5+"])
+}
+
+
+def grade_value(grade: str) -> float | None:
+    """Числовое значение оценки для средних (2- = 2.0 … 5+ = 5.67) или None."""
+    return _GRADE_VALUES.get(str(grade or "").strip())
+
+
+def default_ratings_path() -> Path:
+    return lp.LOCAL_CONFIG_PATH.with_name("model_test_ratings.json")
+
+
+class RatingsBook:
+    """Накопленные оценки: JSON рядом с config.local.json, одна запись на оценку."""
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else default_ratings_path()
+        self.entries: list[dict[str, Any]] = self._load()
+
+    def _load(self) -> list[dict[str, Any]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — нет файла/битый: начинаем с пустой книги
+            return []
+        return [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+
+    def save(self) -> None:
+        self.path.write_text(
+            json.dumps(self.entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def add(self, entry: dict[str, Any]) -> dict[str, Any]:
+        self.entries.append(entry)
+        self.save()
+        return entry
+
+    def update_grade(self, entry: dict[str, Any], grade: str) -> None:
+        entry["grade"] = grade
+        self.save()
+
+    def clear(self) -> None:
+        self.entries = []
+        self.save()
+
+
+def make_rating_entry(result: SlotResult, grade: str, file_name: str = "") -> dict[str, Any]:
+    """Запись оценки из результата слота (метрики замораживаются в момент оценки)."""
+    metrics = plan_metrics(result.plan) if result.plan is not None else {}
+    usage = getattr(result.outcome, "usage", None) if result.outcome is not None else None
+    return {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "provider": result.slot.provider,
+        "model": result.slot.model,
+        "reasoning": result.slot.reasoning,
+        "grade": grade,
+        "closure_ft": metrics.get("closure_ft"),
+        "area_sqft": metrics.get("area_sqft"),
+        "sides": metrics.get("sides"),
+        "seconds": round(result.seconds, 1),
+        "tokens": getattr(usage, "total_tokens", None) if usage is not None else None,
+        "file": file_name,
+    }
+
+
+def aggregate_ratings(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Статистика по (провайдер, модель, уровень рассуждений), лучшая средняя — первой."""
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for entry in entries:
+        key = (str(entry.get("provider") or ""), str(entry.get("model") or ""),
+               str(entry.get("reasoning") or ""))
+        groups.setdefault(key, []).append(entry)
+    rows: list[dict[str, Any]] = []
+    for (provider, model, reasoning), items in groups.items():
+        values = [v for v in (grade_value(str(i.get("grade") or "")) for i in items)
+                  if v is not None]
+        closures = [float(i["closure_ft"]) for i in items
+                    if isinstance(i.get("closure_ft"), (int, float))]
+        rows.append({
+            "provider": provider,
+            "model": model,
+            "reasoning": reasoning,
+            "count": len(items),
+            "avg_grade": (sum(values) / len(values)) if values else None,
+            "avg_closure_ft": (sum(closures) / len(closures)) if closures else None,
+            "last_grade": str(items[-1].get("grade") or ""),
+        })
+    rows.sort(key=lambda r: (-(r["avg_grade"] or 0.0), -r["count"], r["model"]))
+    return rows
 
 
 def metrics_text(result: SlotResult) -> str:

@@ -180,6 +180,7 @@ def make_acris_downloader(
     should_stop: StopCheck | None = None,
     viewer_download=None,
     warmup_url: str | None = None,
+    crfn_opener=None,
 ):
     """
     Загрузчик ACRIS: читалка в настоящем браузере (дискета Save → OK),
@@ -188,6 +189,11 @@ def make_acris_downloader(
     ``warmup_url`` — глубокая ссылка поиска по этому лоту: если читалка по
     прямой ссылке покажет HTTP 405 (нет серверной сессии поиска), загрузчик
     сначала откроет поиск в браузере и повторит.
+
+    Если ``endorsement_id`` — не document_id, а CRFN (NYC Open Data свежего
+    документа ещё не знает), вызывается ``crfn_opener(crfn, destination,
+    options)`` — браузерный резерв (``acris_browser``): клик IMG в
+    результатах поиска и та же читалка.
     """
     download_it = viewer_download or acris_viewer.download_pdf_via_viewer
 
@@ -199,9 +205,17 @@ def make_acris_downloader(
         }
         if warmup_url:
             options["warmup_url"] = warmup_url
-        return download_it(
-            acris.document_image_url(row.endorsement_id), destination, **options,
-        )
+        endorsement = str(row.endorsement_id or "").strip()
+        if endorsement.isdigit() and len(endorsement) == 16:
+            return download_it(
+                acris.document_image_url(endorsement), destination, **options,
+            )
+        if crfn_opener is None:
+            raise rcclerk.ManualStepNeeded(
+                f"NYC Open Data не знает CRFN {endorsement or '?'} — document_id не получить; "
+                "откройте документ в ACRIS вручную (кнопка IMG) и скачайте PDF.",
+            )
+        return crfn_opener(endorsement, destination, options)
 
     return download
 
@@ -565,9 +579,24 @@ def _collect_deeds_acris(
             continue
         # Загрузчик — на каждый лот свой: ссылка прогрева сессии поиска
         # в браузере относится именно к этому лоту (см. acris_viewer).
+        # crfn_opener — браузерный резерв для свежих документов: клик IMG
+        # в результатах вместо document_id из отстающего NYC Open Data.
+        def crfn_opener(crfn: str, destination: Path, options: dict):
+            import acris_browser
+
+            say(f"  CRFN {crfn}: открываю документ в браузере кликом IMG (резерв для свежих)…")
+            acris_browser.open_document_image(
+                crfn, code, block_no, lot_value,
+                progress=progress, should_stop=should_stop, fail_dir=target_dir,
+            )
+            return acris_viewer.download_pdf_via_viewer(
+                acris.search_page_url(), destination, already_open=True, **options,
+            )
+
         lot_download = acris_downloader or make_acris_downloader(
             downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
             warmup_url=acris.search_form_url(code, block_no, lot_value),
+            crfn_opener=crfn_opener,
         )
         for clerk_row, tag in chosen:
             check_stop()
@@ -576,10 +605,11 @@ def _collect_deeds_acris(
                 try:
                     row.document_id = resolve_id(row.crfn)
                 except Exception as exc:  # noqa: BLE001
-                    outcome.missing.append(
-                        f"лот {lot_value}: не получил document_id по CRFN {row.crfn} — {exc}"
-                    )
-                    continue
+                    # Не пропускаем документ: загрузчик пойдёт браузерным
+                    # резервом по CRFN (endorsement_id адаптированной
+                    # строки в этом случае — сам CRFN).
+                    say(f"лот {lot_value}: document_id по CRFN {row.crfn} не получен ({exc}) — "
+                        "попробую открыть документ в браузере кликом IMG")
             outcome_item = _collect_one(
                 block_no=block_no, lot_value=lot_value, role=role,
                 row=_acris_as_clerk_row(row, 0), tag=tag,

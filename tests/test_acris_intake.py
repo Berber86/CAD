@@ -111,6 +111,44 @@ def test_acris_empty_page_reports_text_snippet(tmp_path):
                for item in outcome.missing)
 
 
+def test_acris_fresh_document_falls_back_to_browser_click(tmp_path, monkeypatch):
+    # Живой случай 3876: свежий CRFN NYC Open Data ещё не знает — документ
+    # не пропускается, а открывается браузерным резервом (клик IMG), и PDF
+    # качает та же читалка в режиме already_open.
+    import acris_browser
+    import acris_viewer
+
+    opened = []
+    downloaded = []
+
+    def fake_open(crfn, code, block, lot, **kwargs):
+        opened.append((crfn, code, block, lot))
+
+    def fake_viewer(url, destination, **kwargs):
+        downloaded.append((url, kwargs.get("already_open")))
+        destination.write_bytes(b"%PDF-1.4 fresh deed")
+        return destination, "browser"
+
+    monkeypatch.setattr(acris_browser, "open_document_image", fake_open)
+    monkeypatch.setattr(acris_viewer, "download_pdf_via_viewer", fake_viewer)
+
+    def no_id(_crfn):
+        raise RuntimeError("NYC Open Data не знает CRFN")
+
+    outcome = deed_intake.collect_deeds(
+        block=731, lot=53, borough="Manhattan",
+        neighbours=[54], folder=tmp_path,
+        acris_fetch_page=lambda code, block, lot, page: RESULTS_HTML,
+        acris_id_fetcher=no_id,
+        page_finder=_empty_pages,
+    )
+    assert outcome.ok
+    assert {record.file for record in outcome.records} == {"OUR LOT 53 NEW.pdf", "LOT 54 NEW.pdf"}
+    assert opened and all(code == 1 and block == 731 for _crfn, code, block, _lot in opened)
+    assert downloaded and all(already for _url, already in downloaded)
+    assert any("клик IMG" in note or "кликом IMG" in note for note in outcome.notes)
+
+
 def _page_html(crfn: str, *, has_next: bool) -> str:
     nxt = '<a href="?page=2">next</a>' if has_next else ""
     return (

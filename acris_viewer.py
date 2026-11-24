@@ -244,6 +244,7 @@ def download_pdf_via_viewer(
     url: str,
     destination: str | Path,
     *,
+    already_open: bool = False,
     downloads_dir: str | Path | None = None,
     warmup_url: str | None = None,
     open_browser: Optional[Callable[[str], object]] = None,
@@ -265,6 +266,11 @@ def download_pdf_via_viewer(
 ) -> tuple[Path, str]:
     """
     Скачивает PDF одного документа читалкой: дискета → OK → «Загрузки».
+
+    ``already_open=True``: читалка уже открыта в браузере (например, кликом
+    IMG из результатов поиска — резерв для свежих документов, которых ещё
+    нет в NYC Open Data); URL тогда не открываем, а дожидаемся живую
+    читалку и дальше работаем как обычно.
 
     Возвращает ``(путь, "browser")`` — как ступень лестницы Клерка.
     Не вышло автоматически — ``rcclerk.ManualStepNeeded`` (ссылка + папка
@@ -341,17 +347,13 @@ def download_pdf_via_viewer(
         probe_state["error_seq"] = 0
         return rows
 
-    def open_and_wait(target_url: str) -> Optional[list[ScreenText]]:
+    def wait_healthy() -> Optional[list[ScreenText]]:
         """
-        Открыть читалку и дождаться живой страницы: два здоровых снимка
-        подряд — открылась; два снимка с HTTP-ошибкой подряд — битая.
+        Дождаться живой читалки: два здоровых снимка подряд — открылась;
+        два снимка с HTTP-ошибкой подряд — битая.
         """
         probe_state["error_seq"] = 0
         probe_state["last_error"] = ""
-        try:
-            (open_browser or webbrowser.open)(target_url)
-        except Exception as exc:  # noqa: BLE001 - браузера может не быть вовсе
-            raise manual(f"не удалось открыть браузер ({exc}).") from exc
         healthy = 0
         announced = False
         deadline = monotonic() + max(0.0, float(viewer_wait_sec))
@@ -374,6 +376,14 @@ def download_pdf_via_viewer(
                 return None
             sleep(max(0.05, float(poll_sec)))
 
+    def open_and_wait(target_url: str) -> Optional[list[ScreenText]]:
+        """Открыть читалку по ссылке и дождаться живой страницы."""
+        try:
+            (open_browser or webbrowser.open)(target_url)
+        except Exception as exc:  # noqa: BLE001 - браузера может не быть вовсе
+            raise manual(f"не удалось открыть браузер ({exc}).") from exc
+        return wait_healthy()
+
     def screen_has_rows() -> bool:
         """На экране браузера хоть что-то есть — поиск в браузере выполнился."""
         nonlocal window
@@ -388,9 +398,13 @@ def download_pdf_via_viewer(
         except _ViewerUnavailable:
             return False
 
-    say("открываю документ в браузере…")
-    rows = open_and_wait(url)
-    if rows is None and warmup_url:
+    if already_open:
+        say("читалка уже открыта кликом из результатов — жду живую страницу документа…")
+        rows = wait_healthy()
+    else:
+        say("открываю документ в браузере…")
+        rows = open_and_wait(url)
+    if rows is None and warmup_url and not already_open:
         # У браузера не было серверной сессии поиска — VTU показывает
         # HTTP 405 вместо страницы. Прогреваем сессию поиском по этому же
         # участку в браузере и открываем документ ещё раз.

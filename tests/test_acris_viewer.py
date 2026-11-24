@@ -124,6 +124,46 @@ def test_full_flow_save_then_ok_then_download(tmp_path):
     assert clicks[1] == (256, 204)
 
 
+def test_already_open_viewer_skips_url_and_downloads(tmp_path):
+    # Резерв для свежих документов: читалку уже открыл клик IMG, открывать
+    # URL нельзя — сразу дискета → OK → PDF из «Загрузок».
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    target = tmp_path / "out" / "LOT 62 NEW.pdf"
+    clock = _Clock()
+    clicks: list[tuple[int, int]] = []
+    state = {"dialog": False}
+
+    def capture(_handle):
+        return DIALOG_ROWS if state["dialog"] else READY_ROWS
+
+    def click(_handle, x, y):
+        clicks.append((x, y))
+        if len(clicks) == 1:
+            state["dialog"] = True
+        else:
+            (downloads / "2026111700598001.pdf").write_bytes(b"%PDF-1.4 fresh")
+        return True
+
+    saved, rung = acris_viewer.download_pdf_via_viewer(
+        "https://a836-acris.nyc.gov/DS/DocumentSearch/BBL",
+        target,
+        already_open=True,
+        downloads_dir=downloads,
+        open_browser=lambda _url: pytest.fail("URL при already_open открывать нельзя"),
+        windows_fn=lambda: [_window()],
+        active_fn=lambda: 7,
+        bounds_fn=lambda _h: (0, 0, 1600, 900),
+        capture_rows_fn=capture,
+        click_fn=click,
+        focus_fn=lambda _h: True,
+        sleep=clock.sleep, monotonic=clock.monotonic,
+        viewer_wait_sec=5, dialog_wait_sec=5, download_wait_sec=5, poll_sec=0.1,
+    )
+    assert (saved, rung) == (target, "browser")
+    assert target.read_bytes().startswith(b"%PDF-")
+
+
 def test_manual_step_when_dialog_never_appears(tmp_path):
     clock = _Clock()
     with pytest.raises(rcclerk.ManualStepNeeded) as caught:

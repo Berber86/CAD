@@ -49,9 +49,47 @@ def test_parse_neighbour_result_reads_front_street_angle(raw, expected):
     assert angle == expected
 
 
+@pytest.mark.parametrize("rows", [
+    # Подпись целиком одной строкой (как на живом портале).
+    [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                           (20, 100, 420, 120))],
+    # Только плейсхолдер внутри поля — клик в само поле.
+    [nyc_portal.ScreenText("Enter an address", (25, 130, 300, 155))],
+    # OCR склеил/разделил слова иначе — «enter an address» дословно нет.
+    [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                           (20, 100, 420, 120)),
+     nyc_portal.ScreenText("Search", (430, 128, 480, 156))],
+])
+def test_type_into_address_finds_field_by_label_or_placeholder(rows, monkeypatch):
+    clicks = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _t: True)
+    nyc_portal._type_into_address(1, "1769 Stillwell Avenue, Brooklyn", rows)
+    assert len(clicks) == 1
+
+
+def test_type_into_address_still_errors_without_any_address_row(monkeypatch):
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    with pytest.raises(nyc_portal.PortalLookupError, match="не найдено поле Address"):
+        nyc_portal._type_into_address(
+            1, "X", [nyc_portal.ScreenText("Find a Property", (0, 0, 100, 20))])
+
+
 def test_vision_prompt_asks_for_front_street_angle():
     assert "front_street_angle_deg" in nyc_portal.VISION_SYSTEM_PROMPT
     assert "clockwise from geographic north" in nyc_portal.VISION_SYSTEM_PROMPT
+
+
+def test_vision_prompt_returns_both_neighbours_when_sides_uncertain():
+    # Случай 3868: карта повёрнута, оба соседа видны, стороны — нет.
+    assert "still return both numbers" in nyc_portal.VISION_SYSTEM_PROMPT
+    assert "Return null only for a parcel whose label or adjacency itself is unclear" \
+        in nyc_portal.VISION_SYSTEM_PROMPT
 
 
 def test_local_portal_ocr_extracts_borough_block_and_lot():

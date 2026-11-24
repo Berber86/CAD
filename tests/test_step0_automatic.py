@@ -130,8 +130,26 @@ def test_auto_low_confidence_and_fast_mode_do_not_collect(gui, monkeypatch):
     assert app._step0_auto_stage is None and "быстрый" in app.status_var.get().lower()
     app.step0_fast_mode_var.set(False)
     app._start_step0_auto()
-    app._finish_step0_portal_lookup("ok", parcel(gui, confidence="low"))
+    no_neighbours = gui.nyc_portal.ParcelLookup(
+        block="6323", lot="32", borough="Staten Island", left_neighbour=None,
+        right_neighbour=None, confidence="low", notes="", map_image=Path("map.png"),
+        usage=None,
+    )
+    app._finish_step0_portal_lookup("ok", no_neighbours)
     assert app._step0_auto_stage is None and "уверенность" in app.status_var.get().lower()
+
+
+def test_auto_low_confidence_with_known_neighbours_continues(gui, monkeypatch):
+    """Как 3868 Fresh Pond Road: стороны могли перепутаться, но оба соседа названы."""
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Address")
+    fake_portal(app, monkeypatch)
+    started = []
+    monkeypatch.setattr(app, "_start_step0_intake", lambda: started.append(True))
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui, confidence="low"))
+    assert started == [True]
+    assert app.step0_neighbours_var.get() == "30"
 
 
 def test_auto_stops_if_identity_changes_during_collection(gui, tmp_path, monkeypatch):

@@ -4276,8 +4276,18 @@ class SurveyApp(ctk.CTk):
                 self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
                 return
             if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
-                self._stop_auto_transition("Автопоток остановлен: низкая уверенность при поиске соседей. Проверьте карту и запустите сбор вручную.")
-                return
+                known = [n for n in (result.left_neighbour, result.right_neighbour) if n]
+                if not known:
+                    self._stop_auto_transition("Автопоток остановлен: низкая уверенность при поиске соседей. Проверьте карту и запустите сбор вручную.")
+                    return
+                # Соседи названы, но стороны могли перепутаться (карта повёрнута):
+                # для сбора документов порядок неважен — продолжаем с предупреждением.
+                self._step0_log(
+                    "Низкая уверенность Vision, но соседи известны ("
+                    + ", ".join(known)
+                    + "): продолжаю автопоток; стороны соседей проверьте на схеме.",
+                    level=log_mode.LEVEL_WARN,
+                )
             if not deed_intake.step0_source_name(result.borough):
                 self._stop_auto_transition("Автопоток остановлен: район не подтверждён или пока не поддерживается (нужен Staten Island, Manhattan, Bronx, Brooklyn или Queens).")
                 return

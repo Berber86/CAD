@@ -386,17 +386,30 @@ def _wait_screen(
 
 
 def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
-    # The portal label sits directly above its address autocomplete input.
-    label = next((row for row in rows if "enter an address" in row.text.lower()), None)
-    if label is None:
+    # Поле ищем устойчиво к OCR: подпись над полем содержит «…Common Place
+    # Name)», а плейсхолдер «Enter an address» стоит прямо внутри поля.
+    # Дословная строка «enter an address» в одной OCR-строке не обязана
+    # совпасть (живой сбой 3876: режим переключён, а поле «не найдено»).
+    label = next(
+        (row for row in rows if "commonplace" in _normalise(row.text)), None)
+    placeholder = next(
+        (row for row in rows if "enteranaddress" in _normalise(row.text)), None)
+    anchor = label or placeholder
+    if anchor is None:
         raise PortalLookupError("После переключения режима не найдено поле Address.")
     bounds = browser_save.window_bounds(handle)
     if bounds is None:
         raise PortalLookupError("Окно портала изменилось, не могу определить поле адреса.")
     x0, y0, _x1, _y1 = bounds
-    x_left, y_top, x_right, y_bottom = label.box
-    click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
-    click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+    x_left, y_top, x_right, y_bottom = anchor.box
+    if label is not None:
+        # Подпись над полем: поле ввода — сразу под ней.
+        click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+        click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+    else:
+        # Плейсхолдер внутри поля: кликаем в само поле.
+        click_x = x0 + (x_left + x_right) // 2
+        click_y = y0 + (y_top + y_bottom) // 2
     _focus(handle)
     if not browser_save.click_browser_window(handle, click_x, click_y):
         raise PortalLookupError("Не удалось сфокусировать поле Address.")
@@ -953,7 +966,7 @@ def parse_neighbour_result(
 VISION_SYSTEM_PROMPT = """You inspect ONLY a cropped NYC tax-map image. The selected parcel is highlighted in cyan.
 Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, front_street_angle_deg, confidence, notes.
 Also report front_street_angle_deg: the orientation in degrees of the street that the cyan parcel fronts onto (the street along its frontage side), measured clockwise from geographic north. North points straight up in this image. Report 0 for a street running north-south, 90 for east-west, a value from 0 to under 180; if the front street is unclear, return null for it and never guess.
-Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If the map is rotated or labels/boundaries are unclear, return null for uncertain neighbours and explain briefly in notes. confidence is low, medium, or high. Never guess. Do not include markdown."""
+Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If both side parcels are clearly identified but the map rotation makes the visual left/right assignment uncertain, still return both numbers (in either order), set confidence to low and explain that in notes. Return null only for a parcel whose label or adjacency itself is unclear. confidence is low, medium, or high. Never guess a lot number. Do not include markdown."""
 
 
 DETAILS_VISION_PROMPT = """Read ONLY the visible property details on this NYC Portal card image.
@@ -1033,7 +1046,9 @@ def lookup_parcel(
         (
             f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
             "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
-            "on its left and right opposing side boundaries. If a label or adjacency is unclear, use null."
+            "on its left and right opposing side boundaries. If both are identified but left/right "
+            "is uncertain due to rotation, return both anyway with confidence low. "
+            "Use null only when a label or adjacency itself is unclear."
         ),
         request_cfg,
         image_data_urls=urls,

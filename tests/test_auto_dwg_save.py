@@ -278,6 +278,54 @@ def test_parallel_saves_use_different_names_in_same_folder(tmp_path):
     assert len(list(tmp_path.iterdir())) == 24
 
 
+class _BusySaveError(Exception):
+    hresult = -2147418111
+
+
+def test_busy_autocad_saveas_is_retried_until_it_saves(tmp_path):
+    # Ночной сбой 3870 (24–25.11.2026): SaveAs один раз получил -2147418111
+    # («вызов отклонён») и полностью нарисованный чертёж не сохранился.
+    calls = []
+
+    class BusyThenOk:
+        def SaveAs(self, path):
+            calls.append(path)
+            if len(calls) < 3:
+                raise _BusySaveError("(-2147418111, 'Вызов был отклонен получателем')")
+            Path(path).write_bytes(b"DWG after busy")
+
+    result = auto_dwg_save.save_new_dwg(BusyThenOk(), tmp_path, "30", sleep=lambda _s: None)
+    assert len(calls) == 3 and result.read_bytes() == b"DWG after busy"
+
+
+def test_busy_autocad_saveas_gives_up_honestly_after_attempts(tmp_path):
+    calls = []
+
+    class AlwaysBusy:
+        def SaveAs(self, path):
+            calls.append(path)
+            raise RuntimeError("RPC_E_CALL_REJECTED (-2147418111)")
+
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="не подтвердил") as err:
+        auto_dwg_save.save_new_dwg(
+            AlwaysBusy(), tmp_path, "30", sleep=lambda _s: None, save_attempts=3)
+    assert len(calls) == 3 and "-2147418111" in str(err.value)
+
+
+def test_non_busy_saveas_error_is_not_retried(tmp_path):
+    calls = []
+
+    class DiskError:
+        def SaveAs(self, path):
+            calls.append(path)
+            raise RuntimeError("disk problem")
+
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="disk problem"):
+        auto_dwg_save.save_new_dwg(
+            DiskError(), tmp_path, "30", sleep=lambda _s: pytest.fail("лишний повтор"))
+    assert len(calls) == 1
+
+
 def test_unavailable_autocad_reports_unsaved_file(gui, tmp_path, monkeypatch):
     from contextlib import contextmanager
     app = prepare_auto(gui, tmp_path, monkeypatch)

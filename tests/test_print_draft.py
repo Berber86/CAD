@@ -245,6 +245,129 @@ def test_connect_app_tolerates_clean_autocad_without_documents(monkeypatch):
     assert builder.connect_app() is app
 
 
+def _stub_win32com(monkeypatch, app):
+    import sys
+    import types
+
+    client = types.SimpleNamespace(GetActiveObject=lambda _progid: app)
+    win32com = types.SimpleNamespace(client=client)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(module, "_co_initialize", lambda: None)
+    monkeypatch.setattr(module, "_co_uninitialize", lambda: None)
+
+
+def test_connect_waits_for_active_document_when_asked(monkeypatch):
+    # Ночной сбой 3876 (24–25.11.2026): очередь создала документ, а сеанс
+    # отрисовки мгновенно умер на «активный документ недоступен» — AutoCAD
+    # ещё инициализировал документ и отклонял вызов (-2147418111). Сеанс
+    # очереди обязан подождать, а не хоронить задание в первую же секунду.
+    doc = _Doc()
+    attempts = []
+
+    class _BusyApp:
+        @property
+        def ActiveDocument(self):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise RuntimeError("(-2147418111, 'Вызов был отклонен получателем')")
+            return doc
+
+    _stub_win32com(monkeypatch, _BusyApp())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    builder = AcadBuilder(_cfg())
+    assert builder.connect(active_document_wait=5.0)[1] is doc
+    assert len(attempts) == 3
+
+
+def test_connect_without_wait_keeps_instant_honest_error(monkeypatch):
+    # Ручное подключение не ждёт: нет документа — сразу прежняя ошибка.
+    class _NoDocApp:
+        @property
+        def ActiveDocument(self):
+            return None
+
+    _stub_win32com(monkeypatch, _NoDocApp())
+    builder = AcadBuilder(_cfg())
+    with pytest.raises(module.AcadConnectionError, match="активный документ недоступен"):
+        builder.connect()
+
+
+def test_add_new_document_retries_busy_autocad():
+    calls = []
+
+    class _Documents:
+        def Add(self):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("(-2147418111, 'Вызов был отклонен получателем')")
+            return "doc"
+
+    class _AppWithDocuments:
+        def __init__(self, documents):
+            self.Documents = documents
+
+    assert module.add_new_document(_AppWithDocuments(_Documents()), sleep=lambda _s: None) == "doc"
+    assert len(calls) == 3
+
+
+def test_add_new_document_reraises_after_attempts():
+    class _Documents:
+        def __init__(self):
+            self.calls = 0
+
+        def Add(self):
+            self.calls += 1
+            raise RuntimeError("AutoCAD is busy")
+
+    class _AppWithDocuments:
+        def __init__(self, documents):
+            self.Documents = documents
+
+    documents = _Documents()
+    with pytest.raises(RuntimeError, match="AutoCAD is busy"):
+        module.add_new_document(_AppWithDocuments(documents), attempts=3, sleep=lambda _s: None)
+    assert documents.calls == 3
+
+
+class _FakeComError(Exception):
+    """pywintypes.com_error вне Windows нет; _com_retry смотрит только тип."""
+
+
+class _FlakyModelSpaceDoc:
+    """Документ, у которого ModelSpace один раз отклоняет вызов."""
+
+    def __init__(self, real):
+        self._real = real
+        self.rejections = 1
+
+    @property
+    def ModelSpace(self):
+        if self.rejections:
+            self.rejections -= 1
+            raise _FakeComError("(-2147418111, 'Вызов был отклонен получателем')")
+        return self._real.ModelSpace
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_draw_plan_survives_transient_modelspace_rejection(fake_autocad, monkeypatch):
+    # Ночной сбой 3870: план умер на doc.ModelSpace с -2147418111, хотя
+    # AutoCAD через секунду уже отвечал. Чтение ModelSpace — с повтором.
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "pywintypes", types.SimpleNamespace(com_error=_FakeComError))
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    builder._doc = _FlakyModelSpaceDoc(doc)
+    result = builder.draw_plan(plan)
+    assert doc.ModelSpace.lines
+    assert result.boundary_line_count == len(plan.boundary_lines)
+
+
 @pytest.fixture
 def fake_autocad(monkeypatch):
     monkeypatch.setattr(module, "_co_initialize", lambda: None)

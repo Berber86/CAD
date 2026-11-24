@@ -1583,6 +1583,34 @@ def _com_retry(
     raise AcadDrawError(f"AutoCAD не принял команду: {last_error}") from last_error
 
 
+def add_new_document(
+    app: Any,
+    *,
+    attempts: int = 6,
+    delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """
+    Новый документ AutoCAD с повтором при временной занятости.
+
+    Живой сбой ночного прогона 24–25.11.2026: очередь создавала документ и
+    тут же падала дальше по цепочке — занятый AutoCAD отклоняет COM-вызовы
+    (-2147418111), пока предыдущий документ закрывается или новый ещё
+    инициализируется. Мгновенный отказ здесь стоит всего задания, а несколько
+    секунд ожидания почти всегда спасают. После исчерпания попыток пробрасывается
+    последняя, настоящая ошибка.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return app.Documents.Add()
+        except Exception as exc:  # noqa: BLE001 - занятость AutoCAD временна
+            last_error = exc
+            if attempt < max(1, int(attempts)) - 1:
+                sleep(max(0.0, float(delay)))
+    raise last_error  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Построитель
 # ---------------------------------------------------------------------------
@@ -2771,7 +2799,7 @@ class AcadBuilder:
         return plan_obj
 
     # -- подключение к AutoCAD ---------------------------------------------
-    def connect(self) -> tuple[Any, Any]:
+    def connect(self, *, active_document_wait: float = 0.0) -> tuple[Any, Any]:
         """
         Возвращает (Application, ActiveDocument) уже запущенного AutoCAD.
 
@@ -2779,6 +2807,13 @@ class AcadBuilder:
         отрисовка), соединение переиспользуется, а проверка единиц чертежа
         всё равно выполняется. При вызове из другого потока COM-прокси
         переподключается в текущем потоке, чтобы избежать RPC_E_WRONG_THREAD.
+
+        ``active_document_wait`` — сколько секунд терпеливо ждать активный
+        документ: только что созданный очередью документ AutoCAD ещё
+        инициализирует, и ActiveDocument в эти секунды отклоняет вызов
+        (-2147418111) или пуст (ночной сбой 3876, 24–25.11.2026: сеанс
+        отрисовки умер мгновенно, не дав документу ни секунды). Ручное
+        подключение ждёт 0 — поведение прежнее: нет документа, сразу ошибка.
         """
         cur_tid = threading.get_ident()
         if self._app is not None and self._doc is not None:
@@ -2811,20 +2846,26 @@ class AcadBuilder:
                 f"3) Повторите попытку. Детали: {exc}"
             ) from exc
 
-        try:
-            doc = app.ActiveDocument
-        except Exception as exc:  # noqa: BLE001
-            if co_inited:
-                _co_uninitialize()
-            raise AcadConnectionError(
-                "AutoCAD запущен, но активный документ недоступен — откройте DWG."
-            ) from exc
+        deadline = time.monotonic() + max(0.0, float(active_document_wait))
+        doc = None
+        last_error: Exception | None = None
+        while True:
+            try:
+                doc = app.ActiveDocument
+            except Exception as exc:  # noqa: BLE001 - занятость AutoCAD временна
+                last_error = exc
+                doc = None
+            if doc is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
         if doc is None:
             if co_inited:
                 _co_uninitialize()
             raise AcadConnectionError(
                 "AutoCAD запущен, но активный документ недоступен — откройте DWG."
-            )
+            ) from last_error
         self._app, self._doc = app, doc
         self._com_thread_id = cur_tid
         self._com_owned = bool(co_inited)
@@ -2867,11 +2908,16 @@ class AcadBuilder:
         return app
 
     @contextmanager
-    def drawing_session(self):
-        """Keep the same COM document for a multi-plan draw and its SaveAs."""
+    def drawing_session(self, *, active_document_wait: float = 20.0):
+        """Keep the same COM document for a multi-plan draw and its SaveAs.
+
+        Сеанс ждёт активный документ до ``active_document_wait`` секунд:
+        очередь создаёт документ и сразу рисует, а AutoCAD в первые секунды
+        ещё инициализирует его и отклоняет вызовы (ночной сбой 3876).
+        """
         if self._hold_connection:
             raise AcadConnectionError("сеанс AutoCAD уже открыт")
-        app, doc = self.connect()
+        app, doc = self.connect(active_document_wait=active_document_wait)
         self._hold_connection = True
         try:
             yield app, doc
@@ -3393,7 +3439,10 @@ class AcadBuilder:
                 )
 
             try:
-                model_space = doc.ModelSpace
+                # _com_retry: занятый AutoCAD отклоняет и чтение свойства
+                # (-2147418111; ночной сбой 3870 — третий план умер на этом,
+                # хотя соседние вызовы через секунду проходили).
+                model_space = _com_retry(getattr, doc, "ModelSpace")
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 

@@ -86,6 +86,7 @@ from acad_builder import (
     AcadBuilderError,
     AcadConnectionError,
     DrawPlan,
+    add_new_document,
     make_print_draft,
     DrawResult,
     FeatureLabelResult,
@@ -3611,10 +3612,13 @@ class SurveyApp(ctk.CTk):
 
         Открытый DWG не требуется: чистый AutoCAD без документов — обычное
         состояние перед заданием, новый документ создаётся в нём самом.
+        Создание — с повтором при занятости (add_new_document): между
+        заданиями AutoCAD ещё закрывает предыдущий документ и отклоняет
+        вызовы, а мгновенный отказ губил всё задание (ночь 24–25.11.2026).
         """
         builder = AcadBuilder(self.config_data)
         app = builder.connect_app()
-        doc = app.Documents.Add()
+        doc = add_new_document(app)
         try:
             doc.SetVariable("INSUNITS", 2)  # футы, как ждут координаты схемы
         except Exception:  # noqa: BLE001

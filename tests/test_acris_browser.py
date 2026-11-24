@@ -85,6 +85,8 @@ class FakeBrowser:
 
     def type_text(self, text):
         self.typed.append(text)
+        if text == acris_browser.FORM_URL:
+            self.state = "form"
         return True
 
 
@@ -129,3 +131,68 @@ def test_browser_fallback_reports_missing_crfn_row(monkeypatch, tmp_path):
     fake = FakeBrowser(crfn_on_results=False)
     with pytest.raises(acris_browser.AcrisBrowserError, match="не появилась"):
         _run(fake, monkeypatch, fail_dir=tmp_path)
+
+
+def _run_new_tab(fake: FakeBrowser, monkeypatch, *, titles, focus_ok: bool = True):
+    """Путь без open_form_fn: фокус окна → Ctrl+T → проверка заголовка вкладки."""
+    window = browser_save.BrowserWindow(
+        handle=7, title="ACRIS - Chrome", executable="chrome.exe",
+        image_path=r"C:\Chrome\chrome.exe")
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 7)
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _h: (0, 0, 1600, 900))
+    events: list[str] = []
+    remaining = list(titles)
+
+    def title():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    monkeypatch.setattr(browser_save, "press_ctrl_t", lambda: events.append("ctrl_t") or True)
+    monkeypatch.setattr(browser_save, "press_ctrl_l", lambda: events.append("ctrl_l") or True)
+    monkeypatch.setattr(browser_save, "active_window_title", title)
+    ticks = itertools.count(0.0, 0.5)
+    acris_browser.open_document_image(
+        CRFN, 3, 6643, 62,
+        capture_rows_fn=fake.capture, click_fn=fake.click,
+        focus_fn=lambda _h: events.append("focus") or focus_ok,
+        key_fn=fake.key, ctrl_a_fn=lambda: True, type_fn=fake.type_text,
+        back_fn=fake.back, sleep=lambda _s: None, monotonic=lambda: next(ticks),
+    )
+    return events
+
+
+def test_new_tab_opens_only_after_focusing_browser_window(monkeypatch):
+    # Ночной сбой 24–25.11.2026 (3876, LOT 62): Ctrl+T ушёл в переднее окно
+    # программы, вкладка в Браузере не открылась, а проверка заголовка четыре
+    # секунды читало чужое окно. Фокус окна браузера обязан идти первым.
+    fake = FakeBrowser()
+    events = _run_new_tab(fake, monkeypatch, titles=["Новая вкладка — Яндекс Браузер"])
+    assert fake.state == "viewer"
+    assert events.index("focus") < events.index("ctrl_t")
+    assert fake.typed == [acris_browser.FORM_URL, "6643", "62"]
+
+
+def test_new_tab_waits_for_title_and_refocuses(monkeypatch):
+    fake = FakeBrowser()
+    events = _run_new_tab(
+        fake, monkeypatch,
+        titles=["Переписка — почта", "Переписка — почта", "Новая вкладка"])
+    assert fake.state == "viewer"
+    # До признания вкладки новой фокус возвращался окну браузера.
+    assert events.count("focus") >= 2
+
+
+def test_new_tab_foreign_title_types_nothing(monkeypatch):
+    # Защита прежняя: чужая вкладка останавливает резерв, текст не печатается.
+    fake = FakeBrowser()
+    with pytest.raises(acris_browser.AcrisBrowserError, match="не новая вкладка"):
+        _run_new_tab(fake, monkeypatch, titles=["Переписка — почта"])
+    assert fake.typed == [] and fake.state == "blank"
+
+
+def test_new_tab_without_focus_sends_no_keys(monkeypatch):
+    fake = FakeBrowser()
+    with pytest.raises(acris_browser.AcrisBrowserError, match="активировать окно браузера"):
+        _run_new_tab(fake, monkeypatch, titles=["Новая вкладка"], focus_ok=False)
+    assert fake.typed == [] and fake.state == "blank"

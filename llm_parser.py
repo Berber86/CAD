@@ -431,7 +431,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "layer_colors": {
         "property_line": 3,
         "boundary_text": 7,
-        "street_row": 1,
+        "street_row": 4,
         "neighbor_lot": 4,
     },
     # Полный путь GitHub (репозиторий/ветка/.zip), откуда кнопка «Обновить версию»

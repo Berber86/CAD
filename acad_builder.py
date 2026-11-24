@@ -8,7 +8,7 @@ acad_builder.py
 Точка начала обхода (Point of Beginning) помещается в (0, 0).
 
 Отрисовывается:
-  * отдельные линии основного участка: зелёные PL и красные M-ROW-LINE на фронте;
+  * отдельные линии основного участка: зелёные PL и голубые M-ROW-LINE на фронте;
   * при запуске из GUI — единственный черновик с точной копией границы на +1000 по X;
   * подпись каждой стороны (румб + длина) вдоль линии, снаружи полигона,
     с поворотом по линии и защитой от «вверх ногами»;
@@ -179,6 +179,15 @@ PRINT_STREET_LAYER = "LETTER"
 PRINT_STREET_STYLE = "MtXpl_Times_New_Roma"
 PRINT_TEXT_STYLE = "Romans"
 PRINT_STREET_TEXT_COLOR = 7
+
+# --- цвета и наклон подписей улиц (правило заказчика, 24.11.2026) -----------
+#: Линии улиц и фасадные стороны в слое M-ROW-LINE — голубые (ACI 4), не красные.
+STREET_ROW_COLOR = 4
+#: Названия улиц (RENO AVENUE, 5th Avenue…) — белые (ACI 7) явным цветом объекта,
+#: чтобы не зависеть от цвета слоя LETTER/M-TAX-DIM в шаблоне заказчика.
+STREET_NAME_TEXT_COLOR = 7
+#: Угол наклона (ObliqueAngle) стиля названий улиц — 15°, не путать с поворотом.
+STREET_TEXT_OBLIQUE_DEG = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -2971,12 +2980,17 @@ class AcadBuilder:
             return "Standard"
 
     def _ensure_boundary_text_style(self, doc: Any, warnings: list[str]) -> str:
-        """Use the drawing's LETTER unchanged; create a clearly reported fallback if absent."""
+        """Use the drawing's LETTER; create a clearly reported fallback if absent.
+
+        Угол наклона стиля (ObliqueAngle) приводим к 15° по правилу заказчика
+        (24.11.2026) — это именно наклон букв, не поворот подписи.
+        """
         name = "LETTER"
         try:
             styles = doc.TextStyles
             try:
-                styles.Item(name)
+                style = styles.Item(name)
+                self._set_style_oblique(style, STREET_TEXT_OBLIQUE_DEG, name, warnings)
                 return name
             except Exception:  # noqa: BLE001
                 style = _com_retry(styles.Add, name)
@@ -2987,9 +3001,20 @@ class AcadBuilder:
                 warnings.append(f"Создан стиль LETTER, но шрифт/высоту не удалось настроить: {exc}; проверьте стиль в AutoCAD")
             else:
                 warnings.append("Стиль LETTER отсутствовал и создан с запасным шрифтом romans.shx; проверьте его по шаблону заказчика")
+            self._set_style_oblique(style, STREET_TEXT_OBLIQUE_DEG, name, warnings)
             return name
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль LETTER: {exc}") from exc
+
+    @staticmethod
+    def _set_style_oblique(style: Any, oblique_deg: float, name: str,
+                           warnings: list[str]) -> None:
+        """Задать углу наклона стиля заданное значение; не вышло — предупреждение."""
+        try:
+            style.ObliqueAngle = math.radians(float(oblique_deg))
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"не удалось задать угол наклона {oblique_deg:g}° стиля {name}: {exc}")
 
     @staticmethod
     def _find_text_style(styles: Any, name: str) -> Any | None:
@@ -3020,20 +3045,26 @@ class AcadBuilder:
         *,
         font_file: str | None = None,
         typeface: str | None = None,
+        oblique_deg: float | None = None,
     ) -> str:
-        """Вернуть существующий стиль без изменений; если его нет — создать с запасным шрифтом.
+        """Вернуть существующий стиль; если его нет — создать с запасным шрифтом.
 
         Имя может отличаться регистром от имени в DWG (``Romans`` / ``ROMANS``):
         возвращается фактическое имя найденного стиля, новый дубль не создаётся.
+        ``oblique_deg`` — требуемый угол наклона стиля (задаётся и существующему).
         """
         try:
             styles = doc.TextStyles
             existing = self._find_text_style(styles, name)
             if existing is not None:
+                if oblique_deg is not None:
+                    self._set_style_oblique(existing, oblique_deg, name, warnings)
                 return str(getattr(existing, "Name", name) or name)
             style = _com_retry(styles.Add, name)
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль {name}: {exc}") from exc
+        if oblique_deg is not None:
+            self._set_style_oblique(style, oblique_deg, name, warnings)
 
         configured = False
         font_error = None
@@ -3351,6 +3382,7 @@ class AcadBuilder:
                 draft_street_style = self._ensure_named_text_style(
                     doc, PRINT_STREET_STYLE, warnings,
                     typeface="Times New Roman", font_file="romans.shx",
+                    oblique_deg=STREET_TEXT_OBLIQUE_DEG,
                 )
                 draft_text_style = self._ensure_named_text_style(
                     doc, PRINT_TEXT_STYLE, warnings, font_file="romans.shx"
@@ -3380,7 +3412,7 @@ class AcadBuilder:
                     doc, text_layer_name, int(colors.get("boundary_text", 7)), warnings
                 )
                 street_row_layer = self._ensure_survey_layer(
-                    doc, "M-ROW-LINE", 1, warnings, linetype="Continuous"
+                    doc, "M-ROW-LINE", STREET_ROW_COLOR, warnings, linetype="Continuous"
                 )
                 if line_layer == "0":
                     warnings.append(
@@ -3397,7 +3429,7 @@ class AcadBuilder:
                 for row_line in geo.lines:
                     try:
                         if not is_neighbor:
-                            self._add_survey_line(model_space, row_line, street_row_layer, 1)
+                            self._add_survey_line(model_space, row_line, street_row_layer, STREET_ROW_COLOR)
                         else:
                             self._add_line(model_space, row_line, street_row_layer)
                     except Exception as exc:  # noqa: BLE001
@@ -3417,7 +3449,7 @@ class AcadBuilder:
                         line_ent = self._add_line(model_space, b_line, poly_target_layer)
                     else:
                         on_street = index in street_indices
-                        layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                        layer, color = (street_row_layer, STREET_ROW_COLOR) if on_street else (poly_target_layer, 3)
                         line_ent = self._add_survey_line(
                             model_space, b_line, layer, color,
                             linetype="ByLayer" if on_street else "Continuous",
@@ -3444,7 +3476,7 @@ class AcadBuilder:
                     street_indices.add(index)
                 for index, b_line in enumerate(geo.boundary_lines):
                     on_street = index in street_indices
-                    layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                    layer, color = (street_row_layer, STREET_ROW_COLOR) if on_street else (poly_target_layer, 3)
                     # PL должен быть сплошным даже если существующий слой пунктирный.
                     line_ent = self._add_survey_line(
                         model_space, b_line, layer, color,
@@ -3513,6 +3545,15 @@ class AcadBuilder:
                             model_space, item, geo.text_height, item_layer, item_style,
                             strict_style=True,
                         )
+                    if item.kind in {"main-street", "cross-street"}:
+                        # Названия улиц — белые явным цветом объекта (заказчик,
+                        # 24.11.2026): цвет слоя в шаблоне может быть красным.
+                        # В исправленных MTEXT красные вставки \C1 не трогаем.
+                        try:
+                            entity.Color = STREET_NAME_TEXT_COLOR
+                        except Exception:  # noqa: BLE001
+                            warnings.append(
+                                f"не удалось задать белый цвет названия улицы «{item.text}»")
                     created += 1
                     # Только однострочные bearing + расстояние печатного черновика.
                     match = re.fullmatch(r"side-(\d+)", item.kind) if geo.print_draft else None

@@ -294,14 +294,14 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
                        if _matches_line(entity, edge.start, edge.end, dx)]
             assert len(matches) == 1
             assert matches[0].Layer == ("M-ROW-LINE" if is_front else "PL")
-            assert matches[0].Color == (1 if is_front else 3)
+            assert matches[0].Color == (4 if is_front else 3)
             assert matches[0].Linetype == ("ByLayer" if is_front else "Continuous")
     assert len(doc.ModelSpace.texts) == len(plan.items) + len(draft.items)
     assert len(doc.ModelSpace.arcs) == 2 * len(plan.arcs)
 
 
 
-def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
+def test_corner_lot_has_two_cyan_frontages_in_both_copies(fake_autocad):
     plan = _plan("lot51_commencing_corner.txt")
     assert len(plan.street_boundary_indices) == 2
     builder, doc = fake_autocad(plan)
@@ -313,7 +313,7 @@ def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
             matches = [entity for entity in doc.ModelSpace.lines
                        if _matches_line(entity, edge.start, edge.end, dx)]
             assert len(matches) == 1
-            assert matches[0].Layer == "M-ROW-LINE" and matches[0].Color == 1
+            assert matches[0].Layer == "M-ROW-LINE" and matches[0].Color == 4
 
 
 def test_copy_preserves_open_gap_without_forced_closure(fake_autocad):
@@ -579,6 +579,27 @@ def test_print_draft_other_labels_include_former_names_and_side_notes(fake_autoc
     assert former[0].StyleName == "Romans"
     assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "Romans"
                for t in doc.ModelSpace.texts if "feet" in t.TextString or "'" in t.TextString)
+
+
+def test_street_names_white_oblique15_and_row_lines_cyan(fake_autocad):
+    """Правила заказчика 24.11.2026: названия улиц белые, наклон стиля 15°,
+    линии M-ROW-LINE голубые — и в основном плане, и в печатном черновике."""
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, _cfg()["print_draft"])
+    builder, doc = fake_autocad(plan)
+    builder.draw_plan(plan)
+    builder.draw_plan(draft)
+
+    street_texts = [t for t in doc.ModelSpace.texts
+                    if getattr(t, "StyleName", "") in ("LETTER", "MtXpl_Times_New_Roma")
+                    and any(name in t.TextString for name in ("E. 600TH", "CARLTON"))]
+    assert street_texts
+    assert all(t.Color == 7 for t in street_texts)
+    for style_name in ("LETTER", "MtXpl_Times_New_Roma"):
+        style = doc.TextStyles.Item(style_name)
+        assert math.degrees(style.ObliqueAngle) == pytest.approx(15.0)
+    row_lines = [ln for ln in doc.ModelSpace.lines if ln.Layer == "M-ROW-LINE"]
+    assert row_lines and all(ln.Color == 4 for ln in row_lines)
 
 
 def test_new_style_and_missing_style_error_are_reported(fake_autocad):

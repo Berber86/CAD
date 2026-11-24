@@ -560,9 +560,12 @@ def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[
     Недокачанные файлы (``.crdownload`` и подобные) и файлы без сигнатуры ``%PDF-``
     пропускаются: принять недокачанный документ за документ хуже, чем подождать.
     """
-    best: Optional[Path] = None
-    best_time = -1.0
-    for path in sorted(Path(folder).glob("*.pdf")):
+    candidates: list[tuple[float, Path]] = []
+    try:
+        paths = list(Path(folder).glob("*.pdf"))
+    except OSError:
+        return None
+    for path in paths:
         if path.suffix.lower() in PARTIAL_SUFFIXES:
             continue
         try:
@@ -571,11 +574,14 @@ def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[
             continue
         if since is not None and mtime < since:
             continue
-        if not _is_pdf_file(path):
-            continue
-        if mtime > best_time:
-            best, best_time = path, mtime
-    return best
+        candidates.append((mtime, path))
+    # Не открываем каждый PDF в папке на каждом опросе: сначала самые свежие,
+    # и первая же настоящая сигнатура PDF — ответ. Недействительный свежий
+    # файл не мешает проверить следующий по времени.
+    for _mtime, path in sorted(candidates, key=lambda item: (-item[0], str(item[1]))):
+        if _is_pdf_file(path):
+            return path
+    return None
 
 
 def _drop_our_pending(path: Path, downloads_dir: Path) -> None:

@@ -21,10 +21,15 @@ DocumentImageVtu) диалог Save открывается с уже выбра�
   центр дискеты = правый край текста «73%» + 134 px (замерено шаблонным
   поиском по настоящему скриншоту пользователя: «73%» кончается на x=291,
   центр дискеты — x=425, y совпадает со строкой тулбара);
-* OK — обычный текст диалога, кликается по центру его OCR-рамки.
+* OK — обычный текст диалога. На первом документе кликается по центру его
+  OCR-рамки, а смещение от дискеты запоминается. На следующих документах
+  после дискеты выдерживается секунда и OK нажимается по запомненной точке
+  без промежуточного снимка; если PDF не пошёл, диалог один раз проверяется
+  снимком и точка перекалибровывается.
 
-Каждая ступень проверяется снимком после действия; если что-то не нашлось —
-``rcclerk.ManualStepNeeded`` со ссылкой и подсказкой, а не слепой второй клик.
+Каждая ступень, кроме откалиброванного быстрого OK, проверяется снимком
+после действия; если что-то не нашлось — ``rcclerk.ManualStepNeeded`` со
+ссылкой и подсказкой, а не слепой второй клик.
 Сеть и Windows здесь подменяются параметрами, поэтому сценарий проверяется
 тестами без браузера и без интернета.
 
@@ -57,6 +62,14 @@ import rcclerk
 SAVE_DX_FROM_ZOOM_RIGHT = 134
 #: Запасной якорь: центр дискеты правее левого края «of» на столько пикселей.
 SAVE_DX_FROM_OF_LEFT = 303
+#: После первого успешно найденного диалога Save его OK нажимается без
+#: промежуточного снимка: дискета → пауза → клик по запомненному смещению.
+FAST_OK_DELAY_SEC = 1.0
+#: Если после быстрого OK PDF так и не пошёл, один снимок спасает ситуацию:
+#: диалог ещё открыт — OK нажимается уже по свежему OCR.
+FAST_OK_GRACE_SEC = 8.0
+#: Смещение центра OK относительно точки дискеты по размеру окна браузера.
+_OK_POINT_CACHE: dict[tuple[str, int, int], tuple[int, int]] = {}
 
 Progress = Callable[[str], None]
 StopCheck = Callable[[], bool]
@@ -134,6 +147,39 @@ def ok_button(rows: Sequence[ScreenText]) -> Optional[ScreenText]:
     if not looks_like_save_dialog(rows):
         return None
     return next((row for row in rows if _normalise(row.text) == "ok"), None)
+
+
+def _ok_cache_key(window: Optional[browser_save.BrowserWindow],
+                  bounds: Optional[tuple[int, int, int, int]]) -> Optional[tuple[str, int, int]]:
+    if window is None or bounds is None:
+        return None
+    width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+    if width <= 0 or height <= 0:
+        return None
+    return (str(getattr(window, "executable", "") or "").lower(), width, height)
+
+
+def _cached_ok_point(window: Optional[browser_save.BrowserWindow],
+                     bounds: Optional[tuple[int, int, int, int]],
+                     save_point: tuple[int, int]) -> Optional[tuple[int, int]]:
+    """Точка OK, вычисленная из смещения, запомненного на первом диалоге."""
+    key = _ok_cache_key(window, bounds)
+    if key is None:
+        return None
+    delta = _OK_POINT_CACHE.get(key)
+    if delta is None:
+        return None
+    point = (save_point[0] + delta[0], save_point[1] + delta[1])
+    width, height = key[1], key[2]
+    return point if 0 <= point[0] < width and 0 <= point[1] < height else None
+
+
+def _remember_ok_point(window: Optional[browser_save.BrowserWindow],
+                       bounds: Optional[tuple[int, int, int, int]],
+                       save_point: tuple[int, int], ok_point: tuple[int, int]) -> None:
+    key = _ok_cache_key(window, bounds)
+    if key is not None:
+        _OK_POINT_CACHE[key] = (ok_point[0] - save_point[0], ok_point[1] - save_point[1])
 
 
 _HTTP_ERROR_RE = re.compile(
@@ -258,6 +304,8 @@ def download_pdf_via_viewer(
     viewer_wait_sec: float = 90.0,
     dialog_wait_sec: float = 20.0,
     download_wait_sec: float = 300.0,
+    fast_ok_delay_sec: float = FAST_OK_DELAY_SEC,
+    fast_ok_grace_sec: float = FAST_OK_GRACE_SEC,
     poll_sec: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -435,16 +483,39 @@ def download_pdf_via_viewer(
             raise manual(f"автоматика экрана недоступна ({exc}).") from exc
         return ok_button(current)
 
-    ok_row = wait_for(dialog_ok, dialog_wait_sec)
-    if ok_row is None:
-        raise manual("диалог Save после дискеты не появился.")
-    say("диалог Save на месте — нажимаю OK (All уже выбрано)")
-    ok_bounds = bounds_fn(window.handle)
-    if ok_bounds is None:
-        raise manual("окно браузера изменилось перед нажатием OK.")
-    ocx, ocy = ok_row.center
-    if not click(window.handle, ok_bounds[0] + ocx, ok_bounds[1] + ocy):
-        raise manual("не удалось нажать OK в диалоге Save.")
+    # Быстрый путь после первого документа: место OK уже вычислено по первому
+    # проходу. Не делаем снимок и OCR между дискетой и OK — просто выдерживаем
+    # секунду, как предложил пользователь, и нажимаем запомненную точку.
+    fast_ok_deadline: Optional[float] = None
+    if _cached_ok_point(window, bounds, point) is not None:
+        say("диалог Save уже калиброван — через секунду нажму OK без промежуточного снимка")
+        check_stop()
+        sleep(max(0.0, float(fast_ok_delay_sec)))
+        check_stop()
+        ok_bounds = bounds_fn(window.handle)
+        fast_point = _cached_ok_point(window, ok_bounds, point)
+        if ok_bounds is not None and fast_point is not None and click(
+                window.handle, ok_bounds[0] + fast_point[0], ok_bounds[1] + fast_point[1]):
+            fast_ok_deadline = monotonic() + max(0.0, float(fast_ok_grace_sec))
+        else:
+            say("быстрое нажатие OK не подтвердилось — проверяю диалог Save по снимку")
+
+    if fast_ok_deadline is None:
+        ok_row = wait_for(dialog_ok, dialog_wait_sec)
+        if ok_row is None:
+            raise manual("диалог Save после дискеты не появился.")
+        say("диалог Save на месте — нажимаю OK (All уже выбрано)")
+        ok_bounds = bounds_fn(window.handle)
+        if ok_bounds is None:
+            raise manual("окно браузера изменилось перед нажатием OK.")
+        _remember_ok_point(window, ok_bounds, point, ok_row.center)
+        ocx, ocy = ok_row.center
+        if not click(window.handle, ok_bounds[0] + ocx, ok_bounds[1] + ocy):
+            raise manual("не удалось нажать OK в диалоге Save.")
+    # Отсечка для «Загрузок» ставится после OK, а не до открытия читалки:
+    # PDF предыдущего документа, оставшийся в папке, не должен приниматься
+    # за результат этого клика. Секундный запас — на расхождение часов ФС.
+    since = time.time() - 1.0
     say(f"жду, пока PDF упадёт в «{folder}»…")
 
     found: Optional[Path] = None
@@ -457,7 +528,32 @@ def download_pdf_via_viewer(
             break
         if monotonic() >= download_deadline:
             break
-        if window is not None and monotonic() >= next_probe:
+        now = monotonic()
+        if fast_ok_deadline is not None and now >= fast_ok_deadline:
+            # Быстрый клик не дал PDF за короткий срок. Это не промежуточная
+            # проверка на успешном пути, а спасение: если диалог всё ещё открыт,
+            # значит запомненная точка устарела — нажимаем OK по свежему снимку
+            # и заодно перекалибровываем её для следующих документов.
+            fast_ok_deadline = None
+            try:
+                current = capture_rows(window.handle)  # type: ignore[union-attr]
+            except _ViewerUnavailable:
+                current = []
+            error = http_error_text(current)
+            if error:
+                raise manual_http_error(error)
+            rescue = ok_button(current)
+            if rescue is not None:
+                say("PDF после быстрого OK не пошёл — диалог Save ещё открыт, нажимаю OK по снимку")
+                rescue_bounds = bounds_fn(window.handle)  # type: ignore[union-attr]
+                if rescue_bounds is None:
+                    raise manual("окно браузера изменилось перед повторным нажатием OK.")
+                _remember_ok_point(window, rescue_bounds, point, rescue.center)
+                rcx, rcy = rescue.center
+                if not click(window.handle, rescue_bounds[0] + rcx, rescue_bounds[1] + rcy):  # type: ignore[union-attr]
+                    raise manual("не удалось нажать OK в диалоге Save.")
+            next_probe = monotonic() + 15.0
+        elif window is not None and now >= next_probe:
             next_probe = monotonic() + 15.0
             try:
                 current = capture_rows(window.handle)
@@ -466,7 +562,9 @@ def download_pdf_via_viewer(
             error = http_error_text(current)
             if error:
                 raise manual_http_error(error)
-        sleep(max(0.05, float(poll_sec)))
+        # Папка загрузок проверяется чаще, чем экран: это дешёвая файловая
+        # проверка, а снимок+OCR здесь не нужны.
+        sleep(max(0.05, min(float(poll_sec), 0.25)))
     if found is None:
         raise manual(f"PDF не появился в «{folder}» за {int(download_wait_sec)} с.")
     shutil.copyfile(found, target)

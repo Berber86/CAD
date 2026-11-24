@@ -38,6 +38,13 @@ WARM_URL = ("https://a836-acris.nyc.gov/DS/DocumentSearch/"
             "BBL?borough=1&block=731&lot=53")
 
 
+@pytest.fixture(autouse=True)
+def _clear_fast_ok_cache():
+    acris_viewer._OK_POINT_CACHE.clear()
+    yield
+    acris_viewer._OK_POINT_CACHE.clear()
+
+
 def test_looks_like_viewer_and_dialog():
     assert acris_viewer.looks_like_viewer(READY_ROWS)
     assert not acris_viewer.looks_like_viewer([ScreenText("ACRIS Search", (0, 0, 90, 20))])
@@ -332,3 +339,104 @@ def test_stop_raises_download_stopped(tmp_path):
             focus_fn=lambda _h: True,
             should_stop=lambda: True,
         )
+
+
+class _SaveFlow:
+    """Один проход читалки: дискета открывает диалог, OK создаёт PDF."""
+
+    def __init__(self, downloads: Path, filename: str, *, serve_dialog: bool = True,
+                 ok_point: tuple[int, int] = (256, 204)):
+        self.downloads = downloads
+        self.filename = filename
+        self.serve_dialog = serve_dialog
+        self.ok_point = ok_point
+        self.clock = _Clock()
+        self.dialog = False
+        self.save_clicked = False
+        self.captures_after_save = 0
+        self.click_points: list[tuple[int, int]] = []
+        self.click_times: list[float] = []
+
+    def capture(self, _handle):
+        if self.save_clicked:
+            self.captures_after_save += 1
+        if self.dialog and self.serve_dialog:
+            if self.ok_point == (256, 204):
+                return DIALOG_ROWS
+            return READY_ROWS + [
+                ScreenText("Save", (128, 130, 169, 150)),
+                ScreenText("Cancel", (192, 194, 247, 214)),
+                ScreenText("OK", (282, 194, 310, 214)),
+            ]
+        return READY_ROWS
+
+    def click(self, _handle, x, y):
+        self.click_points.append((x, y))
+        self.click_times.append(self.clock.now)
+        if not self.save_clicked:
+            self.save_clicked = True
+            self.dialog = True
+        elif (x, y) == self.ok_point:
+            (self.downloads / self.filename).write_bytes(b"%PDF-1.4 fake")
+        return True
+
+    def run(self, target: Path, **kwargs):
+        return acris_viewer.download_pdf_via_viewer(
+            DOC_URL, target,
+            downloads_dir=self.downloads,
+            open_browser=lambda _url: None,
+            windows_fn=lambda: [_window()],
+            active_fn=lambda: 7,
+            bounds_fn=lambda _h: (0, 0, 1600, 900),
+            capture_rows_fn=self.capture,
+            click_fn=self.click,
+            focus_fn=lambda _h: True,
+            sleep=self.clock.sleep, monotonic=self.clock.monotonic,
+            viewer_wait_sec=5, dialog_wait_sec=5, download_wait_sec=5, poll_sec=0.1,
+            **kwargs,
+        )
+
+
+def test_second_document_clicks_ok_after_one_second_without_dialog_capture(tmp_path):
+    first_downloads = tmp_path / "DownloadsFirst"
+    second_downloads = tmp_path / "DownloadsSecond"
+    first_downloads.mkdir()
+    second_downloads.mkdir()
+
+    first = _SaveFlow(first_downloads, "first.pdf")
+    first.run(tmp_path / "first-target.pdf")
+    assert first.click_points == [(425, 103), (256, 204)]
+
+    # Второй документ: снимок после дискеты вообще не показывает диалог.
+    # Успех возможен только если OK нажат по запомненной точке через 1 с.
+    second = _SaveFlow(second_downloads, "second.pdf", serve_dialog=False)
+    saved, rung = second.run(tmp_path / "second-target.pdf")
+
+    assert (saved, rung) == (tmp_path / "second-target.pdf", "browser")
+    assert second.click_points == [(425, 103), (256, 204)]
+    assert second.click_times[1] - second.click_times[0] == pytest.approx(1.0)
+    assert second.captures_after_save == 0
+
+
+def test_fast_ok_miss_is_rescued_by_one_dialog_capture_and_recalibrated(tmp_path):
+    first_downloads = tmp_path / "DownloadsFirst"
+    shifted_downloads = tmp_path / "DownloadsShifted"
+    first_downloads.mkdir()
+    shifted_downloads.mkdir()
+
+    first = _SaveFlow(first_downloads, "first.pdf")
+    first.run(tmp_path / "first-target.pdf")
+
+    # Диалог переехал вправо: старая точка OK промахивается, PDF не появляется.
+    # После короткой паузы программа один раз смотрит снимок, нажимает настоящее
+    # OK и запоминает новое смещение.
+    shifted = _SaveFlow(shifted_downloads, "shifted.pdf", ok_point=(296, 204))
+    saved, _rung = shifted.run(
+        tmp_path / "shifted-target.pdf", fast_ok_grace_sec=0.2)
+
+    assert saved.read_bytes().startswith(b"%PDF-")
+    assert shifted.click_points == [(425, 103), (256, 204), (296, 204)]
+    assert shifted.captures_after_save >= 1
+    point = acris_viewer._cached_ok_point(
+        _window(), (0, 0, 1600, 900), (425, 103))
+    assert point == (296, 204)

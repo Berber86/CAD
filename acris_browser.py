@@ -207,8 +207,7 @@ def open_document_image(
         sleep(0.4)
         rows = rows_now()
 
-    def fill(label_text: str, value: int, description: str) -> None:
-        current = rows_now()
+    def fill(label_text: str, value: int, description: str, current) -> None:
         anchor = _find(current, label_text)
         if anchor is None:
             raise fail(f"На форме ACRIS не нашёл подпись «{label_text}» ({description}).")
@@ -217,9 +216,12 @@ def open_document_image(
         if not press_ctrl_a() or not type_text(str(value)):
             raise fail(f"Не удалось ввести {description} в форму ACRIS.")
 
-    fill("Enter Block", int(block), "Block")
-    fill("Enter Lot", int(lot), "Lot")
-    search = _find_exact(rows_now(), "Search")
+    # Подписи и кнопка не переезжают от ввода цифр: один снимок формы
+    # обслуживает Block, Lot и Search. Раньше каждое поле и кнопка требовали
+    # отдельный снимок+OCR, хотя координаты уже были известны.
+    fill("Enter Block", int(block), "Block", rows)
+    fill("Enter Lot", int(lot), "Lot", rows)
+    search = _find_exact(rows, "Search")
     if search is None:
         raise fail("На форме ACRIS не нашёл кнопку Search.")
     click_row(search)

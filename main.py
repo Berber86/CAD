@@ -3642,6 +3642,9 @@ class SurveyApp(ctk.CTk):
                 doc.Close()
             except Exception:  # noqa: BLE001 - файл уже на диске; открытый не страшен
                 pass
+        warnings_file = auto_dwg_save.warnings_path_for(data_dir / new_dwgs[0])
+        if warnings_file.is_file():
+            self._sink_job("очередь", f"Предупреждения построения: {warnings_file.name} (рядом с DWG).")
         self._job_succeed_task(f"DWG: {', '.join(new_dwgs)}")
 
     def _job_abort_current(self) -> None:
@@ -3666,7 +3669,7 @@ class SurveyApp(ctk.CTk):
         task = self._job_tasks[self._job_current]
         task["status"] = "готово"
         task["detail"] = detail
-        self._sink_job("очередь", f"Задание готово: {detail}")
+        self._sink_job("очередь", f"Задание готово: {detail}", level=log_mode.LEVEL_KEY)
         self._job_close_task()
 
     def _job_close_task(self) -> None:
@@ -3694,10 +3697,12 @@ class SurveyApp(ctk.CTk):
             f"Модель: {self.current_model()}",
             "-" * 60,
         ]
-        lines += [
-            f"[{stamp}] [{source}] {text}"
-            for stamp, source, _level, text in (self._job_log_sink or [])
-        ]
+        # В файл пишется весь ход работы, но без механического шума (страницы
+        # OCR, шаги загрузок, технические параметры) и с повторами подряд,
+        # схлопнутыми в одну строку, — иначе лог нечитаем (job_queue).
+        lines.append("Журнал: ход работы без служебных строк и повторов подряд; "
+                     "полный поток — на экранах Шага 0 и Журнала.")
+        lines += job_queue.session_log_lines(self._job_log_sink or [])
         try:
             job_queue.session_log_path(task["path"]).write_text(
                 "\n".join(lines) + "\n", encoding="utf-8")
@@ -12900,6 +12905,21 @@ class SurveyApp(ctk.CTk):
                             save_result = ("failed", str(exc))
                         else:
                             save_result = ("saved", str(path))
+                            # Предупреждения построения — отдельным файлом по
+                            # имени DWG рядом с ним: в журнале сессии их потом
+                            # не выискивать. Сбой записи файла не губит DWG.
+                            try:
+                                sections = []
+                                for plan_name, result in completed:
+                                    seen: list[str] = []
+                                    for warning in list(result.plan.warnings) + list(result.warnings):
+                                        text = str(warning)
+                                        if text.strip() and text not in seen:
+                                            seen.append(text)
+                                    sections.append((plan_name, seen))
+                                auto_dwg_save.write_dwg_warnings(path, sections, error=error or "")
+                            except Exception:  # noqa: BLE001 - файл предупреждений не критичен
+                                pass
         except Exception as exc:  # noqa: BLE001 - connection/session failed
             error = "; ".join(x for x in (error, str(exc)) if x)
             if auto_save and save_result is None:

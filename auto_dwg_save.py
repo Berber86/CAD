@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 
@@ -85,3 +85,56 @@ def save_new_dwg(
                 # A stale reservation is harmless and must not mask a saved DWG.
                 pass
     raise AutoDwgSaveError("не удалось выбрать свободное имя DWG в папке описаний")
+
+
+def warnings_path_for(dwg_path: Path) -> Path:
+    """Файл предупреждений рядом с DWG: то же имя, суффикс ``.warnings.txt``."""
+    dwg = Path(dwg_path)
+    return dwg.with_name(f"{dwg.stem}.warnings.txt")
+
+
+def write_dwg_warnings(
+    dwg_path: Path,
+    sections: Iterable[tuple[str, Sequence[str]]],
+    *,
+    error: str = "",
+    stamp: str | None = None,
+) -> Path | None:
+    """
+    Записывает предупреждения построения property line в файл по имени DWG.
+
+    ``sections`` — (подпись плана, его предупреждения) по каждому построенному
+    плану: расчётные предупреждения плана и предупреждения отрисовки, в порядке
+    выдачи. Файл создаётся при каждом сохранении DWG — и когда предупреждений
+    не было (это тоже видно сразу, без раскопок журнала сессии). Ошибка записи
+    не должна губить уже сохранённый DWG: при сбое возвращается None.
+    """
+    dwg = Path(dwg_path)
+    blocks: list[str] = []
+    total = 0
+    for title, warnings in sections:
+        items = [str(warning) for warning in warnings if str(warning).strip()]
+        if not items:
+            continue
+        total += len(items)
+        blocks.append(f"== {title} ==")
+        blocks.extend(f"- {item}" for item in items)
+        blocks.append("")
+    lines = [
+        "Предупреждения при построении property line",
+        f"DWG: {dwg.name}",
+        f"Записано: {stamp or time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    if str(error or "").strip():
+        lines.append(f"Ошибка отрисовки: {str(error).strip()}")
+        lines.append("")
+    lines += blocks
+    if total == 0:
+        lines.append("Предупреждений не было.")
+    target = warnings_path_for(dwg)
+    try:
+        target.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return target

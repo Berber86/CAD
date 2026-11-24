@@ -326,6 +326,58 @@ def test_non_busy_saveas_error_is_not_retried(tmp_path):
     assert len(calls) == 1
 
 
+def test_warnings_file_named_after_dwg_with_all_plan_warnings(tmp_path):
+    dwg = tmp_path / "lot_41_ee2e30a5c6b143ea86cf5e20c96aa2c8.dwg"
+    dwg.write_bytes(b"DWG")
+    target = auto_dwg_save.write_dwg_warnings(
+        dwg,
+        [("наш участок", ["контур не замкнулся на 0.42 ft", "номер лота из описания: 41"]),
+         ("сосед LOT 43", ["контур выходит за окно листа"]),
+         ("черновик", [])],
+        stamp="2026-11-24 17:40:00",
+    )
+    assert target is not None and target.name == "lot_41_ee2e30a5c6b143ea86cf5e20c96aa2c8.warnings.txt"
+    text = target.read_text(encoding="utf-8")
+    assert dwg.name in text and "2026-11-24 17:40:00" in text
+    assert "== наш участок ==" in text and "- контур не замкнулся на 0.42 ft" in text
+    assert "== сосед LOT 43 ==" in text and "черновик" not in text
+
+
+def test_warnings_file_records_absence_and_draw_error(tmp_path):
+    dwg = tmp_path / "lot_7_x.dwg"
+    dwg.write_bytes(b"DWG")
+    clean = auto_dwg_save.write_dwg_warnings(dwg, [("наш участок", [])], stamp="s")
+    assert clean is not None and "Предупреждений не было." in clean.read_text(encoding="utf-8")
+    partial = auto_dwg_save.write_dwg_warnings(
+        dwg, [("наш участок", ["одно предупреждение"])], error="третий план не построен", stamp="s")
+    assert partial is not None
+    text = partial.read_text(encoding="utf-8")
+    assert "Ошибка отрисовки: третий план не построен" in text and "- одно предупреждение" in text
+
+
+def test_draw_warnings_are_written_next_to_saved_dwg(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    real_draw = builder.draw_plan
+
+    def draw_with_warning(plan):
+        result = real_draw(plan)
+        result.warnings.append("тестовое предупреждение отрисовки")
+        return result
+
+    monkeypatch.setattr(builder, "draw_plan", draw_with_warning)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    data_dir = tmp_path / "project" / "01_описания"
+    dwg, = data_dir.glob("lot_32_*.dwg")
+    warnings_file = data_dir / f"{dwg.stem}.warnings.txt"
+    text = warnings_file.read_text(encoding="utf-8")
+    assert dwg.name in text and "тестовое предупреждение отрисовки" in text
+
+
 def test_unavailable_autocad_reports_unsaved_file(gui, tmp_path, monkeypatch):
     from contextlib import contextmanager
     app = prepare_auto(gui, tmp_path, monkeypatch)

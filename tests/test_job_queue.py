@@ -49,3 +49,53 @@ def test_data_dir_and_session_log_path(tmp_path):
     job = tmp_path / "1234#417 WEST 33RD STREET"
     assert job_queue.data_dir_for(job) == job / "data"
     assert job_queue.session_log_path(job) == job / "data" / "session_log.txt"
+
+
+def _entry(source, level, text, stamp="10:00:00"):
+    return (stamp, source, level, text)
+
+
+def test_session_log_keeps_outcomes_warnings_errors_and_steps():
+    entries = [
+        _entry("шаг0", "key", "район, Block и Lot получены"),
+        _entry("шаг0", "warn", "уверенность Vision низкая"),
+        _entry("шаг0", "error", "LOT 62: документ не скачался"),
+        _entry("шаг1", "info", "собрано документов: 3"),
+        # Содержательные информационные строки остаются любой длины и вида:
+        # это след хода работы, по которому видно, где всё остановилось.
+        _entry("шаг0", "info", "ищу в ACRIS блок 6643, лот 61 и документ CRFN 2026000329272…"),
+        _entry("шаг0", "info", "д" * 120),
+    ]
+    assert job_queue.session_log_lines(entries) == [
+        "[10:00:00] [шаг0] район, Block и Lot получены",
+        "[10:00:00] [шаг0] уверенность Vision низкая",
+        "[10:00:00] [шаг0] LOT 62: документ не скачался",
+        "[10:00:00] [шаг1] собрано документов: 3",
+        "[10:00:00] [шаг0] ищу в ACRIS блок 6643, лот 61 и документ CRFN 2026000329272…",
+        f"[10:00:00] [шаг0] {'д' * 120}",
+    ]
+
+
+def test_session_log_drops_only_mechanical_noise():
+    entries = [
+        _entry("шаг0", "info", "качаю PDF документа CRFN 2026000329272…"),
+        _entry("шаг0", "info", "стр. 2 из 5 обработана"),
+        _entry("шаг0", "info", "   "),
+        _entry("очередь", "key", "Создан новый документ AutoCAD; рисую схему…"),
+    ]
+    assert job_queue.session_log_lines(entries) == [
+        "[10:00:00] [очередь] Создан новый документ AutoCAD; рисую схему…"]
+
+
+def test_session_log_collapses_consecutive_repeats_only():
+    entries = (
+        [_entry("шаг0", "info", "собрано документов: 3")] * 3
+        + [_entry("шаг0", "info", "собрано документов: 4"),
+           _entry("шаг0", "info", "собрано документов: 3")]
+    )
+    # Повтор не подряд — отдельная строка: хронология хода работы не врёт.
+    assert job_queue.session_log_lines(entries) == [
+        "[10:00:00] [шаг0] собрано документов: 3 (повтор ×3)",
+        "[10:00:00] [шаг0] собрано документов: 4",
+        "[10:00:00] [шаг0] собрано документов: 3",
+    ]

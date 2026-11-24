@@ -19,6 +19,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Sequence
+
+import log_mode
 
 #: Подпапка задачи, куда складывается вся её работа.
 DATA_DIR_NAME = "data"
@@ -104,3 +107,36 @@ def data_dir_for(job_folder: str | Path) -> Path:
 def session_log_path(job_folder: str | Path) -> Path:
     """Файл полного лога сессии задачи: ``<папка>/data/session_log.txt``."""
     return data_dir_for(job_folder) / SESSION_LOG_NAME
+
+
+def session_log_lines(entries: Iterable[Sequence[str]]) -> list[str]:
+    """
+    Тело ``session_log.txt`` из записей приёмника ``(метка, источник, уровень, текст)``.
+
+    Единственный вариант лога — без режимов. Раньше в файл сваливался весь
+    поток: каждая страница OCR, каждый шаг загрузки и каждый повтор повторов
+    при повторах запросов — читать такой лог тяжело и человеку, и при разборе
+    сбоев. Теперь из информационных записей уходит только механический шум
+    (``log_mode.is_log_file_noise``: постраничные счётчики, шаги загрузок,
+    технические параметры), повторы подряд схлопываются в одну строку со
+    счётчиком, а весь содержательный ход работы — шаги, итоги, предупреждения
+    и ошибки любой длины — остаётся как был.
+    """
+    kept: list[tuple[str, str, str, str]] = []
+    for stamp, source, level, text in entries:
+        text = str(text)
+        if not text.strip():
+            continue
+        if str(level) == log_mode.LEVEL_INFO and log_mode.is_log_file_noise(text):
+            continue
+        kept.append((str(stamp), str(source), str(level), text))
+    grouped: list[list] = []
+    for stamp, source, level, text in kept:
+        if grouped and grouped[-1][1:4] == [source, level, text]:
+            grouped[-1][4] += 1
+        else:
+            grouped.append([stamp, source, level, text, 1])
+    return [
+        f"[{stamp}] [{source}] {text}" + (f" (повтор ×{count})" if count > 1 else "")
+        for stamp, source, _level, text, count in grouped
+    ]

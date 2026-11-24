@@ -226,18 +226,16 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         "base_url": "https://routerai.ru/api/v1",
         "api_key": "",
         "env_key": "ROUTERAI_API_KEY",
-        "default_model": "openai/gpt-4.1",
-        "selected_model": "openai/gpt-4.1",
+        "default_model": "x-ai/grok-4.7",
+        "selected_model": "x-ai/grok-4.7",
+        # Список сознательно короткий (указание пользователя, 5.18): Grok 4.7
+        # и 4.6 для разбора (4.7 — ещё и страховочная копия Hydra grok-4.7),
+        # jev и microsoft — модели поиска релевантных страниц.
         "models": [
             "x-ai/grok-4.7",
-            "openai/gpt-4.1",
-            "openai/gpt-4.1-mini",
-            "openai/gpt-4o",
-            "openai/gpt-4o-mini",
-            "google/gemini-2.5-pro",
-            "google/gemini-2.5-flash",
-            "anthropic/claude-sonnet-4.5",
-            "deepseek/deepseek-chat",
+            "x-ai/grok-4.6",
+            "typesafe/jev-1.14",
+            "microsoft/microsoft-decision-1.1",
         ],
     },
 }
@@ -293,6 +291,20 @@ LEGACY_HYDRA_TEXT_MODELS: tuple[str, ...] = (
     "hydra-gemini-pro",
     "hydra-gemini-3-pro",
     "hydra-gemini",
+)
+
+#: Прежний список моделей RouterAI: удаляются миграцией ``load_config`` из
+#: пользовательских списков (5.18 — в выборе остаются только Grok 4.7/4.6,
+#: jev и microsoft).
+LEGACY_ROUTERAI_MODELS: tuple[str, ...] = (
+    "openai/gpt-4.1",
+    "openai/gpt-4.1-mini",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "google/gemini-2.5-pro",
+    "google/gemini-2.5-flash",
+    "anthropic/claude-sonnet-4.5",
+    "deepseek/deepseek-chat",
 )
 
 
@@ -383,7 +395,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "pass2_provider": "openrouter",
             "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
             "pass3_provider": "routerai",
-            "pass3_model": "openai/gpt-4.1",
+            "pass3_model": "x-ai/grok-4.7",
         },
         # ИИ-советник по конфликтам между участками набора PDF (Шаг 1).
         # ``enabled`` — выключатель, ``auto`` — спрашивать без кнопки (по умолчанию
@@ -907,6 +919,35 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 section_pid = str(cons_cfg.get(key.replace("model", "provider")) or "").strip().lower()
                 if section_pid == "hydra" and str(cons_cfg.get(key) or "").strip() in removed_hydra:
                     cons_cfg[key] = fallback_model
+
+    # Миграция 5.18: список моделей RouterAI сокращён до Grok 4.7/4.6, jev и
+    # microsoft. Пользовательский config.json обновлением не перезаписывается,
+    # поэтому прежние модели вычищаем здесь (иначе Grok в выборе не виден:
+    # сохранённый список перекрывает каталог), а цели на удалённых моделях
+    # переводим на Grok 4.7. Ручные имена вне прежнего списка не трогаем.
+    routerai_cfg = (cfg.get("api", {}).get("providers") or {}).get("routerai")
+    if isinstance(routerai_cfg, dict):
+        removed_routerai = set(LEGACY_ROUTERAI_MODELS)
+        old_models = [str(m) for m in (routerai_cfg.get("models") or []) if str(m).strip()]
+        catalog_models = [str(m) for m in PROVIDERS_CATALOG["routerai"]["models"]]
+        routerai_cfg["models"] = list(catalog_models) + [
+            m for m in old_models if m not in removed_routerai and m not in catalog_models
+        ]
+        routerai_fallback = str(
+            PROVIDERS_CATALOG["routerai"].get("default_model") or "x-ai/grok-4.7"
+        )
+        for field in ("selected_model", "default_model"):
+            if str(routerai_cfg.get(field) or "").strip() in removed_routerai:
+                routerai_cfg[field] = routerai_fallback
+        if str((cfg.get("api") or {}).get("provider") or "").strip().lower() == "routerai":
+            if str((cfg.get("api") or {}).get("model") or "").strip() in removed_routerai:
+                cfg["api"]["model"] = routerai_fallback
+        cons_cfg = (cfg.get("api") or {}).get("consensus")
+        if isinstance(cons_cfg, dict):
+            for key in ("pass2_model", "pass3_model"):
+                section_pid = str(cons_cfg.get(key.replace("model", "provider")) or "").strip().lower()
+                if section_pid == "routerai" and str(cons_cfg.get(key) or "").strip() in removed_routerai:
+                    cons_cfg[key] = routerai_fallback
 
     dotenv_vars = load_dotenv_dict() if path is None else {}
     api = cfg["api"]

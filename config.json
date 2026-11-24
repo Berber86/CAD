@@ -84,17 +84,13 @@
         "base_url": "https://routerai.ru/api/v1",
         "api_key": "",
         "env_key": "ROUTERAI_API_KEY",
-        "default_model": "openai/gpt-4.1",
-        "selected_model": "openai/gpt-4.1",
+        "default_model": "x-ai/grok-4.7",
+        "selected_model": "x-ai/grok-4.7",
         "models": [
-          "openai/gpt-4.1",
-          "openai/gpt-4.1-mini",
-          "openai/gpt-4o",
-          "openai/gpt-4o-mini",
-          "google/gemini-2.5-pro",
-          "google/gemini-2.5-flash",
-          "anthropic/claude-sonnet-4.5",
-          "deepseek/deepseek-chat"
+          "x-ai/grok-4.7",
+          "x-ai/grok-4.6",
+          "typesafe/jev-1.14",
+          "microsoft/microsoft-decision-1.1"
         ]
       }
     },
@@ -103,7 +99,7 @@
       "pass2_provider": "openrouter",
       "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
       "pass3_provider": "routerai",
-      "pass3_model": "openai/gpt-4.1"
+      "pass3_model": "x-ai/grok-4.7"
     },
     "conflict_advisor": {
       "enabled": true,

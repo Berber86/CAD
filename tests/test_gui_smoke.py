@@ -830,7 +830,9 @@ def test_gui_builds_and_reports(gui):
 
     app.select_provider("routerai")
     assert app.current_provider_id() == "routerai"
-    assert "openai/gpt-4.1" in app.model_combo.cget("values")
+    assert "x-ai/grok-4.7" in app.model_combo.cget("values")
+    assert "x-ai/grok-4.6" in app.model_combo.cget("values")
+    assert "openai/gpt-4.1" not in app.model_combo.cget("values")
 
     app.select_provider("Hydra AI")
     assert app.current_model() == "hydra-gemini-pro"
@@ -1131,7 +1133,7 @@ def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_p
     app.select_passes(3)
     assert app.current_passes_count() == 3
     app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
-    app.select_pass3_target("RouterAI", "openai/gpt-4.1")
+    app.select_pass3_target("RouterAI", "x-ai/grok-4.7")
     app.provider_key_vars["hydra"].set("sk-hydra-test")
     app.provider_key_vars["openrouter"].set("sk-or-test")
     app.provider_key_vars["routerai"].set("sk-rai-test")

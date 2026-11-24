@@ -346,20 +346,33 @@ def _focus(handle: int) -> None:
         raise PortalLookupError("Не удалось безопасно активировать окно NYC Portal.")
 
 
+def _click_row(handle: int, row: ScreenText) -> ScreenText:
+    bounds = browser_save.window_bounds(handle)
+    if bounds is None:
+        raise PortalLookupError("Окно браузера изменилось, координаты мыши недоступны.")
+    x0, y0, _x1, _y1 = bounds
+    cx, cy = row.center
+    _focus(handle)
+    if not browser_save.click_browser_window(handle, x0 + cx, y0 + cy):
+        raise PortalLookupError("Не удалось нажать элемент в окне NYC Portal.")
+    return row
+
+
+def _search_button_row(rows: Sequence[ScreenText]) -> ScreenText | None:
+    return next((row for row in rows if _normalise(row.text) == "search"), None)
+
+
+def _search_rejected(rows: Sequence[ScreenText]) -> bool:
+    joined = _normalise(" ".join(row.text for row in rows))
+    return "notfound" in joined or "noresults" in joined
+
+
 def _click_text(handle: int, rows: Sequence[ScreenText], text: str) -> ScreenText:
     target = _normalise(text)
     found = next((row for row in rows if target in _normalise(row.text)), None)
     if found is None:
         raise PortalLookupError(f"На странице не найден элемент «{text}».")
-    bounds = browser_save.window_bounds(handle)
-    if bounds is None:
-        raise PortalLookupError("Окно браузера изменилось, координаты мыши недоступны.")
-    x0, y0, _x1, _y1 = bounds
-    cx, cy = found.center
-    _focus(handle)
-    if not browser_save.click_browser_window(handle, x0 + cx, y0 + cy):
-        raise PortalLookupError("Не удалось нажать элемент в окне NYC Portal.")
-    return found
+    return _click_row(handle, found)
 
 
 def _key(handle: int, vk: int) -> None:
@@ -552,8 +565,9 @@ def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[
     """
     Ждём, пока портал покажет список подсказок, и возвращаем первую строку.
 
-    Что в ней написано — не проверяем (решение пользователя 2026-11-23):
-    выбирается она клавишами Down+Enter, а не кликом по координатам.
+    Что в ней написано — не проверяем (решение пользователя 2026-11-23).
+    Выбирается строка кликом мыши по её центру (см. ``select_suggestion``):
+    Down+Enter однажды превратились в текстовый поиск по подписи подсказки.
     Признак списка — текст подсказки («…, NY … USA»), геометрию не смотрим:
     она трижды отсекала настоящий список на живом окне. Нет списка после
     повторных проверок — остановка с диагностикой, что OCR видит под полем.
@@ -925,9 +939,6 @@ def _drive_portal_rest(
         if progress and picked is not None:
             progress(f"первая подсказка портала: «{picked.text}» — выбираю её")
     check_layout_size()
-    _key(window.handle, browser_save.VK_DOWN)
-    time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
-    _key(window.handle, browser_save.VK_RETURN)
 
     def card_ready(screen: Sequence[ScreenText]) -> bool:
         if not fast_mode and not use_optimal:
@@ -950,18 +961,99 @@ def _drive_portal_rest(
             raise _ScreenNotFound("Карточка не готова после повторной проверки. Увеличьте паузу или выберите надёжный режим.")
         return retry
 
-    retried_fast_card = False
-    try:
-        rows = wait(
+    def wait_card() -> list[ScreenText]:
+        return wait(
             window.handle, card_ready,
             delay=OPTIMAL_CARD_DELAY if use_optimal else RELIABLE_CARD_DELAY,
             description="карточку объекта с Borough, Block и Lot", region=None,
         )
-    except _ScreenNotFound:
-        if not fast_mode:
-            raise
-        rows = fast_card_retry()
-        retried_fast_card = True
+
+    def form_snapshot() -> list[ScreenText]:
+        _focus(window.handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_after_select_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(window.handle, path)
+            snapshot = _screen_ocr_region(path, _FORM_REGION)
+        _reject_challenge(snapshot)
+        return snapshot
+
+    def select_suggestion() -> list[ScreenText]:
+        """
+        Выбор первой подсказки как человек: клик мышью, не Down+Enter.
+
+        Живой случай 3868 (24.11.2026): Down+Enter превратились в текстовый
+        поиск по подписи подсказки — портал ответил «Address not found
+        within the NYC limits» и «No results», хотя в поле был верный адрес
+        из названия папки; карточка так и не появилась. Клик по строке
+        регистрирует в виджете сам объект подсказки. Распознавание строки
+        по-прежнему только по тексту; координаты — лишь точка клика по уже
+        найденной строке. Если клика мало (портал ждёт явный Search) или
+        поиск по тексту уже отклонён — лестница запасных действий ниже,
+        последним шагом прежние Down+Enter.
+        """
+        def soft_wait_card() -> list[ScreenText] | None:
+            try:
+                return wait_card()
+            except _ScreenNotFound:
+                return None
+
+        def click_and_wait(row: ScreenText) -> list[ScreenText] | None:
+            _click_row(window.handle, row)
+            return soft_wait_card()
+
+        def search_click_and_wait(screen: list[ScreenText]) -> list[ScreenText] | None:
+            button = _search_button_row(screen)
+            if button is None:
+                return None
+            if progress:
+                progress("карточки после выбора подсказки нет — нажимаю Search")
+            return click_and_wait(button)
+
+        if picked is not None:
+            if progress:
+                progress("выбираю первую подсказку кликом мыши")
+            found = click_and_wait(picked)
+            if found is not None:
+                return found
+            screen = form_snapshot()
+            found = search_click_and_wait(screen)
+            if found is not None:
+                return found
+            if _search_button_row(screen) is not None:
+                screen = form_snapshot()
+            if _search_rejected(screen):
+                if progress:
+                    progress("портал отклонил поиск по тексту — ввожу адрес заново и выбираю подсказку кликом")
+                _type_into_address(window.handle, address, rows)
+                again = _wait_after_address_input(
+                    window.handle, address, rows,
+                    first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+                if again is not None:
+                    found = click_and_wait(again)
+                    if found is not None:
+                        return found
+                    found = search_click_and_wait(form_snapshot())
+                    if found is not None:
+                        return found
+        if progress:
+            progress("выбираю подсказку клавишами Down+Enter")
+        _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(0.2)
+        _key(window.handle, browser_save.VK_RETURN)
+        return wait_card()
+
+    retried_fast_card = False
+    if fast_mode:
+        _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(FAST_KEY_DELAY_SEC)
+        _key(window.handle, browser_save.VK_RETURN)
+        try:
+            rows = wait_card()
+        except _ScreenNotFound:
+            rows = fast_card_retry()
+            retried_fast_card = True
+    else:
+        rows = select_suggestion()
     details_source = "ocr"
     if not fast_mode and not use_optimal:
         # Сначала один финальный снимок после уменьшения карты: правая часть — карта,

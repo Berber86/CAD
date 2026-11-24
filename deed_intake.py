@@ -443,12 +443,16 @@ def _acris_as_clerk_row(row: acris.AcrisRow, index: int) -> rcclerk.DeedRow:
 
 def _fetch_acris_rows(
     code: int, block_no: int, lot_no: int, fetch_page: AcrisPageFetcher,
+    *, on_first_page=None,
 ) -> list[acris.AcrisRow]:
     """Все строки лота: страницы по 99, пока ACRIS говорит, что есть дальше."""
     rows: list[acris.AcrisRow] = []
     seen: set[str] = set()
     for page_no in range(1, _MAX_ACRIS_PAGES + 1):
-        page = acris.parse_result_page(fetch_page(code, block_no, lot_no, page_no))
+        html = fetch_page(code, block_no, lot_no, page_no)
+        if page_no == 1 and on_first_page is not None:
+            on_first_page(html)
+        page = acris.parse_result_page(html)
         for row in page.rows:
             if row.crfn in seen:
                 continue
@@ -457,6 +461,12 @@ def _fetch_acris_rows(
         if not page.has_next or not page.rows:
             break
     return rows
+
+
+def _page_text_snippet(html: str, limit: int = 180) -> str:
+    """Первые слова текста страницы без тегов — образец для журнала при пустом разборе."""
+    text = acris._TAG_RE.sub(" ", str(html or ""))  # noqa: SLF001 - общий разбор проекта
+    return " ".join(text.split())[:limit]
 
 
 def _collect_deeds_acris(
@@ -516,8 +526,10 @@ def _collect_deeds_acris(
         check_stop()
         who = "наш участок" if role == "our" else "сосед"
         say(f"{who}: блок {block_no}, лот {lot_value} — читаю список документов в ACRIS…")
+        first_page_html: list[str] = []
         try:
-            rows = _fetch_acris_rows(code, block_no, lot_value, fetch_page)
+            rows = _fetch_acris_rows(code, block_no, lot_value, fetch_page,
+                                     on_first_page=first_page_html.append)
         except acris.AcrisBlocked as exc:
             outcome.missing.append(f"{who} (лот {lot_value}): список закрыт страницей отказа ACRIS — {exc}")
             continue
@@ -525,9 +537,11 @@ def _collect_deeds_acris(
             outcome.missing.append(f"{who} (лот {lot_value}): список не открылся — {exc}")
             continue
         if not rows:
+            snippet = _page_text_snippet(first_page_html[0]) if first_page_html else ""
             outcome.missing.append(
                 f"{who} (лот {lot_value}): в ACRIS нет строк документов — "
                 f"проверьте block/lot: {acris.search_page_url()}"
+                + (f"; образец страницы: {snippet}" if snippet else "")
             )
             continue
         listed = "; ".join(

@@ -3889,6 +3889,26 @@ def test_step0_failure_keeps_the_button_for_another_try(gui, tmp_path):
     assert "наш участок не собран" in app.status_var.get()
 
 
+def test_job_session_log_keeps_background_progress_and_missing_report(gui, tmp_path):
+    # Живой случай 3870 (24.11.2026): в session_log.txt задания не было ни одной
+    # строки хода сбора и раздела «Чего не хватает» — только «сбор неполный».
+    # Прогресс воркера и отчёт исхода обязаны попадать в лог задания.
+    app = gui.SurveyApp()
+    app._job_log_sink = []
+    app._post("step0_progress", "[13:50:53] наш участок: блок 1492, лот 42 — читаю список документов в ACRIS…")
+    app._drain_events()
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=tmp_path,
+        missing=["наш участок (лот 42): список закрыт страницей отказа ACRIS"],
+    )
+    app._finish_step0("ok", outcome)
+    texts = [text for _stamp, source, _level, text in app._job_log_sink if source == "шаг0"]
+    assert any("читаю список документов в ACRIS" in text for text in texts)
+    assert any("Чего не хватает" in text and "страницей отказа ACRIS" in text for text in texts)
+    # Метка времени внутри строки прогресса не дублируется в начале записи лога.
+    assert not any(text.startswith("[13:50:53]") for text in texts)
+
+
 def test_step0_stop_leaves_the_window_usable(gui):
     app = gui.SurveyApp()
     app._step0_running = True

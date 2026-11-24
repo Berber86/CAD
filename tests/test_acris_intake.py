@@ -92,6 +92,25 @@ def test_acris_blocked_list_is_reported_not_faked(tmp_path):
     assert any("страницей отказа ACRIS" in item for item in outcome.missing)
 
 
+def test_acris_empty_page_reports_text_snippet(tmp_path):
+    # Страница пришла, но строк не распозналось: в причине — образец текста
+    # страницы, чтобы отличить «документов нет» от «страница устроена иначе»
+    # (живой случай 3870: сбор дал 0 документов без видимой причины).
+    def fetch_page(code, block, lot, page):
+        return "<html><body><p>Search Results No records found for this BBL</p></body></html>"
+
+    outcome = deed_intake.collect_deeds(
+        block=1492, lot=42, borough="Manhattan", folder=tmp_path,
+        acris_fetch_page=fetch_page,
+        acris_id_fetcher=lambda crfn: DOC_ID,
+        acris_downloader=_downloader,
+        page_finder=_empty_pages,
+    )
+    assert not outcome.ok
+    assert any("нет строк документов" in item and "No records found" in item
+               for item in outcome.missing)
+
+
 def _page_html(crfn: str, *, has_next: bool) -> str:
     nxt = '<a href="?page=2">next</a>' if has_next else ""
     return (

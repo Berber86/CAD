@@ -4500,11 +4500,15 @@ class SurveyApp(ctk.CTk):
         outcome = payload
         self._step0_outcome = outcome
         self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}", level=log_mode.LEVEL_KEY)
-        self._step0_lines.append((
-            log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY,
-            outcome.report(include_notes=False),
-        ))
+        report_text = outcome.report(include_notes=False)
+        report_level = log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY
+        self._step0_lines.append((report_level, report_text))
         self._render_step0_log()
+        # Отчёт с разделом «Чего не хватает» — тоже в лог задания очереди,
+        # иначе в session_log.txt остаётся только «сбор неполный» без причины.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), "шаг0", report_level, report_text))
         if outcome.ok:
             self.step0_to_step1_button.configure(state="normal")
             self._set_status(
@@ -11863,6 +11867,13 @@ class SurveyApp(ctk.CTk):
             level = log_mode.LEVEL_KEY if kind == "step0_portal_notice" else log_mode.LEVEL_INFO
             self._step0_lines.append((level, text))
             self._render_step0_log()
+            # Ход фоновой работы (сбор ACRIS/Клерка, портал) обязан попадать и в
+            # session_log.txt задания очереди: без этих строк в логе задания не
+            # видно, почему сбор дал 0 документов (живой случай 3870, 24.11.2026).
+            if getattr(self, "_job_log_sink", None) is not None:
+                sink_text = text[11:].lstrip() if text.startswith("[") and len(text) >= 10 and text[9] == "]" else text
+                self._job_log_sink.append(
+                    (time.strftime("%H:%M:%S"), "шаг0", level, sink_text))
         elif kind == "step0_portal_done":
             status, portal_result = payload
             self._finish_step0_portal_lookup(status, portal_result)

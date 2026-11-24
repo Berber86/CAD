@@ -528,3 +528,10 @@ def test_full_pdf_only_path_skips_legacy_search_and_cropping(tmp_path, monkeypat
         with pytest.importorskip("pymupdf").open(outcome.folder / record.file) as pdf:
             assert len(pdf) == 3
     assert not list(outcome.folder.glob("*_p*.pdf"))
+
+
+def test_on_record_fires_as_each_document_is_downloaded(tmp_path):
+    seen = []
+    outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], on_record=lambda rec: seen.append(rec.file))
+    assert seen == [record.file for record in outcome.records]
+    assert seen[:2] == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]

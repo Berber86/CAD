@@ -8,7 +8,9 @@ the disabled-by-default experimental workflow.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+import queue
+import threading
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from multiple_description_errors import ProviderResponseError
 from multiple_description_parse import (Attempt, COMPARISON_INSTRUCTION, ImageSizeRejected, PageImage,
@@ -58,6 +60,69 @@ def _call(client: Any, model: str, messages: list[dict[str, Any]],
             raise ImageSizeRejected(status_code=413) from exc
         raise
     return _content(completion)
+
+
+_T = TypeVar("_T")
+
+
+def hedged_call(primary: Callable[..., _T], secondary: Callable[..., _T], *args: Any,
+                delay: float = 300.0, notice: Callable[[str], None] | None = None,
+                **kwargs: Any) -> _T:
+    """Вызов с отложенной параллельной копией у второго провайдера.
+
+    Первый запрос не отменяется. Если он не завершился за ``delay`` секунд,
+    тот же запрос уходит второму провайдеру, и используется первый успешный
+    ответ. Быстрая ошибка первого провайдера (до порога) не маскируется:
+    она сразу возвращается вызывающему, как без страховки.
+    """
+    results: queue.SimpleQueue[tuple[str, bool, Any]] = queue.SimpleQueue()
+
+    def run(name: str, fn: Callable[..., _T]) -> None:
+        try:
+            results.put((name, True, fn(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - результат гонки, не потеря
+            results.put((name, False, exc))
+
+    threading.Thread(target=run, args=("primary", primary), daemon=True,
+                     name="llm-hedge-primary").start()
+    try:
+        name, ok, value = results.get(timeout=max(0.0, float(delay)))
+        if ok:
+            return value
+        raise value
+    except queue.Empty:
+        pass
+    if notice is not None:
+        try:
+            notice("Hydra не ответила за 300 с — параллельно запрашиваю ту же модель у RouterAI; "
+                   "использую первый успешный ответ.")
+        except Exception:  # noqa: BLE001 - журнал не должен ломать запрос
+            pass
+    threading.Thread(target=run, args=("secondary", secondary), daemon=True,
+                     name="llm-hedge-secondary").start()
+    errors: dict[str, BaseException] = {}
+    while len(errors) < 2:
+        name, ok, value = results.get()
+        if ok:
+            return value
+        errors[name] = value
+    raise errors.get("primary") or next(iter(errors.values()))
+
+
+def make_hedged_sender(primary: Callable[..., str], secondary: Callable[..., str], *,
+                       delay: float = 300.0, notice: Callable[[str], None] | None = None):
+    """Sender: Hydra grok-4.7, после порога — та же модель у RouterAI."""
+    def send(pages: Sequence[PageImage], context: Mapping[str, str | None]) -> str:
+        return hedged_call(primary, secondary, pages, context, delay=delay, notice=notice)
+    return send
+
+
+def make_hedged_selector(primary: Callable[..., int], secondary: Callable[..., int], *,
+                         delay: float = 300.0, notice: Callable[[str], None] | None = None):
+    """Selector: та же отложенная гонка провайдеров, что и у sender."""
+    def choose(pages: Sequence[PageImage], attempts: Sequence[Attempt]) -> int:
+        return hedged_call(primary, secondary, pages, attempts, delay=delay, notice=notice)
+    return choose
 
 
 def create_client(target: Mapping[str, str], *, timeout: float = 500) -> Any:

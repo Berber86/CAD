@@ -640,6 +640,8 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage: str | None = None
         self._step0_auto_address = ""
         self._step0_auto_identity: tuple[str, str, str, str] | None = None
+        self._auto_stream_batch: Any = None
+        self._auto_stream_jobs: tuple[Any, ...] = ()
         self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
         # Страница «Данные»: очередь папок-задач («номер…#адрес») через
         # автопоток; каждая задача — подпапка data и лог сессии в ней.
@@ -4385,11 +4387,34 @@ class SurveyApp(ctk.CTk):
         identities = file_metadata.intake_observations(
             block, lot, borough, neighbours, str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
         )
+        stream_plan = None
+        self._auto_stream_batch = None
+        self._auto_stream_jobs = ()
+        if self._step0_auto_stage == "intake":
+            try:
+                stream_cfg, stream_provider, stream_model, stream_key, stream_secret = (
+                    self._build_runtime_config())
+                stream_search_cfg = copy.deepcopy(
+                    stream_cfg.get("multiple_description_search") or {})
+                stream_search_cfg["enabled"] = True  # только этот автопоток
+                stream_cfg["multiple_description_search"] = stream_search_cfg
+                stream_plan = (stream_cfg, stream_provider, stream_model, stream_key,
+                               stream_secret, self._current_scale())
+                self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                    "Автопоток: каждый PDF пойдёт в поиск страниц и разбор сразу после скачивания, "
+                    "не дожидаясь остальных файлов; OUR OLD — только скачиваю.")))
+                self._render_step0_log()
+            except Exception:  # noqa: BLE001 - конвейер необязателен, обычный этап ниже
+                stream_plan = None
+                self._step0_lines.append((log_mode.LEVEL_WARN, self._step0_timestamp(
+                    "Автопоток: параллельный разбор по мере скачивания не подготовлен — "
+                    "соберу файлы и разберу обычным этапом.")))
+                self._render_step0_log()
         self._start_background(
             self._step0_worker,
             args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
                   bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-                  self._step0_auto_stage == "intake"),
+                  self._step0_auto_stage == "intake", stream_plan),
         )
 
     def _step0_worker(
@@ -4405,6 +4430,7 @@ class SurveyApp(ctk.CTk):
         borough: str = "",
         identities: dict[str, dict] | None = None,
         skip_page_search: bool = False,
+        stream_plan: tuple[Any, ...] | None = None,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         def progress(line: str) -> None:
@@ -4433,6 +4459,87 @@ class SurveyApp(ctk.CTk):
         else:
             progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
 
+        # Конвейер автопотока: отдельный поток разбирает PDF по мере их
+        # скачивания, пока этот поток качает следующие. OUR OLD не разбираем.
+        stream_queue: queue.Queue[Any] | None = None
+        stream_thread: threading.Thread | None = None
+        stream_box: dict[str, Any] = {}
+        stream_jobs_seen: list[Any] = []
+        stream_stop = threading.Event()
+        stream_generation = getattr(self._worker_context, "generation", self._generation)
+        stream_queued: set[Path] = set()
+        on_record = None
+        if stream_plan is not None:
+            from multiple_description_runtime import (
+                FileJob, open_runtime_callbacks, prepare_runtime, provider_target,
+                run_batch_streaming, ROUTERAI_GROK_MODEL,
+            )
+
+            stream_queue = queue.Queue()
+
+            def stream_jobs() -> Any:
+                while True:
+                    job = stream_queue.get()
+                    if job is None:
+                        return
+                    stream_jobs_seen.append(job)
+                    yield job
+
+            def stream_current() -> bool:
+                return (not stream_stop.is_set() and not self._step0_stop.is_set()
+                        and not self._closing and stream_generation == self._generation)
+
+            def stream_progress(line: str) -> None:
+                self._post("step0_progress", self._step0_timestamp(line),
+                           generation=stream_generation)
+
+            def stream_main() -> None:
+                try:
+                    cfg2, provider2, model2, key2, secret2, scale2 = stream_plan
+                    target, router_key = prepare_runtime(
+                        cfg2, selected_provider=provider2, selected_model=model2,
+                        selected_api_key=key2, key_secret=secret2, current=stream_current)
+                    router = provider_target(
+                        cfg2, "routerai", legal_page_search.PRIMARY, key_secret=secret2,
+                        explicit_key=key2 if provider2 == "routerai" else None)
+                    hedge = None
+                    if target.provider == "hydra" and target.model == "grok-4.7":
+                        try:
+                            hedge = provider_target(cfg2, "routerai", ROUTERAI_GROK_MODEL,
+                                                    key_secret=secret2)
+                        except Exception:  # noqa: BLE001 - страховка необязательна
+                            hedge = None
+                    with open_runtime_callbacks(target, cfg2, hedge_target=hedge,
+                                                progress=stream_progress) as (send, choose):
+                        batch = run_batch_streaming(
+                            stream_jobs(), cfg2, target=target, search_api_key=router_key,
+                            send=send, choose=choose, search_base_url=router.base_url,
+                            scale=scale2, force_parse=False, current=stream_current,
+                            detail=stream_progress)
+                    if not batch.cancelled:
+                        stream_box["batch"] = batch
+                        stream_box["jobs"] = tuple(stream_jobs_seen)
+                except Exception:  # noqa: BLE001 - обычный этап после сбора повторит честно
+                    stream_box["error"] = True
+                    stream_progress("Параллельный разбор по мере скачивания не запустился; "
+                                    "после сбора разберу обычным этапом.")
+
+            stream_thread = threading.Thread(target=stream_main, daemon=True,
+                                             name="step0-stream-parse")
+            stream_thread.start()
+
+            def on_record(record: Any) -> None:
+                if record.role == "our" and str(record.tag).upper() == "OLD":
+                    progress(f"  {record.file}: скачан; в автопотоке не разбираю (OUR OLD).")
+                    return
+                assert stream_queue is not None  # для проверяльщика типов
+                path = folder / str(record.file)
+                if path in stream_queued:
+                    return
+                stream_queued.add(path)
+                stream_queue.put(FileJob(path, record.role == "our" or lot_identity.has_our_prefix(path)))
+                progress(f"  {record.file}: скачан — сразу в поиск страниц и разбор, остальные файлы не жду.")
+
         try:
             outcome = deed_intake.collect_deeds(
                 block=block,
@@ -4448,13 +4555,27 @@ class SurveyApp(ctk.CTk):
                 ocr_dpi=ocr_dpi,
                 search_pages=not skip_page_search,
                 downloads_dir=downloads,
+                on_record=on_record,
             )
         except deed_intake.IntakeCancelled:
+            stream_stop.set()
+            if stream_queue is not None:
+                stream_queue.put(None)
             self._post("step0_done", ("cancelled", None))
             return
         except Exception as exc:  # noqa: BLE001 - сеть, файлы, PDF — всё возможно
+            stream_stop.set()
+            if stream_queue is not None:
+                stream_queue.put(None)
             self._post("step0_done", ("error", f"{type(exc).__name__}: {exc}"))
             return
+        if stream_queue is not None:
+            stream_queue.put(None)
+        if stream_thread is not None:
+            stream_thread.join()
+            if "batch" in stream_box:
+                self._auto_stream_batch = stream_box["batch"]
+                self._auto_stream_jobs = stream_box.get("jobs", ())
         self._post("step0_done", ("ok", outcome))
 
     def _stop_step0_intake(self) -> None:
@@ -4553,6 +4674,7 @@ class SurveyApp(ctk.CTk):
         folder = Path(outcome.folder)
         paths: list[Path] = []
         roles: dict[Path, bool] = {}
+        skipped_old = False
         for record in outcome.records:
             name = str(record.file or "")
             if not name or Path(name).name != name:
@@ -4562,11 +4684,20 @@ class SurveyApp(ctk.CTk):
             if not path.is_file() or path.resolve().parent != folder.resolve():
                 self._stop_auto_transition(f"Автопоток остановлен: собранный PDF недоступен: {name}")
                 return
+            if record.role == "our" and str(getattr(record, "tag", "")).upper() == "OLD":
+                # OUR OLD в автопотоке только скачиваем и храним: время на его
+                # поиск страниц и ИИ-разбор не тратим (указание пользователя).
+                skipped_old = True
+                continue
             if path not in paths:
                 paths.append(path)
             roles[path] = record.role == "our" or lot_identity.has_our_prefix(path)
+        if skipped_old:
+            self._step0_log("Автопоток: OUR OLD скачан и сохранён, но не разбираю — "
+                            "в автопотоке разбираются NEW нашего участка и соседи.",
+                            level=log_mode.LEVEL_KEY)
         if not paths or not any(roles.values()):
-            self._stop_auto_transition("Автопоток остановлен: нет доступного PDF нашего участка.")
+            self._stop_auto_transition("Автопоток остановлен: нет доступного PDF нашего участка для разбора (OUR OLD не разбираю).")
             return
         # The explicit auto button opts into this mode for the current session only.
         self.multi_pdf_mode_var.set(True)
@@ -4582,6 +4713,51 @@ class SurveyApp(ctk.CTk):
         if errors or len(items) != len(paths) or not items or not any(item.is_main for item in items):
             self._stop_auto_transition("Автопоток остановлен: не все собранные PDF открылись.")
             return
+        stream_batch = getattr(self, "_auto_stream_batch", None)
+        stream_jobs = getattr(self, "_auto_stream_jobs", ())
+        self._auto_stream_batch = None
+        self._auto_stream_jobs = ()
+        if stream_batch is not None and [job.path for job in stream_jobs] == paths:
+            try:
+                from multiple_description_handoff import build_handoff
+                from multiple_description_runtime import FileJob
+
+                stream_view = build_handoff(
+                    stream_batch,
+                    expected_jobs=tuple(FileJob(path, roles[path]) for path in paths))
+            except Exception:  # noqa: BLE001 - готовый результат не подошёл: обычный этап
+                stream_view = None
+            if stream_view is not None:
+                self._reset_visual_sources()
+                self._visual_source_role = "set"
+                self.pdf_set = list(items)
+                self._pdf_set_main_plan = None
+                self._pdf_set_scene_neighbors = set()
+                self._pdf_set_main_pending = False
+                self._main_analysis_pending = False
+                self._neighbor_text_pending = False
+                self._pending_neighbor_files.clear()
+                self.text_box.delete("1.0", "end")
+                self._refresh_text_counter()
+                self.source_mode_var.set("📄 PDF")
+                try:
+                    self.source_mode_switch.set("📄 PDF")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._on_source_mode_changed()
+                self.pdf_label.configure(
+                    text=f"Набор PDF: {len(items)} файл. (ИИ)", text_color=THEME["warn"])
+                self._running_source_signature = self._source_signature(mode="📄 PDF")
+                self._ready_source_signature = None
+                self._input_incomplete = True
+                self._step0_auto_stage = "parse"
+                self._step0_log(
+                    "Автопоток: разбор шёл одновременно со скачиванием — использую готовый результат; "
+                    "повторно файлы не разбираю.", level=log_mode.LEVEL_KEY)
+                self._handle_multi_pdf_done(stream_view, self._running_source_signature)
+                return
+            self._step0_log("Автопоток: параллельный результат не подошёл к собранному набору — "
+                            "разберу обычным этапом.", level=log_mode.LEVEL_WARN)
         self._step0_auto_stage = "parse"
         self._step0_log(f"Автопоток: передаю {len(items)} полных PDF на поиск всех описаний. AutoCAD не запускаю.", level=log_mode.LEVEL_KEY)
         try:
@@ -9757,7 +9933,7 @@ class SurveyApp(ctk.CTk):
     def _multi_pdf_worker(self, jobs: Any, signature: Any, cfg: dict[str, Any], provider: str,
                           model: str, key: str | None, secret: str, scale: float, force: bool) -> None:
         from multiple_description_runtime import (prepare_runtime, provider_target, run_batch,
-                                                   open_runtime_callbacks, Cancelled)
+                                                   open_runtime_callbacks, Cancelled, ROUTERAI_GROK_MODEL)
         from multiple_description_handoff import build_handoff
         import multiple_description_cache as multi_cache
         post = self._worker_poster()
@@ -9773,7 +9949,14 @@ class SurveyApp(ctk.CTk):
             post("multi_progress", f"Разбирающая модель: {target.provider} / {target.model}; лимит изображений {target.image_limit}.")
             router = provider_target(cfg, "routerai", legal_page_search.PRIMARY, key_secret=secret,
                                      explicit_key=key if provider == "routerai" else None)
-            with open_runtime_callbacks(target, cfg) as (send, choose):
+            hedge = None
+            if target.provider == "hydra" and target.model == "grok-4.7":
+                try:
+                    hedge = provider_target(cfg, "routerai", ROUTERAI_GROK_MODEL, key_secret=secret)
+                except Exception:  # noqa: BLE001 - страховка необязательна
+                    hedge = None
+            with open_runtime_callbacks(target, cfg, hedge_target=hedge,
+                                        progress=lambda text: post("multi_progress", text)) as (send, choose):
                 batch = run_batch(jobs, cfg, target=target, search_api_key=router_key,
                                   search_base_url=router.base_url, send=send, choose=choose,
                                   scale=scale, force_parse=force, current=self._worker_is_current,

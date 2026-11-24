@@ -229,6 +229,7 @@ PROVIDERS_CATALOG: dict[str, dict[str, Any]] = {
         "default_model": "openai/gpt-4.1",
         "selected_model": "openai/gpt-4.1",
         "models": [
+            "x-ai/grok-4.7",
             "openai/gpt-4.1",
             "openai/gpt-4.1-mini",
             "openai/gpt-4o",

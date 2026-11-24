@@ -281,10 +281,15 @@ def collect_deeds(
     search_pages: bool = True,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
+    on_record: Callable[[deed_store.StoredDeed], None] | None = None,
 ) -> IntakeOutcome:
     """
     Собирает описания нашего участка и соседей в ``folder`` (по умолчанию
     ``01_описания`` в текущей папке).
+
+    ``on_record`` вызывается сразу после сохранения каждого документа:
+    автопоток в этот момент запускает поиск страниц и разбор этого PDF, не
+    дожидаясь скачивания остальных файлов.
 
     Авария одного документа не отменяет остальные: проход идёт дальше, а причина
     попадает в ``missing``/``notes`` — так человек видит и то, что собралось, и
@@ -312,6 +317,7 @@ def collect_deeds(
             fetch_list=fetch_list, downloader=downloader, auto_save=auto_save,
             ocr_dpi=ocr_dpi, downloads_dir=downloads_dir, page_finder=page_finder,
             search_pages=search_pages, progress=progress, should_stop=should_stop,
+            on_record=on_record,
         )
     code = acris_borough_code(borough)
     if code is None:
@@ -327,6 +333,7 @@ def collect_deeds(
         acris_id_fetcher=acris_id_fetcher, downloads_dir=downloads_dir,
         ocr_dpi=ocr_dpi, page_finder=page_finder,
         search_pages=search_pages, progress=progress, should_stop=should_stop,
+        on_record=on_record,
     )
 
 
@@ -349,6 +356,7 @@ def _collect_deeds_richmond(
     search_pages: bool = True,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
+    on_record: Callable[[deed_store.StoredDeed], None] | None = None,
 ) -> IntakeOutcome:
     """Проход по Richmond County Clerk (Staten Island) — первый настроенный вариант."""
     neighbour_lots = parse_lot_list(neighbours)
@@ -423,6 +431,11 @@ def _collect_deeds_richmond(
             )
             if outcome_item is not None:
                 outcome.records.append(outcome_item)
+                if on_record is not None:
+                    try:
+                        on_record(outcome_item)
+                    except Exception:  # noqa: BLE001 - конвейер не должен ронять сбор
+                        say(f"  {outcome_item.file}: сразу запустить обработку не удалось — продолжу сбор")
 
     if outcome.records:
         deed_store.write_manifest(
@@ -502,6 +515,7 @@ def _collect_deeds_acris(
     search_pages: bool = True,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
+    on_record: Callable[[deed_store.StoredDeed], None] | None = None,
 ) -> IntakeOutcome:
     """
     Проход по ACRIS (Manhattan, Bronx, Brooklyn, Queens).
@@ -622,6 +636,11 @@ def _collect_deeds_acris(
             )
             if outcome_item is not None:
                 outcome.records.append(outcome_item)
+                if on_record is not None:
+                    try:
+                        on_record(outcome_item)
+                    except Exception:  # noqa: BLE001 - конвейер не должен ронять сбор
+                        say(f"  {outcome_item.file}: сразу запустить обработку не удалось — продолжу сбор")
 
     if outcome.records:
         deed_store.write_manifest(

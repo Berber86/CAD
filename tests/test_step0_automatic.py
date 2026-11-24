@@ -59,11 +59,13 @@ def test_auto_complete_uses_collected_full_pdfs_only_and_never_draws(gui, tmp_pa
     wait_all(app)
     assert seen[0]["borough"] == "Staten Island" and seen[0]["search_pages"] is False
     assert {item.path.name: item.is_main for item in app.pdf_set} == {
-        "OUR LOT 32 NEW.pdf": True, "OUR LOT 32 OLD.pdf": True, "LOT 30 NEW.pdf": False}
+        "OUR LOT 32 NEW.pdf": True, "LOT 30 NEW.pdf": False}
     for item in app.pdf_set:
         with pymupdf.open(str(item.path)) as pdf:
             assert len(pdf) == 3
-    assert calls['search'] == 3 and calls['parse'] == 3
+    # Разбор по мере скачивания: OUR NEW и сосед разобран один раз во время
+    # сбора; OUR OLD только скачан и вообще не входил в набор.
+    assert calls['search'] == 2 and calls['parse'] == 2
     assert app._step0_auto_stage is None and app._multi_scene_handoff is not None
 
 

@@ -246,6 +246,93 @@ def test_unlocated_planning_reason_recorded_without_pdf_text_or_key(tmp_path):
     assert 'Main Street' not in json.dumps(data['scene_history'])
 
 
+def test_hydra_grok_runtime_uses_routerai_grok_as_hedge(monkeypatch):
+    from types import SimpleNamespace
+    from multiple_description_parse import PageImage
+    clients = []
+    calls = []
+
+    class HedgeClient:
+        def __init__(self, key):
+            self.key = key
+            self.closed = False
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, *, model, **kwargs):
+            calls.append((model, self.key))
+            if self.key == 'hydra-key':
+                import time
+                time.sleep(0.05)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"selected": 0}', refusal=None))])
+
+        def close(self):
+            self.closed = True
+
+    def fake_client(target, *, timeout):
+        client = HedgeClient(target['api_key'])
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(runtime.transport, 'create_client', fake_client)
+    target = runtime.ResolvedTarget('hydra', runtime.HYDRA_GROK_MODEL,
+                                    'https://hydra.test/v1', 'hydra-key', 10)
+    hedge = runtime.ResolvedTarget('routerai', runtime.ROUTERAI_GROK_MODEL,
+                                   'https://routerai.test/v1', 'router-key', 10)
+    with runtime.open_runtime_callbacks(target, {}, hedge_target=hedge, hedge_delay_sec=0.0) as (send, _choose):
+        send([PageImage(1, 'data:image/png;base64,AA==')], {'filename_lot': '6'})
+    assert [call[0] for call in calls] == [runtime.HYDRA_GROK_MODEL, runtime.ROUTERAI_GROK_MODEL]
+    assert [call[1] for call in calls] == ['hydra-key', 'router-key']
+    assert all(client.closed for client in clients)
+
+
+def test_other_model_runtime_has_no_hedge(monkeypatch):
+    from types import SimpleNamespace
+    from multiple_description_parse import PageImage
+    calls = []
+
+    class PlainClient:
+        def __init__(self, key):
+            self.key = key
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, *, model, **kwargs):
+            calls.append((model, self.key))
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{}', refusal=None))])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runtime.transport, 'create_client',
+                        lambda target, *, timeout: PlainClient(target['api_key']))
+    target = runtime.ResolvedTarget('hydra', 'gpt-4.1', 'https://hydra.test/v1', 'hydra-key', 10)
+    hedge = runtime.ResolvedTarget('routerai', runtime.ROUTERAI_GROK_MODEL,
+                                   'https://routerai.test/v1', 'router-key', 10)
+    with runtime.open_runtime_callbacks(target, {}, hedge_target=hedge, hedge_delay_sec=0.0) as (send, _choose):
+        send([PageImage(1, 'data:image/png;base64,AA==')], {})
+    assert calls == [('gpt-4.1', 'hydra-key')]
+
+
+def test_streaming_batch_processes_each_yielded_file_and_finishes(tmp_path):
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    target = runtime.ResolvedTarget('hydra', 'grok-4.7', 'https://example.test', 'secret', 10)
+    seen = []
+
+    def jobs():
+        seen.append('yielded')
+        yield runtime.FileJob(pdf, True)
+        seen.append('ended')
+
+    result = runtime.run_batch_streaming(
+        jobs(), config(), target=target, search_api_key='router',
+        send=lambda *a: answer([described('6', 55)]), choose=None, search_send=searcher)
+    assert seen == ['yielded', 'ended']
+    assert [f.status for f in result.files] == ['parsed']
+    assert len(result.scene.plans) == 1
+
+
 def test_runtime_client_is_closed_on_normal_and_exceptional_exit(monkeypatch):
     class Client:
         closed = False

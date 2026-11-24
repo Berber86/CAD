@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import os
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -30,6 +30,13 @@ from multiple_description_parse import MAX_IMAGES, DescriptionItem
 
 class RuntimeUnavailable(RuntimeError):
     """Safe operational failure, never include provider bodies or credentials."""
+
+
+#: Отложенная страховка для медленной Hydra: та же grok-4.7 у RouterAI.
+#: Hydra при этом не отменяется — используется первый успешный ответ.
+HYDRA_GROK_MODEL = "grok-4.7"
+ROUTERAI_GROK_MODEL = "x-ai/grok-4.7"
+HEDGE_DELAY_SEC = 300.0
 
 
 @dataclass(frozen=True)
@@ -257,72 +264,74 @@ def _plan_with_auto_rows(builder: AcadBuilder, sources: Sequence[drawing.Descrip
     return scene, len(groups) - len(failed)
 
 
-def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: ResolvedTarget,
-              search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
-              search_send: Callable[..., Any] | None = None,
-              search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
-              force_parse: bool = False,
-              current: Callable[[], bool] = lambda: True,
-              progress: Callable[[int, int], None] | None = None,
-              detail: Callable[[str], None] | None = None) -> BatchResult:
-    """Process each file independently and plan all usable results, without UI."""
-    if not legal_page_search.enabled(cfg):
-        raise pipeline.ParseDisabled('Developer multiple-description switch is disabled.')
-    files: list[FileResult] = []
-    sources: list[drawing.DescriptionSource] = []
-    source_complete: list[bool] = []
-    for index, job in enumerate(jobs, 1):
-        if not current():
-            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
-        if progress:
-            progress(index, len(jobs))
-        emit(detail, f"Файл {index} из {len(jobs)}: {job.path.name}.")
+class _BatchCancelled(Exception):
+    """Internal: stop streaming/batch without publishing a partial scene."""
+
+
+def _process_batch_file(job: FileJob, index: int, total: int | None, cfg: Mapping[str, Any], *,
+                        target: ResolvedTarget, search_api_key: str,
+                        send: Callable[..., Any], choose: Callable[..., Any] | None,
+                        search_send: Callable[..., Any] | None,
+                        search_base_url: str, force_parse: bool,
+                        current: Callable[[], bool],
+                        detail: Callable[[str], None] | None) -> tuple[FileResult, list[drawing.DescriptionSource], list[bool]]:
+    if not current():
+        raise _BatchCancelled
+    emit(detail, f"Файл {index}" + (f" из {total}" if total else "") + f": {job.path.name}.")
+    try:
+        portal_lot = job.portal_lot if job.portal_lot is not None else portal_lot_from_passport(job.path)
+        result = pipeline.parse_pdf(job.path, cfg, search_api_key=search_api_key,
+                                    provider=target.provider, model=target.model,
+                                    image_limit=target.image_limit, portal_lot=portal_lot,
+                                    send=send, choose=choose, search_send=search_send,
+                                    search_base_url=search_base_url,
+                                    force_parse=force_parse, current=current, progress=detail)
+    except Cancelled as exc:
+        raise _BatchCancelled from exc
+    except Exception:
+        emit(detail, "Файл: обработка не завершена; подробности ответа не записываются.")
+        # Never persist raw provider errors or sensitive text in diagnostics.
         try:
-            portal_lot = job.portal_lot if job.portal_lot is not None else portal_lot_from_passport(job.path)
-            result = pipeline.parse_pdf(job.path, cfg, search_api_key=search_api_key,
-                                        provider=target.provider, model=target.model,
-                                        image_limit=target.image_limit, portal_lot=portal_lot,
-                                        send=send, choose=choose, search_send=search_send,
-                                        search_base_url=search_base_url,
-                                        force_parse=force_parse, current=current, progress=detail)
-        except Cancelled:
-            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
-        except Exception:
-            emit(detail, "Файл: обработка не завершена; подробности ответа не записываются.")
-            # Never persist raw provider errors or sensitive text in diagnostics.
+            cache.record_failure(job.path, file_metadata._digest(job.path), reason='processing_failed', pages=[])
+        except (OSError, ValueError, cache.CacheError):
+            pass
+        return FileResult(job, None, 'processing_failed'), [], []
+    if not current():
+        raise _BatchCancelled
+    status_text = {'parsed': 'разбор выполнен', 'no_candidates': 'описания поиском не найдены',
+                   'search_incomplete': 'поиск неполный', 'images_unavailable': 'страницы недоступны',
+                   'parse_failed': 'разбор не выполнен'}
+    emit(detail, f"Файл: {status_text.get(result.status, 'неизвестное состояние')}, "
+                 f"описаний {len(result.parse.items) if result.parse else 0}.")
+    file_result = FileResult(job, result, result.status)
+    if result.parse is None:
+        return file_result, [], []
+    sources: list[drawing.DescriptionSource] = []
+    complete: list[bool] = []
+    for item in result.parse.items:
+        if not current():
+            raise _BatchCancelled
+        try:
+            outcome = lp.ParseOutcome(data=item.data, source='llm:multi', provider=target.provider,
+                                      model=target.model)
+            item.data._source_identity = file_metadata.record_outcome(
+                job.path, outcome, expected_digest=result.search['pdf_sha256'])
+        except (OSError, ValueError):
             try:
-                cache.record_failure(job.path, file_metadata._digest(job.path), reason='processing_failed', pages=[])
+                cache.record_failure(job.path, result.search['pdf_sha256'], reason='metadata_unavailable', pages=[])
             except (OSError, ValueError, cache.CacheError):
                 pass
-            files.append(FileResult(job, None, 'processing_failed'))
-            continue
-        if not current():
-            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
-        status_text = {'parsed': 'разбор выполнен', 'no_candidates': 'описания поиском не найдены',
-                       'search_incomplete': 'поиск неполный', 'images_unavailable': 'страницы недоступны',
-                       'parse_failed': 'разбор не выполнен'}
-        emit(detail, f"Файл: {status_text.get(result.status, 'неизвестное состояние')}, "
-                     f"описаний {len(result.parse.items) if result.parse else 0}.")
-        files.append(FileResult(job, result, result.status))
-        if result.parse is None:
-            continue
-        for item in result.parse.items:
-            if not current():
-                return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
-            try:
-                outcome = lp.ParseOutcome(data=item.data, source='llm:multi', provider=target.provider,
-                                          model=target.model)
-                item.data._source_identity = file_metadata.record_outcome(
-                    job.path, outcome, expected_digest=result.search['pdf_sha256'])
-            except (OSError, ValueError):
-                try:
-                    cache.record_failure(job.path, result.search['pdf_sha256'], reason='metadata_unavailable', pages=[])
-                except (OSError, ValueError, cache.CacheError):
-                    pass
-            sources.append(drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item)))
-            source_complete.append(result.parse.complete)
+        sources.append(drawing.DescriptionSource(job.path, job.is_main, item, anchor_for(job.path, item)))
+        complete.append(result.parse.complete)
+    return file_result, sources, complete
+
+
+def _finish_batch(files: list[FileResult], sources: list[drawing.DescriptionSource],
+                  source_complete: list[bool], cfg: Mapping[str, Any], *, target: ResolvedTarget,
+                  scale: float, current: Callable[[], bool],
+                  detail: Callable[[str], None] | None) -> BatchResult:
     if not current():
-        return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+        raise _BatchCancelled
     emit(detail, f"Подготовка схемы: описаний {len(sources)}.")
     scene, paired = _plan_with_auto_rows(AcadBuilder(dict(cfg)), sources, eligible=source_complete, scale=scale)
     emit(detail, f"Схема подготовлена: контуров {len(scene.plans)}, ошибок построения {len(scene.failures)}.")
@@ -342,7 +351,7 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
     offset = 0
     for file in files:
         if not current():
-            return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+            raise _BatchCancelled
         result = file.result
         parsed = result.parse.items if result and result.parse else ()
         rows = []
@@ -359,31 +368,140 @@ def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: Resolv
             except (OSError, ValueError, cache.CacheError):
                 pass
     if not current():
-        return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+        raise _BatchCancelled
     return BatchResult(tuple(files), scene, target.provider, target.model)
 
 
-def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
+def _run_batch_jobs(jobs: Iterable[FileJob], total: int | None, cfg: Mapping[str, Any], *, target: ResolvedTarget,
+                    search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
+                    search_send: Callable[..., Any] | None = None,
+                    search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
+                    force_parse: bool = False,
+                    current: Callable[[], bool] = lambda: True,
+                    progress: Callable[[int, int], None] | None = None,
+                    detail: Callable[[str], None] | None = None) -> BatchResult:
+    if not legal_page_search.enabled(cfg):
+        raise pipeline.ParseDisabled('Developer multiple-description switch is disabled.')
+    files: list[FileResult] = []
+    sources: list[drawing.DescriptionSource] = []
+    source_complete: list[bool] = []
+    try:
+        for index, job in enumerate(jobs, 1):
+            if progress and total:
+                progress(index, total)
+            file_result, file_sources, file_complete = _process_batch_file(
+                job, index, total, cfg, target=target, search_api_key=search_api_key,
+                send=send, choose=choose, search_send=search_send,
+                search_base_url=search_base_url, force_parse=force_parse,
+                current=current, detail=detail)
+            files.append(file_result)
+            sources.extend(file_sources)
+            source_complete.extend(file_complete)
+        return _finish_batch(files, sources, source_complete, cfg, target=target,
+                             scale=scale, current=current, detail=detail)
+    except _BatchCancelled:
+        return BatchResult(tuple(files), drawing.SceneResult((), ()), target.provider, target.model, True)
+
+
+def run_batch(jobs: Sequence[FileJob], cfg: Mapping[str, Any], *, target: ResolvedTarget,
+              search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
+              search_send: Callable[..., Any] | None = None,
+              search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
+              force_parse: bool = False,
+              current: Callable[[], bool] = lambda: True,
+              progress: Callable[[int, int], None] | None = None,
+              detail: Callable[[str], None] | None = None) -> BatchResult:
+    """Process each file independently and plan all usable results, without UI."""
+    return _run_batch_jobs(jobs, len(jobs), cfg, target=target, search_api_key=search_api_key,
+                           send=send, choose=choose, search_send=search_send,
+                           search_base_url=search_base_url, scale=scale,
+                           force_parse=force_parse, current=current,
+                           progress=progress, detail=detail)
+
+
+def run_batch_streaming(jobs: Iterable[FileJob], cfg: Mapping[str, Any], *, target: ResolvedTarget,
+                        search_api_key: str, send: Callable[..., Any], choose: Callable[..., Any] | None,
+                        search_send: Callable[..., Any] | None = None,
+                        search_base_url: str = legal_page_search.BASE_URL, scale: float = 16.0,
+                        force_parse: bool = False,
+                        current: Callable[[], bool] = lambda: True,
+                        detail: Callable[[str], None] | None = None) -> BatchResult:
+    """Process jobs as an iterator yields them; plan the scene after it ends.
+
+    Автопоток кормит сюда PDF по мере скачивания: поиск страниц и разбор
+    первого файла идут, пока сбор качает следующий. Сцена, как и раньше,
+    строится один раз по всем готовым описаниям.
+    """
+    return _run_batch_jobs(jobs, None, cfg, target=target, search_api_key=search_api_key,
+                           send=send, choose=choose, search_send=search_send,
+                           search_base_url=search_base_url, scale=scale,
+                           force_parse=force_parse, current=current, detail=detail)
+
+
+def _make_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], client: Any,
+                      hedge_target: ResolvedTarget | None, hedge_client: Any,
+                      progress: Callable[[str], None] | None,
+                      hedge_delay_sec: float):
+    effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
+    send = transport.make_sender(client, target.model, effort)
+    choose = transport.make_selector(client, target.model, effort)
+    if (hedge_target is not None and hedge_client is not None
+            and target.provider == 'hydra' and target.model == HYDRA_GROK_MODEL
+            and hedge_target.provider == 'routerai' and hedge_target.model == ROUTERAI_GROK_MODEL):
+        hedge_effort = lp.resolve_reasoning_effort(
+            cfg, provider=hedge_target.provider, model=hedge_target.model)
+        send = transport.make_hedged_sender(
+            send, transport.make_sender(hedge_client, hedge_target.model, hedge_effort),
+            delay=hedge_delay_sec, notice=progress)
+        choose = transport.make_hedged_selector(
+            choose, transport.make_selector(hedge_client, hedge_target.model, hedge_effort),
+            delay=hedge_delay_sec, notice=progress)
+    return send, choose
+
+
+def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], *,
+                           hedge_target: ResolvedTarget | None = None,
+                           progress: Callable[[str], None] | None = None,
+                           hedge_delay_sec: float = HEDGE_DELAY_SEC):
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
     timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
-    effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
-    return (transport.make_sender(client, target.model, effort),
-            transport.make_selector(client, target.model, effort))
+    hedge_client = None
+    if hedge_target is not None:
+        try:
+            hedge_client = transport.create_client(
+                {'api_key': hedge_target.api_key, 'base_url': hedge_target.base_url}, timeout=timeout)
+        except Exception:  # noqa: BLE001 - страховка необязательна
+            hedge_client = None
+    return _make_callbacks(target, cfg, client, hedge_target, hedge_client, progress, hedge_delay_sec)
 
 
 @contextmanager
-def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any]):
+def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], *,
+                           hedge_target: ResolvedTarget | None = None,
+                           progress: Callable[[str], None] | None = None,
+                           hedge_delay_sec: float = HEDGE_DELAY_SEC):
     """Own the transport client for one job and close it even on cancellation."""
     api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
     timeout = float(api.get('timeout_sec') or 500)
-    client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
-    effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
+    clients = [transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)]
+    hedge_client = None
+    if hedge_target is not None:
+        try:
+            hedge_client = transport.create_client(
+                {'api_key': hedge_target.api_key, 'base_url': hedge_target.base_url}, timeout=timeout)
+            clients.append(hedge_client)
+        except Exception:  # noqa: BLE001 - страховка необязательна
+            hedge_client = None
     try:
-        yield (transport.make_sender(client, target.model, effort),
-               transport.make_selector(client, target.model, effort))
+        yield _make_callbacks(target, cfg, clients[0], hedge_target, hedge_client,
+                              progress, hedge_delay_sec)
     finally:
-        client.close()
+        for client in reversed(clients):
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - закрытие не должно маскировать результат
+                pass
 
 
 def restore_cached_batch(job: FileJob, cfg: Mapping[str, Any], *, scale: float = 16.0) -> BatchResult:

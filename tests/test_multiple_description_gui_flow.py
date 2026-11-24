@@ -39,7 +39,7 @@ def setup_app(gui, monkeypatch, tmp_path, *, parse=None, search=None):
             return search(base, key, model, state, assets, questions)
         return response(questions, {1: .9, 2: .8}, 'two')
     @contextlib.contextmanager
-    def callbacks(target_, cfg):
+    def callbacks(target_, cfg, **kwargs):
         assert target_ is target
         yield sender, None
     monkeypatch.setattr(runtime, 'prepare_runtime', prepare)

@@ -466,8 +466,9 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     Одна точка клика портал не гарантирует: верстка и состояние страницы
     меняются (живые сбои 3875/3876/3870, 24.11.2026). Поэтому стратегии
     идут по кругу с самопроверкой после каждой: клик под подпись, клик в
-    плейсхолдер, клик под подпись ниже, печать в текущий фокус (после
-    выбора режима клавишей Tab фокус часто уже стоит в поле). Проверка —
+    плейсхолдер, клик по содержимому поля, клик под подпись ниже, клик по
+    самой подписи, печать в текущий фокус (после выбора режима клавишей
+    Tab фокус часто уже стоит в поле). Проверка —
     ``_typed_address_visible``: номер дома и слово улицы видны в форме.
     """
     # Поле ищем устойчиво к OCR: подпись над полем содержит «…Common Place
@@ -485,7 +486,26 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     if placeholder is not None and placeholder is not label:
         anchors.append(("placeholder", placeholder))
     if label is not None:
+        # Заполненное поле видно само: первая строка содержимого под подписью.
+        # В «грязном» состоянии (вкладка после упавшего задания: плашка
+        # «Address not found», в поле старый адрес — живой сбой 3870,
+        # 24.11.2026) смещения от высоты подписи уводят клик мимо поля,
+        # а клик по самому содержимому попадает всегда. Плашку ошибки и
+        # заголовок условий не предлагаем: они тоже «под подписью».
+        label_bottom = label.box[3]
+        below = [
+            row for row in rows
+            if row is not label and row is not placeholder
+            and label_bottom <= row.box[1] <= label_bottom + 180
+            and row.box[0] <= label.box[2]
+            and "notfound" not in _normalise(row.text)
+            and not _normalise(row.text).startswith("termsofuse")
+        ]
+        if below:
+            anchors.append(("field_text", min(below, key=lambda row: (row.box[1], row.box[0]))))
         anchors.append(("label_low", label))
+        # Настоящий <label> сам переводит фокус в своё поле по клику.
+        anchors.append(("label_self", label))
     if not anchors:
         raise PortalLookupError("После переключения режима не найдено поле Address.")
     bounds = browser_save.window_bounds(handle)
@@ -494,8 +514,9 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     x0, y0, _x1, _y1 = bounds
     for kind, anchor in anchors:
         x_left, y_top, x_right, y_bottom = anchor.box
-        if kind == "placeholder":
-            # Плейсхолдер внутри поля: кликаем в само поле.
+        if kind in {"placeholder", "field_text", "label_self"}:
+            # Плейсхолдер и содержимое — внутри поля; подпись — настоящий
+            # <label>: в обоих случаях кликаем в центр самой строки.
             click_x = x0 + (x_left + x_right) // 2
             click_y = y0 + (y_top + y_bottom) // 2
         elif kind == "label_low":

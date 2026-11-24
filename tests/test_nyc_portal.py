@@ -152,12 +152,12 @@ def test_type_into_address_falls_back_to_focused_typing(monkeypatch):
                         lambda t: typed.append(t) or True)
     monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
     empty = [nyc_portal.ScreenText("Terms of Use", (20, 300, 300, 320))]
-    screens = iter([empty, empty, empty,
+    screens = iter([empty, empty, empty, empty,
                     [nyc_portal.ScreenText("59-11 Fresh Pond Road", (25, 130, 300, 155))]])
     monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
     strategy = nyc_portal._type_into_address(1, "59-11 Fresh Pond Road, Queens", rows)
-    assert strategy == "focus" and len(clicks) == 3 and len(typed) == 4
+    assert strategy == "focus" and len(clicks) == 4 and len(typed) == 5
 
 
 def test_drive_portal_failure_leaves_black_box_snapshot(tmp_path, monkeypatch):
@@ -1756,3 +1756,35 @@ def test_search_button_is_clicked_when_card_does_not_follow_suggestion_click(tmp
     assert row_clicks == [suggestion.text, "Search"]
     assert any("нажимаю Search" in line for line in logs)
     assert not q
+
+
+def test_type_into_address_clicks_field_content_in_dirty_reused_tab(monkeypatch):
+    """Живой сбой 3870 (24.11.2026): вкладка осталась после упавшего задания —
+    плашка «Address not found», в поле старый адрес. Смещения от подписи
+    уводят клик мимо поля; клик по самому содержимому поля попадает."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (20, 100, 420, 120)),
+        nyc_portal.ScreenText("Address not found within the NYC limits", (20, 130, 420, 150)),
+        nyc_portal.ScreenText("59-11 FRESH POND RD, QUEENS, NY, 11378, USA", (25, 160, 400, 180)),
+        nyc_portal.ScreenText("Terms of Use", (20, 300, 300, 320)),
+    ]
+    clicks = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _t: True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    screens = iter([
+        [nyc_portal.ScreenText("59-11 FRESH POND RD, QUEENS, NY, 11378, USA", (25, 160, 400, 180))],
+        [nyc_portal.ScreenText("52 East 81st Street, New York", (25, 160, 400, 180))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    strategy = nyc_portal._type_into_address(1, "52 East 81st Street, New York", rows)
+    assert strategy == "field_text"
+    # Первый клик — под подпись (плашка/старый текст ещё на месте), второй —
+    # точно в центр содержимого поля.
+    assert clicks[-1] == ((25 + 400) // 2, (160 + 180) // 2)

@@ -173,10 +173,17 @@ def open_document_image(
     else:
         if not browser_save.press_ctrl_t():
             raise fail("Не удалось открыть новую вкладку в браузере.")
-        sleep(0.6)
-        active_title = (browser_save.active_window_title() or "").lower()
-        if not any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
-            raise fail("После Ctrl+T активна не новая вкладка; в чужую страницу ничего не печатаю.")
+        # Живой сбой 24.11.2026 (3876): одна проверка через 0.6 с дала «не новая
+        # вкладка», хотя портал этим же способом прошёл в том же прогоне.
+        # Несколько спокойных проверок дешевле, чем отказ от всего резерва.
+        deadline = monotonic() + 4.0
+        while True:
+            active_title = (browser_save.active_window_title() or "").lower()
+            if any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
+                break
+            if monotonic() >= deadline:
+                raise fail("После Ctrl+T активна не новая вкладка; в чужую страницу ничего не печатаю.")
+            sleep(0.4)
         if not browser_save.press_ctrl_l() or not press_ctrl_a() or not type_text(FORM_URL):
             raise fail("Не удалось ввести адрес формы ACRIS в новой вкладке.")
         if not press_key(browser_save.VK_RETURN):

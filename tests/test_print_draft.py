@@ -222,6 +222,29 @@ class _App:
         return None
 
 
+def test_connect_app_tolerates_clean_autocad_without_documents(monkeypatch):
+    # Живой случай 24.11.2026: пользователь закрыл все вкладки AutoCAD, и
+    # очередь встала с «активный документ недоступен — откройте DWG», хотя
+    # ей нужен был как раз новый документ. connect_app документ не требует.
+    import sys
+    import types
+
+    class _CleanApp:
+        @property
+        def ActiveDocument(self):
+            raise AssertionError("connect_app не должен трогать ActiveDocument")
+
+    app = _CleanApp()
+    client = types.SimpleNamespace(GetActiveObject=lambda _progid: app)
+    win32com = types.SimpleNamespace(client=client)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(module, "_co_initialize", lambda: None)
+    monkeypatch.setattr(module, "_co_uninitialize", lambda: None)
+    builder = AcadBuilder(_cfg())
+    assert builder.connect_app() is app
+
+
 @pytest.fixture
 def fake_autocad(monkeypatch):
     monkeypatch.setattr(module, "_co_initialize", lambda: None)

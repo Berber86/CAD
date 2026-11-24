@@ -3605,9 +3605,13 @@ class SurveyApp(ctk.CTk):
             self._job_fail_task("отрисовка не запустилась (см. журнал)")
 
     def _job_new_acad_document(self) -> Any:
-        """Новый пустой документ запущенного AutoCAD для задания очереди."""
+        """Новый пустой документ запущенного AutoCAD для задания очереди.
+
+        Открытый DWG не требуется: чистый AutoCAD без документов — обычное
+        состояние перед заданием, новый документ создаётся в нём самом.
+        """
         builder = AcadBuilder(self.config_data)
-        app, _doc = builder.connect()
+        app = builder.connect_app()
         doc = app.Documents.Add()
         try:
             doc.SetVariable("INSUNITS", 2)  # футы, как ждут координаты схемы

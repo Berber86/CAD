@@ -48,9 +48,11 @@ def test_primary_overlap_max_count_diagnostics_and_cache(tmp_path):
         calls.append((model, state, assets, qs))
         assert 'OUR 6' not in str(state)
         assert len(assets) == 8
-        if len(calls) == 1:
-            return response(qs, {7: .8, 8: .1}, 'two')
-        return response(qs, {8: .8, 9: .9, 10: .3}, 'one')
+        # Батчи идут параллельно: различаем их по составу вопросов, а не
+        # по порядку вызовов (он больше не гарантирован).
+        if 'page_15' in qs:
+            return response(qs, {8: .8, 9: .9, 10: .3}, 'one')
+        return response(qs, {7: .8, 8: .1}, 'two')
     run = search.search_pdf(pdf, ON, api_key='private-key', send=send)
     assert len(calls) == 2 and all(c[0] == search.PRIMARY for c in calls)
     assert run['candidate_pages'] == [7, 8, 9, 10]
@@ -87,7 +89,7 @@ def test_retries_failed_pages_only_then_fallback_and_no_count_retry(tmp_path):
         return response(qs, {3: .8})
     run = search.search_pdf(pdf, ON, api_key='secret', send=send)
     assert calls == [(search.PRIMARY, ['page_1', 'page_2', 'page_3', 'count'], 3),
-                     (search.PRIMARY, ['page_3'], 1), (search.PRIMARY, ['page_3'], 1),
+                     (search.PRIMARY, ['page_3'], 1),
                      (search.FALLBACK, ['page_3'], 1)]
     assert run['candidate_pages'] == [1, 3]
     assert run['batches'][0]['count']['status'] == 'unknown'
@@ -103,7 +105,7 @@ def test_all_failures_unknown_included_and_retry_limit(tmp_path):
         calls.append((model, len(assets), list(qs)))
         raise httpx.TimeoutException('secret')
     run = search.search_pdf(pdf, ON, api_key='secret', send=fail)
-    assert [x[0] for x in calls] == [search.PRIMARY] * 3 + [search.FALLBACK] * 3
+    assert [x[0] for x in calls] == [search.PRIMARY] * 2 + [search.FALLBACK] * 2
     assert len(calls[0][2]) == 3 and all('count' not in c[2] for c in calls[1:])
     assert run['candidate_pages'] == [1, 2] and not run['coverage_complete']
     assert all(p['incomplete'] and p['max_probability'] is None for p in run['pages'])
@@ -217,13 +219,13 @@ def test_bad_answers_retry_only_those_and_fallback_twice(tmp_path):
     calls = []
     def send(base, key, model, state, assets, qs):
         calls.append((model, list(qs)))
-        if model == search.FALLBACK and sum(c[0] == search.FALLBACK for c in calls) == 3:
+        if model == search.FALLBACK and sum(c[0] == search.FALLBACK for c in calls) == 2:
             return response(qs, {2: .3})
         data = response(qs, {1: .9})
         data['answers']['page_2'] = {'type': 'noul', 'noul': float('nan')}
         return data
     run = search.search_pdf(pdf, ON, api_key='key', send=send)
-    assert len(calls) == 6
+    assert len(calls) == 4
     assert all(keys == ['page_2'] for _, keys in calls[1:])
     assert run['candidate_pages'] == [1, 2] and run['coverage_complete']
 
@@ -363,7 +365,7 @@ def test_real_transport_format_with_mocked_http_and_sanitized_errors(tmp_path, m
     monkeypatch.setattr(dp.httpx, 'post', post)
     result = search.search_pdf(pdf, ON, api_key='secret')
     assert len(calls) == 4
-    assert [call[1]['model'] for call in calls] == [search.PRIMARY] * 3 + [search.FALLBACK]
+    assert [call[1]['model'] for call in calls] == [search.PRIMARY] * 2 + [search.FALLBACK] * 2
     for _, body in calls:
         assert len([p for p in body['state'] if p['type'] == 'image_url']) == 2
         assert all('realistic.pdf' not in str(p) for p in body['state'])
@@ -407,3 +409,34 @@ def test_progress_reports_attempts_before_network_and_cache_without_secrets(tmp_
                       progress=messages.append)
     assert any('кэш' in line for line in messages)
     assert not any('Поиск: запрос' in line for line in messages)
+
+
+def test_batches_run_in_parallel_not_sequence(tmp_path):
+    # Живой лог 24.11.2026: батчи шли строго по очереди и один медленный
+    # документ утягивал весь поиск. Батчи независимы — они должны
+    # выполняться параллельно, а результаты не должны перемешиваться.
+    import threading
+    import time
+
+    pdf = tmp_path / 'parallel.pdf'
+    make_pdf(pdf, 17)  # три батча: 1-8, 8-15, 15-17
+    lock = threading.Lock()
+    concurrent = 0
+    peak = 0
+
+    def send(base, key, model, state, assets, qs):
+        nonlocal concurrent, peak
+        with lock:
+            concurrent += 1
+            peak = max(peak, concurrent)
+        try:
+            time.sleep(0.05)
+            return response(qs, {1: .9, 15: .9})
+        finally:
+            with lock:
+                concurrent -= 1
+
+    run = search.search_pdf(pdf, ON, api_key='key', send=send)
+    assert peak >= 2, 'батчи должны идти параллельно'
+    assert [b['pages'] for b in run['batches']] == [[*range(1, 9)], [*range(8, 16)], [15, 16, 17]]
+    assert 1 in run['candidate_pages'] and 15 in run['candidate_pages']

@@ -2831,6 +2831,41 @@ class AcadBuilder:
         self._warn_about_units(doc)
         return app, doc
 
+    def connect_app(self) -> Any:
+        """
+        Только приложение запущенного AutoCAD — без требования открытого DWG.
+
+        Очереди «Данные» нужен новый документ, и чистый AutoCAD (все вкладки
+        закрыты, стартовый экран) для неё — нормальное исходное состояние,
+        а не ошибка «откройте DWG» (живой случай 24.11.2026: пользователь
+        закрыл лишние вкладки, и все задания очереди встали на этом месте,
+        хотя вся работа до отрисовки была выполнена).
+        """
+        co_inited = _co_initialize()
+        try:
+            import win32com.client
+        except ImportError as exc:  # pragma: no cover
+            if co_inited:
+                _co_uninitialize()
+            raise AcadConnectionError(
+                "pywin32 не установлен. В Windows выполните: pip install pywin32"
+            ) from exc
+        try:
+            app = win32com.client.GetActiveObject(ACAD_PROGID)
+        except Exception as exc:  # noqa: BLE001
+            if co_inited:
+                _co_uninitialize()
+            raise AcadConnectionError(
+                "Не удалось подключиться к запущенному AutoCAD.\n"
+                "1) Откройте AutoCAD (можно без чертежа, со стартового экрана);\n"
+                "2) Дождитесь полной загрузки;\n"
+                f"3) Повторите попытку. Детали: {exc}"
+            ) from exc
+        if co_inited:
+            self._com_owned = True
+            self._com_thread_id = threading.get_ident()
+        return app
+
     @contextmanager
     def drawing_session(self):
         """Keep the same COM document for a multi-plan draw and its SaveAs."""

@@ -162,7 +162,11 @@ def _await_ocr(warmup: Future) -> None:
     try:
         warmup.result()
     except Exception as exc:  # noqa: BLE001 - ошибка инициализации видна пользователю
-        raise PortalLookupError(f"Не удалось подготовить локальный OCR: {exc}") from exc
+        error = PortalLookupError(f"Не удалось подготовить локальный OCR: {exc}")
+        # До готовности OCR экран не снимаем вообще (принцип проекта):
+        # чёрный ящик в обёртке этот сбой не фотографирует.
+        error.skip_failure_shot = True  # type: ignore[attr-defined]
+        raise error from exc
 
 
 def _screen_ocr(image_path: str | Path) -> list[ScreenText]:
@@ -293,6 +297,25 @@ def _save_window_capture(handle: int, destination: str | Path) -> Path:
         raise PortalLookupError(f"Не удалось снять экран окна браузера: {exc}") from exc
 
 
+def _save_failure_shot(handle: int, folder: str | Path | None) -> str:
+    """
+    «Чёрный ящик» автоматизации портала: снимок окна в момент сбоя.
+
+    OCR-обрывки в тексте ошибки («91; 91; 3a») не дают понять, что было на
+    экране; живой PNG рядом со снимком карты задания — даёт. Возвращает
+    хвост для текста ошибки (пустой, если снимок не удался).
+    """
+    if folder is None:
+        return ""
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = Path(folder) / f"PORTAL_FAIL_{stamp}.png"
+        _save_window_capture(handle, path)
+        return f" Снимок экрана при сбое: {path}"
+    except Exception:  # noqa: BLE001 - диагностика не должна ломать остановку
+        return ""
+
+
 def _contains(rows: Sequence[ScreenText], phrase: str) -> bool:
     target = _normalise(phrase)
     return any(target in _normalise(row.text) for row in rows)
@@ -385,19 +408,27 @@ def _wait_screen(
     raise _ScreenNotFound(f"Не дождался {description} на NYC Portal после двух проверок.")
 
 
-def _address_probe(address: str) -> str:
-    """Отличимый кусок адреса для проверки, что текст попал в поле."""
-    digits = re.search(r"\d+", str(address or ""))
-    if digits:
-        return digits.group(0)
-    words = [w for w in re.split(r"\W+", str(address or "")) if len(w) >= 4]
-    return _normalise(words[0]) if words else ""
+def _address_probes(address: str) -> tuple[str, str]:
+    """
+    Пробы введённого адреса: (номер дома, первое слово улицы от 4 букв).
+
+    Одного номера мало: на странице портала с картой тот же номер светится
+    в подписях домов, и проверка «текст в поле» срабатывала вхолостую
+    (живой случай 3870, 24.11.2026: ввод мимо поля засчитался как успешный,
+    а список подсказок так и не появился). Слово улицы в поле обязательно.
+    """
+    text = str(address or "")
+    digits = re.search(r"\d+", text)
+    number = digits.group(0) if digits else ""
+    words = [w for w in re.split(r"\W+", text) if len(w) >= 4 and not w.isdigit()]
+    word = _normalise(words[0]) if words else ""
+    return number, word
 
 
 def _typed_address_visible(handle: int, address: str) -> bool:
-    """Снимок формы после ввода: отличимый кусок адреса виден в области формы."""
-    probe = _address_probe(address)
-    if not probe:
+    """Снимок формы после ввода: номер дома (и слово улицы) видны в области формы."""
+    number, word = _address_probes(address)
+    if not number and not word:
         return True
     try:
         _focus(handle)
@@ -407,10 +438,25 @@ def _typed_address_visible(handle: int, address: str) -> bool:
             rows = _screen_ocr_region(path, _FORM_REGION)
     except Exception:  # noqa: BLE001 - проверка не должна быть хуже самого ввода
         return True
-    return any(probe in _normalise(row.text) for row in rows)
+    texts = [_normalise(row.text) for row in rows]
+    if number and not any(number in text for text in texts):
+        return False
+    if word and not any(word in text for text in texts):
+        return False
+    return bool(number or word)
 
 
-def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
+def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> str:
+    """
+    Вводит адрес, перебирая стратегии, и возвращает имя сработавшей.
+
+    Одна точка клика портал не гарантирует: верстка и состояние страницы
+    меняются (живые сбои 3875/3876/3870, 24.11.2026). Поэтому стратегии
+    идут по кругу с самопроверкой после каждой: клик под подпись, клик в
+    плейсхолдер, клик под подпись ниже, печать в текущий фокус (после
+    выбора режима клавишей Tab фокус часто уже стоит в поле). Проверка —
+    ``_typed_address_visible``: номер дома и слово улицы видны в форме.
+    """
     # Поле ищем устойчиво к OCR: подпись над полем содержит «…Common Place
     # Name)», а плейсхолдер «Enter an address» стоит прямо внутри поля.
     # Дословная строка «enter an address» в одной OCR-строке не обязана
@@ -425,6 +471,8 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
         anchors.append(("label", label))
     if placeholder is not None and placeholder is not label:
         anchors.append(("placeholder", placeholder))
+    if label is not None:
+        anchors.append(("label_low", label))
     if not anchors:
         raise PortalLookupError("После переключения режима не найдено поле Address.")
     bounds = browser_save.window_bounds(handle)
@@ -433,14 +481,18 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     x0, y0, _x1, _y1 = bounds
     for kind, anchor in anchors:
         x_left, y_top, x_right, y_bottom = anchor.box
-        if kind == "label":
-            # Подпись над полем: поле ввода — сразу под ней.
-            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
-            click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
-        else:
+        if kind == "placeholder":
             # Плейсхолдер внутри поля: кликаем в само поле.
             click_x = x0 + (x_left + x_right) // 2
             click_y = y0 + (y_top + y_bottom) // 2
+        elif kind == "label_low":
+            # Поле оказалось ниже, чем ждали от подписи (высокая строка формы).
+            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+            click_y = y0 + y_bottom + max(44, (y_bottom - y_top) * 3)
+        else:
+            # Подпись над полем: поле ввода — сразу под ней.
+            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+            click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
         _focus(handle)
         if not browser_save.click_browser_window(handle, click_x, click_y):
             raise PortalLookupError("Не удалось сфокусировать поле Address.")
@@ -448,12 +500,20 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
             raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
         time.sleep(0.5)
         if _typed_address_visible(handle, address):
-            return
+            return kind
         # Клик прошёл мимо поля: Ctrl+A выделил текст страницы, ввод ушёл
-        # в никуда (живой скриншот 24.11.2026). Пробуем второй якорь.
+        # в никуда (живой скриншот 24.11.2026). Пробуем следующую стратегию.
+    # Последняя стратегия: печать без клика — фокус после Tab может уже
+    # стоять в поле, а клики по OCR-координатам упорно уходят мимо.
+    _focus(handle)
+    if browser_save.press_ctrl_a() and browser_save.type_text(address):
+        time.sleep(0.5)
+        if _typed_address_visible(handle, address):
+            return "focus"
     raise PortalLookupError(
-        "Не удалось ввести адрес: текст не появился в поле Address. "
-        "Кликните в поле адреса вручную и повторите поиск.")
+        "Не удалось ввести адрес: текст не появился в поле Address "
+        "ни по одной стратегии ввода. Кликните в поле адреса вручную "
+        "и повторите поиск.")
 
 
 #: Подсказку портала узнаём по её собственному тексту: «..., NY ... USA».
@@ -617,23 +677,6 @@ def _drive_portal(
     В быстром режиме фиксированные паузы заменяют промежуточный OCR; финальная
     проверка и чтение идентификаторов обязательны. Риск несработавшего действия выше.
     """
-    def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
-             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION,
-             on_region_fallback: Callable[[], None] | None = None) -> list[ScreenText]:
-        if fast_mode:
-            _fast_wait(handle, fast_pause_sec)
-            _await_ocr(warmup)
-            with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
-                path = Path(directory) / "screen.png"
-                _save_window_capture(handle, path)
-                rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
-            _reject_challenge(rows)
-            if not predicate(rows):
-                raise _ScreenNotFound(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
-            return rows
-        return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
-                            ready=lambda: _await_ocr(warmup), on_region_fallback=on_region_fallback)
-
     if optimal_mode and fast_mode:
         raise PortalLookupError("Выберите только один режим поиска: оптимальный или быстрый.")
     if fast_mode:
@@ -652,6 +695,45 @@ def _drive_portal(
     if progress:
         progress("заранее готовлю локальный OCR параллельно с открытием портала")
     window = _portal_window()
+    try:
+        return _drive_portal_rest(
+            address, map_path, progress, window=window, warmup=warmup,
+            fast_mode=fast_mode, fast_pause_sec=fast_pause_sec,
+            optimal_mode=optimal_mode, details_vision=details_vision,
+        )
+    except (PortalLookupError, _ScreenNotFound) as exc:
+        # «Чёрный ящик»: любой сбой портала оставляет снимок экрана в папке
+        # задания и человеческий текст вместо технического _ScreenNotFound.
+        shot = "" if getattr(exc, "skip_failure_shot", False) else (
+            _save_failure_shot(window.handle, map_path.parent))
+        raise PortalLookupError(f"{exc}{shot}") from exc
+
+
+def _drive_portal_rest(
+    address: str, map_path: Path, progress: Progress | None, *, window, warmup,
+    fast_mode: bool = False, fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
+    optimal_mode: bool = False,
+    details_vision: Callable[[Path], tuple[str, str, str]] | None = None,
+) -> PortalCapture:
+    """Вторая половина ``_drive_portal``: окно выбрано, дальше — действия на портале."""
+
+    def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
+             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION,
+             on_region_fallback: Callable[[], None] | None = None) -> list[ScreenText]:
+        if fast_mode:
+            _fast_wait(handle, fast_pause_sec)
+            _await_ocr(warmup)
+            with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
+                path = Path(directory) / "screen.png"
+                _save_window_capture(handle, path)
+                rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
+            _reject_challenge(rows)
+            if not predicate(rows):
+                raise _ScreenNotFound(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
+            return rows
+        return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
+                            ready=lambda: _await_ocr(warmup), on_region_fallback=on_region_fallback)
+
     _focus(window.handle)
     maximize = getattr(browser_save, "maximize_browser_window", None)
     if callable(maximize) and not maximize(window.handle):
@@ -697,19 +779,39 @@ def _drive_portal(
                 "Откройте NYC Portal вручную во вкладке и повторите поиск."
             )
         # Ctrl+L выделяет адресную строку новой вкладки; Ctrl+A очищает возможный остаток.
-        if (
-            not browser_save.press_ctrl_l()
-            or not browser_save.press_ctrl_a()
-            or not browser_save.type_text(PORTAL_URL)
-        ):
-            raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
-        _key(window.handle, browser_save.VK_RETURN)
-        rows = wait(
-            window.handle,
-            lambda screen: _contains(screen, "Select") or _contains(screen, "Find Another Property"),
-            delay=OPTIMAL_PORTAL_DELAY if use_optimal else RELIABLE_PORTAL_DELAY,
-            description="страницу NYC Property Information Portal",
+        # Портал грузится нестабильно (живой сбой 3868, 24.11.2026: страница не
+        # успела за две проверки, а соседнее задание через минуту открылось).
+        # Поэтому навигация — с одним полным повтором, а не с одной попыткой.
+        portal_predicate = (
+            lambda screen: _contains(screen, "Select")
+            or _contains(screen, "Find Another Property")
+            or _contains(screen, "Property Information")
         )
+        rows = None
+        for nav_attempt in range(2):
+            if (
+                not browser_save.press_ctrl_l()
+                or not browser_save.press_ctrl_a()
+                or not browser_save.type_text(PORTAL_URL)
+            ):
+                raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
+            _key(window.handle, browser_save.VK_RETURN)
+            try:
+                rows = wait(
+                    window.handle, portal_predicate,
+                    delay=OPTIMAL_PORTAL_DELAY if use_optimal else RELIABLE_PORTAL_DELAY,
+                    description="страницу NYC Property Information Portal",
+                )
+                break
+            except _ScreenNotFound:
+                if nav_attempt == 1:
+                    raise PortalLookupError(
+                        "Страница NYC Property Information Portal не загрузилась "
+                        "даже после повторной навигации. Проверьте сеть и портал "
+                        "в браузере, затем повторите поиск."
+                    )
+                if progress:
+                    progress("страница портала не загрузилась — повторяю навигацию ещё раз")
     else:
         if not fast_mode:
             time.sleep(RELIABLE_INITIAL_DELAY)
@@ -797,12 +899,29 @@ def _drive_portal(
     if fast_mode and not _contains(rows, "Enter an Address"):
         _type_focused_address(window.handle, address)
     else:
-        _type_into_address(window.handle, address, rows)
+        strategy = _type_into_address(window.handle, address, rows)
+        if progress and strategy not in {"label", "placeholder"}:
+            progress(f"адрес введён стратегией «{strategy}» (первые способы не сработали)")
     if fast_mode:
         _fast_wait(window.handle, fast_pause_sec)
     else:
-        picked = _wait_after_address_input(window.handle, address, rows,
-                                           first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+        # Подсказки могут не выпасть с первого ввода (живой сбой 3870,
+        # 24.11.2026: текст в поле есть, списка нет). Пассивно ждать ещё
+        # дольше бессмысленно — вводим адрес заново и ждём второй раз;
+        # повторный ввод — то, что делает человек в такой ситуации.
+        picked = None
+        for input_cycle in range(2):
+            try:
+                picked = _wait_after_address_input(
+                    window.handle, address, rows,
+                    first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+                break
+            except PortalLookupError:
+                if input_cycle == 1:
+                    raise
+                if progress:
+                    progress("список подсказок не появился — ввожу адрес ещё раз")
+                _type_into_address(window.handle, address, rows)
         if progress and picked is not None:
             progress(f"первая подсказка портала: «{picked.text}» — выбираю её")
     check_layout_size()

@@ -88,7 +88,10 @@ def test_manual_collection_rejects_unknown_borough(gui, tmp_path, monkeypatch):
     assert not app._step0_running and "ACRIS" in app.status_var.get()
 
 
-def test_auto_stops_on_partial_collection(gui, tmp_path, monkeypatch):
+def test_auto_continues_when_only_a_neighbour_is_missing(gui, tmp_path, monkeypatch):
+    # Живой случай 3876 (24.11.2026): у соседа свежий CRFN, которого ещё нет
+    # в NYC Open Data, — document_id не получить. Наш участок собран, поэтому
+    # задание не встаёт: недостача соседа — предупреждение, автопоток идёт дальше.
     app = gui.SurveyApp()
     app.step0_address_var.set("Address")
     app.step0_folder_var.set(str(tmp_path))
@@ -98,11 +101,39 @@ def test_auto_stops_on_partial_collection(gui, tmp_path, monkeypatch):
         kw.update(fetch_list=intake._fetch(fail_lots=[30]), downloader=intake._downloader(tmp_path))
         return actual_collect(**kw)
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
-    monkeypatch.setattr(app, "_submit_pdf_set", lambda *a, **kw: pytest.fail("partial run"))
+    submitted = []
+    def submit(items, **kw):
+        submitted.append(items)
+        app._busy = True
+    monkeypatch.setattr(app, "_submit_pdf_set", submit)
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    for _ in range(1000):
+        app._drain_events()
+        if app._step0_auto_stage == "parse":
+            break
+        time.sleep(.01)
+    assert submitted and app._step0_auto_stage == "parse"
+    assert any("не хватает" in line for _lvl, line in app._step0_lines)
+
+
+def test_auto_stops_when_our_lot_is_missing(gui, tmp_path, monkeypatch):
+    # Полная остановка в автопотоке допустима только в одном случае:
+    # не собран наш собственный участок — дальше идти просто не с чем.
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    actual_collect = gui.deed_intake.collect_deeds
+    def collect(**kw):
+        kw.update(fetch_list=intake._fetch(fail_lots=[32]), downloader=intake._downloader(tmp_path))
+        return actual_collect(**kw)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    monkeypatch.setattr(app, "_submit_pdf_set", lambda *a, **kw: pytest.fail("nothing to parse"))
     app._start_step0_auto()
     app._finish_step0_portal_lookup("ok", parcel(gui))
     wait_all(app)
-    assert app._step0_auto_stage is None and "неполный" in app.status_var.get()
+    assert app._step0_auto_stage is None and "наш участок не собран" in app.status_var.get()
 
 
 def test_changed_address_and_stop_during_portal_prevent_collection(gui, monkeypatch):

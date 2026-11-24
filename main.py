@@ -4532,9 +4532,20 @@ class SurveyApp(ctk.CTk):
         if expected != current or not deed_intake.step0_source_name(current[1]):
             self._stop_auto_transition("Автопоток остановлен: адрес, район, Block или Lot изменились во время сбора.")
             return
-        if not outcome.ok or outcome.missing:
-            self._stop_auto_transition("Автопоток остановлен: сбор неполный; проверьте раздел «Чего не хватает» и завершите ручные шаги.")
+        if not outcome.ok:
+            self._stop_auto_transition("Автопоток остановлен: наш участок не собран; проверьте раздел «Чего не хватает» и завершите ручные шаги.")
             return
+        if outcome.missing:
+            # Наш участок собран: недостача соседей задание не хоронит
+            # (живой случай 3876, 24.11.2026: свежий CRFN соседа не знает
+            # NYC Open Data — из-за этого вставало всё задание без DWG).
+            # Полной остановки в автопотоке не бывает: предупреждаем и идём
+            # дальше с тем, что собралось.
+            self._step0_log(
+                "Сбор: наш участок собран; не хватает — " + "; ".join(outcome.missing)
+                + ". Продолжаю автопоток с собранными документами.",
+                level=log_mode.LEVEL_WARN,
+            )
         folder = Path(outcome.folder)
         paths: list[Path] = []
         roles: dict[Path, bool] = {}

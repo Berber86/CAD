@@ -108,6 +108,86 @@ def test_type_into_address_retries_second_anchor_when_click_missed_field(monkeyp
     assert len(clicks) == 2 and len(typed) == 2
 
 
+def test_type_into_address_rejects_house_number_seen_only_on_map(monkeypatch):
+    """Живой сбой 3870: число дома светится на карте, ввод мимо поля засчитался."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (20, 100, 420, 120)),
+        nyc_portal.ScreenText("Enter an address", (25, 130, 300, 155)),
+    ]
+    clicks = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _t: True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    screens = iter([
+        # Только номер дома где-то на карте — слова улицы в поле нет.
+        [nyc_portal.ScreenText("52", (500, 300, 540, 330))],
+        [nyc_portal.ScreenText("52 East 81st Street", (25, 130, 300, 155))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    strategy = nyc_portal._type_into_address(1, "52 East 81st Street, New York", rows)
+    assert strategy == "placeholder" and len(clicks) == 2
+
+
+def test_type_into_address_falls_back_to_focused_typing(monkeypatch):
+    """Все клики мимо: последняя стратегия — печать в уже стоящий фокус (Tab)."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (20, 100, 420, 120)),
+        nyc_portal.ScreenText("Enter an address", (25, 130, 300, 155)),
+    ]
+    clicks = []
+    typed = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text",
+                        lambda t: typed.append(t) or True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    empty = [nyc_portal.ScreenText("Terms of Use", (20, 300, 300, 320))]
+    screens = iter([empty, empty, empty,
+                    [nyc_portal.ScreenText("59-11 Fresh Pond Road", (25, 130, 300, 155))]])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    strategy = nyc_portal._type_into_address(1, "59-11 Fresh Pond Road, Queens", rows)
+    assert strategy == "focus" and len(clicks) == 3 and len(typed) == 4
+
+
+def test_drive_portal_failure_leaves_black_box_snapshot(tmp_path, monkeypatch):
+    """Любой сбой портала: снимок экрана в папке задания + человеческий текст."""
+    window = nyc_portal.browser_save.BrowserWindow(
+        handle=42, title="Some other page - Chrome",
+        executable="chrome.exe", image_path=r"C:\Chrome\chrome.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+
+    def capture(_handle, destination):
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"png")
+        return path
+
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+
+    def rest(*_args, **_kwargs):
+        raise nyc_portal._ScreenNotFound("Не дождался страницу после двух проверок.")
+
+    monkeypatch.setattr(nyc_portal, "_drive_portal_rest", rest)
+    with pytest.raises(nyc_portal.PortalLookupError) as caught:
+        nyc_portal._drive_portal("59-11 Fresh Pond Road, Queens", tmp_path / "TAX_MAP_x.jpg")
+    shots = list(tmp_path.glob("PORTAL_FAIL_*.png"))
+    assert len(shots) == 1 and str(shots[0]) in str(caught.value)
+
+
 def test_type_into_address_still_errors_without_any_address_row(monkeypatch):
     monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
     monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
@@ -1223,16 +1303,22 @@ def test_optimal_missing_or_other_browser_cache_runs_reliable_and_learns(tmp_pat
 
 
 def test_optimised_stops_only_when_no_suggestion_list_at_all(tmp_path, monkeypatch):
-    """Проверки текста нет; стоп — только если список подсказок так и не выпал."""
+    """Проверки текста нет; стоп — только если список подсказок так и не выпал
+    даже после повторного ввода адреса (восстановление, а не пассивное ожидание)."""
     q, clicks, keys, waits, captures, scans = _optimal_setup(monkeypatch, tmp_path)
     assert nyc_portal.portal_layout_cache.save("chrome.exe", (1000, 800), (20, 160, 250, 180))
     empty = [nyc_portal.ScreenText("No suggestions", (20, 250, 200, 270))]
     q.extend([[nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
               [nyc_portal.ScreenText("Enter an Address", (20, 80, 250, 100))],
-              empty, empty, empty, empty])  # два цикла ожидания по две проверки
+              # Первое ожидание, повторный ввод, второе ожидание — списка
+              # нет ни разу (экранов с запасом: часть проверок ест полнокадровый
+              # повторный OCR того же снимка).
+              empty, empty, empty, empty, empty, empty,
+              empty, empty, empty, empty, empty, empty])
     with pytest.raises(nyc_portal.PortalLookupError, match="список подсказок"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert keys.count(nyc_portal.browser_save.VK_RETURN) == 1  # only menu, never select address
+    assert sum(1 for click in clicks if isinstance(click, tuple)) == 2  # адрес вводился дважды
     assert not (tmp_path / "map.png").exists()
 
 
@@ -1258,7 +1344,10 @@ def test_no_coordinate_learning_after_failed_suggestion(tmp_path, monkeypatch):
     q, _, _, _, _, _ = _optimal_setup(monkeypatch, tmp_path)
     wrong = [nyc_portal.ScreenText("No suggestions", (20, 250, 200, 270))]
     q.extend([[nyc_portal.ScreenText("Enter an Address", (20, 160, 250, 180))],
-              wrong, wrong, wrong, wrong])  # два цикла ожидания по две проверки
+              # Ожидание подсказок, повторный ввод и второе ожидание —
+              # списка как не было, так и нет (экранов с запасом).
+              wrong, wrong, wrong, wrong, wrong, wrong,
+              wrong, wrong, wrong, wrong, wrong, wrong])
     with pytest.raises(nyc_portal.PortalLookupError):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png")
     assert not nyc_portal.portal_layout_cache.cache_path().exists()
@@ -1312,7 +1401,8 @@ def test_fast_card_missing_borough_stops_before_map_or_vision(tmp_path, monkeypa
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("Vision до чтения Borough недопустим"))
     with pytest.raises(nyc_portal.PortalLookupError, match="Borough"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", fast_mode=True)
-    assert len(captures) == 3 and not list(tmp_path.glob("TAX_MAP_*"))
+    # +1 снимок — «чёрный ящик» сбоя (PORTAL_FAIL_*.png), карты/Vision нет.
+    assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))
 
 
 def test_optimised_updates_verified_cache_then_fast_uses_it_without_teaching(tmp_path, monkeypatch):
@@ -1394,7 +1484,7 @@ def test_fast_card_detected_challenge_never_retries_or_sends_vision(tmp_path, mo
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("CAPTCHA"))
     with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y", fast_mode=True)
-    assert len(captures) == 2
+    assert len(captures) == 3  # +1 — снимок «чёрного ящика»; Vision не вызывался
 
 
 def test_fast_retry_challenge_stops_immediately_without_more_captures(tmp_path, monkeypatch):
@@ -1404,7 +1494,8 @@ def test_fast_retry_challenge_stops_immediately_without_more_captures(tmp_path, 
               [nyc_portal.ScreenText("captcha", (20, 160, 250, 180))]])
     with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", fast_mode=True)
-    assert len(captures) == 3 and not (tmp_path / "map.png").exists()
+    # +1 снимок — пассивный «чёрный ящик» после стопа; проверок/OCR больше нет.
+    assert len(captures) == 4 and not (tmp_path / "map.png").exists()
 
 
 def test_stale_optimal_cache_does_not_cause_blind_click_if_no_field(tmp_path, monkeypatch):
@@ -1415,7 +1506,7 @@ def test_stale_optimal_cache_does_not_cause_blind_click_if_no_field(tmp_path, mo
     with pytest.raises(nyc_portal.PortalLookupError, match="поля Address"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png", optimal_mode=True)
     assert clicks == ["Select"]  # no click in an unverified address field
-    assert len(captures) == 3 and keys.count(nyc_portal.browser_save.VK_RETURN) == 1
+    assert len(captures) == 4 and keys.count(nyc_portal.browser_save.VK_RETURN) == 1
     assert nyc_portal.portal_layout_cache.load("chrome.exe", (1000, 800)) == old
 
 
@@ -1520,7 +1611,7 @@ def test_reliable_detected_challenge_on_left_never_calls_vision(tmp_path, monkey
     with pytest.raises(nyc_portal.PortalLookupError, match="CAPTCHA"):
         nyc_portal._drive_portal("87 Stafford Ave", tmp_path / "map.png",
                                  details_vision=lambda _: pytest.fail("CAPTCHA не отправлять"))
-    assert len(captures) == 4
+    assert len(captures) == 5  # +1 — снимок «чёрного ящика»; Vision не вызывался
 
 
 def test_unrecognized_local_borough_requests_vision(tmp_path, monkeypatch):
@@ -1562,7 +1653,9 @@ def test_reliable_without_confirmed_card_does_not_send_screenshot(tmp_path, monk
     monkeypatch.setattr(nyc_portal, "ask_llm_json", lambda *a, **kw: pytest.fail("страница не подтверждена"))
     with pytest.raises(nyc_portal.PortalLookupError, match="карточку объекта"):
         nyc_portal.lookup_parcel("87 Stafford Ave", tmp_path, cfg={}, provider="x", model="y")
-    assert len(captures) == 4 and not list(tmp_path.glob("TAX_MAP_*"))
+    # +1 снимок — «чёрный ящик» сбоя; снимка карты (TAX_MAP_*) при этом нет.
+    assert len(captures) == 5 and not list(tmp_path.glob("TAX_MAP_*"))
+    assert list(tmp_path.glob("PORTAL_FAIL_*.png"))
 
 
 def test_suggestion_row_on_live_screenshot_rows():
@@ -1601,4 +1694,5 @@ def test_suggestion_wait_reports_what_ocr_saw(monkeypatch):
         nyc_portal._wait_after_address_input(42, "417 WEST 33RD STREET", label)
     assert clock_calls["n"] == 2  # два цикла ожидания, потом честная остановка
     assert "417 W 33 St" in str(caught.value)
+    assert seen is not None
     assert seen is not None

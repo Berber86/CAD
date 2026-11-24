@@ -385,6 +385,31 @@ def _wait_screen(
     raise _ScreenNotFound(f"Не дождался {description} на NYC Portal после двух проверок.")
 
 
+def _address_probe(address: str) -> str:
+    """Отличимый кусок адреса для проверки, что текст попал в поле."""
+    digits = re.search(r"\d+", str(address or ""))
+    if digits:
+        return digits.group(0)
+    words = [w for w in re.split(r"\W+", str(address or "")) if len(w) >= 4]
+    return _normalise(words[0]) if words else ""
+
+
+def _typed_address_visible(handle: int, address: str) -> bool:
+    """Снимок формы после ввода: отличимый кусок адреса виден в области формы."""
+    probe = _address_probe(address)
+    if not probe:
+        return True
+    try:
+        _focus(handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_typed_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(handle, path)
+            rows = _screen_ocr_region(path, _FORM_REGION)
+    except Exception:  # noqa: BLE001 - проверка не должна быть хуже самого ввода
+        return True
+    return any(probe in _normalise(row.text) for row in rows)
+
+
 def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
     # Поле ищем устойчиво к OCR: подпись над полем содержит «…Common Place
     # Name)», а плейсхолдер «Enter an address» стоит прямо внутри поля.
@@ -393,28 +418,42 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     label = next(
         (row for row in rows if "commonplace" in _normalise(row.text)), None)
     placeholder = next(
-        (row for row in rows if "enteranaddress" in _normalise(row.text)), None)
-    anchor = label or placeholder
-    if anchor is None:
+        (row for row in rows
+         if row is not label and "enteranaddress" in _normalise(row.text)), None)
+    anchors: list[tuple[str, ScreenText]] = []
+    if label is not None:
+        anchors.append(("label", label))
+    if placeholder is not None and placeholder is not label:
+        anchors.append(("placeholder", placeholder))
+    if not anchors:
         raise PortalLookupError("После переключения режима не найдено поле Address.")
     bounds = browser_save.window_bounds(handle)
     if bounds is None:
         raise PortalLookupError("Окно портала изменилось, не могу определить поле адреса.")
     x0, y0, _x1, _y1 = bounds
-    x_left, y_top, x_right, y_bottom = anchor.box
-    if label is not None:
-        # Подпись над полем: поле ввода — сразу под ней.
-        click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
-        click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
-    else:
-        # Плейсхолдер внутри поля: кликаем в само поле.
-        click_x = x0 + (x_left + x_right) // 2
-        click_y = y0 + (y_top + y_bottom) // 2
-    _focus(handle)
-    if not browser_save.click_browser_window(handle, click_x, click_y):
-        raise PortalLookupError("Не удалось сфокусировать поле Address.")
-    if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
-        raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
+    for kind, anchor in anchors:
+        x_left, y_top, x_right, y_bottom = anchor.box
+        if kind == "label":
+            # Подпись над полем: поле ввода — сразу под ней.
+            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+            click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+        else:
+            # Плейсхолдер внутри поля: кликаем в само поле.
+            click_x = x0 + (x_left + x_right) // 2
+            click_y = y0 + (y_top + y_bottom) // 2
+        _focus(handle)
+        if not browser_save.click_browser_window(handle, click_x, click_y):
+            raise PortalLookupError("Не удалось сфокусировать поле Address.")
+        if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
+            raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
+        time.sleep(0.5)
+        if _typed_address_visible(handle, address):
+            return
+        # Клик прошёл мимо поля: Ctrl+A выделил текст страницы, ввод ушёл
+        # в никуда (живой скриншот 24.11.2026). Пробуем второй якорь.
+    raise PortalLookupError(
+        "Не удалось ввести адрес: текст не появился в поле Address. "
+        "Кликните в поле адреса вручную и повторите поиск.")
 
 
 #: Подсказку портала узнаём по её собственному тексту: «..., NY ... USA».

@@ -120,35 +120,31 @@ def test_changed_address_and_stop_during_portal_prevent_collection(gui, monkeypa
     assert app._step0_auto_stage is None and app.step0_block_var.get() == ""
 
 
-def test_auto_low_confidence_and_fast_mode_do_not_collect(gui, monkeypatch):
-    app = gui.SurveyApp()
-    app.step0_address_var.set("Address")
-    fake_portal(app, monkeypatch)
-    monkeypatch.setattr(app, "_start_step0_intake", lambda: pytest.fail("uncertain map"))
-    app.step0_fast_mode_var.set(True)
-    app._start_step0_auto()
-    assert app._step0_auto_stage is None and "быстрый" in app.status_var.get().lower()
-    app.step0_fast_mode_var.set(False)
-    app._start_step0_auto()
-    no_neighbours = gui.nyc_portal.ParcelLookup(
-        block="6323", lot="32", borough="Staten Island", left_neighbour=None,
-        right_neighbour=None, confidence="low", notes="", map_image=Path("map.png"),
-        usage=None,
-    )
-    app._finish_step0_portal_lookup("ok", no_neighbours)
-    assert app._step0_auto_stage is None and "уверенность" in app.status_var.get().lower()
-
-
-def test_auto_low_confidence_with_known_neighbours_continues(gui, monkeypatch):
-    """Как 3868 Fresh Pond Road: стороны могли перепутаться, но оба соседа названы."""
+def test_auto_fast_mode_does_not_collect_but_low_confidence_never_stops(gui, monkeypatch):
     app = gui.SurveyApp()
     app.step0_address_var.set("Address")
     fake_portal(app, monkeypatch)
     started = []
     monkeypatch.setattr(app, "_start_step0_intake", lambda: started.append(True))
+    app.step0_fast_mode_var.set(True)
+    app._start_step0_auto()
+    assert app._step0_auto_stage is None and "быстрый" in app.status_var.get().lower()
+    app.step0_fast_mode_var.set(False)
+
+    # Полной остановки из-за соседей в автопотоке нет: даже когда не назван никто.
+    no_neighbours = gui.nyc_portal.ParcelLookup(
+        block="6323", lot="32", borough="Staten Island", left_neighbour=None,
+        right_neighbour=None, confidence="low", notes="", map_image=Path("map.png"),
+        usage=None,
+    )
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", no_neighbours)
+    assert started == [True]
+
+    # Как 3868 Fresh Pond Road: стороны могли перепутаться, но оба соседа названы.
     app._start_step0_auto()
     app._finish_step0_portal_lookup("ok", parcel(gui, confidence="low"))
-    assert started == [True]
+    assert started == [True, True]
     assert app.step0_neighbours_var.get() == "30"
 
 

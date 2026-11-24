@@ -49,6 +49,13 @@ def test_parse_neighbour_result_reads_front_street_angle(raw, expected):
     assert angle == expected
 
 
+def _stub_typed_visible(monkeypatch, visible_rows):
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region",
+                        lambda _p, _r: visible_rows)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+
+
 @pytest.mark.parametrize("rows", [
     # Подпись целиком одной строкой (как на живом портале).
     [nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
@@ -68,8 +75,37 @@ def test_type_into_address_finds_field_by_label_or_placeholder(rows, monkeypatch
                         lambda _h, x, y: clicks.append((x, y)) or True)
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _t: True)
+    _stub_typed_visible(monkeypatch, [
+        nyc_portal.ScreenText("1769 Stillwell Avenue, Brooklyn, NY", (25, 130, 300, 155))])
     nyc_portal._type_into_address(1, "1769 Stillwell Avenue, Brooklyn", rows)
     assert len(clicks) == 1
+
+
+def test_type_into_address_retries_second_anchor_when_click_missed_field(monkeypatch):
+    """Живой сбой: клик мимо поля — Ctrl+A выделил страницу, адрес ушёл в никуда."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (20, 100, 420, 120)),
+        nyc_portal.ScreenText("Enter an address", (25, 130, 300, 155)),
+    ]
+    clicks = []
+    typed = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text",
+                        lambda t: typed.append(t) or True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    screens = iter([
+        [nyc_portal.ScreenText("Terms of Use", (20, 300, 300, 320))],  # мимо поля
+        [nyc_portal.ScreenText("1769 Stillwell Avenue, Brooklyn, NY", (25, 130, 300, 155))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    nyc_portal._type_into_address(1, "1769 Stillwell Avenue, Brooklyn", rows)
+    assert len(clicks) == 2 and len(typed) == 2
 
 
 def test_type_into_address_still_errors_without_any_address_row(monkeypatch):

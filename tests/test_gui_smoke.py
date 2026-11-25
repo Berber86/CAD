@@ -6207,6 +6207,15 @@ def test_data_add_folder_native_multiselect_adds_all(gui, tmp_path, monkeypatch)
     assert app._data_dialog_initial_dir == str(tmp_path)
 
 
+def test_long_captcha_checkbox_switches_pdf_wait(gui):
+    # «Ждать долгую капчу» на странице «Данные»: снята — 45 с, поставлена — 300 с.
+    app = gui.SurveyApp()
+    assert app.data_long_captcha_var.get() is False
+    assert app._pdf_wait_sec() == gui.deed_intake.PDF_WAIT_SEC == 45.0
+    app.data_long_captcha_var.set(True)
+    assert app._pdf_wait_sec() == gui.deed_intake.PDF_WAIT_LONG_SEC == 300.0
+
+
 def test_data_add_folder_falls_back_to_single_dialog(gui, tmp_path, monkeypatch):
     # Сбой нативного диалога — откат на прежний askdirectory в одну папку.
     app = gui.SurveyApp()

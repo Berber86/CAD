@@ -207,3 +207,19 @@ def test_make_acris_downloader_passes_warmup_url(tmp_path):
     row = rcclerk.DeedRow(endorsement_id=DOC_ID, doc_type="DEED")
     download(row, tmp_path / "x.pdf")
     assert seen["warmup_url"] == warm
+
+
+def test_make_acris_downloader_passes_long_captcha_wait(tmp_path):
+    seen = {}
+
+    def viewer(url, destination, **kwargs):
+        seen.update(kwargs)
+        return Path(destination), "browser"
+
+    download = deed_intake.make_acris_downloader(
+        downloads_dir=tmp_path / "dl", viewer_download=viewer,
+        download_wait_sec=deed_intake.PDF_WAIT_LONG_SEC,
+    )
+    row = rcclerk.DeedRow(endorsement_id=DOC_ID, doc_type="DEED")
+    download(row, tmp_path / "x.pdf")
+    assert seen["download_wait_sec"] == 300.0

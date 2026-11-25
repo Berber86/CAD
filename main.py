@@ -3324,6 +3324,23 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"), command=self._stop_job_queue,
         )
         self.data_stop_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 10))
+        # «Ждать долгую капчу»: обычное ожидание PDF в «Загрузках» — 45 с
+        # (исход браузерной ступени ясен раньше); с галочкой — прежние 300 с
+        # для обоих источников (Клерк и ACRIS), если проверка Cloudflare на
+        # сайте висит минутами. Действует и на очередь, и на автопоток Шага 0.
+        self.data_long_captcha_var = ctk.BooleanVar(value=False)
+        self.data_long_captcha_check = ctk.CTkCheckBox(
+            panel,
+            text="Ждать долгую капчу (ожидание PDF 300 с вместо 45 с)",
+            variable=self.data_long_captcha_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.data_long_captcha_check.grid(row=10, column=0, sticky="w", padx=16, pady=(0, 12))
 
         right = ctk.CTkFrame(
             page, fg_color=THEME["bg_card"], corner_radius=10,
@@ -3428,6 +3445,15 @@ class SurveyApp(ctk.CTk):
             if parent.is_dir():
                 self._data_dialog_initial_dir = str(parent)
             self._data_add_folders(chosen)
+
+    def _pdf_wait_sec(self) -> float:
+        """Ожидание PDF в «Загрузках»: 45 с; галочка «Ждать долгую капчу» — 300 с."""
+        var = getattr(self, "data_long_captcha_var", None)
+        try:
+            long_wait = bool(var.get()) if var is not None else False
+        except Exception:  # noqa: BLE001 - галочка не должна ломать сбор
+            long_wait = False
+        return deed_intake.PDF_WAIT_LONG_SEC if long_wait else deed_intake.PDF_WAIT_SEC
 
     def _data_remove_task(self, index: int) -> None:
         if self._job_runner_active:
@@ -4454,7 +4480,7 @@ class SurveyApp(ctk.CTk):
             self._step0_worker,
             args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
                   bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-                  self._step0_auto_stage == "intake", stream_plan),
+                  self._step0_auto_stage == "intake", stream_plan, self._pdf_wait_sec()),
         )
 
     def _step0_worker(
@@ -4471,6 +4497,7 @@ class SurveyApp(ctk.CTk):
         identities: dict[str, dict] | None = None,
         skip_page_search: bool = False,
         stream_plan: tuple[Any, ...] | None = None,
+        pdf_wait_sec: float = deed_intake.PDF_WAIT_SEC,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         def progress(line: str) -> None:
@@ -4498,6 +4525,9 @@ class SurveyApp(ctk.CTk):
             progress("старый поиск страниц пропущен: полный PDF пойдёт в поиск всех описаний")
         else:
             progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
+        if pdf_wait_sec > deed_intake.PDF_WAIT_SEC:
+            progress(f"ожидание PDF в «Загрузках» — долгое ({int(pdf_wait_sec)} с): "
+                     "галочка «Ждать долгую капчу» на странице «Данные»")
 
         # Конвейер автопотока: отдельный поток разбирает PDF по мере их
         # скачивания, пока этот поток качает следующие. OUR OLD не разбираем.
@@ -4596,6 +4626,7 @@ class SurveyApp(ctk.CTk):
                 search_pages=not skip_page_search,
                 downloads_dir=downloads,
                 on_record=on_record,
+                pdf_wait_sec=pdf_wait_sec,
             )
         except deed_intake.IntakeCancelled:
             stream_stop.set()

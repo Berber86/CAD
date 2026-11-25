@@ -46,6 +46,12 @@ import rcclerk
 #: Папка описаний внутри папки проекта (как в схеме шага).
 DESCR_DIR_NAME = "01_описания"
 
+#: Сколько ждать появления PDF в «Загрузках» (Клерк и читалка ACRIS одинаково).
+#: 45 с хватает на проверку Cloudflare и сохранение; «долгая капча» на странице
+#: «Данные» возвращает прежние 300 с для обоих источников.
+PDF_WAIT_SEC = 45.0
+PDF_WAIT_LONG_SEC = 300.0
+
 Progress = Callable[[str], None]
 StopCheck = Callable[[], bool]
 
@@ -152,6 +158,7 @@ def make_downloader(
     base_url: str = rcclerk.BASE_URL,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
+    watch_timeout: float | None = None,
 ):
     """
     Загрузчик по лестнице; при поддержке Windows безопасно нажимает Ctrl+S в
@@ -168,6 +175,8 @@ def make_downloader(
             options["should_stop"] = should_stop  # «Стоп» прерывает ожидание сразу
         if auto_save is not None:
             options["auto_save"] = auto_save
+        if watch_timeout is not None:
+            options["watch_timeout"] = float(watch_timeout)  # «долгая капча»: 300 вместо 45
         return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
 
     return download
@@ -181,6 +190,7 @@ def make_acris_downloader(
     viewer_download=None,
     warmup_url: str | None = None,
     crfn_opener=None,
+    download_wait_sec: float | None = None,
 ):
     """
     Загрузчик ACRIS: читалка в настоящем браузере (дискета Save → OK),
@@ -205,6 +215,8 @@ def make_acris_downloader(
         }
         if warmup_url:
             options["warmup_url"] = warmup_url
+        if download_wait_sec is not None:
+            options["download_wait_sec"] = float(download_wait_sec)  # «долгая капча»: 300 вместо 45
         endorsement = str(row.endorsement_id or "").strip()
         if endorsement.isdigit() and len(endorsement) == 16:
             return download_it(
@@ -282,6 +294,7 @@ def collect_deeds(
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
+    pdf_wait_sec: float | None = None,
 ) -> IntakeOutcome:
     """
     Собирает описания нашего участка и соседей в ``folder`` (по умолчанию
@@ -317,7 +330,7 @@ def collect_deeds(
             fetch_list=fetch_list, downloader=downloader, auto_save=auto_save,
             ocr_dpi=ocr_dpi, downloads_dir=downloads_dir, page_finder=page_finder,
             search_pages=search_pages, progress=progress, should_stop=should_stop,
-            on_record=on_record,
+            on_record=on_record, pdf_wait_sec=pdf_wait_sec,
         )
     code = acris_borough_code(borough)
     if code is None:
@@ -333,7 +346,7 @@ def collect_deeds(
         acris_id_fetcher=acris_id_fetcher, downloads_dir=downloads_dir,
         ocr_dpi=ocr_dpi, page_finder=page_finder,
         search_pages=search_pages, progress=progress, should_stop=should_stop,
-        on_record=on_record,
+        on_record=on_record, pdf_wait_sec=pdf_wait_sec,
     )
 
 
@@ -357,6 +370,7 @@ def _collect_deeds_richmond(
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
+    pdf_wait_sec: float | None = None,
 ) -> IntakeOutcome:
     """Проход по Richmond County Clerk (Staten Island) — первый настроенный вариант."""
     neighbour_lots = parse_lot_list(neighbours)
@@ -366,7 +380,7 @@ def _collect_deeds_richmond(
     fetch = fetch_list or _default_fetch_list
     download = downloader or make_downloader(
         auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url,
-        progress=progress, should_stop=should_stop,
+        progress=progress, should_stop=should_stop, watch_timeout=pdf_wait_sec,
     )
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)
@@ -516,6 +530,7 @@ def _collect_deeds_acris(
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
+    pdf_wait_sec: float | None = None,
 ) -> IntakeOutcome:
     """
     Проход по ACRIS (Manhattan, Bronx, Brooklyn, Queens).
@@ -610,7 +625,7 @@ def _collect_deeds_acris(
         lot_download = acris_downloader or make_acris_downloader(
             downloads_dir=downloads_dir, progress=progress, should_stop=should_stop,
             warmup_url=acris.search_form_url(code, block_no, lot_value),
-            crfn_opener=crfn_opener,
+            crfn_opener=crfn_opener, download_wait_sec=pdf_wait_sec,
         )
         for clerk_row, tag in chosen:
             check_stop()

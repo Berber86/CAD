@@ -192,6 +192,53 @@ def test_manual_step_when_dialog_never_appears(tmp_path):
     assert "дискету" in str(caught.value)
 
 
+def test_pdf_wait_default_is_45_seconds():
+    # Как у Клерка Ричмонда: исход ясен раньше прежних 300 с (5.26/5.27).
+    import inspect
+
+    default = inspect.signature(
+        acris_viewer.download_pdf_via_viewer).parameters["download_wait_sec"].default
+    assert default == 45.0
+
+
+def test_pdf_timeout_takes_emergency_shot_into_destination_folder(tmp_path):
+    # Диалог Save был, OK нажат, а PDF так и не упал в «Загрузки»: в папку
+    # назначения падает аварийный снимок ACRIS_FAIL, путь — в тексте шага.
+    clock = _Clock()
+    state = {"dialog": False}
+    shots = []
+
+    def capture(_handle):
+        return DIALOG_ROWS if state["dialog"] else READY_ROWS
+
+    def click(_handle, _x, _y):
+        state["dialog"] = True
+        return True
+
+    def shot(handle, folder):
+        shots.append((handle, folder))
+        return f" Снимок экрана при сбое: {folder}/ACRIS_FAIL_20261125_084142.png"
+
+    target = tmp_path / "out" / "OUR LOT 53 NEW.pdf"
+    with pytest.raises(rcclerk.ManualStepNeeded) as caught:
+        acris_viewer.download_pdf_via_viewer(
+            "https://example.invalid/doc", target,
+            downloads_dir=tmp_path,
+            open_browser=lambda _url: None,
+            windows_fn=lambda: [_window()],
+            active_fn=lambda: 7,
+            bounds_fn=lambda _h: (0, 0, 1600, 900),
+            capture_rows_fn=capture,
+            click_fn=click,
+            focus_fn=lambda _h: True,
+            sleep=clock.sleep, monotonic=clock.monotonic,
+            viewer_wait_sec=5, dialog_wait_sec=5, download_wait_sec=2, poll_sec=0.1,
+            shot_fn=shot,
+        )
+    assert shots == [(7, target.parent)]
+    assert "не появился" in str(caught.value) and "ACRIS_FAIL" in str(caught.value)
+
+
 def test_manual_step_when_viewer_never_opens(tmp_path):
     clock = _Clock()
     with pytest.raises(rcclerk.ManualStepNeeded):

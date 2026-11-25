@@ -286,6 +286,20 @@ _MANUAL_HINT = (
 )
 
 
+def _default_timeout_shot(handle: int, folder: Path) -> str:
+    """Аварийный снимок окна читалки при тайм-ауте PDF — «чёрный ящик».
+
+    Как ``CLERK_FAIL_*`` у Клерка: без снимка не видно, что было на экране
+    вместо скачивания. Любой сбой снимка — пустой хвост.
+    """
+    try:
+        from nyc_portal import _save_failure_shot
+
+        return _save_failure_shot(handle, folder, prefix="ACRIS_FAIL")
+    except Exception:  # noqa: BLE001 - диагностика не ломает остановку
+        return ""
+
+
 def download_pdf_via_viewer(
     url: str,
     destination: str | Path,
@@ -303,7 +317,7 @@ def download_pdf_via_viewer(
     find_pdf_fn: Callable[..., Optional[Path]] = rcclerk.find_new_pdf,
     viewer_wait_sec: float = 90.0,
     dialog_wait_sec: float = 20.0,
-    download_wait_sec: float = 300.0,
+    download_wait_sec: float = 45.0,
     fast_ok_delay_sec: float = FAST_OK_DELAY_SEC,
     fast_ok_grace_sec: float = FAST_OK_GRACE_SEC,
     poll_sec: float = 1.0,
@@ -311,9 +325,14 @@ def download_pdf_via_viewer(
     monotonic: Callable[[], float] = time.monotonic,
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
+    shot_fn: Optional[Callable[[int, Path], str]] = None,
 ) -> tuple[Path, str]:
     """
     Скачивает PDF одного документа читалкой: дискета → OK → «Загрузки».
+
+    Появление PDF ждём ``download_wait_sec`` (по умолчанию 45 с; «долгая
+    капча» на странице «Данные» ставит 300). При тайм-ауте в папку назначения
+    падает аварийный снимок окна читалки ``ACRIS_FAIL_*.png`` для диагностики.
 
     ``already_open=True``: читалка уже открыта в браузере (например, кликом
     IMG из результатов поиска — резерв для свежих документов, которых ещё
@@ -566,7 +585,15 @@ def download_pdf_via_viewer(
         # проверка, а снимок+OCR здесь не нужны.
         sleep(max(0.05, min(float(poll_sec), 0.25)))
     if found is None:
-        raise manual(f"PDF не появился в «{folder}» за {int(download_wait_sec)} с.")
+        # Аварийный снимок окна читалки в папку задания — почему PDF нет,
+        # из одного текста не понять (см. CLERK_FAIL у Клерка).
+        shot = ""
+        if window is not None:
+            try:
+                shot = (shot_fn or _default_timeout_shot)(window.handle, target.parent)
+            except Exception:  # noqa: BLE001 - диагностика не ломает остановку
+                shot = ""
+        raise manual(f"PDF не появился в «{folder}» за {int(download_wait_sec)} с.{shot}")
     shutil.copyfile(found, target)
     say(f"файл взят из загрузок: {Path(found).name}")
     return target, "browser"

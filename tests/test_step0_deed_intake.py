@@ -332,6 +332,22 @@ def test_third_rung_is_the_manual_step_with_a_ready_link(tmp_path):
     assert manual.value.folder == downloads
 
 
+def test_make_downloader_passes_long_captcha_wait(tmp_path, monkeypatch):
+    import deed_intake
+
+    seen = {}
+
+    def fake_fallback(endorsement_id, destination, **kwargs):
+        seen.update(kwargs)
+        return Path(destination), "direct"
+
+    monkeypatch.setattr(rcclerk, "download_with_fallback", fake_fallback)
+    download = deed_intake.make_downloader(watch_timeout=deed_intake.PDF_WAIT_LONG_SEC)
+    row = rcclerk.DeedRow(endorsement_id="1905502")
+    assert download(row, tmp_path / "x.pdf")[1] == "direct"
+    assert seen["watch_timeout"] == 300.0
+
+
 def test_default_watch_timeout_is_45_seconds():
     # Живой случай 3879 (25.11.2026): задание пять минут висело на одном
     # документе Клерка. Исход браузерной ступени ясен гораздо раньше.

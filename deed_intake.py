@@ -159,10 +159,15 @@ def make_downloader(
     progress: Progress | None = None,
     should_stop: StopCheck | None = None,
     watch_timeout: float | None = None,
+    fail_dir: str | Path | None = None,
 ):
     """
     Загрузчик по лестнице; при поддержке Windows безопасно нажимает Ctrl+S в
     браузере только после того, как просмотрщик PDF уже загружен.
+
+    ``fail_dir`` — папка задания: аварийные снимки CLERK_FAIL и снимки
+    «доктора» браузера должны лежать рядом с заданием, а не во временных
+    файлах, иначе по живому прогону нечего разбирать.
     """
 
     def download(row: rcclerk.DeedRow, destination: Path) -> tuple[Path, str]:
@@ -177,6 +182,13 @@ def make_downloader(
             options["auto_save"] = auto_save
         if watch_timeout is not None:
             options["watch_timeout"] = float(watch_timeout)  # «долгая капча»: 300 вместо 45
+        shot_dir = Path(fail_dir) if fail_dir is not None else Path(destination).parent
+        options["fail_dir"] = shot_dir
+
+        def doctor(endorsement_id: int | str) -> None:
+            rcclerk.browser_doctor(endorsement_id, folder=shot_dir, emit=progress)
+
+        options["prompt_operator"] = doctor
         return rcclerk.download_with_fallback(row.endorsement_id, destination, **options)
 
     return download
@@ -387,6 +399,7 @@ def _collect_deeds_richmond(
     download = downloader or make_downloader(
         auto_save=auto_save, downloads_dir=downloads_dir, base_url=base_url,
         progress=progress, should_stop=should_stop, watch_timeout=pdf_wait_sec,
+        fail_dir=target_dir,
     )
     find_pages = page_finder or (
         lambda pdf: _default_page_finder(pdf, dpi=ocr_dpi, progress=progress)

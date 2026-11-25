@@ -4677,7 +4677,7 @@ class SurveyApp(ctk.CTk):
                 ready_delay=fast_pause if fast_mode else 4.0,
                 stable_for=0.0 if fast_mode else 1.0,
                 on_attempt=lambda title: progress(
-                    f"PDF уже загружен в окне браузера «{title}» — нажимаю Ctrl+S один раз"
+                    f"окно документа в браузере «{title}» стабильно — нажимаю Ctrl+S один раз"
                 ),
             )
             mode_note = f" (быстрая работа: пауза {fast_pause:g} с)" if fast_mode else ""

@@ -879,3 +879,76 @@ def test_collect_skips_a_document_the_clerk_could_not_serve(tmp_path):
     )
     assert result is None
     assert any("ошибка на стороне сайта" in item for item in missing)
+
+
+def test_second_wave_after_doctor_picks_up_late_pdf(tmp_path):
+    """Первая волна пуста: «доктор» позван, вторая волна дожидается файла."""
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    doctor_calls = []
+
+    def doctor(endorsement_id):
+        doctor_calls.append(endorsement_id)
+        (downloads / "late.pdf").write_bytes(b"%PDF-1.7 late")
+
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf",
+        opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+        open_browser=lambda url: None,
+        downloads_dir=downloads, watch_timeout=0.2, poll=0.05,
+        prompt_operator=doctor,
+    )
+    assert rung == "browser" and path.read_bytes().startswith(b"%PDF-")
+    assert doctor_calls == [NEWEST_ID]
+
+
+def test_manual_step_reports_hook_state(tmp_path):
+    """Журнал автоматики браузера попадает в текст ручного шага, а не в никуда."""
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+
+    def hook(endorsement_id):
+        return None
+
+    hook.state = lambda endorsement_id: "закреплённое окно ещё не PDF: [msedge.exe] заголовок 'VSCMS'"
+    with pytest.raises(rcclerk.ManualStepNeeded) as manual:
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda url: None,
+            downloads_dir=downloads, watch_timeout=0.2, poll=0.05,
+            auto_save=hook,
+        )
+    assert "Автоматика браузера докладывает" in str(manual.value)
+    assert "VSCMS" in str(manual.value)
+
+
+def test_make_downloader_sends_shots_and_doctor_to_job_folder(tmp_path, monkeypatch):
+    import deed_intake
+
+    seen = {}
+
+    def fake_fallback(endorsement_id, destination, **kwargs):
+        seen.update(kwargs)
+        return Path(destination), "direct"
+
+    monkeypatch.setattr(rcclerk, "download_with_fallback", fake_fallback)
+    download = deed_intake.make_downloader(fail_dir=tmp_path / "job", progress=lambda _m: None)
+    row = rcclerk.DeedRow(endorsement_id="1905502")
+    assert download(row, tmp_path / "x.pdf")[1] == "direct"
+    assert seen["fail_dir"] == tmp_path / "job"
+    assert callable(seen["prompt_operator"])
+
+
+def test_browser_doctor_reports_window_titles():
+    """Доктор вслух перечисляет окна браузера и вердикт по заголовку."""
+    import browser_save as bs
+
+    lines: list[str] = []
+    windows = [
+        bs.BrowserWindow(1, "Just a moment...", "msedge.exe", r"C:\Edge\msedge.exe"),
+        bs.BrowserWindow(2, "Deed.pdf", "chrome.exe", r"C:\Chrome\chrome.exe"),
+    ]
+    rcclerk.browser_doctor("42", emit=lines.append, windows_fn=lambda: windows)
+    joined = "\n".join(lines)
+    assert "Cloudflare" in joined and "PDF" in joined

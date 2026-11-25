@@ -314,7 +314,7 @@ def test_portal_driver_uses_current_window_and_clicks_address_suggestion(tmp_pat
         nyc_portal, "_key", lambda _handle, vk: keys.append(vk),
     )
     monkeypatch.setattr(
-        nyc_portal, "_type_into_address", lambda _handle, address, _rows: clicks.append((42, address)),
+        nyc_portal, "_type_into_address", lambda _handle, address, _rows, *_rest: clicks.append((42, address)),
     )
     ocr_calls = iter([
         # The first entry is consumed by the quick top-left-quarter portal check
@@ -863,7 +863,7 @@ def test_fast_driver_skips_intermediate_ocr_and_uses_pauses(start, tmp_path, mon
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(nyc_portal, "_click_text", lambda _, rows, text: clicks.append(text) or rows[0])
     monkeypatch.setattr(nyc_portal, "_key", lambda _, key: keys.append(key))
-    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda _, address, rows: typed.append(("click", address)))
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda _, address, rows, *_rest: typed.append(("click", address)))
     monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
     monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda address: typed.append(("focused", address)) or True)
     monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _, path: _write_portal_screen(Path(path)))
@@ -1244,7 +1244,7 @@ def _optimal_setup(monkeypatch, tmp_path):
     clicks, keys, waits, captures, scans = [], [], [], [], []
     monkeypatch.setattr(nyc_portal, "_click_text", lambda _, rows, text: clicks.append(text) or rows[0])
     monkeypatch.setattr(nyc_portal, "_click_row", lambda _, row: clicks.append(row.text) or row)
-    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda _, address, rows: clicks.append((address, rows[0].box)))
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda _, address, rows, *_rest: clicks.append((address, rows[0].box)))
     monkeypatch.setattr(nyc_portal, "_key", lambda _, vk: keys.append(vk))
     monkeypatch.setattr(nyc_portal.time, "sleep", lambda n: waits.append(n))
     def capture(_, path):
@@ -2040,3 +2040,25 @@ def test_neighbour_request_gives_up_only_after_all_attempts(tmp_path, monkeypatc
             "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
             model="some-model", api_key="other-key")
     assert len(calls) == nyc_portal.NEIGHBOUR_ATTEMPTS
+
+
+def test_type_into_address_survives_failed_click_without_ctrl_a(monkeypatch):
+    """Клик не состоялся (курсор не встал): Ctrl+A не жмём, пробуем следующий якорь."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (20, 100, 420, 120)),
+        nyc_portal.ScreenText("Enter an address", (25, 130, 300, 155)),
+    ]
+    clicks = []
+    typed = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or len(clicks) > 1)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text",
+                        lambda t: typed.append(t) or True)
+    _stub_typed_visible(monkeypatch, [
+        nyc_portal.ScreenText("1769 Stillwell Avenue, Brooklyn, NY", (25, 130, 300, 155))])
+    strategy = nyc_portal._type_into_address(1, "1769 Stillwell Avenue, Brooklyn", rows)
+    assert strategy == "placeholder" and len(clicks) == 2 and len(typed) == 1

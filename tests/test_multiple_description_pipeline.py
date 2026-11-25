@@ -47,6 +47,32 @@ def test_search_parse_and_cache_reuse_with_changed_portal(tmp_path):
         assert 'data:image' not in text and 'key' not in text
 
 
+def test_failed_fresh_parse_reuses_earlier_complete_parse(tmp_path):
+    # LOT 21 из живого прогона 25.11.2026: PDF уже разобран целиком, а
+    # финальный проход другой моделью трижды лёг по тайм-ауту. Описание не
+    # должно выпадать из чертежа — берётся сохранённый полный разбор.
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    first = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                               image_limit=10, portal_lot='8',
+                               send=lambda images, context: answer([item('5')]), search_send=searcher)
+    assert first.status == 'parsed' and not first.cached
+    def timed_out(images, context):
+        raise TimeoutError('provider down')
+    messages = []
+    second = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='other-model',
+                                image_limit=10, portal_lot='8', send=timed_out,
+                                search_send=searcher, progress=messages.append)
+    assert second.status == 'parsed' and second.cached
+    assert [i.data.lot_number for i in second.parse.items] == ['5']
+    assert any('ранее сохранённое' in m for m in messages)
+    # Явный повторный разбор сохранённым результатом не подменяется.
+    third = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='other-model',
+                               image_limit=10, portal_lot='8', send=timed_out,
+                               search_send=searcher, force_parse=True)
+    assert third.status == 'parse_failed' and not third.cached
+
+
 def test_missing_rerender_is_incomplete_and_does_not_hide_other_candidates(tmp_path):
     pdf = tmp_path / 'OUR 6 NEW.pdf'
     make_pdf(pdf, 2)
@@ -76,6 +102,66 @@ def test_limit_does_not_render_excess_pages_but_marks_them_unparsed(tmp_path):
                                 image_limit=1, portal_lot=None, search_send=searcher, render=render,
                                 send=lambda *a: answer([item()]))
     assert rendered == [1] and result.parse.unparsed_pages == (2,) and not result.parse.complete
+
+
+def test_candidate_pages_pdf_written_next_to_source(tmp_path):
+    pdf = tmp_path / 'LOT 30 NEW.pdf'
+    make_pdf(pdf, 4)
+    messages = []
+    def finder(base, key, model, state, assets, qs):
+        return response(qs, {2: .9, 4: .8}, 'two')
+    result = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                                image_limit=10, portal_lot=None, search_send=finder,
+                                send=lambda imgs, ctx: answer([item('30')]),
+                                progress=messages.append)
+    assert result.status == 'parsed'
+    extracted = tmp_path / 'LOT 30 NEW_p2,4.pdf'
+    assert extracted.is_file()
+    with pymupdf.open(extracted) as doc:
+        assert [page.get_text().strip() for page in doc] == ['Page 2', 'Page 4']
+    assert any('LOT 30 NEW_p2,4.pdf' in message for message in messages)
+
+
+def test_candidate_pages_pdf_uses_final_verdict_across_batches(tmp_path):
+    # Страницы проверяются партиями по 8: релевантные есть и в первой, и во
+    # второй партии. Копия делается по финальному списку после всех партий.
+    pdf = tmp_path / 'LOT 30 NEW.pdf'
+    make_pdf(pdf, 10)
+    def finder(base, key, model, state, assets, qs):
+        return response(qs, {3: .9, 9: .85}, 'two')
+    result = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                                image_limit=10, portal_lot=None, search_send=finder,
+                                send=lambda imgs, ctx: answer([item('30')]))
+    assert result.status == 'parsed'
+    extracted = tmp_path / 'LOT 30 NEW_p3,9.pdf'
+    assert extracted.is_file()
+    with pymupdf.open(extracted) as doc:
+        assert [page.get_text().strip() for page in doc] == ['Page 3', 'Page 9']
+
+
+def test_no_candidate_pages_pdf_when_nothing_relevant(tmp_path):
+    pdf = tmp_path / 'test.pdf'
+    make_pdf(pdf, 2)
+    def no_candidates(base, key, model, state, assets, qs):
+        return response(qs, {}, 'zero')
+    result = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                                image_limit=10, portal_lot=None, search_send=no_candidates,
+                                send=lambda *a: pytest.fail('must not parse'))
+    assert result.status == 'no_candidates'
+    assert not list(tmp_path.glob('*_p*.pdf'))
+
+
+def test_candidate_pages_pdf_failure_does_not_break_parse(tmp_path, monkeypatch):
+    pdf = tmp_path / 'LOT 30 NEW.pdf'
+    make_pdf(pdf, 2)
+    monkeypatch.setattr(pipeline, 'write_candidate_pages_pdf', lambda *a, **k: None)
+    messages = []
+    result = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                                image_limit=10, portal_lot=None, search_send=searcher,
+                                send=lambda imgs, ctx: answer([item('30')]),
+                                progress=messages.append)
+    assert result.status == 'parsed'
+    assert any('не удалось' in message for message in messages)
 
 
 def test_no_pages_is_not_sent_to_parsing_model(tmp_path):

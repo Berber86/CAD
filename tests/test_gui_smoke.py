@@ -817,7 +817,7 @@ def test_gui_builds_and_reports(gui):
     assert app.provider_ids == ["hydra", "openrouter", "routerai"]
     assert app.provider_labels == ["Hydra AI", "OpenRouter", "RouterAI"]
     assert app.current_provider_id() == "hydra"
-    assert app.current_model() == "glm-5.2"
+    assert app.current_model() == "grok-4.7"
     assert "активен" in app.provider_key_labels["hydra"].cget("text")
 
     # Меняем модель в Hydra, переключаемся в OpenRouter и RouterAI, затем назад
@@ -830,7 +830,9 @@ def test_gui_builds_and_reports(gui):
 
     app.select_provider("routerai")
     assert app.current_provider_id() == "routerai"
-    assert "openai/gpt-4.1" in app.model_combo.cget("values")
+    assert "x-ai/grok-4.7" in app.model_combo.cget("values")
+    assert "x-ai/grok-4.6" in app.model_combo.cget("values")
+    assert "openai/gpt-4.1" not in app.model_combo.cget("values")
 
     app.select_provider("Hydra AI")
     assert app.current_model() == "hydra-gemini-pro"
@@ -1059,7 +1061,7 @@ def test_gui_neighbor_mode_and_batch_neighbor_files(gui, tmp_path, monkeypatch):
 
     app = gui.SurveyApp()
     assert not app.is_neighbor_mode()
-    assert "Начертить схему в AutoCAD" in app.draw_button.cget("text")
+    assert app.draw_button.cget("text") == "▶ В AutoCAD"
     app.neighbor_lot_radio.select()
     assert app.is_neighbor_mode()
     app._on_sample_selected("Aspenwall St — 420' (Основной участок)")
@@ -1131,7 +1133,7 @@ def test_gui_multipass_consensus_conflict_and_retry_flow(gui, monkeypatch, tmp_p
     app.select_passes(3)
     assert app.current_passes_count() == 3
     app.select_pass2_target("OpenRouter", "nvidia/nemotron-3.5-super-vl:free")
-    app.select_pass3_target("RouterAI", "openai/gpt-4.1")
+    app.select_pass3_target("RouterAI", "x-ai/grok-4.7")
     app.provider_key_vars["hydra"].set("sk-hydra-test")
     app.provider_key_vars["openrouter"].set("sk-or-test")
     app.provider_key_vars["routerai"].set("sk-rai-test")
@@ -3468,7 +3470,7 @@ def test_step4_offsets_tab_is_last_and_keeps_step1_keys_off(gui):
     assert app.step4_page._gridded is True
     assert app.draw_button._gridded is False
     assert app.step_tab_buttons[gui.STEP_TAB_OFFSETS].cget("fg_color") == gui.THEME["btn_primary"]
-    assert "выделите в AutoCAD" in app.step4_status_label.cget("text")
+    assert "выделите область в AutoCAD" in app.step4_status_label.cget("text")
     assert app.step4_run_button._gridded is True
 
     started = []
@@ -3510,9 +3512,10 @@ def test_step4_run_reports_error_and_result(gui):
 def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     app = gui.SurveyApp()
 
-    # Шаг 0 стоит перед Шагом 1: документы участка собираются до посадки границы.
+    # «Данные» стоят перед Шагом 0 (очередь работ), дальше — прежний порядок.
     assert gui.STEP_TABS == (
-        "Шаг 0. Документы участка",
+        "Данные",
+        "Шаг 0. Документы",
         "Шаг 1. Граница участка (Legal Description)",
         "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)",
         "Шаг 4. Оффсеты",
@@ -3527,7 +3530,7 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     # Элементы вкладки Шага 2 из постановки задачи.
     assert app.house_text_entry.cget("placeholder_text") == "например: 2 STY. BRK. & FR."
     assert app.skip_existing_labels_check.cget("text") == (
-        "Не дублировать уже существующие на чертеже надписи"
+        "Не дублировать надписи"
     )
     assert app.skip_existing_labels_var.get() is True
     assert app.hide_field_notes_check.cget("text") == (
@@ -3535,8 +3538,8 @@ def test_step2_tab_is_second_global_tab_and_keeps_step1(gui):
     )
     assert app.hide_field_notes_var.get() is True
     assert "FENCE_NOTE" in app.step2_notes_hint.cget("text")
-    assert "Автопоиск участка и подписание объектов" in app.feature_auto_button.cget("text")
-    assert "Указать границу участка в AutoCAD и подписать объекты" in app.feature_pick_button.cget("text")
+    assert app.feature_auto_button.cget("text") == "🔎 Автопоиск и подписание"
+    assert app.feature_pick_button.cget("text") == "🖱 Указать границу и подписать"
     assert "0.900 ft" in app.step2_height_label.cget("text")
     assert app.step2_height_entry.cget("placeholder_text") == "авто"
     assert app.feature_text_height_var.get() == ""
@@ -3716,7 +3719,7 @@ def test_step2_error_is_shown_in_report_and_status(gui, monkeypatch):
     report = app.step2_report_box.get("1.0", "end")
     assert report.startswith("ШАГ 2 НЕ ВЫПОЛНЕН")
     assert "не найден замкнутый контур участка" in report
-    assert "Указать границу участка в AutoCAD" in report  # подсказка для автопоиска
+    assert "Указать границу и подписать" in report  # подсказка для автопоиска
     assert "Шаг 2 не выполнен" in app.status_var.get()
     assert app.feature_label_result is None
     assert app._busy is False
@@ -3781,7 +3784,7 @@ def test_step0_tab_is_first_and_hides_step1_workspace(gui):
     app = gui.SurveyApp()
     assert app.step0_page._gridded is False
     app._select_step_tab(gui.STEP_TAB_DEEDS)
-    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы участка"
+    assert gui.STEP_TAB_DEEDS == "Шаг 0. Документы"
     assert app.step0_page._gridded is True
     assert app.main_wrap._gridded is False
     assert app.step2_page._gridded is False
@@ -3886,6 +3889,26 @@ def test_step0_failure_keeps_the_button_for_another_try(gui, tmp_path):
     assert app.step0_to_step1_button.cget("state") == "disabled"
     assert app.step0_run_button.cget("state") == "normal"
     assert "наш участок не собран" in app.status_var.get()
+
+
+def test_job_session_log_keeps_background_progress_and_missing_report(gui, tmp_path):
+    # Живой случай 3870 (24.11.2026): в session_log.txt задания не было ни одной
+    # строки хода сбора и раздела «Чего не хватает» — только «сбор неполный».
+    # Прогресс воркера и отчёт исхода обязаны попадать в лог задания.
+    app = gui.SurveyApp()
+    app._job_log_sink = []
+    app._post("step0_progress", "[13:50:53] наш участок: блок 1492, лот 42 — читаю список документов в ACRIS…")
+    app._drain_events()
+    outcome = gui.deed_intake.IntakeOutcome(
+        folder=tmp_path,
+        missing=["наш участок (лот 42): список закрыт страницей отказа ACRIS"],
+    )
+    app._finish_step0("ok", outcome)
+    texts = [text for _stamp, source, _level, text in app._job_log_sink if source == "шаг0"]
+    assert any("читаю список документов в ACRIS" in text for text in texts)
+    assert any("Чего не хватает" in text and "страницей отказа ACRIS" in text for text in texts)
+    # Метка времени внутри строки прогресса не дублируется в начале записи лога.
+    assert not any(text.startswith("[13:50:53]") for text in texts)
 
 
 def test_step0_stop_leaves_the_window_usable(gui):
@@ -4175,7 +4198,7 @@ def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_pa
     assert app.step0_lot_var.get() == "70"
     assert app.step0_neighbours_var.get() == "68, 72"
     assert app._session_llm_calls == 1
-    assert any("соседи слева/справа 68 / 72" in line for line in _step0_texts(app))
+    assert any("соседи слева/справа от фронтальной улицы 68 / 72" in line for line in _step0_texts(app))
     assert app.step0_run_button.cget("state") == "normal"
 
 
@@ -5961,6 +5984,36 @@ def test_portal_identity_is_snapshotted_when_collecting(gui, tmp_path, monkeypat
     app._on_close()
 
 
+def test_step0_intake_accepts_acris_borough(gui, tmp_path, monkeypatch):
+    """Manhattan идёт в сбор: источник выберет уже deed_intake (ACRIS)."""
+    app = gui.SurveyApp()
+    _fill_step0(app, block="731", lot="53", neighbours="", folder=tmp_path)
+    app.step0_borough_var.set("Manhattan")
+    seen = {}
+    def collect(**kwargs):
+        seen.update(kwargs)
+        return gui.deed_intake.IntakeOutcome(folder=kwargs["folder"])
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_intake()
+    _wait_step0(app)
+    assert seen["borough"] == "Manhattan"
+    assert (seen["block"], seen["lot"]) == (731, 53)
+    app._on_close()
+
+
+def test_step0_intake_rejects_unknown_borough(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    _fill_step0(app, block="731", lot="53", neighbours="", folder=tmp_path)
+    app.step0_borough_var.set("Westchester")
+    called = []
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", lambda **kw: called.append(kw))
+    app._start_step0_intake()
+    assert called == []
+    assert app._step0_running is False
+    assert "ACRIS" in app.status_var.get()
+    app._on_close()
+
+
 def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_path):
     app = gui.SurveyApp()
     app.multi_pdf_mode_var.set(True)
@@ -5981,3 +6034,270 @@ def test_multi_handover_uses_full_documents_and_all_explicit_our_roles(gui, tmp_
         'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
     assert {row['name'].cget('text'): bool(row['role_var'].get()) for row in dialog.rows} == {
         'OUR LOT 32 NEW.pdf': True, 'OUR LOT 32 OLD.pdf': True, 'LOT 30 NEW.pdf': False}
+
+
+def test_reasoning_switches_follow_hydra_models(gui):
+    """Переключатель рассуждений: в настройках и в главном окне при 1 проходе."""
+    app = gui.SurveyApp()
+    assert app.current_provider_id() == "hydra"
+    assert app.current_model() == "grok-4.7"
+    # Hydra grok-4.7: дефолт провайдера none, уровни из каталога Hydra.
+    assert app.reasoning_switch.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+    assert app.reasoning_var.get() == "none"
+    assert app.current_reasoning_effort() == "none"
+    # Главный переключатель виден при одном проходе.
+    assert getattr(app.reasoning_switch_main, "_gridded", False)
+    assert app.reasoning_switch_main.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+
+    app._on_reasoning_changed(1, "high")
+    assert app.current_reasoning_effort() == "high"
+    cfg_rt, active_pid, active_model, _key, _secret = app._build_runtime_config()
+    assert active_pid == "hydra" and active_model == "grok-4.7"
+    assert cfg_rt["api"]["providers"]["hydra"]["reasoning_by_model"]["grok-4.7"] == "high"
+
+    # При двух проходах главный переключатель скрыт (у каждого слота свой в настройках).
+    app.select_passes(2)
+    assert not getattr(app.reasoning_switch_main, "_gridded", True)
+    app.select_passes(1)
+    assert getattr(app.reasoning_switch_main, "_gridded", False)
+
+    # Модель другого провайдера без настраиваемых рассуждений — переключателя нет.
+    app.select_provider("OpenRouter")
+    assert app.current_reasoning_effort() is None
+    assert not getattr(app.reasoning_switch_main, "_gridded", True)
+
+
+def test_expensive_model_selection_warns(gui):
+    """Модель дороже 1000 ₽ за миллион выходных токенов — «это будет дорого»."""
+    app = gui.SurveyApp()
+    assert app.current_model() == "grok-4.7"
+    app._on_model_selected("gpt-6-luna")  # 20 ₽/1M — предупреждения нет
+    assert "дорого" not in app.status_var.get()
+    app._on_model_selected("gpt-6-astra")  # 2000 ₽/1M — дорого
+    assert "Это будет дорого" in app.status_var.get()
+    assert "gpt-6-astra" in app.status_var.get()
+
+
+def test_data_page_is_first_tab_with_queue_controls(gui, tmp_path):
+    # «Данные» — первая вкладка: список папок, модель+рассуждения, очередь.
+    app = gui.SurveyApp()
+    assert list(app.step_tab_buttons)[0] == gui.STEP_TAB_DATA == "Данные"
+
+    app._select_step_tab(gui.STEP_TAB_DATA)
+    assert app.data_page._gridded is True
+    assert app.main_wrap._gridded is False
+    assert app.draw_button._gridded is False
+    # Модель и рассуждения на «Данных» — те же настройки, что везде.
+    assert app.current_model() in app.data_model_combo.cget("values")
+    assert app.data_reasoning_switch.cget("values") == ["none", "low", "medium", "high", "xhigh"]
+
+    good = tmp_path / "1234A#417 WEST 33RD STREET"
+    good.mkdir()
+    bad = tmp_path / "просто папка"
+    bad.mkdir()
+    app._data_add_folders([good, bad, good])
+    assert len(app._job_tasks) == 2
+    by_status = {task["path"].name: task["status"] for task in app._job_tasks}
+    assert by_status["1234A#417 WEST 33RD STREET"] == "ожидает"
+    assert by_status["просто папка"] == "не подходит"
+    assert "«#»" in app._job_tasks[1]["reason"]
+
+    app._data_remove_task(1)
+    assert len(app._job_tasks) == 1
+    app._select_step_tab(gui.STEP_TAB_BOUNDARY)
+    assert app.data_page._gridded is False
+    assert app.main_wrap._gridded is True
+
+
+def test_job_queue_failed_autoflow_marks_error_writes_log_and_moves_on(gui, tmp_path):
+    # Автопоток не запустился (заглушка): задание — ошибка, лог в data,
+    # следующее задание всё равно стартует, очередь завершается.
+    app = gui.SurveyApp()
+    folders = []
+    for name in ("1001#10 FIRST ST", "1002#20 SECOND ST"):
+        folder = tmp_path / name
+        folder.mkdir()
+        folders.append(folder)
+    bad = tmp_path / "без номера"
+    bad.mkdir()
+    app._data_add_folders([*folders, bad])
+    app._start_step0_auto = lambda: None  # автопоток отказывается стартовать
+
+    app._start_job_queue()
+    while app._job_runner_active:
+        app._job_advance()
+
+    statuses = {task["path"].name: task["status"] for task in app._job_tasks}
+    assert statuses["1001#10 FIRST ST"] == "ошибка"
+    assert statuses["1002#20 SECOND ST"] == "ошибка"
+    assert statuses["без номера"] == "не подходит"
+    for folder in folders:
+        log = folder / "data" / "session_log.txt"
+        assert log.is_file()
+        text = log.read_text(encoding="utf-8")
+        assert "Итог: ошибка" in text and "автопоток не запустился" in text
+    assert app._job_runner_active is False
+
+
+def test_job_queue_draw_phase_saves_dwg_and_closes_document(gui, tmp_path):
+    # Полный проход задания: автопоток (заглушка) -> новый документ AutoCAD ->
+    # отрисовка (заглушка пишет DWG в data) -> документ закрыт, задание готово.
+    app = gui.SurveyApp()
+    folder = tmp_path / "1234#417 WEST 33RD STREET"
+    folder.mkdir()
+    app._data_add_folders([folder])
+
+    def fake_auto():
+        app._step0_auto_stage = "portal"  # автопоток как будто стартовал
+
+    app._start_step0_auto = fake_auto
+
+    closed = {}
+
+    class _Doc:
+        def Close(self):
+            closed["yes"] = True
+
+    app._job_new_acad_document = lambda: _Doc()
+
+    def fake_start(parse_only=False, **_kwargs):
+        app._busy = True
+        from pathlib import Path as _P
+        (_P(app.step0_folder_var.get()) / "lot_53_fake.dwg").write_bytes(b"dwg")
+
+    app._start = fake_start
+
+    app._start_job_queue()
+    assert app._job_phase == "autoflow"
+    # Автопоток «завершился»: контекст DWG указывает на data этого задания.
+    data_dir = folder / "data"
+    app._auto_dwg_context = (("417 WEST 33RD STREET", "Manhattan", "731", "53"),
+                             data_dir, None, object())
+    app._step0_auto_stage = None
+    app._job_queue_tick()
+    assert app._job_phase == "draw"
+    app._busy = False
+    app._job_queue_tick()
+    app._job_advance()
+
+    task = app._job_tasks[0]
+    assert task["status"] == "готово"
+    assert "lot_53_fake.dwg" in task["detail"]
+    assert closed.get("yes") is True
+    assert "Итог: готово" in (data_dir / "session_log.txt").read_text(encoding="utf-8")
+    assert app._job_runner_active is False
+
+
+def test_data_add_folder_native_multiselect_adds_all(gui, tmp_path, monkeypatch):
+    # Нативный диалог Windows возвращает сразу несколько папок (Ctrl/Shift):
+    # все попадают в список одним нажатием «Папки…», а следующий диалог
+    # откроется в их родительской папке, а не внутри выбранной.
+    app = gui.SurveyApp()
+    folders = []
+    for name in ("1001#10 FIRST ST", "1002#20 SECOND ST"):
+        folder = tmp_path / name
+        folder.mkdir()
+        folders.append(folder)
+    monkeypatch.setattr(gui.folder_dialog, "available", lambda: True)
+    monkeypatch.setattr(
+        gui.folder_dialog, "ask_folders",
+        lambda *_args, **_kwargs: [str(folders[0]), str(folders[1])])
+    app._data_add_folder_clicked()
+    assert [task["path"] for task in app._job_tasks] == folders
+    assert app._data_dialog_initial_dir == str(tmp_path)
+
+
+def test_long_captcha_checkbox_switches_pdf_wait(gui):
+    # «Ждать долгую капчу» на странице «Данные»: снята — 45 с, поставлена — 300 с.
+    app = gui.SurveyApp()
+    assert app.data_long_captcha_var.get() is False
+    assert app._pdf_wait_sec() == gui.deed_intake.PDF_WAIT_SEC == 45.0
+    app.data_long_captcha_var.set(True)
+    assert app._pdf_wait_sec() == gui.deed_intake.PDF_WAIT_LONG_SEC == 300.0
+
+
+def test_data_add_folder_falls_back_to_single_dialog(gui, tmp_path, monkeypatch):
+    # Сбой нативного диалога — откат на прежний askdirectory в одну папку.
+    app = gui.SurveyApp()
+    folder = tmp_path / "1001#10 FIRST ST"
+    folder.mkdir()
+
+    def boom(*_args, **_kwargs):
+        raise gui.folder_dialog.FolderDialogError("COM недоступен")
+
+    monkeypatch.setattr(gui.folder_dialog, "available", lambda: True)
+    monkeypatch.setattr(gui.folder_dialog, "ask_folders", boom)
+    monkeypatch.setattr(
+        sys.modules["tkinter.filedialog"], "askdirectory",
+        lambda **_kwargs: str(folder), raising=False)
+    app._data_add_folder_clicked()
+    assert [task["path"] for task in app._job_tasks] == [folder]
+
+
+def test_model_test_window_opens_by_triple_click_on_canvas(gui):
+    app = gui.SurveyApp()
+    assert "<Triple-Button-1>" in app.preview_canvas._bindings
+    assert not getattr(app, "_model_test_window", None)
+
+    app.preview_canvas._bindings["<Triple-Button-1>"](None)
+    page = app._model_test_window
+    assert page is not None
+    assert len(page.slot_rows) == 4
+    assert len(page.slots) == 4
+    assert page.slots[0].model  # первый слот — активная модель программы
+
+    # Повторный тройной щелчок не плодит окна.
+    app._open_model_test_window()
+    assert app._model_test_window is page
+
+    page.close()
+    assert app._model_test_window is None
+    assert page._closed is True
+
+
+def test_model_test_window_grades_and_stats(gui):
+    from types import SimpleNamespace
+
+    import model_test as mt
+
+    app = gui.SurveyApp()
+    app._open_model_test_window()
+    page = app._model_test_window
+
+    plan = SimpleNamespace(
+        description=SimpleNamespace(segments=[SimpleNamespace(distance_ft=50.0)]),
+        vertices=[(0.0, 0.0), (50.0, 0.0), (50.0, 50.0)],
+        pob=(0.0, 0.0),
+        lines=[SimpleNamespace(start=(0, -10), end=(60, -10), kind="street-row")],
+        boundary_lines=[SimpleNamespace(start=(0, 0), end=(50, 0), kind="property")],
+        arcs=[],
+        items=[SimpleNamespace(text="MAIN ST", point=(25, -12),
+                               kind="main-street", rotation=0.0)],
+        closure=SimpleNamespace(distance=0.01, perimeter=150.0),
+        area_sqft=2500.0,
+    )
+    result = mt.SlotResult(slot=page.slots[0], outcome=SimpleNamespace(usage=None),
+                           plan=plan, seconds=3.0)
+    page.results[0] = result
+    page._on_slot_done(0, result)
+    page._select(0)
+    drawn_texts = [item[2].get("text") for item in page.canvas.items if item[0] == "text"]
+    assert "MAIN ST" in drawn_texts  # на холсте — весь план, не только контур
+
+    page._on_grade(0, "5")
+    assert len(page.ratings.entries) == 1
+    assert page.ratings.entries[0]["grade"] == "5"
+    page._on_grade(0, "4+")  # повторная оценка правит ту же запись
+    assert len(page.ratings.entries) == 1
+    assert page.ratings.entries[0]["grade"] == "4+"
+
+    page._open_stats()
+    stats = page._stats_window
+    assert stats is not None
+    body_text = stats.body.get("1.0", "end")
+    assert "Всего оценок: 1" in body_text
+    assert page.slots[0].model in body_text
+
+    app._on_close()
+    assert page._closed is True
+    assert stats._closed is True

@@ -27,7 +27,10 @@ def test_proposal_requires_confirmation_and_preserves_original_data(fake_autocad
     assert proposal.tie_label == 'S 37°31\'21" W'
     builder, doc = fake_autocad(None)
     unconfirmed = drawing.plan_scene(builder, src)
-    assert all(not e.placement_known and not e.plan.lines for e in unconfirmed.plans)
+    # Без подтверждения планы всё равно полные, как в обычном режиме;
+    # неподтверждена только взаимная привязка пары.
+    assert all(not e.placement_known for e in unconfirmed.plans)
+    assert all(e.plan.lines for e in unconfirmed.plans)
     accepted = candidate.accept_row(src, proposal)
     assert all(i.item.data.corner_to_pob_bearing is None for i in src)
     assert src[1].item.data.cross_street == 'Lindbergh Avenue'
@@ -38,17 +41,17 @@ def test_proposal_requires_confirmation_and_preserves_original_data(fake_autocad
     assert math.dist(first.boundary_lines[2].end, second.boundary_lines[0].start) < .02
     assert math.dist(first.boundary_lines[2].start, second.boundary_lines[0].end) < .02
     for plan, item in zip((first, second), src):
-        assert plan.open_traverse and len(plan.boundary_lines) == 4
+        assert not plan.open_traverse and len(plan.boundary_lines) == 4
         for edge, segment in zip(plan.boundary_lines, item.item.data.segments):
             assert _vector(edge) == pytest.approx(segment.vector, abs=1e-6)
         builder.draw_plan(plan)
     assert any('LINDBERG' in text.TextString for text in doc.ModelSpace.texts)
-    assert sum('HYLAN' in text.TextString for text in doc.ModelSpace.texts) == 1
+    assert sum('HYLAN' in text.TextString for text in doc.ModelSpace.texts) == 2
     assert not doc.ModelSpace.polylines
-    draft = drawing.make_scene_print_drafts(scene, builder_cfg=builder.cfg)
+    draft = drawing.make_scene_print_drafts(scene, builder_cfg=builder.cfg, print_cfg={})
     assert draft.diagnostic is None and len(draft.plans) == 2
     ties = [ln for plan in draft.plans for ln in plan.lines if ln.kind == 'main-street-row-tie']
-    assert len(ties) == 1 and math.dist(ties[0].start, ties[0].end) == pytest.approx(40)
+    assert len(ties) == 2 and all(math.dist(t.start, t.end) == pytest.approx(40) for t in ties)
     assert all(not any(t.kind == 'main-lot-label' for t in p.items) for p in draft.plans)
     for plan in draft.plans:
         builder.draw_plan(plan)

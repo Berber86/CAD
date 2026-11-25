@@ -106,8 +106,12 @@ def test_shared_label_keeps_correction_from_second_source_and_neighbor(fake_auto
     created = install_mtext(doc)
     scene = drawing.plan_scene(builder, approved)
     labels = [t for e in scene.plans for t in e.plan.items if t.kind == 'cross-street']
-    assert len(labels) == 1 and labels[0].text == 'LINDBERGH  AVENUE'
-    assert ''.join(labels[0].text[i] for i in labels[0].correction_indices) == 'H'
+    # Сцена подписи не сливает: у каждого плана — своя, как в обычном режиме;
+    # исправление соседа сохранено и помечено только в его плане.
+    assert len(labels) == 2 and all(t.text == 'LINDBERGH  AVENUE' for t in labels)
+    corrected = [t for t in labels if t.correction_indices]
+    assert len(corrected) == 1
+    assert ''.join(corrected[0].text[i] for i in corrected[0].correction_indices) == 'H'
     for e in scene.plans:
         builder.draw_plan(e.plan)
     assert any(r'LINDBERG{\C1;H}' in t.TextString for t in created)
@@ -115,7 +119,7 @@ def test_shared_label_keeps_correction_from_second_source_and_neighbor(fake_auto
     assert all(not t.correction_indices and not t.correction_deleted for p in drafts.plans for t in p.items)
 
 
-def test_unlocated_neighbor_frontage_correction_is_visible_without_cross_street(fake_autocad):
+def test_unlocated_neighbor_corrections_match_normal_mode(fake_autocad):
     source = sources()[0]
     data = source.item.data.model_copy(update={'main_street': 'Hylam Boulevard',
                                                'main_street_corrected': 'Hylan Boulevard',
@@ -124,9 +128,11 @@ def test_unlocated_neighbor_frontage_correction_is_visible_without_cross_street(
     builder, _ = fake_autocad(None)
     scene = drawing.plan_scene(builder, [source])
     plan = scene.plans[0].plan
+    # Сосед без якоря оформляется как в обычном режиме: видны исправления
+    # и фасадной, и пересекаемой улицы; линий улиц у соседа нет, как обычно.
     assert not plan.lines
     assert any(t.kind == 'main-street' and t.correction_indices for t in plan.items)
-    assert not any(t.kind == 'cross-street' for t in plan.items)
+    assert any(t.kind == 'cross-street' and t.correction_indices for t in plan.items)
 
 
 def test_multi_parse_roundtrip_keeps_corrected_and_original_and_rejects_missing_original():
@@ -162,7 +168,7 @@ def test_unlocated_draft_has_no_correction_metadata(fake_autocad):
     assert any(t.TextString == 'HYLAN  BOULEVARD' for t in doc.ModelSpace.texts)
 
 
-def test_different_corrected_shared_labels_are_separated(fake_autocad):
+def test_different_corrected_labels_are_kept_per_plan(fake_autocad):
     first, second = sources()
     data = second.item.data.model_copy(update={'cross_street': 'Lindbergh Avenue',
                                                'cross_street_corrected': 'Lindburg Avenue'})
@@ -171,6 +177,7 @@ def test_different_corrected_shared_labels_are_separated(fake_autocad):
     builder, _ = fake_autocad(None)
     scene = drawing.plan_scene(builder, approved)
     labels = [t for e in scene.plans for t in e.plan.items if t.kind == 'cross-street']
+    # Разные исправления не сливаются в одну подпись: у каждого плана — своя.
     assert len(labels) == 2
-    assert labels[0].point != labels[1].point
+    assert {t.text for t in labels} == {'LINDBERG  AVENUE', 'LINDBURG  AVENUE'}
     assert any(t.correction_indices or t.correction_deleted for t in labels)

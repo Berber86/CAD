@@ -188,7 +188,7 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
     app.log_mode_var.set(True)  # проверяются подробные строки отчёта
     monkeypatch.setattr(app, "_ask_source_role", lambda *_: pytest.fail("роль не спрашивается до выбора PDF"))
     monkeypatch.setattr(llm_parser, "_extract_with_llm", lambda *a, **k: pytest.fail("платный запрос без выбора ИИ"))
-    assert "наш участок и соседи" in app.load_pdf_button.cget("text")
+    assert app.load_pdf_button.cget("text") == "⭱ Выберите PDF · Ctrl+O"
     assert not app.pdf_pages_row._gridded  # общего поля страниц для набора нет
 
     dialog = _open_set(app, monkeypatch, main, left, right)
@@ -207,7 +207,7 @@ def test_pdf_button_opens_the_list_and_builds_all_lots_together(gui, tmp_path, m
     assert not app._busy
 
     dialog.submit()
-    assert app._pdf_set_dialog is dialog and "отметьте наш участок" in dialog.message.cget("text")
+    assert app._pdf_set_dialog is dialog and "отметьте наш" in dialog.message.cget("text")
     dialog.rows[0]["radio"].select()
     app._select_result_tab("📋 Ведомость")  # перед стартом разбора вкладка другая
     dialog.submit()

@@ -332,6 +332,71 @@ def test_third_rung_is_the_manual_step_with_a_ready_link(tmp_path):
     assert manual.value.folder == downloads
 
 
+def test_make_downloader_passes_long_captcha_wait(tmp_path, monkeypatch):
+    import deed_intake
+
+    seen = {}
+
+    def fake_fallback(endorsement_id, destination, **kwargs):
+        seen.update(kwargs)
+        return Path(destination), "direct"
+
+    monkeypatch.setattr(rcclerk, "download_with_fallback", fake_fallback)
+    download = deed_intake.make_downloader(watch_timeout=deed_intake.PDF_WAIT_LONG_SEC)
+    row = rcclerk.DeedRow(endorsement_id="1905502")
+    assert download(row, tmp_path / "x.pdf")[1] == "direct"
+    assert seen["watch_timeout"] == 300.0
+
+
+def test_default_watch_timeout_is_45_seconds():
+    # Живой случай 3879 (25.11.2026): задание пять минут висело на одном
+    # документе Клерка. Исход браузерной ступени ясен гораздо раньше.
+    import inspect
+
+    default = inspect.signature(rcclerk.download_with_fallback).parameters["watch_timeout"].default
+    assert default == 45.0
+
+
+def test_timeout_takes_emergency_screenshot_into_job_folder(tmp_path):
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    shots = []
+
+    def fake_shot(folder, endorsement_id):
+        shots.append((folder, endorsement_id))
+        return f" Снимок экрана при сбое: {folder}/CLERK_FAIL_{endorsement_id}_20261125_084142.png"
+
+    with pytest.raises(rcclerk.ManualStepNeeded) as manual:
+        rcclerk.download_with_fallback(
+            NEWEST_ID, tmp_path / "raw.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda url: None,
+            downloads_dir=downloads, watch_timeout=0.2, poll=0.05,
+            fail_dir=tmp_path / "data", shot_fn=fake_shot,
+        )
+    # Снимок пишется в папку задания (fail_dir), а не в «Загрузки».
+    assert shots == [(tmp_path / "data", NEWEST_ID)]
+    assert "Снимок экрана при сбое" in str(manual.value)
+    assert "CLERK_FAIL" in str(manual.value)
+
+
+def test_successful_browser_rung_takes_no_screenshot(tmp_path):
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+
+    def forbidden_shot(folder, endorsement_id):
+        raise AssertionError("снимок при успешной загрузке не нужен")
+
+    path, rung = rcclerk.download_with_fallback(
+        NEWEST_ID, tmp_path / "raw.pdf",
+        opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+        open_browser=_browser_that_saves(downloads),
+        downloads_dir=downloads, watch_timeout=2.0, poll=0.05,
+        fail_dir=tmp_path, shot_fn=forbidden_shot,
+    )
+    assert rung == "browser" and path.is_file()
+
+
 def test_a_browser_that_cannot_open_also_ends_in_the_manual_step(tmp_path):
     def broken(url):
         raise OSError("нет браузера по умолчанию")

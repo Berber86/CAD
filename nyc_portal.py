@@ -3,26 +3,39 @@
 The automation drives a visible supported browser. Challenge pages detected by OCR
 or the browser title stop it; fast mode intentionally skips intermediate screen checks.
 RapidOCR reads Borough, Block and Lot; reliable mode can send the card's left half to
-Vision once if local OCR fails. A separate Vision request reads map neighbour labels.
+Vision once if local OCR fails. Map neighbour labels are asked from two Vision
+requests racing each other (the selected model and a cheap Hydra model); the first
+valid answer wins. As soon as Borough/Block/Lot are known, ``on_identified`` fires
+so the caller can start downloading our parcel's PDFs before neighbours arrive.
 """
 from __future__ import annotations
 
 import hashlib
+import os
+import queue
 import re
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import browser_save
+import front_street
+import map_angle_cache
 import ocr_pages
 import portal_layout_cache
-from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
+from llm_parser import (
+    TokenUsage,
+    ask_llm_json,
+    load_dotenv_dict,
+    render_image_files_base64,
+    unprotect_api_key,
+)
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
 #: Заголовок пустой новой вкладки в разных браузерах (русский и английский интерфейс).
@@ -87,6 +100,12 @@ class ParcelLookup:
     usage: TokenUsage
     details_source: str = "ocr"
     details_usage: TokenUsage | None = None
+    #: Угол фронтальной улицы к северу от Vision и программных оценок
+    #: (front_street.py); значения дублируются в JSON-кэш снимка карты.
+    front_street_angle_deg: float | None = None
+    front_street_angles: dict[str, float | None] = field(default_factory=dict)
+    #: Какая модель первой ответила про соседей (гонка двух запросов).
+    neighbour_model: str = ""
 
     @property
     def neighbours(self) -> list[str]:
@@ -156,7 +175,11 @@ def _await_ocr(warmup: Future) -> None:
     try:
         warmup.result()
     except Exception as exc:  # noqa: BLE001 - ошибка инициализации видна пользователю
-        raise PortalLookupError(f"Не удалось подготовить локальный OCR: {exc}") from exc
+        error = PortalLookupError(f"Не удалось подготовить локальный OCR: {exc}")
+        # До готовности OCR экран не снимаем вообще (принцип проекта):
+        # чёрный ящик в обёртке этот сбой не фотографирует.
+        error.skip_failure_shot = True  # type: ignore[attr-defined]
+        raise error from exc
 
 
 def _screen_ocr(image_path: str | Path) -> list[ScreenText]:
@@ -287,6 +310,25 @@ def _save_window_capture(handle: int, destination: str | Path) -> Path:
         raise PortalLookupError(f"Не удалось снять экран окна браузера: {exc}") from exc
 
 
+def _save_failure_shot(handle: int, folder: str | Path | None, prefix: str = "PORTAL_FAIL") -> str:
+    """
+    «Чёрный ящик» автоматизации портала: снимок окна в момент сбоя.
+
+    OCR-обрывки в тексте ошибки («91; 91; 3a») не дают понять, что было на
+    экране; живой PNG рядом со снимком карты задания — даёт. Возвращает
+    хвост для текста ошибки (пустой, если снимок не удался).
+    """
+    if folder is None:
+        return ""
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = Path(folder) / f"{prefix}_{stamp}.png"
+        _save_window_capture(handle, path)
+        return f" Снимок экрана при сбое: {path}"
+    except Exception:  # noqa: BLE001 - диагностика не должна ломать остановку
+        return ""
+
+
 def _contains(rows: Sequence[ScreenText], phrase: str) -> bool:
     target = _normalise(phrase)
     return any(target in _normalise(row.text) for row in rows)
@@ -317,20 +359,33 @@ def _focus(handle: int) -> None:
         raise PortalLookupError("Не удалось безопасно активировать окно NYC Portal.")
 
 
+def _click_row(handle: int, row: ScreenText) -> ScreenText:
+    bounds = browser_save.window_bounds(handle)
+    if bounds is None:
+        raise PortalLookupError("Окно браузера изменилось, координаты мыши недоступны.")
+    x0, y0, _x1, _y1 = bounds
+    cx, cy = row.center
+    _focus(handle)
+    if not browser_save.click_browser_window(handle, x0 + cx, y0 + cy):
+        raise PortalLookupError("Не удалось нажать элемент в окне NYC Portal.")
+    return row
+
+
+def _search_button_row(rows: Sequence[ScreenText]) -> ScreenText | None:
+    return next((row for row in rows if _normalise(row.text) == "search"), None)
+
+
+def _search_rejected(rows: Sequence[ScreenText]) -> bool:
+    joined = _normalise(" ".join(row.text for row in rows))
+    return "notfound" in joined or "noresults" in joined
+
+
 def _click_text(handle: int, rows: Sequence[ScreenText], text: str) -> ScreenText:
     target = _normalise(text)
     found = next((row for row in rows if target in _normalise(row.text)), None)
     if found is None:
         raise PortalLookupError(f"На странице не найден элемент «{text}».")
-    bounds = browser_save.window_bounds(handle)
-    if bounds is None:
-        raise PortalLookupError("Окно браузера изменилось, координаты мыши недоступны.")
-    x0, y0, _x1, _y1 = bounds
-    cx, cy = found.center
-    _focus(handle)
-    if not browser_save.click_browser_window(handle, x0 + cx, y0 + cy):
-        raise PortalLookupError("Не удалось нажать элемент в окне NYC Portal.")
-    return found
+    return _click_row(handle, found)
 
 
 def _key(handle: int, vk: int) -> None:
@@ -379,63 +434,201 @@ def _wait_screen(
     raise _ScreenNotFound(f"Не дождался {description} на NYC Portal после двух проверок.")
 
 
-def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> None:
-    # The portal label sits directly above its address autocomplete input.
-    label = next((row for row in rows if "enter an address" in row.text.lower()), None)
-    if label is None:
+def _address_probes(address: str) -> tuple[str, str]:
+    """
+    Пробы введённого адреса: (номер дома, первое слово улицы от 4 букв).
+
+    Одного номера мало: на странице портала с картой тот же номер светится
+    в подписях домов, и проверка «текст в поле» срабатывала вхолостую
+    (живой случай 3870, 24.11.2026: ввод мимо поля засчитался как успешный,
+    а список подсказок так и не появился). Слово улицы в поле обязательно.
+    """
+    text = str(address or "")
+    digits = re.search(r"\d+", text)
+    number = digits.group(0) if digits else ""
+    words = [w for w in re.split(r"\W+", text) if len(w) >= 4 and not w.isdigit()]
+    word = _normalise(words[0]) if words else ""
+    return number, word
+
+
+def _typed_address_visible(handle: int, address: str) -> bool:
+    """Снимок формы после ввода: номер дома (и слово улицы) видны в области формы."""
+    number, word = _address_probes(address)
+    if not number and not word:
+        return True
+    try:
+        _focus(handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_typed_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(handle, path)
+            rows = _screen_ocr_region(path, _FORM_REGION)
+    except Exception:  # noqa: BLE001 - проверка не должна быть хуже самого ввода
+        return True
+    texts = [_normalise(row.text) for row in rows]
+    if number and not any(number in text for text in texts):
+        return False
+    if word and not any(word in text for text in texts):
+        return False
+    return bool(number or word)
+
+
+def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> str:
+    """
+    Вводит адрес, перебирая стратегии, и возвращает имя сработавшей.
+
+    Одна точка клика портал не гарантирует: верстка и состояние страницы
+    меняются (живые сбои 3875/3876/3870, 24.11.2026). Поэтому стратегии
+    идут по кругу с самопроверкой после каждой: клик под подпись, клик в
+    плейсхолдер, клик по содержимому поля, клик под подпись ниже, клик по
+    самой подписи, печать в текущий фокус (после выбора режима клавишей
+    Tab фокус часто уже стоит в поле). Проверка —
+    ``_typed_address_visible``: номер дома и слово улицы видны в форме.
+    """
+    # Поле ищем устойчиво к OCR: подпись над полем содержит «…Common Place
+    # Name)», а плейсхолдер «Enter an address» стоит прямо внутри поля.
+    # Дословная строка «enter an address» в одной OCR-строке не обязана
+    # совпасть (живой сбой 3876: режим переключён, а поле «не найдено»).
+    label = next(
+        (row for row in rows if "commonplace" in _normalise(row.text)), None)
+    placeholder = next(
+        (row for row in rows
+         if row is not label and "enteranaddress" in _normalise(row.text)), None)
+    anchors: list[tuple[str, ScreenText]] = []
+    if label is not None:
+        anchors.append(("label", label))
+    if placeholder is not None and placeholder is not label:
+        anchors.append(("placeholder", placeholder))
+    if label is not None:
+        # Заполненное поле видно само: первая строка содержимого под подписью.
+        # В «грязном» состоянии (вкладка после упавшего задания: плашка
+        # «Address not found», в поле старый адрес — живой сбой 3870,
+        # 24.11.2026) смещения от высоты подписи уводят клик мимо поля,
+        # а клик по самому содержимому попадает всегда. Плашку ошибки и
+        # заголовок условий не предлагаем: они тоже «под подписью».
+        label_bottom = label.box[3]
+        below = [
+            row for row in rows
+            if row is not label and row is not placeholder
+            and label_bottom <= row.box[1] <= label_bottom + 180
+            and row.box[0] <= label.box[2]
+            and "notfound" not in _normalise(row.text)
+            and not _normalise(row.text).startswith("termsofuse")
+        ]
+        if below:
+            anchors.append(("field_text", min(below, key=lambda row: (row.box[1], row.box[0]))))
+        anchors.append(("label_low", label))
+        # Настоящий <label> сам переводит фокус в своё поле по клику.
+        anchors.append(("label_self", label))
+    if not anchors:
         raise PortalLookupError("После переключения режима не найдено поле Address.")
     bounds = browser_save.window_bounds(handle)
     if bounds is None:
         raise PortalLookupError("Окно портала изменилось, не могу определить поле адреса.")
     x0, y0, _x1, _y1 = bounds
-    x_left, y_top, x_right, y_bottom = label.box
-    click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
-    click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+    for kind, anchor in anchors:
+        x_left, y_top, x_right, y_bottom = anchor.box
+        if kind in {"placeholder", "field_text", "label_self"}:
+            # Плейсхолдер и содержимое — внутри поля; подпись — настоящий
+            # <label>: в обоих случаях кликаем в центр самой строки.
+            click_x = x0 + (x_left + x_right) // 2
+            click_y = y0 + (y_top + y_bottom) // 2
+        elif kind == "label_low":
+            # Поле оказалось ниже, чем ждали от подписи (высокая строка формы).
+            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+            click_y = y0 + y_bottom + max(44, (y_bottom - y_top) * 3)
+        else:
+            # Подпись над полем: поле ввода — сразу под ней.
+            click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
+            click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+        _focus(handle)
+        if not browser_save.click_browser_window(handle, click_x, click_y):
+            raise PortalLookupError("Не удалось сфокусировать поле Address.")
+        if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
+            raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
+        time.sleep(0.5)
+        if _typed_address_visible(handle, address):
+            return kind
+        # Клик прошёл мимо поля: Ctrl+A выделил текст страницы, ввод ушёл
+        # в никуда (живой скриншот 24.11.2026). Пробуем следующую стратегию.
+    # Последняя стратегия: печать без клика — фокус после Tab может уже
+    # стоять в поле, а клики по OCR-координатам упорно уходят мимо.
     _focus(handle)
-    if not browser_save.click_browser_window(handle, click_x, click_y):
-        raise PortalLookupError("Не удалось сфокусировать поле Address.")
-    if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
-        raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
+    if browser_save.press_ctrl_a() and browser_save.type_text(address):
+        time.sleep(0.5)
+        if _typed_address_visible(handle, address):
+            return "focus"
+    raise PortalLookupError(
+        "Не удалось ввести адрес: текст не появился в поле Address "
+        "ни по одной стратегии ввода. Кликните в поле адреса вручную "
+        "и повторите поиск.")
 
 
-_ADDRESS_SUFFIXES = {"st": "street", "str": "street", "ave": "avenue", "av": "avenue",
-                     "rd": "road", "blvd": "boulevard", "dr": "drive", "ln": "lane",
-                     "pl": "place", "ct": "court", "pkwy": "parkway"}
+#: Подсказку портала узнаём по её собственному тексту: «..., NY ... USA».
+#: Геометрию после трёх живых остановок не используем совсем (решение
+#: пользователя 2026-11-23): у поля ввода и чисел карты такого текста нет.
+_SUGGESTION_ROW_RE = re.compile(r",\s*NY\b|\bUSA\b", re.IGNORECASE)
 
 
-def _address_tokens(text: str) -> list[str]:
-    return [_ADDRESS_SUFFIXES.get(token, token) for token in re.findall(r"[a-z0-9]+", text.lower())]
-
-
-def _first_suggestion(rows: Sequence[ScreenText], address_rows: Sequence[ScreenText]) -> ScreenText | None:
-    label = next((r for r in address_rows if "enter an address" in r.text.lower()), None)
-    if label is None:
-        return None
-    x0, y0, x1, y1 = label.box
-    # Исключаем само поле и числа на карте справа: подсказка находится под полем.
-    min_y = y1 + max(24, (y1 - y0) * 2) + 15
-    max_x = x0 + max(120, (x1 - x0) // 2)
-    candidates = [row for row in rows if row.box[1] >= min_y and x0 - 10 <= row.box[0] <= max_x
-                  and re.match(r"^\s*\d", row.text)]
+def _suggestion_row(items: Sequence[ScreenText]) -> ScreenText | None:
+    """Верхняя строка выпавшего списка подсказок — по тексту, без геометрии."""
+    candidates = [row for row in items if _SUGGESTION_ROW_RE.search(row.text)]
     return min(candidates, key=lambda row: (row.box[1], row.box[0])) if candidates else None
 
 
-def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText], *,
-                              first_delay: float = RELIABLE_SUGGESTION_DELAY) -> None:
-    """Обычный режим: проверяем первую подсказку, не принимая ввод за подсказку."""
-    expected = _address_tokens(address)
-    def matches(items: Sequence[ScreenText]) -> bool:
-        suggestion = _first_suggestion(items, address_rows)
-        actual = _address_tokens(suggestion.text if suggestion else "")
-        return bool(expected) and actual[:len(expected)] == expected
+def _suggestion_screen_hint(handle: int, address: str, address_rows: Sequence[ScreenText]) -> str:
+    """Что OCR видит под полем адреса при неудаче — для журнала, а не для клика."""
+    try:
+        _focus(handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_hint_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(handle, path)
+            rows = _screen_ocr_region(path, _FORM_REGION)
+        suggestion = _suggestion_row(rows)
+        if suggestion is not None:
+            return f" На снимке первая подсказка: «{suggestion.text}»; жду «{address}»."
+        digit_rows = [row.text for row in rows if re.match(r"^\s*\d", row.text)][:3]
+        if digit_rows:
+            return f" На снимке строки с цифрами: {'; '.join(digit_rows)}."
+        return " Подсказок на снимке не видно."
+    except Exception:  # noqa: BLE001 - диагностика не должна ломать остановку
+        return ""
 
-    rows = _wait_screen(handle, matches,
-                        first_delay=first_delay, description="совпадающую первую подсказку адреса",
-                        region=_FORM_REGION)
-    suggestion = _first_suggestion(rows, address_rows)
-    actual = _address_tokens(suggestion.text if suggestion else "")
-    if not expected or actual[:len(expected)] != expected:
-        raise PortalLookupError("Первая подсказка адреса не совпадает с запросом; проверьте ввод и повторите.")
+
+def _wait_after_address_input(handle: int, address: str, address_rows: Sequence[ScreenText], *,
+                              first_delay: float = RELIABLE_SUGGESTION_DELAY) -> ScreenText | None:
+    """
+    Ждём, пока портал покажет список подсказок, и возвращаем первую строку.
+
+    Что в ней написано — не проверяем (решение пользователя 2026-11-23).
+    Выбирается строка кликом мыши по её центру (см. ``select_suggestion``):
+    Down+Enter однажды превратились в текстовый поиск по подписи подсказки.
+    Признак списка — текст подсказки («…, NY … USA»), геометрию не смотрим:
+    она трижды отсекала настоящий список на живом окне. Нет списка после
+    повторных проверок — остановка с диагностикой, что OCR видит под полем.
+    """
+    def present(items: Sequence[ScreenText]) -> bool:
+        return _suggestion_row(items) is not None
+
+    rows: list[ScreenText] | None = None
+    for attempt, delay in enumerate((first_delay, RELIABLE_SUGGESTION_DELAY)):
+        try:
+            rows = _wait_screen(handle, present,
+                                first_delay=delay, description="список подсказок адреса",
+                                region=_FORM_REGION)
+            break
+        except _ScreenNotFound:
+            if attempt == 0:
+                # Подсказки портала иногда грузятся дольше двух проверок
+                # (живой случай 2026-11-23: список уже открыт, а проверки
+                # успели закончиться). Ещё один цикл — и честная остановка.
+                time.sleep(RELIABLE_RETRY_DELAY)
+    if rows is None:
+        raise PortalLookupError(
+            "Не дождался список подсказок адреса на NYC Portal "
+            "после повторных проверок."
+            + _suggestion_screen_hint(handle, address, address_rows)
+        )
+    return _suggestion_row(rows)
 
 
 def _type_focused_address(handle: int, address: str) -> None:
@@ -532,23 +725,6 @@ def _drive_portal(
     В быстром режиме фиксированные паузы заменяют промежуточный OCR; финальная
     проверка и чтение идентификаторов обязательны. Риск несработавшего действия выше.
     """
-    def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
-             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION,
-             on_region_fallback: Callable[[], None] | None = None) -> list[ScreenText]:
-        if fast_mode:
-            _fast_wait(handle, fast_pause_sec)
-            _await_ocr(warmup)
-            with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
-                path = Path(directory) / "screen.png"
-                _save_window_capture(handle, path)
-                rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
-            _reject_challenge(rows)
-            if not predicate(rows):
-                raise _ScreenNotFound(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
-            return rows
-        return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
-                            ready=lambda: _await_ocr(warmup), on_region_fallback=on_region_fallback)
-
     if optimal_mode and fast_mode:
         raise PortalLookupError("Выберите только один режим поиска: оптимальный или быстрый.")
     if fast_mode:
@@ -567,6 +743,45 @@ def _drive_portal(
     if progress:
         progress("заранее готовлю локальный OCR параллельно с открытием портала")
     window = _portal_window()
+    try:
+        return _drive_portal_rest(
+            address, map_path, progress, window=window, warmup=warmup,
+            fast_mode=fast_mode, fast_pause_sec=fast_pause_sec,
+            optimal_mode=optimal_mode, details_vision=details_vision,
+        )
+    except (PortalLookupError, _ScreenNotFound) as exc:
+        # «Чёрный ящик»: любой сбой портала оставляет снимок экрана в папке
+        # задания и человеческий текст вместо технического _ScreenNotFound.
+        shot = "" if getattr(exc, "skip_failure_shot", False) else (
+            _save_failure_shot(window.handle, map_path.parent))
+        raise PortalLookupError(f"{exc}{shot}") from exc
+
+
+def _drive_portal_rest(
+    address: str, map_path: Path, progress: Progress | None, *, window, warmup,
+    fast_mode: bool = False, fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
+    optimal_mode: bool = False,
+    details_vision: Callable[[Path], tuple[str, str, str]] | None = None,
+) -> PortalCapture:
+    """Вторая половина ``_drive_portal``: окно выбрано, дальше — действия на портале."""
+
+    def wait(handle: int, predicate: Callable[[Sequence[ScreenText]], bool], *,
+             delay: float, description: str, region: tuple[float, float, float, float] | None = _FORM_REGION,
+             on_region_fallback: Callable[[], None] | None = None) -> list[ScreenText]:
+        if fast_mode:
+            _fast_wait(handle, fast_pause_sec)
+            _await_ocr(warmup)
+            with tempfile.TemporaryDirectory(prefix="tsai_pip_fast_") as directory:
+                path = Path(directory) / "screen.png"
+                _save_window_capture(handle, path)
+                rows = _screen_ocr_region(path, region) if region else _screen_ocr(path)
+            _reject_challenge(rows)
+            if not predicate(rows):
+                raise _ScreenNotFound(f"После паузы не найдено: {description}. Увеличьте паузу или выключите быструю работу.")
+            return rows
+        return _wait_screen(handle, predicate, first_delay=delay, description=description, region=region,
+                            ready=lambda: _await_ocr(warmup), on_region_fallback=on_region_fallback)
+
     _focus(window.handle)
     maximize = getattr(browser_save, "maximize_browser_window", None)
     if callable(maximize) and not maximize(window.handle):
@@ -612,19 +827,45 @@ def _drive_portal(
                 "Откройте NYC Portal вручную во вкладке и повторите поиск."
             )
         # Ctrl+L выделяет адресную строку новой вкладки; Ctrl+A очищает возможный остаток.
-        if (
-            not browser_save.press_ctrl_l()
-            or not browser_save.press_ctrl_a()
-            or not browser_save.type_text(PORTAL_URL)
-        ):
-            raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
-        _key(window.handle, browser_save.VK_RETURN)
-        rows = wait(
-            window.handle,
-            lambda screen: _contains(screen, "Select") or _contains(screen, "Find Another Property"),
-            delay=OPTIMAL_PORTAL_DELAY if use_optimal else RELIABLE_PORTAL_DELAY,
-            description="страницу NYC Property Information Portal",
+        # Портал грузится нестабильно (живой сбой 3868, 24.11.2026: страница не
+        # успела за две проверки, а соседнее задание через минуту открылось).
+        # Поэтому навигация — с одним полным повтором, а не с одной попыткой.
+        portal_predicate = (
+            lambda screen: _contains(screen, "Select")
+            or _contains(screen, "Find Another Property")
+            or _contains(screen, "Property Information")
         )
+        rows = None
+        for nav_attempt in range(2):
+            if (
+                not browser_save.press_ctrl_l()
+                or not browser_save.press_ctrl_a()
+                or not browser_save.type_text(PORTAL_URL)
+            ):
+                raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
+            # Delete сносит подсвеченное автодополнение из истории браузера:
+            # печать идёт посимвольно, браузер дописывает адрес последней
+            # страницы портала, и Enter без Delete уходит на неё (живой случай
+            # Николая: вместо портала открылся просмотр улиц Cyclomedia).
+            # Подсказки не было — Delete в конце строки безвреден.
+            _key(window.handle, browser_save.VK_DELETE)
+            _key(window.handle, browser_save.VK_RETURN)
+            try:
+                rows = wait(
+                    window.handle, portal_predicate,
+                    delay=OPTIMAL_PORTAL_DELAY if use_optimal else RELIABLE_PORTAL_DELAY,
+                    description="страницу NYC Property Information Portal",
+                )
+                break
+            except _ScreenNotFound:
+                if nav_attempt == 1:
+                    raise PortalLookupError(
+                        "Страница NYC Property Information Portal не загрузилась "
+                        "даже после повторной навигации. Проверьте сеть и портал "
+                        "в браузере, затем повторите поиск."
+                    )
+                if progress:
+                    progress("страница портала не загрузилась — повторяю навигацию ещё раз")
     else:
         if not fast_mode:
             time.sleep(RELIABLE_INITIAL_DELAY)
@@ -712,16 +953,32 @@ def _drive_portal(
     if fast_mode and not _contains(rows, "Enter an Address"):
         _type_focused_address(window.handle, address)
     else:
-        _type_into_address(window.handle, address, rows)
+        strategy = _type_into_address(window.handle, address, rows)
+        if progress and strategy not in {"label", "placeholder"}:
+            progress(f"адрес введён стратегией «{strategy}» (первые способы не сработали)")
     if fast_mode:
         _fast_wait(window.handle, fast_pause_sec)
     else:
-        _wait_after_address_input(window.handle, address, rows,
-                                  first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+        # Подсказки могут не выпасть с первого ввода (живой сбой 3870,
+        # 24.11.2026: текст в поле есть, списка нет). Пассивно ждать ещё
+        # дольше бессмысленно — вводим адрес заново и ждём второй раз;
+        # повторный ввод — то, что делает человек в такой ситуации.
+        picked = None
+        for input_cycle in range(2):
+            try:
+                picked = _wait_after_address_input(
+                    window.handle, address, rows,
+                    first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+                break
+            except PortalLookupError:
+                if input_cycle == 1:
+                    raise
+                if progress:
+                    progress("список подсказок не появился — ввожу адрес ещё раз")
+                _type_into_address(window.handle, address, rows)
+        if progress and picked is not None:
+            progress(f"первая подсказка портала: «{picked.text}» — выбираю её")
     check_layout_size()
-    _key(window.handle, browser_save.VK_DOWN)
-    time.sleep(FAST_KEY_DELAY_SEC if fast_mode else 0.2)
-    _key(window.handle, browser_save.VK_RETURN)
 
     def card_ready(screen: Sequence[ScreenText]) -> bool:
         if not fast_mode and not use_optimal:
@@ -744,18 +1001,99 @@ def _drive_portal(
             raise _ScreenNotFound("Карточка не готова после повторной проверки. Увеличьте паузу или выберите надёжный режим.")
         return retry
 
-    retried_fast_card = False
-    try:
-        rows = wait(
+    def wait_card() -> list[ScreenText]:
+        return wait(
             window.handle, card_ready,
             delay=OPTIMAL_CARD_DELAY if use_optimal else RELIABLE_CARD_DELAY,
             description="карточку объекта с Borough, Block и Lot", region=None,
         )
-    except _ScreenNotFound:
-        if not fast_mode:
-            raise
-        rows = fast_card_retry()
-        retried_fast_card = True
+
+    def form_snapshot() -> list[ScreenText]:
+        _focus(window.handle)
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_after_select_") as directory:
+            path = Path(directory) / "screen.png"
+            _save_window_capture(window.handle, path)
+            snapshot = _screen_ocr_region(path, _FORM_REGION)
+        _reject_challenge(snapshot)
+        return snapshot
+
+    def select_suggestion() -> list[ScreenText]:
+        """
+        Выбор первой подсказки как человек: клик мышью, не Down+Enter.
+
+        Живой случай 3868 (24.11.2026): Down+Enter превратились в текстовый
+        поиск по подписи подсказки — портал ответил «Address not found
+        within the NYC limits» и «No results», хотя в поле был верный адрес
+        из названия папки; карточка так и не появилась. Клик по строке
+        регистрирует в виджете сам объект подсказки. Распознавание строки
+        по-прежнему только по тексту; координаты — лишь точка клика по уже
+        найденной строке. Если клика мало (портал ждёт явный Search) или
+        поиск по тексту уже отклонён — лестница запасных действий ниже,
+        последним шагом прежние Down+Enter.
+        """
+        def soft_wait_card() -> list[ScreenText] | None:
+            try:
+                return wait_card()
+            except _ScreenNotFound:
+                return None
+
+        def click_and_wait(row: ScreenText) -> list[ScreenText] | None:
+            _click_row(window.handle, row)
+            return soft_wait_card()
+
+        def search_click_and_wait(screen: list[ScreenText]) -> list[ScreenText] | None:
+            button = _search_button_row(screen)
+            if button is None:
+                return None
+            if progress:
+                progress("карточки после выбора подсказки нет — нажимаю Search")
+            return click_and_wait(button)
+
+        if picked is not None:
+            if progress:
+                progress("выбираю первую подсказку кликом мыши")
+            found = click_and_wait(picked)
+            if found is not None:
+                return found
+            screen = form_snapshot()
+            found = search_click_and_wait(screen)
+            if found is not None:
+                return found
+            if _search_button_row(screen) is not None:
+                screen = form_snapshot()
+            if _search_rejected(screen):
+                if progress:
+                    progress("портал отклонил поиск по тексту — ввожу адрес заново и выбираю подсказку кликом")
+                _type_into_address(window.handle, address, rows)
+                again = _wait_after_address_input(
+                    window.handle, address, rows,
+                    first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)
+                if again is not None:
+                    found = click_and_wait(again)
+                    if found is not None:
+                        return found
+                    found = search_click_and_wait(form_snapshot())
+                    if found is not None:
+                        return found
+        if progress:
+            progress("выбираю подсказку клавишами Down+Enter")
+        _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(0.2)
+        _key(window.handle, browser_save.VK_RETURN)
+        return wait_card()
+
+    retried_fast_card = False
+    if fast_mode:
+        _key(window.handle, browser_save.VK_DOWN)
+        time.sleep(FAST_KEY_DELAY_SEC)
+        _key(window.handle, browser_save.VK_RETURN)
+        try:
+            rows = wait_card()
+        except _ScreenNotFound:
+            rows = fast_card_retry()
+            retried_fast_card = True
+    else:
+        rows = select_suggestion()
     details_source = "ocr"
     if not fast_mode and not use_optimal:
         # Сначала один финальный снимок после уменьшения карты: правая часть — карта,
@@ -887,22 +1225,40 @@ def _integer_or_none(value: Any, name: str) -> str | None:
     return text
 
 
+def _angle_or_none(value: Any) -> float | None:
+    """Угол улицы из ответа Vision: число/«35°»/«35 deg» -> [0, 180), иначе None."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().lower().replace("°", " ").replace("deg", " ").strip()
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return round(front_street.normalize_line_angle(number), 1)
+
+
 def parse_neighbour_result(
     data: dict[str, Any],
-) -> tuple[str | None, str | None, str, str]:
-    """Validate map-only Vision output: two adjacent lot labels, without BBL fields."""
+) -> tuple[str | None, str | None, str, str, float | None]:
+    """Validate map-only Vision output: neighbour labels + front street angle."""
     left = _integer_or_none(data.get("left_neighbor_lot"), "сосед слева")
     right = _integer_or_none(data.get("right_neighbor_lot"), "сосед справа")
     if left and right and left == right:
         right = None
     confidence = str(data.get("confidence") or "не указана").strip()[:40]
     notes = str(data.get("notes") or "").strip()[:600]
-    return left, right, confidence, notes
+    angle = _angle_or_none(data.get("front_street_angle_deg"))
+    return left, right, confidence, notes, angle
 
 
 VISION_SYSTEM_PROMPT = """You inspect ONLY a cropped NYC tax-map image. The selected parcel is highlighted in cyan.
-Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, confidence, notes.
-Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If the map is rotated or labels/boundaries are unclear, return null for uncertain neighbours and explain briefly in notes. confidence is low, medium, or high. Never guess. Do not include markdown."""
+Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, front_street_angle_deg, confidence, notes.
+Also report front_street_angle_deg: the orientation in degrees of the street that the cyan parcel fronts onto (the street along its frontage side), measured clockwise from geographic north. North points straight up in this image. Report 0 for a street running north-south, 90 for east-west, a value from 0 to under 180; if the front street is unclear, return null for it and never guess.
+Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. Never guess a lot number.
+LEFT AND RIGHT ARE RELATIVE TO THE FRONT STREET of the cyan parcel, not to the edges of the image. First identify the front street: the street that the cyan parcel fronts onto (its frontage side — the side its address and front entrance face, from which the lot's depth runs back). Then imagine standing on that front street and facing the cyan parcel, with the street behind you: the directly touching parcel on your LEFT is left_neighbor_lot and the one on your RIGHT is right_neighbor_lot. Equivalently, mentally rotate the map so the front street runs along the bottom edge and the cyan parcel lies above it, seen from the street; the viewer's left and right in that rotated view are the answer. Never report the image's raw visual left/right when the front street runs along a different side or the map is rotated.
+If both side parcels are clearly identified but the front street cannot be determined, still return both numbers (in either order), set confidence to low and explain in notes that the front street was unclear, so left and right may be swapped. Return null only for a parcel whose label or adjacency itself is unclear. confidence is low, medium, or high. Do not include markdown."""
 
 
 DETAILS_VISION_PROMPT = """Read ONLY the visible property details on this NYC Portal card image.
@@ -924,6 +1280,63 @@ def _parse_vision_details(data: dict[str, Any]) -> tuple[str, str, str]:
     return block, lot, borough
 
 
+#: Параллельный запрос о соседях: дешёвая модель Hydra со средними
+#: рассуждениями. Идёт гонкой с основной выбранной моделью — принимается
+#: первый валидный ответ (указание пользователя: скорость важнее цены
+#: проигравшего запроса, он всё равно оплачивается провайдеру).
+NEIGHBOUR_RACE_PROVIDER = "hydra"
+NEIGHBOUR_RACE_MODEL = "cheap/gpt-6.1-terra"
+NEIGHBOUR_RACE_REASONING = "medium"
+#: Сколько раз каждый запрос про соседей повторяется при сбое (тайм-аут,
+#: кривой JSON, нечисловой ответ) — раньше одна неудачная попытка хоронила
+#: весь поиск адреса и задание очереди целиком.
+NEIGHBOUR_ATTEMPTS = 3
+NEIGHBOUR_RETRY_PAUSE_SEC = 2.0
+#: Тайм-аут одного запроса к нейронкам портала (карточка и соседи), сек.
+#: Общий api.timeout_sec (500) этому шагу не подходит: ответ, который не
+#: пришёл за 180 с, дешевле запросить заново (см. NEIGHBOUR_ATTEMPTS),
+#: чем ждать дальше. Основной разбор PDF этот лимит не затрагивает.
+PORTAL_REQUEST_TIMEOUT_SEC = 180.0
+
+
+def _cfg_with_reasoning(cfg: dict[str, Any], model: str, effort: str) -> dict[str, Any]:
+    """Копия конфига, где у Hydra для ``model`` выставлен уровень рассуждений."""
+    out = dict(cfg)
+    api = dict(out.get("api") or {})
+    providers = dict(api.get("providers") or {})
+    hydra_cfg = dict(providers.get("hydra") or {})
+    reasoning = dict(hydra_cfg.get("reasoning_by_model") or {})
+    reasoning[model] = effort
+    hydra_cfg["reasoning_by_model"] = reasoning
+    providers["hydra"] = hydra_cfg
+    api["providers"] = providers
+    out["api"] = api
+    return out
+
+
+def _hydra_api_key(
+    cfg: dict[str, Any], *, selected_provider: str | None,
+    selected_api_key: str | None, key_secret: str = "",
+) -> str:
+    """Ключ именно Hydra для параллельного запроса — чужие ключи не подставляем."""
+    if str(selected_provider or "").strip().lower() == NEIGHBOUR_RACE_PROVIDER \
+            and selected_api_key:
+        return str(selected_api_key)
+    api = cfg.get("api") if isinstance(cfg.get("api"), dict) else {}
+    providers = api.get("providers") if isinstance(api.get("providers"), dict) else {}
+    hydra_cfg = providers.get("hydra") if isinstance(providers.get("hydra"), dict) else {}
+    env_name = str(hydra_cfg.get("env_key") or "HYDRA_API_KEY").strip()
+    raw = str(hydra_cfg.get("api_key") or "").strip()
+    if not raw and env_name:
+        raw = os.environ.get(env_name, "") or load_dotenv_dict().get(env_name, "")
+    if not raw:
+        return ""
+    try:
+        return unprotect_api_key(NEIGHBOUR_RACE_PROVIDER, raw, secret=key_secret) or ""
+    except Exception:  # noqa: BLE001 - без ключа гонка просто не состоится
+        return ""
+
+
 def lookup_parcel(
     address: str,
     screenshot_folder: str | Path,
@@ -937,8 +1350,14 @@ def lookup_parcel(
     fast_mode: bool = False,
     fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
     optimal_mode: bool = False,
+    on_identified: Callable[[PortalCapture], None] | None = None,
 ) -> ParcelLookup:
-    """Read BBL locally (or one card Vision fallback), then ask Vision about map neighbours."""
+    """Read BBL locally (or one card Vision fallback), then ask Vision about map neighbours.
+
+    ``on_identified`` вызывается сразу, как только Borough/Block/Lot прочитаны
+    и снимок карты сохранён, — ещё до запросов про соседей: вызывающий может
+    уже начинать скачивание PDF нашего участка, не дожидаясь нейронок.
+    """
     clean_address = str(address or "").strip()
     if not clean_address:
         raise PortalLookupError("Введите адрес перед поиском.")
@@ -947,6 +1366,7 @@ def lookup_parcel(
     request_cfg = dict(cfg)
     request_cfg["api"] = dict(cfg.get("api") or {})
     request_cfg["api"]["max_retries"] = 0
+    request_cfg["api"]["timeout_sec"] = PORTAL_REQUEST_TIMEOUT_SEC
     details_usages: list[TokenUsage] = []
 
     def read_details_vision(left_image: Path) -> tuple[str, str, str]:
@@ -968,6 +1388,13 @@ def lookup_parcel(
     if not fast_mode:
         driver_options["details_vision"] = read_details_vision
     capture = _drive_portal(clean_address, map_path, progress, **driver_options)
+    if on_identified is not None:
+        # BBL уже известен: вызывающий может качать наш участок, пока
+        # нейронки ещё думают про соседей. Сбой раннего старта поиск не губит.
+        try:
+            on_identified(capture)
+        except Exception:  # noqa: BLE001
+            pass
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(
@@ -977,27 +1404,142 @@ def lookup_parcel(
     urls, _notes = render_image_files_base64(
         [capture.map_image], max_side_px=1800, enhance_scan=False, output_format="jpeg",
     )
-    response, usage = ask_llm_json(
-        VISION_SYSTEM_PROMPT,
-        (
-            f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
-            "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
-            "on its left and right opposing side boundaries. If a label or adjacency is unclear, use null."
-        ),
-        request_cfg,
-        image_data_urls=urls,
-        api_key=api_key,
-        provider=provider,
-        model=model,
-        key_secret=key_secret,
-        progress=progress,
-        task_label="NYC tax map: номера соседних лотов",
-        attempts=1,
-        single_request=True,
+    neighbour_user_text = (
+        f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
+        "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
+        "on its left and right opposing side boundaries. Left and right are relative to the front "
+        "street of the cyan parcel: stand on that street facing the parcel — the parcel on your "
+        "left hand is left_neighbor_lot, the one on your right hand is right_neighbor_lot. If both "
+        "are identified but the front street is unclear, return both anyway with confidence low. "
+        "Use null only when a label or adjacency itself is unclear."
     )
-    left, right, confidence, notes = parse_neighbour_result(response)
+
+    def ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg):
+        # Один сбой — не приговор: тайм-аут или кривой JSON повторяем, а не
+        # хороним весь поиск (живой случай: «Request timed out» с первой
+        # попытки убил задание очереди). Повторяет каждый участник гонки
+        # сам; гонка по-прежнему принимает первый валидный ответ.
+        last_error: Exception | None = None
+        for attempt in range(1, NEIGHBOUR_ATTEMPTS + 1):
+            try:
+                response, used = ask_llm_json(
+                    VISION_SYSTEM_PROMPT,
+                    neighbour_user_text,
+                    leg_cfg,
+                    image_data_urls=urls,
+                    api_key=leg_key,
+                    provider=leg_provider,
+                    model=leg_model,
+                    key_secret=key_secret,
+                    progress=progress,
+                    task_label="NYC tax map: номера соседних лотов",
+                    attempts=1,
+                    single_request=True,
+                )
+                return parse_neighbour_result(response), used
+            except Exception as exc:  # noqa: BLE001 - повтор важнее типа сбоя
+                last_error = exc
+                if attempt < NEIGHBOUR_ATTEMPTS:
+                    if progress:
+                        progress(
+                            f"NYC tax map: запрос про соседей к {leg_model} не удался "
+                            f"({type(exc).__name__}: {exc}); повторяю — попытка "
+                            f"{attempt + 1} из {NEIGHBOUR_ATTEMPTS}")
+                    time.sleep(NEIGHBOUR_RETRY_PAUSE_SEC * attempt)
+        assert last_error is not None  # цикл выше либо вернул, либо падал
+        raise last_error
+
+    # Гонка двух нейронок: основная выбранная модель и дешёвая Hydra
+    # (cheap/gpt-6.1-terra, рассуждения medium). Принимаем первый валидный
+    # ответ; проигравший запрос остановить нельзя — он договаривает в фоне.
+    legs: list[tuple[str, str, str | None, dict[str, Any], str]] = [
+        (provider, model, api_key, request_cfg, "основная модель"),
+    ]
+    hydra_key = _hydra_api_key(
+        request_cfg, selected_provider=provider, selected_api_key=api_key,
+        key_secret=key_secret,
+    )
+    same_as_race = (
+        str(provider or "").strip().lower() == NEIGHBOUR_RACE_PROVIDER
+        and str(model or "").strip() == NEIGHBOUR_RACE_MODEL
+    )
+    if hydra_key and not same_as_race:
+        legs.append((
+            NEIGHBOUR_RACE_PROVIDER, NEIGHBOUR_RACE_MODEL, hydra_key,
+            _cfg_with_reasoning(request_cfg, NEIGHBOUR_RACE_MODEL, NEIGHBOUR_RACE_REASONING),
+            "параллельная Hydra",
+        ))
+    if len(legs) == 1:
+        (leg_provider, leg_model, leg_key, leg_cfg, _label) = legs[0]
+        (left, right, confidence, notes, llm_angle), usage = ask_neighbours(
+            leg_provider, leg_model, leg_key, leg_cfg)
+        neighbour_model = f"{leg_provider}: {leg_model}"
+    else:
+        if progress:
+            progress(
+                "номера соседей спрашиваю сразу у двух моделей: "
+                f"основная — {model}, параллельная — Hydra {NEIGHBOUR_RACE_MODEL} "
+                f"(рассуждения {NEIGHBOUR_RACE_REASONING}); приму первый валидный ответ"
+            )
+        outcome_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+        def run_leg(leg) -> None:
+            leg_provider, leg_model, leg_key, leg_cfg, leg_label = leg
+            try:
+                outcome_queue.put(("ok", leg_label, leg_provider, leg_model,
+                                   ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg)))
+            except Exception as exc:  # noqa: BLE001 - вторая модель может спасти
+                outcome_queue.put(("err", leg_label, leg_provider, leg_model, exc))
+
+        for leg in legs:
+            threading.Thread(
+                target=run_leg, args=(leg,), daemon=True, name="portal-neighbour-race",
+            ).start()
+        winner = None
+        race_errors: list[str] = []
+        for _ in legs:
+            kind, leg_label, leg_provider, leg_model, payload = outcome_queue.get()
+            if kind == "ok":
+                winner = (leg_label, leg_provider, leg_model, payload)
+                break
+            race_errors.append(f"{leg_label} ({leg_provider}: {leg_model}): {payload}")
+        if winner is None:
+            raise PortalLookupError(
+                "Ни одна из двух моделей не ответила про соседей: "
+                + "; ".join(race_errors)
+            )
+        leg_label, leg_provider, leg_model, (parsed, usage) = winner
+        left, right, confidence, notes, llm_angle = parsed
+        neighbour_model = f"{leg_provider}: {leg_model}"
+        if progress:
+            progress(
+                f"номера соседей первой ответила: {leg_model} ({leg_label}) — "
+                "принимаю её ответ; второй запрос договаривает в фоне"
+            )
+    # Тот же угол — кодом, двумя способами; все три значения клиент сравнит
+    # сам (программа выбор не делает). Кэш — JSON рядом со снимком карты.
+    estimates = front_street.estimate_all(capture.map_image)
+    angles: dict[str, float | None] = {"llm": llm_angle, **estimates}
+    cache_name = ""
+    try:
+        cache_path = map_angle_cache.write_angles(
+            capture.map_image, llm_angle=llm_angle, python_angles=estimates,
+            address=clean_address, block=capture.block, lot=capture.lot,
+        )
+        cache_name = cache_path.name
+    except Exception:  # noqa: BLE001 - кэш не должен губить поиск участка
+        cache_name = ""
+    if progress:
+        progress(
+            "угол фронтальной улицы к северу: "
+            f"ИИ — {map_angle_cache.fmt_angle(angles.get('llm'))}, "
+            f"код (отрезки) — {map_angle_cache.fmt_angle(angles.get('python_hough_lines'))}, "
+            f"код (градиенты) — {map_angle_cache.fmt_angle(angles.get('python_structure_tensor'))}"
+            + (f"; все значения — в {cache_name}" if cache_name else "")
+        )
     return ParcelLookup(
         capture.block, capture.lot, capture.borough, left, right,
         confidence, notes, capture.map_image, usage, capture.details_source,
         details_usages[0] if details_usages else None,
+        llm_angle, angles, neighbour_model,
     )

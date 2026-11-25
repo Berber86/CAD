@@ -222,6 +222,152 @@ class _App:
         return None
 
 
+def test_connect_app_tolerates_clean_autocad_without_documents(monkeypatch):
+    # Живой случай 24.11.2026: пользователь закрыл все вкладки AutoCAD, и
+    # очередь встала с «активный документ недоступен — откройте DWG», хотя
+    # ей нужен был как раз новый документ. connect_app документ не требует.
+    import sys
+    import types
+
+    class _CleanApp:
+        @property
+        def ActiveDocument(self):
+            raise AssertionError("connect_app не должен трогать ActiveDocument")
+
+    app = _CleanApp()
+    client = types.SimpleNamespace(GetActiveObject=lambda _progid: app)
+    win32com = types.SimpleNamespace(client=client)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(module, "_co_initialize", lambda: None)
+    monkeypatch.setattr(module, "_co_uninitialize", lambda: None)
+    builder = AcadBuilder(_cfg())
+    assert builder.connect_app() is app
+
+
+def _stub_win32com(monkeypatch, app):
+    import sys
+    import types
+
+    client = types.SimpleNamespace(GetActiveObject=lambda _progid: app)
+    win32com = types.SimpleNamespace(client=client)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(module, "_co_initialize", lambda: None)
+    monkeypatch.setattr(module, "_co_uninitialize", lambda: None)
+
+
+def test_connect_waits_for_active_document_when_asked(monkeypatch):
+    # Ночной сбой 3876 (24–25.11.2026): очередь создала документ, а сеанс
+    # отрисовки мгновенно умер на «активный документ недоступен» — AutoCAD
+    # ещё инициализировал документ и отклонял вызов (-2147418111). Сеанс
+    # очереди обязан подождать, а не хоронить задание в первую же секунду.
+    doc = _Doc()
+    attempts = []
+
+    class _BusyApp:
+        @property
+        def ActiveDocument(self):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise RuntimeError("(-2147418111, 'Вызов был отклонен получателем')")
+            return doc
+
+    _stub_win32com(monkeypatch, _BusyApp())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    builder = AcadBuilder(_cfg())
+    assert builder.connect(active_document_wait=5.0)[1] is doc
+    assert len(attempts) == 3
+
+
+def test_connect_without_wait_keeps_instant_honest_error(monkeypatch):
+    # Ручное подключение не ждёт: нет документа — сразу прежняя ошибка.
+    class _NoDocApp:
+        @property
+        def ActiveDocument(self):
+            return None
+
+    _stub_win32com(monkeypatch, _NoDocApp())
+    builder = AcadBuilder(_cfg())
+    with pytest.raises(module.AcadConnectionError, match="активный документ недоступен"):
+        builder.connect()
+
+
+def test_add_new_document_retries_busy_autocad():
+    calls = []
+
+    class _Documents:
+        def Add(self):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("(-2147418111, 'Вызов был отклонен получателем')")
+            return "doc"
+
+    class _AppWithDocuments:
+        def __init__(self, documents):
+            self.Documents = documents
+
+    assert module.add_new_document(_AppWithDocuments(_Documents()), sleep=lambda _s: None) == "doc"
+    assert len(calls) == 3
+
+
+def test_add_new_document_reraises_after_attempts():
+    class _Documents:
+        def __init__(self):
+            self.calls = 0
+
+        def Add(self):
+            self.calls += 1
+            raise RuntimeError("AutoCAD is busy")
+
+    class _AppWithDocuments:
+        def __init__(self, documents):
+            self.Documents = documents
+
+    documents = _Documents()
+    with pytest.raises(RuntimeError, match="AutoCAD is busy"):
+        module.add_new_document(_AppWithDocuments(documents), attempts=3, sleep=lambda _s: None)
+    assert documents.calls == 3
+
+
+class _FakeComError(Exception):
+    """pywintypes.com_error вне Windows нет; _com_retry смотрит только тип."""
+
+
+class _FlakyModelSpaceDoc:
+    """Документ, у которого ModelSpace один раз отклоняет вызов."""
+
+    def __init__(self, real):
+        self._real = real
+        self.rejections = 1
+
+    @property
+    def ModelSpace(self):
+        if self.rejections:
+            self.rejections -= 1
+            raise _FakeComError("(-2147418111, 'Вызов был отклонен получателем')")
+        return self._real.ModelSpace
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_draw_plan_survives_transient_modelspace_rejection(fake_autocad, monkeypatch):
+    # Ночной сбой 3870: план умер на doc.ModelSpace с -2147418111, хотя
+    # AutoCAD через секунду уже отвечал. Чтение ModelSpace — с повтором.
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "pywintypes", types.SimpleNamespace(com_error=_FakeComError))
+    plan = _plan("lot72_render_e600.txt")
+    builder, doc = fake_autocad(plan)
+    builder._doc = _FlakyModelSpaceDoc(doc)
+    result = builder.draw_plan(plan)
+    assert doc.ModelSpace.lines
+    assert result.boundary_line_count == len(plan.boundary_lines)
+
+
 @pytest.fixture
 def fake_autocad(monkeypatch):
     monkeypatch.setattr(module, "_co_initialize", lambda: None)
@@ -294,14 +440,14 @@ def test_exact_property_copy_and_colors_survive_legacy_config(fake_autocad):
                        if _matches_line(entity, edge.start, edge.end, dx)]
             assert len(matches) == 1
             assert matches[0].Layer == ("M-ROW-LINE" if is_front else "PL")
-            assert matches[0].Color == (1 if is_front else 3)
+            assert matches[0].Color == (4 if is_front else 3)
             assert matches[0].Linetype == ("ByLayer" if is_front else "Continuous")
     assert len(doc.ModelSpace.texts) == len(plan.items) + len(draft.items)
     assert len(doc.ModelSpace.arcs) == 2 * len(plan.arcs)
 
 
 
-def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
+def test_corner_lot_has_two_cyan_frontages_in_both_copies(fake_autocad):
     plan = _plan("lot51_commencing_corner.txt")
     assert len(plan.street_boundary_indices) == 2
     builder, doc = fake_autocad(plan)
@@ -313,7 +459,7 @@ def test_corner_lot_has_two_red_frontages_in_both_copies(fake_autocad):
             matches = [entity for entity in doc.ModelSpace.lines
                        if _matches_line(entity, edge.start, edge.end, dx)]
             assert len(matches) == 1
-            assert matches[0].Layer == "M-ROW-LINE" and matches[0].Color == 1
+            assert matches[0].Layer == "M-ROW-LINE" and matches[0].Color == 4
 
 
 def test_copy_preserves_open_gap_without_forced_closure(fake_autocad):
@@ -343,7 +489,10 @@ def test_new_pl_layer_is_continuous_without_loading_a_dashed_linetype(fake_autoc
             assert line.Linetype == "Continuous" and line.Color == 3
 
 
-def test_continuous_assignment_failure_reports_error_and_deletes_partial_line(fake_autocad):
+def test_continuous_assignment_failure_keeps_line_and_warns(fake_autocad):
+    # Живой случай 25.11.2026: AutoCAD отклонил AddLine.Color на первой линии
+    # основного плана, и весь участок остался ненарисованным. Оформление —
+    # не геометрия: линия остаётся, отказ уходит в предупреждения.
     plan = _plan("lot72_render_e600.txt")
     builder, doc = fake_autocad(plan)
     deleted = []
@@ -359,9 +508,11 @@ def test_continuous_assignment_failure_reports_error_and_deletes_partial_line(fa
         def Delete(self):
             deleted.append(True)
     doc.ModelSpace.AddLine = lambda *args: FailedLine()
-    with pytest.raises(module.AcadDrawError, match="linetype refused"):
-        builder._add_survey_line(doc.ModelSpace, plan.boundary_lines[0], "PL", 3, linetype="Continuous")
-    assert deleted == [True]
+    warnings = []
+    entity = builder._add_survey_line(doc.ModelSpace, plan.boundary_lines[0], "PL", 3,
+                                      linetype="Continuous", warnings=warnings)
+    assert isinstance(entity, FailedLine) and deleted == []
+    assert len(warnings) == 1 and "linetype refused" in warnings[0] and "PL" in warnings[0]
 
 
 def test_step4_area_selects_original_or_copy_after_step1(fake_autocad):
@@ -579,6 +730,27 @@ def test_print_draft_other_labels_include_former_names_and_side_notes(fake_autoc
     assert former[0].StyleName == "Romans"
     assert all(t.Layer == "M-TAX-DIM" and t.StyleName == "Romans"
                for t in doc.ModelSpace.texts if "feet" in t.TextString or "'" in t.TextString)
+
+
+def test_street_names_white_oblique15_and_row_lines_cyan(fake_autocad):
+    """Правила заказчика 24.11.2026: названия улиц белые, наклон стиля 15°,
+    линии M-ROW-LINE голубые — и в основном плане, и в печатном черновике."""
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, _cfg()["print_draft"])
+    builder, doc = fake_autocad(plan)
+    builder.draw_plan(plan)
+    builder.draw_plan(draft)
+
+    street_texts = [t for t in doc.ModelSpace.texts
+                    if getattr(t, "StyleName", "") in ("LETTER", "MtXpl_Times_New_Roma")
+                    and any(name in t.TextString for name in ("E. 600TH", "CARLTON"))]
+    assert street_texts
+    assert all(t.Color == 7 for t in street_texts)
+    for style_name in ("LETTER", "MtXpl_Times_New_Roma"):
+        style = doc.TextStyles.Item(style_name)
+        assert math.degrees(style.ObliqueAngle) == pytest.approx(15.0)
+    row_lines = [ln for ln in doc.ModelSpace.lines if ln.Layer == "M-ROW-LINE"]
+    assert row_lines and all(ln.Color == 4 for ln in row_lines)
 
 
 def test_new_style_and_missing_style_error_are_reported(fake_autocad):

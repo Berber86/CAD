@@ -8,7 +8,9 @@ the disabled-by-default experimental workflow.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+import queue
+import threading
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from multiple_description_errors import ProviderResponseError
 from multiple_description_parse import (Attempt, COMPARISON_INSTRUCTION, ImageSizeRejected, PageImage,
@@ -36,10 +38,22 @@ def _content(completion: Any) -> str:
     return content
 
 
-def _call(client: Any, model: str, messages: list[dict[str, Any]]) -> str:
+def _call(client: Any, model: str, messages: list[dict[str, Any]],
+          reasoning_effort: str | None = None) -> str:
+    kwargs: dict[str, Any] = {}
+    if reasoning_effort:
+        kwargs['extra_body'] = {'reasoning_effort': reasoning_effort}
     try:
-        completion = client.chat.completions.create(model=model, messages=messages)
+        completion = client.chat.completions.create(model=model, messages=messages, **kwargs)
     except Exception as exc:
+        if kwargs and ('reasoning' in str(exc).lower()):
+            # Провайдер отверг уровень рассуждений — один повтор без него.
+            try:
+                completion = client.chat.completions.create(model=model, messages=messages)
+            except Exception as retry_exc:
+                exc = retry_exc
+            else:
+                return _content(completion)
         # Only a clear HTTP 413 establishes a request-size rejection; generic
         # 400/timeout/network failures must not cause automatic reduction.
         if getattr(exc, 'status_code', None) == 413:
@@ -48,7 +62,70 @@ def _call(client: Any, model: str, messages: list[dict[str, Any]]) -> str:
     return _content(completion)
 
 
-def create_client(target: Mapping[str, str], *, timeout: float = 180) -> Any:
+_T = TypeVar("_T")
+
+
+def hedged_call(primary: Callable[..., _T], secondary: Callable[..., _T], *args: Any,
+                delay: float = 300.0, notice: Callable[[str], None] | None = None,
+                **kwargs: Any) -> _T:
+    """Вызов с отложенной параллельной копией у второго провайдера.
+
+    Первый запрос не отменяется. Если он не завершился за ``delay`` секунд,
+    тот же запрос уходит второму провайдеру, и используется первый успешный
+    ответ. Быстрая ошибка первого провайдера (до порога) не маскируется:
+    она сразу возвращается вызывающему, как без страховки.
+    """
+    results: queue.SimpleQueue[tuple[str, bool, Any]] = queue.SimpleQueue()
+
+    def run(name: str, fn: Callable[..., _T]) -> None:
+        try:
+            results.put((name, True, fn(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - результат гонки, не потеря
+            results.put((name, False, exc))
+
+    threading.Thread(target=run, args=("primary", primary), daemon=True,
+                     name="llm-hedge-primary").start()
+    try:
+        name, ok, value = results.get(timeout=max(0.0, float(delay)))
+        if ok:
+            return value
+        raise value
+    except queue.Empty:
+        pass
+    if notice is not None:
+        try:
+            notice("Hydra не ответила за 300 с — параллельно запрашиваю ту же модель у RouterAI; "
+                   "использую первый успешный ответ.")
+        except Exception:  # noqa: BLE001 - журнал не должен ломать запрос
+            pass
+    threading.Thread(target=run, args=("secondary", secondary), daemon=True,
+                     name="llm-hedge-secondary").start()
+    errors: dict[str, BaseException] = {}
+    while len(errors) < 2:
+        name, ok, value = results.get()
+        if ok:
+            return value
+        errors[name] = value
+    raise errors.get("primary") or next(iter(errors.values()))
+
+
+def make_hedged_sender(primary: Callable[..., str], secondary: Callable[..., str], *,
+                       delay: float = 300.0, notice: Callable[[str], None] | None = None):
+    """Sender: Hydra grok-4.7, после порога — та же модель у RouterAI."""
+    def send(pages: Sequence[PageImage], context: Mapping[str, str | None]) -> str:
+        return hedged_call(primary, secondary, pages, context, delay=delay, notice=notice)
+    return send
+
+
+def make_hedged_selector(primary: Callable[..., int], secondary: Callable[..., int], *,
+                         delay: float = 300.0, notice: Callable[[str], None] | None = None):
+    """Selector: та же отложенная гонка провайдеров, что и у sender."""
+    def choose(pages: Sequence[PageImage], attempts: Sequence[Attempt]) -> int:
+        return hedged_call(primary, secondary, pages, attempts, delay=delay, notice=notice)
+    return choose
+
+
+def create_client(target: Mapping[str, str], *, timeout: float = 500) -> Any:
     """Construct an SDK client with retries disabled; no network call is made."""
     from openai import OpenAI
     if not target.get('api_key') or not target.get('base_url'):
@@ -59,7 +136,7 @@ def create_client(target: Mapping[str, str], *, timeout: float = 180) -> Any:
                                    'X-Title': 'Title Survey AI'})
 
 
-def make_sender(client: Any, model: str):
+def make_sender(client: Any, model: str, reasoning_effort: str | None = None):
     """Return the parser's ``send`` callback, one request per invocation."""
     system = system_instruction()
 
@@ -70,11 +147,11 @@ def make_sender(client: Any, model: str):
         user = [{'type': 'text', 'text': 'Lot context (not an answer filter): ' +
                  json.dumps(labels, ensure_ascii=False)}, *_images(pages)]
         return _call(client, model, [{'role': 'system', 'content': system},
-                                    {'role': 'user', 'content': user}])
+                                    {'role': 'user', 'content': user}], reasoning_effort)
     return send
 
 
-def make_selector(client: Any, model: str):
+def make_selector(client: Any, model: str, reasoning_effort: str | None = None):
     """Return an optional one-call tie selector; indices are zero-based."""
     def choose(pages: Sequence[PageImage], attempts: Sequence[Attempt]) -> int:
         variants = [{'index': idx, 'pages': list(attempt.pages),
@@ -84,7 +161,7 @@ def make_selector(client: Any, model: str):
         instruction = COMPARISON_INSTRUCTION
         content = [{'type': 'text', 'text': json.dumps(variants, ensure_ascii=False)}, *_images(pages)]
         raw = _call(client, model, [{'role': 'system', 'content': instruction},
-                                    {'role': 'user', 'content': content}])
+                                    {'role': 'user', 'content': content}], reasoning_effort)
         answer = json.loads(raw)
         if not isinstance(answer, dict) or set(answer) != {'selected'}:
             raise ValueError('invalid selection')

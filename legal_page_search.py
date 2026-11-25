@@ -232,8 +232,17 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     send = send or dp.post_routerai
     attempts: list[dict[str, Any]] = []
     results = []
-    for group in groups:
+
+    def process_group(group: list[int]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Один батч страниц: кэш, основная модель, ограниченные повторы, запасная.
+
+        Батчи независимы и выполняются параллельно (см. ниже); общие данные
+        здесь только читаются, а попытки копятся в локальный список.
+        Недооценённая страница не теряется: она попадает в кандидаты как
+        неполная, поэтому гнаться за оценкой шестью запросами подряд не нужно.
+        """
         check(current)
+        local_attempts: list[dict[str, Any]] = []
         available = [n for n in group if n in rendered]
         pending = list(available)
         observed: dict[int, dict[str, Any]] = {}
@@ -264,9 +273,9 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
             problem = error_text.get(error, error if error and error.startswith('http_') else "ошибка запроса") if error else ""
             emit(progress, f"Поиск: ответ {model}, страниц с оценкой {valid_pages}/{len(numbers)}, "
                            f"{seconds:.1f} с" + (f", {problem}" if problem else "") + ".")
-            attempts.append({"batch_pages": group, "pages": numbers, "model": model,
-                             "fingerprint": fp, "source": source, "seconds": seconds, "usage": usage,
-                             "error_kind": error, "answers": answers})
+            local_attempts.append({"batch_pages": group, "pages": numbers, "model": model,
+                                   "fingerprint": fp, "source": source, "seconds": seconds, "usage": usage,
+                                   "error_kind": error, "answers": answers})
             for n in numbers:
                 answer = answers[f"page_{n}"]
                 if answer["status"] == "ok" and n not in observed:
@@ -294,18 +303,35 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                 pending = [n for n in pending if n not in observed]
             # A cache read costs no live attempt. When some cached answers are
             # missing, ask only those pages, without retrying count by itself.
+            # Повторов немного: недооценённая страница всё равно попадёт в
+            # кандидаты как неполная, а живой прогон 24.11.2026 показал, как
+            # один батч гоняли пять раз по ~150 с тайм-аута подряд.
             microsoft_attempts = 0 if used_cache else 1
-            while pending and microsoft_attempts < 3:
+            while pending and microsoft_attempts < 2:
                 attempt(pending, PRIMARY, False)
                 microsoft_attempts += 1
                 pending = [n for n in pending if n not in observed]
-            for _ in range(3):
+            for _ in range(2):
                 if not pending:
                     break
                 attempt(pending, FALLBACK, False)
                 pending = [n for n in pending if n not in observed]
-        results.append({"pages": group, "count": count_result,
-                        "observations": {str(n): observed.get(n) for n in group}})
+        return {"pages": group, "count": count_result,
+                "observations": {str(n): observed.get(n) for n in group}}, local_attempts
+
+    # Батчи независимы: страницы уже отрисованы, запросы друг друга не ждут.
+    # Порядок результатов сохраняем по исходному списку батчей.
+    if len(groups) <= 1:
+        batch_outputs = [process_group(groups[0])] if groups else []
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(groups)),
+                                thread_name_prefix="page-search") as pool:
+            batch_outputs = list(pool.map(process_group, groups))
+    for batch_result, batch_attempts in batch_outputs:
+        results.append(batch_result)
+        attempts.extend(batch_attempts)
     check(current)
     page_results = []
     for n in range(1, covered + 1):

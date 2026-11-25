@@ -8,7 +8,7 @@ acad_builder.py
 Точка начала обхода (Point of Beginning) помещается в (0, 0).
 
 Отрисовывается:
-  * отдельные линии основного участка: зелёные PL и красные M-ROW-LINE на фронте;
+  * отдельные линии основного участка: зелёные PL и голубые M-ROW-LINE на фронте;
   * при запуске из GUI — единственный черновик с точной копией границы на +1000 по X;
   * подпись каждой стороны (румб + длина) вдоль линии, снаружи полигона,
     с поворотом по линии и защитой от «вверх ногами»;
@@ -179,6 +179,15 @@ PRINT_STREET_LAYER = "LETTER"
 PRINT_STREET_STYLE = "MtXpl_Times_New_Roma"
 PRINT_TEXT_STYLE = "Romans"
 PRINT_STREET_TEXT_COLOR = 7
+
+# --- цвета и наклон подписей улиц (правило заказчика, 24.11.2026) -----------
+#: Линии улиц и фасадные стороны в слое M-ROW-LINE — голубые (ACI 4), не красные.
+STREET_ROW_COLOR = 4
+#: Названия улиц (RENO AVENUE, 5th Avenue…) — белые (ACI 7) явным цветом объекта,
+#: чтобы не зависеть от цвета слоя LETTER/M-TAX-DIM в шаблоне заказчика.
+STREET_NAME_TEXT_COLOR = 7
+#: Угол наклона (ObliqueAngle) стиля названий улиц — 15°, не путать с поворотом.
+STREET_TEXT_OBLIQUE_DEG = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -1574,6 +1583,34 @@ def _com_retry(
     raise AcadDrawError(f"AutoCAD не принял команду: {last_error}") from last_error
 
 
+def add_new_document(
+    app: Any,
+    *,
+    attempts: int = 6,
+    delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """
+    Новый документ AutoCAD с повтором при временной занятости.
+
+    Живой сбой ночного прогона 24–25.11.2026: очередь создавала документ и
+    тут же падала дальше по цепочке — занятый AutoCAD отклоняет COM-вызовы
+    (-2147418111), пока предыдущий документ закрывается или новый ещё
+    инициализируется. Мгновенный отказ здесь стоит всего задания, а несколько
+    секунд ожидания почти всегда спасают. После исчерпания попыток пробрасывается
+    последняя, настоящая ошибка.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return app.Documents.Add()
+        except Exception as exc:  # noqa: BLE001 - занятость AutoCAD временна
+            last_error = exc
+            if attempt < max(1, int(attempts)) - 1:
+                sleep(max(0.0, float(delay)))
+    raise last_error  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Построитель
 # ---------------------------------------------------------------------------
@@ -2762,7 +2799,7 @@ class AcadBuilder:
         return plan_obj
 
     # -- подключение к AutoCAD ---------------------------------------------
-    def connect(self) -> tuple[Any, Any]:
+    def connect(self, *, active_document_wait: float = 0.0) -> tuple[Any, Any]:
         """
         Возвращает (Application, ActiveDocument) уже запущенного AutoCAD.
 
@@ -2770,6 +2807,13 @@ class AcadBuilder:
         отрисовка), соединение переиспользуется, а проверка единиц чертежа
         всё равно выполняется. При вызове из другого потока COM-прокси
         переподключается в текущем потоке, чтобы избежать RPC_E_WRONG_THREAD.
+
+        ``active_document_wait`` — сколько секунд терпеливо ждать активный
+        документ: только что созданный очередью документ AutoCAD ещё
+        инициализирует, и ActiveDocument в эти секунды отклоняет вызов
+        (-2147418111) или пуст (ночной сбой 3876, 24–25.11.2026: сеанс
+        отрисовки умер мгновенно, не дав документу ни секунды). Ручное
+        подключение ждёт 0 — поведение прежнее: нет документа, сразу ошибка.
         """
         cur_tid = threading.get_ident()
         if self._app is not None and self._doc is not None:
@@ -2802,32 +2846,78 @@ class AcadBuilder:
                 f"3) Повторите попытку. Детали: {exc}"
             ) from exc
 
-        try:
-            doc = app.ActiveDocument
-        except Exception as exc:  # noqa: BLE001
-            if co_inited:
-                _co_uninitialize()
-            raise AcadConnectionError(
-                "AutoCAD запущен, но активный документ недоступен — откройте DWG."
-            ) from exc
+        deadline = time.monotonic() + max(0.0, float(active_document_wait))
+        doc = None
+        last_error: Exception | None = None
+        while True:
+            try:
+                doc = app.ActiveDocument
+            except Exception as exc:  # noqa: BLE001 - занятость AutoCAD временна
+                last_error = exc
+                doc = None
+            if doc is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
         if doc is None:
             if co_inited:
                 _co_uninitialize()
             raise AcadConnectionError(
                 "AutoCAD запущен, но активный документ недоступен — откройте DWG."
-            )
+            ) from last_error
         self._app, self._doc = app, doc
         self._com_thread_id = cur_tid
         self._com_owned = bool(co_inited)
         self._warn_about_units(doc)
         return app, doc
 
+    def connect_app(self) -> Any:
+        """
+        Только приложение запущенного AutoCAD — без требования открытого DWG.
+
+        Очереди «Данные» нужен новый документ, и чистый AutoCAD (все вкладки
+        закрыты, стартовый экран) для неё — нормальное исходное состояние,
+        а не ошибка «откройте DWG» (живой случай 24.11.2026: пользователь
+        закрыл лишние вкладки, и все задания очереди встали на этом месте,
+        хотя вся работа до отрисовки была выполнена).
+        """
+        co_inited = _co_initialize()
+        try:
+            import win32com.client
+        except ImportError as exc:  # pragma: no cover
+            if co_inited:
+                _co_uninitialize()
+            raise AcadConnectionError(
+                "pywin32 не установлен. В Windows выполните: pip install pywin32"
+            ) from exc
+        try:
+            app = win32com.client.GetActiveObject(ACAD_PROGID)
+        except Exception as exc:  # noqa: BLE001
+            if co_inited:
+                _co_uninitialize()
+            raise AcadConnectionError(
+                "Не удалось подключиться к запущенному AutoCAD.\n"
+                "1) Откройте AutoCAD (можно без чертежа, со стартового экрана);\n"
+                "2) Дождитесь полной загрузки;\n"
+                f"3) Повторите попытку. Детали: {exc}"
+            ) from exc
+        if co_inited:
+            self._com_owned = True
+            self._com_thread_id = threading.get_ident()
+        return app
+
     @contextmanager
-    def drawing_session(self):
-        """Keep the same COM document for a multi-plan draw and its SaveAs."""
+    def drawing_session(self, *, active_document_wait: float = 20.0):
+        """Keep the same COM document for a multi-plan draw and its SaveAs.
+
+        Сеанс ждёт активный документ до ``active_document_wait`` секунд:
+        очередь создаёт документ и сразу рисует, а AutoCAD в первые секунды
+        ещё инициализирует его и отклоняет вызовы (ночной сбой 3876).
+        """
         if self._hold_connection:
             raise AcadConnectionError("сеанс AutoCAD уже открыт")
-        app, doc = self.connect()
+        app, doc = self.connect(active_document_wait=active_document_wait)
         self._hold_connection = True
         try:
             yield app, doc
@@ -2924,18 +3014,34 @@ class AcadBuilder:
 
     def _add_survey_line(
         self, model_space: Any, item: LineItem, layer: str, color: int, *, linetype: str = "ByLayer",
+        warnings: list[str] | None = None,
     ) -> Any:
-        """Новый отрезок: заданный цвет и выбранный тип линии без изменения слоя."""
+        """Новый отрезок: заданный цвет и выбранный тип линии без изменения слоя.
+
+        Цвет и тип линии — оформление, а не геометрия: если AutoCAD на миг
+        отклонил присваивание (живой случай 25.11.2026 — только что созданный
+        очередью документ: ``AddLine.Color can not be set`` на первой же
+        линии основного плана), отрезок уже создан, и удалять его вместе со
+        всем планом нельзя. Один короткий повтор, дальше — линия остаётся
+        как есть, а в результат уходит предупреждение проверить её вид.
+        """
         entity = self._add_line(model_space, item, layer)
-        try:
-            entity.Color = color
-            entity.Linetype = linetype
-        except Exception as exc:  # noqa: BLE001
+        failure: Exception | None = None
+        for attempt in range(2):
             try:
-                entity.Delete()
-            except Exception:  # noqa: BLE001
-                pass
-            raise AcadDrawError(f"Не удалось задать цвет/тип линии в слое {layer}: {exc}") from exc
+                entity.Color = color
+                entity.Linetype = linetype
+                failure = None
+                break
+            except Exception as exc:  # noqa: BLE001 - оформление не губит геометрию
+                failure = exc
+                if attempt == 0:
+                    time.sleep(0.5)
+        if failure is not None and warnings is not None:
+            warnings.append(
+                f"не удалось задать цвет/тип линии отрезка в слое {layer}: {failure}; "
+                "линия оставлена как есть — проверьте её в AutoCAD"
+            )
         return entity
 
     def _ensure_text_style(self, doc: Any) -> str:
@@ -2971,12 +3077,17 @@ class AcadBuilder:
             return "Standard"
 
     def _ensure_boundary_text_style(self, doc: Any, warnings: list[str]) -> str:
-        """Use the drawing's LETTER unchanged; create a clearly reported fallback if absent."""
+        """Use the drawing's LETTER; create a clearly reported fallback if absent.
+
+        Угол наклона стиля (ObliqueAngle) приводим к 15° по правилу заказчика
+        (24.11.2026) — это именно наклон букв, не поворот подписи.
+        """
         name = "LETTER"
         try:
             styles = doc.TextStyles
             try:
-                styles.Item(name)
+                style = styles.Item(name)
+                self._set_style_oblique(style, STREET_TEXT_OBLIQUE_DEG, name, warnings)
                 return name
             except Exception:  # noqa: BLE001
                 style = _com_retry(styles.Add, name)
@@ -2987,9 +3098,20 @@ class AcadBuilder:
                 warnings.append(f"Создан стиль LETTER, но шрифт/высоту не удалось настроить: {exc}; проверьте стиль в AutoCAD")
             else:
                 warnings.append("Стиль LETTER отсутствовал и создан с запасным шрифтом romans.shx; проверьте его по шаблону заказчика")
+            self._set_style_oblique(style, STREET_TEXT_OBLIQUE_DEG, name, warnings)
             return name
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль LETTER: {exc}") from exc
+
+    @staticmethod
+    def _set_style_oblique(style: Any, oblique_deg: float, name: str,
+                           warnings: list[str]) -> None:
+        """Задать углу наклона стиля заданное значение; не вышло — предупреждение."""
+        try:
+            style.ObliqueAngle = math.radians(float(oblique_deg))
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"не удалось задать угол наклона {oblique_deg:g}° стиля {name}: {exc}")
 
     @staticmethod
     def _find_text_style(styles: Any, name: str) -> Any | None:
@@ -3020,20 +3142,26 @@ class AcadBuilder:
         *,
         font_file: str | None = None,
         typeface: str | None = None,
+        oblique_deg: float | None = None,
     ) -> str:
-        """Вернуть существующий стиль без изменений; если его нет — создать с запасным шрифтом.
+        """Вернуть существующий стиль; если его нет — создать с запасным шрифтом.
 
         Имя может отличаться регистром от имени в DWG (``Romans`` / ``ROMANS``):
         возвращается фактическое имя найденного стиля, новый дубль не создаётся.
+        ``oblique_deg`` — требуемый угол наклона стиля (задаётся и существующему).
         """
         try:
             styles = doc.TextStyles
             existing = self._find_text_style(styles, name)
             if existing is not None:
+                if oblique_deg is not None:
+                    self._set_style_oblique(existing, oblique_deg, name, warnings)
                 return str(getattr(existing, "Name", name) or name)
             style = _com_retry(styles.Add, name)
         except Exception as exc:  # noqa: BLE001
             raise AcadDrawError(f"Не удалось получить или создать стиль {name}: {exc}") from exc
+        if oblique_deg is not None:
+            self._set_style_oblique(style, oblique_deg, name, warnings)
 
         configured = False
         font_error = None
@@ -3327,7 +3455,10 @@ class AcadBuilder:
                 )
 
             try:
-                model_space = doc.ModelSpace
+                # _com_retry: занятый AutoCAD отклоняет и чтение свойства
+                # (-2147418111; ночной сбой 3870 — третий план умер на этом,
+                # хотя соседние вызовы через секунду проходили).
+                model_space = _com_retry(getattr, doc, "ModelSpace")
             except Exception as exc:  # noqa: BLE001
                 raise AcadDrawError(f"не удалось получить ModelSpace: {exc}") from exc
 
@@ -3351,6 +3482,7 @@ class AcadBuilder:
                 draft_street_style = self._ensure_named_text_style(
                     doc, PRINT_STREET_STYLE, warnings,
                     typeface="Times New Roman", font_file="romans.shx",
+                    oblique_deg=STREET_TEXT_OBLIQUE_DEG,
                 )
                 draft_text_style = self._ensure_named_text_style(
                     doc, PRINT_TEXT_STYLE, warnings, font_file="romans.shx"
@@ -3380,7 +3512,7 @@ class AcadBuilder:
                     doc, text_layer_name, int(colors.get("boundary_text", 7)), warnings
                 )
                 street_row_layer = self._ensure_survey_layer(
-                    doc, "M-ROW-LINE", 1, warnings, linetype="Continuous"
+                    doc, "M-ROW-LINE", STREET_ROW_COLOR, warnings, linetype="Continuous"
                 )
                 if line_layer == "0":
                     warnings.append(
@@ -3397,7 +3529,8 @@ class AcadBuilder:
                 for row_line in geo.lines:
                     try:
                         if not is_neighbor:
-                            self._add_survey_line(model_space, row_line, street_row_layer, 1)
+                            self._add_survey_line(model_space, row_line, street_row_layer, STREET_ROW_COLOR,
+                                                  warnings=warnings)
                         else:
                             self._add_line(model_space, row_line, street_row_layer)
                     except Exception as exc:  # noqa: BLE001
@@ -3417,10 +3550,11 @@ class AcadBuilder:
                         line_ent = self._add_line(model_space, b_line, poly_target_layer)
                     else:
                         on_street = index in street_indices
-                        layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                        layer, color = (street_row_layer, STREET_ROW_COLOR) if on_street else (poly_target_layer, 3)
                         line_ent = self._add_survey_line(
                             model_space, b_line, layer, color,
                             linetype="ByLayer" if on_street else "Continuous",
+                            warnings=warnings,
                         )
                     created_boundary_lines += 1
                     if primary_entity is None:
@@ -3444,7 +3578,7 @@ class AcadBuilder:
                     street_indices.add(index)
                 for index, b_line in enumerate(geo.boundary_lines):
                     on_street = index in street_indices
-                    layer, color = (street_row_layer, 1) if on_street else (poly_target_layer, 3)
+                    layer, color = (street_row_layer, STREET_ROW_COLOR) if on_street else (poly_target_layer, 3)
                     # PL должен быть сплошным даже если существующий слой пунктирный.
                     line_ent = self._add_survey_line(
                         model_space, b_line, layer, color,
@@ -3513,6 +3647,15 @@ class AcadBuilder:
                             model_space, item, geo.text_height, item_layer, item_style,
                             strict_style=True,
                         )
+                    if item.kind in {"main-street", "cross-street"}:
+                        # Названия улиц — белые явным цветом объекта (заказчик,
+                        # 24.11.2026): цвет слоя в шаблоне может быть красным.
+                        # В исправленных MTEXT красные вставки \C1 не трогаем.
+                        try:
+                            entity.Color = STREET_NAME_TEXT_COLOR
+                        except Exception:  # noqa: BLE001
+                            warnings.append(
+                                f"не удалось задать белый цвет названия улицы «{item.text}»")
                     created += 1
                     # Только однострочные bearing + расстояние печатного черновика.
                     match = re.fullmatch(r"side-(\d+)", item.kind) if geo.print_draft else None

@@ -37,6 +37,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover
 
 import app_updater
 import auto_dwg_save
+import folder_dialog
 import lot_identity
 import file_metadata
 import legal_page_search
@@ -85,6 +87,7 @@ from acad_builder import (
     AcadBuilderError,
     AcadConnectionError,
     DrawPlan,
+    add_new_document,
     make_print_draft,
     DrawResult,
     FeatureLabelResult,
@@ -144,7 +147,10 @@ from llm_parser import (
     parse_page_range,
     parse_with_regex,
     prepare_survey_image_bytes,
+    model_output_price_rub,
     protect_api_key,
+    reasoning_spec,
+    resolve_reasoning_effort,
     recheck_consensus_discrepancies,
     recheck_typo_suspicion,
     resolve_api_target,
@@ -156,6 +162,7 @@ import browser_save
 import console_window
 import deed_intake
 import deed_store
+import job_queue
 import nyc_portal
 import ocr_pages
 import rcclerk
@@ -203,13 +210,15 @@ CENTER_PANEL_MIN_WIDTH = 260
 RESULT_SPLITTER_WIDTH = 12
 
 # Глобальные вкладки окна: шаги технологической цепочки Title Survey.
-# Шаг 0 стоит перед Шагом 1: сначала документы участка, потом посадка границы.
-STEP_TAB_DEEDS = "Шаг 0. Документы участка"
+# «Данные» стоят перед Шагом 0: очередь папок-задач, дальше — как обычно:
+# Шаг 0 документы участка, потом посадка границы.
+STEP_TAB_DATA = "Данные"
+STEP_TAB_DEEDS = "Шаг 0. Документы"
 STEP_TAB_BOUNDARY = "Шаг 1. Граница участка (Legal Description)"
 STEP_TAB_LABELS = "Шаг 2. Автоподписание объектов (D-TOPO-TEXT)"
 # Шага 3 в программе пока нет (пропущен в постановке): после Шага 2 идёт Шаг 4.
 STEP_TAB_OFFSETS = "Шаг 4. Оффсеты"
-STEP_TABS = (STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
+STEP_TABS = (STEP_TAB_DATA, STEP_TAB_DEEDS, STEP_TAB_BOUNDARY, STEP_TAB_LABELS, STEP_TAB_OFFSETS)
 #: Роль файла, который человек докачал сам: наш участок или сосед.
 STEP0_MANUAL_ROLES = ("Наш участок", "Сосед")
 STEP0_PORTAL_RELIABLE = "Надёжный"
@@ -224,8 +233,8 @@ STEP0_EMPTY_REPORT = (
     "2. Проверьте Block, Lot и соседей слева/справа; поля можно исправить вручную. "
     "Каждый сосед получает роль «сосед» и файл, например LOT 30 NEW.pdf. "
     "Если портал/ИИ недоступен, значения можно ввести самостоятельно.\n"
-    "3. Нажмите «Собрать описания»: программа откроет список документов Richmond "
-    "County Clerk, возьмёт Deed (новее 2015 года; иначе свежую Mortgage с 2015 года), скачает свежий и старый "
+    "3. Нажмите «Собрать описания»: программа откроет список документов участка "
+    "(Staten Island — Richmond County Clerk, остальные районы — ACRIS), возьмёт Deed (новее 2015 года; иначе свежую Mortgage с 2015 года), скачает свежий и старый "
     "документ нашего участка, найдёт страницы описания и положит всё в папку "
     "01_описания вместе с паспортами и _manifest.json.\n\n"
     "Если сайт закрыт проверкой Cloudflare, программа открывает ссылку в браузере "
@@ -236,7 +245,7 @@ STEP2_EMPTY_REPORT = (
     "Отчёт появится после запуска.\n\n"
     "1. Откройте в AutoCAD чертёж, в котором уже посажена граница участка (Шаг 1).\n"
     "2. При необходимости введите текст для основного дома.\n"
-    "3. Нажмите «Автопоиск участка и подписание объектов» либо укажите границу в AutoCAD.\n\n"
+    "3. Нажмите «Автопоиск и подписание» либо укажите границу в AutoCAD.\n\n"
     "Заметки полевого чертёжника переводятся в формулировки заказчика (WOOD PORCH → FRAME DECK, "
     "PAVERS → DECO. PAVERS, CHAIN LINK GATE → C.L.F. / GATE) и ставятся в слой D-TOPO-TEXT.\n"
     "В отчёте будет показано, сколько объектов найдено по заметкам, по кодам точек "
@@ -633,7 +642,27 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage: str | None = None
         self._step0_auto_address = ""
         self._step0_auto_identity: tuple[str, str, str, str] | None = None
+        # Ранний сбор автопотока: наш участок качается сразу по Block/Lot,
+        # не дожидаясь номеров соседей от нейронок; соседи — вторым проходом.
+        self._step0_early_active = False
+        self._step0_early_phase = ""  # "our" → "neighbours"
+        self._step0_neighbour_lots: list[int] | None = None  # None — ответа ещё нет
+        self._step0_our_outcome: Any = None
+        self._auto_stream_batch: Any = None
+        self._auto_stream_jobs: tuple[Any, ...] = ()
         self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
+        # Страница «Данные»: очередь папок-задач («номер…#адрес») через
+        # автопоток; каждая задача — подпапка data и лог сессии в ней.
+        self._job_tasks: list[dict[str, Any]] = []
+        self._job_runner_active = False
+        self._job_current = -1
+        self._job_phase = ""
+        self._job_stop_requested = False
+        self._job_phase_deadline = 0.0
+        self._job_created_doc: Any = None
+        self._job_dwg_before: set[str] = set()
+        self._job_log_sink: list[tuple[str, str, str, str]] | None = None
+        self._job_started_at = ""
         self.house_text_var = ctk.StringVar(value="")
         self.feature_text_height_var = ctk.StringVar(value="")
         # Настройки Шага 2 читаются один раз: раньше каждый переключатель заново
@@ -691,7 +720,7 @@ class SurveyApp(ctk.CTk):
             if default_m and default_m not in models:
                 models.insert(0, default_m)
             if not models:
-                models = [default_m or "glm-5.2"]
+                models = [default_m or "grok-4.7"]
             self._provider_models[pid] = models
             self._selected_models[pid] = default_m or models[0]
 
@@ -737,6 +766,16 @@ class SurveyApp(ctk.CTk):
         init_passes = max(1, min(3, int(cons_cfg.get("passes") or 1)))
         self.passes_options = ["1 проход", "2 прохода", "3 прохода"]
         self.passes_label_var = ctk.StringVar(value=self.passes_options[init_passes - 1])
+
+        # Уровни рассуждений моделей Hydra: выбор пользователя на каждую модель
+        hydra_reasoning_cfg = ((self.config_data["api"].get("providers") or {}).get("hydra") or {}).get("reasoning_by_model")
+        self._reasoning_by_model: dict[str, str] = (
+            {str(k): str(v) for k, v in hydra_reasoning_cfg.items() if str(k).strip() and str(v).strip()}
+            if isinstance(hydra_reasoning_cfg, dict) else {}
+        )
+        self.reasoning_var = ctk.StringVar(value="")
+        self.pass2_reasoning_var = ctk.StringVar(value="")
+        self.pass3_reasoning_var = ctk.StringVar(value="")
 
         p2_pid = str(cons_cfg.get("pass2_provider") or "openrouter").strip().lower()
         if p2_pid not in self._pid_to_label:
@@ -1192,11 +1231,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         ctk.CTkLabel(
             update_row,
-            text=(
-                "Источник обновления. Оставьте пустым — программа сама найдёт ветку "
-                "с наибольшей версией (тестовые ветки пропускает). Ссылка нужна, только "
-                "если хотите конкретную ветку, репозиторий или .zip."
-            ),
+            text="Пусто = сама найдёт ветку",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1209,7 +1244,7 @@ class SurveyApp(ctk.CTk):
             height=30,
             fg_color=THEME["bg_editor"],
             border_color=THEME["border_card"],
-            placeholder_text="пусто = найти автоматически (или github.com/owner/repo/tree/branch)",
+            placeholder_text="пусто = авто",
         )
         self.update_source_entry.grid(row=2, column=0, sticky="ew", padx=(10, 4), pady=(0, 6))
         self.update_version_button = ctk.CTkButton(
@@ -1264,12 +1299,7 @@ class SurveyApp(ctk.CTk):
         self.update_progress_bar.grid_remove()  # показываем только во время обновления
         ctk.CTkLabel(
             update_row,
-            text=(
-                "Архив скачивается и принудительно разворачивается в папку программы "
-                "(совпадающие файлы заменяются); config.json, config.local.json и .env "
-                "не трогаются — ваш выбор провайдера/моделей и ключи сохранятся. "
-                "После обновления перезапустите программу."
-            ),
+            text="🔄",
             anchor="w",
             justify="left",
             wraplength=394,
@@ -1303,7 +1333,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkLabel(
             drawer_body,
-            text="API-КЛЮЧИ (НА ДИСК ПОПАДАЮТ ТОЛЬКО ШИФРОВАННЫЕ ТОКЕНЫ TSAI1:…)",
+            text="🔑",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1402,7 +1432,7 @@ class SurveyApp(ctk.CTk):
         self.secret_eye_button.grid(row=1, column=1, padx=(5, 2), pady=(3, 0), sticky="w")
         ctk.CTkLabel(
             vault_row,
-            text="На диске хранится только зашифрованный токен tsai1:… (MachineGuid + DPAPI + PIN)",
+            text="🔒",
             anchor="w",
             justify="left",
             wraplength=410,
@@ -1473,7 +1503,7 @@ class SurveyApp(ctk.CTk):
         self.start_source_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
         ctk.CTkLabel(
             start_card,
-            text="Что открывать при запуске программы. Действует со следующего запуска.",
+            text="При запуске открывать",
             font=ctk.CTkFont(size=10),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1489,7 +1519,7 @@ class SurveyApp(ctk.CTk):
         ctk.CTkLabel(help_card, text="🆘 ПОМОЩЬ И ОБРАТНАЯ СВЯЗЬ",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#fbbf24", anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
-        ctk.CTkLabel(help_card, text="Столкнулись с ошибкой? Нажмите «Пожаловаться» — к разработчику уйдут только последние записи журнала и ваш комментарий. Без нажатия ничего не отправляется.",
+        ctk.CTkLabel(help_card, text="🐞 Пожаловаться — отправить журнал разработчику",
                      font=ctk.CTkFont(size=10), text_color=THEME["text_dim"], anchor="w", justify="left", wraplength=400).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
         ctk.CTkButton(help_card, text="🐛 Пожаловаться разработчику",
                       height=32, fg_color="#ea580c", hover_color="#c2410c",
@@ -1518,7 +1548,7 @@ class SurveyApp(ctk.CTk):
             command=self._on_theme_changed,
         )
         self.theme_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
-        ctk.CTkLabel(theme_card, text="Тема сохранится и применится после перезапуска программы.",
+        ctk.CTkLabel(theme_card, text="После перезапуска",
                      font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
                      anchor="w", justify="left", wraplength=400).grid(
                          row=2, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -1540,7 +1570,7 @@ class SurveyApp(ctk.CTk):
         self.ask_on_doubt_check.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
         ctk.CTkLabel(
             self.doubt_settings_card,
-            text="Включено: спрашивать при оставшихся сомнениях. Выключено: показывать замечания без вопросов. Однозначные автоисправления отмечаются на чертеже.",
+            text="Спрашивать при сомнениях",
             font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -1586,11 +1616,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkLabel(
             self.llm_policy_row,
-            text=(
-                "Независимые запросы идут параллельно. Расхождение откроет панель выбора, "
-                "совпадение — покажет результат. Автоисправленные значения отмечаются "
-                "в журнале и на основном чертеже."
-            ),
+            text="⧉",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1670,6 +1696,28 @@ class SurveyApp(ctk.CTk):
         )
         self.model_combo.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
 
+        self.reasoning_label = ctk.CTkLabel(
+            pass1_card,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.reasoning_label.grid(row=5, column=0, sticky="w", padx=10)
+        self.reasoning_switch = ctk.CTkSegmentedButton(
+            pass1_card,
+            values=[],
+            variable=self.reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.reasoning_switch.grid(row=6, column=0, sticky="ew", padx=10, pady=(2, 9))
+
         # Слот Прохода #2 (независимая сверка)
         self.pass2_row = _slot_card(3, "Проход #2", "независимая сверка", THEME["sky"])
         self.pass2_provider_switch = ctk.CTkSegmentedButton(
@@ -1698,6 +1746,28 @@ class SurveyApp(ctk.CTk):
         )
         self.pass2_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
 
+        self.pass2_reasoning_label = ctk.CTkLabel(
+            self.pass2_row,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.pass2_reasoning_label.grid(row=3, column=0, sticky="w", padx=10)
+        self.pass2_reasoning_switch = ctk.CTkSegmentedButton(
+            self.pass2_row,
+            values=[],
+            variable=self.pass2_reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(2, val),
+        )
+        self.pass2_reasoning_switch.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
+
         # Слот Прохода #3 (арбитражный)
         self.pass3_row = _slot_card(4, "Проход #3", "арбитражный слот", THEME["ok"])
         self.pass3_provider_switch = ctk.CTkSegmentedButton(
@@ -1725,6 +1795,28 @@ class SurveyApp(ctk.CTk):
             command=lambda val: self._on_pass_model_selected(3, val),
         )
         self.pass3_model_combo.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 9))
+
+        self.pass3_reasoning_label = ctk.CTkLabel(
+            self.pass3_row,
+            text="Рассуждения модели:",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        )
+        self.pass3_reasoning_label.grid(row=3, column=0, sticky="w", padx=10)
+        self.pass3_reasoning_switch = ctk.CTkSegmentedButton(
+            self.pass3_row,
+            values=[],
+            variable=self.pass3_reasoning_var,
+            height=26,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(3, val),
+        )
+        self.pass3_reasoning_switch.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 9))
 
         # 3. Левая колонка «1 Источник»: шапка панели + вкладки Текст / PDF / Фото
         workspace = self.left_panel
@@ -1861,7 +1953,7 @@ class SurveyApp(ctk.CTk):
 
         self.load_pdf_button = ctk.CTkButton(
             self.pdf_mode_card,
-            text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O",
+            text="⭱ Выберите PDF · Ctrl+O",
             height=64,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -1903,10 +1995,7 @@ class SurveyApp(ctk.CTk):
         self.pdf_pages_entry.grid(row=0, column=1, sticky="e", padx=10, pady=7)
         self.pdf_info_label = ctk.CTkLabel(
             self.pdf_mode_card,
-            text=(
-                "После выбора откроется список: отметьте наш участок и страницы с границами. "
-                "Текст обхода — бесплатно и локально, скан — через ИИ/Vision."
-            ),
+            text="☰",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -1917,7 +2006,7 @@ class SurveyApp(ctk.CTk):
 
         self.load_images_button = ctk.CTkButton(
             self.pdf_mode_card,
-            text="📷 Загрузить фото чертежа · Ctrl+I",
+            text="📷 Фото",
             height=30,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -1994,7 +2083,7 @@ class SurveyApp(ctk.CTk):
         self.photo_empty_card.grid_columnconfigure(0, weight=1)
         self.photo_load_button = ctk.CTkButton(
             self.photo_empty_card,
-            text="📷  Выберите фото чертежа\nJPG · PNG · TIFF · несколько кадров · Ctrl+I",
+            text="📷",
             height=132,
             fg_color=THEME["bg_field"],
             hover_color=THEME["accent_soft_bg"],
@@ -2136,7 +2225,7 @@ class SurveyApp(ctk.CTk):
 
         self.enhance_scan_switch = ctk.CTkSwitch(
             visual_opts_card,
-            text="Чёткость фото 80-х  (контраст и резкость без искажения цветов)",
+            text="Резкость 80-х",
             variable=self.enhance_scan_var,
             font=ctk.CTkFont(size=11),
             command=self._redraw_preview_canvas,
@@ -2320,6 +2409,27 @@ class SurveyApp(ctk.CTk):
         )
         self.passes_switch_mini.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
 
+        self.reasoning_main_label = ctk.CTkLabel(
+            engine_card,
+            text="Рассужд.",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+        )
+        self.reasoning_main_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.reasoning_switch_main = ctk.CTkSegmentedButton(
+            engine_card,
+            values=[],
+            variable=self.reasoning_var,
+            height=24,
+            fg_color=THEME["bg_editor"],
+            unselected_color=THEME["bg_editor"],
+            selected_color=THEME["seg_sel"],
+            selected_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.reasoning_switch_main.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
+
         # Блок главного действия в источнике (Spectrum: «Разобрать и проверить» + regex)
         run_box = ctk.CTkFrame(input_frame, fg_color=THEME["bg_header"], corner_radius=0)
         run_box.grid(row=7, column=0, sticky="ew", pady=(10, 0))
@@ -2327,7 +2437,7 @@ class SurveyApp(ctk.CTk):
 
         self.parse_button = ctk.CTkButton(
             run_box,
-            text="✨ Разобрать с ИИ · Ctrl+Enter",
+            text="✨ ИИ-разбор",
             height=44,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
@@ -2520,6 +2630,7 @@ class SurveyApp(ctk.CTk):
                 bind_fn("<B1-Motion>", self._on_canvas_drag_move)
                 bind_fn("<ButtonRelease-1>", self._on_canvas_drag_end)
                 bind_fn("<Double-Button-1>", lambda _ev: self.reset_viewport_zoom())
+                bind_fn("<Triple-Button-1>", self._open_model_test_window)
                 bind_fn("<Motion>", self._on_canvas_hover)
                 bind_fn("<Leave>", self._on_canvas_leave)
 
@@ -2575,7 +2686,7 @@ class SurveyApp(ctk.CTk):
 
         self.canvas_hint_label = ctk.CTkLabel(
             canvas_wrap,
-            text="Колесо — зум · ЛКМ — панорама · 2× клик — вписать",
+            text="Колесо — зум, ЛКМ — панорама",
             font=ctk.CTkFont(size=10),
             fg_color=THEME["bg_header"],
             text_color=THEME["text_dim"],
@@ -2880,7 +2991,7 @@ class SurveyApp(ctk.CTk):
 
         self.sides_title_label = ctk.CTkLabel(
             self.sheet_tab_frame,
-            text="СТОРОНЫ КОНТУРА (наведите мышью на схеме — подсветка синхронна)",
+            text="СТОРОНЫ КОНТУРА",
             font=self._result_fonts["small_bold"],
             wraplength=self._result_wrap_length(),
             justify="left",
@@ -3074,7 +3185,7 @@ class SurveyApp(ctk.CTk):
 
         self.draw_button = ctk.CTkButton(
             footer,
-            text="▶  Начертить схему в AutoCAD   F5",
+            text="▶ В AutoCAD",
             height=42,
             width=300,
             fg_color=THEME["btn_primary"],
@@ -3088,6 +3199,7 @@ class SurveyApp(ctk.CTk):
         self._build_step0_page()
         self._build_step2_page()
         self._build_step4_page()
+        self._build_data_page()
         self._switch_step_tab()
 
     # ------------------------------------------- глобальные вкладки шагов ---
@@ -3114,16 +3226,564 @@ class SurveyApp(ctk.CTk):
                 padx=(16 if column == 0 else 6, 0), pady=(8, 8),
             )
             self.step_tab_buttons[label] = button
+
+
+    # --------------------------------------------------- Страница «Данные» ---
+    _JOB_AUTOFLOW_TIMEOUT_SEC = 3600.0
+    _JOB_DRAW_TIMEOUT_SEC = 900.0
+    _JOB_STATUS_ICON = {
+        "ожидает": "•", "выполняется": "▶", "готово": "✔", "ошибка": "✖",
+        "не подходит": "⚠", "остановлено": "⏹", "пропущено": "—",
+    }
+
+    def _build_data_page(self) -> None:
+        """
+        Страница «Данные»: очередь папок-задач «номер…#адрес».
+
+        Каждая подходящая папка проходит весь автопоток (адрес → сбор PDF →
+        разбор → новый DWG в AutoCAD) в своей подпапке ``data``; сбой одного
+        задания не останавливает остальные. Здесь же — основная ИИ-модель и
+        её уровень рассуждений (те же настройки, что на Шаге 1 и в Настройках).
+        """
+        page = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
+        page.grid(row=2, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=0)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        self.data_page = page
+
+        panel = ctk.CTkFrame(
+            page, width=440, fg_color=THEME["bg_card"], corner_radius=10,
+            border_width=1, border_color=THEME["border_card"],
+        )
+        panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=(4, 12))
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(
-            bar,
-            text=(
-                "Порядок работы: 0 — документы участка → 1 — посадка границы → "
-                "2 — подписи объектов → 4 — оффсеты"
-            ),
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_dim"],
-            anchor="e",
-        ).grid(row=0, column=len(STEP_TABS), sticky="e", padx=(8, 16))
+            panel, text=STEP_TAB_DATA,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=THEME["text_main"], anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            panel,
+            text="Папки «номер#адрес» — по очереди: PDF → DWG, всё в data.",
+            font=ctk.CTkFont(size=11), text_color=THEME["text_muted"],
+            anchor="w", justify="left", wraplength=400,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(
+            panel, text="Основная ИИ-модель:",
+            font=ctk.CTkFont(size=11), text_color=THEME["text_dim"], anchor="w",
+        ).grid(row=2, column=0, sticky="w", padx=16)
+        self.data_model_combo = ctk.CTkComboBox(
+            panel, values=[], variable=self.model_var, height=30,
+            fg_color=THEME["bg_editor"], border_color=THEME["border_card"],
+            button_color=THEME["btn_secondary"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(family="Consolas", size=11),
+            command=self._on_model_selected,
+        )
+        self.data_model_combo.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 6))
+        ctk.CTkLabel(
+            panel, text="Рассуждения модели:",
+            font=ctk.CTkFont(size=11), text_color=THEME["text_dim"], anchor="w",
+        ).grid(row=4, column=0, sticky="w", padx=16)
+        self.data_reasoning_switch = ctk.CTkSegmentedButton(
+            panel, values=["—"], height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda val: self._on_reasoning_changed(1, val),
+        )
+        self.data_reasoning_switch.grid(row=5, column=0, sticky="ew", padx=16, pady=(2, 12))
+
+        self.data_scan_button = ctk.CTkButton(
+            panel, text="📂 Сканировать каталог…", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_scan_catalog_clicked,
+        )
+        self.data_scan_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 6))
+        row_buttons = ctk.CTkFrame(panel, fg_color="transparent")
+        row_buttons.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 6))
+        row_buttons.grid_columnconfigure(0, weight=1)
+        row_buttons.grid_columnconfigure(1, weight=1)
+        self.data_add_button = ctk.CTkButton(
+            row_buttons, text="➕ Папку…", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_add_folder_clicked,
+        )
+        self.data_add_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.data_clear_button = ctk.CTkButton(
+            row_buttons, text="🧹 Очистить", height=32,
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._data_clear_tasks,
+        )
+        self.data_clear_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.data_run_button = ctk.CTkButton(
+            panel, text="▶ Запустить очередь", height=38,
+            fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._start_job_queue,
+        )
+        self.data_run_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(6, 6))
+        self.data_stop_button = ctk.CTkButton(
+            panel, text="⏹ Остановить очередь", height=32, state="disabled",
+            fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"), command=self._stop_job_queue,
+        )
+        self.data_stop_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 10))
+        # «Ждать долгую капчу»: обычное ожидание PDF в «Загрузках» — 45 с
+        # (исход браузерной ступени ясен раньше); с галочкой — прежние 300 с
+        # для обоих источников (Клерк и ACRIS), если проверка Cloudflare на
+        # сайте висит минутами. Действует и на очередь, и на автопоток Шага 0.
+        self.data_long_captcha_var = ctk.BooleanVar(value=False)
+        self.data_long_captcha_check = ctk.CTkCheckBox(
+            panel,
+            text="Ждать долгую капчу (ожидание PDF 300 с вместо 45 с)",
+            variable=self.data_long_captcha_var,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=THEME["btn_primary"],
+            hover_color=THEME["btn_primary_hover"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+        )
+        self.data_long_captcha_check.grid(row=10, column=0, sticky="w", padx=16, pady=(0, 12))
+
+        right = ctk.CTkFrame(
+            page, fg_color=THEME["bg_card"], corner_radius=10,
+            border_width=1, border_color=THEME["border_card"],
+        )
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        self.data_status_var = ctk.StringVar(value="Добавьте папки работ: сканированием каталога или выбором (можно сразу несколько).")
+        ctk.CTkLabel(
+            right, textvariable=self.data_status_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"], anchor="w", justify="left", wraplength=700,
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
+        self.data_list_frame = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        self.data_list_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 10))
+        self.data_list_frame.grid_columnconfigure(0, weight=1)
+        self._refresh_data_task_list()
+
+    def _refresh_data_controls(self) -> None:
+        """Модель и рассуждения на странице «Данные» = общие настройки ИИ."""
+        if not hasattr(self, "data_model_combo"):
+            return
+        try:
+            pid = self.current_provider_id()
+            self.data_model_combo.configure(values=self._provider_models.get(pid, []))
+            spec = reasoning_spec(*self._reasoning_target(1))
+            if spec is None:
+                self.data_reasoning_switch.configure(values=["—"], state="disabled")
+                self.data_reasoning_switch.set("—")
+            else:
+                default, choices = spec
+                stored = str(self._reasoning_by_model.get(self.current_model()) or "").strip()
+                self.data_reasoning_switch.configure(values=list(choices), state="normal")
+                self.data_reasoning_switch.set(stored if stored in choices else default)
+        except Exception:  # noqa: BLE001 - страница не должна ронять настройки
+            pass
+
+    def _data_add_folders(self, paths) -> None:
+        known = {str(task["path"]) for task in self._job_tasks}
+        added = 0
+        for raw in paths or []:
+            folder = Path(raw)
+            if str(folder) in known or not folder.is_dir():
+                continue
+            known.add(str(folder))
+            info = job_queue.describe_job_folder(folder)
+            self._job_tasks.append({
+                "path": folder,
+                "info": info,
+                "reason": "" if info else job_queue.invalid_reason(folder.name),
+                "status": "ожидает" if info else "не подходит",
+                "detail": "",
+            })
+            added += 1
+        self._refresh_data_task_list()
+        if added:
+            valid = sum(1 for task in self._job_tasks if task["info"])
+            self.data_status_var.set(
+                f"Папок в списке: {len(self._job_tasks)}; в очередь пойдут: {valid}.")
+
+    def _data_scan_catalog_clicked(self) -> None:
+        from tkinter import filedialog
+
+        chosen = filedialog.askdirectory(title="Каталог с папками работ")
+        if chosen:
+            self._data_add_folders(job_queue.scan_catalog(chosen))
+
+    def _data_add_folder_clicked(self) -> None:
+        from tkinter import filedialog
+
+        # Нативный диалог Windows умеет выбирать сразу несколько папок
+        # (Ctrl/Shift); tkinter askdirectory — только одну, и папки приходилось
+        # добавлять по одной, вылезая из предыдущей на уровень вверх. Начальная
+        # папка — родительская от прошлого выбора, а не сама выбранная папка.
+        # Любой сбой нативного диалога — откат на прежний askdirectory.
+        initial_dir = getattr(self, "_data_dialog_initial_dir", None)
+        chosen: list[str] = []
+        native_done = False
+        if folder_dialog.available():
+            try:
+                try:
+                    parent_hwnd = int(self.winfo_id())
+                except Exception:  # noqa: BLE001 - диалог и без владельца откроется
+                    parent_hwnd = 0
+                chosen = folder_dialog.ask_folders(
+                    "Папки работ (номер#адрес) — можно выбрать несколько (Ctrl/Shift)",
+                    parent_hwnd=parent_hwnd,
+                    initial_dir=initial_dir,
+                )
+                native_done = True
+            except Exception:  # noqa: BLE001 - откат на обычный диалог ниже
+                native_done = False
+        if not native_done:
+            dialog_kwargs: dict[str, Any] = {"title": "Папка работы (номер#адрес)"}
+            if initial_dir:
+                dialog_kwargs["initialdir"] = initial_dir
+            single = filedialog.askdirectory(**dialog_kwargs)
+            chosen = [single] if single else []
+        if chosen:
+            parent = Path(chosen[0]).parent
+            if parent.is_dir():
+                self._data_dialog_initial_dir = str(parent)
+            self._data_add_folders(chosen)
+
+    def _pdf_wait_sec(self) -> float:
+        """Ожидание PDF в «Загрузках»: 45 с; галочка «Ждать долгую капчу» — 300 с."""
+        var = getattr(self, "data_long_captcha_var", None)
+        try:
+            long_wait = bool(var.get()) if var is not None else False
+        except Exception:  # noqa: BLE001 - галочка не должна ломать сбор
+            long_wait = False
+        return deed_intake.PDF_WAIT_LONG_SEC if long_wait else deed_intake.PDF_WAIT_SEC
+
+    def _data_remove_task(self, index: int) -> None:
+        if self._job_runner_active:
+            return
+        if 0 <= index < len(self._job_tasks):
+            del self._job_tasks[index]
+        self._refresh_data_task_list()
+
+    def _data_clear_tasks(self) -> None:
+        if self._job_runner_active:
+            return
+        self._job_tasks.clear()
+        self._refresh_data_task_list()
+
+    _JOB_STATUS_COLOR = {
+        "готово": "ok", "ошибка": "warn", "не подходит": "warn",
+        "выполняется": "text_main", "ожидает": "text_muted",
+        "остановлено": "warn", "пропущено": "text_dim",
+    }
+
+    def _refresh_data_task_list(self) -> None:
+        frame = getattr(self, "data_list_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if not self._job_tasks:
+            ctk.CTkLabel(
+                frame, text="Папок пока нет",
+                font=ctk.CTkFont(size=11), text_color=THEME["text_dim"],
+                anchor="w", justify="left", wraplength=640,
+            ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+            return
+        for index, task in enumerate(self._job_tasks):
+            info = task["info"]
+            status = task["status"]
+            color = THEME[self._JOB_STATUS_COLOR.get(status, "text_muted")]
+            row = ctk.CTkFrame(frame, fg_color=THEME["bg_field"], corner_radius=8)
+            row.grid(row=index, column=0, sticky="ew", padx=4, pady=3)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                row, text=f"{self._JOB_STATUS_ICON.get(status, '•')} {status}",
+                font=ctk.CTkFont(size=11, weight="bold"), text_color=color,
+                anchor="w", width=110,
+            ).grid(row=0, column=0, sticky="nw", padx=(10, 4), pady=(7, 1))
+            title = info.title if info else task["path"].name
+            ctk.CTkLabel(
+                row, text=title, font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=THEME["text_main"], anchor="w", justify="left", wraplength=640,
+            ).grid(row=0, column=1, sticky="ew", pady=(7, 1))
+            detail = task["detail"] or (task["reason"] if not info else str(task["path"]))
+            ctk.CTkLabel(
+                row, text=detail, font=ctk.CTkFont(size=10),
+                text_color=THEME["text_dim"], anchor="w", justify="left", wraplength=640,
+            ).grid(row=1, column=1, sticky="ew", pady=(0, 7))
+            remove = ctk.CTkButton(
+                row, text="✕", width=30, height=30,
+                fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
+                font=ctk.CTkFont(size=11),
+                state="disabled" if self._job_runner_active else "normal",
+                command=lambda i=index: self._data_remove_task(i),
+            )
+            remove.grid(row=0, column=2, rowspan=2, padx=(4, 10), pady=7)
+
+    def _data_set_controls(self, *, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for widget in (self.data_scan_button, self.data_add_button,
+                       self.data_clear_button, self.data_run_button):
+            widget.configure(state=state)
+        self.data_stop_button.configure(state="normal" if running else "disabled")
+        self._refresh_data_task_list()
+
+    # --- Очередь заданий: автопоток → новый DWG, что бы ни случилось дальше ---
+
+    def _sink_job(self, source: str, message: str, level: str = log_mode.LEVEL_INFO) -> None:
+        if self._job_log_sink is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), source, level, str(message)))
+
+    def _job_last_error_line(self) -> str:
+        for _stamp, _src, level, text in reversed(self._job_log_sink or []):
+            if level == log_mode.LEVEL_ERROR and text:
+                return text
+        return ""
+
+    def _start_job_queue(self) -> None:
+        if self._job_runner_active:
+            return
+        if (self._busy or self._step0_running or self._step0_portal_running
+                or self._step0_auto_stage):
+            self._set_status("Дождитесь завершения текущей работы.", warn=True)
+            return
+        if not any(task["info"] and task["status"] != "готово" for task in self._job_tasks):
+            self._set_status("В списке нет подходящих папок для очереди.", warn=True)
+            return
+        if self.step0_fast_mode_var.get():
+            self._set_status("Для очереди выключите быстрый режим поиска на Шаге 0.", warn=True)
+            return
+        for task in self._job_tasks:
+            if task["info"] and task["status"] != "готово":
+                task["status"] = "ожидает"
+                task["detail"] = ""
+        self._job_runner_active = True
+        self._job_stop_requested = False
+        self._job_current = -1
+        self._job_phase = ""
+        self._data_set_controls(running=True)
+        total = sum(1 for task in self._job_tasks if task["info"])
+        self.data_status_var.set(f"Очередь запущена: заданий — {total}.")
+        self._job_advance()
+
+    def _stop_job_queue(self) -> None:
+        if self._job_runner_active:
+            self._job_stop_requested = True
+            self.data_status_var.set("Останавливаю очередь после текущего шага…")
+
+    def _job_advance(self) -> None:
+        if self._job_stop_requested:
+            self._job_finish_queue()
+            return
+        nxt = next((i for i, task in enumerate(self._job_tasks)
+                    if task["info"] and task["status"] == "ожидает"), None)
+        if nxt is None:
+            self._job_finish_queue()
+            return
+        self._job_current = nxt
+        self._job_start_task(self._job_tasks[nxt])
+        if self._job_runner_active and self._job_phase:
+            self.after(400, self._job_queue_tick)
+
+    def _job_start_task(self, task: dict[str, Any]) -> None:
+        info = task["info"]
+        data_dir = job_queue.data_dir_for(task["path"])
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            task["status"] = "ошибка"
+            task["detail"] = f"не создал data: {exc}"
+            self._refresh_data_task_list()
+            self.after(50, self._job_advance)
+            return
+        task["status"] = "выполняется"
+        task["detail"] = "автопоток: адрес → PDF → разбор…"
+        self._job_log_sink = []
+        self._job_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._sink_job("очередь", f"Задание {info.title}; папка {task['path']}")
+        # Чистый сеанс и поля Шага 0 под это задание: адрес из имени папки,
+        # папка описаний — data (все PDF, обрезки, кэш и JSON падают туда).
+        self._reset_session()
+        self._auto_dwg_context = None
+        self._step0_outcome = None
+        self.step0_address_var.set(info.address)
+        self.step0_borough_var.set("")
+        self.step0_block_var.set("")
+        self.step0_lot_var.set("")
+        self.step0_folder_var.set(str(data_dir))
+        self._select_step_tab(STEP_TAB_DEEDS)
+        done = sum(1 for t in self._job_tasks if t["status"] == "готово")
+        total = sum(1 for t in self._job_tasks if t["info"])
+        self.data_status_var.set(
+            f"Очередь: задание {done + 1} из {total} — {info.title} (автопоток…)")
+        self._refresh_data_task_list()
+        self._job_phase = "autoflow"
+        self._job_phase_deadline = time.monotonic() + self._JOB_AUTOFLOW_TIMEOUT_SEC
+        self._start_step0_auto()
+        if not self._step0_auto_stage and not self._step0_portal_running:
+            self._job_fail_task("автопоток не запустился (см. журнал Шага 0)")
+
+    def _job_queue_tick(self) -> None:
+        if not self._job_runner_active or self._job_current < 0:
+            return
+        if self._job_stop_requested:
+            self._job_abort_current()
+            return
+        if self._job_phase and time.monotonic() > self._job_phase_deadline:
+            self._job_fail_task("тайм-аут этапа")
+            return
+        task = self._job_tasks[self._job_current]
+        if self._job_phase == "autoflow":
+            if (self._step0_auto_stage is None and not self._step0_portal_running
+                    and not self._step0_running and not self._busy):
+                self._job_after_autoflow(task)
+        elif self._job_phase == "draw":
+            if not self._busy:
+                self._job_after_draw(task)
+        if self._job_runner_active and self._job_phase:
+            self.after(400, self._job_queue_tick)
+
+    def _job_after_autoflow(self, task: dict[str, Any]) -> None:
+        context = self._auto_dwg_context
+        data_dir = job_queue.data_dir_for(task["path"])
+        if context is None or Path(context[1]).resolve() != data_dir.resolve():
+            self._job_fail_task(
+                self._job_last_error_line() or "автопоток остановился до разбора")
+            return
+        task["detail"] = "отрисовка: новый DWG в AutoCAD…"
+        self._refresh_data_task_list()
+        self._job_dwg_before = {p.name for p in data_dir.glob("*.dwg")}
+        try:
+            self._job_created_doc = self._job_new_acad_document()
+        except Exception as exc:  # noqa: BLE001 - AutoCAD закрыт/недоступен
+            self._job_fail_task(f"AutoCAD: не создал новый документ — {exc}")
+            return
+        self._sink_job("очередь", "Создан новый документ AutoCAD; рисую схему…")
+        self._job_phase = "draw"
+        self._job_phase_deadline = time.monotonic() + self._JOB_DRAW_TIMEOUT_SEC
+        self._start(parse_only=False)
+        if not self._busy:
+            self._job_fail_task("отрисовка не запустилась (см. журнал)")
+
+    def _job_new_acad_document(self) -> Any:
+        """Новый пустой документ запущенного AutoCAD для задания очереди.
+
+        Открытый DWG не требуется: чистый AutoCAD без документов — обычное
+        состояние перед заданием, новый документ создаётся в нём самом.
+        Создание — с повтором при занятости (add_new_document): между
+        заданиями AutoCAD ещё закрывает предыдущий документ и отклоняет
+        вызовы, а мгновенный отказ губил всё задание (ночь 24–25.11.2026).
+        """
+        builder = AcadBuilder(self.config_data)
+        app = builder.connect_app()
+        doc = add_new_document(app)
+        try:
+            doc.SetVariable("INSUNITS", 2)  # футы, как ждут координаты схемы
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            app.ActiveDocument = doc
+        except Exception:  # noqa: BLE001 - Add обычно и так активирует документ
+            pass
+        return doc
+
+    def _job_after_draw(self, task: dict[str, Any]) -> None:
+        data_dir = job_queue.data_dir_for(task["path"])
+        new_dwgs = sorted(
+            p.name for p in data_dir.glob("*.dwg") if p.name not in self._job_dwg_before)
+        if not new_dwgs:
+            self._job_fail_task("DWG не сохранён в data (см. журнал)")
+            return
+        doc, self._job_created_doc = self._job_created_doc, None
+        if doc is not None:
+            try:
+                doc.Close()
+            except Exception:  # noqa: BLE001 - файл уже на диске; открытый не страшен
+                pass
+        warnings_file = auto_dwg_save.warnings_path_for(data_dir / new_dwgs[0])
+        if warnings_file.is_file():
+            self._sink_job("очередь", f"Предупреждения построения: {warnings_file.name} (рядом с DWG).")
+        self._job_succeed_task(f"DWG: {', '.join(new_dwgs)}")
+
+    def _job_abort_current(self) -> None:
+        self._step0_stop.set()
+        if getattr(self, "_step0_running", False):
+            self._stop_step0_intake()
+        task = self._job_tasks[self._job_current]
+        task["status"] = "остановлено"
+        task["detail"] = "остановлено пользователем"
+        self._sink_job("очередь", "Остановлено пользователем.")
+        self._job_close_task()
+
+    def _job_fail_task(self, detail: str) -> None:
+        task = self._job_tasks[self._job_current]
+        task["status"] = "ошибка"
+        task["detail"] = detail
+        self._sink_job("очередь", f"Задание завершено с ошибкой: {detail}",
+                       log_mode.LEVEL_ERROR)
+        self._job_close_task()
+
+    def _job_succeed_task(self, detail: str) -> None:
+        task = self._job_tasks[self._job_current]
+        task["status"] = "готово"
+        task["detail"] = detail
+        self._sink_job("очередь", f"Задание готово: {detail}", level=log_mode.LEVEL_KEY)
+        self._job_close_task()
+
+    def _job_close_task(self) -> None:
+        self._job_write_log()
+        self._job_log_sink = None
+        self._job_created_doc = None
+        self._job_phase = ""
+        self._refresh_data_task_list()
+        if self._job_stop_requested:
+            self._job_finish_queue()
+        else:
+            self.after(300, self._job_advance)
+
+    def _job_write_log(self) -> None:
+        if not (0 <= self._job_current < len(self._job_tasks)):
+            return
+        task = self._job_tasks[self._job_current]
+        info = task["info"]
+        lines = [
+            f"Задание: {task['path'].name}",
+            f"Папка: {task['path']}",
+            f"Адрес: {info.address if info else '—'}",
+            f"Старт: {self._job_started_at} · финиш: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Итог: {task['status']} · {task['detail']}",
+            f"Модель: {self.current_model()}",
+            "-" * 60,
+        ]
+        # В файл пишется весь ход работы, но без механического шума (страницы
+        # OCR, шаги загрузок, технические параметры) и с повторами подряд,
+        # схлопнутыми в одну строку, — иначе лог нечитаем (job_queue).
+        lines.append("Журнал: ход работы без служебных строк и повторов подряд; "
+                     "полный поток — на экранах Шага 0 и Журнала.")
+        lines += job_queue.session_log_lines(self._job_log_sink or [])
+        try:
+            job_queue.session_log_path(task["path"]).write_text(
+                "\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def _job_finish_queue(self) -> None:
+        for task in self._job_tasks:
+            if task["info"] and task["status"] == "ожидает":
+                task["status"] = "пропущено"
+        self._job_runner_active = False
+        self._job_phase = ""
+        self._job_current = -1
+        self._data_set_controls(running=False)
+        done = sum(1 for t in self._job_tasks if t["status"] == "готово")
+        failed = sum(1 for t in self._job_tasks if t["status"] == "ошибка")
+        self.data_status_var.set(f"Очередь завершена: готово — {done}, ошибок — {failed}.")
+        self._refresh_data_task_list()
 
     # ----------------------------------------------- Шаг 0: документы участка ---
     def _build_step0_page(self) -> None:
@@ -3155,23 +3815,6 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_main"],
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
-        ctk.CTkLabel(
-            panel,
-            text=(
-                "Staten Island — Richmond County: список документов участка, Deed новее 2015 года, "
-                "иначе свежая Mortgage с 2015 года. Наш участок — самый свежий и самый старый "
-                "документ (старый Deed), сосед — только свежий. "
-                "Имена: OUR LOT 32 NEW.pdf, OUR LOT 32 OLD.pdf, LOT 30 NEW.pdf. "
-                "Block/Lot и Borough читает локальный OCR. Vision получает карту и адрес; "
-                "при неудаче OCR надёжный режим может отправить левую половину карточки, "
-                "включая видимые персональные данные, для одного дополнительного запроса."
-            ),
-            font=ctk.CTkFont(size=11),
-            text_color=THEME["text_dim"],
-            anchor="w",
-            justify="left",
-            wraplength=430,
-        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
 
         fields = ctk.CTkFrame(panel, fg_color="transparent")
         fields.grid(row=2, column=0, sticky="ew", padx=16)
@@ -3201,7 +3844,7 @@ class SurveyApp(ctk.CTk):
               "87 Stafford Ave")
         field(1, "Borough (район Нью-Йорка)", self.step0_borough_var, "Staten Island")
         self.step0_portal_button = ctk.CTkButton(
-            fields, text="🌐 Найти по адресу + анализ карты", height=32,
+            fields, text="🌐 Адрес → Block/Lot", height=32,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._start_step0_portal_lookup,
@@ -3236,7 +3879,7 @@ class SurveyApp(ctk.CTk):
         checks.grid_columnconfigure(0, weight=1)
         ctk.CTkCheckBox(
             checks,
-            text="докачать старый документ соседей (если межа соседа спорная)",
+            text="докачать старый документ соседей",
             variable=self.step0_old_neighbour_var,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
@@ -3275,8 +3918,7 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_muted"],
         ).grid(row=0, column=2, sticky="w")
         ctk.CTkLabel(
-            checks, text="Быстрый режим пропускает проверки адресной подсказки; проверьте адрес, "
-            "Borough, Block и Lot. Он также меняет ожидания при сохранении PDF.",
+            checks, text="⚡",
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
         ).grid(row=4, column=0, sticky="w", pady=(4, 0))
@@ -3310,7 +3952,7 @@ class SurveyApp(ctk.CTk):
         self.step0_run_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(12, 4))
 
         self.step0_auto_button = ctk.CTkButton(
-            panel, text="▶ Автопоток Staten Island · ИИ · DWG после отрисовки", height=38,
+            panel, text="▶ Автопоток", height=38,
             fg_color=THEME["btn_primary"], hover_color=THEME["btn_primary_hover"],
             font=ctk.CTkFont(size=11, weight="bold"), command=self._start_step0_auto,
         )
@@ -3327,7 +3969,7 @@ class SurveyApp(ctk.CTk):
         )
         self.step0_stop_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.step0_open_button = ctk.CTkButton(
-            run_row, text="📂 Открыть папку", height=30, fg_color=THEME["btn_secondary"],
+            run_row, text="📂", height=30, fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"], command=self._open_step0_folder,
         )
         self.step0_open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
@@ -3345,7 +3987,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
         ctk.CTkLabel(
             manual,
-            text="PDF уже лежит в «Загрузках» — программа назовёт его по схеме и добавит в папку.",
+            text="📥 Из «Загрузок»",
             font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
@@ -3369,7 +4011,7 @@ class SurveyApp(ctk.CTk):
             border_color=THEME["border_card"], font=ctk.CTkFont(size=11),
         ).grid(row=0, column=2, sticky="w")
         ctk.CTkButton(
-            manual, text="📂 Забрать свежий PDF из «Загрузок»", height=30,
+            manual, text="📂 Загрузки", height=30,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             command=self._adopt_step0_download,
         ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
@@ -3390,7 +4032,7 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_main"], anchor="w",
         ).grid(row=0, column=0, sticky="w")
         self.step0_to_step1_button = ctk.CTkButton(
-            head, text="→ Передать в Шаг 1", height=28, width=170,
+            head, text="→ В Шаг 1", height=28, width=170,
             fg_color=THEME["btn_secondary"], hover_color=THEME["btn_secondary_hover"],
             font=ctk.CTkFont(size=11), state="disabled",
             command=self._step0_to_step1,
@@ -3435,6 +4077,10 @@ class SurveyApp(ctk.CTk):
     def _step0_log(self, message: str, level: str = log_mode.LEVEL_INFO) -> None:
         self._step0_lines.append((level, self._step0_timestamp(message)))
         self._render_step0_log()
+        # Полный лог сессии задания очереди («Данные») пишется в его data.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), "шаг0", level, str(message)))
         try:
             tel = getattr(self, "_telemetry", None)
             if tel is not None and tel.active:
@@ -3497,7 +4143,7 @@ class SurveyApp(ctk.CTk):
         return value
 
     def _start_step0_auto(self) -> None:
-        """Explicit paid opt-in: address → Richmond downloads → all descriptions."""
+        """Explicit paid opt-in: address → Step 0 downloads (Clerk or ACRIS) → all descriptions."""
         if (self._busy or self._step0_running or self._step0_portal_running
                 or self._step0_auto_stage or getattr(self, "_source_role_dialog", None)):
             self._set_status("Дождитесь завершения текущей работы.", warn=True)
@@ -3516,6 +4162,7 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage = "portal"
         self._step0_auto_address = address
         self._step0_auto_identity = None
+        self._reset_step0_early()
         self._step0_stop.clear()
         self._start_step0_portal_lookup()
         if not self._step0_portal_running:
@@ -3525,9 +4172,17 @@ class SurveyApp(ctk.CTk):
         self.step0_stop_button.configure(state="normal")
         self._step0_log("Автопоток: поиск адреса → сбор PDF → поиск и разбор описаний; возможны платные запросы. AutoCAD не запускается автоматически. После ручной отрисовки активный документ сохраняется под новым именем в папке описаний, даже если результат неполный.", level=log_mode.LEVEL_KEY)
 
+    def _reset_step0_early(self) -> None:
+        """Сбрасывает состояние раннего сбора (наш участок до соседей)."""
+        self._step0_early_active = False
+        self._step0_early_phase = ""
+        self._step0_neighbour_lots = None
+        self._step0_our_outcome = None
+
     def _stop_auto_transition(self, message: str) -> None:
         self._step0_auto_stage = None
         self._step0_auto_identity = None
+        self._reset_step0_early()
         self.step0_auto_button.configure(state="normal")
         if not self._step0_running:
             self.step0_stop_button.configure(state="disabled")
@@ -3536,6 +4191,9 @@ class SurveyApp(ctk.CTk):
 
     def _start_step0_portal_lookup(self) -> None:
         """Address → NYC Portal → one user-initiated Vision extraction call."""
+        if self._step0_early_active:
+            self._set_status("Автопоток: ранний сбор уже идёт — дождитесь его завершения.", warn=True)
+            return
         if self._step0_portal_running or self._step0_running:
             self._set_status("Шаг 0 уже выполняет поиск или сбор; дождитесь завершения.", warn=True)
             return
@@ -3626,6 +4284,14 @@ class SurveyApp(ctk.CTk):
             ))
             self._post("step0_portal_notice" if important else "step0_progress", self._step0_timestamp(line))
 
+        def identified(capture: Any) -> None:
+            # Block/Lot уже прочитаны: GUI может качать наш участок, пока
+            # нейронки ещё отвечают про соседей (только автопоток).
+            self._post("step0_portal_identified", (
+                address, capture.borough, capture.block, capture.lot,
+                capture.details_source, str(capture.map_image),
+            ))
+
         try:
             result = nyc_portal.lookup_parcel(
                 address,
@@ -3638,6 +4304,7 @@ class SurveyApp(ctk.CTk):
                 progress=progress,
                 fast_mode=fast_mode,
                 fast_pause_sec=fast_pause,
+                on_identified=identified,
                 **({"optimal_mode": True} if optimal_mode else {}),
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
@@ -3645,13 +4312,81 @@ class SurveyApp(ctk.CTk):
             return
         self._post("step0_portal_done", ("ok", result))
 
+    def _handle_step0_portal_identified(self, payload: Any) -> None:
+        """Block/Lot известны до ответа про соседей: качаем наш участок сразу.
+
+        Работает только в автопотоке: ручной поиск по-прежнему сначала
+        показывает Borough/Block/Lot человеку и ждёт его команды.
+        """
+        address, borough, block, lot, details_source, map_image = payload
+        if self._step0_auto_stage != "portal" or self._step0_early_active:
+            return
+        if address != self._step0_auto_address:
+            return
+        if str(self.step0_address_var.get() or "").strip() != address:
+            return
+        if not deed_intake.step0_source_name(borough or ""):
+            return  # финальный обработчик остановит автопоток с объяснением
+        try:
+            int(str(block))
+            int(str(lot))
+        except (TypeError, ValueError):
+            return
+        self._step0_lookup_snapshot = (address, nyc_portal.ParcelLookup(
+            block=str(block), lot=str(lot), borough=borough,
+            left_neighbour=None, right_neighbour=None,
+            confidence="", notes="", map_image=Path(map_image), usage=None,
+            details_source=details_source or "ocr",
+        ))
+        self.step0_borough_var.set(borough or "")
+        self.step0_block_var.set(str(block))
+        self.step0_lot_var.set(str(lot))
+        self._step0_auto_identity = (address, str(borough), str(block), str(lot))
+        self._step0_early_active = True
+        self._step0_early_phase = "our"
+        self._step0_neighbour_lots = None
+        self._step0_our_outcome = None
+        self._step0_auto_stage = "intake"
+        self._start_step0_intake(neighbours_override=[], include_our=True, early=True)
+        if not self._step0_running:
+            self._stop_auto_transition(
+                "Автопоток остановлен: не удалось начать ранний сбор нашего участка.")
+            return
+        self._step0_log(
+            "Автопоток: Block и Lot уже известны — скачиваю наш участок сейчас, "
+            "не дожидаясь номеров соседей от нейронок; соседей докачаю, как только "
+            "придёт первый ответ.", level=log_mode.LEVEL_KEY)
+
+    def _continue_after_neighbours(self) -> None:
+        """Наш участок собран и номера соседей известны: докачать или на разбор."""
+        our = self._step0_our_outcome
+        if our is None:
+            return
+        lots = list(self._step0_neighbour_lots or [])
+        if not lots:
+            self._reset_step0_early()
+            self._auto_submit_step0_outcome(our)
+            return
+        self._step0_early_phase = "neighbours"
+        self._step0_log(
+            "Автопоток: наш участок уже собран; докачиваю соседей: "
+            + ", ".join(str(value) for value in lots) + ".",
+            level=log_mode.LEVEL_KEY)
+        self._start_step0_intake(neighbours_override=lots, include_our=False)
+        if not self._step0_running:
+            self._step0_log(
+                "Автопоток: сбор соседей не запустился — продолжаю с нашим участком.",
+                level=log_mode.LEVEL_WARN)
+            self._reset_step0_early()
+            self._auto_submit_step0_outcome(our)
+
     def _finish_step0_portal_lookup(self, status: str, payload: Any) -> None:
         self._step0_portal_running = False
         if self._step0_portal_restore_topmost is not None:
             self.attributes("-topmost", self._step0_portal_restore_topmost)
             self._step0_portal_restore_topmost = None
         self.step0_portal_button.configure(
-            state="normal", text="🌐 Найти по адресу + анализ карты",
+            state="normal", text="🌐 Адрес → Block/Lot",
         )
         self.step0_run_button.configure(state="normal")
         try:
@@ -3665,6 +4400,17 @@ class SurveyApp(ctk.CTk):
             if self._step0_auto_stage == "portal":
                 self._stop_auto_transition(f"Автопоток остановлен: поиск адреса не завершён — {payload}")
                 return
+            if self._step0_early_active:
+                # Наш участок уже качается/собран: сбой ответа про соседей
+                # задание не хоронит — продолжаем без соседей.
+                self._step0_neighbour_lots = []
+                self._step0_log(
+                    f"Автопоток: номера соседей не получены ({payload}); "
+                    "продолжаю без соседей — соседей проверьте и соберите вручную.",
+                    level=log_mode.LEVEL_WARN)
+                if self._step0_our_outcome is not None and not self._step0_running:
+                    self._continue_after_neighbours()
+                return
             self._step0_log(f"Поиск участка не завершён: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
@@ -3677,6 +4423,11 @@ class SurveyApp(ctk.CTk):
                 and str(self.step0_address_var.get() or "").strip() != self._step0_auto_address):
             self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
             return
+        if (self._step0_early_active
+                and str(self.step0_address_var.get() or "").strip() != self._step0_auto_address):
+            self._step0_stop.set()
+            self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
+            return
         self._step0_lookup_snapshot = (self._step0_lookup_address, result)
         self.step0_borough_var.set(result.borough or "")
         self.step0_block_var.set(result.block)
@@ -3687,29 +4438,81 @@ class SurveyApp(ctk.CTk):
         self._step0_log(
             f"{details_label}: Borough {result.borough or 'не распознан'}, "
             f"Block {result.block}, Lot {result.lot}. Vision по карте: "
-            f"соседи слева/справа {result.left_neighbour or '—'} / "
-            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}.",
+            f"соседи слева/справа от фронтальной улицы {result.left_neighbour or '—'} / "
+            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}"
+            + (f"; первой ответила {result.neighbour_model}" if getattr(result, "neighbour_model", "") else "")
+            + ".",
             level=log_mode.LEVEL_KEY,
         )
         if result.notes:
             self._step0_log(f"Примечание Vision: {result.notes}")
+        _angles = getattr(result, "front_street_angles", None) or {}
+        if any(value is not None for value in _angles.values()):
+            _labels = {"llm": "ИИ", "python_hough_lines": "код (отрезки)",
+                       "python_structure_tensor": "код (градиенты)"}
+            _shown = ", ".join(
+                f"{_labels.get(key, key)} {value:.0f}°" if value is not None else f"{_labels.get(key, key)} —"
+                for key, value in _angles.items()
+            )
+            self._step0_log(f"Угол фронтальной улицы к северу: {_shown} — значения в JSON-кэше снимка карты.")
         self._step0_log(f"Vision получил обрезку карты: {result.map_image}; адрес передан текстом.")
         if self._step0_auto_stage == "portal":
             if str(self.step0_address_var.get() or "").strip() != self._step0_auto_address:
                 self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
                 return
             if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
-                self._stop_auto_transition("Автопоток остановлен: низкая уверенность при поиске соседей. Проверьте карту и запустите сбор вручную.")
-                return
-            if not deed_intake.is_richmond_borough(result.borough):
-                self._stop_auto_transition("Автопоток остановлен: сайт Richmond County работает только для Staten Island; район не подтверждён или пока не поддерживается.")
+                # Полной остановки в автопотоке из-за соседей не бывает (решение
+                # пользователя 24.11.2026): идём дальше с тем, что названо.
+                known = [n for n in (result.left_neighbour, result.right_neighbour) if n]
+                self._step0_log(
+                    "Низкая уверенность Vision при поиске соседей; названо: "
+                    + (", ".join(known) if known else "никого")
+                    + ". Продолжаю автопоток; соседей и стороны проверьте на схеме.",
+                    level=log_mode.LEVEL_WARN,
+                )
+            if not deed_intake.step0_source_name(result.borough):
+                self._stop_auto_transition("Автопоток остановлен: район не подтверждён или пока не поддерживается (нужен Staten Island, Manhattan, Bronx, Brooklyn или Queens).")
                 return
             self._step0_auto_identity = (self._step0_auto_address, str(result.borough), str(result.block), str(result.lot))
             self._step0_auto_stage = "intake"
-            self._step0_log("Автопоток: район, Block и Lot получены; собираю документы Staten Island.", level=log_mode.LEVEL_KEY)
+            self._step0_log(f"Автопоток: район, Block и Lot получены; собираю документы ({deed_intake.step0_source_name(result.borough)}).", level=log_mode.LEVEL_KEY)
             self._start_step0_intake()
             if not self._step0_running:
                 self._stop_auto_transition("Автопоток остановлен: не удалось начать сбор документов.")
+            return
+        if self._step0_auto_stage == "intake" and self._step0_early_active:
+            # Ранний сбор нашего участка уже идёт или завершён: принимаем
+            # номера соседей от первой ответившей нейронки.
+            if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
+                known = [n for n in (result.left_neighbour, result.right_neighbour) if n]
+                self._step0_log(
+                    "Низкая уверенность Vision при поиске соседей; названо: "
+                    + (", ".join(known) if known else "никого")
+                    + ". Продолжаю автопоток; соседей и стороны проверьте на схеме.",
+                    level=log_mode.LEVEL_WARN,
+                )
+            lots: list[int] = []
+            for value in result.neighbours:
+                try:
+                    number = int(str(value))
+                except (TypeError, ValueError):
+                    continue
+                if number > 0 and str(number) != str(result.lot) and number not in lots:
+                    lots.append(number)
+            self._step0_neighbour_lots = lots
+            winner = getattr(result, "neighbour_model", "") or "модель не указана"
+            if self._step0_our_outcome is not None and not self._step0_running:
+                self._step0_log(
+                    f"Автопоток: номера соседей приняла первой — {winner}; "
+                    + ("наш участок уже собран." if self._step0_our_outcome.ok
+                       else "наш участок не собран — начерчу хотя бы соседа."),
+                    level=log_mode.LEVEL_KEY)
+                self._continue_after_neighbours()
+            else:
+                self._step0_log(
+                    f"Автопоток: номера соседей приняла первой — {winner} "
+                    f"({', '.join(str(v) for v in lots) if lots else 'соседи не названы'}); "
+                    "докачаю их сразу после нашего участка.", level=log_mode.LEVEL_KEY)
             return
         self._set_status(
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
@@ -3718,20 +4521,32 @@ class SurveyApp(ctk.CTk):
             key=True,
         )
 
-    def _start_step0_intake(self) -> None:
-        """Собирает описания в фоне: окно не замирает на Cloudflare и OCR."""
+    def _start_step0_intake(
+        self, *, neighbours_override: list[int] | None = None,
+        include_our: bool = True, early: bool = False,
+    ) -> None:
+        """Собирает описания в фоне: окно не замирает на Cloudflare и OCR.
+
+        ``neighbours_override``/``include_our`` — проходы раннего сбора
+        автопотока: сначала только наш участок (соседи ещё не названы),
+        затем только соседи. ``early`` разрешает старт, пока поиск портала
+        ещё ждёт ответ нейронок про соседей.
+        """
         if self._busy:
             self._set_status("Дождитесь окончания текущего разбора перед сбором документов.", warn=True)
             return
-        if self._step0_portal_running:
+        if self._step0_early_active and neighbours_override is None:
+            self._set_status("Автопоток: ранний сбор уже идёт — дождитесь его завершения.", warn=True)
+            return
+        if self._step0_portal_running and not early:
             self._set_status("Сначала дождитесь завершения поиска адреса на портале.", warn=True)
             return
         if self._step0_running:
             self._set_status("Шаг 0: сбор уже идёт — дождитесь конца или нажмите «Стоп».")
             return
         borough = str(self.step0_borough_var.get() or "").strip()
-        if not deed_intake.is_richmond_borough(borough):
-            self._set_status("Сбор на сайте Richmond County доступен только для Staten Island. Укажите распознанный район; другие районы пока не поддерживаются.", error=True)
+        if not deed_intake.step0_source_name(borough):
+            self._set_status("Сбор доступен для Staten Island / Richmond County (Richmond County Clerk) и Manhattan, Bronx, Brooklyn, Queens (ACRIS). Укажите распознанный район; другие районы пока не поддерживаются.", error=True)
             return
         try:
             block = int(str(self.step0_block_var.get() or "").strip())
@@ -3742,14 +4557,17 @@ class SurveyApp(ctk.CTk):
         if block <= 0 or lot <= 0:
             self._set_status("Шаг 0: block и lot должны быть положительными числами.", error=True)
             return
-        try:
-            neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
-        except ValueError as exc:
-            self._set_status(
-                f"Шаг 0: соседи — {exc}. Впишите номера лотов через запятую, например «30, 28».",
-                error=True,
-            )
-            return
+        if neighbours_override is not None:
+            neighbours = [int(value) for value in neighbours_override]
+        else:
+            try:
+                neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
+            except ValueError as exc:
+                self._set_status(
+                    f"Шаг 0: соседи — {exc}. Впишите номера лотов через запятую, например «30, 28».",
+                    error=True,
+                )
+                return
         try:
             ocr_dpi = int(str(self.step0_ocr_dpi_var.get() or "").strip())
         except (TypeError, ValueError):
@@ -3797,11 +4615,35 @@ class SurveyApp(ctk.CTk):
         identities = file_metadata.intake_observations(
             block, lot, borough, neighbours, str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
         )
+        stream_plan = None
+        self._auto_stream_batch = None
+        self._auto_stream_jobs = ()
+        if self._step0_auto_stage == "intake":
+            try:
+                stream_cfg, stream_provider, stream_model, stream_key, stream_secret = (
+                    self._build_runtime_config())
+                stream_search_cfg = copy.deepcopy(
+                    stream_cfg.get("multiple_description_search") or {})
+                stream_search_cfg["enabled"] = True  # только этот автопоток
+                stream_cfg["multiple_description_search"] = stream_search_cfg
+                stream_plan = (stream_cfg, stream_provider, stream_model, stream_key,
+                               stream_secret, self._current_scale())
+                self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                    "Автопоток: каждый PDF пойдёт в поиск страниц и разбор сразу после скачивания, "
+                    "не дожидаясь остальных файлов; OUR OLD — только скачиваю.")))
+                self._render_step0_log()
+            except Exception:  # noqa: BLE001 - конвейер необязателен, обычный этап ниже
+                stream_plan = None
+                self._step0_lines.append((log_mode.LEVEL_WARN, self._step0_timestamp(
+                    "Автопоток: параллельный разбор по мере скачивания не подготовлен — "
+                    "соберу файлы и разберу обычным этапом.")))
+                self._render_step0_log()
         self._start_background(
             self._step0_worker,
             args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
                   bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-                  self._step0_auto_stage == "intake"),
+                  self._step0_auto_stage == "intake", stream_plan, self._pdf_wait_sec(),
+                  include_our),
         )
 
     def _step0_worker(
@@ -3817,12 +4659,17 @@ class SurveyApp(ctk.CTk):
         borough: str = "",
         identities: dict[str, dict] | None = None,
         skip_page_search: bool = False,
+        stream_plan: tuple[Any, ...] | None = None,
+        pdf_wait_sec: float = deed_intake.PDF_WAIT_SEC,
+        include_our: bool = True,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         def progress(line: str) -> None:
             self._post("step0_progress", self._step0_timestamp(line))
 
         downloads = rcclerk.default_downloads_dir()
+        if deed_intake.step0_source_name(borough) == "ACRIS":
+            progress("ACRIS: список — прямым запросом сразу по 99 строк; документ открою в читалке браузера и нажму дискету (Save) → OK, PDF заберу из «Загрузок»")
         auto_save = None
         if browser_save.available():
             auto_save = browser_save.auto_save_hook(
@@ -3834,13 +4681,98 @@ class SurveyApp(ctk.CTk):
                 ),
             )
             mode_note = f" (быстрая работа: пауза {fast_pause:g} с)" if fast_mode else ""
-            progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
-        else:
+            if deed_intake.step0_source_name(borough) != "ACRIS":
+                progress(f"браузер: Ctrl+S сработает только после загрузки PDF; Cloudflare не трогаю{mode_note}")
+        elif deed_intake.step0_source_name(borough) != "ACRIS":
             progress("браузер: авто-Ctrl+S доступен только в Windows; если нужно, сохраните PDF вручную")
         if skip_page_search:
             progress("старый поиск страниц пропущен: полный PDF пойдёт в поиск всех описаний")
         else:
             progress(f"поиск начала/конца описания: OCR настроен на {ocr_dpi} dpi")
+        if pdf_wait_sec > deed_intake.PDF_WAIT_SEC:
+            progress(f"ожидание PDF в «Загрузках» — долгое ({int(pdf_wait_sec)} с): "
+                     "галочка «Ждать долгую капчу» на странице «Данные»")
+
+        # Конвейер автопотока: отдельный поток разбирает PDF по мере их
+        # скачивания, пока этот поток качает следующие. OUR OLD не разбираем.
+        stream_queue: queue.Queue[Any] | None = None
+        stream_thread: threading.Thread | None = None
+        stream_box: dict[str, Any] = {}
+        stream_jobs_seen: list[Any] = []
+        stream_stop = threading.Event()
+        stream_generation = getattr(self._worker_context, "generation", self._generation)
+        stream_queued: set[Path] = set()
+        on_record = None
+        if stream_plan is not None:
+            from multiple_description_runtime import (
+                FileJob, open_runtime_callbacks, prepare_runtime, provider_target,
+                run_batch_streaming, ROUTERAI_GROK_MODEL,
+            )
+
+            stream_queue = queue.Queue()
+
+            def stream_jobs() -> Any:
+                while True:
+                    job = stream_queue.get()
+                    if job is None:
+                        return
+                    stream_jobs_seen.append(job)
+                    yield job
+
+            def stream_current() -> bool:
+                return (not stream_stop.is_set() and not self._step0_stop.is_set()
+                        and not self._closing and stream_generation == self._generation)
+
+            def stream_progress(line: str) -> None:
+                self._post("step0_progress", self._step0_timestamp(line),
+                           generation=stream_generation)
+
+            def stream_main() -> None:
+                try:
+                    cfg2, provider2, model2, key2, secret2, scale2 = stream_plan
+                    target, router_key = prepare_runtime(
+                        cfg2, selected_provider=provider2, selected_model=model2,
+                        selected_api_key=key2, key_secret=secret2, current=stream_current)
+                    router = provider_target(
+                        cfg2, "routerai", legal_page_search.PRIMARY, key_secret=secret2,
+                        explicit_key=key2 if provider2 == "routerai" else None)
+                    hedge = None
+                    if target.provider == "hydra" and target.model == "grok-4.7":
+                        try:
+                            hedge = provider_target(cfg2, "routerai", ROUTERAI_GROK_MODEL,
+                                                    key_secret=secret2)
+                        except Exception:  # noqa: BLE001 - страховка необязательна
+                            hedge = None
+                    with open_runtime_callbacks(target, cfg2, hedge_target=hedge,
+                                                progress=stream_progress) as (send, choose):
+                        batch = run_batch_streaming(
+                            stream_jobs(), cfg2, target=target, search_api_key=router_key,
+                            send=send, choose=choose, search_base_url=router.base_url,
+                            scale=scale2, force_parse=False, current=stream_current,
+                            detail=stream_progress)
+                    if not batch.cancelled:
+                        stream_box["batch"] = batch
+                        stream_box["jobs"] = tuple(stream_jobs_seen)
+                except Exception:  # noqa: BLE001 - обычный этап после сбора повторит честно
+                    stream_box["error"] = True
+                    stream_progress("Параллельный разбор по мере скачивания не запустился; "
+                                    "после сбора разберу обычным этапом.")
+
+            stream_thread = threading.Thread(target=stream_main, daemon=True,
+                                             name="step0-stream-parse")
+            stream_thread.start()
+
+            def on_record(record: Any) -> None:
+                if record.role == "our" and str(record.tag).upper() == "OLD":
+                    progress(f"  {record.file}: скачан; в автопотоке не разбираю (OUR OLD).")
+                    return
+                assert stream_queue is not None  # для проверяльщика типов
+                path = folder / str(record.file)
+                if path in stream_queued:
+                    return
+                stream_queued.add(path)
+                stream_queue.put(FileJob(path, record.role == "our" or lot_identity.has_our_prefix(path)))
+                progress(f"  {record.file}: скачан — сразу в поиск страниц и разбор, остальные файлы не жду.")
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -3857,13 +4789,29 @@ class SurveyApp(ctk.CTk):
                 ocr_dpi=ocr_dpi,
                 search_pages=not skip_page_search,
                 downloads_dir=downloads,
+                on_record=on_record,
+                pdf_wait_sec=pdf_wait_sec,
+                include_our=include_our,
             )
         except deed_intake.IntakeCancelled:
+            stream_stop.set()
+            if stream_queue is not None:
+                stream_queue.put(None)
             self._post("step0_done", ("cancelled", None))
             return
         except Exception as exc:  # noqa: BLE001 - сеть, файлы, PDF — всё возможно
+            stream_stop.set()
+            if stream_queue is not None:
+                stream_queue.put(None)
             self._post("step0_done", ("error", f"{type(exc).__name__}: {exc}"))
             return
+        if stream_queue is not None:
+            stream_queue.put(None)
+        if stream_thread is not None:
+            stream_thread.join()
+            if "batch" in stream_box:
+                self._auto_stream_batch = stream_box["batch"]
+                self._auto_stream_jobs = stream_box.get("jobs", ())
         self._post("step0_done", ("ok", outcome))
 
     def _stop_step0_intake(self) -> None:
@@ -3874,6 +4822,7 @@ class SurveyApp(ctk.CTk):
             self._step0_stop.set()
             self._step0_auto_stage = "portal_cancelled" if stage == "portal" else None
             self._step0_auto_identity = None
+            self._reset_step0_early()
             self.step0_auto_button.configure(state="normal")
             if stage == "parse":
                 self._generation += 1
@@ -3913,11 +4862,15 @@ class SurveyApp(ctk.CTk):
         outcome = payload
         self._step0_outcome = outcome
         self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}", level=log_mode.LEVEL_KEY)
-        self._step0_lines.append((
-            log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY,
-            outcome.report(include_notes=False),
-        ))
+        report_text = outcome.report(include_notes=False)
+        report_level = log_mode.LEVEL_ERROR if outcome.missing else log_mode.LEVEL_KEY
+        self._step0_lines.append((report_level, report_text))
         self._render_step0_log()
+        # Отчёт с разделом «Чего не хватает» — тоже в лог задания очереди,
+        # иначе в session_log.txt остаётся только «сбор неполный» без причины.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append(
+                (time.strftime("%H:%M:%S"), "шаг0", report_level, report_text))
         if outcome.ok:
             self.step0_to_step1_button.configure(state="normal")
             self._set_status(
@@ -3930,7 +4883,39 @@ class SurveyApp(ctk.CTk):
                 error=True,
             )
         if self._step0_auto_stage == "intake":
-            self._auto_submit_step0_outcome(outcome)
+            if self._step0_early_active and self._step0_early_phase == "our":
+                # Ранний проход: наш участок собран до ответа про соседей.
+                # Даже если наш участок не собрался, автопоток не встаёт:
+                # дождёмся соседей и начертим хотя бы их (указание пользователя).
+                self._step0_our_outcome = outcome
+                if self._step0_neighbour_lots is None:
+                    self._step0_log(
+                        "Автопоток: наш участок собран; жду номера соседей от "
+                        "нейронок, чтобы докачать соседей." if outcome.ok else
+                        "Автопоток: наш участок не собран; жду номера соседей от "
+                        "нейронок — начерчу хотя бы соседа, если его назовут.",
+                        level=log_mode.LEVEL_KEY)
+                elif self._step0_neighbour_lots:
+                    self._continue_after_neighbours()
+                else:
+                    self._auto_submit_step0_outcome(outcome)
+            elif self._step0_early_active and self._step0_early_phase == "neighbours":
+                merged = (deed_intake.merge_outcomes(self._step0_our_outcome, outcome)
+                          if self._step0_our_outcome is not None else outcome)
+                self._step0_outcome = merged
+                self._reset_step0_early()
+                try:
+                    deed_store.write_manifest(
+                        Path(merged.folder),
+                        block=str(self.step0_block_var.get() or ""),
+                        lot=str(self.step0_lot_var.get() or ""),
+                        missing=[{"reason": item} for item in merged.missing],
+                    )
+                except Exception:  # noqa: BLE001 - manifest не должен губить автопоток
+                    pass
+                self._auto_submit_step0_outcome(merged)
+            else:
+                self._auto_submit_step0_outcome(outcome)
 
     def _auto_submit_step0_outcome(self, outcome: Any) -> None:
         expected = self._step0_auto_identity
@@ -3938,15 +4923,35 @@ class SurveyApp(ctk.CTk):
                    str(self.step0_borough_var.get() or "").strip(),
                    str(self.step0_block_var.get() or "").strip(),
                    str(self.step0_lot_var.get() or "").strip())
-        if expected != current or not deed_intake.is_richmond_borough(current[1]):
+        if expected != current or not deed_intake.step0_source_name(current[1]):
             self._stop_auto_transition("Автопоток остановлен: адрес, район, Block или Lot изменились во время сбора.")
             return
-        if not outcome.ok or outcome.missing:
-            self._stop_auto_transition("Автопоток остановлен: сбор неполный; проверьте раздел «Чего не хватает» и завершите ручные шаги.")
-            return
+        if not outcome.ok:
+            # Наш участок не собран — но автопоток всё равно обязан дойти до
+            # черчения, если можно начертить хотя бы одного соседа, пусть и
+            # криво (указание пользователя). Останавливаемся ниже, только
+            # если не собралось вообще ничего.
+            detail = "; ".join(outcome.missing) if outcome.missing else "причины — в отчёте сбора"
+            self._step0_log(
+                f"Сбор: наш участок не собран ({detail}). Продолжаю автопоток "
+                "с тем, что собралось: начерчу хотя бы соседей.",
+                level=log_mode.LEVEL_WARN,
+            )
+        elif outcome.missing:
+            # Наш участок собран: недостача соседей задание не хоронит
+            # (живой случай 3876, 24.11.2026: свежий CRFN соседа не знает
+            # NYC Open Data — из-за этого вставало всё задание без DWG).
+            # Полной остановки в автопотоке не бывает: предупреждаем и идём
+            # дальше с тем, что собралось.
+            self._step0_log(
+                "Сбор: наш участок собран; не хватает — " + "; ".join(outcome.missing)
+                + ". Продолжаю автопоток с собранными документами.",
+                level=log_mode.LEVEL_WARN,
+            )
         folder = Path(outcome.folder)
         paths: list[Path] = []
         roles: dict[Path, bool] = {}
+        skipped_old = False
         for record in outcome.records:
             name = str(record.file or "")
             if not name or Path(name).name != name:
@@ -3956,12 +4961,25 @@ class SurveyApp(ctk.CTk):
             if not path.is_file() or path.resolve().parent != folder.resolve():
                 self._stop_auto_transition(f"Автопоток остановлен: собранный PDF недоступен: {name}")
                 return
+            if record.role == "our" and str(getattr(record, "tag", "")).upper() == "OLD":
+                # OUR OLD в автопотоке только скачиваем и храним: время на его
+                # поиск страниц и ИИ-разбор не тратим (указание пользователя).
+                skipped_old = True
+                continue
             if path not in paths:
                 paths.append(path)
             roles[path] = record.role == "our" or lot_identity.has_our_prefix(path)
-        if not paths or not any(roles.values()):
-            self._stop_auto_transition("Автопоток остановлен: нет доступного PDF нашего участка.")
+        if skipped_old:
+            self._step0_log("Автопоток: OUR OLD скачан и сохранён, но не разбираю — "
+                            "в автопотоке разбираются NEW нашего участка и соседи.",
+                            level=log_mode.LEVEL_KEY)
+        if not paths:
+            self._stop_auto_transition("Автопоток остановлен: не собралось ни одного PDF для разбора — начертить нечего.")
             return
+        if not any(roles.values()):
+            self._step0_log(
+                "Автопоток: нашего участка среди собранных PDF нет — разбираю "
+                "и начерчу соседей, какие есть.", level=log_mode.LEVEL_WARN)
         # The explicit auto button opts into this mode for the current session only.
         self.multi_pdf_mode_var.set(True)
         self._on_multi_pdf_mode_changed()
@@ -3973,9 +4991,61 @@ class SurveyApp(ctk.CTk):
             item.is_main = roles[item.path]
         for error in errors:
             self._step0_log(f"Не открыт собранный PDF: {error}", level=log_mode.LEVEL_ERROR)
-        if errors or len(items) != len(paths) or not items or not any(item.is_main for item in items):
-            self._stop_auto_transition("Автопоток остановлен: не все собранные PDF открылись.")
+        if not items:
+            self._stop_auto_transition("Автопоток остановлен: ни один собранный PDF не открылся — начертить нечего.")
             return
+        if errors:
+            # Кто-то из собранных не открылся — не хороним остальных:
+            # разберём и начертим тех, кто открылся.
+            self._step0_log(
+                "Автопоток: часть собранных PDF не открылась — продолжаю с "
+                "открывшимися.", level=log_mode.LEVEL_WARN)
+            paths = [item.path for item in items]
+        stream_batch = getattr(self, "_auto_stream_batch", None)
+        stream_jobs = getattr(self, "_auto_stream_jobs", ())
+        self._auto_stream_batch = None
+        self._auto_stream_jobs = ()
+        if stream_batch is not None and [job.path for job in stream_jobs] == paths:
+            try:
+                from multiple_description_handoff import build_handoff
+                from multiple_description_runtime import FileJob
+
+                stream_view = build_handoff(
+                    stream_batch,
+                    expected_jobs=tuple(FileJob(path, roles[path]) for path in paths))
+            except Exception:  # noqa: BLE001 - готовый результат не подошёл: обычный этап
+                stream_view = None
+            if stream_view is not None:
+                self._reset_visual_sources()
+                self._visual_source_role = "set"
+                self.pdf_set = list(items)
+                self._pdf_set_main_plan = None
+                self._pdf_set_scene_neighbors = set()
+                self._pdf_set_main_pending = False
+                self._main_analysis_pending = False
+                self._neighbor_text_pending = False
+                self._pending_neighbor_files.clear()
+                self.text_box.delete("1.0", "end")
+                self._refresh_text_counter()
+                self.source_mode_var.set("📄 PDF")
+                try:
+                    self.source_mode_switch.set("📄 PDF")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._on_source_mode_changed()
+                self.pdf_label.configure(
+                    text=f"Набор PDF: {len(items)} файл. (ИИ)", text_color=THEME["warn"])
+                self._running_source_signature = self._source_signature(mode="📄 PDF")
+                self._ready_source_signature = None
+                self._input_incomplete = True
+                self._step0_auto_stage = "parse"
+                self._step0_log(
+                    "Автопоток: разбор шёл одновременно со скачиванием — использую готовый результат; "
+                    "повторно файлы не разбираю.", level=log_mode.LEVEL_KEY)
+                self._handle_multi_pdf_done(stream_view, self._running_source_signature)
+                return
+            self._step0_log("Автопоток: параллельный результат не подошёл к собранному набору — "
+                            "разберу обычным этапом.", level=log_mode.LEVEL_WARN)
         self._step0_auto_stage = "parse"
         self._step0_log(f"Автопоток: передаю {len(items)} полных PDF на поиск всех описаний. AutoCAD не запускаю.", level=log_mode.LEVEL_KEY)
         try:
@@ -4215,13 +5285,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
         ctk.CTkLabel(
             panel,
-            text=(
-                "Выполняется после посадки границы участка и до оффсетов. Программа читает "
-                "активный чертёж AutoCAD, находит участок и в зоне «участок + буфер» "
-                "распознаёт заборы, строения, крыльца, ступени и дорожки — по кодам "
-                "геодезических точек (POINT_LABELS) и по именам слоёв — и подписывает их "
-                f"в слое {self._feature_output_layer(fcfg)}."
-            ),
+            text="🏷 Подписи объектов у участка",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             anchor="w",
@@ -4240,7 +5304,7 @@ class SurveyApp(ctk.CTk):
         house_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             house_card,
-            text="Текст для основного дома (например: 2 STY. BRK. & FR.)",
+            text="Основной дом (напр.: 2 STY. BRK. & FR.)",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_main"],
             anchor="w",
@@ -4269,7 +5333,7 @@ class SurveyApp(ctk.CTk):
 
         self.skip_existing_labels_check = ctk.CTkCheckBox(
             panel,
-            text="Не дублировать уже существующие на чертеже надписи",
+            text="Не дублировать надписи",
             variable=self.skip_existing_labels_var,
             checkbox_width=18,
             checkbox_height=18,
@@ -4351,7 +5415,7 @@ class SurveyApp(ctk.CTk):
 
         self.feature_auto_button = ctk.CTkButton(
             panel,
-            text="🔎  Автопоиск участка и подписание объектов",
+            text="🔎 Автопоиск и подписание",
             height=42,
             fg_color=THEME["btn_primary"],
             hover_color=THEME["btn_primary_hover"],
@@ -4361,7 +5425,7 @@ class SurveyApp(ctk.CTk):
         self.feature_auto_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.feature_pick_button = ctk.CTkButton(
             panel,
-            text="🖱  Указать границу участка в AutoCAD и подписать объекты",
+            text="🖱 Указать границу и подписать",
             height=38,
             fg_color=THEME["btn_secondary"],
             hover_color=THEME["btn_secondary_hover"],
@@ -4371,12 +5435,7 @@ class SurveyApp(ctk.CTk):
         self.feature_pick_button.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 8))
         ctk.CTkLabel(
             panel,
-            text=(
-                "Автопоиск берёт замкнутый контур в слоях границы (PROPERTY_LINE, PL, "
-                "M-TAX-LINE…). Если контуров несколько или граница не найдена — укажите её "
-                "в AutoCAD: выберите полилинию или все стороны участка и нажмите Enter. "
-                "Все подписи одного запуска отменяются в AutoCAD одним Ctrl+Z."
-            ),
+            text="Автопоиск ищет контур границы; не найдёт — укажите полилинию в AutoCAD.",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
             anchor="w",
@@ -4439,7 +5498,7 @@ class SurveyApp(ctk.CTk):
         report_head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             report_head,
-            text="Отчёт Шага 2 (дублируется в «🧾 Журнал» на вкладке Шага 1)",
+            text="🧾",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=THEME["text_main"],
             anchor="w",
@@ -4525,8 +5584,7 @@ class SurveyApp(ctk.CTk):
             manual = self._feature_text_height_override()
         except ValueError:
             label.configure(
-                text="Высота текста: введите число в футах от 0.05 до 20 (например 0.5) "
-                     "или оставьте поле пустым.",
+                text="Высота: число 0.05–20 или пусто.",
                 text_color=THEME["warn"],
             )
             return
@@ -4563,7 +5621,8 @@ class SurveyApp(ctk.CTk):
         on_step2 = tab == STEP_TAB_LABELS
         on_step0 = tab == STEP_TAB_DEEDS
         on_step4 = tab == STEP_TAB_OFFSETS
-        if on_step2 or on_step0 or on_step4:
+        on_data = tab == STEP_TAB_DATA
+        if on_step2 or on_step0 or on_step4 or on_data:
             self.main_wrap.grid_remove()
             # Кнопки отрисовки границы относятся только к Шагу 1.
             self.add_neighbor_button.grid_remove()
@@ -4586,6 +5645,11 @@ class SurveyApp(ctk.CTk):
             self._refresh_step4_report()
         else:
             self.step4_page.grid_remove()
+        if on_data:
+            self.data_page.grid(row=2, column=0, sticky="nsew")
+            self._refresh_data_controls()
+        else:
+            self.data_page.grid_remove()
         for label, button in getattr(self, "step_tab_buttons", {}).items():
             active = label == tab
             button.configure(
@@ -4637,11 +5701,7 @@ class SurveyApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
         ctk.CTkLabel(
             panel,
-            text=(
-                "Подписи расстояний от дома, заборов и стен до границы участка. Граница на фронте — "
-                "M-ROW-LINE. Текст может стоять с выноской, размерной подписью или без выноски "
-                "(для зданий и гаражей)."
-            ),
+            text="Расстояния от дома и заборов до границы участка.",
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_muted"],
             anchor="w",
@@ -4710,11 +5770,7 @@ class SurveyApp(ctk.CTk):
         status = getattr(self, "step4_status_label", None)
         if status is not None:
             status.configure(
-                text=(
-                    "Заранее выделите в AutoCAD рамкой область (или замкнутую полилинию по её "
-                    "контуру), затем нажмите кнопку здесь. Оффсеты появятся в ней, в слое "
-                    "D-TOPO-TEXT; один Undo отменяет запись."
-                ),
+                text="Сначала выделите область в AutoCAD.",
             )
 
     def _set_step4_report(self, content: str) -> None:
@@ -4936,7 +5992,7 @@ class SurveyApp(ctk.CTk):
             hint = (
                 "" if mode == "pick" else
                 "\n\nЕсли участок не находится автоматически, нажмите "
-                "«Указать границу участка в AutoCAD и подписать объекты»."
+                "«Указать границу и подписать»."
             )
             self._set_step2_report(f"ШАГ 2 НЕ ВЫПОЛНЕН\n\n{message}{hint}")
             for var in self.step2_stat_vars.values():
@@ -5186,7 +6242,7 @@ class SurveyApp(ctk.CTk):
         is_batch = len(self.neighbor_pdf_paths) > 1 and self._current_source_mode() == "📄 PDF"
         economy_on = bool(self.economy_var.get())
         if use_llm:
-            primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ (платно) · Ctrl+Enter"
+            primary = "✨ ИИ для всех PDF · платно" if is_batch else "✨ ИИ-разбор"
             alternative = "⚡ Локальный разбор без ИИ · бесплатно"
         elif economy_on:
             primary = "⚖ Разобрать экономно · Ctrl+Enter"
@@ -5238,6 +6294,10 @@ class SurveyApp(ctk.CTk):
         passes = self.current_passes_count()
         provider = self._pid_to_label.get(self._active_provider_id, self._active_provider_id)
         extra = f" + ещё {passes - 1}" if passes > 1 else ""
+        if passes == 1:
+            effort = self.current_reasoning_effort()
+            if effort:
+                extra += f"  ·  рассужд. {effort}"
         self.engine_model_var.set(f"{model}  ·  {provider}{extra}")
         badge = getattr(self, "ask_on_doubt_badge", None)
         if badge is not None:
@@ -5527,11 +6587,7 @@ class SurveyApp(ctk.CTk):
         if not plans:
             ctk.CTkLabel(
                 holder,
-                text=(
-                    "Проверок пока нет — разберите описание.\n"
-                    "Замыкание, сумма углов, самопересечения и потерянные точки "
-                    "проверяются автоматически."
-                ),
+                text="Проверок пока нет — разберите описание.",
                 font=self._result_fonts["body"], text_color=THEME["text_dim"],
                 justify="left", wraplength=self._result_wrap_length(),
             ).grid(row=0, column=0, sticky="ew", pady=14)
@@ -5698,8 +6754,121 @@ class SurveyApp(ctk.CTk):
     def _on_passes_changed(self, _selected_label: str = "") -> None:
         self._refresh_consensus_rows()
 
+    def _reasoning_target(self, slot: int) -> tuple[str, str]:
+        """(провайдер, модель) слота прохода 1/2/3 для переключателя рассуждений."""
+        if slot == 2:
+            return self.current_pass2_provider_id(), self.current_pass2_model()
+        if slot == 3:
+            return self.current_pass3_provider_id(), self.current_pass3_model()
+        return self.current_provider_id(), self.current_model()
+
+    def current_reasoning_effort(self) -> str | None:
+        """Выбранный уровень рассуждений активной модели (None — параметр не шлётся)."""
+        pid, model = self._reasoning_target(1)
+        spec = reasoning_spec(pid, model)
+        if spec is None:
+            return None
+        default, choices = spec
+        stored = str(self._reasoning_by_model.get(model) or "").strip()
+        return stored if stored in choices else default
+
+    def _refresh_reasoning_controls(self) -> None:
+        """Синхронизирует переключатели рассуждений с выбранными моделями.
+
+        Показывает переключатель только для моделей с настраиваемым уровнем
+        (сейчас это каталог Hydra); главный переключатель в карточке движка —
+        только при одном проходе, настройки слотов — всегда.
+        """
+        slots = (
+            (1, self.reasoning_var, getattr(self, "reasoning_switch", None),
+             getattr(self, "reasoning_label", None), (6, 5)),
+            (2, self.pass2_reasoning_var, getattr(self, "pass2_reasoning_switch", None),
+             getattr(self, "pass2_reasoning_label", None), (4, 3)),
+            (3, self.pass3_reasoning_var, getattr(self, "pass3_reasoning_switch", None),
+             getattr(self, "pass3_reasoning_label", None), (4, 3)),
+        )
+        use_llm = bool(self.use_llm_var.get())
+        for slot, var, switch, label, rows in slots:
+            if switch is None or label is None:
+                continue
+            pid, model = self._reasoning_target(slot)
+            spec = reasoning_spec(pid, model)
+            if spec is None:
+                var.set("")
+                switch.grid_remove()
+                label.grid_remove()
+                continue
+            default, choices = spec
+            stored = str(self._reasoning_by_model.get(model) or "").strip()
+            var.set(stored if stored in choices else default)
+            switch.configure(values=list(choices))
+            state = "normal" if use_llm else "disabled"
+            switch.configure(state=state)
+            label.grid(row=rows[1], column=0, sticky="w", padx=10)
+            switch.grid(row=rows[0], column=0, sticky="ew", padx=10, pady=(2, 9))
+        main_switch = getattr(self, "reasoning_switch_main", None)
+        main_label = getattr(self, "reasoning_main_label", None)
+        if main_switch is not None and main_label is not None:
+            spec1 = reasoning_spec(*self._reasoning_target(1))
+            show_main = (
+                use_llm and self.current_passes_count() == 1 and spec1 is not None
+            )
+            if spec1 is not None:
+                main_switch.configure(values=list(spec1[1]))
+            if show_main:
+                main_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+                main_switch.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8))
+            else:
+                main_label.grid_remove()
+                main_switch.grid_remove()
+
+    def _warn_expensive_models(self) -> None:
+        """Предупреждение «это будет дорого» для моделей дороже порога цены выхода.
+
+        Срабатывает при выборе модели в любом используемом проходе: цена
+        миллиона выходных токенов выше EXPENSIVE_OUT_RUB_PER_M (1000 ₽) —
+        сейчас это gpt-5.5, gpt-5.6-sol, gpt-6.2-astra и gpt-6-astra.
+        """
+        from llm_parser import EXPENSIVE_OUT_RUB_PER_M
+        passes = self.current_passes_count()
+        expensive: list[str] = []
+        for slot in (1, 2, 3):
+            if slot > passes:
+                continue
+            pid, model = self._reasoning_target(slot)
+            price = model_output_price_rub(pid, model)
+            if price is not None and price > EXPENSIVE_OUT_RUB_PER_M and model not in expensive:
+                expensive.append(model)
+        if expensive:
+            names = ", ".join(expensive)
+            self._set_status(
+                f"⚠ Это будет дорого: модель {names} — больше 1000 ₽ "
+                "за миллион выходных токенов.",
+                warn=True,
+            )
+
+    def _on_reasoning_changed(self, slot: int, value: str) -> None:
+        """Пользователь выбрал уровень рассуждений модели слота — сохранить."""
+        pid, model = self._reasoning_target(slot)
+        spec = reasoning_spec(pid, model)
+        clean = str(value or "").strip()
+        if spec is None or clean not in spec[1] or not model:
+            return
+        self._reasoning_by_model[model] = clean
+        self._persist_ai_preferences()
+        self._refresh_engine_card()
+        if hasattr(self, "data_model_combo"):
+            self._refresh_data_controls()
+
+    def select_reasoning(self, value: str) -> None:
+        """Программный выбор уровня рассуждений активной модели (для тестов/вызовов)."""
+        self._on_reasoning_changed(1, value)
+        if str(value or "").strip():
+            self.reasoning_var.set(str(value).strip())
+
     def _refresh_consensus_rows(self) -> None:
         self._refresh_parse_actions()
+        self._refresh_reasoning_controls()
         use_llm = bool(self.use_llm_var.get())
         count = self.current_passes_count() if use_llm else 1
         state = "normal" if use_llm else "disabled"
@@ -5766,6 +6935,7 @@ class SurveyApp(ctk.CTk):
         self.pass2_model_combo.configure(values=models)
         self.pass2_model_var.set(chosen)
         self.pass2_model_combo.set(chosen)
+        self._refresh_reasoning_controls()
         self._persist_ai_preferences()
 
     def _on_pass3_provider_changed(self, selected_label: str) -> None:
@@ -5778,6 +6948,7 @@ class SurveyApp(ctk.CTk):
         self.pass3_model_combo.configure(values=models)
         self.pass3_model_var.set(chosen)
         self.pass3_model_combo.set(chosen)
+        self._refresh_reasoning_controls()
         self._persist_ai_preferences()
 
     def select_pass2_target(
@@ -5829,6 +7000,8 @@ class SurveyApp(ctk.CTk):
         self.model_var.set(chosen)
         self.model_combo.set(chosen)
         self._refresh_provider_highlights()
+        self._refresh_reasoning_controls()
+        self._warn_expensive_models()
         self._persist_ai_preferences()
 
     def _on_model_selected(self, chosen_model: str) -> None:
@@ -5836,7 +7009,11 @@ class SurveyApp(ctk.CTk):
         if clean:
             self.model_var.set(clean)
             self._selected_models[self._active_provider_id] = clean
+            self._refresh_reasoning_controls()
             self._persist_ai_preferences()
+            self._warn_expensive_models()
+            if hasattr(self, "data_model_combo"):
+                self._refresh_data_controls()
 
     def _refresh_provider_highlights(self) -> None:
         active = self._active_provider_id
@@ -6168,6 +7345,8 @@ class SurveyApp(ctk.CTk):
                 models = [str(value) for value in (provider_cfg.get("models") or [])]
                 if model and model not in models:
                     provider_cfg["models"] = [model, *models]
+            hydra_persist = providers.setdefault("hydra", {})
+            hydra_persist["reasoning_by_model"] = dict(self._reasoning_by_model)
             api["consensus"] = {
                 "passes": self.current_passes_count(),
                 "pass2_provider": pass2_pid,
@@ -6191,7 +7370,9 @@ class SurveyApp(ctk.CTk):
         value = str(chosen_model or "").strip()
         if value:
             (self.pass2_model_var if slot == 2 else self.pass3_model_var).set(value)
+            self._refresh_reasoning_controls()
             self._persist_ai_preferences()
+            self._warn_expensive_models()
 
     def _bind_update_source_autosave(self) -> None:
         """Persist the GitHub update source as soon as the field loses focus or Enter is hit."""
@@ -6382,6 +7563,16 @@ class SurveyApp(ctk.CTk):
                 level=log_mode.LEVEL_INFO,
             )
 
+    def _open_model_test_window(self, _event: Any = None) -> None:
+        """Секретное окно теста моделей: только тройной щелчок по схеме участка."""
+        page = getattr(self, "_model_test_window", None)
+        if page is not None and not page._closed:
+            page.window.lift()
+            return
+        from model_test_ui import ModelTestWindow
+
+        self._model_test_window = ModelTestWindow(self, ctk, THEME)
+
     def _open_developer_chat(self, _event: Any = None) -> None:
         page = getattr(self, "_developer_chat", None)
         if page is not None and not page._closed:
@@ -6548,7 +7739,7 @@ class SurveyApp(ctk.CTk):
             backups = []
         if not backups:
             label.configure(
-                text="Резервных копий нет: откат станет доступен после первого обновления.",
+                text="Резервных копий нет",
                 text_color=THEME["text_dim"],
             )
             self._set_rollback_enabled(False)
@@ -7617,7 +8808,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text="Исходное изображение не загружено.\nНажмите «📷 Фото (JPG)…» (Ctrl+I) или «📄 PDF…» (Ctrl+O)",
+                text="🖼",
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",
@@ -7817,11 +9008,7 @@ class SurveyApp(ctk.CTk):
             canvas.create_text(
                 w / 2,
                 h / 2,
-                text=(
-                    "Здесь появится интерактивная CAD-схема участка,\n"
-                    "красных линий улиц, точки POB и соседних лотов от (0, 0)\n"
-                    "(колесо мыши — масштаб, зажатая ЛКМ — панорама)"
-                ),
+                text="Здесь будет схема участка",
                 fill=THEME["text_dim"],
                 font=("Segoe UI", 10),
                 justify="center",
@@ -8218,6 +9405,9 @@ class SurveyApp(ctk.CTk):
         page = getattr(self, "_developer_chat", None)
         if page is not None:
             page.close()
+        test_page = getattr(self, "_model_test_window", None)
+        if test_page is not None:
+            test_page.close()
         self._persist_ai_preferences(report_error=False)
         # В режиме «по кнопке» на закрытии ничего не шлём — только если стоит auto_send.
         try:
@@ -8355,7 +9545,7 @@ class SurveyApp(ctk.CTk):
                 self.neighbor_pdf_summary.grid_remove()
         else:
             self.load_pdf_button.configure(
-                text="⭱ Выберите PDF: наш участок и соседи сразу\nТекст, чертёж или скан · Ctrl+O"
+                text="⭱ Выберите PDF · Ctrl+O"
             )
             self.pdf_info_label.grid()
             self.load_images_button.grid()
@@ -8485,6 +9675,7 @@ class SurveyApp(ctk.CTk):
             self._step0_stop.set()
             self._step0_auto_stage = "portal_cancelled" if self._step0_portal_running else None
             self._step0_auto_identity = None
+            self._reset_step0_early()
             self.step0_auto_button.configure(state="normal")
         self._step0_stop.set()
         if self._step0_portal_running:
@@ -9031,7 +10222,7 @@ class SurveyApp(ctk.CTk):
     def _multi_pdf_worker(self, jobs: Any, signature: Any, cfg: dict[str, Any], provider: str,
                           model: str, key: str | None, secret: str, scale: float, force: bool) -> None:
         from multiple_description_runtime import (prepare_runtime, provider_target, run_batch,
-                                                   open_runtime_callbacks, Cancelled)
+                                                   open_runtime_callbacks, Cancelled, ROUTERAI_GROK_MODEL)
         from multiple_description_handoff import build_handoff
         import multiple_description_cache as multi_cache
         post = self._worker_poster()
@@ -9047,7 +10238,14 @@ class SurveyApp(ctk.CTk):
             post("multi_progress", f"Разбирающая модель: {target.provider} / {target.model}; лимит изображений {target.image_limit}.")
             router = provider_target(cfg, "routerai", legal_page_search.PRIMARY, key_secret=secret,
                                      explicit_key=key if provider == "routerai" else None)
-            with open_runtime_callbacks(target, cfg) as (send, choose):
+            hedge = None
+            if target.provider == "hydra" and target.model == "grok-4.7":
+                try:
+                    hedge = provider_target(cfg, "routerai", ROUTERAI_GROK_MODEL, key_secret=secret)
+                except Exception:  # noqa: BLE001 - страховка необязательна
+                    hedge = None
+            with open_runtime_callbacks(target, cfg, hedge_target=hedge,
+                                        progress=lambda text: post("multi_progress", text)) as (send, choose):
                 batch = run_batch(jobs, cfg, target=target, search_api_key=router_key,
                                   search_base_url=router.base_url, send=send, choose=choose,
                                   scale=scale, force_parse=force, current=self._worker_is_current,
@@ -9128,7 +10326,7 @@ class SurveyApp(ctk.CTk):
             if auto_identity and self._step0_outcome is not None:
                 folder = Path(self._step0_outcome.folder).resolve()
                 self._auto_dwg_context = (auto_identity, folder, signature, view)
-                note = "После ручной отрисовки DWG сохраняется в папке описаний, даже если результат неполный."
+                note = "После ручной отрисовки DWG один раз сохранится в папке описаний, даже если результат неполный. Дальше сохраняйте вручную."
                 self._step0_log(note, level=log_mode.LEVEL_KEY)
                 self._log_line(note, level=log_mode.LEVEL_KEY)
             self._select_step_tab(STEP_TAB_BOUNDARY)
@@ -9142,7 +10340,8 @@ class SurveyApp(ctk.CTk):
                      if was_auto and self._auto_dwg_context is not None else "")
         if unlocated:
             self._set_status(
-                f"Подготовлено контуров: {len(view.drawable)}. Отдельно размещено: {unlocated}." + auto_note, key=True)
+                f"Подготовлено контуров: {len(view.drawable)}. Без явной привязки к перекрёстку: {unlocated} — "
+                "построены как в обычном режиме, проверьте положение." + auto_note, key=True)
         else:
             self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой." + auto_note, key=True)
 
@@ -10488,6 +11687,8 @@ class SurveyApp(ctk.CTk):
                 if extra_m not in m_list:
                     m_list.insert(0, extra_m)
                     providers[extra_pid]["models"] = m_list
+        hydra_runtime = providers.setdefault("hydra", {})
+        hydra_runtime["reasoning_by_model"] = dict(self._reasoning_by_model)
         cfg["api"]["consensus"] = {
             "passes": self.current_passes_count(),
             "pass2_provider": p2_pid,
@@ -10759,6 +11960,9 @@ class SurveyApp(ctk.CTk):
             self._log = []
         stamp = __import__("datetime").datetime.now().strftime("%H:%M:%S")
         self._log.append((level, f"{stamp}  {message}"))
+        # Полный лог сессии задания очереди («Данные») пишется в его data.
+        if getattr(self, "_job_log_sink", None) is not None:
+            self._job_log_sink.append((stamp, "шаг1", level, str(message)))
         del self._log[:-400]
         if hasattr(self, "result_tab_var") and str(self.result_tab_var.get()) == "🧾 Журнал":
             self._refresh_log_view()
@@ -10988,6 +12192,12 @@ class SurveyApp(ctk.CTk):
         elif kind == "multi_scene_drawn":
             completed, error = payload[:2]
             save_result = payload[2] if len(payload) > 2 else None
+            if save_result is not None:
+                # Автосохранение — одноразовое, только для отрисовки самого
+                # автопотока. Контекст израсходован: дальнейшие ручные
+                # построения (добавленные лоты, повторные отрисовки) DWG
+                # сами не сохраняют — ни в папку автопотока, ни куда-либо ещё.
+                self._auto_dwg_context = None
             self._finish_busy()
             if completed:
                 self.draw_result = completed[-1][1]
@@ -11151,6 +12361,15 @@ class SurveyApp(ctk.CTk):
             level = log_mode.LEVEL_KEY if kind == "step0_portal_notice" else log_mode.LEVEL_INFO
             self._step0_lines.append((level, text))
             self._render_step0_log()
+            # Ход фоновой работы (сбор ACRIS/Клерка, портал) обязан попадать и в
+            # session_log.txt задания очереди: без этих строк в логе задания не
+            # видно, почему сбор дал 0 документов (живой случай 3870, 24.11.2026).
+            if getattr(self, "_job_log_sink", None) is not None:
+                sink_text = text[11:].lstrip() if text.startswith("[") and len(text) >= 10 and text[9] == "]" else text
+                self._job_log_sink.append(
+                    (time.strftime("%H:%M:%S"), "шаг0", level, sink_text))
+        elif kind == "step0_portal_identified":
+            self._handle_step0_portal_identified(payload)
         elif kind == "step0_portal_done":
             status, portal_result = payload
             self._finish_step0_portal_lookup(status, portal_result)
@@ -11905,6 +13124,10 @@ class SurveyApp(ctk.CTk):
             identity, folder, saved_signature, saved_view = context
             if saved_signature != signature or saved_view is not self._multi_scene_handoff:
                 save_notice = "Автосохранение DWG пропущено: схема больше не относится к результату автопотока."
+                # Контекст мёртв: не держать его до следующего построения,
+                # чтобы каждое ручное построение не повторяло это сообщение
+                # и не пыталось сохраниться в папку автопотока.
+                self._auto_dwg_context = None
             else:
                 auto_save = (folder, identity[3])
         self._set_status(f"Рисую подготовленные контуры: {len(plans)}…"
@@ -11927,7 +13150,9 @@ class SurveyApp(ctk.CTk):
         """Черновик для печати из основного участка: без соседей, на +1000 по X."""
         if getattr(self, "_multi_scene_handoff", None) is not None:
             from multiple_description_drawing import make_scene_print_drafts
-            result = make_scene_print_drafts(self._multi_scene_handoff.scene, builder_cfg=self.config_data)
+            print_cfg = dict((self.config_data or {}).get("print_draft") or {})
+            result = make_scene_print_drafts(
+                self._multi_scene_handoff.scene, builder_cfg=self.config_data, print_cfg=print_cfg)
             return [(f"Черновик для печати: #{index}", plan) for index, plan in enumerate(result.plans, 1)]
         main = self._preview_main_plan
         if main is None or main.is_neighbor:
@@ -11954,17 +13179,23 @@ class SurveyApp(ctk.CTk):
             # Pin the document receiving the geometry even if the active tab changes.
             session = builder.drawing_session() if auto_save else nullcontext(None)
             with session as connected:
-                try:
-                    for index, (name, plan) in enumerate(plans, 1):
-                        if not self._worker_is_current():
-                            return
-                        post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
+                # Каждый план — отдельно: сбой одного (живой случай 25.11.2026:
+                # основной план умер на первой линии, и нарисованным остался
+                # только печатный черновик) не отменяет остальные планы, а
+                # частично нарисованный документ всё равно сохраняется ниже.
+                for index, (name, plan) in enumerate(plans, 1):
+                    if not self._worker_is_current():
+                        return
+                    post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
+                    try:
                         result = self._draw_if_current(builder, plan)
-                        if result is None:
-                            return
-                        completed.append((name, result))
-                except Exception as exc:  # noqa: BLE001 - save even a partially drawn document
-                    error = "; ".join(x for x in (error, str(exc)) if x)
+                    except Exception as exc:  # noqa: BLE001 - save even a partially drawn document
+                        error = "; ".join(
+                            x for x in (error, f"план «{name}» не нарисован: {exc}") if x)
+                        continue
+                    if result is None:
+                        return
+                    completed.append((name, result))
                 if auto_save:
                     with self._draw_lock:
                         if not self._worker_is_current():
@@ -11975,6 +13206,21 @@ class SurveyApp(ctk.CTk):
                             save_result = ("failed", str(exc))
                         else:
                             save_result = ("saved", str(path))
+                            # Предупреждения построения — отдельным файлом по
+                            # имени DWG рядом с ним: в журнале сессии их потом
+                            # не выискивать. Сбой записи файла не губит DWG.
+                            try:
+                                sections = []
+                                for plan_name, result in completed:
+                                    seen: list[str] = []
+                                    for warning in list(result.plan.warnings) + list(result.warnings):
+                                        text = str(warning)
+                                        if text.strip() and text not in seen:
+                                            seen.append(text)
+                                    sections.append((plan_name, seen))
+                                auto_dwg_save.write_dwg_warnings(path, sections, error=error or "")
+                            except Exception:  # noqa: BLE001 - файл предупреждений не критичен
+                                pass
         except Exception as exc:  # noqa: BLE001 - connection/session failed
             error = "; ".join(x for x in (error, str(exc)) if x)
             if auto_save and save_result is None:
@@ -12542,11 +13788,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkLabel(
             top_banner,
-            text=(
-                "Система НЕ меняет спорные цифры самовольно. Вы можете отправить модели на прицельную "
-                "перепроверку именно этой стороны в документе, оставить прочитанные данные как есть "
-                "или вручную применить исправление."
-            ),
+            text="Спорные цифры не меняются сами. Перепроверьте, оставьте как есть или правьте вручную.",
             anchor="w",
             justify="left",
             wraplength=830,
@@ -12917,11 +14159,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkLabel(
             top_banner,
-            text=(
-                "Сверьте спорные строки по исходному документу и выберите правый проход ниже, "
-                "либо нажмите «🔄 Попробуй разобраться ещё раз» — модели получат задание "
-                "прицельно перепроверить именно спорные места."
-            ),
+            text="Выберите верный проход ниже.",
             anchor="w",
             justify="left",
             wraplength=840,
@@ -13000,7 +14238,7 @@ class SurveyApp(ctk.CTk):
 
         ctk.CTkButton(
             btn_bar,
-            text="🔄 Попробуй разобраться ещё раз (прицельно проверить спорные места)",
+            text="🔄 Ещё раз",
             height=38,
             fg_color=THEME["btn_amber"],
             hover_color=THEME["btn_amber_hover"],
@@ -13168,7 +14406,7 @@ class SurveyApp(ctk.CTk):
                         "plan": plan,
                         "cfg": cfg,
                         "provider_id": str(cfg.get("api", {}).get("provider") or "hydra"),
-                        "model_name": str(cfg.get("api", {}).get("model") or "glm-5.2"),
+                        "model_name": str(cfg.get("api", {}).get("model") or "grok-4.7"),
                         "api_key": None,
                         "key_secret": key_secret,
                         "use_llm": True,
@@ -13403,8 +14641,8 @@ class PdfSetDialog:
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            head, text=("Отметьте наши документы — остальные файлы будут соседями" if self.multi_mode
-                        else "Отметьте наш участок — остальные файлы будут соседями"),
+            head, text=("Отметьте наши" if self.multi_mode
+                        else "Отметьте наш"),
             font=ctk.CTkFont(size=15, weight="bold"), text_color=THEME["text_main"], anchor="w",
         ).grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(
@@ -13427,7 +14665,7 @@ class PdfSetDialog:
         foot.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 14))
         foot.grid_columnconfigure(0, weight=1)
         self.no_main_radio = ctk.CTkRadioButton(
-            foot, text="Нашего участка в этом наборе нет — все файлы соседи",
+            foot, text="Нашего нет — все соседи",
             variable=self.main_var, value=self.NO_MAIN, command=self._refresh_notes,
             font=ctk.CTkFont(size=12), text_color=THEME["text_main"],
         )
@@ -13876,7 +15114,7 @@ class PdfSetDialog:
         if self.legacy_multi_roles and sum(item.is_main for item in self.items) > 1:
             problems.append("обычный режим поддерживает только один наш документ; выберите один или включите режим всех описаний")
         if not self.multi_mode and not self.legacy_multi_roles and self.items and not (choice == self.NO_MAIN or (choice.isdigit() and int(choice) < len(self.items))):
-            problems.append("отметьте наш участок или пункт «Нашего участка в этом наборе нет»")
+            problems.append("отметьте наш или пункт «Нашего нет — все соседи»")
         scene_mode = str(self.scene_var.get() or "") if self.ask_scene else "update"
         if self.multi_mode and scene_mode == "add" and not self.app._multi_scene_can_add():
             scene_mode = ""

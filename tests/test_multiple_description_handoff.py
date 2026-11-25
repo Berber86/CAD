@@ -114,21 +114,26 @@ def test_handoff_rejects_plan_with_changed_recorded_side(tmp_path):
     result = batch(tmp_path)
     first = result.scene.plans[0]
     plan = first.plan
-    bad_line = replace(plan.boundary_lines[0], end=(plan.boundary_lines[0].end[0] + 3, plan.boundary_lines[0].end[1]))
-    bad_plan = replace(plan, boundary_lines=[bad_line, *plan.boundary_lines[1:]])
+    seg = plan.description.segments[0]
+    changed = seg.model_copy(update={'distance_ft': seg.distance_ft + 3})
+    bad_desc = plan.description.model_copy(update={'segments': [changed, *plan.description.segments[1:]]})
+    bad_plan = replace(plan, description=bad_desc)
     scene = drawing.SceneResult((replace(first, plan=bad_plan),) + result.scene.plans[1:], ())
     with pytest.raises(handoff.InvalidHandoff, match='plan sides mismatch'):
         handoff.build_handoff(replace(result, scene=scene))
 
 
-def test_handoff_rejects_relocated_side_even_if_its_vector_is_unchanged(tmp_path):
+def test_handoff_accepts_side_relocated_by_builder_gap(tmp_path):
+    # Обычный построитель вправе отнести невязку округления в другой угол:
+    # отрезок сдвинут, но описание в плане — то же самое. Такой план валиден,
+    # как и в обычном режиме.
     result = batch(tmp_path)
     first = result.scene.plans[0]
     plan = first.plan
     edge = plan.boundary_lines[1]
     shifted = replace(edge, start=(edge.start[0] + 2, edge.start[1]),
                       end=(edge.end[0] + 2, edge.end[1]))
-    damaged = replace(plan, boundary_lines=[plan.boundary_lines[0], shifted, *plan.boundary_lines[2:]])
-    scene = drawing.SceneResult((replace(first, plan=damaged),) + result.scene.plans[1:], ())
-    with pytest.raises(handoff.InvalidHandoff, match='plan sides mismatch'):
-        handoff.build_handoff(replace(result, scene=scene))
+    moved = replace(plan, boundary_lines=[plan.boundary_lines[0], shifted, *plan.boundary_lines[2:]])
+    scene = drawing.SceneResult((replace(first, plan=moved),) + result.scene.plans[1:], ())
+    view = handoff.build_handoff(replace(result, scene=scene))
+    assert view.drawable[0].plan is moved

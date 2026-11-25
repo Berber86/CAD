@@ -1,5 +1,6 @@
 """Ensure each experimental transport callback sends exactly one request."""
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -86,3 +87,62 @@ def test_transport_status_code_and_response_categories_are_preserved_safely():
         transport.make_sender(client, 'test')(pages(1), {})
     assert classify_exception(refused.value) == 'provider_refusal'
     assert 'private refusal' not in str(refused.value)
+
+
+def test_hedge_launches_routerai_after_delay_and_first_success_wins():
+    import threading
+    calls = []
+    release_primary = threading.Event()
+
+    def slow_primary(pages_, context):
+        calls.append('primary')
+        release_primary.wait(2)
+        return 'primary-answer'
+
+    def fast_secondary(pages_, context):
+        calls.append('secondary')
+        return 'routerai-answer'
+
+    send = transport.make_hedged_sender(slow_primary, fast_secondary, delay=0.05)
+    assert send(pages(1), {}) == 'routerai-answer'
+    assert calls == ['primary', 'secondary']
+    release_primary.set()
+
+
+def test_hedge_fast_primary_never_launches_secondary():
+    calls = []
+    send = transport.make_hedged_sender(
+        lambda p, c: calls.append('primary') or 'primary-answer',
+        lambda p, c: calls.append('secondary') or 'routerai-answer',
+        delay=0.5)
+    assert send(pages(1), {}) == 'primary-answer'
+    assert calls == ['primary']
+
+
+def test_hedge_primary_error_after_secondary_launch_returns_secondary():
+    import threading
+
+    def failing_primary(pages_, context):
+        time.sleep(0.12)
+        raise TimeoutError('hydra timeout')
+
+    def fast_secondary(pages_, context):
+        return 'routerai-answer'
+
+    send = transport.make_hedged_sender(failing_primary, fast_secondary, delay=0.02)
+    assert send(pages(1), {}) == 'routerai-answer'
+
+
+def test_hedge_both_errors_prefers_primary_error():
+    import threading
+
+    def failing_primary(pages_, context):
+        time.sleep(0.12)
+        raise TimeoutError('primary-error')
+
+    def failing_secondary(pages_, context):
+        raise RuntimeError('secondary-error')
+
+    send = transport.make_hedged_sender(failing_primary, failing_secondary, delay=0.02)
+    with pytest.raises(TimeoutError, match='primary-error'):
+        send(pages(1), {})

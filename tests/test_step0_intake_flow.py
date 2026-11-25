@@ -489,14 +489,31 @@ def test_portal_values_are_kept_per_file_and_survive_step1_read(tmp_path):
     assert next(item for item in manifest["items"] if item["file"] == neighbor.file)["identity"] == passport["identity"]
 
 
-@pytest.mark.parametrize("borough", ["", "Queens", "Brooklyn", "Bronx", "Manhattan", "Staten Island Queens", None])
-def test_richmond_site_rejects_unknown_or_other_borough_before_any_side_effect(tmp_path, borough):
+@pytest.mark.parametrize("borough", ["", "Staten Island Queens", None])
+def test_unknown_borough_is_rejected_before_any_side_effect(tmp_path, borough):
     folder = tmp_path / "never-created"
     calls = []
     with pytest.raises(ValueError, match="Staten Island"):
         deed_intake.collect_deeds(block=BLOCK, lot=LOT, borough=borough, folder=folder,
-                                  fetch_list=lambda *args: calls.append(args))
+                                  fetch_list=lambda *args: calls.append(args),
+                                  acris_fetch_page=lambda *args: calls.append(args))
     assert not calls and not folder.exists()
+
+
+@pytest.mark.parametrize("borough", ["Queens", "Brooklyn", "Bronx", "Manhattan"])
+def test_other_boroughs_go_to_acris_never_to_richmond(tmp_path, borough):
+    """Районы ACRIS не должны попадать на сайт Клерка Ричмонда — у них свой."""
+    richmond_calls = []
+    outcome = deed_intake.collect_deeds(
+        block=BLOCK, lot=LOT, borough=borough, folder=tmp_path,
+        fetch_list=lambda *args: richmond_calls.append(args),
+        acris_fetch_page=lambda code, block, lot, page: "<html><body>нет строк</body></html>",
+        acris_downloader=lambda row, dest: pytest.fail("качать нечего"),
+        page_finder=lambda pdf: pytest.fail("страниц нет"),
+    )
+    assert richmond_calls == []
+    assert not outcome.ok
+    assert any("ACRIS" in item for item in outcome.missing)
 
 
 def test_full_pdf_only_path_skips_legacy_search_and_cropping(tmp_path, monkeypatch):
@@ -511,3 +528,31 @@ def test_full_pdf_only_path_skips_legacy_search_and_cropping(tmp_path, monkeypat
         with pytest.importorskip("pymupdf").open(outcome.folder / record.file) as pdf:
             assert len(pdf) == 3
     assert not list(outcome.folder.glob("*_p*.pdf"))
+
+
+def test_on_record_fires_as_each_document_is_downloaded(tmp_path):
+    seen = []
+    outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], on_record=lambda rec: seen.append(rec.file))
+    assert seen == [record.file for record in outcome.records]
+    assert seen[:2] == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]
+
+
+# --------------------------------------------- двухфазный сбор раннего автопотока
+
+
+def test_collect_only_neighbours_skips_our_lot(tmp_path):
+    outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], include_our=False)
+    assert [record.file for record in outcome.records] == ["LOT 30 NEW.pdf"]
+    assert not any("наш участок не собран" in item for item in outcome.missing)
+
+
+def test_two_phase_collection_merges_and_manifest_covers_both(tmp_path):
+    first = _collect(tmp_path)
+    second = _collect(tmp_path, neighbours=[NEIGHBOUR], include_our=False)
+    merged = deed_intake.merge_outcomes(first, second)
+    assert {record.file for record in merged.records} == {
+        "OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf", "LOT 30 NEW.pdf"}
+    assert merged.ok
+    manifest = deed_store.read_manifest(merged.folder)
+    files = {item["file"] for item in manifest["items"]}
+    assert {"OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf", "LOT 30 NEW.pdf"} <= files

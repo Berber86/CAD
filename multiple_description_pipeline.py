@@ -72,6 +72,41 @@ class PipelineResult:
     render_errors: tuple[int, ...]
 
 
+def candidate_pages_pdf_name(source: Path, pages: Sequence[int]) -> str:
+    """Имя копии только релевантных страниц: ``LOT 30 NEW_p2,4.pdf``."""
+    return f"{source.stem}_p{','.join(str(int(n)) for n in pages)}.pdf"
+
+
+def write_candidate_pages_pdf(source: Path, pages: Sequence[int]) -> Path | None:
+    """Копия исходника только из релевантных страниц рядом с ним.
+
+    Чтобы пользователю не листать весь документ в поисках описания при
+    проверке. Вызывать только с финальным списком кандидатов: страницы
+    оцениваются партиями, и вердикт полон лишь после проверки всех партий.
+    Любой сбой возвращает None — отсутствие копии не должно губить разбор.
+    """
+    numbers = sorted({int(n) for n in pages if int(n) > 0})
+    if not numbers:
+        return None
+    try:
+        import pymupdf
+
+        source = Path(source)
+        target = source.with_name(candidate_pages_pdf_name(source, numbers))
+        if target.resolve() == source.resolve():
+            return None
+        with pymupdf.open(source) as doc:
+            if doc.needs_pass or any(not 1 <= n <= len(doc) for n in numbers):
+                return None
+            with pymupdf.open() as trimmed:
+                for n in numbers:
+                    trimmed.insert_pdf(doc, from_page=n - 1, to_page=n - 1)
+                trimmed.save(target)
+        return target
+    except Exception:  # noqa: BLE001 - копия для проверки необязательна
+        return None
+
+
 def parse_pdf(
     path: str | Path,
     config: Mapping[str, Any] | None,
@@ -126,6 +161,14 @@ def parse_pdf(
         return PipelineResult(search, None, status, False, None, portal_lot, ())
     if file_metadata._digest(path) != search['pdf_sha256']:
         raise cache.CacheError('PDF changed after page search; parse not started.')
+    # Финальный вердикт о релевантных страницах вынесен (все партии проверены
+    # внутри search_pdf): рядом с исходником — копия только этих страниц,
+    # чтобы пользователь проверял описание, не листая весь документ.
+    extracted = write_candidate_pages_pdf(path, candidates)
+    if extracted is not None:
+        emit(progress, f"Для проверки: копия только релевантных страниц — {extracted.name}.")
+    else:
+        emit(progress, "Для проверки: копию релевантных страниц сделать не удалось.")
     pages: list[PageImage] = []
     errors: list[int] = []
     limit = min(MAX_IMAGES, image_limit)
@@ -167,5 +210,18 @@ def parse_pdf(
                          search_complete=complete, send=send, choose=choose, current_job=current, progress=progress)
     check(current)
     cache.save_result(path, context, result, portal_lot=portal_lot)
+    if not result.items and not force_parse:
+        # Свежий разбор не дал ничего, а этот же PDF уже разбирался успешно
+        # (например, целиком на этапе сбора, а финальный проход по отобранным
+        # страницам лёг по тайм-аутам провайдера): описание не должно молча
+        # выпадать из чертежа. Явный повторный разбор (force_parse) эту
+        # подмену не получает — пользователь просил именно свежий результат.
+        fallback = cache.load_latest_complete(path)
+        if fallback is not None:
+            restored, original_portal_lot = fallback
+            emit(progress, "Разбор: свежий запрос не удался — использовано ранее сохранённое "
+                           "полное описание этого PDF; сверьте его перед использованием.")
+            return PipelineResult(search, restored, 'parsed', True, original_portal_lot,
+                                  portal_lot, tuple(errors))
     return PipelineResult(search, result, 'parsed' if result.selected_attempt is not None else 'parse_failed',
                           False, portal_lot, portal_lot, tuple(errors))

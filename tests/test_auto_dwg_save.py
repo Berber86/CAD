@@ -122,9 +122,21 @@ def test_auto_pipeline_manually_draws_then_saves_same_document(gui, tmp_path, mo
     result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
     assert result.read_bytes() == b"DWG simulated" and len(doc.ModelSpace.lines) > 0
     assert str(result) in app.status_var.get() and "сохранён" in app.status_var.get()
+    # Автосохранение одноразовое: контекст автопотока израсходован первой
+    # отрисовкой. Повторное ручное построение DWG само не сохраняет —
+    # Николай: после автопотока человек достраивает лоты вручную и не ждёт,
+    # что программа без спроса плодит файлы в папке автопотока.
+    assert app._auto_dwg_context is None
     app._start_draw_scene()
     smoke._wait_for_gui_worker(app)
-    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 2
+    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 1
+
+
+def test_full_reset_drops_auto_dwg_context(gui, tmp_path, monkeypatch):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    assert app._auto_dwg_context
+    app._reset_session()
+    assert app._auto_dwg_context is None
 
 
 def test_mismatched_lot_still_saves_using_portal_number(gui, tmp_path, monkeypatch, fake_autocad):
@@ -269,6 +281,32 @@ def test_reports_both_drawing_and_save_failure(gui, tmp_path, monkeypatch, fake_
     assert partial.read_bytes() == b"partial"
 
 
+def test_one_failed_plan_does_not_stop_remaining_plans(gui, tmp_path, monkeypatch, fake_autocad):
+    # Живой случай 25.11.2026: первый план (печатный черновик) лёг, и основной
+    # план с участком и соседом даже не начинался. Теперь планы независимы:
+    # остальные рисуются, документ сохраняется, упавший план назван в итоге.
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    real_draw = builder.draw_plan
+    calls = []
+    def flaky(plan):
+        calls.append(plan)
+        if len(calls) == 1:
+            raise RuntimeError("Property 'AddLine.Color' can not be set")
+        return real_draw(plan)
+    monkeypatch.setattr(builder, "draw_plan", flaky)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert result.read_bytes() == b"DWG simulated"
+    assert len(calls) >= 2 and doc.ModelSpace.lines
+    status = app.status_var.get()
+    assert "не нарисован" in status and "завершено планов: 1" not in status
+
+
 def test_parallel_saves_use_different_names_in_same_folder(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -276,6 +314,124 @@ def test_parallel_saves_use_different_names_in_same_folder(tmp_path):
     assert len(set(paths)) == 24
     assert all(p.parent == tmp_path and p.read_bytes() == b"DWG mock" for p in paths)
     assert len(list(tmp_path.iterdir())) == 24
+
+
+class _BusySaveError(Exception):
+    hresult = -2147418111
+
+
+def test_busy_autocad_saveas_is_retried_until_it_saves(tmp_path):
+    # Ночной сбой 3870 (24–25.11.2026): SaveAs один раз получил -2147418111
+    # («вызов отклонён») и полностью нарисованный чертёж не сохранился.
+    calls = []
+
+    class BusyThenOk:
+        def SaveAs(self, path):
+            calls.append(path)
+            if len(calls) < 3:
+                raise _BusySaveError("(-2147418111, 'Вызов был отклонен получателем')")
+            Path(path).write_bytes(b"DWG after busy")
+
+    result = auto_dwg_save.save_new_dwg(BusyThenOk(), tmp_path, "30", sleep=lambda _s: None)
+    assert len(calls) == 3 and result.read_bytes() == b"DWG after busy"
+
+
+def test_busy_autocad_saveas_gives_up_honestly_after_attempts(tmp_path):
+    calls = []
+
+    class AlwaysBusy:
+        def SaveAs(self, path):
+            calls.append(path)
+            raise RuntimeError("RPC_E_CALL_REJECTED (-2147418111)")
+
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="не подтвердил") as err:
+        auto_dwg_save.save_new_dwg(
+            AlwaysBusy(), tmp_path, "30", sleep=lambda _s: None, save_attempts=3)
+    assert len(calls) == 3 and "-2147418111" in str(err.value)
+
+
+def test_non_busy_saveas_error_is_retried_then_reported_honestly(tmp_path):
+    # Живой случай 25.11.2026: SaveAs только что созданного документа умер с
+    # «<unknown>.SaveAs» — не «занятость», но и не приговор: полностью
+    # нарисованный чертёж нельзя терять из-за одного отклонённого вызова.
+    # Постоянная ошибка после всех попыток всё равно честно сообщается.
+    calls = []
+
+    class DiskError:
+        def SaveAs(self, path):
+            calls.append(path)
+            raise RuntimeError("disk problem")
+
+    with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="disk problem"):
+        auto_dwg_save.save_new_dwg(
+            DiskError(), tmp_path, "30", sleep=lambda _s: None, save_attempts=3)
+    assert len(calls) == 3
+
+
+def test_transient_unknown_saveas_error_recovers_on_retry(tmp_path):
+    calls = []
+
+    class Flaky:
+        def SaveAs(self, path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("<unknown>.SaveAs")
+            Path(path).write_bytes(b"DWG after hiccup")
+
+    result = auto_dwg_save.save_new_dwg(Flaky(), tmp_path, "30", sleep=lambda _s: None)
+    assert len(calls) == 2 and result.read_bytes() == b"DWG after hiccup"
+
+
+def test_warnings_file_named_after_dwg_with_all_plan_warnings(tmp_path):
+    dwg = tmp_path / "lot_41_ee2e30a5c6b143ea86cf5e20c96aa2c8.dwg"
+    dwg.write_bytes(b"DWG")
+    target = auto_dwg_save.write_dwg_warnings(
+        dwg,
+        [("наш участок", ["контур не замкнулся на 0.42 ft", "номер лота из описания: 41"]),
+         ("сосед LOT 43", ["контур выходит за окно листа"]),
+         ("черновик", [])],
+        stamp="2026-11-24 17:40:00",
+    )
+    assert target is not None and target.name == "lot_41_ee2e30a5c6b143ea86cf5e20c96aa2c8.warnings.txt"
+    text = target.read_text(encoding="utf-8")
+    assert dwg.name in text and "2026-11-24 17:40:00" in text
+    assert "== наш участок ==" in text and "- контур не замкнулся на 0.42 ft" in text
+    assert "== сосед LOT 43 ==" in text and "черновик" not in text
+
+
+def test_warnings_file_records_absence_and_draw_error(tmp_path):
+    dwg = tmp_path / "lot_7_x.dwg"
+    dwg.write_bytes(b"DWG")
+    clean = auto_dwg_save.write_dwg_warnings(dwg, [("наш участок", [])], stamp="s")
+    assert clean is not None and "Предупреждений не было." in clean.read_text(encoding="utf-8")
+    partial = auto_dwg_save.write_dwg_warnings(
+        dwg, [("наш участок", ["одно предупреждение"])], error="третий план не построен", stamp="s")
+    assert partial is not None
+    text = partial.read_text(encoding="utf-8")
+    assert "Ошибка отрисовки: третий план не построен" in text and "- одно предупреждение" in text
+
+
+def test_draw_warnings_are_written_next_to_saved_dwg(gui, tmp_path, monkeypatch, fake_autocad):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    real_draw = builder.draw_plan
+
+    def draw_with_warning(plan):
+        result = real_draw(plan)
+        result.warnings.append("тестовое предупреждение отрисовки")
+        return result
+
+    monkeypatch.setattr(builder, "draw_plan", draw_with_warning)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    data_dir = tmp_path / "project" / "01_описания"
+    dwg, = data_dir.glob("lot_32_*.dwg")
+    warnings_file = data_dir / f"{dwg.stem}.warnings.txt"
+    text = warnings_file.read_text(encoding="utf-8")
+    assert dwg.name in text and "тестовое предупреждение отрисовки" in text
 
 
 def test_unavailable_autocad_reports_unsaved_file(gui, tmp_path, monkeypatch):

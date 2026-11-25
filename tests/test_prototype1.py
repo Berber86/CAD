@@ -663,7 +663,7 @@ def test_providers_catalog_and_switching(monkeypatch):
     hydra_t = resolve_api_target(cfg, provider="hydra")
     assert hydra_t["base_url"] == "https://api.hydraai.ru/v1"
     assert hydra_t["api_key"] == "hk-env"
-    assert hydra_t["model"] == "glm-5.2"
+    assert hydra_t["model"] == "grok-4.7"
 
     or_t = resolve_api_target(cfg, provider="openrouter")
     assert or_t["base_url"] == "https://openrouter.ai/api/v1"

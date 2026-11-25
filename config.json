@@ -11,9 +11,9 @@
     "provider": "hydra",
     "api_key": "",
     "base_url": "https://api.hydraai.ru/v1",
-    "model": "glm-5.2",
+    "model": "grok-4.7",
     "temperature": 0.0,
-    "timeout_sec": 180,
+    "timeout_sec": 500,
     "max_retries": 2,
     "max_input_chars": 60000,
     "vision_dpi": 220,
@@ -27,14 +27,40 @@
         "base_url": "https://api.hydraai.ru/v1",
         "api_key": "",
         "env_key": "HYDRA_API_KEY",
-        "default_model": "glm-5.2",
-        "selected_model": "glm-5.2",
+        "default_model": "grok-4.7",
+        "selected_model": "grok-4.7",
         "models": [
-          "glm-5.2",
-          "hydra-gemini-pro",
-          "hydra-gemini-3-pro",
-          "hydra-gemini"
-        ]
+          "grok-4.7",
+          "gpt-6-luna",
+          "minimax-m3.1-flash",
+          "pro/glm-5.3-flash",
+          "gpt-5.6-luna",
+          "pro/deepseek-v4.1-flash-1017",
+          "gpt-5.4-nano",
+          "gemini-3.1-flash-lite",
+          "gpt-5-mini",
+          "gemini-3.5-flash-lite",
+          "gemini-3-flash",
+          "gemini-3.8-flash",
+          "gpt-5.4-mini",
+          "gpt-6.1-terra",
+          "gpt-5.1",
+          "gpt-6-sol",
+          "gpt-6.1-sol",
+          "gpt-6.2-sol",
+          "claude-sonnet-5",
+          "claude-sonnet-5.5",
+          "gemini-3.1-pro",
+          "gpt-5.6-terra",
+          "gpt-5.2",
+          "gpt-5.3-codex",
+          "gpt-5.4",
+          "gpt-5.5",
+          "gpt-5.6-sol",
+          "gpt-6.2-astra",
+          "gpt-6-astra"
+        ],
+        "reasoning_by_model": {}
       },
       "openrouter": {
         "label": "OpenRouter",
@@ -58,17 +84,13 @@
         "base_url": "https://routerai.ru/api/v1",
         "api_key": "",
         "env_key": "ROUTERAI_API_KEY",
-        "default_model": "openai/gpt-4.1",
-        "selected_model": "openai/gpt-4.1",
+        "default_model": "x-ai/grok-4.7",
+        "selected_model": "x-ai/grok-4.7",
         "models": [
-          "openai/gpt-4.1",
-          "openai/gpt-4.1-mini",
-          "openai/gpt-4o",
-          "openai/gpt-4o-mini",
-          "google/gemini-2.5-pro",
-          "google/gemini-2.5-flash",
-          "anthropic/claude-sonnet-4.5",
-          "deepseek/deepseek-chat"
+          "x-ai/grok-4.7",
+          "x-ai/grok-4.6",
+          "typesafe/jev-1.14",
+          "microsoft/microsoft-decision-1.1"
         ]
       }
     },
@@ -77,7 +99,7 @@
       "pass2_provider": "openrouter",
       "pass2_model": "nvidia/nemotron-3.5-super-vl:free",
       "pass3_provider": "routerai",
-      "pass3_model": "openai/gpt-4.1"
+      "pass3_model": "x-ai/grok-4.7"
     },
     "conflict_advisor": {
       "enabled": true,
@@ -139,7 +161,7 @@
   "layer_colors": {
     "property_line": 3,
     "boundary_text": 7,
-    "street_row": 1,
+    "street_row": 4,
     "neighbor_lot": 4
   },
   "feature_labeling": {

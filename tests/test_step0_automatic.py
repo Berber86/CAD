@@ -217,3 +217,117 @@ def test_reset_releases_lock_if_completion_already_in_queue(gui, monkeypatch):
     app._reset_session()
     assert not app._step0_portal_running and app._step0_auto_stage is None
     assert app.step0_block_var.get() == ""
+
+
+# ------------------------------------- ранний сбор: наш участок до соседей
+
+
+def _drain_until(app, predicate, tries=3000):
+    for _ in range(tries):
+        app._drain_events()
+        if predicate():
+            return
+        time.sleep(.01)
+    pytest.fail("automatic pipeline did not reach the expected state")
+
+
+def _collect_spy(gui, monkeypatch, tmp_path, seen, **fetch_kwargs):
+    actual_collect = gui.deed_intake.collect_deeds
+
+    def collect(**kwargs):
+        seen.append(dict(kwargs))
+        kwargs.update(fetch_list=intake._fetch(**fetch_kwargs),
+                      downloader=intake._downloader(tmp_path),
+                      page_finder=intake._finder())
+        return actual_collect(**kwargs)
+
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+
+
+def _submit_spy(app, monkeypatch, submitted):
+    def submit(items, **kwargs):
+        submitted.append(items)
+        app._busy = True
+
+    monkeypatch.setattr(app, "_submit_pdf_set", submit)
+
+
+def test_auto_downloads_our_lot_before_neighbours_are_known(gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    seen, submitted = [], []
+    _collect_spy(gui, monkeypatch, tmp_path, seen)
+    _submit_spy(app, monkeypatch, submitted)
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    assert app._step0_running  # наш участок качается, нейронки ещё не ответили
+    _drain_until(app, lambda: not app._step0_running
+                 and app._step0_our_outcome is not None)
+    assert len(seen) == 1 and seen[0]["neighbours"] == [] and seen[0]["include_our"] is True
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    _drain_until(app, lambda: bool(submitted))
+    assert len(seen) == 2 and seen[1]["include_our"] is False
+    assert list(seen[1]["neighbours"]) == [30]
+    assert {item.path.name for item in submitted[0]} == {
+        "OUR LOT 32 NEW.pdf", "LOT 30 NEW.pdf"}
+
+
+def test_auto_collects_neighbours_after_our_when_answer_comes_mid_download(
+        gui, tmp_path, monkeypatch):
+    import threading
+
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    seen, submitted = [], []
+    gate, entered = threading.Event(), threading.Event()
+    actual_collect = gui.deed_intake.collect_deeds
+
+    def collect(**kwargs):
+        seen.append(dict(kwargs))
+        if len(seen) == 1:
+            entered.set()
+            gate.wait(15)
+        kwargs.update(fetch_list=intake._fetch(),
+                      downloader=intake._downloader(tmp_path),
+                      page_finder=intake._finder())
+        return actual_collect(**kwargs)
+
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    _submit_spy(app, monkeypatch, submitted)
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    assert entered.wait(10)
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    assert len(seen) == 1  # соседи известны, но второй проход ждёт наш участок
+    gate.set()
+    _drain_until(app, lambda: bool(submitted))
+    assert len(seen) == 2 and seen[1]["include_our"] is False
+    assert {item.path.name for item in submitted[0]} == {
+        "OUR LOT 32 NEW.pdf", "LOT 30 NEW.pdf"}
+
+
+def test_auto_continues_without_neighbours_when_neighbour_answer_fails(
+        gui, tmp_path, monkeypatch):
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    seen, submitted = [], []
+    _collect_spy(gui, monkeypatch, tmp_path, seen)
+    _submit_spy(app, monkeypatch, submitted)
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    _drain_until(app, lambda: not app._step0_running
+                 and app._step0_our_outcome is not None)
+    app._finish_step0_portal_lookup("error", "PortalLookupError: обе модели молчат")
+    _drain_until(app, lambda: bool(submitted))
+    assert len(seen) == 1
+    assert {item.path.name for item in submitted[0]} == {"OUR LOT 32 NEW.pdf"}
+    assert any("без соседей" in line for _level, line in app._step0_lines)

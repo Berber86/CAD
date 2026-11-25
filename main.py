@@ -642,6 +642,12 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage: str | None = None
         self._step0_auto_address = ""
         self._step0_auto_identity: tuple[str, str, str, str] | None = None
+        # Ранний сбор автопотока: наш участок качается сразу по Block/Lot,
+        # не дожидаясь номеров соседей от нейронок; соседи — вторым проходом.
+        self._step0_early_active = False
+        self._step0_early_phase = ""  # "our" → "neighbours"
+        self._step0_neighbour_lots: list[int] | None = None  # None — ответа ещё нет
+        self._step0_our_outcome: Any = None
         self._auto_stream_batch: Any = None
         self._auto_stream_jobs: tuple[Any, ...] = ()
         self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
@@ -4156,6 +4162,7 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage = "portal"
         self._step0_auto_address = address
         self._step0_auto_identity = None
+        self._reset_step0_early()
         self._step0_stop.clear()
         self._start_step0_portal_lookup()
         if not self._step0_portal_running:
@@ -4165,9 +4172,17 @@ class SurveyApp(ctk.CTk):
         self.step0_stop_button.configure(state="normal")
         self._step0_log("Автопоток: поиск адреса → сбор PDF → поиск и разбор описаний; возможны платные запросы. AutoCAD не запускается автоматически. После ручной отрисовки активный документ сохраняется под новым именем в папке описаний, даже если результат неполный.", level=log_mode.LEVEL_KEY)
 
+    def _reset_step0_early(self) -> None:
+        """Сбрасывает состояние раннего сбора (наш участок до соседей)."""
+        self._step0_early_active = False
+        self._step0_early_phase = ""
+        self._step0_neighbour_lots = None
+        self._step0_our_outcome = None
+
     def _stop_auto_transition(self, message: str) -> None:
         self._step0_auto_stage = None
         self._step0_auto_identity = None
+        self._reset_step0_early()
         self.step0_auto_button.configure(state="normal")
         if not self._step0_running:
             self.step0_stop_button.configure(state="disabled")
@@ -4176,6 +4191,9 @@ class SurveyApp(ctk.CTk):
 
     def _start_step0_portal_lookup(self) -> None:
         """Address → NYC Portal → one user-initiated Vision extraction call."""
+        if self._step0_early_active:
+            self._set_status("Автопоток: ранний сбор уже идёт — дождитесь его завершения.", warn=True)
+            return
         if self._step0_portal_running or self._step0_running:
             self._set_status("Шаг 0 уже выполняет поиск или сбор; дождитесь завершения.", warn=True)
             return
@@ -4266,6 +4284,14 @@ class SurveyApp(ctk.CTk):
             ))
             self._post("step0_portal_notice" if important else "step0_progress", self._step0_timestamp(line))
 
+        def identified(capture: Any) -> None:
+            # Block/Lot уже прочитаны: GUI может качать наш участок, пока
+            # нейронки ещё отвечают про соседей (только автопоток).
+            self._post("step0_portal_identified", (
+                address, capture.borough, capture.block, capture.lot,
+                capture.details_source, str(capture.map_image),
+            ))
+
         try:
             result = nyc_portal.lookup_parcel(
                 address,
@@ -4278,12 +4304,81 @@ class SurveyApp(ctk.CTk):
                 progress=progress,
                 fast_mode=fast_mode,
                 fast_pause_sec=fast_pause,
+                on_identified=identified,
                 **({"optimal_mode": True} if optimal_mode else {}),
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
             self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
             return
         self._post("step0_portal_done", ("ok", result))
+
+    def _handle_step0_portal_identified(self, payload: Any) -> None:
+        """Block/Lot известны до ответа про соседей: качаем наш участок сразу.
+
+        Работает только в автопотоке: ручной поиск по-прежнему сначала
+        показывает Borough/Block/Lot человеку и ждёт его команды.
+        """
+        address, borough, block, lot, details_source, map_image = payload
+        if self._step0_auto_stage != "portal" or self._step0_early_active:
+            return
+        if address != self._step0_auto_address:
+            return
+        if str(self.step0_address_var.get() or "").strip() != address:
+            return
+        if not deed_intake.step0_source_name(borough or ""):
+            return  # финальный обработчик остановит автопоток с объяснением
+        try:
+            int(str(block))
+            int(str(lot))
+        except (TypeError, ValueError):
+            return
+        self._step0_lookup_snapshot = (address, nyc_portal.ParcelLookup(
+            block=str(block), lot=str(lot), borough=borough,
+            left_neighbour=None, right_neighbour=None,
+            confidence="", notes="", map_image=Path(map_image), usage=None,
+            details_source=details_source or "ocr",
+        ))
+        self.step0_borough_var.set(borough or "")
+        self.step0_block_var.set(str(block))
+        self.step0_lot_var.set(str(lot))
+        self._step0_auto_identity = (address, str(borough), str(block), str(lot))
+        self._step0_early_active = True
+        self._step0_early_phase = "our"
+        self._step0_neighbour_lots = None
+        self._step0_our_outcome = None
+        self._step0_auto_stage = "intake"
+        self._start_step0_intake(neighbours_override=[], include_our=True, early=True)
+        if not self._step0_running:
+            self._stop_auto_transition(
+                "Автопоток остановлен: не удалось начать ранний сбор нашего участка.")
+            return
+        self._step0_log(
+            "Автопоток: Block и Lot уже известны — скачиваю наш участок сейчас, "
+            "не дожидаясь номеров соседей от нейронок; соседей докачаю, как только "
+            "придёт первый ответ.", level=log_mode.LEVEL_KEY)
+
+    def _continue_after_neighbours(self) -> None:
+        """Наш участок собран и номера соседей известны: докачать или на разбор."""
+        our = self._step0_our_outcome
+        if our is None:
+            return
+        lots = list(self._step0_neighbour_lots or [])
+        if not lots:
+            self._reset_step0_early()
+            self._auto_submit_step0_outcome(our)
+            return
+        self._step0_early_phase = "neighbours"
+        self._step0_log(
+            "Автопоток: наш участок уже собран; докачиваю соседей: "
+            + ", ".join(str(value) for value in lots) + ".",
+            level=log_mode.LEVEL_KEY)
+        self._start_step0_intake(neighbours_override=lots, include_our=False)
+        if not self._step0_running:
+            self._step0_log(
+                "Автопоток: сбор соседей не запустился — продолжаю с нашим участком.",
+                level=log_mode.LEVEL_WARN)
+            self._reset_step0_early()
+            self._auto_submit_step0_outcome(our)
 
     def _finish_step0_portal_lookup(self, status: str, payload: Any) -> None:
         self._step0_portal_running = False
@@ -4305,6 +4400,17 @@ class SurveyApp(ctk.CTk):
             if self._step0_auto_stage == "portal":
                 self._stop_auto_transition(f"Автопоток остановлен: поиск адреса не завершён — {payload}")
                 return
+            if self._step0_early_active:
+                # Наш участок уже качается/собран: сбой ответа про соседей
+                # задание не хоронит — продолжаем без соседей.
+                self._step0_neighbour_lots = []
+                self._step0_log(
+                    f"Автопоток: номера соседей не получены ({payload}); "
+                    "продолжаю без соседей — соседей проверьте и соберите вручную.",
+                    level=log_mode.LEVEL_WARN)
+                if self._step0_our_outcome is not None and not self._step0_running:
+                    self._continue_after_neighbours()
+                return
             self._step0_log(f"Поиск участка не завершён: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: поиск не завершён — {payload}", error=True)
             return
@@ -4315,6 +4421,11 @@ class SurveyApp(ctk.CTk):
             return
         if (self._step0_auto_stage == "portal"
                 and str(self.step0_address_var.get() or "").strip() != self._step0_auto_address):
+            self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
+            return
+        if (self._step0_early_active
+                and str(self.step0_address_var.get() or "").strip() != self._step0_auto_address):
+            self._step0_stop.set()
             self._stop_auto_transition("Автопоток остановлен: адрес изменился во время поиска.")
             return
         self._step0_lookup_snapshot = (self._step0_lookup_address, result)
@@ -4328,7 +4439,9 @@ class SurveyApp(ctk.CTk):
             f"{details_label}: Borough {result.borough or 'не распознан'}, "
             f"Block {result.block}, Lot {result.lot}. Vision по карте: "
             f"соседи слева/справа {result.left_neighbour or '—'} / "
-            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}.",
+            f"{result.right_neighbour or '—'}; уверенность: {result.confidence}"
+            + (f"; первой ответила {result.neighbour_model}" if getattr(result, "neighbour_model", "") else "")
+            + ".",
             level=log_mode.LEVEL_KEY,
         )
         if result.notes:
@@ -4367,6 +4480,38 @@ class SurveyApp(ctk.CTk):
             if not self._step0_running:
                 self._stop_auto_transition("Автопоток остановлен: не удалось начать сбор документов.")
             return
+        if self._step0_auto_stage == "intake" and self._step0_early_active:
+            # Ранний сбор нашего участка уже идёт или завершён: принимаем
+            # номера соседей от первой ответившей нейронки.
+            if str(result.confidence or "").strip().lower() in {"low", "низкая"}:
+                known = [n for n in (result.left_neighbour, result.right_neighbour) if n]
+                self._step0_log(
+                    "Низкая уверенность Vision при поиске соседей; названо: "
+                    + (", ".join(known) if known else "никого")
+                    + ". Продолжаю автопоток; соседей и стороны проверьте на схеме.",
+                    level=log_mode.LEVEL_WARN,
+                )
+            lots: list[int] = []
+            for value in result.neighbours:
+                try:
+                    number = int(str(value))
+                except (TypeError, ValueError):
+                    continue
+                if number > 0 and str(number) != str(result.lot) and number not in lots:
+                    lots.append(number)
+            self._step0_neighbour_lots = lots
+            winner = getattr(result, "neighbour_model", "") or "модель не указана"
+            if self._step0_our_outcome is not None and not self._step0_running:
+                self._step0_log(
+                    f"Автопоток: номера соседей приняла первой — {winner}; "
+                    "наш участок уже собран.", level=log_mode.LEVEL_KEY)
+                self._continue_after_neighbours()
+            else:
+                self._step0_log(
+                    f"Автопоток: номера соседей приняла первой — {winner} "
+                    f"({', '.join(str(v) for v in lots) if lots else 'соседи не названы'}); "
+                    "докачаю их сразу после нашего участка.", level=log_mode.LEVEL_KEY)
+            return
         self._set_status(
             f"Шаг 0: {result.borough or 'район не распознан'}, Block {result.block}, Lot {result.lot}; "
             "проверьте Borough, Block, Lot и соседей, затем нажмите «Собрать описания».",
@@ -4374,12 +4519,24 @@ class SurveyApp(ctk.CTk):
             key=True,
         )
 
-    def _start_step0_intake(self) -> None:
-        """Собирает описания в фоне: окно не замирает на Cloudflare и OCR."""
+    def _start_step0_intake(
+        self, *, neighbours_override: list[int] | None = None,
+        include_our: bool = True, early: bool = False,
+    ) -> None:
+        """Собирает описания в фоне: окно не замирает на Cloudflare и OCR.
+
+        ``neighbours_override``/``include_our`` — проходы раннего сбора
+        автопотока: сначала только наш участок (соседи ещё не названы),
+        затем только соседи. ``early`` разрешает старт, пока поиск портала
+        ещё ждёт ответ нейронок про соседей.
+        """
         if self._busy:
             self._set_status("Дождитесь окончания текущего разбора перед сбором документов.", warn=True)
             return
-        if self._step0_portal_running:
+        if self._step0_early_active and neighbours_override is None:
+            self._set_status("Автопоток: ранний сбор уже идёт — дождитесь его завершения.", warn=True)
+            return
+        if self._step0_portal_running and not early:
             self._set_status("Сначала дождитесь завершения поиска адреса на портале.", warn=True)
             return
         if self._step0_running:
@@ -4398,14 +4555,17 @@ class SurveyApp(ctk.CTk):
         if block <= 0 or lot <= 0:
             self._set_status("Шаг 0: block и lot должны быть положительными числами.", error=True)
             return
-        try:
-            neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
-        except ValueError as exc:
-            self._set_status(
-                f"Шаг 0: соседи — {exc}. Впишите номера лотов через запятую, например «30, 28».",
-                error=True,
-            )
-            return
+        if neighbours_override is not None:
+            neighbours = [int(value) for value in neighbours_override]
+        else:
+            try:
+                neighbours = deed_intake.parse_lot_list(str(self.step0_neighbours_var.get() or ""))
+            except ValueError as exc:
+                self._set_status(
+                    f"Шаг 0: соседи — {exc}. Впишите номера лотов через запятую, например «30, 28».",
+                    error=True,
+                )
+                return
         try:
             ocr_dpi = int(str(self.step0_ocr_dpi_var.get() or "").strip())
         except (TypeError, ValueError):
@@ -4480,7 +4640,8 @@ class SurveyApp(ctk.CTk):
             self._step0_worker,
             args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
                   bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-                  self._step0_auto_stage == "intake", stream_plan, self._pdf_wait_sec()),
+                  self._step0_auto_stage == "intake", stream_plan, self._pdf_wait_sec(),
+                  include_our),
         )
 
     def _step0_worker(
@@ -4498,6 +4659,7 @@ class SurveyApp(ctk.CTk):
         skip_page_search: bool = False,
         stream_plan: tuple[Any, ...] | None = None,
         pdf_wait_sec: float = deed_intake.PDF_WAIT_SEC,
+        include_our: bool = True,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
         def progress(line: str) -> None:
@@ -4627,6 +4789,7 @@ class SurveyApp(ctk.CTk):
                 downloads_dir=downloads,
                 on_record=on_record,
                 pdf_wait_sec=pdf_wait_sec,
+                include_our=include_our,
             )
         except deed_intake.IntakeCancelled:
             stream_stop.set()
@@ -4657,6 +4820,7 @@ class SurveyApp(ctk.CTk):
             self._step0_stop.set()
             self._step0_auto_stage = "portal_cancelled" if stage == "portal" else None
             self._step0_auto_identity = None
+            self._reset_step0_early()
             self.step0_auto_button.configure(state="normal")
             if stage == "parse":
                 self._generation += 1
@@ -4717,7 +4881,34 @@ class SurveyApp(ctk.CTk):
                 error=True,
             )
         if self._step0_auto_stage == "intake":
-            self._auto_submit_step0_outcome(outcome)
+            if self._step0_early_active and self._step0_early_phase == "our":
+                # Ранний проход: наш участок собран до ответа про соседей.
+                self._step0_our_outcome = outcome
+                if not outcome.ok:
+                    self._auto_submit_step0_outcome(outcome)
+                elif self._step0_neighbour_lots is None:
+                    self._step0_log(
+                        "Автопоток: наш участок собран; жду номера соседей от "
+                        "нейронок, чтобы докачать соседей.", level=log_mode.LEVEL_KEY)
+                else:
+                    self._continue_after_neighbours()
+            elif self._step0_early_active and self._step0_early_phase == "neighbours":
+                merged = (deed_intake.merge_outcomes(self._step0_our_outcome, outcome)
+                          if self._step0_our_outcome is not None else outcome)
+                self._step0_outcome = merged
+                self._reset_step0_early()
+                try:
+                    deed_store.write_manifest(
+                        Path(merged.folder),
+                        block=str(self.step0_block_var.get() or ""),
+                        lot=str(self.step0_lot_var.get() or ""),
+                        missing=[{"reason": item} for item in merged.missing],
+                    )
+                except Exception:  # noqa: BLE001 - manifest не должен губить автопоток
+                    pass
+                self._auto_submit_step0_outcome(merged)
+            else:
+                self._auto_submit_step0_outcome(outcome)
 
     def _auto_submit_step0_outcome(self, outcome: Any) -> None:
         expected = self._step0_auto_identity
@@ -9458,6 +9649,7 @@ class SurveyApp(ctk.CTk):
             self._step0_stop.set()
             self._step0_auto_stage = "portal_cancelled" if self._step0_portal_running else None
             self._step0_auto_identity = None
+            self._reset_step0_early()
             self.step0_auto_button.configure(state="normal")
         self._step0_stop.set()
         if self._step0_portal_running:
@@ -12150,6 +12342,8 @@ class SurveyApp(ctk.CTk):
                 sink_text = text[11:].lstrip() if text.startswith("[") and len(text) >= 10 and text[9] == "]" else text
                 self._job_log_sink.append(
                     (time.strftime("%H:%M:%S"), "шаг0", level, sink_text))
+        elif kind == "step0_portal_identified":
+            self._handle_step0_portal_identified(payload)
         elif kind == "step0_portal_done":
             status, portal_result = payload
             self._finish_step0_portal_lookup(status, portal_result)

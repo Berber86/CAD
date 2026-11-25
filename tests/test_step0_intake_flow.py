@@ -535,3 +535,24 @@ def test_on_record_fires_as_each_document_is_downloaded(tmp_path):
     outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], on_record=lambda rec: seen.append(rec.file))
     assert seen == [record.file for record in outcome.records]
     assert seen[:2] == ["OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf"]
+
+
+# --------------------------------------------- двухфазный сбор раннего автопотока
+
+
+def test_collect_only_neighbours_skips_our_lot(tmp_path):
+    outcome = _collect(tmp_path, neighbours=[NEIGHBOUR], include_our=False)
+    assert [record.file for record in outcome.records] == ["LOT 30 NEW.pdf"]
+    assert not any("наш участок не собран" in item for item in outcome.missing)
+
+
+def test_two_phase_collection_merges_and_manifest_covers_both(tmp_path):
+    first = _collect(tmp_path)
+    second = _collect(tmp_path, neighbours=[NEIGHBOUR], include_our=False)
+    merged = deed_intake.merge_outcomes(first, second)
+    assert {record.file for record in merged.records} == {
+        "OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf", "LOT 30 NEW.pdf"}
+    assert merged.ok
+    manifest = deed_store.read_manifest(merged.folder)
+    files = {item["file"] for item in manifest["items"]}
+    assert {"OUR LOT 32 NEW.pdf", "OUR LOT 32 OLD.pdf", "LOT 30 NEW.pdf"} <= files

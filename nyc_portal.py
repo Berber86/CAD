@@ -3,11 +3,16 @@
 The automation drives a visible supported browser. Challenge pages detected by OCR
 or the browser title stop it; fast mode intentionally skips intermediate screen checks.
 RapidOCR reads Borough, Block and Lot; reliable mode can send the card's left half to
-Vision once if local OCR fails. A separate Vision request reads map neighbour labels.
+Vision once if local OCR fails. Map neighbour labels are asked from two Vision
+requests racing each other (the selected model and a cheap Hydra model); the first
+valid answer wins. As soon as Borough/Block/Lot are known, ``on_identified`` fires
+so the caller can start downloading our parcel's PDFs before neighbours arrive.
 """
 from __future__ import annotations
 
 import hashlib
+import os
+import queue
 import re
 import sys
 import tempfile
@@ -24,7 +29,13 @@ import front_street
 import map_angle_cache
 import ocr_pages
 import portal_layout_cache
-from llm_parser import TokenUsage, ask_llm_json, render_image_files_base64
+from llm_parser import (
+    TokenUsage,
+    ask_llm_json,
+    load_dotenv_dict,
+    render_image_files_base64,
+    unprotect_api_key,
+)
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
 #: Заголовок пустой новой вкладки в разных браузерах (русский и английский интерфейс).
@@ -93,6 +104,8 @@ class ParcelLookup:
     #: (front_street.py); значения дублируются в JSON-кэш снимка карты.
     front_street_angle_deg: float | None = None
     front_street_angles: dict[str, float | None] = field(default_factory=dict)
+    #: Какая модель первой ответила про соседей (гонка двух запросов).
+    neighbour_model: str = ""
 
     @property
     def neighbours(self) -> list[str]:
@@ -1265,6 +1278,53 @@ def _parse_vision_details(data: dict[str, Any]) -> tuple[str, str, str]:
     return block, lot, borough
 
 
+#: Параллельный запрос о соседях: дешёвая модель Hydra со средними
+#: рассуждениями. Идёт гонкой с основной выбранной моделью — принимается
+#: первый валидный ответ (указание пользователя: скорость важнее цены
+#: проигравшего запроса, он всё равно оплачивается провайдеру).
+NEIGHBOUR_RACE_PROVIDER = "hydra"
+NEIGHBOUR_RACE_MODEL = "cheap/gpt-6.1-terra"
+NEIGHBOUR_RACE_REASONING = "medium"
+
+
+def _cfg_with_reasoning(cfg: dict[str, Any], model: str, effort: str) -> dict[str, Any]:
+    """Копия конфига, где у Hydra для ``model`` выставлен уровень рассуждений."""
+    out = dict(cfg)
+    api = dict(out.get("api") or {})
+    providers = dict(api.get("providers") or {})
+    hydra_cfg = dict(providers.get("hydra") or {})
+    reasoning = dict(hydra_cfg.get("reasoning_by_model") or {})
+    reasoning[model] = effort
+    hydra_cfg["reasoning_by_model"] = reasoning
+    providers["hydra"] = hydra_cfg
+    api["providers"] = providers
+    out["api"] = api
+    return out
+
+
+def _hydra_api_key(
+    cfg: dict[str, Any], *, selected_provider: str | None,
+    selected_api_key: str | None, key_secret: str = "",
+) -> str:
+    """Ключ именно Hydra для параллельного запроса — чужие ключи не подставляем."""
+    if str(selected_provider or "").strip().lower() == NEIGHBOUR_RACE_PROVIDER \
+            and selected_api_key:
+        return str(selected_api_key)
+    api = cfg.get("api") if isinstance(cfg.get("api"), dict) else {}
+    providers = api.get("providers") if isinstance(api.get("providers"), dict) else {}
+    hydra_cfg = providers.get("hydra") if isinstance(providers.get("hydra"), dict) else {}
+    env_name = str(hydra_cfg.get("env_key") or "HYDRA_API_KEY").strip()
+    raw = str(hydra_cfg.get("api_key") or "").strip()
+    if not raw and env_name:
+        raw = os.environ.get(env_name, "") or load_dotenv_dict().get(env_name, "")
+    if not raw:
+        return ""
+    try:
+        return unprotect_api_key(NEIGHBOUR_RACE_PROVIDER, raw, secret=key_secret) or ""
+    except Exception:  # noqa: BLE001 - без ключа гонка просто не состоится
+        return ""
+
+
 def lookup_parcel(
     address: str,
     screenshot_folder: str | Path,
@@ -1278,8 +1338,14 @@ def lookup_parcel(
     fast_mode: bool = False,
     fast_pause_sec: float = FAST_SCREEN_CHECK_PAUSE_SEC,
     optimal_mode: bool = False,
+    on_identified: Callable[[PortalCapture], None] | None = None,
 ) -> ParcelLookup:
-    """Read BBL locally (or one card Vision fallback), then ask Vision about map neighbours."""
+    """Read BBL locally (or one card Vision fallback), then ask Vision about map neighbours.
+
+    ``on_identified`` вызывается сразу, как только Borough/Block/Lot прочитаны
+    и снимок карты сохранён, — ещё до запросов про соседей: вызывающий может
+    уже начинать скачивание PDF нашего участка, не дожидаясь нейронок.
+    """
     clean_address = str(address or "").strip()
     if not clean_address:
         raise PortalLookupError("Введите адрес перед поиском.")
@@ -1309,6 +1375,13 @@ def lookup_parcel(
     if not fast_mode:
         driver_options["details_vision"] = read_details_vision
     capture = _drive_portal(clean_address, map_path, progress, **driver_options)
+    if on_identified is not None:
+        # BBL уже известен: вызывающий может качать наш участок, пока
+        # нейронки ещё думают про соседей. Сбой раннего старта поиск не губит.
+        try:
+            on_identified(capture)
+        except Exception:  # noqa: BLE001
+            pass
     if progress:
         borough_text = capture.borough or "район не распознан"
         progress(
@@ -1318,27 +1391,98 @@ def lookup_parcel(
     urls, _notes = render_image_files_base64(
         [capture.map_image], max_side_px=1800, enhance_scan=False, output_format="jpeg",
     )
-    response, usage = ask_llm_json(
-        VISION_SYSTEM_PROMPT,
-        (
-            f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
-            "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
-            "on its left and right opposing side boundaries. If both are identified but left/right "
-            "is uncertain due to rotation, return both anyway with confidence low. "
-            "Use null only when a label or adjacency itself is unclear."
-        ),
-        request_cfg,
-        image_data_urls=urls,
-        api_key=api_key,
-        provider=provider,
-        model=model,
-        key_secret=key_secret,
-        progress=progress,
-        task_label="NYC tax map: номера соседних лотов",
-        attempts=1,
-        single_request=True,
+    neighbour_user_text = (
+        f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
+        "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
+        "on its left and right opposing side boundaries. If both are identified but left/right "
+        "is uncertain due to rotation, return both anyway with confidence low. "
+        "Use null only when a label or adjacency itself is unclear."
     )
-    left, right, confidence, notes, llm_angle = parse_neighbour_result(response)
+
+    def ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg):
+        response, used = ask_llm_json(
+            VISION_SYSTEM_PROMPT,
+            neighbour_user_text,
+            leg_cfg,
+            image_data_urls=urls,
+            api_key=leg_key,
+            provider=leg_provider,
+            model=leg_model,
+            key_secret=key_secret,
+            progress=progress,
+            task_label="NYC tax map: номера соседних лотов",
+            attempts=1,
+            single_request=True,
+        )
+        return parse_neighbour_result(response), used
+
+    # Гонка двух нейронок: основная выбранная модель и дешёвая Hydra
+    # (cheap/gpt-6.1-terra, рассуждения medium). Принимаем первый валидный
+    # ответ; проигравший запрос остановить нельзя — он договаривает в фоне.
+    legs: list[tuple[str, str, str | None, dict[str, Any], str]] = [
+        (provider, model, api_key, request_cfg, "основная модель"),
+    ]
+    hydra_key = _hydra_api_key(
+        request_cfg, selected_provider=provider, selected_api_key=api_key,
+        key_secret=key_secret,
+    )
+    same_as_race = (
+        str(provider or "").strip().lower() == NEIGHBOUR_RACE_PROVIDER
+        and str(model or "").strip() == NEIGHBOUR_RACE_MODEL
+    )
+    if hydra_key and not same_as_race:
+        legs.append((
+            NEIGHBOUR_RACE_PROVIDER, NEIGHBOUR_RACE_MODEL, hydra_key,
+            _cfg_with_reasoning(request_cfg, NEIGHBOUR_RACE_MODEL, NEIGHBOUR_RACE_REASONING),
+            "параллельная Hydra",
+        ))
+    if len(legs) == 1:
+        (leg_provider, leg_model, leg_key, leg_cfg, _label) = legs[0]
+        (left, right, confidence, notes, llm_angle), usage = ask_neighbours(
+            leg_provider, leg_model, leg_key, leg_cfg)
+        neighbour_model = f"{leg_provider}: {leg_model}"
+    else:
+        if progress:
+            progress(
+                "номера соседей спрашиваю сразу у двух моделей: "
+                f"основная — {model}, параллельная — Hydra {NEIGHBOUR_RACE_MODEL} "
+                f"(рассуждения {NEIGHBOUR_RACE_REASONING}); приму первый валидный ответ"
+            )
+        outcome_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+        def run_leg(leg) -> None:
+            leg_provider, leg_model, leg_key, leg_cfg, leg_label = leg
+            try:
+                outcome_queue.put(("ok", leg_label, leg_provider, leg_model,
+                                   ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg)))
+            except Exception as exc:  # noqa: BLE001 - вторая модель может спасти
+                outcome_queue.put(("err", leg_label, leg_provider, leg_model, exc))
+
+        for leg in legs:
+            threading.Thread(
+                target=run_leg, args=(leg,), daemon=True, name="portal-neighbour-race",
+            ).start()
+        winner = None
+        race_errors: list[str] = []
+        for _ in legs:
+            kind, leg_label, leg_provider, leg_model, payload = outcome_queue.get()
+            if kind == "ok":
+                winner = (leg_label, leg_provider, leg_model, payload)
+                break
+            race_errors.append(f"{leg_label} ({leg_provider}: {leg_model}): {payload}")
+        if winner is None:
+            raise PortalLookupError(
+                "Ни одна из двух моделей не ответила про соседей: "
+                + "; ".join(race_errors)
+            )
+        leg_label, leg_provider, leg_model, (parsed, usage) = winner
+        left, right, confidence, notes, llm_angle = parsed
+        neighbour_model = f"{leg_provider}: {leg_model}"
+        if progress:
+            progress(
+                f"номера соседей первой ответила: {leg_model} ({leg_label}) — "
+                "принимаю её ответ; второй запрос договаривает в фоне"
+            )
     # Тот же угол — кодом, двумя способами; все три значения клиент сравнит
     # сам (программа выбор не делает). Кэш — JSON рядом со снимком карты.
     estimates = front_street.estimate_all(capture.map_image)
@@ -1364,5 +1508,5 @@ def lookup_parcel(
         capture.block, capture.lot, capture.borough, left, right,
         confidence, notes, capture.map_image, usage, capture.details_source,
         details_usages[0] if details_usages else None,
-        llm_angle, angles,
+        llm_angle, angles, neighbour_model,
     )

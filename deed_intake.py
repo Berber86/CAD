@@ -295,10 +295,15 @@ def collect_deeds(
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
     pdf_wait_sec: float | None = None,
+    include_our: bool = True,
 ) -> IntakeOutcome:
     """
     Собирает описания нашего участка и соседей в ``folder`` (по умолчанию
     ``01_описания`` в текущей папке).
+
+    ``include_our=False`` — собрать только соседей: так автопоток докачивает
+    соседей отдельным проходом после того, как наш участок уже скачан ранним
+    проходом (номера соседей нейронки назвали позже).
 
     ``on_record`` вызывается сразу после сохранения каждого документа:
     автопоток в этот момент запускает поиск страниц и разбор этого PDF, не
@@ -330,7 +335,7 @@ def collect_deeds(
             fetch_list=fetch_list, downloader=downloader, auto_save=auto_save,
             ocr_dpi=ocr_dpi, downloads_dir=downloads_dir, page_finder=page_finder,
             search_pages=search_pages, progress=progress, should_stop=should_stop,
-            on_record=on_record, pdf_wait_sec=pdf_wait_sec,
+            on_record=on_record, pdf_wait_sec=pdf_wait_sec, include_our=include_our,
         )
     code = acris_borough_code(borough)
     if code is None:
@@ -346,7 +351,7 @@ def collect_deeds(
         acris_id_fetcher=acris_id_fetcher, downloads_dir=downloads_dir,
         ocr_dpi=ocr_dpi, page_finder=page_finder,
         search_pages=search_pages, progress=progress, should_stop=should_stop,
-        on_record=on_record, pdf_wait_sec=pdf_wait_sec,
+        on_record=on_record, pdf_wait_sec=pdf_wait_sec, include_our=include_our,
     )
 
 
@@ -371,6 +376,7 @@ def _collect_deeds_richmond(
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
     pdf_wait_sec: float | None = None,
+    include_our: bool = True,
 ) -> IntakeOutcome:
     """Проход по Richmond County Clerk (Staten Island) — первый настроенный вариант."""
     neighbour_lots = parse_lot_list(neighbours)
@@ -396,7 +402,7 @@ def _collect_deeds_richmond(
         if should_stop is not None and should_stop():
             raise IntakeCancelled("сбор описаний остановлен")
 
-    plans: list[tuple[str, int]] = [("our", lot_no)]
+    plans: list[tuple[str, int]] = [("our", lot_no)] if include_our else []
     plans.extend(("neighbour", value) for value in neighbour_lots)
     if not plans:
         outcome.missing.append("не указан номер лота нашего участка")
@@ -458,7 +464,8 @@ def _collect_deeds_richmond(
             missing=[{"reason": item} for item in outcome.missing],
         )
         say(f"папка описаний собрана: {len(outcome.records)} документ(ов)")
-    if not outcome.ok and not any("наш участок" in item for item in outcome.missing):
+    if include_our and not outcome.ok \
+            and not any("наш участок" in item for item in outcome.missing):
         outcome.missing.append("наш участок не собран")
     return outcome
 
@@ -531,6 +538,7 @@ def _collect_deeds_acris(
     should_stop: StopCheck | None = None,
     on_record: Callable[[deed_store.StoredDeed], None] | None = None,
     pdf_wait_sec: float | None = None,
+    include_our: bool = True,
 ) -> IntakeOutcome:
     """
     Проход по ACRIS (Manhattan, Bronx, Brooklyn, Queens).
@@ -562,7 +570,7 @@ def _collect_deeds_acris(
         if should_stop is not None and should_stop():
             raise IntakeCancelled("сбор описаний остановлен")
 
-    plans: list[tuple[str, int]] = [("our", lot_no)]
+    plans: list[tuple[str, int]] = [("our", lot_no)] if include_our else []
     plans.extend(("neighbour", value) for value in neighbour_lots)
 
     for role, lot_value in plans:
@@ -664,9 +672,21 @@ def _collect_deeds_acris(
             missing=[{"reason": item} for item in outcome.missing],
         )
         say(f"папка описаний собрана: {len(outcome.records)} документ(ов)")
-    if not outcome.ok and not any("наш участок" in item for item in outcome.missing):
+    if include_our and not outcome.ok \
+            and not any("наш участок" in item for item in outcome.missing):
         outcome.missing.append("наш участок не собран")
     return outcome
+
+
+def merge_outcomes(first: IntakeOutcome, second: IntakeOutcome) -> IntakeOutcome:
+    """Слияние двух проходов сбора одной папки (наш участок + соседи)."""
+    return IntakeOutcome(
+        folder=first.folder,
+        records=[*first.records, *second.records],
+        missing=[*first.missing, *second.missing],
+        notes=[*first.notes, *second.notes],
+        page_search_skipped=bool(first.page_search_skipped and second.page_search_skipped),
+    )
 
 
 def _collect_one(

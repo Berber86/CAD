@@ -1792,3 +1792,145 @@ def test_type_into_address_clicks_field_content_in_dirty_reused_tab(monkeypatch)
     # Первый клик — под подпись (плашка/старый текст ещё на месте), второй —
     # точно в центр содержимого поля.
     assert clicks[-1] == ((25 + 400) // 2, (160 + 180) // 2)
+
+
+# ------------------------------------------- гонка моделей про соседей и ранний BBL
+
+
+def _race_setup(monkeypatch, tmp_path, ask):
+    from PIL import Image
+
+    map_image = tmp_path / "NYC_Portal_map.png"
+    Image.new("RGB", (600, 400), "blue").save(map_image)
+    monkeypatch.setattr(
+        nyc_portal, "_drive_portal",
+        lambda *a, **k: nyc_portal.PortalCapture("5712", "70", "Staten Island", map_image))
+    monkeypatch.setattr(
+        nyc_portal, "render_image_files_base64",
+        lambda paths, **kw: (["data:image/jpeg;base64,AA=="], []))
+    monkeypatch.setattr(nyc_portal, "ask_llm_json", ask)
+    return map_image
+
+
+_RACE_CFG = {"api": {"providers": {"hydra": {"api_key": "hydra-key"}}}}
+
+
+def test_neighbour_race_accepts_the_first_valid_answer(tmp_path, monkeypatch):
+    import threading
+
+    import llm_parser
+
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    release_main = threading.Event()
+    main_started = threading.Event()
+    seen_cfg = {}
+
+    def ask(system, user_text, cfg, **kwargs):
+        seen_cfg[kwargs["model"]] = cfg
+        if kwargs["model"] == nyc_portal.NEIGHBOUR_RACE_MODEL:
+            return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                    "confidence": "high"}, usage
+        main_started.set()
+        release_main.wait(10)
+        return {"left_neighbor_lot": "60", "right_neighbor_lot": "61",
+                "confidence": "low"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    try:
+        result = nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG),
+            provider="hydra", model="main-model", api_key="hydra-key")
+    finally:
+        release_main.set()
+    assert result.neighbours == ["68", "72"]
+    assert result.neighbour_model.endswith(nyc_portal.NEIGHBOUR_RACE_MODEL)
+    assert main_started.is_set()  # основная модель спрошена параллельно, а не после
+    assert llm_parser.resolve_reasoning_effort(
+        seen_cfg[nyc_portal.NEIGHBOUR_RACE_MODEL], provider="hydra",
+        model=nyc_portal.NEIGHBOUR_RACE_MODEL) == "medium"
+
+
+def test_neighbour_race_falls_back_when_the_fast_model_fails(tmp_path, monkeypatch):
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+
+    def ask(system, user_text, cfg, **kwargs):
+        if kwargs["model"] == nyc_portal.NEIGHBOUR_RACE_MODEL:
+            raise RuntimeError("hydra unavailable")
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    result = nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG),
+        provider="hydra", model="main-model", api_key="hydra-key")
+    assert result.neighbours == ["68", "72"]
+    assert result.neighbour_model.endswith("main-model")
+
+
+def test_neighbour_race_reports_when_both_models_fail(tmp_path, monkeypatch):
+    def ask(system, user_text, cfg, **kwargs):
+        raise RuntimeError("down")
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    with pytest.raises(nyc_portal.PortalLookupError, match="Ни одна"):
+        nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG),
+            provider="hydra", model="main-model", api_key="hydra-key")
+
+
+def test_neighbour_request_stays_single_without_a_hydra_key(tmp_path, monkeypatch):
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    calls = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        calls.append(kwargs["model"])
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.delenv("HYDRA_API_KEY", raising=False)
+    monkeypatch.setattr(nyc_portal, "load_dotenv_dict", lambda: {})
+    result = nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg={"api": {}},
+        provider="openrouter", model="some-model", api_key="other-key")
+    assert calls == ["some-model"]
+    assert result.neighbour_model == "openrouter: some-model"
+
+
+def test_no_duplicate_request_when_selected_model_is_the_race_model(tmp_path, monkeypatch):
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    calls = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        calls.append(kwargs["model"])
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    result = nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG), provider="hydra",
+        model=nyc_portal.NEIGHBOUR_RACE_MODEL, api_key="hydra-key")
+    assert calls == [nyc_portal.NEIGHBOUR_RACE_MODEL]
+    assert result.neighbours == ["68", "72"]
+
+
+def test_on_identified_fires_before_the_neighbour_request(tmp_path, monkeypatch):
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    events = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        events.append("ask")
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.delenv("HYDRA_API_KEY", raising=False)
+    monkeypatch.setattr(nyc_portal, "load_dotenv_dict", lambda: {})
+    result = nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
+        model="some-model", api_key="other-key",
+        on_identified=lambda capture: events.append(
+            ("identified", capture.block, capture.lot)))
+    assert result.neighbours == ["68", "72"]
+    assert events[0] == ("identified", "5712", "70")
+    assert events[1] == "ask"

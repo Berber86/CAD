@@ -171,6 +171,10 @@ def test_new_tab_opens_only_after_focusing_browser_window(monkeypatch):
     assert fake.state == "viewer"
     assert events.index("focus") < events.index("ctrl_t")
     assert fake.typed == [acris_browser.FORM_URL, "6643", "62"]
+    # Перед Enter — Delete: автодополнение из истории не должно уводить
+    # навигацию на последнюю страницу ACRIS вместо напечатанной формы.
+    assert fake.keys[0] == browser_save.VK_DELETE
+    assert fake.keys[1] == browser_save.VK_RETURN
 
 
 def test_new_tab_waits_for_title_and_refocuses(monkeypatch):

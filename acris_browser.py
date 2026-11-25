@@ -194,6 +194,9 @@ def open_document_image(
             sleep(0.4)
         if not browser_save.press_ctrl_l() or not press_ctrl_a() or not type_text(FORM_URL):
             raise fail("Не удалось ввести адрес формы ACRIS в новой вкладке.")
+        # Delete — против автодополнения из истории (как в портале): Enter
+        # обязан открывать напечатанную форму, а не последнюю страницу ACRIS.
+        press_key(browser_save.VK_DELETE)
         if not press_key(browser_save.VK_RETURN):
             raise fail("Не удалось открыть форму ACRIS.")
     rows = wait_rows(

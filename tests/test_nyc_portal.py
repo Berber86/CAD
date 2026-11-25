@@ -448,7 +448,11 @@ def test_non_portal_active_browser_opens_portal_in_a_new_tab(tmp_path, monkeypat
     assert typed == [nyc_portal.PORTAL_URL]
     assert new_tabs == [1]  # портал открыт в новой вкладке
     assert waits == [0.6, 5.0, 1.0, 0.2, 0.2, 0.2, 1.5, 0.2, 5.0, 6.0]  # 0.6 — ждём переключения на новую вкладку
-    assert key_events[0] == nyc_portal.browser_save.VK_RETURN  # navigate current tab
+    # Перед Enter — Delete: сносит автодополнение адреса из истории браузера,
+    # иначе Enter уходит на последнюю страницу портала, а не на напечатанный
+    # адрес (живой случай Николая с просмотром улиц Cyclomedia).
+    assert key_events[0] == nyc_portal.browser_save.VK_DELETE
+    assert key_events[1] == nyc_portal.browser_save.VK_RETURN
     # Подсказка выбирается кликом мыши, а не Down+Enter: клавиши заканчиваются на Tab.
     assert key_events[-1] == nyc_portal.browser_save.VK_TAB
 

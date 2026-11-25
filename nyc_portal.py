@@ -830,6 +830,12 @@ def _drive_portal_rest(
                 or not browser_save.type_text(PORTAL_URL)
             ):
                 raise PortalLookupError("Не удалось ввести адрес в новой вкладке браузера.")
+            # Delete сносит подсвеченное автодополнение из истории браузера:
+            # печать идёт посимвольно, браузер дописывает адрес последней
+            # страницы портала, и Enter без Delete уходит на неё (живой случай
+            # Николая: вместо портала открылся просмотр улиц Cyclomedia).
+            # Подсказки не было — Delete в конце строки безвреден.
+            _key(window.handle, browser_save.VK_DELETE)
             _key(window.handle, browser_save.VK_RETURN)
             try:
                 rows = wait(

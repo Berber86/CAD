@@ -210,5 +210,18 @@ def parse_pdf(
                          search_complete=complete, send=send, choose=choose, current_job=current, progress=progress)
     check(current)
     cache.save_result(path, context, result, portal_lot=portal_lot)
+    if not result.items and not force_parse:
+        # Свежий разбор не дал ничего, а этот же PDF уже разбирался успешно
+        # (например, целиком на этапе сбора, а финальный проход по отобранным
+        # страницам лёг по тайм-аутам провайдера): описание не должно молча
+        # выпадать из чертежа. Явный повторный разбор (force_parse) эту
+        # подмену не получает — пользователь просил именно свежий результат.
+        fallback = cache.load_latest_complete(path)
+        if fallback is not None:
+            restored, original_portal_lot = fallback
+            emit(progress, "Разбор: свежий запрос не удался — использовано ранее сохранённое "
+                           "полное описание этого PDF; сверьте его перед использованием.")
+            return PipelineResult(search, restored, 'parsed', True, original_portal_lot,
+                                  portal_lot, tuple(errors))
     return PipelineResult(search, result, 'parsed' if result.selected_attempt is not None else 'parse_failed',
                           False, portal_lot, portal_lot, tuple(errors))

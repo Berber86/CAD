@@ -251,12 +251,13 @@ def record_scene_diagnostics(pdf: str | Path, pdf_sha256: str, *, is_main: bool,
         raise CacheError('Cannot save scene diagnostics.') from exc
 
 
-def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] | None:
-    """Restore a compatible complete snapshot without a network/key lookup.
+def _history_results(pdf: str | Path) -> list[tuple[dict[str, Any], ParseResult, str | None]]:
+    """Newest-first historic parses whose stored format this build can read.
 
-    This is an explicit historical restore, not a fresh parse or current-model
-    cache hit. PDF digest, filename identity, compatible prompt, schema and the
-    original cache fingerprint must all match. No sidecars are written.
+    PDF digest, filename identity, compatible prompt, schema and the original
+    cache fingerprint must all match; each candidate is re-validated through
+    the strict :func:`load_result` against its own stored context. No sidecars
+    are written.
     """
     import lot_identity
     from multiple_description_parse import SCHEMA_VERSION
@@ -267,7 +268,6 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
     schema_hash = hashlib.sha256(json.dumps(
         LegalDescription.model_json_schema(), sort_keys=True, ensure_ascii=False,
         separators=(',', ':')).encode('utf-8')).hexdigest()
-    # Historic snapshots are allowed only by the explicit offline command.
     # Pair the known prompt and schema hashes; the ordinary cache still checks
     # the exact current context and cannot silently masquerade as a new parse.
     current_prompt = hashlib.sha256(system_instruction().encode('utf-8')).hexdigest()
@@ -278,6 +278,7 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
                   ('multiple-legal-descriptions-v3',
                    '1e05287cfcb562ac81cae64b7e3c95c82047ed850424fe38a920533297de0502',
                    '5ef4cdb9afa8ad6ff57784f183da8f0496a5763af91d7b673ebec74670d61bcc')}
+    found: list[tuple[dict[str, Any], ParseResult, str | None]] = []
     for run in reversed(history['runs']):
         if not isinstance(run, dict) or not isinstance(run.get('context'), dict):
             continue
@@ -293,6 +294,40 @@ def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] |
             restored = load_result(path, ctx)
         except (CacheError, ValueError, TypeError):
             continue
-        if restored is not None and restored[0].complete and restored[0].items:
-            return restored[0], dict(ctx)
+        if restored is not None:
+            found.append((dict(ctx), restored[0], restored[1]))
+    return found
+
+
+def load_latest_offline(pdf: str | Path) -> tuple[ParseResult, dict[str, Any]] | None:
+    """Restore a compatible complete snapshot without a network/key lookup.
+
+    This is an explicit historical restore, not a fresh parse or current-model
+    cache hit.
+    """
+    for ctx, result, _portal in _history_results(pdf):
+        if result.complete and result.items:
+            return result, ctx
+    return None
+
+
+def load_latest_complete(pdf: str | Path) -> tuple[ParseResult, str | None] | None:
+    """Newest earlier parse of this PDF whose descriptions are all complete.
+
+    Safety net for a fresh parse that returned nothing at all: the same PDF
+    (digest-checked) may already have been parsed successfully — possibly
+    over a different page subset, e.g. the full file during deed intake while
+    the final pass re-parses only selected pages. Live case 25.11.2026:
+    LOT 21 was fully parsed during intake, then three fresh requests timed
+    out and the lot silently dropped out of the drawing. A run counts only
+    when every stored item is a complete description; the run-level flag may
+    be False merely because intake skips the page search. The caller must
+    tell the user a stored result was reused.
+    """
+    from dataclasses import replace
+    for _ctx, result, portal in _history_results(pdf):
+        if result.items and all(item.complete for item in result.items):
+            if not result.complete:
+                result = replace(result, complete=True)
+            return result, portal
     return None

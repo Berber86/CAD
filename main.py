@@ -13179,17 +13179,23 @@ class SurveyApp(ctk.CTk):
             # Pin the document receiving the geometry even if the active tab changes.
             session = builder.drawing_session() if auto_save else nullcontext(None)
             with session as connected:
-                try:
-                    for index, (name, plan) in enumerate(plans, 1):
-                        if not self._worker_is_current():
-                            return
-                        post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
+                # Каждый план — отдельно: сбой одного (живой случай 25.11.2026:
+                # основной план умер на первой линии, и нарисованным остался
+                # только печатный черновик) не отменяет остальные планы, а
+                # частично нарисованный документ всё равно сохраняется ниже.
+                for index, (name, plan) in enumerate(plans, 1):
+                    if not self._worker_is_current():
+                        return
+                    post("progress", f"[{index}/{len(plans)}] Рисую рассчитанный план: {name}…")
+                    try:
                         result = self._draw_if_current(builder, plan)
-                        if result is None:
-                            return
-                        completed.append((name, result))
-                except Exception as exc:  # noqa: BLE001 - save even a partially drawn document
-                    error = "; ".join(x for x in (error, str(exc)) if x)
+                    except Exception as exc:  # noqa: BLE001 - save even a partially drawn document
+                        error = "; ".join(
+                            x for x in (error, f"план «{name}» не нарисован: {exc}") if x)
+                        continue
+                    if result is None:
+                        return
+                    completed.append((name, result))
                 if auto_save:
                     with self._draw_lock:
                         if not self._worker_is_current():

@@ -11,22 +11,6 @@ class AutoDwgSaveError(RuntimeError):
     """Save did not complete; the source drawing and any partial output remain."""
 
 
-#: COM-коды «AutoCAD занят, повтори позже»: вызов отклонён получателем,
-#: отмена вызова и «приложение занято» фильтра сообщений. Ночной прогон
-#: 24–25.11.2026: SaveAs дважды за ночь умер на -2147418111 ровно один раз —
-#: без повтора задание теряло полностью нарисованный чертёж.
-_BUSY_HRESULTS = frozenset({-2147418111, -2147418110, -2147417846})
-_BUSY_MARKS = ("-2147418111", "-2147417846", "отклон", "rejected", "занят", "busy")
-
-
-def _is_busy_error(exc: BaseException) -> bool:
-    """True, если ошибка похожа на временную занятость AutoCAD, а не на отказ."""
-    if getattr(exc, "hresult", None) in _BUSY_HRESULTS:
-        return True
-    text = str(exc).lower()
-    return any(mark in text for mark in _BUSY_MARKS)
-
-
 def save_new_dwg(
     doc: Any,
     descriptions_dir: Path,
@@ -34,7 +18,7 @@ def save_new_dwg(
     *,
     sleep: Callable[[float], None] = time.sleep,
     save_attempts: int = 5,
-    save_delay: float = 2.0,
+    save_delay: float = 1.0,
 ) -> Path:
     """SaveAs to this directory, choosing a unique filename without overwriting.
 
@@ -42,9 +26,12 @@ def save_new_dwg(
     parallel application instances. Never reserve over an existing DWG. Partial
     DWGs from failed SaveAs calls are retained so the user can recover them.
 
-    A busy AutoCAD (call rejected, -2147418111) is retried for a few seconds:
-    the drawing is already fully built at this point, and one rejected SaveAs
-    must not cost the whole job. Non-busy errors fail immediately, as before.
+    Any failed SaveAs is retried for a few seconds: the drawing is already
+    fully built at this point, and one rejected call must not cost the whole
+    job. Busy AutoCAD (call rejected, -2147418111) is the known case, but a
+    just-created document also rejects calls with texts no classifier knows
+    (live case 25.11.2026: ``<unknown>.SaveAs`` a second after the draw).
+    A genuinely permanent error still surfaces honestly after the attempts.
     """
     number = str(lot or "").strip()
     number = str(int(number)) if re.fullmatch(r"[0-9]+", number) and int(number) > 0 else "unknown"
@@ -70,7 +57,7 @@ def save_new_dwg(
                     break
                 except Exception as exc:  # noqa: BLE001 - retain partial output on failure
                     save_error = exc
-                    if not _is_busy_error(exc) or attempt == max(1, int(save_attempts)) - 1:
+                    if attempt == max(1, int(save_attempts)) - 1:
                         break
                     sleep(max(0.0, float(save_delay)))
             if save_error is not None:

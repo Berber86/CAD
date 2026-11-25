@@ -205,6 +205,35 @@ def test_offline_restore_rejects_incomplete_and_mismatched_filename(tmp_path):
     assert cache.load_latest_offline(other) is None
 
 
+def test_latest_complete_reuses_full_parse_despite_incomplete_run_flag(tmp_path):
+    # Живой случай 25.11.2026 (LOT 21): разбор на этапе сбора идёт по всему
+    # PDF без поиска страниц, поэтому run помечен неполным, хотя само
+    # описание полное. Финальный проход по отобранным страницам лёг по
+    # тайм-аутам — участок обязан подхватиться из этого сохранённого разбора.
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    result = parse(search_complete=False)
+    assert not result.complete and result.items[0].complete
+    cache.save_result(pdf, context(pdf), result, portal_lot='7')
+    assert cache.load_latest_offline(pdf) is None  # офлайн-восстановление строже
+    found = cache.load_latest_complete(pdf)
+    assert found is not None
+    restored, portal = found
+    assert portal == '7' and restored.complete and restored.items[0].data.lot_number == '5'
+
+
+def test_latest_complete_ignores_incomplete_items_and_changed_pdf(tmp_path):
+    pdf = tmp_path / 'OUR 6.pdf'
+    pdf.write_bytes(b'original')
+    result = parse(response=answer([item('5', complete=False)], complete=False))
+    cache.save_result(pdf, context(pdf), result, portal_lot=None)
+    assert cache.load_latest_complete(pdf) is None
+    cache.save_result(pdf, context(pdf), parse(search_complete=False), portal_lot=None)
+    assert cache.load_latest_complete(pdf) is not None
+    pdf.write_bytes(b'changed')
+    assert cache.load_latest_complete(pdf) is None
+
+
 def test_old_known_prompt_only_restored_offline_not_as_current_parse(tmp_path):
     pdf = tmp_path / 'OUR 6.pdf'
     pdf.write_bytes(b'original')

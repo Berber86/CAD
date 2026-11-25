@@ -281,6 +281,32 @@ def test_reports_both_drawing_and_save_failure(gui, tmp_path, monkeypatch, fake_
     assert partial.read_bytes() == b"partial"
 
 
+def test_one_failed_plan_does_not_stop_remaining_plans(gui, tmp_path, monkeypatch, fake_autocad):
+    # Живой случай 25.11.2026: первый план (печатный черновик) лёг, и основной
+    # план с участком и соседом даже не начинался. Теперь планы независимы:
+    # остальные рисуются, документ сохраняется, упавший план назван в итоге.
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    real_draw = builder.draw_plan
+    calls = []
+    def flaky(plan):
+        calls.append(plan)
+        if len(calls) == 1:
+            raise RuntimeError("Property 'AddLine.Color' can not be set")
+        return real_draw(plan)
+    monkeypatch.setattr(builder, "draw_plan", flaky)
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
+    assert result.read_bytes() == b"DWG simulated"
+    assert len(calls) >= 2 and doc.ModelSpace.lines
+    status = app.status_var.get()
+    assert "не нарисован" in status and "завершено планов: 1" not in status
+
+
 def test_parallel_saves_use_different_names_in_same_folder(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -324,7 +350,11 @@ def test_busy_autocad_saveas_gives_up_honestly_after_attempts(tmp_path):
     assert len(calls) == 3 and "-2147418111" in str(err.value)
 
 
-def test_non_busy_saveas_error_is_not_retried(tmp_path):
+def test_non_busy_saveas_error_is_retried_then_reported_honestly(tmp_path):
+    # Живой случай 25.11.2026: SaveAs только что созданного документа умер с
+    # «<unknown>.SaveAs» — не «занятость», но и не приговор: полностью
+    # нарисованный чертёж нельзя терять из-за одного отклонённого вызова.
+    # Постоянная ошибка после всех попыток всё равно честно сообщается.
     calls = []
 
     class DiskError:
@@ -334,8 +364,22 @@ def test_non_busy_saveas_error_is_not_retried(tmp_path):
 
     with pytest.raises(auto_dwg_save.AutoDwgSaveError, match="disk problem"):
         auto_dwg_save.save_new_dwg(
-            DiskError(), tmp_path, "30", sleep=lambda _s: pytest.fail("лишний повтор"))
-    assert len(calls) == 1
+            DiskError(), tmp_path, "30", sleep=lambda _s: None, save_attempts=3)
+    assert len(calls) == 3
+
+
+def test_transient_unknown_saveas_error_recovers_on_retry(tmp_path):
+    calls = []
+
+    class Flaky:
+        def SaveAs(self, path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("<unknown>.SaveAs")
+            Path(path).write_bytes(b"DWG after hiccup")
+
+    result = auto_dwg_save.save_new_dwg(Flaky(), tmp_path, "30", sleep=lambda _s: None)
+    assert len(calls) == 2 and result.read_bytes() == b"DWG after hiccup"
 
 
 def test_warnings_file_named_after_dwg_with_all_plan_warnings(tmp_path):

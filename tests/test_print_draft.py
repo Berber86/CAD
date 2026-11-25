@@ -489,7 +489,10 @@ def test_new_pl_layer_is_continuous_without_loading_a_dashed_linetype(fake_autoc
             assert line.Linetype == "Continuous" and line.Color == 3
 
 
-def test_continuous_assignment_failure_reports_error_and_deletes_partial_line(fake_autocad):
+def test_continuous_assignment_failure_keeps_line_and_warns(fake_autocad):
+    # Живой случай 25.11.2026: AutoCAD отклонил AddLine.Color на первой линии
+    # основного плана, и весь участок остался ненарисованным. Оформление —
+    # не геометрия: линия остаётся, отказ уходит в предупреждения.
     plan = _plan("lot72_render_e600.txt")
     builder, doc = fake_autocad(plan)
     deleted = []
@@ -505,9 +508,11 @@ def test_continuous_assignment_failure_reports_error_and_deletes_partial_line(fa
         def Delete(self):
             deleted.append(True)
     doc.ModelSpace.AddLine = lambda *args: FailedLine()
-    with pytest.raises(module.AcadDrawError, match="linetype refused"):
-        builder._add_survey_line(doc.ModelSpace, plan.boundary_lines[0], "PL", 3, linetype="Continuous")
-    assert deleted == [True]
+    warnings = []
+    entity = builder._add_survey_line(doc.ModelSpace, plan.boundary_lines[0], "PL", 3,
+                                      linetype="Continuous", warnings=warnings)
+    assert isinstance(entity, FailedLine) and deleted == []
+    assert len(warnings) == 1 and "linetype refused" in warnings[0] and "PL" in warnings[0]
 
 
 def test_step4_area_selects_original_or_copy_after_step1(fake_autocad):

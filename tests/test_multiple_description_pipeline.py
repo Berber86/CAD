@@ -47,6 +47,32 @@ def test_search_parse_and_cache_reuse_with_changed_portal(tmp_path):
         assert 'data:image' not in text and 'key' not in text
 
 
+def test_failed_fresh_parse_reuses_earlier_complete_parse(tmp_path):
+    # LOT 21 из живого прогона 25.11.2026: PDF уже разобран целиком, а
+    # финальный проход другой моделью трижды лёг по тайм-ауту. Описание не
+    # должно выпадать из чертежа — берётся сохранённый полный разбор.
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    first = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+                               image_limit=10, portal_lot='8',
+                               send=lambda images, context: answer([item('5')]), search_send=searcher)
+    assert first.status == 'parsed' and not first.cached
+    def timed_out(images, context):
+        raise TimeoutError('provider down')
+    messages = []
+    second = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='other-model',
+                                image_limit=10, portal_lot='8', send=timed_out,
+                                search_send=searcher, progress=messages.append)
+    assert second.status == 'parsed' and second.cached
+    assert [i.data.lot_number for i in second.parse.items] == ['5']
+    assert any('ранее сохранённое' in m for m in messages)
+    # Явный повторный разбор сохранённым результатом не подменяется.
+    third = pipeline.parse_pdf(pdf, ON, search_api_key='key', provider='hydra', model='other-model',
+                               image_limit=10, portal_lot='8', send=timed_out,
+                               search_send=searcher, force_parse=True)
+    assert third.status == 'parse_failed' and not third.cached
+
+
 def test_missing_rerender_is_incomplete_and_does_not_hide_other_candidates(tmp_path):
     pdf = tmp_path / 'OUR 6 NEW.pdf'
     make_pdf(pdf, 2)

@@ -3014,18 +3014,34 @@ class AcadBuilder:
 
     def _add_survey_line(
         self, model_space: Any, item: LineItem, layer: str, color: int, *, linetype: str = "ByLayer",
+        warnings: list[str] | None = None,
     ) -> Any:
-        """Новый отрезок: заданный цвет и выбранный тип линии без изменения слоя."""
+        """Новый отрезок: заданный цвет и выбранный тип линии без изменения слоя.
+
+        Цвет и тип линии — оформление, а не геометрия: если AutoCAD на миг
+        отклонил присваивание (живой случай 25.11.2026 — только что созданный
+        очередью документ: ``AddLine.Color can not be set`` на первой же
+        линии основного плана), отрезок уже создан, и удалять его вместе со
+        всем планом нельзя. Один короткий повтор, дальше — линия остаётся
+        как есть, а в результат уходит предупреждение проверить её вид.
+        """
         entity = self._add_line(model_space, item, layer)
-        try:
-            entity.Color = color
-            entity.Linetype = linetype
-        except Exception as exc:  # noqa: BLE001
+        failure: Exception | None = None
+        for attempt in range(2):
             try:
-                entity.Delete()
-            except Exception:  # noqa: BLE001
-                pass
-            raise AcadDrawError(f"Не удалось задать цвет/тип линии в слое {layer}: {exc}") from exc
+                entity.Color = color
+                entity.Linetype = linetype
+                failure = None
+                break
+            except Exception as exc:  # noqa: BLE001 - оформление не губит геометрию
+                failure = exc
+                if attempt == 0:
+                    time.sleep(0.5)
+        if failure is not None and warnings is not None:
+            warnings.append(
+                f"не удалось задать цвет/тип линии отрезка в слое {layer}: {failure}; "
+                "линия оставлена как есть — проверьте её в AutoCAD"
+            )
         return entity
 
     def _ensure_text_style(self, doc: Any) -> str:
@@ -3513,7 +3529,8 @@ class AcadBuilder:
                 for row_line in geo.lines:
                     try:
                         if not is_neighbor:
-                            self._add_survey_line(model_space, row_line, street_row_layer, STREET_ROW_COLOR)
+                            self._add_survey_line(model_space, row_line, street_row_layer, STREET_ROW_COLOR,
+                                                  warnings=warnings)
                         else:
                             self._add_line(model_space, row_line, street_row_layer)
                     except Exception as exc:  # noqa: BLE001
@@ -3537,6 +3554,7 @@ class AcadBuilder:
                         line_ent = self._add_survey_line(
                             model_space, b_line, layer, color,
                             linetype="ByLayer" if on_street else "Continuous",
+                            warnings=warnings,
                         )
                     created_boundary_lines += 1
                     if primary_entity is None:

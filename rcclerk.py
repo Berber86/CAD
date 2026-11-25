@@ -605,6 +605,28 @@ class DownloadStopped(Exception):
     """Пользователь нажал «Стоп» во время ожидания загрузки — это не ошибка документа."""
 
 
+def _default_failure_shot(folder: Path, endorsement_id: int | str) -> str:
+    """«Чёрный ящик»: снимок окна браузера в папку при тайм-ауте загрузки.
+
+    Без снимка не понять, почему PDF не скачался: проверка Cloudflare, не та
+    страница, зависший просмотрщик, чужой диалог. Любой сбой снимка — пустой
+    хвост: диагностика не должна ломать и без того ручной шаг.
+    """
+    try:
+        import acris_viewer
+        import browser_save
+        from nyc_portal import _save_failure_shot
+
+        window = acris_viewer._pick_window(  # noqa: SLF001 - общий выбор окна браузера
+            browser_save.list_windows, browser_save.active_window_handle)
+        if window is None:
+            return ""
+        return _save_failure_shot(
+            window.handle, folder, prefix=f"CLERK_FAIL_{endorsement_id}")
+    except Exception:  # noqa: BLE001 - диагностика не ломает остановку
+        return ""
+
+
 def download_with_fallback(
     endorsement_id: int | str,
     destination: str | Path,
@@ -613,11 +635,13 @@ def download_with_fallback(
     opener=None,
     open_browser=None,
     downloads_dir: str | Path | None = None,
-    watch_timeout: float = 300.0,
+    watch_timeout: float = 45.0,
     poll: float = 1.0,
     auto_save=None,
     on_step=None,
     should_stop=None,
+    fail_dir: str | Path | None = None,
+    shot_fn=None,
 ) -> tuple[Path, str]:
     """
     Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
@@ -627,8 +651,11 @@ def download_with_fallback(
        заголовок браузерного окна показывает уже загруженный PDF, безопасный хук
        один раз отправляет Ctrl+S именно этому браузеру. Затем файл подхватывается
        из «Загрузок».
-    3. **Ручной шаг**: если браузер/просмотрщик не распознан или файл не появился,
-       ``ManualStepNeeded`` подсказывает ссылку и папку для ручного завершения.
+    3. **Ручной шаг**: если браузер/просмотрщик не распознан или файл не появился
+       за ``watch_timeout`` (по умолчанию 45 с — дольше ждать бессмысленно,
+       исход ясен раньше), ``ManualStepNeeded`` подсказывает ссылку и папку для
+       ручного завершения, а в папку назначения падает аварийный снимок окна
+       браузера ``CLERK_FAIL_<endorsement>_<время>.png` для диагностики.
 
     Возвращает ``(путь, ступень)``, где ступень — ``"direct"`` или ``"browser"``.
     """
@@ -716,8 +743,21 @@ def download_with_fallback(
         if time.monotonic() >= deadline:
             break
         time.sleep(max(0.05, float(poll)))
+    # Аварийный снимок окна браузера в папку задания: без него не видно, что
+    # было на экране вместо скачивания (капча, не та страница, зависший
+    # просмотрщик). Сбой снимка ручной шаг не отменяет.
+    shot_dir = Path(fail_dir) if fail_dir is not None else target.parent
+    try:
+        shot_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        shot = (shot_fn or _default_failure_shot)(shot_dir, endorsement_id)
+    except Exception:  # noqa: BLE001 - диагностика не ломает остановку
+        shot = ""
     raise ManualStepNeeded(
         f"PDF не появился в «{folder}» за {int(watch_timeout)} с. Ссылка: {url}. "
-        "Если PDF уже виден, нажмите Ctrl+S в его окне; либо сохраните файл в папку описаний вручную.",
+        "Если PDF уже виден, нажмите Ctrl+S в его окне; либо сохраните файл в папку описаний вручную."
+        f"{shot}",
         url, folder=folder,
     )

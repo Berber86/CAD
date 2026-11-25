@@ -297,7 +297,7 @@ def _save_window_capture(handle: int, destination: str | Path) -> Path:
         raise PortalLookupError(f"Не удалось снять экран окна браузера: {exc}") from exc
 
 
-def _save_failure_shot(handle: int, folder: str | Path | None) -> str:
+def _save_failure_shot(handle: int, folder: str | Path | None, prefix: str = "PORTAL_FAIL") -> str:
     """
     «Чёрный ящик» автоматизации портала: снимок окна в момент сбоя.
 
@@ -309,7 +309,7 @@ def _save_failure_shot(handle: int, folder: str | Path | None) -> str:
         return ""
     try:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = Path(folder) / f"PORTAL_FAIL_{stamp}.png"
+        path = Path(folder) / f"{prefix}_{stamp}.png"
         _save_window_capture(handle, path)
         return f" Снимок экрана при сбое: {path}"
     except Exception:  # noqa: BLE001 - диагностика не должна ломать остановку

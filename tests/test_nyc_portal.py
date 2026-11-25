@@ -1934,3 +1934,31 @@ def test_on_identified_fires_before_the_neighbour_request(tmp_path, monkeypatch)
     assert result.neighbours == ["68", "72"]
     assert events[0] == ("identified", "5712", "70")
     assert events[1] == "ask"
+
+
+def test_vision_prompt_takes_left_right_relative_to_the_front_street():
+    # Указание пользователя: левый/правый сосед — относительно фронтальной
+    # улицы нашего участка, а не краёв картинки.
+    prompt = nyc_portal.VISION_SYSTEM_PROMPT
+    assert "RELATIVE TO THE FRONT STREET" in prompt
+    assert "standing on that front street" in prompt
+    assert "not to the edges of the image" in prompt
+    assert "visual left as left_neighbor_lot" not in prompt
+
+
+def test_neighbour_user_text_defines_sides_by_the_front_street(tmp_path, monkeypatch):
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    texts = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        texts.append(user_text)
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.delenv("HYDRA_API_KEY", raising=False)
+    monkeypatch.setattr(nyc_portal, "load_dotenv_dict", lambda: {})
+    nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
+        model="some-model", api_key="other-key")
+    assert "front street" in texts[0] and "left hand" in texts[0]

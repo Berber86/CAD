@@ -4198,7 +4198,7 @@ def test_step0_portal_vision_result_fills_current_and_neighbour_lots(gui, tmp_pa
     assert app.step0_lot_var.get() == "70"
     assert app.step0_neighbours_var.get() == "68, 72"
     assert app._session_llm_calls == 1
-    assert any("соседи слева/справа 68 / 72" in line for line in _step0_texts(app))
+    assert any("соседи слева/справа от фронтальной улицы 68 / 72" in line for line in _step0_texts(app))
     assert app.step0_run_button.cget("state") == "normal"
 
 

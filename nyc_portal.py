@@ -1256,7 +1256,9 @@ def parse_neighbour_result(
 VISION_SYSTEM_PROMPT = """You inspect ONLY a cropped NYC tax-map image. The selected parcel is highlighted in cyan.
 Return one JSON object only with keys left_neighbor_lot, right_neighbor_lot, front_street_angle_deg, confidence, notes.
 Also report front_street_angle_deg: the orientation in degrees of the street that the cyan parcel fronts onto (the street along its frontage side), measured clockwise from geographic north. North points straight up in this image. Report 0 for a street running north-south, 90 for east-west, a value from 0 to under 180; if the front street is unclear, return null for it and never guess.
-Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Report the neighbour on the visual left as left_neighbor_lot and the one on the visual right as right_neighbor_lot. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. If both side parcels are clearly identified but the map rotation makes the visual left/right assignment uncertain, still return both numbers (in either order), set confidence to low and explain that in notes. Return null only for a parcel whose label or adjacency itself is unclear. confidence is low, medium, or high. Never guess a lot number. Do not include markdown."""
+Read only the lot-number labels printed inside the two parcels that directly share the opposing side/end boundaries of the cyan parcel. Do not return Block, the selected Lot, street numbers, or any property-detail data. Do not use a rear parcel or a lot that does not share a boundary. Never guess a lot number.
+LEFT AND RIGHT ARE RELATIVE TO THE FRONT STREET of the cyan parcel, not to the edges of the image. First identify the front street: the street that the cyan parcel fronts onto (its frontage side — the side its address and front entrance face, from which the lot's depth runs back). Then imagine standing on that front street and facing the cyan parcel, with the street behind you: the directly touching parcel on your LEFT is left_neighbor_lot and the one on your RIGHT is right_neighbor_lot. Equivalently, mentally rotate the map so the front street runs along the bottom edge and the cyan parcel lies above it, seen from the street; the viewer's left and right in that rotated view are the answer. Never report the image's raw visual left/right when the front street runs along a different side or the map is rotated.
+If both side parcels are clearly identified but the front street cannot be determined, still return both numbers (in either order), set confidence to low and explain in notes that the front street was unclear, so left and right may be swapped. Return null only for a parcel whose label or adjacency itself is unclear. confidence is low, medium, or high. Do not include markdown."""
 
 
 DETAILS_VISION_PROMPT = """Read ONLY the visible property details on this NYC Portal card image.
@@ -1394,8 +1396,10 @@ def lookup_parcel(
     neighbour_user_text = (
         f"Search address (context only): {clean_address}. The attached image contains only the tax map.\n"
         "The selected parcel is cyan. Identify only the directly touching neighbour lot numbers "
-        "on its left and right opposing side boundaries. If both are identified but left/right "
-        "is uncertain due to rotation, return both anyway with confidence low. "
+        "on its left and right opposing side boundaries. Left and right are relative to the front "
+        "street of the cyan parcel: stand on that street facing the parcel — the parcel on your "
+        "left hand is left_neighbor_lot, the one on your right hand is right_neighbor_lot. If both "
+        "are identified but the front street is unclear, return both anyway with confidence low. "
         "Use null only when a label or adjacency itself is unclear."
     )
 

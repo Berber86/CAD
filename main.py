@@ -4438,7 +4438,7 @@ class SurveyApp(ctk.CTk):
         self._step0_log(
             f"{details_label}: Borough {result.borough or 'не распознан'}, "
             f"Block {result.block}, Lot {result.lot}. Vision по карте: "
-            f"соседи слева/справа {result.left_neighbour or '—'} / "
+            f"соседи слева/справа от фронтальной улицы {result.left_neighbour or '—'} / "
             f"{result.right_neighbour or '—'}; уверенность: {result.confidence}"
             + (f"; первой ответила {result.neighbour_model}" if getattr(result, "neighbour_model", "") else "")
             + ".",
@@ -4504,7 +4504,9 @@ class SurveyApp(ctk.CTk):
             if self._step0_our_outcome is not None and not self._step0_running:
                 self._step0_log(
                     f"Автопоток: номера соседей приняла первой — {winner}; "
-                    "наш участок уже собран.", level=log_mode.LEVEL_KEY)
+                    + ("наш участок уже собран." if self._step0_our_outcome.ok
+                       else "наш участок не собран — начерчу хотя бы соседа."),
+                    level=log_mode.LEVEL_KEY)
                 self._continue_after_neighbours()
             else:
                 self._step0_log(
@@ -4883,15 +4885,20 @@ class SurveyApp(ctk.CTk):
         if self._step0_auto_stage == "intake":
             if self._step0_early_active and self._step0_early_phase == "our":
                 # Ранний проход: наш участок собран до ответа про соседей.
+                # Даже если наш участок не собрался, автопоток не встаёт:
+                # дождёмся соседей и начертим хотя бы их (указание пользователя).
                 self._step0_our_outcome = outcome
-                if not outcome.ok:
-                    self._auto_submit_step0_outcome(outcome)
-                elif self._step0_neighbour_lots is None:
+                if self._step0_neighbour_lots is None:
                     self._step0_log(
                         "Автопоток: наш участок собран; жду номера соседей от "
-                        "нейронок, чтобы докачать соседей.", level=log_mode.LEVEL_KEY)
-                else:
+                        "нейронок, чтобы докачать соседей." if outcome.ok else
+                        "Автопоток: наш участок не собран; жду номера соседей от "
+                        "нейронок — начерчу хотя бы соседа, если его назовут.",
+                        level=log_mode.LEVEL_KEY)
+                elif self._step0_neighbour_lots:
                     self._continue_after_neighbours()
+                else:
+                    self._auto_submit_step0_outcome(outcome)
             elif self._step0_early_active and self._step0_early_phase == "neighbours":
                 merged = (deed_intake.merge_outcomes(self._step0_our_outcome, outcome)
                           if self._step0_our_outcome is not None else outcome)
@@ -4920,9 +4927,17 @@ class SurveyApp(ctk.CTk):
             self._stop_auto_transition("Автопоток остановлен: адрес, район, Block или Lot изменились во время сбора.")
             return
         if not outcome.ok:
-            self._stop_auto_transition("Автопоток остановлен: наш участок не собран; проверьте раздел «Чего не хватает» и завершите ручные шаги.")
-            return
-        if outcome.missing:
+            # Наш участок не собран — но автопоток всё равно обязан дойти до
+            # черчения, если можно начертить хотя бы одного соседа, пусть и
+            # криво (указание пользователя). Останавливаемся ниже, только
+            # если не собралось вообще ничего.
+            detail = "; ".join(outcome.missing) if outcome.missing else "причины — в отчёте сбора"
+            self._step0_log(
+                f"Сбор: наш участок не собран ({detail}). Продолжаю автопоток "
+                "с тем, что собралось: начерчу хотя бы соседей.",
+                level=log_mode.LEVEL_WARN,
+            )
+        elif outcome.missing:
             # Наш участок собран: недостача соседей задание не хоронит
             # (живой случай 3876, 24.11.2026: свежий CRFN соседа не знает
             # NYC Open Data — из-за этого вставало всё задание без DWG).
@@ -4958,9 +4973,13 @@ class SurveyApp(ctk.CTk):
             self._step0_log("Автопоток: OUR OLD скачан и сохранён, но не разбираю — "
                             "в автопотоке разбираются NEW нашего участка и соседи.",
                             level=log_mode.LEVEL_KEY)
-        if not paths or not any(roles.values()):
-            self._stop_auto_transition("Автопоток остановлен: нет доступного PDF нашего участка для разбора (OUR OLD не разбираю).")
+        if not paths:
+            self._stop_auto_transition("Автопоток остановлен: не собралось ни одного PDF для разбора — начертить нечего.")
             return
+        if not any(roles.values()):
+            self._step0_log(
+                "Автопоток: нашего участка среди собранных PDF нет — разбираю "
+                "и начерчу соседей, какие есть.", level=log_mode.LEVEL_WARN)
         # The explicit auto button opts into this mode for the current session only.
         self.multi_pdf_mode_var.set(True)
         self._on_multi_pdf_mode_changed()
@@ -4972,9 +4991,16 @@ class SurveyApp(ctk.CTk):
             item.is_main = roles[item.path]
         for error in errors:
             self._step0_log(f"Не открыт собранный PDF: {error}", level=log_mode.LEVEL_ERROR)
-        if errors or len(items) != len(paths) or not items or not any(item.is_main for item in items):
-            self._stop_auto_transition("Автопоток остановлен: не все собранные PDF открылись.")
+        if not items:
+            self._stop_auto_transition("Автопоток остановлен: ни один собранный PDF не открылся — начертить нечего.")
             return
+        if errors:
+            # Кто-то из собранных не открылся — не хороним остальных:
+            # разберём и начертим тех, кто открылся.
+            self._step0_log(
+                "Автопоток: часть собранных PDF не открылась — продолжаю с "
+                "открывшимися.", level=log_mode.LEVEL_WARN)
+            paths = [item.path for item in items]
         stream_batch = getattr(self, "_auto_stream_batch", None)
         stream_jobs = getattr(self, "_auto_stream_jobs", ())
         self._auto_stream_batch = None

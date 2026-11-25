@@ -119,9 +119,10 @@ def test_auto_continues_when_only_a_neighbour_is_missing(gui, tmp_path, monkeypa
     assert any("не хватает" in line for _lvl, line in app._step0_lines)
 
 
-def test_auto_stops_when_our_lot_is_missing(gui, tmp_path, monkeypatch):
-    # Полная остановка в автопотоке допустима только в одном случае:
-    # не собран наш собственный участок — дальше идти просто не с чем.
+def test_auto_draws_a_neighbour_even_when_our_lot_is_missing(gui, tmp_path, monkeypatch):
+    # Указание пользователя (5.32): автопоток обязан дойти до черчения, если
+    # можно начертить хотя бы одного соседа, пусть и криво. Несобранный наш
+    # участок — предупреждение, а не остановка (до 5.32 было наоборот).
     app = gui.SurveyApp()
     app.step0_address_var.set("Address")
     app.step0_folder_var.set(str(tmp_path))
@@ -131,11 +132,40 @@ def test_auto_stops_when_our_lot_is_missing(gui, tmp_path, monkeypatch):
         kw.update(fetch_list=intake._fetch(fail_lots=[32]), downloader=intake._downloader(tmp_path))
         return actual_collect(**kw)
     monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    submitted = []
+    def submit(items, **kw):
+        submitted.append(items)
+        app._busy = True
+    monkeypatch.setattr(app, "_submit_pdf_set", submit)
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    for _ in range(1000):
+        app._drain_events()
+        if app._step0_auto_stage == "parse":
+            break
+        time.sleep(.01)
+    assert submitted and app._step0_auto_stage == "parse"
+    assert [(item.path.name, item.is_main) for item in submitted[0]] == [("LOT 30 NEW.pdf", False)]
+    assert any("хотя бы сосед" in line for _lvl, line in app._step0_lines)
+
+
+def test_auto_stops_only_when_nothing_is_collected(gui, tmp_path, monkeypatch):
+    # Полная остановка допустима в одном случае: не собралось вообще
+    # ничего — начертить нечего.
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    actual_collect = gui.deed_intake.collect_deeds
+    def collect(**kw):
+        kw.update(fetch_list=intake._fetch(fail_lots=[32, 30]), downloader=intake._downloader(tmp_path))
+        return actual_collect(**kw)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
     monkeypatch.setattr(app, "_submit_pdf_set", lambda *a, **kw: pytest.fail("nothing to parse"))
     app._start_step0_auto()
     app._finish_step0_portal_lookup("ok", parcel(gui))
     wait_all(app)
-    assert app._step0_auto_stage is None and "наш участок не собран" in app.status_var.get()
+    assert app._step0_auto_stage is None and "нечего" in app.status_var.get()
 
 
 def test_changed_address_and_stop_during_portal_prevent_collection(gui, monkeypatch):
@@ -331,3 +361,25 @@ def test_auto_continues_without_neighbours_when_neighbour_answer_fails(
     assert len(seen) == 1
     assert {item.path.name for item in submitted[0]} == {"OUR LOT 32 NEW.pdf"}
     assert any("без соседей" in line for _level, line in app._step0_lines)
+
+
+def test_auto_early_our_failure_still_draws_the_neighbour(gui, tmp_path, monkeypatch):
+    # Ранний сбор: наш участок не скачался до ответа про соседей — автопоток
+    # всё равно докачивает соседа и уходит на разбор с ним одним.
+    app = gui.SurveyApp()
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path))
+    fake_portal(app, monkeypatch)
+    seen, submitted = [], []
+    _collect_spy(gui, monkeypatch, tmp_path, seen, fail_lots=[32])
+    _submit_spy(app, monkeypatch, submitted)
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    _drain_until(app, lambda: not app._step0_running
+                 and app._step0_our_outcome is not None)
+    assert not app._step0_our_outcome.ok
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    _drain_until(app, lambda: bool(submitted))
+    assert [(item.path.name, item.is_main) for item in submitted[0]] == [
+        ("LOT 30 NEW.pdf", False)]

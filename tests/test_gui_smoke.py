@@ -6188,6 +6188,43 @@ def test_job_queue_draw_phase_saves_dwg_and_closes_document(gui, tmp_path):
     assert app._job_runner_active is False
 
 
+def test_data_add_folder_native_multiselect_adds_all(gui, tmp_path, monkeypatch):
+    # Нативный диалог Windows возвращает сразу несколько папок (Ctrl/Shift):
+    # все попадают в список одним нажатием «Папки…», а следующий диалог
+    # откроется в их родительской папке, а не внутри выбранной.
+    app = gui.SurveyApp()
+    folders = []
+    for name in ("1001#10 FIRST ST", "1002#20 SECOND ST"):
+        folder = tmp_path / name
+        folder.mkdir()
+        folders.append(folder)
+    monkeypatch.setattr(gui.folder_dialog, "available", lambda: True)
+    monkeypatch.setattr(
+        gui.folder_dialog, "ask_folders",
+        lambda *_args, **_kwargs: [str(folders[0]), str(folders[1])])
+    app._data_add_folder_clicked()
+    assert [task["path"] for task in app._job_tasks] == folders
+    assert app._data_dialog_initial_dir == str(tmp_path)
+
+
+def test_data_add_folder_falls_back_to_single_dialog(gui, tmp_path, monkeypatch):
+    # Сбой нативного диалога — откат на прежний askdirectory в одну папку.
+    app = gui.SurveyApp()
+    folder = tmp_path / "1001#10 FIRST ST"
+    folder.mkdir()
+
+    def boom(*_args, **_kwargs):
+        raise gui.folder_dialog.FolderDialogError("COM недоступен")
+
+    monkeypatch.setattr(gui.folder_dialog, "available", lambda: True)
+    monkeypatch.setattr(gui.folder_dialog, "ask_folders", boom)
+    monkeypatch.setattr(
+        sys.modules["tkinter.filedialog"], "askdirectory",
+        lambda **_kwargs: str(folder), raising=False)
+    app._data_add_folder_clicked()
+    assert [task["path"] for task in app._job_tasks] == [folder]
+
+
 def test_model_test_window_opens_by_triple_click_on_canvas(gui):
     app = gui.SurveyApp()
     assert "<Triple-Button-1>" in app.preview_canvas._bindings

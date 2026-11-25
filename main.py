@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover
 
 import app_updater
 import auto_dwg_save
+import folder_dialog
 import lot_identity
 import file_metadata
 import legal_page_search
@@ -3331,7 +3332,7 @@ class SurveyApp(ctk.CTk):
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(4, 12))
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
-        self.data_status_var = ctk.StringVar(value="Добавьте папки работ: сканированием каталога или по одной.")
+        self.data_status_var = ctk.StringVar(value="Добавьте папки работ: сканированием каталога или выбором (можно сразу несколько).")
         ctk.CTkLabel(
             right, textvariable=self.data_status_var,
             font=ctk.CTkFont(size=12, weight="bold"),
@@ -3394,9 +3395,39 @@ class SurveyApp(ctk.CTk):
     def _data_add_folder_clicked(self) -> None:
         from tkinter import filedialog
 
-        chosen = filedialog.askdirectory(title="Папка работы (номер#адрес)")
+        # Нативный диалог Windows умеет выбирать сразу несколько папок
+        # (Ctrl/Shift); tkinter askdirectory — только одну, и папки приходилось
+        # добавлять по одной, вылезая из предыдущей на уровень вверх. Начальная
+        # папка — родительская от прошлого выбора, а не сама выбранная папка.
+        # Любой сбой нативного диалога — откат на прежний askdirectory.
+        initial_dir = getattr(self, "_data_dialog_initial_dir", None)
+        chosen: list[str] = []
+        native_done = False
+        if folder_dialog.available():
+            try:
+                try:
+                    parent_hwnd = int(self.winfo_id())
+                except Exception:  # noqa: BLE001 - диалог и без владельца откроется
+                    parent_hwnd = 0
+                chosen = folder_dialog.ask_folders(
+                    "Папки работ (номер#адрес) — можно выбрать несколько (Ctrl/Shift)",
+                    parent_hwnd=parent_hwnd,
+                    initial_dir=initial_dir,
+                )
+                native_done = True
+            except Exception:  # noqa: BLE001 - откат на обычный диалог ниже
+                native_done = False
+        if not native_done:
+            dialog_kwargs: dict[str, Any] = {"title": "Папка работы (номер#адрес)"}
+            if initial_dir:
+                dialog_kwargs["initialdir"] = initial_dir
+            single = filedialog.askdirectory(**dialog_kwargs)
+            chosen = [single] if single else []
         if chosen:
-            self._data_add_folders([chosen])
+            parent = Path(chosen[0]).parent
+            if parent.is_dir():
+                self._data_dialog_initial_dir = str(parent)
+            self._data_add_folders(chosen)
 
     def _data_remove_task(self, index: int) -> None:
         if self._job_runner_active:

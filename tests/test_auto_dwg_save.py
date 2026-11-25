@@ -122,9 +122,21 @@ def test_auto_pipeline_manually_draws_then_saves_same_document(gui, tmp_path, mo
     result, = (tmp_path / "project" / "01_описания").glob("lot_32_*.dwg")
     assert result.read_bytes() == b"DWG simulated" and len(doc.ModelSpace.lines) > 0
     assert str(result) in app.status_var.get() and "сохранён" in app.status_var.get()
+    # Автосохранение одноразовое: контекст автопотока израсходован первой
+    # отрисовкой. Повторное ручное построение DWG само не сохраняет —
+    # Николай: после автопотока человек достраивает лоты вручную и не ждёт,
+    # что программа без спроса плодит файлы в папке автопотока.
+    assert app._auto_dwg_context is None
     app._start_draw_scene()
     smoke._wait_for_gui_worker(app)
-    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 2
+    assert len(list((tmp_path / "project" / "01_описания").glob("lot_32_*.dwg"))) == 1
+
+
+def test_full_reset_drops_auto_dwg_context(gui, tmp_path, monkeypatch):
+    app = prepare_auto(gui, tmp_path, monkeypatch)
+    assert app._auto_dwg_context
+    app._reset_session()
+    assert app._auto_dwg_context is None
 
 
 def test_mismatched_lot_still_saves_using_portal_number(gui, tmp_path, monkeypatch, fake_autocad):

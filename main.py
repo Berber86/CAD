@@ -10108,7 +10108,7 @@ class SurveyApp(ctk.CTk):
             if auto_identity and self._step0_outcome is not None:
                 folder = Path(self._step0_outcome.folder).resolve()
                 self._auto_dwg_context = (auto_identity, folder, signature, view)
-                note = "После ручной отрисовки DWG сохраняется в папке описаний, даже если результат неполный."
+                note = "После ручной отрисовки DWG один раз сохранится в папке описаний, даже если результат неполный. Дальше сохраняйте вручную."
                 self._step0_log(note, level=log_mode.LEVEL_KEY)
                 self._log_line(note, level=log_mode.LEVEL_KEY)
             self._select_step_tab(STEP_TAB_BOUNDARY)
@@ -11974,6 +11974,12 @@ class SurveyApp(ctk.CTk):
         elif kind == "multi_scene_drawn":
             completed, error = payload[:2]
             save_result = payload[2] if len(payload) > 2 else None
+            if save_result is not None:
+                # Автосохранение — одноразовое, только для отрисовки самого
+                # автопотока. Контекст израсходован: дальнейшие ручные
+                # построения (добавленные лоты, повторные отрисовки) DWG
+                # сами не сохраняют — ни в папку автопотока, ни куда-либо ещё.
+                self._auto_dwg_context = None
             self._finish_busy()
             if completed:
                 self.draw_result = completed[-1][1]
@@ -12898,6 +12904,10 @@ class SurveyApp(ctk.CTk):
             identity, folder, saved_signature, saved_view = context
             if saved_signature != signature or saved_view is not self._multi_scene_handoff:
                 save_notice = "Автосохранение DWG пропущено: схема больше не относится к результату автопотока."
+                # Контекст мёртв: не держать его до следующего построения,
+                # чтобы каждое ручное построение не повторяло это сообщение
+                # и не пыталось сохраниться в папку автопотока.
+                self._auto_dwg_context = None
             else:
                 auto_save = (folder, identity[3])
         self._set_status(f"Рисую подготовленные контуры: {len(plans)}…"

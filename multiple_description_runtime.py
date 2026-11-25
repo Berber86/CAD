@@ -37,6 +37,11 @@ class RuntimeUnavailable(RuntimeError):
 HYDRA_GROK_MODEL = "grok-4.7"
 ROUTERAI_GROK_MODEL = "x-ai/grok-4.7"
 HEDGE_DELAY_SEC = 300.0
+#: ВРЕМЕННО ВЫКЛЮЧЕНО указанием пользователя (5.33): параллельный
+#: страховочный вызов RouterAI Grok после HEDGE_DELAY_SEC ожидания
+#: основной модели не делается. Механизм, вызывающие места и тесты
+#: сохранены — чтобы вернуть страховку, поставить True.
+HEDGE_ENABLED = False
 
 
 @dataclass(frozen=True)
@@ -444,7 +449,7 @@ def _make_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], client: Any,
     effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
     send = transport.make_sender(client, target.model, effort)
     choose = transport.make_selector(client, target.model, effort)
-    if (hedge_target is not None and hedge_client is not None
+    if (HEDGE_ENABLED and hedge_target is not None and hedge_client is not None
             and target.provider == 'hydra' and target.model == HYDRA_GROK_MODEL
             and hedge_target.provider == 'routerai' and hedge_target.model == ROUTERAI_GROK_MODEL):
         hedge_effort = lp.resolve_reasoning_effort(
@@ -466,7 +471,7 @@ def make_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], *,
     timeout = float(api.get('timeout_sec') or 500)
     client = transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)
     hedge_client = None
-    if hedge_target is not None:
+    if HEDGE_ENABLED and hedge_target is not None:
         try:
             hedge_client = transport.create_client(
                 {'api_key': hedge_target.api_key, 'base_url': hedge_target.base_url}, timeout=timeout)
@@ -485,7 +490,7 @@ def open_runtime_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], *,
     timeout = float(api.get('timeout_sec') or 500)
     clients = [transport.create_client({'api_key': target.api_key, 'base_url': target.base_url}, timeout=timeout)]
     hedge_client = None
-    if hedge_target is not None:
+    if HEDGE_ENABLED and hedge_target is not None:
         try:
             hedge_client = transport.create_client(
                 {'api_key': hedge_target.api_key, 'base_url': hedge_target.base_url}, timeout=timeout)

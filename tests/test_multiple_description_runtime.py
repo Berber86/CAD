@@ -275,6 +275,7 @@ def test_hydra_grok_runtime_uses_routerai_grok_as_hedge(monkeypatch):
         return client
 
     monkeypatch.setattr(runtime.transport, 'create_client', fake_client)
+    monkeypatch.setattr(runtime, 'HEDGE_ENABLED', True)  # механизм жив, когда включён
     target = runtime.ResolvedTarget('hydra', runtime.HYDRA_GROK_MODEL,
                                     'https://hydra.test/v1', 'hydra-key', 10)
     hedge = runtime.ResolvedTarget('routerai', runtime.ROUTERAI_GROK_MODEL,
@@ -443,3 +444,41 @@ def test_two_pdf_cross_borough_safe_auto_row_uses_no_additional_model_calls(tmp_
     assert batch.scene.plans[0].group == batch.scene.plans[1].group
     assert [p.plan.is_neighbor for p in batch.scene.plans] == [False, True]
     assert batch.files[1].result.parse.items[0].data.cross_street == 'Lindbergh Avenue'
+
+
+def test_hedge_is_disabled_by_default(monkeypatch):
+    # 5.33, указание пользователя: страховочный вызов RouterAI Grok через
+    # 300 с временно выключен — даже для Hydra grok-4.7 с готовым hedge
+    # запрос идёт только основной модели, клиент страховки не создаётся.
+    from types import SimpleNamespace
+    from multiple_description_parse import PageImage
+    assert runtime.HEDGE_ENABLED is False
+    created_keys = []
+    calls = []
+
+    class PlainClient:
+        def __init__(self, key):
+            self.key = key
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, *, model, **kwargs):
+            calls.append((model, self.key))
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{}', refusal=None))])
+
+        def close(self):
+            pass
+
+    def fake_client(target, *, timeout):
+        created_keys.append(target['api_key'])
+        return PlainClient(target['api_key'])
+
+    monkeypatch.setattr(runtime.transport, 'create_client', fake_client)
+    target = runtime.ResolvedTarget('hydra', runtime.HYDRA_GROK_MODEL,
+                                    'https://hydra.test/v1', 'hydra-key', 10)
+    hedge = runtime.ResolvedTarget('routerai', runtime.ROUTERAI_GROK_MODEL,
+                                   'https://routerai.test/v1', 'router-key', 10)
+    with runtime.open_runtime_callbacks(target, {}, hedge_target=hedge, hedge_delay_sec=0.0) as (send, _choose):
+        send([PageImage(1, 'data:image/png;base64,AA==')], {})
+    assert calls == [(runtime.HYDRA_GROK_MODEL, 'hydra-key')]
+    assert created_keys == ['hydra-key']  # клиент RouterAI даже не создавался

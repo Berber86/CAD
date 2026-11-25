@@ -16,11 +16,14 @@
 На реальной карте всегда есть ДВА перпендикулярных семейства линий
 (улицы и авеню, фасады и боковые межи), поэтому глобальное среднее по всем
 направлениям бессмысленно — оценки ищут семейство, а не среднее. Какое из
-двух семейств — фронтальное, подсказывает сам снимок: выделенный голубым
-участок фасадной стороной смотрит на серую полосу улицы, а боковыми и
-задней — на белые соседние участки (``_parcel_anchor``). Без голубой
-подсветки оценка отрезков честно берёт доминирующее семейство сетки, а
-тензорная может отказаться (``None``) — это лучше выдуманного числа.
+двух семейств — фронтальное, подсказывает сам снимок: за фасадной стороной
+выделенного голубым участка лежит улица — одна огромная связная область
+без меж через весь блок, а за боковыми и задней — соседние участки,
+каждый областью размером с наш (``_parcel_anchor``). Яркость заливки не
+подсказывает: на живых картах участки такие же серые, как улица. Без
+голубой подсветки оценка отрезков честно берёт доминирующее семейство
+сетки, а тензорная может отказаться (``None``) — это лучше выдуманного
+числа.
 
 Клиент сам сравнивает значения (JSON-кэш — ``map_angle_cache.py``) и
 применяет самое точное; программа выбор за него не делает.
@@ -40,9 +43,10 @@ _MIN_CLUSTER_SHARE = 0.35
 _MIN_COHERENCE = 0.15
 #: Когерентность тензора по градиентам одного семейства.
 _MIN_COHERENCE_FAMILY = 0.30
-#: Яркость заливки улицы на tax map заметно ниже белых участков (~218 против
-#: ~236); порог — середина, пятно за фасадной стороной должно быть не светлее.
-_STREET_LUMINANCE_MAX = 227.0
+#: Улица за фасадной стороной — связная область без меж площадью заметно
+#: больше самого участка (полоса через весь блок); соседний участок даёт
+#: область примерно его размера. Порог — между этими масштабами.
+_STREET_REGION_MIN_RATIO = 1.5
 
 
 def normalize_line_angle(deg: float) -> float:
@@ -113,10 +117,15 @@ def _parcel_anchor(image) -> tuple[tuple[int, int, int, int] | None, float | Non
     Голубой участок на снимке: (рамка, азимут фронтального семейства | None).
 
     Кандидаты в семейства — главная ось контура участка и ось поперёк неё.
-    Фронтальное — то, за крайней стороной которого заливка серая (улица),
-    а не белая (соседний участок). Угловой участок смотрит на улицу двумя
-    сторонами — берём семейство с большей длиной фасада. Не вышло — None:
-    оценки тогда обойдутся без привязки к фасаду.
+    Фронтальное — то, за крайней стороной которого лежит не соседний
+    участок (связная область без меж размером с наш), а улица: одна
+    огромная область через весь блок. Проба яркостью здесь не работает:
+    на живых tax map заливка участков такая же серая, как улица, и проба
+    честно называла «улицей» боковые стороны (живой случай 25.11.2026,
+    Reno Ave: обе оценки ушли на перпендикулярное семейство — 34° вместо
+    125°). Угловой участок смотрит на улицу двумя семействами — берём то,
+    у которого длиннее фасад. Не вышло — None: оценки тогда обойдутся без
+    привязки к фасаду.
     """
     try:
         import numpy as np
@@ -176,22 +185,41 @@ def _parcel_anchor(image) -> tuple[tuple[int, int, int, int] | None, float | Non
         xf = xs.astype(np.float64)
         yf = ys.astype(np.float64)
 
-        def _side_is_street(family: float, proj_l, proj_n, lx, ly, nx, ny) -> bool:
-            for side in (-1.0, 1.0):
-                extreme = float(proj_n.max() if side > 0 else proj_n.min())
-                span = float(proj_l.max() - proj_l.min())
-                values: list[float] = []
-                for fraction in (0.3, 0.5, 0.7):
-                    along = float(proj_l.min()) + fraction * span
-                    normal_at = extreme + side * 18.0
+        # Области без меж: тёмные линии (и подписи) — перегородки, чуть
+        # расширенные, чтобы цифры размеров на линиях не пробивали дыр.
+        try:
+            import cv2
+
+            sealed = cv2.dilate(
+                (luminance < 120).astype(np.uint8), np.ones((5, 5), np.uint8))
+            _count, regions, region_stats, _centroids = (
+                cv2.connectedComponentsWithStats((1 - sealed).astype(np.uint8), 8))
+        except Exception:  # noqa: BLE001 - нет OpenCV: фронта не знаем
+            return bbox, None
+        parcel_area = float(mask.sum())
+
+        def _outside_region(family: float, proj_l, proj_n, lx, ly, nx, ny,
+                            side: float) -> tuple[float, float]:
+            """(площадь области за стороной, её доля в пробе); (0, 0) — нет данных."""
+            extreme = float(proj_n.max() if side > 0 else proj_n.min())
+            span = float(proj_l.max() - proj_l.min())
+            labels: list[int] = []
+            for offset in (6.0, 10.0, 14.0, 18.0, 22.0):
+                for fraction in np.linspace(0.06, 0.94, 30):
+                    along = float(proj_l.min()) + float(fraction) * span
+                    normal_at = extreme + side * offset
                     px = int(round(lx * along + nx * normal_at))
                     py = int(round(ly * along + ny * normal_at))
-                    if 4 <= px < width - 4 and 4 <= py < height - 4:
-                        patch = luminance[py - 4:py + 5, px - 4:px + 5]
-                        values.append(float(np.median(patch)))
-                if values and float(np.median(values)) <= _STREET_LUMINANCE_MAX:
-                    return True
-            return False
+                    if 0 <= px < width and 0 <= py < height:
+                        label = int(regions[py, px])
+                        if label > 0:
+                            labels.append(label)
+            if not labels:
+                return 0.0, 0.0
+            values, counts = np.unique(labels, return_counts=True)
+            top = int(np.argmax(counts))
+            area = float(region_stats[int(values[top]), cv2.CC_STAT_AREA])
+            return area, float(counts[top]) / len(labels)
 
         best: tuple[float, float] | None = None  # (длина фасада, семейство)
         for family in candidates:
@@ -200,10 +228,13 @@ def _parcel_anchor(image) -> tuple[tuple[int, int, int, int] | None, float | Non
             nx, ny = math.cos(rad), math.sin(rad)    # поперёк улицы
             proj_l = xf * lx + yf * ly
             proj_n = xf * nx + yf * ny
-            if _side_is_street(family, proj_l, proj_n, lx, ly, nx, ny):
-                extent = float(proj_l.max() - proj_l.min())
-                if best is None or extent > best[0]:
-                    best = (extent, family)
+            for side in (-1.0, 1.0):
+                area, cover = _outside_region(family, proj_l, proj_n, lx, ly, nx, ny, side)
+                if area >= _STREET_REGION_MIN_RATIO * parcel_area and cover >= 0.5:
+                    extent = float(proj_l.max() - proj_l.min())
+                    if best is None or extent > best[0]:
+                        best = (extent, family)
+                    break
         return bbox, (best[1] if best else None)
     except Exception:  # noqa: BLE001 - якорь необязателен, падение = без якоря
         return None, None

@@ -38,9 +38,9 @@ def test_both_estimators_find_known_street_angle(theta):
     assert tensor is not None and front_street.angle_difference(tensor, theta) <= 2.0
 
 
-def _tax_map_image(theta_deg: float, size=(1100, 800)) -> Image.Image:
+def _tax_map_image(theta_deg: float, size=(1100, 800), lot_fill="white") -> Image.Image:
     """
-    Похожая на настоящую tax map картинка: серая полоса улицы, белые участки
+    Похожая на настоящую tax map картинка: серая полоса улицы, участки
     чёрными межами по обе стороны (ДВА перпендикулярных семейства линий) и
     голубой «наш» участок фасадом на улицу под углом theta к северу.
     """
@@ -67,7 +67,7 @@ def _tax_map_image(theta_deg: float, size=(1100, 800)) -> Image.Image:
             a0, a1 = i * 100, i * 100 + 100
             if side < 0 and i == 0:
                 continue  # место нашего участка
-            rect(a0, a1, near, far, fill="white", outline="black", width=3)
+            rect(a0, a1, near, far, fill=lot_fill, outline="black", width=3)
     # Наш участок: голубой, фасадом на улицу (верхняя сторона полосы).
     rect(0, 100, -195, -45, fill=(164, 227, 227), outline="black", width=3)
     return image
@@ -80,6 +80,33 @@ def test_tax_map_picks_front_street_family_not_the_cross_one(theta):
     tensor = front_street.estimate_structure_tensor(image)
     assert hough is not None and front_street.angle_difference(hough, theta) <= 3.5
     assert tensor is not None and front_street.angle_difference(tensor, theta) <= 3.5
+
+
+@pytest.mark.parametrize("theta", [35, 125])
+def test_tax_map_with_street_gray_lots_still_picks_front(theta):
+    # Живые tax map заливают участки тем же серым, что и улицу: проба
+    # яркостью «улица темнее участков» там называет улицей боковые стороны
+    # и уводит оценку на перпендикулярное семейство. Разделять должна
+    # топология: за фасадом — одна огромная область улицы, за боками —
+    # области соседних участков.
+    image = _tax_map_image(theta, lot_fill=(218, 218, 218))
+    hough = front_street.estimate_hough_lines(image)
+    tensor = front_street.estimate_structure_tensor(image)
+    assert hough is not None and front_street.angle_difference(hough, theta) <= 3.5
+    assert tensor is not None and front_street.angle_difference(tensor, theta) <= 3.5
+
+
+def test_real_staten_island_tax_map_matches_deed_frontage():
+    # Настоящий снимок портала (Staten Island, block 4252, lot 19, фронт на
+    # Reno Ave). Эталон 125° — румб фронтальной стороны из самого дида
+    # (N 55°04′10″ W). Прежняя проба яркостью давала здесь 34° (боковые
+    # межи), Vision на разных прогонах — 125° и 65°.
+    path = __file__.replace("test_front_street.py", "data/tax_map_staten_island_4252_19.jpg")
+    result = front_street.estimate_all(path)
+    assert result["python_hough_lines"] is not None
+    assert result["python_structure_tensor"] is not None
+    assert front_street.angle_difference(result["python_hough_lines"], 125.0) <= 4.0
+    assert front_street.angle_difference(result["python_structure_tensor"], 125.0) <= 4.0
 
 
 def test_real_manhattan_tax_map_matches_measured_street():

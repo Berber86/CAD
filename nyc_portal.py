@@ -1287,6 +1287,11 @@ def _parse_vision_details(data: dict[str, Any]) -> tuple[str, str, str]:
 NEIGHBOUR_RACE_PROVIDER = "hydra"
 NEIGHBOUR_RACE_MODEL = "cheap/gpt-6.1-terra"
 NEIGHBOUR_RACE_REASONING = "medium"
+#: Сколько раз каждый запрос про соседей повторяется при сбое (тайм-аут,
+#: кривой JSON, нечисловой ответ) — раньше одна неудачная попытка хоронила
+#: весь поиск адреса и задание очереди целиком.
+NEIGHBOUR_ATTEMPTS = 3
+NEIGHBOUR_RETRY_PAUSE_SEC = 2.0
 
 
 def _cfg_with_reasoning(cfg: dict[str, Any], model: str, effort: str) -> dict[str, Any]:
@@ -1404,21 +1409,39 @@ def lookup_parcel(
     )
 
     def ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg):
-        response, used = ask_llm_json(
-            VISION_SYSTEM_PROMPT,
-            neighbour_user_text,
-            leg_cfg,
-            image_data_urls=urls,
-            api_key=leg_key,
-            provider=leg_provider,
-            model=leg_model,
-            key_secret=key_secret,
-            progress=progress,
-            task_label="NYC tax map: номера соседних лотов",
-            attempts=1,
-            single_request=True,
-        )
-        return parse_neighbour_result(response), used
+        # Один сбой — не приговор: тайм-аут или кривой JSON повторяем, а не
+        # хороним весь поиск (живой случай: «Request timed out» с первой
+        # попытки убил задание очереди). Повторяет каждый участник гонки
+        # сам; гонка по-прежнему принимает первый валидный ответ.
+        last_error: Exception | None = None
+        for attempt in range(1, NEIGHBOUR_ATTEMPTS + 1):
+            try:
+                response, used = ask_llm_json(
+                    VISION_SYSTEM_PROMPT,
+                    neighbour_user_text,
+                    leg_cfg,
+                    image_data_urls=urls,
+                    api_key=leg_key,
+                    provider=leg_provider,
+                    model=leg_model,
+                    key_secret=key_secret,
+                    progress=progress,
+                    task_label="NYC tax map: номера соседних лотов",
+                    attempts=1,
+                    single_request=True,
+                )
+                return parse_neighbour_result(response), used
+            except Exception as exc:  # noqa: BLE001 - повтор важнее типа сбоя
+                last_error = exc
+                if attempt < NEIGHBOUR_ATTEMPTS:
+                    if progress:
+                        progress(
+                            f"NYC tax map: запрос про соседей к {leg_model} не удался "
+                            f"({type(exc).__name__}: {exc}); повторяю — попытка "
+                            f"{attempt + 1} из {NEIGHBOUR_ATTEMPTS}")
+                    time.sleep(NEIGHBOUR_RETRY_PAUSE_SEC * attempt)
+        assert last_error is not None  # цикл выше либо вернул, либо падал
+        raise last_error
 
     # Гонка двух нейронок: основная выбранная модель и дешёвая Hydra
     # (cheap/gpt-6.1-terra, рассуждения medium). Принимаем первый валидный

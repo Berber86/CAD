@@ -1872,6 +1872,7 @@ def test_neighbour_race_reports_when_both_models_fail(tmp_path, monkeypatch):
         raise RuntimeError("down")
 
     _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
     with pytest.raises(nyc_portal.PortalLookupError, match="Ни одна"):
         nyc_portal.lookup_parcel(
             "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG),
@@ -1962,3 +1963,76 @@ def test_neighbour_user_text_defines_sides_by_the_front_street(tmp_path, monkeyp
         "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
         model="some-model", api_key="other-key")
     assert "front street" in texts[0] and "left hand" in texts[0]
+
+
+def test_neighbour_request_retries_after_a_timeout(tmp_path, monkeypatch):
+    # Живой случай из очереди: «Request timed out» с первой попытки хоронил
+    # всё задание. Теперь запрос повторяется и поиск живёт.
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    calls = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        calls.append(kwargs["model"])
+        if len(calls) == 1:
+            raise RuntimeError("Request timed out.")
+        return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                "confidence": "high"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.delenv("HYDRA_API_KEY", raising=False)
+    monkeypatch.setattr(nyc_portal, "load_dotenv_dict", lambda: {})
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    result = nyc_portal.lookup_parcel(
+        "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
+        model="some-model", api_key="other-key")
+    assert result.neighbours == ["68", "72"]
+    assert calls == ["some-model", "some-model"]
+
+
+def test_neighbour_race_leg_retries_before_losing(tmp_path, monkeypatch):
+    import threading
+
+    usage = nyc_portal.TokenUsage(prompt_tokens=10, total_tokens=10)
+    release_main = threading.Event()
+    terra_calls = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        if kwargs["model"] == nyc_portal.NEIGHBOUR_RACE_MODEL:
+            terra_calls.append(1)
+            if len(terra_calls) == 1:
+                raise RuntimeError("Request timed out.")
+            return {"left_neighbor_lot": "68", "right_neighbor_lot": "72",
+                    "confidence": "high"}, usage
+        release_main.wait(10)
+        return {"left_neighbor_lot": "60", "right_neighbor_lot": "61",
+                "confidence": "low"}, usage
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    try:
+        result = nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg=dict(_RACE_CFG),
+            provider="hydra", model="main-model", api_key="hydra-key")
+    finally:
+        release_main.set()
+    assert result.neighbours == ["68", "72"]
+    assert result.neighbour_model.endswith(nyc_portal.NEIGHBOUR_RACE_MODEL)
+    assert len(terra_calls) == 2  # первая попытка упала, вторая выиграла гонку
+
+
+def test_neighbour_request_gives_up_only_after_all_attempts(tmp_path, monkeypatch):
+    calls = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        calls.append(1)
+        raise RuntimeError("Request timed out.")
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.delenv("HYDRA_API_KEY", raising=False)
+    monkeypatch.setattr(nyc_portal, "load_dotenv_dict", lambda: {})
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    with pytest.raises(RuntimeError, match="timed out"):
+        nyc_portal.lookup_parcel(
+            "87 Stafford Ave", tmp_path, cfg={"api": {}}, provider="openrouter",
+            model="some-model", api_key="other-key")
+    assert len(calls) == nyc_portal.NEIGHBOUR_ATTEMPTS

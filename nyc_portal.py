@@ -1292,6 +1292,11 @@ NEIGHBOUR_RACE_REASONING = "medium"
 #: весь поиск адреса и задание очереди целиком.
 NEIGHBOUR_ATTEMPTS = 3
 NEIGHBOUR_RETRY_PAUSE_SEC = 2.0
+#: Тайм-аут одного запроса к нейронкам портала (карточка и соседи), сек.
+#: Общий api.timeout_sec (500) этому шагу не подходит: ответ, который не
+#: пришёл за 180 с, дешевле запросить заново (см. NEIGHBOUR_ATTEMPTS),
+#: чем ждать дальше. Основной разбор PDF этот лимит не затрагивает.
+PORTAL_REQUEST_TIMEOUT_SEC = 180.0
 
 
 def _cfg_with_reasoning(cfg: dict[str, Any], model: str, effort: str) -> dict[str, Any]:
@@ -1361,6 +1366,7 @@ def lookup_parcel(
     request_cfg = dict(cfg)
     request_cfg["api"] = dict(cfg.get("api") or {})
     request_cfg["api"]["max_retries"] = 0
+    request_cfg["api"]["timeout_sec"] = PORTAL_REQUEST_TIMEOUT_SEC
     details_usages: list[TokenUsage] = []
 
     def read_details_vision(left_image: Path) -> tuple[str, str, str]:

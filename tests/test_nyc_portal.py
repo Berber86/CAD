@@ -1848,6 +1848,10 @@ def test_neighbour_race_accepts_the_first_valid_answer(tmp_path, monkeypatch):
     assert llm_parser.resolve_reasoning_effort(
         seen_cfg[nyc_portal.NEIGHBOUR_RACE_MODEL], provider="hydra",
         model=nyc_portal.NEIGHBOUR_RACE_MODEL) == "medium"
+    # Тайм-аут портальных запросов — 180 с у обоих участников гонки,
+    # а не общий api.timeout_sec основного разбора.
+    assert seen_cfg["main-model"]["api"]["timeout_sec"] == 180
+    assert seen_cfg[nyc_portal.NEIGHBOUR_RACE_MODEL]["api"]["timeout_sec"] == 180
 
 
 def test_neighbour_race_falls_back_when_the_fast_model_fails(tmp_path, monkeypatch):

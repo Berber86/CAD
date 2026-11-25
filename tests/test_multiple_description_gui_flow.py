@@ -305,12 +305,12 @@ def test_unlocated_scene_warns_user_without_changing_cached_requests(gui, tmp_pa
                            parse=lambda *a: answer([described('5', 55, tie=False),
                                                     described('6', 100, tie=False)]))
     submit(app, gui, tmp_path)
-    assert 'Отдельно размещено: 4' in app.status_var.get()
+    assert 'Без явной привязки к перекрёстку: 4' in app.status_var.get()
     assert calls['parse'] == 2 and calls['search'] == 2
     app._start(parse_only=True)
     smoke._wait_for_gui_worker(app)
     assert calls['parse'] == 2 and calls['search'] == 2
-    assert 'Отдельно размещено: 4' in app.status_var.get()
+    assert 'Без явной привязки к перекрёстку: 4' in app.status_var.get()
 
 
 def test_deed_row_is_placed_automatically_without_prompt(gui, tmp_path, monkeypatch):

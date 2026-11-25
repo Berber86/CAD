@@ -339,13 +339,12 @@ def _finish_batch(files: list[FileResult], sources: list[drawing.DescriptionSour
         emit(detail, f"Геометрически сопоставлено пар участков: {paired}.")
     unlocated = sum(not entry.placement_known for entry in scene.plans)
     if unlocated:
-        emit(detail, f"{unlocated} контуров без установленной привязки к перекрёстку; "
-                     "они размещены отдельно, взаимное положение не установлено. "
-                     "Перекрёсток и расстояние до него не нарисованы.")
-    fallback = sum(entry.diagnostic == 'exact_sides_fallback' for entry in scene.plans)
-    if fallback:
-        emit(detail, f"{fallback} контуров построено по исходным сторонам "
-                     "без полного оформления обычного режима.")
+        emit(detail, f"{unlocated} контуров без явной привязки к перекрёстку в описании; "
+                     "построены как в обычном режиме — проверьте их положение на схеме.")
+    partial = sum(entry.diagnostic == 'partial_description' for entry in scene.plans)
+    if partial:
+        emit(detail, f"{partial} описаний неполные: построены по известным сторонам, "
+                     "как в обычном режиме.")
     by_index = {entry.description_index: entry for entry in scene.plans}
     failures = {entry.description_index: entry.reason for entry in scene.failures}
     offset = 0

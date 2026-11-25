@@ -10122,7 +10122,8 @@ class SurveyApp(ctk.CTk):
                      if was_auto and self._auto_dwg_context is not None else "")
         if unlocated:
             self._set_status(
-                f"Подготовлено контуров: {len(view.drawable)}. Отдельно размещено: {unlocated}." + auto_note, key=True)
+                f"Подготовлено контуров: {len(view.drawable)}. Без явной привязки к перекрёстку: {unlocated} — "
+                "построены как в обычном режиме, проверьте положение." + auto_note, key=True)
         else:
             self._set_status(f"Подготовлено контуров: {len(view.drawable)}. Проверьте схему перед отрисовкой." + auto_note, key=True)
 
@@ -12919,7 +12920,9 @@ class SurveyApp(ctk.CTk):
         """Черновик для печати из основного участка: без соседей, на +1000 по X."""
         if getattr(self, "_multi_scene_handoff", None) is not None:
             from multiple_description_drawing import make_scene_print_drafts
-            result = make_scene_print_drafts(self._multi_scene_handoff.scene, builder_cfg=self.config_data)
+            print_cfg = dict((self.config_data or {}).get("print_draft") or {})
+            result = make_scene_print_drafts(
+                self._multi_scene_handoff.scene, builder_cfg=self.config_data, print_cfg=print_cfg)
             return [(f"Черновик для печати: #{index}", plan) for index, plan in enumerate(result.plans, 1)]
         main = self._preview_main_plan
         if main is None or main.is_neighbor:

@@ -416,7 +416,7 @@ def test_unlocated_placement_is_reported_to_user(tmp_path):
                                search_api_key='router', send=lambda *a: answer([described('5', 55, tie=False)]),
                                choose=None, search_send=searcher, detail=messages.append)
     assert not result.scene.plans[0].placement_known
-    assert any('без установленной привязки' in message and 'размещены отдельно' in message
+    assert any('без явной привязки' in message and 'как в обычном режиме' in message
                for message in messages)
 
 

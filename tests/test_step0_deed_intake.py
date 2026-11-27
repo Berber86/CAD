@@ -952,3 +952,31 @@ def test_browser_doctor_reports_window_titles():
     rcclerk.browser_doctor("42", emit=lines.append, windows_fn=lambda: windows)
     joined = "\n".join(lines)
     assert "Cloudflare" in joined and "PDF" in joined
+
+
+def test_download_with_fallback_skips_prior_rcc_pdf_left_in_downloads(tmp_path):
+    """Документ №2 в серии (<1 с после документа №1) не должен подхватить чужой RCC-*.pdf."""
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    prior_pdf = downloads / "RCC-1712449-143758-5538.pdf"
+    prior_pdf.write_bytes(b"%PDF-1.7 prior-doc")
+
+    # Document 2 hasn't written its own PDF yet: must NOT grab prior_pdf even though mtime is <1s old!
+    with pytest.raises(rcclerk.ManualStepNeeded):
+        rcclerk.download_with_fallback(
+            "1799244", tmp_path / "doc2.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda url: None,
+            downloads_dir=downloads, watch_timeout=0.15, poll=0.05,
+        )
+
+    # When doc 2's own Adobe/Chrome download finishes after open_browser, it IS adopted.
+    path, rung = rcclerk.download_with_fallback(
+        "1799244", tmp_path / "doc2.pdf",
+        opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+        open_browser=lambda _url: (downloads / "RCC-1799244-143758-5538.pdf").write_bytes(b"%PDF-1.7 doc2"),
+        downloads_dir=downloads, watch_timeout=1.0, poll=0.05,
+    )
+    assert rung == "browser"
+    assert path.read_bytes() == b"%PDF-1.7 doc2"
+

@@ -102,6 +102,9 @@ SAVE_DIALOG_MARKS = (
 WEBPAGE_SAVE_MARKS = (
     "веб-страница", "вебстраница", "один файл", "webpage", "web page",
     "mhtml", "web archive", "веб-архив", "только html", "html only",
+    # RapidOCR (ch_PP-OCRv4) reads Russian Cyrillic UI text as Latin homoglyphs
+    # (e.g. "редактирование" -> "peAaKTMpoBaHMe", "Веб-страница, один файл" -> "be6-cTpaHHLa, oAHH oaNn").
+    "be6-", "beb-", "be6c", "ctpah", "ctpahn", "ctpahm", "oahh", "oann", "nonhoct",
 )
 _SAVE_NOTE_LOCK = threading.Lock()
 _LAST_SAVE_NOTE = ""
@@ -1037,6 +1040,173 @@ def _is_pdf_file(path: Path) -> bool:
         return False
 
 
+_WEBPAGE_PAYLOAD_PREFIXES = (
+    b"from:",
+    b"mime-version:",
+    b"content-type:",
+    b"subject:",
+    b"<!doctype",
+    b"<html",
+    b"<head",
+    b"<script",
+    b"<?xml",
+)
+
+
+def _is_non_pdf_webpage_file(path: Path) -> bool:
+    """True when a saved file is HTML/MHTML rather than a real %PDF- payload."""
+    try:
+        if not path.is_file():
+            return False
+        with path.open("rb") as handle:
+            head = handle.read(512)
+        if head.startswith(b"%PDF-"):
+            return False
+        stripped = head.lstrip().lower()
+        return any(stripped.startswith(prefix) for prefix in _WEBPAGE_PAYLOAD_PREFIXES)
+    except OSError:
+        return False
+
+
+def _is_download_arrow_cluster(img, x0: int, x1: int, y0: int, y1: int) -> bool:
+    """Match the downward-arrow-into-tray (↓) Adobe Acrobat toolbar icon."""
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    if width < 10 or height < 12:
+        return False
+    icon_rows: list[tuple[int, list[int]]] = []
+    for y in range(y0, y1 + 1):
+        xs = [x for x in range(x0, x1 + 1) if sum(img.getpixel((x, y))[:3]) < 500]
+        if xs:
+            icon_rows.append((y, xs))
+    if len(icon_rows) < 10:
+        return False
+    iy0, iy1 = icon_rows[0][0], icon_rows[-1][0]
+    ih = iy1 - iy0 + 1
+    if ih < 10:
+        return False
+    top_limit = iy0 + max(2, int(ih * 0.30))
+    top_widths = [len(xs) for y, xs in icon_rows if y <= top_limit]
+    if not top_widths or max(top_widths) > max(4, int(width * 0.35)):
+        return False
+    bot_start = iy1 - max(2, int(ih * 0.25))
+    bot_widths = [max(xs) - min(xs) + 1 for y, xs in icon_rows if y >= bot_start]
+    if not bot_widths or max(bot_widths) < int(width * 0.70):
+        return False
+    return True
+
+
+def find_adobe_download_point(image) -> tuple[int, int] | None:
+    """Return window-relative (x, y) of Adobe Acrobat Chrome viewer's Download (↓) icon."""
+    try:
+        rgb = image.convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+    w, h = rgb.size
+    if w < 600 or h < 300:
+        return None
+    y_min, y_max = int(h * 0.06), int(h * 0.24)
+    x_min, x_max = int(w * 0.62), int(w * 0.99)
+
+    def _is_dark(px: tuple[int, int, int]) -> bool:
+        return px[0] < 80 and px[1] < 80 and px[2] < 80
+
+    lip_rows: list[tuple[int, int, int]] = []
+    for y in range(y_min, y_max):
+        run = 0
+        best_run = (0, 0, 0)
+        start = 0
+        for x in range(x_min, x_max):
+            if _is_dark(rgb.getpixel((x, y))[:3]):
+                if run == 0:
+                    start = x
+                run += 1
+                if run > best_run[0]:
+                    best_run = (run, start, x)
+            else:
+                run = 0
+        if 55 <= best_run[0] <= 280:
+            lip_rows.append((y, best_run[1], best_run[2]))
+    if not lip_rows:
+        return None
+
+    for seed_y, seed_l, seed_r in lip_rows:
+        mid_x = (seed_l + seed_r) // 2
+        if min(rgb.getpixel((mid_x, max(0, seed_y - 4)))[:3]) < 200:
+            continue
+        probe_l = min(seed_r, seed_l + 6)
+        probe_r = max(seed_l, seed_r - 6)
+        y0 = seed_y
+        while y0 > y_min and (
+            _is_dark(rgb.getpixel((probe_l, y0 - 1))[:3])
+            or _is_dark(rgb.getpixel((probe_r, y0 - 1))[:3])
+        ):
+            y0 -= 1
+        y1 = seed_y
+        while y1 < y_max and (
+            _is_dark(rgb.getpixel((probe_l, y1 + 1))[:3])
+            or _is_dark(rgb.getpixel((probe_r, y1 + 1))[:3])
+        ):
+            y1 += 1
+        pill_h = y1 - y0 + 1
+        if not (16 <= pill_h <= 64):
+            continue
+        pill_left = seed_l
+        for yy in range(y0 + 2, y1 - 1):
+            x = pill_left
+            while x > x_min and _is_dark(rgb.getpixel((x - 1, yy))[:3]):
+                x -= 1
+            pill_left = min(pill_left, x)
+        if min(rgb.getpixel((mid_x, min(h - 1, y1 + 4)))[:3]) < 200:
+            continue
+        red_pixels = sum(
+            1 for y in range(y0, y1 + 1) for x in range(0, min(120, w))
+            if (px := rgb.getpixel((x, y)))[0] > 180 and px[1] < 80 and px[2] < 80
+        )
+        if red_pixels < 25:
+            continue
+        pill_cy = (y0 + y1) // 2
+        scan_left = max(0, pill_left - int(pill_h * 5.5))
+        cols = [
+            x for x in range(scan_left, pill_left - 6)
+            if any(sum(rgb.getpixel((x, y))[:3]) < 450 for y in range(y0 + 4, y1 - 3))
+        ]
+        clusters: list[list[int]] = []
+        gap = max(5, int(pill_h * 0.25))
+        for x in cols:
+            if not clusters or x > clusters[-1][1] + gap:
+                clusters.append([x, x])
+            else:
+                clusters[-1][1] = x
+        for cluster in reversed(clusters):
+            if _is_download_arrow_cluster(rgb, cluster[0], cluster[1], y0 + 3, y1 - 3):
+                return ((cluster[0] + cluster[1]) // 2, pill_cy)
+    return None
+
+
+def _try_click_adobe_download(handle: int) -> tuple[int, int] | None:
+    """Click Adobe Acrobat Chrome viewer's ↓ Download button when visible."""
+    if not handle or os.name != "nt":
+        return None
+    bounds = window_bounds(handle)
+    if bounds is None:
+        return None
+    try:
+        from PIL import ImageGrab
+
+        image = ImageGrab.grab(bbox=bounds, all_screens=True)
+    except Exception:  # noqa: BLE001
+        return None
+    rel = find_adobe_download_point(image)
+    if rel is None:
+        return None
+    abs_x = int(bounds[0] + rel[0])
+    abs_y = int(bounds[1] + rel[1])
+    if click_browser_window(handle, abs_x, abs_y):
+        return (abs_x, abs_y)
+    return None
+
+
 def _save_dialog_ocr_text(handle: int) -> str:
     """Best-effort OCR of the lower half of an open Save As dialog (Type dropdown)."""
     if not handle or os.name != "nt":
@@ -1168,16 +1338,23 @@ def save_pdf_if_possible(
     dialog_open_fn: Optional[Callable[[], bool]] = None,
     type_text_fn: Optional[Callable[[str], bool]] = None,
     press_enter_fn: Optional[Callable[[], bool]] = None,
+    adobe_download_fn: Optional[Callable[[int], object]] = None,
     sleep: Callable[[float], None] = time.sleep,
     wait: float = 0.8,
     require_pdf_title: bool = True,
     preferred: Optional[object] = None,
 ) -> Optional[Path]:
-    """Одна безопасная попытка Ctrl+S только в уже загруженном PDF браузера."""
+    """Одна безопасная попытка скачивания только в уже загруженном PDF браузера."""
     _set_last_save_note("")
     destination = Path(target)
-    if destination.is_file() and _is_pdf_file(destination):
-        return destination
+    if destination.is_file():
+        if _is_pdf_file(destination):
+            return destination
+        if _is_non_pdf_webpage_file(destination):
+            try:
+                destination.unlink()
+            except OSError:
+                pass
     try:
         candidate = find_pdf_browser_window((windows or list_windows)(),
                                             require_title=require_pdf_title,
@@ -1194,55 +1371,119 @@ def save_pdf_if_possible(
     active_handle = active_handle_fn or active_window_handle
     if int(active_handle()) != int(candidate.handle):
         return None
-    press = press_ctrl_s_fn or press_ctrl_s
-    if not press():
-        return None
+
+    adobe_fn = adobe_download_fn
+    if adobe_fn is None and press_ctrl_s_fn is None and dialog_open_fn is None and os.name == "nt":
+        adobe_fn = _try_click_adobe_download
+
+    clicked_adobe = False
+    if adobe_fn is not None:
+        try:
+            clicked_adobe = bool(adobe_fn(candidate.handle))
+        except Exception:  # noqa: BLE001
+            clicked_adobe = False
+
+    if clicked_adobe:
+        _set_last_save_note(
+            "в окне Adobe Acrobat нажата кнопка скачивания (↓) вместо Ctrl+S"
+        )
+    else:
+        press = press_ctrl_s_fn or press_ctrl_s
+        if not press():
+            return None
 
     dialog_open = dialog_open_fn or (lambda: looks_like_save_dialog(active_window_title()))
-    opened_dialog = False
     open_budget = max(float(wait), 2.5)
     step = 0.15
     checks = max(1, int(round(open_budget / step)))
     first_pause = min(float(wait), step) if float(wait) > 0 else 0.0
-    for idx in range(checks):
-        sleep(first_pause if idx == 0 else step)
-        if destination.is_file() and _is_pdf_file(destination):
-            return destination
-        try:
-            if dialog_open():
-                opened_dialog = True
-                break
-        except Exception:  # noqa: BLE001
-            pass
-    if not opened_dialog:
-        return None
-
-    if dialog_open_fn is None and save_dialog_is_webpage():
-        press_escape()
-        _set_last_save_note(
-            "Chrome открыл «Сохранение» как веб-страницу («Веб-страница, один файл») "
-            "вместо PDF — отключите расширение Adobe Acrobat в Chrome («Защита файла PDF») "
-            "или включите «Скачивать PDF-файлы» в настройках Chrome; диалог закрыт."
-        )
-        return None
-
-    if dialog_open_fn is None:
-        press_ctrl_a()
     write = type_text_fn or type_text
     enter = press_enter_fn or press_enter
-    if not write(str(destination)):
-        return None
-    sleep(0.2)
-    if not enter():
-        return None
 
-    save_budget = max(float(wait), 2.5)
-    save_checks = max(1, int(round(save_budget / step)))
-    for _ in range(save_checks):
-        sleep(step)
+    def _await_dialog_and_save() -> tuple[Optional[Path], str]:
+        opened_dialog = False
+        for idx in range(checks):
+            sleep(first_pause if idx == 0 else step)
+            if destination.is_file() and _is_pdf_file(destination):
+                _set_last_save_note("")
+                return destination, "ok"
+            if destination.is_file() and _is_non_pdf_webpage_file(destination):
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                return None, "mhtml"
+            try:
+                if dialog_open():
+                    opened_dialog = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        if not opened_dialog:
+            return None, "no_dialog"
+
+        if dialog_open_fn is None and save_dialog_is_webpage():
+            press_escape()
+            _set_last_save_note(
+                "Chrome открыл «Сохранение» как веб-страницу («Веб-страница, один файл») "
+                "вместо PDF — отключите расширение Adobe Acrobat в Chrome («Защита файла PDF») "
+                "или включите «Скачивать PDF-файлы» в настройках Chrome; диалог закрыт."
+            )
+            return None, "webpage"
+
+        if dialog_open_fn is None:
+            press_ctrl_a()
+        if not write(str(destination)):
+            return None, "write_failed"
+        sleep(0.2)
+        if not enter():
+            return None, "enter_failed"
+
+        save_budget = max(float(wait), 2.5)
+        save_checks = max(1, int(round(save_budget / step)))
+        for _ in range(save_checks):
+            sleep(step)
+            if destination.is_file() and _is_pdf_file(destination):
+                _set_last_save_note("")
+                return destination, "ok"
+            if destination.is_file() and _is_non_pdf_webpage_file(destination):
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                return None, "mhtml"
         if destination.is_file() and _is_pdf_file(destination):
-            return destination
-    return destination if (destination.is_file() and _is_pdf_file(destination)) else None
+            _set_last_save_note("")
+            return destination, "ok"
+        if destination.is_file() and _is_non_pdf_webpage_file(destination):
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            return None, "mhtml"
+        return None, "timeout"
+
+    saved_path, outcome = _await_dialog_and_save()
+    if saved_path is not None:
+        return saved_path
+    if outcome == "mhtml":
+        if not clicked_adobe and adobe_fn is not None and bring(candidate.handle):
+            try:
+                if adobe_fn(candidate.handle):
+                    _set_last_save_note(
+                        "Chrome сохранил веб-страницу (MHTML) по Ctrl+S — удалена и нажата кнопка скачивания (↓) в Adobe Acrobat"
+                    )
+                    retry_path, _ = _await_dialog_and_save()
+                    if retry_path is not None:
+                        return retry_path
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
+        _set_last_save_note(
+            "Chrome сохранил веб-страницу (MHTML) вместо PDF — проверьте расширение Adobe Acrobat / настройки PDF в Chrome."
+        )
+        return None
+    return None
 
 
 def auto_save_hook(

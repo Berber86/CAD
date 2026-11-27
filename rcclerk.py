@@ -553,7 +553,30 @@ def _is_pdf_file(path: Path) -> bool:
         return False
 
 
-def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[Path]:
+def _pdf_snapshot(folder: str | Path) -> dict[Path, tuple[int, int]]:
+    """Снимок уже лежащих в папке PDF: ``resolved_path -> (mtime_ns, size)``."""
+    snapshot: dict[Path, tuple[int, int]] = {}
+    try:
+        paths = list(Path(folder).glob("*.pdf"))
+    except OSError:
+        return snapshot
+    for path in paths:
+        if path.suffix.lower() in PARTIAL_SUFFIXES:
+            continue
+        try:
+            st = path.stat()
+            snapshot[path.resolve()] = (int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            continue
+    return snapshot
+
+
+def find_new_pdf(
+    folder: str | Path,
+    *,
+    since: float | None = None,
+    ignore_snapshot: dict[Path, tuple[int, int]] | None = None,
+) -> Optional[Path]:
     """
     Самый свежий готовый PDF в папке, появившийся после ``since`` (время в секундах).
 
@@ -569,9 +592,17 @@ def find_new_pdf(folder: str | Path, *, since: float | None = None) -> Optional[
         if path.suffix.lower() in PARTIAL_SUFFIXES:
             continue
         try:
-            mtime = path.stat().st_mtime
+            st = path.stat()
+            mtime = st.st_mtime
         except OSError:
             continue
+        if ignore_snapshot is not None:
+            try:
+                prev = ignore_snapshot.get(path.resolve())
+            except OSError:
+                prev = None
+            if prev == (int(st.st_mtime_ns), int(st.st_size)):
+                continue
         if since is not None and mtime < since:
             continue
         candidates.append((mtime, path))
@@ -692,6 +723,15 @@ def browser_doctor(endorsement_id: int | str, *, folder: str | Path | None = Non
                 _save_window_capture(window.handle, shot)
                 note(f"доктор: снимок окна браузера: {shot}")
                 try:
+                    from PIL import Image
+
+                    with Image.open(shot) as shot_img:
+                        adobe_pt = browser_save.find_adobe_download_point(shot_img)
+                    if adobe_pt is not None:
+                        note(f"доктор: активен просмотрщик Adobe Acrobat (кнопка скачивания ↓ на {adobe_pt})")
+                except Exception:  # noqa: BLE001 - диагностика необязательна
+                    pass
+                try:
                     rows = _screen_ocr_region(shot, (0.0, 0.0, 1.0, 1.0))
                     texts = [row.text.strip() for row in rows if row.text.strip()]
                     if texts:
@@ -782,7 +822,10 @@ def download_with_fallback(
             prepare_save(endorsement_id)
         except Exception:  # noqa: BLE001 - безопасность важнее необязательной автоматики
             pass
-    # Небольшой запас: время файла может оказаться чуть раньше времени открытия.
+    # Небольшой запас: время файла может оказаться чуть раньше времени открытия,
+    # но файлы, уже лежавшие в «Загрузках» до открытия текущей ссылки, не берём
+    # повторно (например RCC-*.pdf от предыдущего документа в той же серии).
+    seen_before = _pdf_snapshot(folder)
     since = time.time() - 1.0
     try:
         open_it(url)
@@ -803,7 +846,7 @@ def download_with_fallback(
         deadline = time.monotonic() + max(0.0, float(seconds))
         while True:
             check_stop()
-            found = find_new_pdf(folder, since=since)
+            found = find_new_pdf(folder, since=since, ignore_snapshot=seen_before)
             if found is not None:
                 shutil.copyfile(found, target)
                 _drop_our_pending(found, folder)

@@ -861,3 +861,130 @@ def test_foreground_switches_to_target_window_when_same_browser_has_two_titled_w
     assert browser_save.foreground(10, timeout=0.1)
     assert ("activate", 10) in calls
 
+
+def _make_adobe_toolbar_image():
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (1616, 876), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    # Gray document viewport below the toolbar (y >= 155)
+    draw.rectangle((0, 155, 1615, 875), fill=(235, 235, 235))
+    # Red Adobe Acrobat badge on left of toolbar (y = 107..138)
+    draw.rectangle((16, 111, 34, 134), fill=(220, 35, 35))
+    # Dark "Общий доступ" / "Share" pill on right of toolbar (y = 107..138, x = 1426..1546)
+    draw.rectangle((1426, 107, 1546, 138), fill=(44, 44, 44))
+    # Printer icon at x = 1351..1368 (wide top paper + wide bottom)
+    draw.rectangle((1353, 115, 1366, 118), fill=(50, 50, 50))
+    draw.rectangle((1351, 118, 1368, 127), fill=(50, 50, 50))
+    draw.rectangle((1353, 128, 1366, 130), fill=(50, 50, 50))
+    # Download arrow (↓) into tray at x = 1316..1331, y = 115..128 (center ≈ (1323, 122))
+    draw.rectangle((1323, 115, 1324, 124), fill=(50, 50, 50))  # narrow top shaft
+    draw.polygon([(1319, 121), (1328, 121), (1323, 125)], fill=(50, 50, 50))  # arrowhead
+    draw.rectangle((1316, 124, 1317, 128), fill=(50, 50, 50))  # left tray wall
+    draw.rectangle((1330, 124, 1331, 128), fill=(50, 50, 50))  # right tray wall
+    draw.rectangle((1316, 127, 1331, 128), fill=(50, 50, 50))  # bottom tray bar
+    return img
+
+
+def test_find_adobe_download_point_detects_toolbar_and_ignores_plain_pages():
+    from PIL import Image
+
+    adobe_img = _make_adobe_toolbar_image()
+    pt = browser_save.find_adobe_download_point(adobe_img)
+    assert pt is not None
+    assert 1316 <= pt[0] <= 1331
+    assert 115 <= pt[1] <= 130
+
+    # Plain webpage without Adobe toolbar must return None
+    plain = Image.new("RGB", (1616, 876), (255, 255, 255))
+    assert browser_save.find_adobe_download_point(plain) is None
+
+
+def test_save_pdf_prefers_adobe_download_button_over_ctrl_s(tmp_path):
+    target = tmp_path / "tsai_step0_1799244.pdf"
+    calls: list[object] = []
+
+    # Case 1: Chrome auto-downloads RCC-*.pdf (no Save dialog) after clicking ↓ ->
+    # save_pdf_if_possible must NOT send Ctrl+S and leaves an informative note.
+    res = browser_save.save_pdf_if_possible(
+        target,
+        windows=lambda: [BrowserWindow(10, "viewer.pdf - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")],
+        foreground_fn=lambda _h: True,
+        active_handle_fn=lambda: 10,
+        press_ctrl_s_fn=lambda: calls.append("ctrl+s") or True,
+        dialog_open_fn=lambda: False,
+        adobe_download_fn=lambda h: calls.append(("adobe", h)) or (1323, 122),
+        sleep=lambda _s: None,
+    )
+    assert res is None
+    assert calls == [("adobe", 10)]
+    assert "Adobe Acrobat" in browser_save.last_save_note()
+
+    # Case 2: Ask-where-to-save is ON, so clicking ↓ opens Save As -> confirmed cleanly.
+    calls.clear()
+    res2 = browser_save.save_pdf_if_possible(
+        target,
+        windows=lambda: [BrowserWindow(10, "viewer.pdf - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")],
+        foreground_fn=lambda _h: True,
+        active_handle_fn=lambda: 10,
+        press_ctrl_s_fn=lambda: calls.append("ctrl+s") or True,
+        dialog_open_fn=lambda: True,
+        type_text_fn=lambda p: Path(p).write_bytes(b"%PDF-1.7 real") or True,
+        press_enter_fn=lambda: True,
+        adobe_download_fn=lambda h: calls.append(("adobe", h)) or (1323, 122),
+        sleep=lambda _s: None,
+    )
+    assert res2 == target
+    assert calls == [("adobe", 10)]
+
+
+def test_save_pdf_unlinks_mhtml_webpage_payload_and_falls_back_to_adobe(tmp_path):
+    target = tmp_path / "tsai_step0_1712449.pdf"
+    events: list[object] = []
+    adobe_calls = {"n": 0}
+
+    def fake_adobe(handle: int):
+        adobe_calls["n"] += 1
+        events.append(("adobe", handle))
+        if adobe_calls["n"] == 1:
+            return None  # Pretend pre-Ctrl+S Adobe toolbar was missed once
+        return (1323, 122)
+
+    dialog_checks = {"n": 0}
+
+    def fake_dialog():
+        dialog_checks["n"] += 1
+        # Open on Ctrl+S (checks 1), closed/no second Save dialog after Adobe ↓ click
+        return dialog_checks["n"] == 1
+
+    def write_mhtml(value: str) -> bool:
+        events.append(("write", value))
+        Path(value).write_text("From: <Saved by Blink>\n<html></html>", encoding="utf-8")
+        return True
+
+    res = browser_save.save_pdf_if_possible(
+        target,
+        windows=lambda: [BrowserWindow(10, "viewer.pdf - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")],
+        foreground_fn=lambda _h: True,
+        active_handle_fn=lambda: 10,
+        press_ctrl_s_fn=lambda: events.append("ctrl+s") or True,
+        dialog_open_fn=fake_dialog,
+        type_text_fn=write_mhtml,
+        press_enter_fn=lambda: True,
+        adobe_download_fn=fake_adobe,
+        sleep=lambda _s: None,
+    )
+    assert res is None
+    assert not target.exists()  # Fake MHTML named .pdf must be cleaned up!
+    assert adobe_calls["n"] == 2
+    assert "MHTML" in browser_save.last_save_note()
+
+
+def test_text_indicates_webpage_save_matches_rapidocr_homoglyphs():
+    assert browser_save._text_indicates_webpage_save("Веб-страница, один файл")
+    assert browser_save._text_indicates_webpage_save("Webpage, Single File (*.mhtml)")
+    assert browser_save._text_indicates_webpage_save("be6-cTpaHHLa, oAHH oaNn")
+    assert not browser_save._text_indicates_webpage_save("Документ PDF (*.pdf)")
+    assert not browser_save._text_indicates_webpage_save("Adobe Acrobat Document (*.pdf)")
+
+

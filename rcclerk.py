@@ -842,6 +842,14 @@ def download_with_fallback(
         f"пока проверка идёт, автоматика вкладку не трогает"
     )
 
+    def _cleanup_save() -> None:
+        cleanup_fn = getattr(auto_save, "cleanup", None)
+        if callable(cleanup_fn):
+            try:
+                cleanup_fn(endorsement_id)
+            except Exception:  # noqa: BLE001 - очистка не должна ломать ручной шаг/остановку
+                pass
+
     def wait_wave(seconds: float) -> Optional[tuple[Path, str]]:
         deadline = time.monotonic() + max(0.0, float(seconds))
         while True:
@@ -867,33 +875,37 @@ def download_with_fallback(
                 return None
             time.sleep(max(0.05, float(poll)))
 
-    result = wait_wave(watch_timeout)
-    if result is not None:
-        return result
-    doctor_note = ""
-    if prompt_operator is not None:
-        # Вторая волна: сначала «доктор» вслух говорит, что видит автоматика
-        # (окна, заголовки, снимок, OCR экрана), затем ждём ещё — человек
-        # успевает пройти капчу, а просмотрщик с незнакомым заголовком
-        # получает слепую попытку Ctrl+S от хука.
-        second = min(float(watch_timeout), 60.0)
-        step(f"первая волна ({int(watch_timeout)} с) пуста — зову «доктора» браузера "
-             f"и жду ещё {int(second)} с")
-        try:
-            prompt_operator(endorsement_id)
-        except Exception:  # noqa: BLE001 - диагностика не ломает ожидание
-            pass
-        if auto_save is not None:
-            state_fn = getattr(auto_save, "state", None)
-            if callable(state_fn):
-                try:
-                    doctor_note = f" Автоматика браузера докладывает: {state_fn(endorsement_id)}."
-                    step(doctor_note.strip())
-                except Exception:  # noqa: BLE001
-                    doctor_note = ""
-        result = wait_wave(second)
+    try:
+        result = wait_wave(watch_timeout)
         if result is not None:
             return result
+        doctor_note = ""
+        if prompt_operator is not None:
+            # Вторая волна: сначала «доктор» вслух говорит, что видит автоматика
+            # (окна, заголовки, снимок, OCR экрана), затем ждём ещё — человек
+            # успевает пройти капчу, а просмотрщик с незнакомым заголовком
+            # получает слепую попытку Ctrl+S от хука.
+            second = min(float(watch_timeout), 60.0)
+            step(f"первая волна ({int(watch_timeout)} с) пуста — зову «доктора» браузера "
+                 f"и жду ещё {int(second)} с")
+            try:
+                prompt_operator(endorsement_id)
+            except Exception:  # noqa: BLE001 - диагностика не ломает ожидание
+                pass
+            if auto_save is not None:
+                state_fn = getattr(auto_save, "state", None)
+                if callable(state_fn):
+                    try:
+                        doctor_note = f" Автоматика браузера докладывает: {state_fn(endorsement_id)}."
+                        step(doctor_note.strip())
+                    except Exception:  # noqa: BLE001
+                        doctor_note = ""
+            result = wait_wave(second)
+            if result is not None:
+                return result
+    except DownloadStopped:
+        _cleanup_save()
+        raise
     # Аварийный снимок окна браузера в папку задания: без него не видно, что
     # было на экране вместо скачивания (капча, не та страница, зависший
     # просмотрщик). Сбой снимка ручной шаг не отменяет.
@@ -913,6 +925,7 @@ def download_with_fallback(
                 doctor_note = f" Автоматика браузера докладывает: {state_fn(endorsement_id)}."
             except Exception:  # noqa: BLE001
                 doctor_note = ""
+    _cleanup_save()
     raise ManualStepNeeded(
         f"PDF не появился в «{folder}» за {int(watch_timeout)} с ожидания"
         f"{' плюс вторая волна после «доктора»' if prompt_operator is not None else ''}. "

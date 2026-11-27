@@ -980,3 +980,56 @@ def test_download_with_fallback_skips_prior_rcc_pdf_left_in_downloads(tmp_path):
     assert rung == "browser"
     assert path.read_bytes() == b"%PDF-1.7 doc2"
 
+
+def test_download_with_fallback_calls_auto_save_cleanup_after_failure_shot(tmp_path):
+    """Аварийный снимок снимается ДО cleanup (чтобы видеть зависший диалог), а потом диалог закрывается."""
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    timeline: list[tuple[str, str]] = []
+
+    def hook(_eid):
+        return None
+
+    hook.before_open = lambda eid: timeline.append(("before_open", str(eid)))
+    hook.state = lambda _eid: "диалог «Сохранение» завис"
+    hook.cleanup = lambda eid: timeline.append(("cleanup", str(eid)))
+
+    def fake_shot(_shot_dir, eid):
+        timeline.append(("shot", str(eid)))
+        return " Снимок экрана: fail.png."
+
+    with pytest.raises(rcclerk.ManualStepNeeded):
+        rcclerk.download_with_fallback(
+            "591091", tmp_path / "out.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda _url: None,
+            downloads_dir=downloads, watch_timeout=0.08, poll=0.03,
+            auto_save=hook, shot_fn=fake_shot,
+        )
+    assert timeline == [
+        ("before_open", "591091"),
+        ("shot", "591091"),
+        ("cleanup", "591091"),
+    ]
+
+    # Same cleanup on user stop (DownloadStopped)
+    timeline.clear()
+    stop_calls = {"n": 0}
+
+    def stop_on_second():
+        stop_calls["n"] += 1
+        return stop_calls["n"] >= 2
+
+    with pytest.raises(rcclerk.DownloadStopped):
+        rcclerk.download_with_fallback(
+            "2559052", tmp_path / "out2.pdf",
+            opener=lambda request, timeout=0: _Response(b"<html>Just a moment...</html>", "text/html"),
+            open_browser=lambda _url: None,
+            downloads_dir=downloads, watch_timeout=1.0, poll=0.03,
+            auto_save=hook, should_stop=stop_on_second,
+        )
+    assert timeline == [
+        ("before_open", "2559052"),
+        ("cleanup", "2559052"),
+    ]
+

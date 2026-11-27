@@ -988,3 +988,186 @@ def test_text_indicates_webpage_save_matches_rapidocr_homoglyphs():
     assert not browser_save._text_indicates_webpage_save("Adobe Acrobat Document (*.pdf)")
 
 
+def test_find_adobe_download_point_matches_modal_dimmed_toolbar():
+    from PIL import Image, ImageDraw
+
+    # Modal-dimmed Adobe Acrobat window behind a Windows Save As dialog (exact
+    # palette observed on 2559052: toolbar white dimmed to ~153, red icon ~150,
+    # dark "Общий доступ" pill ~26, icons ~30).
+    img = Image.new("RGB", (1616, 876), (153, 153, 153))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 155, 1615, 875), fill=(140, 140, 140))
+    draw.rectangle((16, 111, 34, 134), fill=(150, 40, 35))
+    draw.rectangle((1426, 107, 1546, 138), fill=(26, 26, 26))
+    draw.rectangle((1353, 115, 1366, 118), fill=(30, 30, 30))
+    draw.rectangle((1351, 118, 1368, 127), fill=(30, 30, 30))
+    draw.rectangle((1353, 128, 1366, 130), fill=(30, 30, 30))
+    draw.rectangle((1323, 115, 1324, 124), fill=(30, 30, 30))
+    draw.polygon([(1319, 121), (1328, 121), (1323, 125)], fill=(30, 30, 30))
+    draw.rectangle((1316, 124, 1317, 128), fill=(30, 30, 30))
+    draw.rectangle((1330, 124, 1331, 128), fill=(30, 30, 30))
+    draw.rectangle((1316, 127, 1331, 128), fill=(30, 30, 30))
+
+    pt = browser_save.find_adobe_download_point(img)
+    assert pt is not None
+    assert 1316 <= pt[0] <= 1331
+    assert 115 <= pt[1] <= 130
+
+
+def test_confirm_open_save_dialog_focuses_unfocused_same_browser_dialog(tmp_path):
+    target = tmp_path / "tsai_step0_591091.pdf"
+    chrome_win = BrowserWindow(10, "viewer - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")
+    save_win = BrowserWindow(20, "Сохранение", "chrome.exe", r"C:\Chrome\chrome.exe")
+    events: list[object] = []
+
+    def fake_fg(hwnd: int) -> bool:
+        events.append(("fg", hwnd))
+        return True
+
+    def fake_type(text: str) -> bool:
+        events.append(("type", text))
+        Path(text).write_bytes(b"%PDF-1.7 real")
+        return True
+
+    res = browser_save.confirm_open_save_dialog(
+        10,
+        target=target,
+        seen_dialogs=set(),
+        active_handle_fn=lambda: 10,  # Chrome main tab is focused, Save As modal is NOT
+        active_title_fn=lambda: chrome_win.title,
+        is_webpage_fn=lambda _h: False,
+        press_ctrl_a_fn=lambda: events.append("ctrl+a") or True,
+        type_text_fn=fake_type,
+        press_enter_fn=lambda: events.append("enter") or True,
+        windows_fn=lambda: [chrome_win, save_win],
+        foreground_fn=fake_fg,
+    )
+    assert res == "confirmed"
+    assert ("fg", 20) in events
+    assert ("type", str(target)) in events
+    assert target.read_bytes() == b"%PDF-1.7 real"
+
+
+def test_type_text_uses_sendinput_utf16_for_cyrillic_and_falls_back(monkeypatch):
+    sent_units: list[tuple[int, int]] = []
+
+    class FakeSendInput:
+        def __call__(self, count, inputs, _size):
+            for idx in range(count):
+                sent_units.append((int(inputs[idx].ki.wScan), int(inputs[idx].ki.dwFlags)))
+            return count
+
+    class User32WithSendInput:
+        SendInput = FakeSendInput()
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32WithSendInput())
+    sample = r"C:\Users\Николай\Загрузки\doc.pdf"
+    assert browser_save.type_text(sample)
+    raw = sample.encode("utf-16-le")
+    expected_units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    assert [u for u, flags in sent_units if flags == browser_save.KEYEVENTF_UNICODE] == expected_units
+    assert any(u > 255 for u, _ in sent_units)  # Cyrillic units NOT truncated to 8-bit BYTE
+
+    # Legacy fallback when SendInput attribute is absent
+    legacy_calls: list[tuple[int, int, int]] = []
+
+    class User32Legacy:
+        def keybd_event(self, vk, scan, flags, _extra):
+            legacy_calls.append((vk, scan, flags))
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32Legacy())
+    assert browser_save.type_text("ab")
+    assert legacy_calls == [
+        (0, ord("a"), browser_save.KEYEVENTF_UNICODE),
+        (0, ord("a"), browser_save.KEYEVENTF_UNICODE | browser_save.KEYEVENTF_KEYUP),
+        (0, ord("b"), browser_save.KEYEVENTF_UNICODE),
+        (0, ord("b"), browser_save.KEYEVENTF_UNICODE | browser_save.KEYEVENTF_KEYUP),
+    ]
+
+
+def test_click_browser_window_verify_active_after_flag(monkeypatch):
+    class FakeUser32:
+        def SetCursorPos(self, _x, _y):
+            return True
+
+        def mouse_event(self, *_args):
+            # Simulate Save button click immediately closing the modal dialog
+            fg["hwnd"] = 10
+            return True
+
+    fg = {"hwnd": 20}
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _h: (0, 0, 800, 600))
+    monkeypatch.setattr(browser_save, "_user32", lambda: FakeUser32())
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: fg["hwnd"])
+
+    # Default (verify_active_after=True) sees focus changed -> False
+    assert not browser_save.click_browser_window(20, 100, 200)
+    fg["hwnd"] = 20
+    # Button-submit mode (verify_active_after=False) treats closed dialog click as True
+    assert browser_save.click_browser_window(20, 100, 200, verify_active_after=False)
+
+
+def test_auto_save_hook_pins_tab_over_save_dialog_retries_and_cleans_up(tmp_path, monkeypatch):
+    prior_tab = BrowserWindow(10, "Richmond County Clerk - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")
+    chrome_tab = BrowserWindow(10, "viewer - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")
+    save_dlg = BrowserWindow(20, "Сохранение", "chrome.exe", r"C:\Chrome\chrome.exe")
+    # Put a stale MHTML payload at pending_path first; cleanup/submit must clear it
+    stale = browser_save.pending_path(tmp_path, "591091")
+    stale.write_text("From: <Saved by Blink>\n<html></html>", encoding="utf-8")
+
+    now = {"t": 0.0}
+    dismissed: list[str] = []
+    confirmed_calls: list[int] = []
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _s: None)
+
+    def fake_confirm(browser_handle, *, target=None, seen_dialogs=None, **_kwargs):
+        if seen_dialogs is not None and 20 in seen_dialogs:
+            return ""
+        confirmed_calls.append(browser_handle)
+        if seen_dialogs is not None:
+            seen_dialogs.add(20)
+        return "confirmed"
+
+    monkeypatch.setattr(browser_save, "confirm_open_save_dialog", fake_confirm)
+
+    current_wins = [prior_tab]
+    hook = browser_save.auto_save_hook(
+        tmp_path,
+        windows_fn=lambda: list(current_wins),
+        active_handle_fn=lambda: 20,  # Save dialog is active when poll runs
+        monotonic=lambda: now["t"],
+        dismiss_fn=lambda: dismissed.append("called") or 1,
+    )
+    hook.before_open("591091")
+    assert dismissed == ["called"]  # before_open cleans lingering dialogs
+    assert not stale.exists()  # stale MHTML pending file was unlinked
+
+    # Simulate browser opening viewer + Save As modal after before_open()
+    current_wins[:] = [chrome_tab, save_dlg]
+
+    # Poll #1 (t=0.5): both chrome_tab and save_dlg are new; must pin chrome_tab (10), NOT save_dlg (20)
+    now["t"] = 0.5
+    assert hook("591091") is None
+    assert confirmed_calls == [10]
+
+    # Poll #2 (t=1.0): dialog still open within 3s retry cooldown -> skips re-confirm
+    now["t"] = 1.0
+    assert hook("591091") is None
+    assert confirmed_calls == [10]
+
+    # Poll #3 (t=4.0): >= 3s elapsed while dialog lingers -> retries!
+    now["t"] = 4.0
+    assert hook("591091") is None
+    assert confirmed_calls == [10, 10]
+
+    # Poll #4 (t=4.5): write real PDF -> attempt returns it!
+    stale.write_bytes(b"%PDF-1.7 saved")
+    assert hook("591091") == stale
+
+    # cleanup() always dismisses lingering dialogs via dismiss_fn
+    hook.cleanup("591091")
+    assert dismissed == ["called", "called"]
+
+

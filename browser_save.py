@@ -819,7 +819,51 @@ def window_bounds(handle: int) -> tuple[int, int, int, int] | None:
         return None
 
 
-def click_browser_window(handle: int, x: int, y: int) -> bool:
+_SENDINPUT_TYPES = None
+
+
+def _sendinput_types():
+    """Return cached Win32 INPUT/MOUSEINPUT/KEYBDINPUT ctypes structures."""
+    global _SENDINPUT_TYPES  # noqa: PLW0603
+    if _SENDINPUT_TYPES is not None:
+        return _SENDINPUT_TYPES
+    import ctypes
+    from ctypes import wintypes
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        ]
+
+    class INPUTUNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("union",)
+        _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
+
+    _SENDINPUT_TYPES = (INPUT, MOUSEINPUT, KEYBDINPUT)
+    return _SENDINPUT_TYPES
+
+
+def click_browser_window(
+    handle: int, x: int, y: int, *, verify_active_after: bool = True,
+) -> bool:
     """Click only inside the currently foreground supported browser window."""
     if active_window_handle() != int(handle) or window_bounds(handle) is None:
         return False
@@ -875,23 +919,13 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
             import ctypes
             from ctypes import wintypes
 
-            class MOUSEINPUT(ctypes.Structure):
-                _fields_ = [
-                    ("dx", wintypes.LONG), ("dy", wintypes.LONG),
-                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
-                ]
-
-            class INPUTUNION(ctypes.Union):
-                _fields_ = [("mi", MOUSEINPUT)]
-
-            class INPUT(ctypes.Structure):
-                _anonymous_ = ("union",)
-                _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
-
+            INPUT, MOUSEINPUT, _KEYBDINPUT = _sendinput_types()
             send_input = user32.SendInput
-            send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-            send_input.restype = wintypes.UINT
+            try:
+                send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+                send_input.restype = wintypes.UINT
+            except (AttributeError, TypeError):
+                pass
 
             def send_mouse(flags: int) -> int:
                 inputs = (INPUT * 1)(INPUT(type=0, mi=MOUSEINPUT(dwFlags=flags)))
@@ -903,14 +937,14 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
             time.sleep(0.05)
             if send_mouse(MOUSEEVENTF_LEFTUP) != 1:
                 return False
-            return active_window_handle() == int(handle)
+            return True if not verify_active_after else (active_window_handle() == int(handle))
         except Exception:  # noqa: BLE001 - legacy fallback below
             if sendinput_available:
                 return False
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.05)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        return active_window_handle() == int(handle)
+        return True if not verify_active_after else (active_window_handle() == int(handle))
     except Exception:  # noqa: BLE001
         return False
 
@@ -1002,14 +1036,45 @@ def press_ctrl_a() -> bool:
 
 
 def type_text(text: str) -> bool:
-    """Ввод Unicode-пути в появившийся диалог «Сохранить как»."""
+    """Ввод Unicode-пути в появившийся диалог «Сохранить как» через SendInput."""
     user32 = _user32()
     if user32 is None:
         return False
+    value = str(text)
+    if not value:
+        return True
+    raw = value.encode("utf-16-le")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    send_input = getattr(user32, "SendInput", None)
+    if callable(send_input):
+        sendinput_called = False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            INPUT, _MOUSEINPUT, KEYBDINPUT = _sendinput_types()
+            try:
+                send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+                send_input.restype = wintypes.UINT
+            except (AttributeError, TypeError):
+                pass
+            events = []
+            for code_unit in units:
+                events.append(INPUT(type=1, ki=KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)))
+                events.append(INPUT(
+                    type=1,
+                    ki=KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                ))
+            buf = (INPUT * len(events))(*events)
+            sendinput_called = True
+            return int(send_input(len(events), buf, ctypes.sizeof(INPUT))) == len(events)
+        except Exception:  # noqa: BLE001 - fall back to keybd_event only if SendInput could not run
+            if sendinput_called:
+                return False
     try:
-        for char in str(text):
-            user32.keybd_event(0, ord(char), KEYEVENTF_UNICODE, 0)
-            user32.keybd_event(0, ord(char), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+        for code_unit in units:
+            user32.keybd_event(0, code_unit, KEYEVENTF_UNICODE, 0)
+            user32.keybd_event(0, code_unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -1068,7 +1133,9 @@ def _is_non_pdf_webpage_file(path: Path) -> bool:
         return False
 
 
-def _is_download_arrow_cluster(img, x0: int, x1: int, y0: int, y1: int) -> bool:
+def _is_download_arrow_cluster(
+    img, x0: int, x1: int, y0: int, y1: int, *, fg_luma_thresh: int = 165,
+) -> bool:
     """Match the downward-arrow-into-tray (↓) Adobe Acrobat toolbar icon."""
     width = x1 - x0 + 1
     height = y1 - y0 + 1
@@ -1076,7 +1143,10 @@ def _is_download_arrow_cluster(img, x0: int, x1: int, y0: int, y1: int) -> bool:
         return False
     icon_rows: list[tuple[int, list[int]]] = []
     for y in range(y0, y1 + 1):
-        xs = [x for x in range(x0, x1 + 1) if sum(img.getpixel((x, y))[:3]) < 500]
+        xs = [
+            x for x in range(x0, x1 + 1)
+            if (sum(img.getpixel((x, y))[:3]) // 3) < fg_luma_thresh
+        ]
         if xs:
             icon_rows.append((y, xs))
     if len(icon_rows) < 10:
@@ -1108,8 +1178,11 @@ def find_adobe_download_point(image) -> tuple[int, int] | None:
     y_min, y_max = int(h * 0.06), int(h * 0.24)
     x_min, x_max = int(w * 0.62), int(w * 0.99)
 
-    def _is_dark(px: tuple[int, int, int]) -> bool:
-        return px[0] < 80 and px[1] < 80 and px[2] < 80
+    def _luma(px: tuple[int, int, int]) -> int:
+        return (px[0] + px[1] + px[2]) // 3
+
+    def _is_dark_pill(px: tuple[int, int, int]) -> bool:
+        return px[0] < 90 and px[1] < 90 and px[2] < 90 and (max(px) - min(px)) < 25
 
     lip_rows: list[tuple[int, int, int]] = []
     for y in range(y_min, y_max):
@@ -1117,7 +1190,7 @@ def find_adobe_download_point(image) -> tuple[int, int] | None:
         best_run = (0, 0, 0)
         start = 0
         for x in range(x_min, x_max):
-            if _is_dark(rgb.getpixel((x, y))[:3]):
+            if _is_dark_pill(rgb.getpixel((x, y))[:3]):
                 if run == 0:
                     start = x
                 run += 1
@@ -1132,20 +1205,22 @@ def find_adobe_download_point(image) -> tuple[int, int] | None:
 
     for seed_y, seed_l, seed_r in lip_rows:
         mid_x = (seed_l + seed_r) // 2
-        if min(rgb.getpixel((mid_x, max(0, seed_y - 4)))[:3]) < 200:
+        above_l = _luma(rgb.getpixel((mid_x, max(0, seed_y - 4)))[:3])
+        pill_l = _luma(rgb.getpixel((mid_x, seed_y))[:3])
+        if above_l < 115 or (above_l - pill_l) < 75:
             continue
         probe_l = min(seed_r, seed_l + 6)
         probe_r = max(seed_l, seed_r - 6)
         y0 = seed_y
         while y0 > y_min and (
-            _is_dark(rgb.getpixel((probe_l, y0 - 1))[:3])
-            or _is_dark(rgb.getpixel((probe_r, y0 - 1))[:3])
+            _is_dark_pill(rgb.getpixel((probe_l, y0 - 1))[:3])
+            or _is_dark_pill(rgb.getpixel((probe_r, y0 - 1))[:3])
         ):
             y0 -= 1
         y1 = seed_y
         while y1 < y_max and (
-            _is_dark(rgb.getpixel((probe_l, y1 + 1))[:3])
-            or _is_dark(rgb.getpixel((probe_r, y1 + 1))[:3])
+            _is_dark_pill(rgb.getpixel((probe_l, y1 + 1))[:3])
+            or _is_dark_pill(rgb.getpixel((probe_r, y1 + 1))[:3])
         ):
             y1 += 1
         pill_h = y1 - y0 + 1
@@ -1154,22 +1229,27 @@ def find_adobe_download_point(image) -> tuple[int, int] | None:
         pill_left = seed_l
         for yy in range(y0 + 2, y1 - 1):
             x = pill_left
-            while x > x_min and _is_dark(rgb.getpixel((x - 1, yy))[:3]):
+            while x > x_min and _is_dark_pill(rgb.getpixel((x - 1, yy))[:3]):
                 x -= 1
             pill_left = min(pill_left, x)
-        if min(rgb.getpixel((mid_x, min(h - 1, y1 + 4)))[:3]) < 200:
+        below_l = _luma(rgb.getpixel((mid_x, min(h - 1, y1 + 4)))[:3])
+        if below_l < 115 or (below_l - pill_l) < 75:
             continue
+        # Works both at full brightness and when Windows dims a parent window behind a modal.
         red_pixels = sum(
             1 for y in range(y0, y1 + 1) for x in range(0, min(120, w))
-            if (px := rgb.getpixel((x, y)))[0] > 180 and px[1] < 80 and px[2] < 80
+            if (px := rgb.getpixel((x, y)))[0] > 95
+            and px[0] > px[1] * 2 + 20
+            and px[0] > px[2] * 2 + 20
         )
         if red_pixels < 25:
             continue
+        fg_thresh = max(80, int(above_l * 0.65))
         pill_cy = (y0 + y1) // 2
         scan_left = max(0, pill_left - int(pill_h * 5.5))
         cols = [
             x for x in range(scan_left, pill_left - 6)
-            if any(sum(rgb.getpixel((x, y))[:3]) < 450 for y in range(y0 + 4, y1 - 3))
+            if any(_luma(rgb.getpixel((x, y))[:3]) < fg_thresh for y in range(y0 + 4, y1 - 3))
         ]
         clusters: list[list[int]] = []
         gap = max(5, int(pill_h * 0.25))
@@ -1179,7 +1259,9 @@ def find_adobe_download_point(image) -> tuple[int, int] | None:
             else:
                 clusters[-1][1] = x
         for cluster in reversed(clusters):
-            if _is_download_arrow_cluster(rgb, cluster[0], cluster[1], y0 + 3, y1 - 3):
+            if _is_download_arrow_cluster(
+                rgb, cluster[0], cluster[1], y0 + 3, y1 - 3, fg_luma_thresh=fg_thresh,
+            ):
                 return ((cluster[0] + cluster[1]) // 2, pill_cy)
     return None
 
@@ -1205,6 +1287,174 @@ def _try_click_adobe_download(handle: int) -> tuple[int, int] | None:
     if click_browser_window(handle, abs_x, abs_y):
         return (abs_x, abs_y)
     return None
+
+
+def _find_save_dialog_controls(dlg_handle: int) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """Return desktop (x, y) centers for (#32770 filename Edit, Save Button)."""
+    if not dlg_handle or os.name != "nt":
+        return None, None
+    user32 = _user32()
+    if user32 is None:
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        dlg_rect = wintypes.RECT()
+        if not user32.GetWindowRect(int(dlg_handle), ctypes.byref(dlg_rect)):
+            return None, None
+        dlg_h = int(dlg_rect.bottom - dlg_rect.top)
+        if dlg_h < 120:
+            return None, None
+
+        found_edit: list[tuple[int, int, int]] = []
+        found_button: list[tuple[int, int]] = []
+        cb_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        try:
+            user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+            user32.GetClassNameW.restype = ctypes.c_int
+            user32.EnumChildWindows.argtypes = (wintypes.HWND, cb_type, wintypes.LPARAM)
+            user32.EnumChildWindows.restype = wintypes.BOOL
+        except (AttributeError, TypeError):
+            pass
+
+        def collect(child, _param):  # noqa: ANN001
+            if not user32.IsWindowVisible(child):
+                return True
+            cls_buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(child, cls_buf, 64)
+            cls = cls_buf.value.strip()
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(child, ctypes.byref(rect)):
+                return True
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width <= 0 or height <= 0:
+                return True
+            cx = (int(rect.left) + int(rect.right)) // 2
+            cy = (int(rect.top) + int(rect.bottom)) // 2
+            if cls == "Edit" and width >= 120 and int(rect.top) >= int(dlg_rect.top + dlg_h * 0.55):
+                found_edit.append((int(rect.top), cx, cy))
+            elif cls == "Button":
+                txt_len = user32.GetWindowTextLengthW(child)
+                if 0 < txt_len < 64:
+                    txt_buf = ctypes.create_unicode_buffer(txt_len + 1)
+                    user32.GetWindowTextW(child, txt_buf, txt_len + 1)
+                    label = txt_buf.value.replace("&", "").strip().lower()
+                    if label in {"сохранить", "save"}:
+                        found_button.append((cx, cy))
+            return True
+
+        user32.EnumChildWindows(int(dlg_handle), cb_type(collect), 0)
+        edit_xy = (found_edit[0][1], found_edit[0][2]) if found_edit else None
+        btn_xy = found_button[0] if found_button else None
+        return edit_xy, btn_xy
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _submit_save_dialog(
+    dlg_handle: int,
+    target: str | Path | None,
+    *,
+    live_ui: bool,
+    press_ctrl_a_fn: Optional[Callable[[], bool]] = None,
+    type_text_fn: Optional[Callable[[str], bool]] = None,
+    press_enter_fn: Optional[Callable[[], bool]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Fill Save As filename (if given) and submit via Save button or Enter."""
+    ctrl_a = press_ctrl_a_fn or press_ctrl_a
+    write = type_text_fn or type_text
+    enter = press_enter_fn or press_enter
+
+    edit_xy: tuple[int, int] | None = None
+    btn_xy: tuple[int, int] | None = None
+    if live_ui and os.name == "nt":
+        # Common File Dialog (#32770) needs a brief settle window after HWND creation
+        # before its shell folder view finishes stealing focus from the Edit box.
+        sleep(0.25)
+        edit_xy, btn_xy = _find_save_dialog_controls(dlg_handle)
+
+    if target is not None:
+        dest = Path(target)
+        if dest.is_file() and not _is_pdf_file(dest):
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        if edit_xy is not None and dlg_handle:
+            click_browser_window(dlg_handle, *edit_xy)
+            sleep(0.08)
+        ctrl_a()
+        if live_ui:
+            sleep(0.05)
+        if not write(str(dest)):
+            return False
+        sleep(0.20)
+
+    if btn_xy is not None and dlg_handle and click_browser_window(
+        dlg_handle, *btn_xy, verify_active_after=False,
+    ):
+        return True
+    return bool(enter())
+
+
+def _same_browser_or_process(
+    dlg_handle: int,
+    browser_handle: int,
+    windows: Optional[Sequence[BrowserWindow]] = None,
+) -> bool:
+    """True when dialog and browser window belong to the same PID or browser family."""
+    if int(dlg_handle) == int(browser_handle):
+        return True
+    user32 = _user32()
+    if user32 is not None and _same_owning_process(user32, int(dlg_handle), int(browser_handle)):
+        return True
+    if windows is None:
+        return False
+    dlg_win = next((w for w in windows if w.handle == int(dlg_handle)), None)
+    br_win = next((w for w in windows if w.handle == int(browser_handle)), None)
+    if dlg_win is None or br_win is None:
+        return False
+    if not (is_supported_browser(dlg_win.executable, dlg_win.image_path)
+            and is_supported_browser(br_win.executable, br_win.image_path)):
+        return False
+    dlg_key = browser_key(dlg_win.executable, dlg_win.image_path)
+    br_key = browser_key(br_win.executable, br_win.image_path)
+    return bool(dlg_key) and dlg_key == br_key
+
+
+def dismiss_stale_save_dialogs(
+    *,
+    preferred: Optional[object] = None,
+    windows_fn: Optional[Callable[[], list[BrowserWindow]]] = None,
+    foreground_fn: Optional[Callable[[int], bool]] = None,
+    press_escape_fn: Optional[Callable[[], bool]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Close lingering browser-owned Save As dialogs so they cannot block later docs."""
+    try:
+        windows = (windows_fn or list_windows)()
+    except Exception:  # noqa: BLE001
+        return 0
+    pref = normalize_preferred_browser(
+        preferred if preferred is not None else get_preferred_browser()
+    )
+    bring = foreground_fn or foreground
+    esc = press_escape_fn or press_escape
+    closed = 0
+    for window in windows:
+        if not is_supported_browser(window.executable, window.image_path):
+            continue
+        if pref != "auto" and not matches_browser(window, pref):
+            continue
+        if not looks_like_save_dialog(window.title):
+            continue
+        if bring(window.handle) and esc():
+            closed += 1
+            sleep(0.15)
+    return closed
 
 
 def _save_dialog_ocr_text(handle: int) -> str:
@@ -1274,6 +1524,8 @@ def confirm_open_save_dialog(
     type_text_fn: Optional[Callable[[str], bool]] = None,
     press_enter_fn: Optional[Callable[[], bool]] = None,
     press_escape_fn: Optional[Callable[[], bool]] = None,
+    windows_fn: Optional[Callable[[], Sequence[BrowserWindow]]] = None,
+    foreground_fn: Optional[Callable[[int], bool]] = None,
 ) -> str:
     """Confirm a browser-owned PDF 'Save As' dialog, or cancel if it is 'Webpage'.
 
@@ -1283,24 +1535,47 @@ def confirm_open_save_dialog(
     """
     active_fn = active_handle_fn or active_window_handle
     title_fn = active_title_fn or active_window_title
+    windows: Optional[Sequence[BrowserWindow]] = None
+
+    def _windows() -> Sequence[BrowserWindow]:
+        nonlocal windows
+        if windows is None:
+            if windows_fn is not None:
+                windows = list(windows_fn())
+            elif active_handle_fn is None and os.name == "nt":
+                windows = list_windows()
+            else:
+                windows = []
+        return windows
+
+    def _matches_browser(handle: int) -> bool:
+        if same_process_fn is not None:
+            return bool(same_process_fn(handle, int(browser_handle)))
+        return _same_browser_or_process(handle, int(browser_handle), _windows())
+
     dlg_handle = int(active_fn() or 0)
-    if not dlg_handle or not looks_like_save_dialog(title_fn()):
+    matched = False
+    if dlg_handle and looks_like_save_dialog(title_fn()):
+        if (seen_dialogs is None or dlg_handle not in seen_dialogs) and _matches_browser(dlg_handle):
+            matched = True
+
+    if not matched and (windows_fn is not None or (active_handle_fn is None and os.name == "nt")):
+        for win in _windows():
+            if seen_dialogs is not None and win.handle in seen_dialogs:
+                continue
+            if not looks_like_save_dialog(win.title):
+                continue
+            if not _matches_browser(win.handle):
+                continue
+            if not (foreground_fn or foreground)(win.handle):
+                continue
+            dlg_handle = int(win.handle)
+            matched = True
+            break
+
+    if not matched:
         return ""
-    if seen_dialogs is not None and dlg_handle in seen_dialogs:
-        return ""
-    if same_process_fn is not None:
-        same_proc = bool(same_process_fn(dlg_handle, int(browser_handle)))
-    else:
-        user32 = _user32()
-        same_proc = (
-            user32 is not None
-            and (
-                dlg_handle == int(browser_handle)
-                or _same_owning_process(user32, dlg_handle, int(browser_handle))
-            )
-        )
-    if not same_proc:
-        return ""
+
     if seen_dialogs is not None:
         seen_dialogs.add(dlg_handle)
 
@@ -1314,12 +1589,22 @@ def confirm_open_save_dialog(
         )
         return "webpage_cancelled"
 
-    if target is not None:
-        (press_ctrl_a_fn or press_ctrl_a)()
-        if not (type_text_fn or type_text)(str(target)):
-            return ""
-        time.sleep(0.15)
-    if not (press_enter_fn or press_enter)():
+    live_ui = (
+        press_ctrl_a_fn is None
+        and type_text_fn is None
+        and press_enter_fn is None
+    )
+    ok = _submit_save_dialog(
+        dlg_handle,
+        target,
+        live_ui=live_ui,
+        press_ctrl_a_fn=press_ctrl_a_fn,
+        type_text_fn=type_text_fn,
+        press_enter_fn=press_enter_fn,
+    )
+    if not ok:
+        if seen_dialogs is not None:
+            seen_dialogs.discard(dlg_handle)
         return ""
     return "confirmed"
 
@@ -1350,11 +1635,10 @@ def save_pdf_if_possible(
     if destination.is_file():
         if _is_pdf_file(destination):
             return destination
-        if _is_non_pdf_webpage_file(destination):
-            try:
-                destination.unlink()
-            except OSError:
-                pass
+        try:
+            destination.unlink()
+        except OSError:
+            pass
     try:
         candidate = find_pdf_browser_window((windows or list_windows)(),
                                             require_title=require_pdf_title,
@@ -1372,16 +1656,27 @@ def save_pdf_if_possible(
     if int(active_handle()) != int(candidate.handle):
         return None
 
-    adobe_fn = adobe_download_fn
-    if adobe_fn is None and press_ctrl_s_fn is None and dialog_open_fn is None and os.name == "nt":
-        adobe_fn = _try_click_adobe_download
+    live_adobe = (
+        adobe_download_fn is None
+        and press_ctrl_s_fn is None
+        and dialog_open_fn is None
+        and os.name == "nt"
+    )
+    adobe_fn = _try_click_adobe_download if live_adobe else adobe_download_fn
+    adobe_attempts = 4 if live_adobe else (1 if adobe_fn is not None else 0)
 
     clicked_adobe = False
-    if adobe_fn is not None:
+    for idx in range(adobe_attempts):
+        if idx > 0:
+            sleep(0.4)
+            if int(active_handle()) != int(candidate.handle) and not bring(candidate.handle):
+                break
         try:
-            clicked_adobe = bool(adobe_fn(candidate.handle))
+            if adobe_fn(candidate.handle):  # type: ignore[misc]
+                clicked_adobe = True
+                break
         except Exception:  # noqa: BLE001
-            clicked_adobe = False
+            pass
 
     if clicked_adobe:
         _set_last_save_note(
@@ -1393,15 +1688,19 @@ def save_pdf_if_possible(
             return None
 
     dialog_open = dialog_open_fn or (lambda: looks_like_save_dialog(active_window_title()))
-    open_budget = max(float(wait), 2.5)
     step = 0.15
-    checks = max(1, int(round(open_budget / step)))
     first_pause = min(float(wait), step) if float(wait) > 0 else 0.0
-    write = type_text_fn or type_text
-    enter = press_enter_fn or press_enter
+    live_ui = (
+        dialog_open_fn is None
+        and type_text_fn is None
+        and press_enter_fn is None
+    )
 
-    def _await_dialog_and_save() -> tuple[Optional[Path], str]:
+    def _await_dialog_and_save(*, use_adobe_budget: bool) -> tuple[Optional[Path], str]:
+        open_budget = max(float(wait), 8.0 if use_adobe_budget else 2.5)
+        checks = max(1, int(round(open_budget / step)))
         opened_dialog = False
+        dlg_handle = 0
         for idx in range(checks):
             sleep(first_pause if idx == 0 else step)
             if destination.is_file() and _is_pdf_file(destination):
@@ -1416,13 +1715,32 @@ def save_pdf_if_possible(
             try:
                 if dialog_open():
                     opened_dialog = True
+                    dlg_handle = int(active_handle())
                     break
             except Exception:  # noqa: BLE001
                 pass
+            if dialog_open_fn is None and os.name == "nt" and (idx % 4 == 3 or idx == checks - 1):
+                try:
+                    all_wins = list_windows()
+                    for win in all_wins:
+                        if (
+                            looks_like_save_dialog(win.title)
+                            and _same_browser_or_process(win.handle, candidate.handle, all_wins)
+                            and bring(win.handle)
+                        ):
+                            opened_dialog = True
+                            dlg_handle = int(win.handle)
+                            break
+                    if opened_dialog:
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
         if not opened_dialog:
             return None, "no_dialog"
 
-        if dialog_open_fn is None and save_dialog_is_webpage():
+        if not dlg_handle:
+            dlg_handle = int(active_handle())
+        if dialog_open_fn is None and save_dialog_is_webpage(dlg_handle):
             press_escape()
             _set_last_save_note(
                 "Chrome открыл «Сохранение» как веб-страницу («Веб-страница, один файл») "
@@ -1431,13 +1749,17 @@ def save_pdf_if_possible(
             )
             return None, "webpage"
 
-        if dialog_open_fn is None:
-            press_ctrl_a()
-        if not write(str(destination)):
-            return None, "write_failed"
-        sleep(0.2)
-        if not enter():
-            return None, "enter_failed"
+        submitted = _submit_save_dialog(
+            dlg_handle,
+            destination,
+            live_ui=live_ui,
+            press_ctrl_a_fn=(None if dialog_open_fn is None else (lambda: True)),
+            type_text_fn=type_text_fn,
+            press_enter_fn=press_enter_fn,
+            sleep=sleep,
+        )
+        if not submitted:
+            return None, "submit_failed"
 
         save_budget = max(float(wait), 2.5)
         save_checks = max(1, int(round(save_budget / step)))
@@ -1463,7 +1785,7 @@ def save_pdf_if_possible(
             return None, "mhtml"
         return None, "timeout"
 
-    saved_path, outcome = _await_dialog_and_save()
+    saved_path, outcome = _await_dialog_and_save(use_adobe_budget=clicked_adobe)
     if saved_path is not None:
         return saved_path
     if outcome == "mhtml":
@@ -1473,7 +1795,7 @@ def save_pdf_if_possible(
                     _set_last_save_note(
                         "Chrome сохранил веб-страницу (MHTML) по Ctrl+S — удалена и нажата кнопка скачивания (↓) в Adobe Acrobat"
                     )
-                    retry_path, _ = _await_dialog_and_save()
+                    retry_path, _ = _await_dialog_and_save(use_adobe_budget=True)
                     if retry_path is not None:
                         return retry_path
                     return None
@@ -1497,6 +1819,7 @@ def auto_save_hook(
     active_handle_fn: Callable[[], int] = active_window_handle,
     monotonic: Callable[[], float] = time.monotonic,
     preferred: Optional[object] = None,
+    dismiss_fn: Optional[Callable[[], int]] = None,
 ):
     """Хук для лестницы: ждёт готовый PDF после старта навигации и на документ
     посылает Ctrl+S только один раз. Cloudflare-title не соответствует PDF-title.
@@ -1508,6 +1831,7 @@ def auto_save_hook(
     target_handles: dict[str, int] = {}
     ready_since: dict[str, tuple[int, str, float]] = {}
     seen_save_dialogs: set[int] = set()
+    dialog_attempts: dict[int, tuple[int, float]] = {}
     state: dict[str, str] = {}
 
     def _eligible(window: BrowserWindow) -> bool:
@@ -1518,9 +1842,63 @@ def auto_save_hook(
         )
         return pref == "auto" or matches_browser(window, pref)
 
+    def _cleanup_dialogs_and_pending(endorsement_id: int | str | None = None) -> None:
+        if dismiss_fn is not None:
+            try:
+                dismiss_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        elif available() and windows_fn is list_windows:
+            try:
+                dismiss_stale_save_dialogs(preferred=preferred, windows_fn=windows_fn)
+            except Exception:  # noqa: BLE001
+                pass
+        if endorsement_id is not None:
+            stale = pending_path(downloads_dir, str(endorsement_id))
+            if stale.is_file() and not _is_pdf_file(stale):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+    def _prune_lingering_dialog(windows: Sequence[BrowserWindow], now: float) -> None:
+        open_handles = {w.handle for w in windows if looks_like_save_dialog(w.title)}
+        for hwnd in list(seen_save_dialogs):
+            if hwnd not in open_handles:
+                continue
+            tries, tried_at = dialog_attempts.get(hwnd, (0, 0.0))
+            if 0 < tries < 3 and (now - tried_at) >= 3.0:
+                seen_save_dialogs.discard(hwnd)
+
+    def _handle_open_save_dialog(
+        browser_handle: int,
+        target: Path,
+        windows: Sequence[BrowserWindow],
+        key: str,
+        now: float,
+    ) -> str:
+        _prune_lingering_dialog(windows, now)
+        before_seen = set(seen_save_dialogs)
+        dlg_res = confirm_open_save_dialog(
+            browser_handle,
+            target=target,
+            seen_dialogs=seen_save_dialogs,
+            active_handle_fn=active_handle_fn,
+            windows_fn=lambda: windows,
+        )
+        for new_hwnd in seen_save_dialogs - before_seen:
+            prev_count = dialog_attempts.get(new_hwnd, (0, 0.0))[0]
+            dialog_attempts[new_hwnd] = (prev_count + 1, now)
+        if dlg_res == "webpage_cancelled":
+            state[key] = last_save_note() or "диалог сохранения веб-страницы отменён"
+        elif dlg_res == "confirmed":
+            state[key] = f"диалог «Сохранить как» подтверждён автоматически -> {target.name}"
+        return dlg_res
+
     def before_open(endorsement_id: int | str) -> None:
         """Snapshot existing browser tabs before the new document is navigated."""
         key = str(endorsement_id)
+        _cleanup_dialogs_and_pending(key)
         requested_at[key] = monotonic()
         try:
             baselines[key] = {
@@ -1532,6 +1910,10 @@ def auto_save_hook(
         target_handles.pop(key, None)
         ready_since.pop(key, None)
 
+    def cleanup(endorsement_id: int | str) -> None:
+        """Dismiss stale browser Save dialogs after timeout/abort."""
+        _cleanup_dialogs_and_pending(endorsement_id)
+
     def attempt(endorsement_id: int | str) -> Optional[Path]:
         key = str(endorsement_id)
         target = pending_path(downloads_dir, key)
@@ -1540,37 +1922,35 @@ def auto_save_hook(
         if not available():
             state.setdefault(key, "автоматика Windows (клавиатура/окна) недоступна")
             return None
-        if key in attempted_pdf:
-            pinned_done = target_handles.get(key)
-            if pinned_done:
-                dlg_res = confirm_open_save_dialog(
-                    pinned_done, target=target, seen_dialogs=seen_save_dialogs,
-                    active_handle_fn=active_handle_fn,
-                )
-                if dlg_res == "webpage_cancelled":
-                    state[key] = last_save_note() or "диалог сохранения веб-страницы отменён"
-                elif dlg_res == "confirmed":
-                    time.sleep(0.5)
-                    if target.is_file() and _is_pdf_file(target):
-                        return target
-            return None
         now = monotonic()
-        requested_at.setdefault(key, now)
         try:
             windows = windows_fn()
         except Exception:  # noqa: BLE001
             return None
+        if key in attempted_pdf:
+            pinned_done = target_handles.get(key)
+            if pinned_done:
+                dlg_res = _handle_open_save_dialog(pinned_done, target, windows, key, now)
+                if dlg_res == "confirmed":
+                    time.sleep(0.5)
+                    if target.is_file() and _is_pdf_file(target):
+                        return target
+            return None
+        requested_at.setdefault(key, now)
 
         # Pin the window/tab created or navigated by this document's browser
-        # fallback. Never fall back to an older PDF tab in another browser window.
+        # fallback. Never fall back to an older PDF tab in another browser window,
+        # and never pin a transient modal Save As dialog as the browser tab HWND.
         pinned = target_handles.get(key)
         if pinned is None:
             baseline = baselines.setdefault(key, {})
-            changed = [
+            changed_all = [
                 window for window in windows
                 if _eligible(window)
                 and (window.handle not in baseline or baseline[window.handle] != window.title)
             ]
+            changed = [w for w in changed_all if not looks_like_save_dialog(w.title)]
+            changed_dialogs = [w for w in changed_all if looks_like_save_dialog(w.title)]
             active_handle = int(active_handle_fn())
             active_changed = [window for window in changed if window.handle == active_handle]
             if len(active_changed) == 1:
@@ -1587,6 +1967,15 @@ def auto_save_hook(
                 if len(pinned_browser_changed) == 1:
                     pinned = pinned_browser_changed[0].handle
                 else:
+                    if changed_dialogs and not changed:
+                        dlg_res = _handle_open_save_dialog(
+                            changed_dialogs[0].handle, target, windows, key, now,
+                        )
+                        if dlg_res == "confirmed":
+                            time.sleep(0.8)
+                            if target.is_file() and _is_pdf_file(target):
+                                return target
+                        return None
                     seen = "; ".join(sorted(
                         {f"[{window.executable}] {window.title!r}" for window in changed})) or "ни одного"
                     state[key] = f"окно загрузки не закреплено: изменилось окон {len(changed)}: {seen}"
@@ -1596,15 +1985,10 @@ def auto_save_hook(
         # If Chrome ("Ask where to save") popped a Save As dialog immediately upon
         # navigation/download, confirm it straight away instead of waiting 15 s
         # and sending Ctrl+S to the Save As dialog.
-        dlg_res = confirm_open_save_dialog(
-            pinned, target=target, seen_dialogs=seen_save_dialogs,
-            active_handle_fn=active_handle_fn,
-        )
+        dlg_res = _handle_open_save_dialog(pinned, target, windows, key, now)
         if dlg_res == "webpage_cancelled":
-            state[key] = last_save_note() or "диалог сохранения веб-страницы отменён"
             return None
         if dlg_res == "confirmed":
-            state[key] = f"диалог «Сохранить как» подтверждён автоматически -> {target.name}"
             time.sleep(0.8)
             if target.is_file() and _is_pdf_file(target):
                 return target
@@ -1675,5 +2059,6 @@ def auto_save_hook(
         return state.get(str(endorsement_id), "состояние не записано")
 
     attempt.before_open = before_open  # type: ignore[attr-defined]
+    attempt.cleanup = cleanup  # type: ignore[attr-defined]
     attempt.state = note  # type: ignore[attr-defined]
     return attempt

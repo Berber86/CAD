@@ -603,6 +603,11 @@ def download_pdf_via_viewer(
                 shot = (shot_fn or _default_timeout_shot)(window.handle, target.parent)
             except Exception:  # noqa: BLE001 - диагностика не ломает остановку
                 shot = ""
+        if windows_fn is browser_save.list_windows and browser_save.available():
+            try:
+                browser_save.dismiss_stale_save_dialogs()
+            except Exception:  # noqa: BLE001
+                pass
         raise manual(f"PDF не появился в «{folder}» за {int(download_wait_sec)} с.{shot}")
     shutil.copyfile(found, target)
     say(f"файл взят из загрузок: {Path(found).name}")

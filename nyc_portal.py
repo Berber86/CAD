@@ -1436,13 +1436,21 @@ def lookup_parcel(
         "Use null only when a label or adjacency itself is unclear."
     )
 
-    def ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg):
+    def ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg,
+                       race_done: threading.Event | None = None):
         # Один сбой — не приговор: тайм-аут или кривой JSON повторяем, а не
         # хороним весь поиск (живой случай: «Request timed out» с первой
         # попытки убил задание очереди). Повторяет каждый участник гонки
-        # сам; гонка по-прежнему принимает первый валидный ответ.
+        # сам; гонка по-прежнему принимает первый валидный ответ, а после
+        # победы одной модели проигравшая больше не шлёт платные повторы.
+        def leg_progress(line: str) -> None:
+            if progress and (race_done is None or not race_done.is_set()):
+                progress(line)
+
         last_error: Exception | None = None
         for attempt in range(1, NEIGHBOUR_ATTEMPTS + 1):
+            if race_done is not None and race_done.is_set():
+                raise PortalLookupError("гонка за ответом о соседях уже завершена")
             try:
                 response, used = ask_llm_json(
                     VISION_SYSTEM_PROMPT,
@@ -1453,7 +1461,7 @@ def lookup_parcel(
                     provider=leg_provider,
                     model=leg_model,
                     key_secret=key_secret,
-                    progress=progress,
+                    progress=leg_progress if progress else None,
                     task_label="NYC tax map: номера соседних лотов",
                     attempts=1,
                     single_request=True,
@@ -1461,19 +1469,25 @@ def lookup_parcel(
                 return parse_neighbour_result(response), used
             except Exception as exc:  # noqa: BLE001 - повтор важнее типа сбоя
                 last_error = exc
+                if race_done is not None and race_done.is_set():
+                    raise
                 if attempt < NEIGHBOUR_ATTEMPTS:
                     if progress:
                         progress(
                             f"NYC tax map: запрос про соседей к {leg_model} не удался "
                             f"({type(exc).__name__}: {exc}); повторяю — попытка "
                             f"{attempt + 1} из {NEIGHBOUR_ATTEMPTS}")
-                    time.sleep(NEIGHBOUR_RETRY_PAUSE_SEC * attempt)
+                    if race_done is not None:
+                        if race_done.wait(NEIGHBOUR_RETRY_PAUSE_SEC * attempt):
+                            raise PortalLookupError("гонка за ответом о соседях уже завершена")
+                    else:
+                        time.sleep(NEIGHBOUR_RETRY_PAUSE_SEC * attempt)
         assert last_error is not None  # цикл выше либо вернул, либо падал
         raise last_error
 
     # Гонка двух нейронок: основная выбранная модель и дешёвая Hydra
     # (cheap/gpt-6.1-terra, рассуждения medium). Принимаем первый валидный
-    # ответ; проигравший запрос остановить нельзя — он договаривает в фоне.
+    # ответ; уже ушедший проигравший запрос договаривает без новых повторов.
     legs: list[tuple[str, str, str | None, dict[str, Any], str]] = [
         (provider, model, api_key, request_cfg, "основная модель"),
     ]
@@ -1504,12 +1518,13 @@ def lookup_parcel(
                 f"(рассуждения {NEIGHBOUR_RACE_REASONING}); приму первый валидный ответ"
             )
         outcome_queue: queue.SimpleQueue = queue.SimpleQueue()
+        race_done = threading.Event()
 
         def run_leg(leg) -> None:
             leg_provider, leg_model, leg_key, leg_cfg, leg_label = leg
             try:
                 outcome_queue.put(("ok", leg_label, leg_provider, leg_model,
-                                   ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg)))
+                                   ask_neighbours(leg_provider, leg_model, leg_key, leg_cfg, race_done)))
             except Exception as exc:  # noqa: BLE001 - вторая модель может спасти
                 outcome_queue.put(("err", leg_label, leg_provider, leg_model, exc))
 
@@ -1519,12 +1534,16 @@ def lookup_parcel(
             ).start()
         winner = None
         race_errors: list[str] = []
-        for _ in legs:
-            kind, leg_label, leg_provider, leg_model, payload = outcome_queue.get()
-            if kind == "ok":
-                winner = (leg_label, leg_provider, leg_model, payload)
-                break
-            race_errors.append(f"{leg_label} ({leg_provider}: {leg_model}): {payload}")
+        try:
+            for _ in legs:
+                kind, leg_label, leg_provider, leg_model, payload = outcome_queue.get()
+                if kind == "ok":
+                    race_done.set()
+                    winner = (leg_label, leg_provider, leg_model, payload)
+                    break
+                race_errors.append(f"{leg_label} ({leg_provider}: {leg_model}): {payload}")
+        finally:
+            race_done.set()
         if winner is None:
             raise PortalLookupError(
                 "Ни одна из двух моделей не ответила про соседей: "

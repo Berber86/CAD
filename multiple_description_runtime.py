@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
+import threading
+import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -112,11 +115,89 @@ def provider_target(cfg: Mapping[str, Any], provider: str, model: str, *,
     return ResolvedTarget(provider, model.strip(), base_url, key, image_limit, capability)
 
 
-def fetch_hydra_catalog() -> Any:
+_HYDRA_CATALOG_LOCK = threading.Lock()
+_HYDRA_CATALOG_CACHE: tuple[float, Any] | None = None
+_HYDRA_CATALOG_TTL_SEC = 7 * 24 * 3600.0
+
+
+def _hydra_catalog_cache_path() -> Path:
+    base = os.environ.get('LOCALAPPDATA', '').strip()
+    root = Path(base) / 'TitleSurveyAI' if base else Path.home() / '.cache' / 'titlesurveyai'
+    return root / 'hydra_models_cache.json'
+
+
+def _compact_catalog(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get('data'), list):
+        return None
+    entries = []
+    for entry in payload['data']:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get('id'), str):
+            continue
+        item: dict[str, Any] = {'id': entry['id']}
+        if isinstance(entry.get('input_modalities'), list):
+            item['input_modalities'] = list(entry['input_modalities'])
+        if 'max_file_count' in entry:
+            item['max_file_count'] = entry['max_file_count']
+        entries.append(item)
+    return {'data': entries}
+
+
+def _read_hydra_catalog_fallback(cache_path: Path | None = None) -> Any | None:
+    now = time.time()
+    with _HYDRA_CATALOG_LOCK:
+        if _HYDRA_CATALOG_CACHE is not None and 0 <= now - _HYDRA_CATALOG_CACHE[0] <= _HYDRA_CATALOG_TTL_SEC:
+            return _HYDRA_CATALOG_CACHE[1]
+    path = cache_path or _hydra_catalog_cache_path()
+    try:
+        stored = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stored, Mapping):
+        return None
+    cached_at = stored.get('cached_at')
+    catalog = stored.get('catalog')
+    if (isinstance(cached_at, (int, float)) and not isinstance(cached_at, bool)
+            and 0 <= now - float(cached_at) <= _HYDRA_CATALOG_TTL_SEC
+            and isinstance(catalog, Mapping) and isinstance(catalog.get('data'), list)):
+        return catalog
+    return None
+
+
+def fetch_hydra_catalog(*, attempts: int = 3, timeout: float = 15.0,
+                        cache_path: Path | None = None,
+                        sleep: Callable[[float], None] = time.sleep) -> Any:
     """Public metadata only; no key or document is sent."""
-    response = httpx.get('https://api.hydraai.ru/v1/models', timeout=10.0, follow_redirects=False)
-    response.raise_for_status()
-    return response.json()
+    global _HYDRA_CATALOG_CACHE
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            response = httpx.get('https://api.hydraai.ru/v1/models', timeout=timeout, follow_redirects=False)
+            response.raise_for_status()
+            data = response.json()
+            compact = _compact_catalog(data)
+            if compact is not None:
+                now = time.time()
+                with _HYDRA_CATALOG_LOCK:
+                    _HYDRA_CATALOG_CACHE = (now, data)
+                target = cache_path or _hydra_catalog_cache_path()
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(
+                        json.dumps({'cached_at': now, 'catalog': compact}, ensure_ascii=False),
+                        encoding='utf-8',
+                    )
+                except OSError:
+                    pass
+            return data
+        except (httpx.HTTPError, ValueError) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                sleep(0.5 * attempt)
+    cached = _read_hydra_catalog_fallback(cache_path)
+    if cached is not None:
+        return cached
+    assert last_exc is not None
+    raise last_exc
 
 
 def model_capability(catalog: Any, model: str) -> tuple[str, int | None]:
@@ -283,6 +364,29 @@ def _process_batch_file(job: FileJob, index: int, total: int | None, cfg: Mappin
     if not current():
         raise _BatchCancelled
     emit(detail, f"Файл {index}" + (f" из {total}" if total else "") + f": {job.path.name}.")
+    api_cfg = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
+    output_format = str(api_cfg.get('vision_output_format') or 'auto').strip().lower()
+    if output_format == 'jpg':
+        output_format = 'jpeg'
+    if output_format not in ('auto', 'png', 'jpeg'):
+        output_format = 'auto'
+    enhance_scan = bool(api_cfg.get('vision_enhance_scans', True))
+    try:
+        render_dpi = max(96, min(350, int(api_cfg.get('vision_dpi') or 220)))
+    except (TypeError, ValueError):
+        render_dpi = 220
+    hydra_key: str | None = None
+    hydra_url = legal_page_search.HYDRA_BASE_URL
+    if target.provider == 'hydra' and target.api_key:
+        hydra_key = target.api_key
+        hydra_url = target.base_url or hydra_url
+    else:
+        try:
+            h_target = provider_target(cfg, 'hydra', legal_page_search.HYDRA_FALLBACK_MODEL)
+            hydra_key = h_target.api_key
+            hydra_url = h_target.base_url or hydra_url
+        except RuntimeUnavailable:
+            hydra_key = None
     try:
         portal_lot = job.portal_lot if job.portal_lot is not None else portal_lot_from_passport(job.path)
         result = pipeline.parse_pdf(job.path, cfg, search_api_key=search_api_key,
@@ -290,6 +394,13 @@ def _process_batch_file(job: FileJob, index: int, total: int | None, cfg: Mappin
                                     image_limit=target.image_limit, portal_lot=portal_lot,
                                     send=send, choose=choose, search_send=search_send,
                                     search_base_url=search_base_url,
+                                    hydra_api_key=hydra_key,
+                                    hydra_base_url=hydra_url,
+                                    ocr_fallback=True,
+                                    render_dpi=render_dpi,
+                                    output_format=output_format,
+                                    enhance_scan=enhance_scan,
+                                    window_excess=True,
                                     force_parse=force_parse, current=current, progress=detail)
     except Cancelled as exc:
         raise _BatchCancelled from exc
@@ -446,19 +557,25 @@ def _make_callbacks(target: ResolvedTarget, cfg: Mapping[str, Any], client: Any,
                       hedge_target: ResolvedTarget | None, hedge_client: Any,
                       progress: Callable[[str], None] | None,
                       hedge_delay_sec: float):
+    import inspect
+    api = cfg.get('api') if isinstance(cfg.get('api'), Mapping) else {}
+    raw_temp = api.get('temperature', 0.0)
+    temperature = float(raw_temp) if raw_temp is not None else 0.0
     effort = lp.resolve_reasoning_effort(cfg, provider=target.provider, model=target.model)
-    send = transport.make_sender(client, target.model, effort)
-    choose = transport.make_selector(client, target.model, effort)
+    sender_kw = {'temperature': temperature} if 'temperature' in inspect.signature(transport.make_sender).parameters else {}
+    selector_kw = {'temperature': temperature} if 'temperature' in inspect.signature(transport.make_selector).parameters else {}
+    send = transport.make_sender(client, target.model, effort, **sender_kw)
+    choose = transport.make_selector(client, target.model, effort, **selector_kw)
     if (HEDGE_ENABLED and hedge_target is not None and hedge_client is not None
             and target.provider == 'hydra' and target.model == HYDRA_GROK_MODEL
             and hedge_target.provider == 'routerai' and hedge_target.model == ROUTERAI_GROK_MODEL):
         hedge_effort = lp.resolve_reasoning_effort(
             cfg, provider=hedge_target.provider, model=hedge_target.model)
         send = transport.make_hedged_sender(
-            send, transport.make_sender(hedge_client, hedge_target.model, hedge_effort),
+            send, transport.make_sender(hedge_client, hedge_target.model, hedge_effort, **sender_kw),
             delay=hedge_delay_sec, notice=progress)
         choose = transport.make_hedged_selector(
-            choose, transport.make_selector(hedge_client, hedge_target.model, hedge_effort),
+            choose, transport.make_selector(hedge_client, hedge_target.model, hedge_effort, **selector_kw),
             delay=hedge_delay_sec, notice=progress)
     return send, choose
 

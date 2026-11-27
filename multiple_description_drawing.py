@@ -75,7 +75,7 @@ def plan_partial(
                                       rotation=angle, kind=f'side-{index}' if row == 0 else f'side-{index}-note'))
     xs, ys = zip(*points)
     center = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
-    label = f"LOT {lot_identity.effective_number(description) or '?'}"
+    label = lot_identity.lot_label(description)
     texts.append(TextItem(text=label, point=center, rotation=0.0,
                           kind='main-lot-label' if is_main else 'neighbor-label'))
     # Preserve an explicitly available frontage, but do not guess one from an
@@ -157,22 +157,45 @@ def _drawing_description(record: DescriptionSource):
     дистанции на чертеже нет. Поэтому для построения румб выводится здесь
     тем же ``infer_corner_to_pob_bearing``; исходное описание и кэш не
     меняются, якоря это не касается.
+
+    Дополнительно применяются безопасные санитарные правила старого метода
+    (``_repair_llm_geometry`` без изменения цифр/направлений): сброс
+    заведомо неверного ``front_segment_index`` на ``PARALLEL WITH`` /
+    ``AT RIGHT ANGLES``, сброс углового ``cross_street_side_index`` для
+    рядовых участков (``distance_to_corner_ft > 0.5``) и выравнивание
+    номинальной привязки вдоль напечатанной оси улицы (``align_corner_tie_to_street``).
     """
     desc = lot_identity.bind_filename(record.item.data, record.source)
+    updates: dict[str, Any] = {}
+    f_idx = getattr(desc, 'front_segment_index', None)
+    segs = getattr(desc, 'segments', None) or ()
+    if f_idx is not None and 0 <= f_idx < len(segs):
+        c_note = str(getattr(segs[f_idx], 'course_note', '') or '').upper()
+        if 'PARALLEL WITH' in c_note or 'AT RIGHT ANGLES' in c_note:
+            updates['front_segment_index'] = None
+    if (getattr(desc, 'cross_street_side_index', None) is not None
+            and float(getattr(desc, 'distance_to_corner_ft', 0.0) or 0.0) > 0.5):
+        updates['cross_street_side_index'] = None
     if (getattr(desc, 'corner_to_pob_bearing', None) is None
             and float(getattr(desc, 'distance_to_corner_ft', 0.0) or 0.0) > 1e-6
-            and getattr(desc, 'segments', None)):
+            and segs):
         try:
             inferred = lp.infer_corner_to_pob_bearing(
-                desc.segments,
+                segs,
                 distance_to_corner_ft=desc.distance_to_corner_ft,
-                front_segment_index=desc.front_segment_index,
+                front_segment_index=updates.get('front_segment_index', f_idx),
                 front_side=desc.front_side,
             )
         except Exception:  # noqa: BLE001 - построение не должно падать из-за привязки
             inferred = None
         if inferred is not None:
-            desc = desc.model_copy(update={'corner_to_pob_bearing': inferred})
+            updates['corner_to_pob_bearing'] = inferred
+    if updates:
+        desc = desc.model_copy(update=updates)
+    try:
+        desc, _ = lp.align_corner_tie_to_street(desc)
+    except Exception:  # noqa: BLE001
+        pass
     return desc
 
 
@@ -194,6 +217,11 @@ def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: fl
     дистанцию до него у всех соседних участков (живой сбой 25.11.2026).
     """
     desc = _drawing_description(record)
+    extra_warnings: list[str] = []
+    if record.is_main and lot_identity.is_old_tag(record.source):
+        extra_warnings.append(
+            f"Использован OUR OLD вместо OUR NEW — в DWG лот подписан как {lot_identity.lot_label(desc)}."
+        )
     try:
         plan = builder.plan(desc, scale=scale, is_neighbor=False)
     except Exception:
@@ -202,6 +230,8 @@ def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: fl
         start = record.anchor.pob if record.anchor is not None else compute_pob_point(desc)
         plan = plan_partial(builder, record.item, source=record.source, is_main=record.is_main,
                             scale=scale, start=start)
+        if extra_warnings:
+            plan = dc_replace(plan, warnings=[*plan.warnings, *extra_warnings])
         return plan, 'partial_description'
     if not record.is_main:
         plan = dc_replace(
@@ -209,6 +239,12 @@ def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: fl
             items=[dc_replace(item, kind='neighbor-label') if item.kind == 'main-lot-label'
                    else item for item in plan.items],
         )
+    if extra_warnings:
+        merged = list(plan.warnings)
+        for warning in extra_warnings:
+            if warning not in merged:
+                merged.append(warning)
+        plan = dc_replace(plan, warnings=merged)
     return plan, None if record.item.complete else 'partial_description'
 
 

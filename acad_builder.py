@@ -2560,7 +2560,7 @@ class AcadBuilder:
         if neighbor_label and str(neighbor_label).strip():
             label = str(neighbor_label).strip()
         else:
-            label = f"LOT {lot_identity.effective_number(description) or '?'}"
+            label = lot_identity.lot_label(description)
 
         center = polygon_centroid(vertices)
         count = len(vertices)

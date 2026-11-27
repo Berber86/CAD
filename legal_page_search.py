@@ -11,7 +11,10 @@ import copy
 import hashlib
 import json
 import math
+import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -19,11 +22,14 @@ from typing import Any, Callable, Mapping
 import httpx
 import developer_probability as dp
 import file_metadata
+import ocr_pages
 from multiple_description_cancel import check
 from multiple_description_progress import emit, page_list, waiting
 
 PRIMARY = "microsoft/microsoft-decision-1.1"
 FALLBACK = "typesafe/jev-1.14"
+HYDRA_FALLBACK_MODEL = "gpt-6-luna"
+HYDRA_BASE_URL = "https://api.hydraai.ru/v1"
 PROVIDER = "routerai"
 BASE_URL = "https://routerai.ru/api/v1"
 PAGE_CAP = 200
@@ -31,6 +37,16 @@ THRESHOLD = 0.30
 SCHEMA = "titlesurveyai.legal_page_search.v1"
 QUESTION = ("Does this page contain any part of a legal description of a land parcel, "
             "including the beginning or continuation of boundary courses?")
+HYDRA_SEARCH_PROMPT = (
+    "Inspect the attached whole PDF pages (labeled with exact PDF page numbers). "
+    "Identify EVERY page that contains ANY part (opening, middle, or continuation) "
+    "of a geodesic / metes-and-bounds legal land description (LD), parcel boundary "
+    "courses, bearings/distances, relative street boundary calls (PARALLEL WITH / AT "
+    "RIGHT ANGLES TO), or a survey plat containing parcel boundary geometry. "
+    "Ignore deed cover sheets, recording stamps, ACRIS/tax forms (RP-5217, TP-584), "
+    "notary acknowledgments, and signature pages unless they contain boundary calls. "
+    "Return STRICT JSON ONLY in this exact schema: {\"pages\": [<integer page numbers>]}."
+)
 COUNT_INSTRUCTIONS = ("Count distinct metes-and-bounds descriptions of land parcels on the supplied pages. "
                       "One description continued over multiple pages counts once. A title, deed cover, "
                       "map, address or lot reference alone is not a separate description. "
@@ -175,9 +191,237 @@ def _request(pages: list[dict[str, Any]], questions: dict[str, Any], model: str,
     return answers, error, round(time.monotonic() - start, 3), usage
 
 
+_OCR_OPENER_RE = re.compile(
+    r"\b(?:all\s+that\s+(?:certa[i1l]n\s+)?(?:plot|p[i1l]ece|parcel|tract|lot)"
+    r"|beg[i1l][nm]{2}[i1l]ng\b|commenc[i1l]ng\b|metes\s+and\s+bounds"
+    r"|schedule\s+a\b|bou[nm]ded\s+and\s+descr[i1l]bed"
+    r"|s[i1l]tuate[,\s]+ly[i1l]ng\s+and\s+be[i1l]ng"
+    r"|po[i1l]nt\s+(?:or\s+place\s+)?of\s+beg[i1l][nm]{2}[i1l]ng)\b",
+    re.IGNORECASE,
+)
+_OCR_CLOSING_POB_RE = re.compile(
+    r"\bto\s+(?:the\s+)?(?:true\s+)?(?:po[i1l]nt(?:\s+or\s+place)?\s+of\s+|place\s+of\s+)?beg[i1l][nm]{2}[i1l]ng\b",
+    re.IGNORECASE,
+)
+_OCR_THENCE_RE = re.compile(r"\b(?:runn[i1l]ng\s+)?t[hb]e[nmh]ce\b", re.IGNORECASE)
+_OCR_RELATIVE_RE = re.compile(
+    r"\b(?:parallel\s+w[i1l]th|at\s+r[i1l]ght\s+angles\s+to|inter[i1l]or\s+angle)\b",
+    re.IGNORECASE,
+)
+_OCR_BEARING_RE = re.compile(
+    r"\b[NS5]\s*\d{1,2}\s*(?:°|deg\w*|d|o|0|\s)\s*\d{1,2}"
+    r"(?:\s*(?:'|′|min\w*|\s)\s*\d{1,2}(?:\.\d+)?)?\s*(?:\"|″|sec\w*)?\s*[EW]\b",
+    re.IGNORECASE,
+)
+_OCR_DIST_RE = re.compile(
+    r"\b\d{1,4}(?:[.,]\d{1,4})?\s*(?:f[eoc]{2}t|f[s]?et|ft\.?|cha[i1l]ns?|l[i1l]nks?|varas?|'|′)",
+    re.IGNORECASE,
+)
+_OCR_DIR_CONTEXT_RE = re.compile(
+    r"\b(?:north\w*|south\w*|east\w*|west\w*|along|corner|d[i1l]stant|s[i1l]de\s+of|party\s+wall|avenue|street|boulevard|road|lane|drive)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_ocr_noise(text: str) -> str:
+    """Repair common RapidOCR character substitutions inside numeric/angle tokens."""
+    if not text:
+        return ""
+    cleaned = text.replace("°", "°").replace("′", "'").replace("″", '"')
+    # Fix O/o -> 0 and I/l -> 1 when adjacent to digits, decimals, or angle/foot punctuation.
+    prev = None
+    while prev != cleaned:
+        prev = cleaned
+        cleaned = re.sub(r"(?<=\d)[Oo](?=[0-9°'\".,\s])", "0", cleaned)
+        cleaned = re.sub(r"(?<=[NSns\s])[Oo](?=\d)", "0", cleaned)
+        cleaned = re.sub(r"(?<=\d)[Il|](?=[0-9°'\".,])", "1", cleaned)
+        cleaned = re.sub(r"(?<=[0-9.])([Il|])(?=\d)", "1", cleaned)
+    return cleaned
+
+
+def _ocr_page_has_legal_description(text: str) -> tuple[bool, bool]:
+    """Return (has_ld_cues, needs_next_page_continuation) resilient to OCR typos."""
+    if not text or not text.strip():
+        return False, False
+    norm = _normalize_ocr_noise(text)
+    opener = bool(_OCR_OPENER_RE.search(norm))
+    bearings = len(_OCR_BEARING_RE.findall(norm))
+    thence = len(_OCR_THENCE_RE.findall(norm))
+    relative = bool(_OCR_RELATIVE_RE.search(norm))
+    has_dist = bool(_OCR_DIST_RE.search(norm))
+    has_dir = bool(_OCR_DIR_CONTEXT_RE.search(norm))
+    dist_and_dir = has_dist and (has_dir or thence > 0)
+
+    is_ld = (
+        bearings >= 2
+        or (bearings >= 1 and (thence >= 1 or dist_and_dir or opener))
+        or (opener and (thence >= 1 or dist_and_dir or relative))
+        or (thence >= 2 and dist_and_dir)
+        or (relative and dist_and_dir)
+    )
+    if not is_ld:
+        return False, False
+    # Check whether closure back to POB already appears after any opening word.
+    closing = bool(_OCR_CLOSING_POB_RE.search(norm))
+    return True, not closing
+
+
+def _chunk_numbers(numbers: list[int], size: int = dp.ROUTERAI_IMAGE_LIMIT) -> list[list[int]]:
+    return [numbers[i:i + size] for i in range(0, len(numbers), size)]
+
+
+def _hydra_questions(numbers: list[int]) -> dict[str, dict[str, Any]]:
+    return {f"page_{n}": {"type": "noul", "instructions": f"hydra_ld_chunk:{n}"} for n in numbers}
+
+
+def _hydra_fingerprint(digest: str, pages: list[dict[str, Any]], model: str,
+                       image_side: int, base_url: str) -> str:
+    payload = {"pdf_sha256": digest, "pages": [p["page"] for p in pages],
+               "image_sha256": [hashlib.sha256(p["content"]).hexdigest() for p in pages],
+               "image_side": image_side, "image_format": "png", "provider": "hydra",
+               "base_url": base_url, "model": model, "prompt": HYDRA_SEARCH_PROMPT}
+    return hashlib.sha256(json.dumps(payload, sort_keys=False, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _default_hydra_search_send(base_url: str, api_key: str, model: str,
+                               pages: list[dict[str, Any]]) -> dict[str, Any]:
+    import base64
+    from multiple_description_parse import decode_json_object
+    from multiple_description_transport import _call, create_client
+
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": "PDF page numbers attached: " + ", ".join(str(p["page"]) for p in pages)}
+    ]
+    for page in pages:
+        b64 = base64.b64encode(page["content"]).decode("ascii")
+        content.append({"type": "text", "text": f"PDF page {page['page']}"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    client = create_client({"api_key": api_key, "base_url": base_url}, timeout=90.0)
+    try:
+        raw = _call(
+            client,
+            model,
+            [
+                {"role": "system", "content": HYDRA_SEARCH_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            reasoning_effort="none",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    parsed, _ = decode_json_object(raw, expected_keys=frozenset({"pages"}))
+    return parsed
+
+
+def _parse_hydra_pages_payload(payload: Any, allowed: set[int]) -> list[int]:
+    if isinstance(payload, str):
+        from multiple_description_parse import decode_json_object
+        payload, _ = decode_json_object(payload, expected_keys=frozenset({"pages"}))
+    if not isinstance(payload, dict) or set(payload) != {"pages"}:
+        raise ValueError("invalid hydra search response")
+    raw_pages = payload.get("pages")
+    if not isinstance(raw_pages, list):
+        raise ValueError("invalid hydra pages list")
+    selected: list[int] = []
+    for val in raw_pages:
+        if isinstance(val, bool):
+            raise ValueError("invalid hydra page entry")
+        if isinstance(val, int):
+            num = val
+        elif isinstance(val, str) and val.strip().isdigit():
+            num = int(val.strip())
+        else:
+            raise ValueError("invalid hydra page entry")
+        if num in allowed and num not in selected:
+            selected.append(num)
+    return sorted(selected)
+
+
+def _screen_pages_with_ocr(
+    path: Path,
+    numbers: list[int],
+    *,
+    ocr_dpi: int,
+    ocr_fn: Callable[[Path, int], str] | None,
+    current: Callable[[], bool],
+    progress: Callable[[str], None] | None,
+) -> dict[int, dict[str, Any]]:
+    """Third-line defense: embedded text + local RapidOCR scan for unresolved pages."""
+    results: dict[int, dict[str, Any]] = {}
+    if not numbers:
+        return results
+    try:
+        import pymupdf
+    except Exception:  # noqa: BLE001
+        return {n: {"inspected": False, "matched": True, "needs_next": False} for n in numbers}
+
+    engine_ready = ocr_fn is not None or ocr_pages.available()
+    try:
+        doc = pymupdf.open(str(path))
+    except Exception:  # noqa: BLE001
+        return {n: {"inspected": False, "matched": True, "needs_next": False} for n in numbers}
+    try:
+        for n in numbers:
+            check(current)
+            if not 1 <= n <= len(doc):
+                results[n] = {"inspected": False, "matched": True, "needs_next": False}
+                continue
+            page = doc.load_page(n - 1)
+            try:
+                embedded = page.get_text("text") or ""
+            except Exception:  # noqa: BLE001
+                embedded = ""
+            matched, needs_next = _ocr_page_has_legal_description(embedded)
+            inspected = bool(embedded.strip())
+            try:
+                has_images = bool(page.get_images(full=False))
+            except Exception:  # noqa: BLE001
+                has_images = False
+            if not matched and (len(embedded.strip()) < 60 or has_images) and engine_ready:
+                try:
+                    if ocr_fn is not None:
+                        ocr_text = ocr_fn(path, n)
+                    else:
+                        ocr_text = ocr_pages.ocr_pdf_pages(
+                            path, n, n, dpi=ocr_dpi, progress=progress, use_cache=True,
+                        )
+                    ocr_matched, ocr_next = _ocr_page_has_legal_description(ocr_text or "")
+                    matched = matched or ocr_matched
+                    needs_next = needs_next or ocr_next
+                    inspected = True
+                except ocr_pages.OcrUnavailable:
+                    pass
+                except ocr_pages.OcrError:
+                    # OcrError (e.g. blank image page with no recognized text) still inspected the page.
+                    inspected = True
+                except Exception:  # noqa: BLE001
+                    pass
+            results[n] = {
+                "inspected": inspected,
+                "matched": matched if inspected else True,
+                "needs_next": needs_next if (inspected and matched) else False,
+            }
+    finally:
+        doc.close()
+    return results
+
+
 def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: str,
                base_url: str = BASE_URL, image_side: int = dp.PDF_IMAGE_MAX_SIDE,
                send: Callable[..., Any] | None = None,
+               hydra_api_key: str | None = None,
+               hydra_base_url: str = HYDRA_BASE_URL,
+               hydra_model: str = HYDRA_FALLBACK_MODEL,
+               hydra_send: Callable[..., Any] | None = None,
+               ocr_fallback: bool = False,
+               ocr_dpi: int = 200,
+               ocr_fn: Callable[[Path, int], str] | None = None,
                current: Callable[[], bool] = lambda: True,
                progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Evaluate up to 200 pages and save a diagnostic sidecar; never build geometry.
@@ -232,6 +476,9 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     send = send or dp.post_routerai
     attempts: list[dict[str, Any]] = []
     results = []
+    auth_rejected = threading.Event()
+    auth_lock = threading.Lock()
+    auth_notified = False
 
     def process_group(group: list[int]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Один батч страниц: кэш, основная модель, ограниченные повторы, запасная.
@@ -248,8 +495,8 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         observed: dict[int, dict[str, Any]] = {}
         count_result: dict[str, Any] = {"status": "unknown", "value": None}
 
-        def attempt(numbers: list[int], model: str, include_count: bool) -> None:
-            nonlocal count_result
+        def attempt(numbers: list[int], model: str, include_count: bool) -> bool:
+            nonlocal auth_notified, count_result
             check(current)
             pages = [rendered[n] for n in numbers]
             questions = questions_for(numbers, count=include_count)
@@ -260,6 +507,8 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                 answers = {name: ({"status": "ok", "value": cached[name]} if name in cached else
                                   {"status": "error", "value": None}) for name in questions}
                 error, seconds, source, usage = None, 0.0, "cache", None
+            elif auth_rejected.is_set():
+                return False
             else:
                 emit(progress, f"Поиск: запрос {model}, страницы {page_list(numbers)}; ожидаем ответ.")
                 check(current)
@@ -283,6 +532,18 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
             if include_count and count_result["status"] != "ok" and answers["count"]["status"] == "ok":
                 count_result = {"status": "ok", "value": answers["count"]["value"],
                                 "model": model, "source": source}
+            if error in ("http_401", "http_403"):
+                auth_rejected.set()
+                notify = False
+                with auth_lock:
+                    if not auth_notified:
+                        auth_notified = True
+                        notify = True
+                if notify:
+                    emit(progress, "Поиск: доступ к RouterAI отклонён (ошибка авторизации) — "
+                                   "дальнейшие запросы поиска остановлены.")
+                return False
+            return True
 
         if pending:
             # A complete initial batch may use Jev cache when its precise request
@@ -298,7 +559,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
                     attempt(available, model, len(available) == len(group))
                     used_cache = True
             pending = [n for n in available if n not in observed]
-            if not used_cache:
+            if not used_cache and pending and not auth_rejected.is_set():
                 attempt(pending, PRIMARY, len(available) == len(group))
                 pending = [n for n in pending if n not in observed]
             # A cache read costs no live attempt. When some cached answers are
@@ -307,14 +568,16 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
             # кандидаты как неполная, а живой прогон 24.11.2026 показал, как
             # один батч гоняли пять раз по ~150 с тайм-аута подряд.
             microsoft_attempts = 0 if used_cache else 1
-            while pending and microsoft_attempts < 2:
-                attempt(pending, PRIMARY, False)
+            while pending and microsoft_attempts < 2 and not auth_rejected.is_set():
+                if not attempt(pending, PRIMARY, False):
+                    break
                 microsoft_attempts += 1
                 pending = [n for n in pending if n not in observed]
             for _ in range(2):
-                if not pending:
+                if not pending or auth_rejected.is_set():
                     break
-                attempt(pending, FALLBACK, False)
+                if not attempt(pending, FALLBACK, False):
+                    break
                 pending = [n for n in pending if n not in observed]
         return {"pages": group, "count": count_result,
                 "observations": {str(n): observed.get(n) for n in group}}, local_attempts
@@ -324,8 +587,6 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     if len(groups) <= 1:
         batch_outputs = [process_group(groups[0])] if groups else []
     else:
-        from concurrent.futures import ThreadPoolExecutor
-
         with ThreadPoolExecutor(max_workers=min(4, len(groups)),
                                 thread_name_prefix="page-search") as pool:
             batch_outputs = list(pool.map(process_group, groups))
@@ -333,13 +594,140 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         results.append(batch_result)
         attempts.extend(batch_attempts)
     check(current)
+
+    # Identify pages that Tier 1 (RouterAI Microsoft / Jev) did not answer.
+    unresolved = [
+        n for n in range(1, covered + 1)
+        if n in rendered and all(b["observations"][str(n)] is None for b in results if n in b["pages"])
+    ]
+    hydra_enabled = bool((hydra_api_key or hydra_send is not None) and hydra_base_url.startswith("https://"))
+    hydra_observed: dict[int, dict[str, Any]] = {}
+    ocr_observed: dict[int, dict[str, Any]] = {}
+    if unresolved and (hydra_enabled or ocr_fallback):
+        check(current)
+        if hydra_enabled and ocr_fallback:
+            emit(progress, f"Поиск: RouterAI не ответил по {len(unresolved)} стр. — "
+                           f"параллельно отправляю чанки по 8 стр. в Hydra ({hydra_model}) и запускаю локальный OCR.")
+        elif hydra_enabled:
+            emit(progress, f"Поиск: RouterAI не ответил по {len(unresolved)} стр. — "
+                           f"отправляю чанки по 8 стр. в Hydra ({hydra_model}).")
+        else:
+            emit(progress, f"Поиск: RouterAI не ответил по {len(unresolved)} стр. — "
+                           "проверяю страницы локальным OCR.")
+
+        hydra_auth_failed = threading.Event()
+        hydra_chunks = _chunk_numbers(unresolved, dp.ROUTERAI_IMAGE_LIMIT) if hydra_enabled else []
+        hydra_caller = hydra_send or _default_hydra_search_send
+
+        def run_hydra_chunk(chunk: list[int]) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+            check(current)
+            chunk_pages = [rendered[n] for n in chunk]
+            questions = _hydra_questions(chunk)
+            fp = _hydra_fingerprint(digest, chunk_pages, hydra_model, image_side, hydra_base_url)
+            cached = _cached(history, fp, questions, hydra_model)
+            answers: dict[str, Any] = {}
+            error_kind: str | None = None
+            source = "hydra_network"
+            started = time.monotonic()
+            chunk_obs: dict[int, dict[str, Any]] = {}
+            if cached and len(cached) == len(chunk):
+                source = "hydra_cache"
+                for n in chunk:
+                    val = cached[f"page_{n}"]
+                    answers[f"page_{n}"] = {"status": "ok", "value": val}
+                    chunk_obs[n] = {"value": val, "model": hydra_model, "source": source}
+                emit(progress, f"Поиск: кэш Hydra {hydra_model}, страницы {page_list(chunk)}.")
+            elif hydra_auth_failed.is_set():
+                error_kind = "http_401"
+                answers = {name: {"status": "error", "value": None} for name in questions}
+            else:
+                emit(progress, f"Поиск: запрос Hydra {hydra_model}, страницы {page_list(chunk)}.")
+                check(current)
+                try:
+                    with waiting(progress):
+                        raw_resp = hydra_caller(hydra_base_url, hydra_api_key or "", hydra_model, chunk_pages)
+                    check(current)
+                    matched = set(_parse_hydra_pages_payload(raw_resp, set(chunk)))
+                    for n in chunk:
+                        val = 1.0 if n in matched else 0.0
+                        answers[f"page_{n}"] = {"status": "ok", "value": val}
+                        chunk_obs[n] = {"value": val, "model": hydra_model, "source": source}
+                except Exception as exc:  # noqa: BLE001
+                    status = getattr(exc, "status_code", None)
+                    if status is None and isinstance(exc, httpx.HTTPStatusError):
+                        status = exc.response.status_code
+                    if status in (401, 403):
+                        error_kind = f"http_{status}"
+                        hydra_auth_failed.set()
+                    elif isinstance(exc, httpx.TimeoutException) or "timeout" in str(exc).lower():
+                        error_kind = "timeout"
+                    else:
+                        error_kind = f"http_{status}" if status else "processing_error"
+                    answers = {name: {"status": "error", "value": None} for name in questions}
+            seconds = round(time.monotonic() - started, 3)
+            emit(progress, f"Поиск: ответ Hydra {hydra_model}, страниц {len(chunk_obs)}/{len(chunk)}, "
+                           f"{seconds:.1f} с" + (f", {error_kind}" if error_kind else "") + ".")
+            attempt_rec = {
+                "batch_pages": chunk, "pages": chunk, "model": hydra_model,
+                "fingerprint": fp, "source": source, "seconds": seconds,
+                "usage": None, "error_kind": error_kind, "answers": answers,
+            }
+            return chunk_obs, attempt_rec
+
+        worker_count = max(1, (min(4, len(hydra_chunks)) if hydra_chunks else 0) + (1 if ocr_fallback else 0))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="page-search-fallback") as pool:
+            ocr_future = (
+                pool.submit(
+                    _screen_pages_with_ocr,
+                    path, unresolved, ocr_dpi=ocr_dpi, ocr_fn=ocr_fn,
+                    current=current, progress=progress,
+                )
+                if ocr_fallback else None
+            )
+            hydra_futures = [pool.submit(run_hydra_chunk, chunk) for chunk in hydra_chunks]
+            for fut in hydra_futures:
+                chunk_obs, attempt_rec = fut.result()
+                hydra_observed.update(chunk_obs)
+                attempts.append(attempt_rec)
+            if ocr_future is not None:
+                ocr_observed = ocr_future.result()
+        check(current)
+
+    # Compute OCR continuation flags (if page n started an LD without closing POB, include n + 1).
+    ocr_continuation: set[int] = set()
+    for n in unresolved:
+        info = ocr_observed.get(n)
+        if info and info.get("inspected") and info.get("matched") and info.get("needs_next"):
+            if (n + 1) in rendered and (n + 1) in unresolved:
+                ocr_continuation.add(n + 1)
+
     page_results = []
     for n in range(1, covered + 1):
         obs = [b["observations"][str(n)] for b in results if n in b["pages"]]
         valid = [x["value"] for x in obs if x is not None]
-        incomplete = any(x is None for x in obs)
-        maximum = max(valid) if valid else None
-        candidate = n in rendered and (incomplete or (maximum is not None and maximum >= THRESHOLD))
+        if valid:
+            incomplete = any(x is None for x in obs)
+            maximum = max(valid)
+            candidate = n in rendered and (incomplete or maximum >= THRESHOLD)
+        elif n in hydra_observed:
+            h_obs = hydra_observed[n]
+            obs = [h_obs]
+            maximum = h_obs["value"]
+            incomplete = False
+            candidate = n in rendered and maximum >= THRESHOLD
+        elif n in ocr_observed:
+            o_info = ocr_observed[n]
+            inspected = bool(o_info.get("inspected"))
+            matched = bool(o_info.get("matched")) or (n in ocr_continuation)
+            obs = [{"value": None, "model": "ocr", "source": "ocr_fallback",
+                    "inspected": inspected, "matched": matched}]
+            maximum = None
+            incomplete = True
+            candidate = n in rendered and (matched if inspected else True)
+        else:
+            incomplete = any(x is None for x in obs)
+            maximum = None
+            candidate = n in rendered and incomplete
         page_results.append({"page": n, "observations": obs, "max_probability": maximum,
                              "incomplete": incomplete, "image_available": n in rendered,
                              "candidate": candidate})
@@ -355,9 +743,9 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         if file_metadata._digest(path) != digest:
             raise SearchError("PDF changed during search; results were not saved.")
         with file_metadata._LOCK:
-            current = _load_history(target)
-            current["runs"].append(run)
-            file_metadata._write_json(target, current)
+            saved_history = _load_history(target)
+            saved_history["runs"].append(run)
+            file_metadata._write_json(target, saved_history)
     except SearchError:
         raise
     except OSError as exc:

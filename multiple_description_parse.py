@@ -26,16 +26,44 @@ MAX_PARSE_CALLS = 4
 MAX_ORDINARY_FAILURES = 3
 SCHEMA_VERSION = "multiple-legal-descriptions-v4"
 INSTRUCTION = (
+    "You are a senior licensed New York / USA land-survey technician. "
     "Read all supplied whole PDF pages. Return every separate land boundary "
     "description as a separate item in document order, including repeated "
     "descriptions. Do not select a single lot. Keep each description's sides "
-    "together and in order. Lot identifiers from the filename and portal are "
-    "context only, not a reason to exclude a description. Do not invent "
-    "unreadable sides or claim a cut-off description is complete. Return JSON "
-    "with descriptions (each item: complete, data) and complete (boolean). "
+    "together and in continuous loop order. Lot identifiers from the filename "
+    "and portal are context only, not a reason to exclude a description. Do not "
+    "invent unreadable sides or claim a cut-off description is complete. Return "
+    "JSON with descriptions (each item: complete, data) and complete (boolean). "
     "For corner_to_pob_bearing give a bearing only when the document explicitly "
     "states that bearing from the intersection to POB; otherwise use null. "
-    "Do not calculate or infer this bearing from a frontage or from a word direction."
+    "Do not calculate or infer this bearing from a frontage or from a word direction. "
+    "SURVEY EXTRACTION RULES: "
+    "(1) Orientation & North arrow first: if a scan or survey plat is tilted, sideways "
+    "(90°/270°), or upside-down (180°), determine true orientation from the title block, "
+    "street labels, and drawn NORTH ARROW before determining front_side or directions; "
+    "double-check upside-down or faded 1980s glyphs (6<->9, 3<->8, 5<->6, 1<->7, 0<->8). "
+    "(2) Tie lines & offsets: NEVER include COMMENCING / corner tie calls from a street "
+    "intersection to POB in segments (record the immediate corner distance along main_street "
+    "in distance_to_corner_ft, 0.0 for a corner lot, and compound/dual ties in tie_note); "
+    "NEVER include building wall dimensions or fence/setback offsets (FE. 0.1'W, GARAGE, "
+    "SHED, 2-sty frame) in segments. "
+    "(3) Strict verbatim rule: ALWAYS keep the exact printed numbers, bearings, degrees, "
+    "minutes, seconds, and quadrant letters in segments even when a polygon does not close; "
+    "NEVER silently substitute digits (such as changing 54 to 56) to force closure — report "
+    "any suspected typo or blurred glyph in Russian in anomaly_note (otherwise null). "
+    "(4) Courses, relative NYC directions & inches: use has_bearing=false when a side uses "
+    "cardinal/relative wording (PARALLEL WITH ..., AT RIGHT ANGLES TO ..., interior_angle) "
+    "without a printed compass bearing; capture exact vertex interior_angle when shown; "
+    "convert feet-and-inches and fractional inches accurately to decimal feet (e.g. "
+    "25'-6 1/2\" -> 25.5417) while keeping the printed form in distance_source; set "
+    "party_wall=true only when explicitly stated as a party wall; use chord bearing + "
+    "chord distance for curved boundaries. "
+    "(5) Streets & frontage: keep main_street and cross_street verbatim (putting parenthetical "
+    "easements/widths in main_street_note and former/a/k/a street names in main_street_former "
+    "/ cross_street_former); pick front_segment_index strictly on main_street (never a "
+    "PARALLEL WITH / AT RIGHT ANGLES rear/side wall); for the frontage segment ONLY, set "
+    "course_note to the clean printed street name without 'along the northerly side of' or "
+    "direction phrases, while keeping non-frontage course_note values verbatim."
 )
 
 
@@ -240,14 +268,75 @@ def _recover_prefix(text: str) -> list[Any]:
     return recovered
 
 
+def extract_json_text(raw: str) -> str:
+    """Strip reasoning tags and Markdown fences around a JSON reply."""
+    text = raw.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    lower = text.lower()
+    if "</think>" in lower:
+        idx = lower.rfind("</think>")
+        text = text[idx + len("</think>") :].strip()
+    fences = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    for inner in fences:
+        stripped = inner.strip()
+        if stripped.startswith("{"):
+            return stripped
+    if fences:
+        return fences[0].strip()
+    open_fence = re.search(r"```(?:json)?\s*([\s\S]+)$", text, flags=re.IGNORECASE)
+    if open_fence:
+        return open_fence.group(1).strip()
+    return text
+
+
+def decode_json_object(raw: str, *, expected_keys: frozenset[str] | None = None) -> tuple[Any, str]:
+    """Decode a complete JSON value from wrapped/prose text, returning (value, cleaned_text)."""
+    cleaned = extract_json_text(raw)
+    try:
+        return json.loads(cleaned), cleaned
+    except (ValueError, RecursionError):
+        pass
+    decoder = json.JSONDecoder()
+    if cleaned.startswith("{"):
+        value, end = decoder.raw_decode(cleaned, 0)
+        if not isinstance(value, dict) or cleaned[end:].strip().startswith("{"):
+            raise ValueError("invalid json envelope")
+        return value, cleaned
+    fallback_value: Any = None
+    has_fallback = False
+    pos = cleaned.find("{")
+    while pos != -1:
+        try:
+            value, _end = decoder.raw_decode(cleaned, pos)
+        except (ValueError, RecursionError):
+            pos = cleaned.find("{", pos + 1)
+            continue
+        if isinstance(value, dict):
+            if expected_keys is None or set(value) == expected_keys:
+                return value, cleaned
+            if not has_fallback:
+                fallback_value = value
+                has_fallback = True
+        pos = cleaned.find("{", pos + 1)
+    if has_fallback:
+        return fallback_value, cleaned
+    raise ValueError("no json object found")
+
+
 def read_response(raw: str, pages: Sequence[int]) -> Attempt:
     """Validate entries independently; never store raw response or image data."""
     if not isinstance(raw, str):
         return Attempt(tuple(pages), (), False, False, "invalid_response")
+    cleaned = extract_json_text(raw)
     try:
-        value = json.loads(raw)
+        value, cleaned = decode_json_object(raw, expected_keys=frozenset({"descriptions", "complete"}))
     except (ValueError, RecursionError):
-        items, _ = _items(_recover_prefix(raw))
+        recovery_text = cleaned
+        if not recovery_text.startswith("{"):
+            match = re.search(r'\{\s*"descriptions"\s*:\s*\[', recovery_text)
+            if match is not None:
+                recovery_text = recovery_text[match.start():]
+        items, _ = _items(_recover_prefix(recovery_text))
         return Attempt(tuple(pages), items, False, False, "invalid_json")
     if (not isinstance(value, dict) or set(value) != {"descriptions", "complete"}
             or not isinstance(value["complete"], bool)):
@@ -365,6 +454,9 @@ def parse_pages(
             attempts.append(Attempt(tuple(p.number for p in current), (), False, False, "request_failed", kind, elapsed))
             ordinary_failures += 1
             error = "request_failed"
+            if kind in ("http_401", "http_403"):
+                emit(progress, "Разбор: доступ отклонён провайдером (ошибка авторизации) — повторы остановлены.")
+                break
             continue
         check(current_job)
         attempt = read_response(response, [p.number for p in current])

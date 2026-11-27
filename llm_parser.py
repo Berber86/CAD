@@ -402,6 +402,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vision_dpi": 220,
         "vision_max_pages": 8,
         "vision_enhance_scans": True,
+        "vision_output_format": "auto",
         "vision_auto_orient": False,
         "ask_on_doubt": True,
         "providers": copy.deepcopy(PROVIDERS_CATALOG),
@@ -6186,6 +6187,9 @@ def _prepare_parse_input(
                     progress(
                         f"PDF «{p_name}» ({reason}) — рендерю страницы ({dpi} DPI) для Vision LLM…"
                     )
+                eff_fmt = str(cfg["api"].get("vision_output_format") or "auto").strip().lower()
+                if eff_fmt not in ("auto", "png", "jpeg"):
+                    eff_fmt = "auto"
                 pdf_urls = render_pdf_pages_base64(
                     eff_pdf_path,
                     dpi=dpi,
@@ -6193,7 +6197,7 @@ def _prepare_parse_input(
                     pages=pdf_pages,
                     rotation_deg=rotation_deg,
                     enhance_scan=do_enhance,
-                    output_format="auto",
+                    output_format=eff_fmt,
                 )
                 image_data_urls.extend(pdf_urls)
                 warnings.append(

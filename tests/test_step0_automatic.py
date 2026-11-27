@@ -9,6 +9,7 @@ import deed_pages
 import test_gui_smoke as smoke
 import test_step0_intake_flow as intake
 from test_multiple_description_gui_flow import setup_app
+from test_print_draft import fake_autocad  # noqa: F401
 
 gui = smoke.gui
 
@@ -383,3 +384,155 @@ def test_auto_early_our_failure_still_draws_the_neighbour(gui, tmp_path, monkeyp
     _drain_until(app, lambda: bool(submitted))
     assert [(item.path.name, item.is_main) for item in submitted[0]] == [
         ("LOT 30 NEW.pdf", False)]
+
+
+def test_auto_early_plus_neighbours_keeps_single_stream_and_never_reruns_step1(
+        gui, tmp_path, monkeypatch):
+    import threading
+
+    our_parse_entered = threading.Event()
+    release_our_parse = threading.Event()
+    phase2_collect_started = threading.Event()
+
+    def slow_parse(images, context):
+        if context.get("filename_lot") == "32":
+            our_parse_entered.set()
+            assert release_our_parse.wait(5)
+        from test_multiple_description_parse import answer
+        from test_multiple_description_runtime import described
+        return answer([described(context.get("filename_lot") or "32", 55.42)], complete=True)
+
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=slow_parse)
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path / "docs"))
+    fake_portal(app, monkeypatch)
+    seen = []
+    actual_collect = gui.deed_intake.collect_deeds
+
+    def collect(**kwargs):
+        seen.append(dict(kwargs))
+        if len(seen) == 2:
+            phase2_collect_started.set()
+        kwargs.update(fetch_list=intake._fetch(),
+                      downloader=intake._downloader(tmp_path),
+                      page_finder=lambda _: pytest.fail("legacy page finder"))
+        return actual_collect(**kwargs)
+
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    monkeypatch.setattr(app, "_submit_pdf_set", lambda *a, **kw: pytest.fail("must not rerun Step 1"))
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    # Phase 1 AI parsing starts in background while Phase 1 download finishes without blocking Phase 2.
+    assert our_parse_entered.wait(5)
+    _drain_until(app, lambda: not app._step0_running and app._step0_our_outcome is not None)
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    # Phase 2 starts downloading immediately while Phase 1 AI is STILL blocked on release_our_parse!
+    assert phase2_collect_started.wait(5)
+    release_our_parse.set()
+    wait_all(app)
+    assert len(seen) == 2
+    assert {item.path.name: item.is_main for item in app.pdf_set} == {
+        "OUR LOT 32 NEW.pdf": True, "LOT 30 NEW.pdf": False}
+    assert calls["search"] == 2 and calls["parse"] == 2
+    assert app._step0_auto_stage is None and app._multi_scene_handoff is not None
+    assert not any("не подошёл" in line for _lvl, line in app._step0_lines)
+
+
+def test_auto_early_without_neighbours_waits_for_running_stream_without_rerun(
+        gui, tmp_path, monkeypatch):
+    import threading
+
+    our_parse_entered = threading.Event()
+    release_our_parse = threading.Event()
+
+    def slow_parse(images, context):
+        our_parse_entered.set()
+        assert release_our_parse.wait(5)
+        from test_multiple_description_parse import answer
+        from test_multiple_description_runtime import described
+        return answer([described("32", 55.42)], complete=True)
+
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=slow_parse)
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path / "docs"))
+    fake_portal(app, monkeypatch)
+    seen = []
+    _collect_spy(gui, monkeypatch, tmp_path, seen)
+    monkeypatch.setattr(app, "_submit_pdf_set", lambda *a, **kw: pytest.fail("must not rerun Step 1"))
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    assert our_parse_entered.wait(5)
+    _drain_until(app, lambda: not app._step0_running and app._step0_our_outcome is not None)
+    app._finish_step0_portal_lookup("error", "PortalLookupError: failed")
+    assert app._step0_auto_stage == "parse" and app._busy
+    release_our_parse.set()
+    wait_all(app)
+    assert calls["search"] == 1 and calls["parse"] == 1
+    assert app._multi_scene_handoff is not None and len(app._scene_plans()) == 1
+
+
+def test_auto_falls_back_to_our_old_when_our_new_fails_and_writes_old_label_to_dwg(
+        gui, tmp_path, monkeypatch, fake_autocad):
+    import types
+    from test_multiple_description_parse import answer
+    from test_multiple_description_runtime import described
+
+    parse_calls = []
+
+    def parse(images, context):
+        parse_calls.append(context.get("filename_lot"))
+        # First call for OUR NEW fails badly (empty descriptions); OUR OLD & neighbour succeed!
+        if len(parse_calls) == 1:
+            return answer([], complete=True)
+        return answer([described(context.get("filename_lot") or "30", 55.42)], complete=True)
+
+    app, calls = setup_app(gui, monkeypatch, tmp_path, parse=parse)
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path / "docs"))
+    fake_portal(app, monkeypatch)
+    _collect_spy(gui, monkeypatch, tmp_path, [])
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    wait_all(app)
+    assert {item.path.name: item.is_main for item in app.pdf_set} == {
+        "OUR LOT 32 OLD.pdf": True, "LOT 30 NEW.pdf": False}
+    # Neighbour LOT 30 NEW.pdf came from cache on the fallback pass!
+    assert len(parse_calls) == 3  # OUR NEW (1) + LOT 30 (2) + OUR OLD (3)
+    assert app._auto_dwg_context is not None
+
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    texts = [t.TextString for t in doc.ModelSpace.texts]
+    assert "OLD 32" in texts and "LOT 30" in texts
+    dwg, = (tmp_path / "docs").glob("lot_32_*.dwg")
+    warnings_text = gui.auto_dwg_save.warnings_path_for(dwg).read_text(encoding="utf-8")
+    assert "OUR OLD" in warnings_text and "OLD 32" in warnings_text
+
+
+def test_auto_promotes_our_old_when_our_new_missing_from_download(gui, tmp_path, monkeypatch):
+    app, calls = setup_app(gui, monkeypatch, tmp_path)
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path / "docs"))
+    fake_portal(app, monkeypatch)
+
+    actual_collect = gui.deed_intake.collect_deeds
+    def collect(**kwargs):
+        kwargs.update(fetch_list=intake._fetch(),
+                      downloader=intake._downloader(tmp_path, fail_ids=(str(intake.OUR_NEW),)),
+                      page_finder=lambda _: pytest.fail("legacy page finder"))
+        return actual_collect(**kwargs)
+    monkeypatch.setattr(gui.deed_intake, "collect_deeds", collect)
+    app._start_step0_auto()
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    wait_all(app)
+    assert {item.path.name: item.is_main for item in app.pdf_set} == {
+        "OUR LOT 32 OLD.pdf": True, "LOT 30 NEW.pdf": False}
+    assert any("OLD 32" in line for _lvl, line in app._step0_lines)
+
+

@@ -357,3 +357,42 @@ def test_failure_diagnostics_include_safe_status_and_elapsed_without_provider_me
 def test_size_rejection_does_not_invent_http_status():
     result = call(lambda *a: (_ for _ in ()).throw(md.ImageSizeRejected()), n=2)
     assert all(a.failure_kind == 'size_rejected' for a in result.attempts)
+
+
+@pytest.mark.parametrize('wrapper', [
+    lambda s: '```json\n' + s + '\n```',
+    lambda s: '<think>planning {"ignore": true}</think>\n```json\n' + s + '\n```\nDone.',
+    lambda s: 'Unclosed thoughts</think>\nHere is the JSON:\n' + s + '\nThanks!',
+])
+def test_read_response_accepts_fenced_think_and_prose_wrapped_json(wrapper):
+    payload = answer([item('5'), item('6')])
+    attempt = md.read_response(wrapper(payload), [1, 2])
+    assert attempt.valid_response and attempt.complete
+    assert [i.data.lot_number for i in attempt.items] == ['5', '6']
+
+
+def test_read_response_recovers_truncated_prefix_inside_unclosed_fence_or_preamble():
+    first = json.dumps(item('5'))
+    truncated = 'Here is the JSON:\n```json\n{"descriptions": [' + first + ', {"complete": true, "data": '
+    attempt = md.read_response(truncated, [2, 3])
+    assert [i.data.lot_number for i in attempt.items] == ['5']
+    assert attempt.issue == 'invalid_json'
+    bad = 'Here:\n```json\n{"other":[], "descriptions": [' + first + ', '
+    assert not md.read_response(bad, [1]).items
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_parse_pages_stops_retrying_on_auth_error(status):
+    class AuthError(Exception):
+        status_code = status
+
+    calls = []
+    def send(*a):
+        calls.append(1)
+        raise AuthError('SECRET KEY')
+
+    result = call(send)
+    assert len(calls) == 1
+    assert len(result.attempts) == 1
+    assert result.attempts[0].failure_kind == f'http_{status}'
+

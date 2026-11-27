@@ -564,3 +564,36 @@ def test_scene_builds_corner_and_distance_like_normal_mode_for_neighbor():
         assert any(t.kind == label_kind and t.text == "LOT 17" for t in plan.items)
     # Исходное описание сценой не переписано: в кэше не появится выдуманный румб.
     assert parsed_item.data.corner_to_pob_bearing is None
+
+
+def test_drawing_sanitizes_relative_front_and_interior_cross_street_like_legacy():
+    from pathlib import Path
+    raw = {
+        "main_street": "Queens Blvd",
+        "cross_street": "63rd Drive",
+        "distance_to_corner_ft": 80.0,
+        "front_side": "S",
+        "front_segment_index": 1,  # mistakenly points at PARALLEL WITH rear line!
+        "cross_street_side_index": 2,  # invalid for non-corner interior lot!
+        "lot_number": "76",
+        "segments": [
+            {"ns": "N", "degrees": 0, "minutes": 0, "seconds": 0.0, "ew": "E", "distance_ft": 100.0, "has_bearing": True},
+            {"ns": "S", "degrees": 90, "minutes": 0, "seconds": 0.0, "ew": "E", "distance_ft": 40.0, "has_bearing": True,
+             "course_note": "PARALLEL WITH QUEENS BLVD"},
+            {"ns": "S", "degrees": 0, "minutes": 0, "seconds": 0.0, "ew": "E", "distance_ft": 100.0, "has_bearing": True},
+            {"ns": "N", "degrees": 90, "minutes": 0, "seconds": 0.0, "ew": "W", "distance_ft": 40.0, "has_bearing": True},
+        ],
+    }
+    parsed = parse.DescriptionItem(parse._validated_description(llm_parser.LegalDescription, raw), True)
+    cleaned = drawing._drawing_description(
+        drawing.DescriptionSource(Path("OUR LOT 76 OLD.pdf"), True, parsed)
+    )
+    assert cleaned.front_segment_index is None
+    assert cleaned.cross_street_side_index is None
+    assert lot_identity.lot_label(cleaned) == "OLD 76"
+    builder = ab.AcadBuilder(llm_parser.load_config())
+    scene = drawing.plan_scene(builder, [drawing.DescriptionSource(Path("OUR LOT 76 OLD.pdf"), True, parsed)])
+    plan = scene.plans[0].plan
+    assert any(t.text == "OLD 76" and t.kind == "main-lot-label" for t in plan.items)
+    assert any("OUR OLD" in w and "OLD 76" in w for w in plan.warnings)
+

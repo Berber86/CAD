@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from multiple_description_errors import ProviderResponseError
 from multiple_description_parse import (Attempt, COMPARISON_INSTRUCTION, ImageSizeRejected, PageImage,
-                                        system_instruction)
+                                        decode_json_object, system_instruction)
 
 
 def _images(pages: Sequence[PageImage]) -> list[dict[str, Any]]:
@@ -33,33 +33,58 @@ def _content(completion: Any) -> str:
         content = message.content
     except (AttributeError, IndexError, TypeError) as exc:
         raise ProviderResponseError('invalid_provider_response') from exc
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get('text'), str):
+                parts.append(item['text'])
+            elif isinstance(getattr(item, 'text', None), str):
+                parts.append(item.text)
+        content = ''.join(parts)
     if not isinstance(content, str) or not content:
         raise ProviderResponseError('empty_response')
     return content
 
 
 def _call(client: Any, model: str, messages: list[dict[str, Any]],
-          reasoning_effort: str | None = None) -> str:
+          reasoning_effort: str | None = None,
+          *,
+          temperature: float | None = 0.0,
+          response_format: Mapping[str, Any] | None = None) -> str:
     kwargs: dict[str, Any] = {}
+    if temperature is not None:
+        kwargs['temperature'] = float(temperature)
+    if response_format is not None:
+        kwargs['response_format'] = dict(response_format)
     if reasoning_effort:
         kwargs['extra_body'] = {'reasoning_effort': reasoning_effort}
-    try:
-        completion = client.chat.completions.create(model=model, messages=messages, **kwargs)
-    except Exception as exc:
-        if kwargs and ('reasoning' in str(exc).lower()):
-            # Провайдер отверг уровень рассуждений — один повтор без него.
-            try:
-                completion = client.chat.completions.create(model=model, messages=messages)
-            except Exception as retry_exc:
-                exc = retry_exc
-            else:
-                return _content(completion)
-        # Only a clear HTTP 413 establishes a request-size rejection; generic
-        # 400/timeout/network failures must not cause automatic reduction.
-        if getattr(exc, 'status_code', None) == 413:
-            raise ImageSizeRejected(status_code=413) from exc
-        raise
-    return _content(completion)
+    for _ in range(3):
+        try:
+            completion = client.chat.completions.create(model=model, messages=messages, **kwargs)
+            return _content(completion)
+        except Exception as exc:
+            # Only a clear HTTP 413 establishes a request-size rejection; generic
+            # 400/timeout/network failures must not cause automatic reduction.
+            status = getattr(exc, 'status_code', None)
+            if status == 413:
+                raise ImageSizeRejected(status_code=413) from exc
+            msg = str(exc).lower()
+            dropped = False
+            if isinstance(exc, TypeError) or status in (400, 422):
+                if 'extra_body' in kwargs and ('reasoning' in msg or 'extra_body' in msg):
+                    kwargs.pop('extra_body', None)
+                    dropped = True
+                if 'response_format' in kwargs and ('response_format' in msg or 'json_object' in msg or 'structured' in msg):
+                    kwargs.pop('response_format', None)
+                    dropped = True
+                if 'temperature' in kwargs and 'temperature' in msg:
+                    kwargs.pop('temperature', None)
+                    dropped = True
+            if not dropped:
+                raise
+    raise ProviderResponseError('invalid_provider_response')
 
 
 _T = TypeVar("_T")
@@ -136,7 +161,8 @@ def create_client(target: Mapping[str, str], *, timeout: float = 500) -> Any:
                                    'X-Title': 'Title Survey AI'})
 
 
-def make_sender(client: Any, model: str, reasoning_effort: str | None = None):
+def make_sender(client: Any, model: str, reasoning_effort: str | None = None,
+                *, temperature: float | None = 0.0):
     """Return the parser's ``send`` callback, one request per invocation."""
     system = system_instruction()
 
@@ -146,12 +172,19 @@ def make_sender(client: Any, model: str, reasoning_effort: str | None = None):
         labels = {'filename_lot': context.get('filename_lot'), 'portal_lot': context.get('portal_lot')}
         user = [{'type': 'text', 'text': 'Lot context (not an answer filter): ' +
                  json.dumps(labels, ensure_ascii=False)}, *_images(pages)]
-        return _call(client, model, [{'role': 'system', 'content': system},
-                                    {'role': 'user', 'content': user}], reasoning_effort)
+        return _call(
+            client,
+            model,
+            [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
+            reasoning_effort,
+            temperature=temperature,
+            response_format={'type': 'json_object'},
+        )
     return send
 
 
-def make_selector(client: Any, model: str, reasoning_effort: str | None = None):
+def make_selector(client: Any, model: str, reasoning_effort: str | None = None,
+                  *, temperature: float | None = 0.0):
     """Return an optional one-call tie selector; indices are zero-based."""
     def choose(pages: Sequence[PageImage], attempts: Sequence[Attempt]) -> int:
         variants = [{'index': idx, 'pages': list(attempt.pages),
@@ -160,9 +193,15 @@ def make_selector(client: Any, model: str, reasoning_effort: str | None = None):
                     for idx, attempt in enumerate(attempts)]
         instruction = COMPARISON_INSTRUCTION
         content = [{'type': 'text', 'text': json.dumps(variants, ensure_ascii=False)}, *_images(pages)]
-        raw = _call(client, model, [{'role': 'system', 'content': instruction},
-                                    {'role': 'user', 'content': content}], reasoning_effort)
-        answer = json.loads(raw)
+        raw = _call(
+            client,
+            model,
+            [{'role': 'system', 'content': instruction}, {'role': 'user', 'content': content}],
+            reasoning_effort,
+            temperature=temperature,
+            response_format={'type': 'json_object'},
+        )
+        answer, _ = decode_json_object(raw, expected_keys=frozenset({'selected'}))
         if not isinstance(answer, dict) or set(answer) != {'selected'}:
             raise ValueError('invalid selection')
         selected = answer['selected']

@@ -448,3 +448,33 @@ def test_unavailable_autocad_reports_unsaved_file(gui, tmp_path, monkeypatch):
     smoke._wait_for_gui_worker(app)
     assert "AutoCAD unavailable" in app.status_var.get() and "DWG не сохранён" in app.status_var.get()
     assert not list((tmp_path / "project" / "01_описания").glob("*.dwg"))
+
+
+def test_empty_contours_do_not_arm_auto_dwg_context(gui, tmp_path):
+    from types import SimpleNamespace
+    from multiple_description_drawing import SceneResult
+    from multiple_description_handoff import DocumentView, SceneHandoff
+    from pdf_set import PdfSetItem
+
+    app = gui.SurveyApp()
+    app._multi_pdf_active = True
+    pdf = tmp_path / "01_описания" / "OUR LOT 52 NEW.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF")
+    app.pdf_set = [PdfSetItem(path=pdf, page_texts=[""], is_main=True)]
+    app._step0_auto_identity = ("11 MOSEL LOOP", "Staten Island", "2882", "52")
+    app._step0_outcome = SimpleNamespace(folder=str(pdf.parent))
+    app._step0_auto_stage = "parse"
+    app._auto_dwg_context = ("stale",)
+
+    doc = DocumentView(source=pdf, is_main=True, status="failed", pdf_sha256=None,
+                       cached=False, complete=False, descriptions=())
+    empty_view = SceneHandoff((doc,), SceneResult((), ()))
+    sig = app._source_signature(mode="📄 PDF")
+    app._handle_multi_pdf_done(empty_view, sig)
+    assert app._auto_dwg_context is None
+    assert app._input_incomplete is True
+    assert app._ready_source_signature is None
+    assert app._step0_auto_stage is None
+    assert any("автосохранение DWG отключено" in line for _lvl, line in app._step0_lines)
+

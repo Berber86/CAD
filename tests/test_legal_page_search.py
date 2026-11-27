@@ -440,3 +440,110 @@ def test_batches_run_in_parallel_not_sequence(tmp_path):
     assert peak >= 2, 'батчи должны идти параллельно'
     assert [b['pages'] for b in run['batches']] == [[*range(1, 9)], [*range(8, 16)], [15, 16, 17]]
     assert 1 in run['candidate_pages'] and 15 in run['candidate_pages']
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_http_auth_error_stops_retries_and_fallback(tmp_path, status):
+    pdf = tmp_path / 'auth-fail.pdf'
+    make_pdf(pdf, 17)  # 3 batches
+    calls = []
+    messages = []
+
+    def send(base, key, model, state, assets, qs):
+        calls.append(model)
+        req = httpx.Request('POST', base + '/decisions')
+        raise httpx.HTTPStatusError('auth', request=req, response=httpx.Response(status, request=req))
+
+    run = search.search_pdf(pdf, ON, api_key='bad-key', send=send, progress=messages.append)
+    assert len(calls) <= 3  # at most 1 per parallel batch, zero retries or FALLBACK calls
+    assert all(m == search.PRIMARY for m in calls)
+    assert not run['coverage_complete']
+    assert run['candidate_pages'] == list(range(1, 18))
+    assert sum('ошибка авторизации' in m for m in messages) == 1
+
+
+def test_hydra_8page_chunks_and_simultaneous_ocr_precedence(tmp_path):
+    """When RouterAI fails, Hydra gpt-6-luna (8-page chunks) and OCR run simultaneously; Hydra wins when valid."""
+    import threading
+
+    pdf = tmp_path / 'fallback.pdf'
+    make_pdf(pdf, 10)
+    hydra_chunks = []
+    ocr_pages_called = []
+    ocr_started = threading.Event()
+    hydra_can_finish = threading.Event()
+
+    def failing_router(base, key, model, state, assets, qs):
+        req = httpx.Request('POST', base + '/decisions')
+        raise httpx.HTTPStatusError('auth', request=req, response=httpx.Response(401, request=req))
+
+    def fake_hydra(base, key, model, chunk_pages):
+        assert model == search.HYDRA_FALLBACK_MODEL
+        nums = [p['page'] for p in chunk_pages]
+        hydra_chunks.append(nums)
+        # Ensure OCR started concurrently before Hydra returns!
+        assert ocr_started.wait(3)
+        hydra_can_finish.set()
+        return {'pages': [n for n in nums if n in (2, 9)]}
+
+    def fake_ocr(path, page_no):
+        ocr_pages_called.append(page_no)
+        ocr_started.set()
+        hydra_can_finish.wait(3)
+        # Noisy OCR thinks page 4 has text too, but Hydra's strict verdict should take precedence.
+        return 'BEGINNING AT a point N 4O 15 00 E 100.00 feet' if page_no in (2, 4, 9) else 'Cover sheet'
+
+    run = search.search_pdf(
+        pdf, ON, api_key='bad-router', send=failing_router,
+        hydra_api_key='hydra-key', hydra_send=fake_hydra,
+        ocr_fallback=True, ocr_fn=fake_ocr,
+    )
+    assert sorted(c for ch in hydra_chunks for c in ch) == list(range(1, 11))
+    assert all(len(ch) <= 8 for ch in hydra_chunks)
+    assert len(hydra_chunks) == 2
+    assert sorted(ocr_pages_called) == list(range(1, 11))
+    # Hydra verdict wins over noisy OCR!
+    assert run['candidate_pages'] == [2, 9]
+    assert run['coverage_complete'] is True
+
+    # Repeat call uses Hydra cache in .page-search.json without hitting network again.
+    def no_hydra(*a, **kw):
+        raise AssertionError('expected hydra cache hit')
+
+    run2 = search.search_pdf(
+        pdf, ON, api_key='bad-router', send=failing_router,
+        hydra_api_key='hydra-key', hydra_send=no_hydra,
+        ocr_fallback=False,
+    )
+    assert run2['candidate_pages'] == [2, 9]
+
+
+def test_ocr_third_line_handles_garbled_zeros_and_continuation(tmp_path):
+    """When both RouterAI and Hydra fail, OCR rescues noisy LD pages + continuation page and filters junk."""
+    pdf = tmp_path / 'ocr-rescue.pdf'
+    make_pdf(pdf, 5)
+
+    def failing_router(base, key, model, state, assets, qs):
+        raise httpx.TimeoutException('timeout')
+
+    def failing_hydra(*a, **kw):
+        raise TimeoutError('hydra down')
+
+    texts = {
+        1: 'ACRIS RECORDING COVER PAGE AND ENDORSEMENT STAMP BLOCK 100 LOT 5',
+        2: 'BEG1NN1NG AT a corner; THENCE N 4O° 15\' OO" E 1OO.O5 fset along Main Street',
+        3: '120.00 feet to Oak Ave; THENCE to the point of beginning.',  # continuation of page 2
+        4: 'TP-584 TRANSFER TAX FORM NO BOUNDARIES',
+        5: 'NOTARY ACKNOWLEDGMENT STATE OF NEW YORK',
+    }
+
+    run = search.search_pdf(
+        pdf, ON, api_key='router', send=failing_router,
+        hydra_api_key='hydra', hydra_send=failing_hydra,
+        ocr_fallback=True, ocr_fn=lambda p, n: texts[n],
+    )
+    assert run['candidate_pages'] == [2, 3]
+    assert run['coverage_complete'] is False
+    assert all(p['incomplete'] for p in run['pages'])
+
+

@@ -115,3 +115,19 @@ def test_our_lot_label_main_but_not_print_draft(filename, deed, expected, warnin
 ])
 def test_our_role_prefix_is_on_the_basename_only(path, expected):
     assert li.has_our_prefix(path) is expected
+
+
+def test_our_old_tag_produces_old_lot_label_in_acad_plan():
+    desc_old = li.bind_filename(sample(), "OUR LOT 76 OLD.pdf")
+    desc_new = li.bind_filename(sample(), "OUR LOT 76 NEW.pdf")
+    desc_nb = li.bind_filename(sample(), "LOT 76 OLD.pdf")
+    assert li.is_old_tag("OUR LOT 76 OLD.pdf") is True
+    assert li.is_old_tag("OUR LOT 76 NEW.pdf") is False
+    assert li.is_old_tag("LOT 76 OLD.pdf") is False
+    assert li.lot_label(desc_old) == "OLD 76"
+    assert li.lot_label(desc_new) == "LOT 76"
+    assert li.lot_label(desc_nb) == "LOT 76"
+    plan = AcadBuilder(lp.load_config()).plan(desc_old, is_neighbor=False)
+    label = next(item for item in plan.items if item.kind == "main-lot-label")
+    assert label.text == "OLD 76"
+

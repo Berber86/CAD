@@ -6188,6 +6188,47 @@ def test_job_queue_draw_phase_saves_dwg_and_closes_document(gui, tmp_path):
     assert app._job_runner_active is False
 
 
+def test_job_queue_skips_autocad_when_zero_contours_and_closes_leaked_doc(gui, tmp_path, monkeypatch):
+    from multiple_description_drawing import SceneResult
+    from multiple_description_handoff import SceneHandoff
+
+    folder = tmp_path / "3889#11 MOSEL LOOP"
+    folder.mkdir()
+    data_dir = folder / "data"
+    data_dir.mkdir()
+    app = gui.SurveyApp()
+    app._data_add_folders([folder])
+    app._job_current = 0
+    app._job_log_sink = []
+    app._job_runner_active = True
+
+    acad_calls = []
+    app._job_new_acad_document = lambda: acad_calls.append(1) or object()
+    # 0 contours from autoflow -> _auto_dwg_context must not open AutoCAD.
+    empty_view = SceneHandoff((), SceneResult((), ()))
+    app._auto_dwg_context = (("11 MOSEL LOOP", "Staten Island", "2882", "52"),
+                             data_dir, ("sig",), empty_view)
+    app._input_incomplete = True
+    app.after = lambda *_a, **_kw: None
+    app._job_after_autoflow(app._job_tasks[0])
+    assert acad_calls == []
+    assert app._job_tasks[0]["status"] == "ошибка"
+    assert "нет пригодных контуров" in app._job_tasks[0]["detail"]
+
+    # When AutoCAD created a document before draw failure, _job_close_task closes it without saving.
+    closed_args = []
+
+    class _LeakDoc:
+        def Close(self, save_changes=True):
+            closed_args.append(save_changes)
+
+    app._job_current = 0
+    app._job_created_doc = _LeakDoc()
+    app._job_fail_task("отрисовка не запустилась")
+    assert closed_args == [False] and app._job_created_doc is None
+
+
+
 def test_data_add_folder_native_multiselect_adds_all(gui, tmp_path, monkeypatch):
     # Нативный диалог Windows возвращает сразу несколько папок (Ctrl/Shift):
     # все попадают в список одним нажатием «Папки…», а следующий диалог
@@ -6301,3 +6342,21 @@ def test_model_test_window_grades_and_stats(gui):
     app._on_close()
     assert page._closed is True
     assert stats._closed is True
+
+
+def test_image_format_toggles_stay_synced_between_step1_and_data_tab(gui, monkeypatch):
+    saved = []
+    monkeypatch.setattr(gui, "save_config", lambda cfg: saved.append(cfg["api"]["vision_output_format"]))
+    app = gui.SurveyApp()
+    assert app._current_vision_format_code() == "auto"
+    assert app.step1_image_format_switch.cget("variable") is app.vision_format_var
+    assert app.data_image_format_switch.cget("variable") is app.vision_format_var
+    app._on_vision_format_changed("PNG")
+    assert app._current_vision_format_code() == "png"
+    assert app.config_data["api"]["vision_output_format"] == "png"
+    assert app.vision_format_var.get() == "PNG"
+    app._on_vision_format_changed("JPEG")
+    assert app._current_vision_format_code() == "jpeg"
+    assert app.config_data["api"]["vision_output_format"] == "jpeg"
+    assert saved == ["png", "jpeg"]
+

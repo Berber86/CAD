@@ -255,3 +255,64 @@ def test_explicit_force_reparses_with_current_portal_without_repeating_search(tm
     pipeline.parse_pdf(pdf, ON, portal_lot='8', force_parse=True, **args)
     assert [x['portal_lot'] for x in calls] == ['7', '8']
     assert len(searches) == 1
+
+
+def test_jpeg_and_auto_format_cache_isolation(tmp_path):
+    pdf = tmp_path / 'OUR 6 NEW.pdf'
+    make_pdf(pdf, 2)
+    formats_seen = []
+
+    def fake_render(path, **kwargs):
+        fmt = kwargs['output_format']
+        formats_seen.append((fmt, kwargs['enhance_scan']))
+        if fmt == 'jpeg':
+            return ['data:image/jpeg;base64,/9j/4AAQ']
+        return ['data:image/png;base64,ZmFrZQ==']
+
+    calls = []
+    def send(imgs, ctx):
+        calls.append([p.data_url.split(',', 1)[0] for p in imgs])
+        return answer([item('6')])
+
+    r_png = pipeline.parse_pdf(
+        pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+        image_limit=10, portal_lot=None, search_send=searcher, send=send,
+        render=fake_render, output_format='png', enhance_scan=False,
+    )
+    r_jpeg = pipeline.parse_pdf(
+        pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+        image_limit=10, portal_lot=None, search_send=searcher, send=send,
+        render=fake_render, output_format='jpeg', enhance_scan=True,
+    )
+    assert not r_png.cached and not r_jpeg.cached
+    assert len(calls) == 2
+    assert calls[0] == ['data:image/png;base64', 'data:image/png;base64']
+    assert calls[1] == ['data:image/jpeg;base64', 'data:image/jpeg;base64']
+    assert formats_seen == [('png', False), ('png', False), ('jpeg', True), ('jpeg', True)]
+
+
+def test_excess_candidate_pages_overlap_windowing_and_dedup(tmp_path):
+    pdf = tmp_path / 'MANY.pdf'
+    make_pdf(pdf, 13)
+    def many_finder(base, key, model, state, assets, qs):
+        return response(qs, {p: 0.9 for p in state['assets_pages']} if 'assets_pages' in state
+                        else {int(k.split('_')[1]): 0.9 for k in qs if k.startswith('page_')}, 'four_plus')
+
+    windows_sent = []
+    def send(imgs, ctx):
+        nums = [p.number for p in imgs]
+        windows_sent.append(nums)
+        if nums[0] == 1:
+            return answer([item('1'), item('10')])
+        return answer([item('10'), item('13')])
+
+    res = pipeline.parse_pdf(
+        pdf, ON, search_api_key='key', provider='hydra', model='grok-4.7',
+        image_limit=10, portal_lot=None, search_send=many_finder, send=send,
+        window_excess=True,
+    )
+    assert windows_sent == [list(range(1, 11)), [10, 11, 12, 13]]
+    assert res.status == 'parsed'
+    assert res.parse.unparsed_pages == ()
+    assert [i.data.lot_number for i in res.parse.items] == ['1', '10', '13']
+

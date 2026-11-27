@@ -82,6 +82,8 @@ _SLIDE_METHOD_TEXT = {
     "corner": "соединение углов",
     "side": "сдвиг вдоль стороны соседа",
 }
+_VISION_FORMAT_LABELS = {"auto": "Авто", "png": "PNG", "jpeg": "JPEG"}
+_VISION_FORMAT_CODES = {label: code for code, label in _VISION_FORMAT_LABELS.items()}
 from acad_builder import (
     AcadBuilder,
     AcadBuilderError,
@@ -313,6 +315,39 @@ def scale_value(label: str) -> float:
         return float(digits) or 16.0
     except ValueError:
         return 16.0
+
+
+class _AutoStreamSession:
+    """Один поток поиска и разбора PDF на весь двухфазный ранний автосбор."""
+
+    def __init__(self, generation: int) -> None:
+        self.queue: queue.Queue[Any] = queue.Queue()
+        self.box: dict[str, Any] = {}
+        self.jobs_seen: list[Any] = []
+        self.queued: set[Path] = set()
+        self.stop_event = threading.Event()
+        self.generation = generation
+        self.lock = threading.Lock()
+        self.closed = False
+        self.thread: threading.Thread | None = None
+
+    def enqueue(self, job: Any) -> bool:
+        with self.lock:
+            if self.closed or self.stop_event.is_set() or job.path in self.queued:
+                return False
+            self.queued.add(job.path)
+            self.queue.put(job)
+            return True
+
+    def close(self) -> None:
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                self.queue.put(None)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.close()
 
 
 def provider_entries(cfg: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -587,6 +622,13 @@ class SurveyApp(ctk.CTk):
         self.enhance_scan_var = ctk.BooleanVar(
             value=bool(self.config_data["api"].get("vision_enhance_scans", True))
         )
+        raw_fmt = str(self.config_data.get("api", {}).get("vision_output_format") or "auto").strip().lower()
+        if raw_fmt == "jpg":
+            raw_fmt = "jpeg"
+        if raw_fmt not in _VISION_FORMAT_LABELS:
+            raw_fmt = "auto"
+        self.vision_format_var = ctk.StringVar(value=_VISION_FORMAT_LABELS[raw_fmt])
+        self._step0_our_old_tried = False
         # ИИ-автоповорот через LLM ВСЕГДА выключен по умолчанию (доп. платный вызов API);
         # включается только разово на 1 конкретный запуск с явным предупреждением.
         self.auto_orient_var = ctk.BooleanVar(value=False)
@@ -648,6 +690,7 @@ class SurveyApp(ctk.CTk):
         self._step0_early_phase = ""  # "our" → "neighbours"
         self._step0_neighbour_lots: list[int] | None = None  # None — ответа ещё нет
         self._step0_our_outcome: Any = None
+        self._auto_stream_session: Any = None
         self._auto_stream_batch: Any = None
         self._auto_stream_jobs: tuple[Any, ...] = ()
         self._auto_dwg_context: tuple[Any, Path, Any, Any] | None = None
@@ -2076,6 +2119,22 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"), command=self._restore_multi_cache,
         )
         self.multi_cache_restore_button.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        ctk.CTkLabel(
+            self.pdf_mode_card,
+            text="Формат страниц для ИИ (PDF):",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=9, column=0, sticky="w", pady=(10, 2))
+        self.step1_image_format_switch = ctk.CTkSegmentedButton(
+            self.pdf_mode_card,
+            values=["Авто", "PNG", "JPEG"],
+            height=26,
+            variable=self.vision_format_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_vision_format_changed,
+        )
+        self.step1_image_format_switch.grid(row=10, column=0, sticky="ew", pady=(0, 2))
 
         # Пустой режим «📷 Фото» тоже должен позволять выбрать первый файл.
         self.photo_empty_card = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -3346,7 +3405,23 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["text_main"],
         )
-        self.data_long_captcha_check.grid(row=10, column=0, sticky="w", padx=16, pady=(0, 12))
+        self.data_long_captcha_check.grid(row=10, column=0, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkLabel(
+            panel,
+            text="Формат страниц для ИИ (PDF):",
+            font=ctk.CTkFont(size=11),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=11, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.data_image_format_switch = ctk.CTkSegmentedButton(
+            panel,
+            values=["Авто", "PNG", "JPEG"],
+            height=28,
+            variable=self.vision_format_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_vision_format_changed,
+        )
+        self.data_image_format_switch.grid(row=12, column=0, sticky="ew", padx=16, pady=(0, 12))
 
         right = ctk.CTkFrame(
             page, fg_color=THEME["bg_card"], corner_radius=10,
@@ -3655,6 +3730,12 @@ class SurveyApp(ctk.CTk):
             self._job_fail_task(
                 self._job_last_error_line() or "автопоток остановился до разбора")
             return
+        saved_view = context[3] if len(context) > 3 else None
+        if self._input_incomplete or (hasattr(saved_view, "drawable") and not saved_view.drawable):
+            self._auto_dwg_context = None
+            self._job_fail_task(
+                self._job_last_error_line() or "после разбора PDF нет пригодных контуров для отрисовки")
+            return
         task["detail"] = "отрисовка: новый DWG в AutoCAD…"
         self._refresh_data_task_list()
         self._job_dwg_before = {p.name for p in data_dir.glob("*.dwg")}
@@ -3712,6 +3793,7 @@ class SurveyApp(ctk.CTk):
 
     def _job_abort_current(self) -> None:
         self._step0_stop.set()
+        self._reset_step0_early()
         if getattr(self, "_step0_running", False):
             self._stop_step0_intake()
         task = self._job_tasks[self._job_current]
@@ -3721,6 +3803,8 @@ class SurveyApp(ctk.CTk):
         self._job_close_task()
 
     def _job_fail_task(self, detail: str) -> None:
+        self._step0_stop.set()
+        self._reset_step0_early()
         task = self._job_tasks[self._job_current]
         task["status"] = "ошибка"
         task["detail"] = detail
@@ -3738,7 +3822,17 @@ class SurveyApp(ctk.CTk):
     def _job_close_task(self) -> None:
         self._job_write_log()
         self._job_log_sink = None
-        self._job_created_doc = None
+        doc, self._job_created_doc = self._job_created_doc, None
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except TypeError:
+                try:
+                    doc.Close()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
         self._job_phase = ""
         self._refresh_data_task_list()
         if self._job_stop_requested:
@@ -4162,6 +4256,7 @@ class SurveyApp(ctk.CTk):
         self._step0_auto_stage = "portal"
         self._step0_auto_address = address
         self._step0_auto_identity = None
+        self._step0_our_old_tried = False
         self._reset_step0_early()
         self._step0_stop.clear()
         self._start_step0_portal_lookup()
@@ -4172,12 +4267,23 @@ class SurveyApp(ctk.CTk):
         self.step0_stop_button.configure(state="normal")
         self._step0_log("Автопоток: поиск адреса → сбор PDF → поиск и разбор описаний; возможны платные запросы. AutoCAD не запускается автоматически. После ручной отрисовки активный документ сохраняется под новым именем в папке описаний, даже если результат неполный.", level=log_mode.LEVEL_KEY)
 
-    def _reset_step0_early(self) -> None:
+    def _reset_step0_early(self, *, keep_stream: bool = False) -> None:
         """Сбрасывает состояние раннего сбора (наш участок до соседей)."""
         self._step0_early_active = False
         self._step0_early_phase = ""
         self._step0_neighbour_lots = None
         self._step0_our_outcome = None
+        if not keep_stream:
+            self._stop_auto_stream()
+
+    def _stop_auto_stream(self) -> None:
+        """Останавливает фоновый поток разбора автопотока и очищает его состояние."""
+        session = getattr(self, "_auto_stream_session", None)
+        self._auto_stream_session = None
+        if session is not None:
+            session.stop()
+        self._auto_stream_batch = None
+        self._auto_stream_jobs = ()
 
     def _stop_auto_transition(self, message: str) -> None:
         self._step0_auto_stage = None
@@ -4275,6 +4381,8 @@ class SurveyApp(ctk.CTk):
         optimal_mode: bool = False,
     ) -> None:
         """Browser UI, screenshot and Vision run off the Tk thread."""
+        portal_generation = getattr(self._worker_context, "generation", self._generation)
+
         def progress(line: str) -> None:
             important = line.startswith((
                 "для этого окна нет подходящих координат",
@@ -4282,7 +4390,11 @@ class SurveyApp(ctk.CTk):
                 "быстрая проверка карточки не удалась",
                 "локальный OCR не прочитал карточку",
             ))
-            self._post("step0_portal_notice" if important else "step0_progress", self._step0_timestamp(line))
+            self._post(
+                "step0_portal_notice" if important else "step0_progress",
+                self._step0_timestamp(line),
+                generation=portal_generation,
+            )
 
         def identified(capture: Any) -> None:
             # Block/Lot уже прочитаны: GUI может качать наш участок, пока
@@ -4290,7 +4402,7 @@ class SurveyApp(ctk.CTk):
             self._post("step0_portal_identified", (
                 address, capture.borough, capture.block, capture.lot,
                 capture.details_source, str(capture.map_image),
-            ))
+            ), generation=portal_generation)
 
         try:
             result = nyc_portal.lookup_parcel(
@@ -4308,9 +4420,9 @@ class SurveyApp(ctk.CTk):
                 **({"optimal_mode": True} if optimal_mode else {}),
             )
         except Exception as exc:  # noqa: BLE001 - browser, OCR and provider failures
-            self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"))
+            self._post("step0_portal_done", ("error", f"{type(exc).__name__}: {exc}"), generation=portal_generation)
             return
-        self._post("step0_portal_done", ("ok", result))
+        self._post("step0_portal_done", ("ok", result), generation=portal_generation)
 
     def _handle_step0_portal_identified(self, payload: Any) -> None:
         """Block/Lot известны до ответа про соседей: качаем наш участок сразу.
@@ -4364,7 +4476,7 @@ class SurveyApp(ctk.CTk):
             return
         lots = list(self._step0_neighbour_lots or [])
         if not lots:
-            self._reset_step0_early()
+            self._reset_step0_early(keep_stream=True)
             self._auto_submit_step0_outcome(our)
             return
         self._step0_early_phase = "neighbours"
@@ -4377,7 +4489,7 @@ class SurveyApp(ctk.CTk):
             self._step0_log(
                 "Автопоток: сбор соседей не запустился — продолжаю с нашим участком.",
                 level=log_mode.LEVEL_WARN)
-            self._reset_step0_early()
+            self._reset_step0_early(keep_stream=True)
             self._auto_submit_step0_outcome(our)
 
     def _finish_step0_portal_lookup(self, status: str, payload: Any) -> None:
@@ -4595,6 +4707,14 @@ class SurveyApp(ctk.CTk):
                 save_config(self.config_data)
             except OSError as exc:
                 dpi_save_error = f"не удалось сохранить DPI в config.json: {exc}"
+        continuing_early = bool(
+            self._step0_early_active and self._step0_early_phase == "neighbours" and not include_our
+        )
+        start_line = (log_mode.LEVEL_KEY, self._step0_timestamp(
+            f"Начинаю сбор: блок {block}, лот {lot}"
+            + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
+            + f"; OCR: {ocr_dpi} dpi; папка: {folder}"
+        ))
         self._step0_stop.clear()
         self._step0_running = True
         self._step0_outcome = None
@@ -4602,11 +4722,11 @@ class SurveyApp(ctk.CTk):
         self.step0_to_step1_button.configure(state="disabled")
         self.step0_run_button.configure(state="disabled", text="⏳ Собираю…")
         self.step0_stop_button.configure(state="normal")
-        self._step0_lines = [(log_mode.LEVEL_KEY, self._step0_timestamp(
-            f"Начинаю сбор: блок {block}, лот {lot}"
-            + (f"; соседи: {', '.join(str(value) for value in neighbours)}" if neighbours else "")
-            + f"; OCR: {ocr_dpi} dpi; папка: {folder}"
-        ))]
+        if continuing_early:
+            self._step0_lines.append(start_line)
+        else:
+            self._step0_lines = [start_line]
+            self._stop_auto_stream()
         if dpi_save_error:
             self._step0_lines.append((log_mode.LEVEL_ERROR, self._step0_timestamp(dpi_save_error)))
         self._render_step0_log()
@@ -4615,36 +4735,115 @@ class SurveyApp(ctk.CTk):
         identities = file_metadata.intake_observations(
             block, lot, borough, neighbours, str(self.step0_address_var.get() or ""), self._step0_lookup_snapshot,
         )
-        stream_plan = None
-        self._auto_stream_batch = None
-        self._auto_stream_jobs = ()
+        stream_session = self._auto_stream_session if continuing_early else None
         if self._step0_auto_stage == "intake":
-            try:
-                stream_cfg, stream_provider, stream_model, stream_key, stream_secret = (
-                    self._build_runtime_config())
-                stream_search_cfg = copy.deepcopy(
-                    stream_cfg.get("multiple_description_search") or {})
-                stream_search_cfg["enabled"] = True  # только этот автопоток
-                stream_cfg["multiple_description_search"] = stream_search_cfg
-                stream_plan = (stream_cfg, stream_provider, stream_model, stream_key,
-                               stream_secret, self._current_scale())
-                self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
-                    "Автопоток: каждый PDF пойдёт в поиск страниц и разбор сразу после скачивания, "
-                    "не дожидаясь остальных файлов; OUR OLD — только скачиваю.")))
-                self._render_step0_log()
-            except Exception:  # noqa: BLE001 - конвейер необязателен, обычный этап ниже
-                stream_plan = None
-                self._step0_lines.append((log_mode.LEVEL_WARN, self._step0_timestamp(
-                    "Автопоток: параллельный разбор по мере скачивания не подготовлен — "
-                    "соберу файлы и разберу обычным этапом.")))
-                self._render_step0_log()
+            if continuing_early:
+                if (stream_session is not None and not stream_session.closed
+                        and not stream_session.stop_event.is_set()):
+                    self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                        "Автопоток: докачиваю соседей и добавляю в уже запущенный поиск и разбор.")))
+                    self._render_step0_log()
+                else:
+                    stream_session = None
+            else:
+                try:
+                    stream_cfg, stream_provider, stream_model, stream_key, stream_secret = (
+                        self._build_runtime_config())
+                    stream_search_cfg = copy.deepcopy(
+                        stream_cfg.get("multiple_description_search") or {})
+                    stream_search_cfg["enabled"] = True  # только этот автопоток
+                    stream_cfg["multiple_description_search"] = stream_search_cfg
+                    stream_plan = (stream_cfg, stream_provider, stream_model, stream_key,
+                                   stream_secret, self._current_scale())
+                    stream_session = self._start_auto_stream_session(stream_plan)
+                    self._auto_stream_session = stream_session
+                    self._step0_lines.append((log_mode.LEVEL_KEY, self._step0_timestamp(
+                        "Автопоток: каждый PDF пойдёт в поиск страниц и разбор сразу после скачивания, "
+                        "не дожидаясь остальных файлов; OUR OLD — только скачиваю.")))
+                    self._render_step0_log()
+                except Exception:  # noqa: BLE001 - конвейер необязателен, обычный этап ниже
+                    stream_session = None
+                    self._step0_lines.append((log_mode.LEVEL_WARN, self._step0_timestamp(
+                        "Автопоток: параллельный разбор по мере скачивания не подготовлен — "
+                        "соберу файлы и разберу обычным этапом.")))
+                    self._render_step0_log()
+        early_keep_open = bool(early and self._step0_auto_stage == "intake" and stream_session is not None)
         self._start_background(
             self._step0_worker,
             args=(block, lot, neighbours, folder, bool(self.step0_old_neighbour_var.get()), ocr_dpi,
                   bool(self.step0_fast_mode_var.get()), fast_pause, borough, identities,
-                  self._step0_auto_stage == "intake", stream_plan, self._pdf_wait_sec(),
-                  include_our),
+                  self._step0_auto_stage == "intake", stream_session, self._pdf_wait_sec(),
+                  include_our, early_keep_open),
         )
+
+    def _start_auto_stream_session(self, stream_plan: tuple[Any, ...]) -> _AutoStreamSession:
+        """Запускает единый поток поиска+разбора на всё время автопотока."""
+        from multiple_description_runtime import (
+            open_runtime_callbacks, prepare_runtime, provider_target,
+            run_batch_streaming, ROUTERAI_GROK_MODEL,
+        )
+
+        session = _AutoStreamSession(self._generation)
+
+        def stream_jobs() -> Any:
+            while True:
+                job = session.queue.get()
+                if job is None:
+                    return
+                session.jobs_seen.append(job)
+                yield job
+
+        def stream_current() -> bool:
+            return (not session.stop_event.is_set() and not self._step0_stop.is_set()
+                    and not self._closing and session.generation == self._generation)
+
+        def stream_progress(line: str) -> None:
+            self._post("step0_progress", self._step0_timestamp(line),
+                       generation=session.generation)
+
+        def stream_main() -> None:
+            try:
+                cfg2, provider2, model2, key2, secret2, scale2 = stream_plan
+                target, router_key = prepare_runtime(
+                    cfg2, selected_provider=provider2, selected_model=model2,
+                    selected_api_key=key2, key_secret=secret2, current=stream_current)
+                stream_progress(
+                    f"Разбирающая модель: {target.provider} / {target.model}; "
+                    f"лимит изображений {target.image_limit}."
+                )
+                if target.model != model2 or target.provider != provider2:
+                    stream_progress(
+                        f"Выбранная модель без изображений; используется резерв {target.provider} / {target.model}."
+                    )
+                router = provider_target(
+                    cfg2, "routerai", legal_page_search.PRIMARY, key_secret=secret2,
+                    explicit_key=key2 if provider2 == "routerai" else None)
+                hedge = None
+                if target.provider == "hydra" and target.model == "grok-4.7":
+                    try:
+                        hedge = provider_target(cfg2, "routerai", ROUTERAI_GROK_MODEL,
+                                                key_secret=secret2)
+                    except Exception:  # noqa: BLE001 - страховка необязательна
+                        hedge = None
+                with open_runtime_callbacks(target, cfg2, hedge_target=hedge,
+                                            progress=stream_progress) as (send, choose):
+                    batch = run_batch_streaming(
+                        stream_jobs(), cfg2, target=target, search_api_key=router_key,
+                        send=send, choose=choose, search_base_url=router.base_url,
+                        scale=scale2, force_parse=False, current=stream_current,
+                        detail=stream_progress)
+                if not batch.cancelled:
+                    session.box["batch"] = batch
+                    session.box["jobs"] = tuple(session.jobs_seen)
+            except Exception:  # noqa: BLE001 - обычный этап после сбора повторит честно
+                session.box["error"] = True
+                stream_progress("Параллельный разбор по мере скачивания не запустился; "
+                                "после сбора разберу обычным этапом.")
+
+        session.thread = threading.Thread(target=stream_main, daemon=True,
+                                          name="step0-stream-parse")
+        session.thread.start()
+        return session
 
     def _step0_worker(
         self,
@@ -4659,13 +4858,16 @@ class SurveyApp(ctk.CTk):
         borough: str = "",
         identities: dict[str, dict] | None = None,
         skip_page_search: bool = False,
-        stream_plan: tuple[Any, ...] | None = None,
+        stream_session: _AutoStreamSession | None = None,
         pdf_wait_sec: float = deed_intake.PDF_WAIT_SEC,
         include_our: bool = True,
+        early_keep_open: bool = False,
     ) -> None:
         """Фоновый сбор: сеть и OCR. Результат возвращается через очередь событий."""
+        worker_generation = getattr(self._worker_context, "generation", self._generation)
+
         def progress(line: str) -> None:
-            self._post("step0_progress", self._step0_timestamp(line))
+            self._post("step0_progress", self._step0_timestamp(line), generation=worker_generation)
 
         downloads = rcclerk.default_downloads_dir()
         if deed_intake.step0_source_name(borough) == "ACRIS":
@@ -4693,86 +4895,19 @@ class SurveyApp(ctk.CTk):
             progress(f"ожидание PDF в «Загрузках» — долгое ({int(pdf_wait_sec)} с): "
                      "галочка «Ждать долгую капчу» на странице «Данные»")
 
-        # Конвейер автопотока: отдельный поток разбирает PDF по мере их
-        # скачивания, пока этот поток качает следующие. OUR OLD не разбираем.
-        stream_queue: queue.Queue[Any] | None = None
-        stream_thread: threading.Thread | None = None
-        stream_box: dict[str, Any] = {}
-        stream_jobs_seen: list[Any] = []
-        stream_stop = threading.Event()
-        stream_generation = getattr(self._worker_context, "generation", self._generation)
-        stream_queued: set[Path] = set()
+        # Конвейер автопотока: единый поток разбирает PDF по мере их
+        # скачивания в фазах 1 и 2. OUR OLD не разбираем.
         on_record = None
-        if stream_plan is not None:
-            from multiple_description_runtime import (
-                FileJob, open_runtime_callbacks, prepare_runtime, provider_target,
-                run_batch_streaming, ROUTERAI_GROK_MODEL,
-            )
-
-            stream_queue = queue.Queue()
-
-            def stream_jobs() -> Any:
-                while True:
-                    job = stream_queue.get()
-                    if job is None:
-                        return
-                    stream_jobs_seen.append(job)
-                    yield job
-
-            def stream_current() -> bool:
-                return (not stream_stop.is_set() and not self._step0_stop.is_set()
-                        and not self._closing and stream_generation == self._generation)
-
-            def stream_progress(line: str) -> None:
-                self._post("step0_progress", self._step0_timestamp(line),
-                           generation=stream_generation)
-
-            def stream_main() -> None:
-                try:
-                    cfg2, provider2, model2, key2, secret2, scale2 = stream_plan
-                    target, router_key = prepare_runtime(
-                        cfg2, selected_provider=provider2, selected_model=model2,
-                        selected_api_key=key2, key_secret=secret2, current=stream_current)
-                    router = provider_target(
-                        cfg2, "routerai", legal_page_search.PRIMARY, key_secret=secret2,
-                        explicit_key=key2 if provider2 == "routerai" else None)
-                    hedge = None
-                    if target.provider == "hydra" and target.model == "grok-4.7":
-                        try:
-                            hedge = provider_target(cfg2, "routerai", ROUTERAI_GROK_MODEL,
-                                                    key_secret=secret2)
-                        except Exception:  # noqa: BLE001 - страховка необязательна
-                            hedge = None
-                    with open_runtime_callbacks(target, cfg2, hedge_target=hedge,
-                                                progress=stream_progress) as (send, choose):
-                        batch = run_batch_streaming(
-                            stream_jobs(), cfg2, target=target, search_api_key=router_key,
-                            send=send, choose=choose, search_base_url=router.base_url,
-                            scale=scale2, force_parse=False, current=stream_current,
-                            detail=stream_progress)
-                    if not batch.cancelled:
-                        stream_box["batch"] = batch
-                        stream_box["jobs"] = tuple(stream_jobs_seen)
-                except Exception:  # noqa: BLE001 - обычный этап после сбора повторит честно
-                    stream_box["error"] = True
-                    stream_progress("Параллельный разбор по мере скачивания не запустился; "
-                                    "после сбора разберу обычным этапом.")
-
-            stream_thread = threading.Thread(target=stream_main, daemon=True,
-                                             name="step0-stream-parse")
-            stream_thread.start()
+        if stream_session is not None:
+            from multiple_description_runtime import FileJob
 
             def on_record(record: Any) -> None:
                 if record.role == "our" and str(record.tag).upper() == "OLD":
                     progress(f"  {record.file}: скачан; в автопотоке не разбираю (OUR OLD).")
                     return
-                assert stream_queue is not None  # для проверяльщика типов
                 path = folder / str(record.file)
-                if path in stream_queued:
-                    return
-                stream_queued.add(path)
-                stream_queue.put(FileJob(path, record.role == "our" or lot_identity.has_our_prefix(path)))
-                progress(f"  {record.file}: скачан — сразу в поиск страниц и разбор, остальные файлы не жду.")
+                if stream_session.enqueue(FileJob(path, record.role == "our" or lot_identity.has_our_prefix(path))):
+                    progress(f"  {record.file}: скачан — сразу в поиск страниц и разбор, остальные файлы не жду.")
 
         try:
             outcome = deed_intake.collect_deeds(
@@ -4794,25 +4929,20 @@ class SurveyApp(ctk.CTk):
                 include_our=include_our,
             )
         except deed_intake.IntakeCancelled:
-            stream_stop.set()
-            if stream_queue is not None:
-                stream_queue.put(None)
-            self._post("step0_done", ("cancelled", None))
+            if stream_session is not None:
+                stream_session.stop()
+            self._post("step0_done", ("cancelled", None), generation=worker_generation)
             return
         except Exception as exc:  # noqa: BLE001 - сеть, файлы, PDF — всё возможно
-            stream_stop.set()
-            if stream_queue is not None:
-                stream_queue.put(None)
-            self._post("step0_done", ("error", f"{type(exc).__name__}: {exc}"))
+            if stream_session is not None:
+                stream_session.stop()
+            self._post("step0_done", ("error", f"{type(exc).__name__}: {exc}"), generation=worker_generation)
             return
-        if stream_queue is not None:
-            stream_queue.put(None)
-        if stream_thread is not None:
-            stream_thread.join()
-            if "batch" in stream_box:
-                self._auto_stream_batch = stream_box["batch"]
-                self._auto_stream_jobs = stream_box.get("jobs", ())
-        self._post("step0_done", ("ok", outcome))
+        if stream_session is not None and not early_keep_open:
+            stream_session.close()
+            if stream_session.thread is not None:
+                stream_session.thread.join()
+        self._post("step0_done", ("ok", outcome), generation=worker_generation)
 
     def _stop_step0_intake(self) -> None:
         if self._step0_auto_stage == "portal_cancelled":
@@ -4898,12 +5028,14 @@ class SurveyApp(ctk.CTk):
                 elif self._step0_neighbour_lots:
                     self._continue_after_neighbours()
                 else:
+                    self._reset_step0_early(keep_stream=True)
                     self._auto_submit_step0_outcome(outcome)
             elif self._step0_early_active and self._step0_early_phase == "neighbours":
                 merged = (deed_intake.merge_outcomes(self._step0_our_outcome, outcome)
                           if self._step0_our_outcome is not None else outcome)
                 self._step0_outcome = merged
-                self._reset_step0_early()
+                self._reset_step0_early(keep_stream=True)
+                self._consume_closed_auto_stream()
                 try:
                     deed_store.write_manifest(
                         Path(merged.folder),
@@ -4915,7 +5047,17 @@ class SurveyApp(ctk.CTk):
                     pass
                 self._auto_submit_step0_outcome(merged)
             else:
+                self._consume_closed_auto_stream()
                 self._auto_submit_step0_outcome(outcome)
+
+    def _consume_closed_auto_stream(self) -> None:
+        session = getattr(self, "_auto_stream_session", None)
+        if session is None or not session.closed:
+            return
+        if not session.stop_event.is_set() and "batch" in session.box:
+            self._auto_stream_batch = session.box["batch"]
+            self._auto_stream_jobs = session.box.get("jobs", ())
+        self._auto_stream_session = None
 
     def _auto_submit_step0_outcome(self, outcome: Any) -> None:
         expected = self._step0_auto_identity
@@ -4950,6 +5092,7 @@ class SurveyApp(ctk.CTk):
             )
         folder = Path(outcome.folder)
         paths: list[Path] = []
+        our_old_paths: list[Path] = []
         roles: dict[Path, bool] = {}
         skipped_old = False
         for record in outcome.records:
@@ -4962,14 +5105,28 @@ class SurveyApp(ctk.CTk):
                 self._stop_auto_transition(f"Автопоток остановлен: собранный PDF недоступен: {name}")
                 return
             if record.role == "our" and str(getattr(record, "tag", "")).upper() == "OLD":
-                # OUR OLD в автопотоке только скачиваем и храним: время на его
-                # поиск страниц и ИИ-разбор не тратим (указание пользователя).
+                if path not in our_old_paths:
+                    our_old_paths.append(path)
                 skipped_old = True
                 continue
             if path not in paths:
                 paths.append(path)
             roles[path] = record.role == "our" or lot_identity.has_our_prefix(path)
-        if skipped_old:
+        if not any(roles.values()) and our_old_paths:
+            # OUR NEW отсутствует среди собранных PDF — сразу берём OUR OLD.
+            for old_p in our_old_paths:
+                if old_p not in paths:
+                    paths.insert(0, old_p)
+                roles[old_p] = True
+            self._step0_our_old_tried = True
+            skipped_old = False
+            lot_tag = lot_identity.lot_from_filename(our_old_paths[0]) or current[3] or "?"
+            self._step0_log(
+                f"Автопоток: OUR NEW недоступен — беру OUR OLD ({our_old_paths[0].name}); "
+                f"в DWG лот будет подписан как OLD {lot_tag}.",
+                level=log_mode.LEVEL_WARN,
+            )
+        elif skipped_old:
             self._step0_log("Автопоток: OUR OLD скачан и сохранён, но не разбираю — "
                             "в автопотоке разбираются NEW нашего участка и соседи.",
                             level=log_mode.LEVEL_KEY)
@@ -4991,6 +5148,23 @@ class SurveyApp(ctk.CTk):
             item.is_main = roles[item.path]
         for error in errors:
             self._step0_log(f"Не открыт собранный PDF: {error}", level=log_mode.LEVEL_ERROR)
+        if not any(item.is_main for item in items) and our_old_paths and not self._step0_our_old_tried:
+            old_items, old_errs = self._make_pdf_set_items(our_old_paths)
+            for error in old_errs:
+                self._step0_log(f"Не открыт OUR OLD PDF: {error}", level=log_mode.LEVEL_ERROR)
+            if old_items:
+                for old_item in old_items:
+                    old_item.is_main = True
+                    roles[old_item.path] = True
+                items = [*old_items, *items]
+                paths = [item.path for item in items]
+                self._step0_our_old_tried = True
+                lot_tag = lot_identity.lot_from_filename(old_items[0].path) or current[3] or "?"
+                self._step0_log(
+                    f"Автопоток: OUR NEW не открылся — беру OUR OLD ({old_items[0].path.name}); "
+                    f"в DWG лот будет подписан как OLD {lot_tag}.",
+                    level=log_mode.LEVEL_WARN,
+                )
         if not items:
             self._stop_auto_transition("Автопоток остановлен: ни один собранный PDF не открылся — начертить нечего.")
             return
@@ -5001,6 +5175,32 @@ class SurveyApp(ctk.CTk):
                 "Автопоток: часть собранных PDF не открылась — продолжаю с "
                 "открывшимися.", level=log_mode.LEVEL_WARN)
             paths = [item.path for item in items]
+        session = getattr(self, "_auto_stream_session", None)
+        if session is not None:
+            session.close()
+            if session.thread is not None and session.thread.is_alive():
+                self._step0_auto_stage = "parse"
+                self._busy = True
+                self._set_controls_busy(True)
+                self.progress.start()
+                self.step0_stop_button.configure(state="normal")
+                self._step0_log(
+                    "Автопоток: жду завершения уже запущенного разбора скачанных файлов…",
+                    level=log_mode.LEVEL_KEY,
+                )
+
+                def wait_stream() -> None:
+                    session.thread.join()
+                    self._post("step0_stream_done", (session, items, paths, roles))
+
+                self._start_background(wait_stream)
+                return
+            self._consume_closed_auto_stream()
+        self._finish_auto_submit_step0(items, paths, roles)
+
+    def _finish_auto_submit_step0(
+        self, items: list[Any], paths: list[Path], roles: dict[Path, bool],
+    ) -> None:
         stream_batch = getattr(self, "_auto_stream_batch", None)
         stream_jobs = getattr(self, "_auto_stream_jobs", ())
         self._auto_stream_batch = None
@@ -6179,6 +6379,33 @@ class SurveyApp(ctk.CTk):
     def _multi_pdf_enabled(self) -> bool:
         return bool(self._multi_pdf_active)
 
+    def _current_vision_format_code(self) -> str:
+        label = str(self.vision_format_var.get() or "Авто").strip()
+        return _VISION_FORMAT_CODES.get(label, "auto")
+
+    def _on_vision_format_changed(self, chosen: str | None = None) -> None:
+        code = _VISION_FORMAT_CODES.get(
+            str(chosen or self.vision_format_var.get() or "").strip(), "auto"
+        )
+        label = _VISION_FORMAT_LABELS[code]
+        self.vision_format_var.set(label)
+        for sw_name in ("step1_image_format_switch", "data_image_format_switch"):
+            sw = getattr(self, sw_name, None)
+            setter = getattr(sw, "set", None)
+            if callable(setter):
+                try:
+                    setter(label)
+                except Exception:  # noqa: BLE001
+                    pass
+        self.config_data.setdefault("api", {})["vision_output_format"] = code
+        self._persist_ai_preferences(report_error=False)
+        fmt_desc = {
+            "auto": "Авто (PNG для векторных PDF, JPEG 4:4:4 для сканов)",
+            "png": "PNG без сжатия",
+            "jpeg": "JPEG (компактнее)",
+        }[code]
+        self._set_status(f"Формат страниц для ИИ: {fmt_desc}.")
+
     def _on_multi_pdf_mode_changed(self) -> None:
         """Change the PDF workflow in memory without mixing existing results."""
         old = self._multi_pdf_enabled()
@@ -7347,6 +7574,7 @@ class SurveyApp(ctk.CTk):
                     provider_cfg["models"] = [model, *models]
             hydra_persist = providers.setdefault("hydra", {})
             hydra_persist["reasoning_by_model"] = dict(self._reasoning_by_model)
+            api["vision_output_format"] = self._current_vision_format_code()
             api["consensus"] = {
                 "passes": self.current_passes_count(),
                 "pass2_provider": pass2_pid,
@@ -9418,6 +9646,7 @@ class SurveyApp(ctk.CTk):
             pass
         self._closing = True
         self._step0_stop.set()
+        self._stop_auto_stream()
         self._generation += 1
         try:
             self.destroy()
@@ -9677,7 +9906,9 @@ class SurveyApp(ctk.CTk):
             self._step0_auto_identity = None
             self._reset_step0_early()
             self.step0_auto_button.configure(state="normal")
+        self._step0_our_old_tried = False
         self._step0_stop.set()
+        self._stop_auto_stream()
         if self._step0_portal_running:
             self._step0_auto_stage = "portal_cancelled"
         self._generation += 1
@@ -10281,13 +10512,92 @@ class SurveyApp(ctk.CTk):
                     pass
             post("multi_pdf_done", (None, signature))
 
+    def _auto_find_our_old_path(self) -> Path | None:
+        """Return an unused OUR OLD PDF from Step 0 outcome, if present on disk."""
+        outcome = getattr(self, "_step0_outcome", None)
+        if outcome is None:
+            return None
+        folder = Path(outcome.folder)
+        existing = {item.path.resolve() for item in getattr(self, "pdf_set", ()) if getattr(item, "path", None)}
+        for record in getattr(outcome, "records", ()):
+            if record.role != "our" or str(getattr(record, "tag", "")).upper() != "OLD":
+                continue
+            name = str(getattr(record, "file", "") or "")
+            if not name or Path(name).name != name:
+                continue
+            candidate = folder / name
+            try:
+                if candidate.is_file() and candidate.resolve().parent == folder.resolve():
+                    if candidate.resolve() not in existing:
+                        return candidate
+            except OSError:
+                continue
+        return None
+
+    def _our_new_failed_badly(self, view: Any) -> bool:
+        """Return True when OUR NEW produced no usable closed contour (<=2.0 ft)."""
+        if view is None:
+            return any(
+                item.is_main and not lot_identity.is_old_tag(item.path)
+                for item in getattr(self, "pdf_set", ())
+            )
+        our_docs = [doc for doc in getattr(view, "documents", ()) if doc.is_main]
+        if not our_docs or any(lot_identity.is_old_tag(doc.source) for doc in our_docs):
+            return False
+        our_drawable = [
+            entry
+            for doc in our_docs
+            for entry in getattr(doc, "descriptions", ())
+            if entry.plan is not None
+        ]
+        if not our_drawable:
+            return True
+        for entry in our_drawable:
+            plan = entry.plan
+            segs = getattr(plan.description, "segments", ()) or ()
+            if not plan.open_traverse and len(segs) >= 3 and plan.closure.distance <= 2.0:
+                return False
+        return True
+
     def _handle_multi_pdf_done(self, view: Any, signature: Any) -> None:
         from multiple_description_handoff import InvalidHandoff
         was_auto = self._step0_auto_stage == "parse"
         auto_identity = self._step0_auto_identity if was_auto else None
+        if (was_auto and auto_identity and not getattr(self, "_step0_our_old_tried", False)
+                and signature == self._source_signature(mode="📄 PDF")
+                and self._our_new_failed_badly(view)):
+            old_path = self._auto_find_our_old_path()
+            if old_path is not None:
+                old_items, old_errs = self._make_pdf_set_items([old_path])
+                for err in old_errs:
+                    self._step0_log(f"Не открыт OUR OLD PDF: {err}", level=log_mode.LEVEL_ERROR)
+                if old_items:
+                    old_item = old_items[0]
+                    old_item.is_main = True
+                    neighbour_items = [item for item in self.pdf_set if not item.is_main]
+                    self._step0_our_old_tried = True
+                    self._finish_busy()
+                    lot_tag = lot_identity.lot_from_filename(old_path) or auto_identity[3] or "?"
+                    msg = (
+                        f"Автопоток: OUR NEW не дал пригодного контура — переключаюсь на OUR OLD "
+                        f"({old_path.name}); в DWG лот подпишу как OLD {lot_tag}."
+                    )
+                    self._step0_log(msg, level=log_mode.LEVEL_WARN)
+                    self._log_line(msg, level=log_mode.LEVEL_WARN)
+                    try:
+                        self._submit_pdf_set([old_item, *neighbour_items], scene_mode="update", fresh=True)
+                    except Exception as exc:  # noqa: BLE001
+                        if self._busy:
+                            self._finish_busy()
+                        self._step0_log(f"Автопоток: не удалось запустить OUR OLD ({type(exc).__name__}).",
+                                        level=log_mode.LEVEL_ERROR)
+                    else:
+                        if self._busy:
+                            return
         if was_auto:
             self._step0_auto_stage = None
             self._step0_auto_identity = None
+            self._auto_dwg_context = None
             self.step0_auto_button.configure(state="normal")
             self.step0_stop_button.configure(state="disabled")
         self._finish_busy()
@@ -10323,12 +10633,17 @@ class SurveyApp(ctk.CTk):
         if was_auto:
             # Use the portal lot captured for these PDFs even if the deed does
             # not confirm it; it is a filename label, not a claim of accuracy.
-            if auto_identity and self._step0_outcome is not None:
+            if auto_identity and self._step0_outcome is not None and view.drawable:
                 folder = Path(self._step0_outcome.folder).resolve()
                 self._auto_dwg_context = (auto_identity, folder, signature, view)
                 note = "После ручной отрисовки DWG один раз сохранится в папке описаний, даже если результат неполный. Дальше сохраняйте вручную."
                 self._step0_log(note, level=log_mode.LEVEL_KEY)
                 self._log_line(note, level=log_mode.LEVEL_KEY)
+            elif auto_identity:
+                self._auto_dwg_context = None
+                note = "Автопоток: ни одного контура для отрисовки не получено; автосохранение DWG отключено."
+                self._step0_log(note, level=log_mode.LEVEL_WARN)
+                self._log_line(note, level=log_mode.LEVEL_WARN)
             self._select_step_tab(STEP_TAB_BOUNDARY)
         self._ready_source_signature = signature if view.drawable else None
         self._input_incomplete = not bool(view.drawable)
@@ -11671,6 +11986,7 @@ class SurveyApp(ctk.CTk):
         cfg["api"]["provider"] = active_pid
         cfg["api"]["model"] = active_model
         cfg["api"]["vision_enhance_scans"] = bool(self.enhance_scan_var.get())
+        cfg["api"]["vision_output_format"] = self._current_vision_format_code()
         # Никогда не сохраняем платный ИИ-автоповорот как настройку по умолчанию
         cfg["api"]["vision_auto_orient"] = False
         cfg["api"]["ask_on_doubt"] = bool(self.ask_on_doubt_var.get())
@@ -12389,6 +12705,14 @@ class SurveyApp(ctk.CTk):
         elif kind == "step0_done":
             status, payload_done = payload
             self._finish_step0(status, payload_done)
+        elif kind == "step0_stream_done":
+            session, items, paths, roles = payload
+            self._finish_busy()
+            if self._step0_auto_stage != "parse":
+                return
+            if getattr(self, "_auto_stream_session", None) is session:
+                self._consume_closed_auto_stream()
+            self._finish_auto_submit_step0(items, paths, roles)
         elif kind == "pdf_set_done":
             self._finish_busy()
             self._handle_pdf_set_done(payload)

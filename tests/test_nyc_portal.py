@@ -2062,3 +2062,39 @@ def test_type_into_address_survives_failed_click_without_ctrl_a(monkeypatch):
         nyc_portal.ScreenText("1769 Stillwell Avenue, Brooklyn, NY", (25, 130, 300, 155))])
     strategy = nyc_portal._type_into_address(1, "1769 Stillwell Avenue, Brooklyn", rows)
     assert strategy == "placeholder" and len(clicks) == 2 and len(typed) == 1
+
+
+def test_losing_neighbour_race_thread_stops_retrying_and_logging_after_winner(tmp_path, monkeypatch):
+    import threading
+
+    winner_done = threading.Event()
+    loser_exited = threading.Event()
+    calls = []
+    messages = []
+
+    def ask(system, user_text, cfg, **kwargs):
+        model = kwargs["model"]
+        calls.append(model)
+        if model == nyc_portal.NEIGHBOUR_RACE_MODEL:
+            return {"left_neighbor_lot": "51", "right_neighbor_lot": "53", "confidence": "high", "notes": ""}, None
+        assert winner_done.wait(5)
+        try:
+            raise RuntimeError("Request timed out.")
+        finally:
+            loser_exited.set()
+
+    _race_setup(monkeypatch, tmp_path, ask)
+    monkeypatch.setenv("HYDRA_API_KEY", "hydra-secret")
+    result = nyc_portal.lookup_parcel(
+        "11 Mosel Loop", tmp_path, cfg={"api": {}}, provider="hydra",
+        model="claude-haiku-5.5", api_key="hydra-secret", progress=messages.append)
+    winner_done.set()
+    assert loser_exited.wait(5)
+    # Give the losing thread a moment to unwind its exception handler.
+    for t in threading.enumerate():
+        if t.name == "portal-neighbour-race":
+            t.join(timeout=2)
+    assert result.left_neighbour == "51" and result.right_neighbour == "53"
+    assert calls.count("claude-haiku-5.5") == 1  # no retries 2 or 3 after terra won
+    assert not any("повторяю — попытка" in line for line in messages)
+

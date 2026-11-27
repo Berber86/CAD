@@ -482,3 +482,35 @@ def test_hedge_is_disabled_by_default(monkeypatch):
         send([PageImage(1, 'data:image/png;base64,AA==')], {})
     assert calls == [(runtime.HYDRA_GROK_MODEL, 'hydra-key')]
     assert created_keys == ['hydra-key']  # клиент RouterAI даже не создавался
+
+
+def test_fetch_hydra_catalog_retries_and_uses_cache_fallback(tmp_path, monkeypatch):
+    import httpx
+    cache_file = tmp_path / 'hydra_models.json'
+    monkeypatch.setattr(runtime, '_HYDRA_CATALOG_CACHE', None)
+    payload = {'data': [{'id': 'claude-haiku-5.5', 'input_modalities': ['text', 'image'], 'max_file_count': 10}]}
+    calls = []
+
+    def flaky_get(url, **kwargs):
+        calls.append(url)
+        req = httpx.Request('GET', url)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout('slow', request=req)
+        return httpx.Response(200, request=req, json=payload)
+
+    monkeypatch.setattr(runtime.httpx, 'get', flaky_get)
+    got = runtime.fetch_hydra_catalog(cache_path=cache_file, sleep=lambda _s: None)
+    assert got == payload and len(calls) == 2 and cache_file.is_file()
+
+    # Clear in-memory cache and simulate total outage: persistent fallback preserves limit=10.
+    monkeypatch.setattr(runtime, '_HYDRA_CATALOG_CACHE', None)
+    monkeypatch.setattr(runtime.httpx, 'get', lambda url, **kw: (_ for _ in ()).throw(
+        httpx.ReadTimeout('down', request=httpx.Request('GET', url))))
+    cached = runtime.fetch_hydra_catalog(attempts=2, cache_path=cache_file, sleep=lambda _s: None)
+    assert runtime.model_capability(cached, 'claude-haiku-5.5') == ('yes', 10)
+
+    # Without cache, outage still raises cleanly so prepare_runtime handles unknown.
+    cache_file.unlink()
+    with pytest.raises(httpx.ReadTimeout):
+        runtime.fetch_hydra_catalog(attempts=2, cache_path=cache_file, sleep=lambda _s: None)
+

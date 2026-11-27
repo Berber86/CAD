@@ -146,3 +146,39 @@ def test_hedge_both_errors_prefers_primary_error():
     send = transport.make_hedged_sender(failing_primary, failing_secondary, delay=0.02)
     with pytest.raises(TimeoutError, match='primary-error'):
         send(pages(1), {})
+
+
+def test_content_accepts_list_text_blocks_and_selector_unwraps_fence():
+    blocks = [{'type': 'text', 'text': '<think>x</think>\n```json\n{"selected": 1}\n```'}]
+    client = FakeClient(blocks)
+    selector = transport.make_selector(client, 'claude-haiku-5.5')
+    attempts = [md.read_response(answer([item('a'), {}]), [1, 2]),
+                md.read_response(answer([item('b'), {}]), [1])]
+    assert selector(pages(2), attempts) == 1
+
+
+def test_call_sends_temperature_and_json_mode_and_strips_only_explicit_400_rejection():
+    class RejectJsonFormat(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return 'Unsupported parameter: response_format json_object is not supported'
+
+    seen = []
+
+    class AdaptiveClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kwargs):
+            seen.append(dict(kwargs))
+            if 'response_format' in kwargs:
+                raise RejectJsonFormat()
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=answer([item()]), refusal=None))])
+
+    raw = transport.make_sender(AdaptiveClient(), 'custom-model')(pages(1), {})
+    assert raw == answer([item()])
+    assert len(seen) == 2
+    assert seen[0]['temperature'] == 0.0 and seen[0]['response_format'] == {'type': 'json_object'}
+    assert 'response_format' not in seen[1] and seen[1]['temperature'] == 0.0
+

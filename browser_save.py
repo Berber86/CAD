@@ -20,6 +20,7 @@ PENDING_PREFIX = "tsai_step0_"
 VK_CONTROL = 0x11
 VK_S = 0x53
 VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
 VK_TAB = 0x09
 VK_DOWN = 0x28
 VK_A = 0x41
@@ -98,6 +99,23 @@ SAVE_DIALOG_MARKS = (
     "save as", "save a copy", "save print output as", "сохранить как",
     "сохранить копию", "сохранение", "download file",
 )
+WEBPAGE_SAVE_MARKS = (
+    "веб-страница", "вебстраница", "один файл", "webpage", "web page",
+    "mhtml", "web archive", "веб-архив", "только html", "html only",
+)
+_SAVE_NOTE_LOCK = threading.Lock()
+_LAST_SAVE_NOTE = ""
+
+
+def _set_last_save_note(note: str) -> None:
+    with _SAVE_NOTE_LOCK:
+        global _LAST_SAVE_NOTE
+        _LAST_SAVE_NOTE = str(note or "")
+
+
+def last_save_note() -> str:
+    with _SAVE_NOTE_LOCK:
+        return _LAST_SAVE_NOTE
 
 
 @dataclass(frozen=True)
@@ -664,10 +682,11 @@ def foreground_is_acceptable(handle: int) -> bool:
 
 def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     """Activate the exact supported browser and wait for Windows to grant focus."""
+    windows = list_windows()
     if not any(
         window.handle == int(handle)
         and is_supported_browser(window.executable, window.image_path)
-        for window in list_windows()
+        for window in windows
     ):
         return False
     user32 = _user32()
@@ -677,8 +696,13 @@ def foreground(handle: int, *, timeout: float = 1.5) -> bool:
     # dropdown) is already foreground, preserve focus inside its web page.
     # Reapplying SetFocus/SetForegroundWindow to the top-level Chrome HWND here
     # would steal activation from that popup and close it immediately.
+    # A separate titled top-level window of the same browser process is NOT a
+    # popup — in that case we still need to activate the target window handle.
     try:
-        if foreground_is_acceptable(handle):
+        other_titled = {w.handle for w in windows if w.handle != int(handle)}
+        if foreground_is_acceptable(handle) and (
+            not other_titled or int(user32.GetForegroundWindow() or 0) not in other_titled
+        ):
             return True
     except Exception:  # noqa: BLE001
         pass
@@ -890,22 +914,37 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
 
 def _key(vk: int, *, up: bool) -> None:
     user32 = _user32()
-    if user32 is not None:
-        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP if up else 0, 0)
-
-
-def press_ctrl_s() -> bool:
-    user32 = _user32()
     if user32 is None:
+        return
+    scan = 0
+    map_vk = getattr(user32, "MapVirtualKeyW", None)
+    if callable(map_vk):
+        try:
+            scan = int(map_vk(int(vk), 0) or 0)
+        except Exception:  # noqa: BLE001
+            scan = 0
+    user32.keybd_event(vk, scan, KEYEVENTF_KEYUP if up else 0, 0)
+
+
+def _press_ctrl_combo(vk: int) -> bool:
+    """Send Ctrl+<key> with tiny settle pauses so Chrome/RDP never drops the modifier."""
+    if _user32() is None:
         return False
     try:
         _key(VK_CONTROL, up=False)
-        _key(VK_S, up=False)
-        _key(VK_S, up=True)
+        time.sleep(0.015)
+        _key(int(vk), up=False)
+        time.sleep(0.015)
+        _key(int(vk), up=True)
+        time.sleep(0.015)
         _key(VK_CONTROL, up=True)
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def press_ctrl_s() -> bool:
+    return _press_ctrl_combo(VK_S)
 
 
 def press_enter() -> bool:
@@ -915,6 +954,18 @@ def press_enter() -> bool:
     try:
         _key(VK_RETURN, up=False)
         _key(VK_RETURN, up=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def press_escape() -> bool:
+    user32 = _user32()
+    if user32 is None:
+        return False
+    try:
+        _key(VK_ESCAPE, up=False)
+        _key(VK_ESCAPE, up=True)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -934,44 +985,17 @@ def press_key(vk: int) -> bool:
 
 def press_ctrl_l() -> bool:
     """Focus the address bar in the foreground browser tab."""
-    if _user32() is None:
-        return False
-    try:
-        _key(VK_CONTROL, up=False)
-        _key(VK_L, up=False)
-        _key(VK_L, up=True)
-        _key(VK_CONTROL, up=True)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return _press_ctrl_combo(VK_L)
 
 
 def press_ctrl_t() -> bool:
     """Open a new browser tab (the current tabs are left untouched)."""
-    if _user32() is None:
-        return False
-    try:
-        _key(VK_CONTROL, up=False)
-        _key(VK_T, up=False)
-        _key(VK_T, up=True)
-        _key(VK_CONTROL, up=True)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return _press_ctrl_combo(VK_T)
 
 
 def press_ctrl_a() -> bool:
     """Select the focused browser field contents."""
-    if _user32() is None:
-        return False
-    try:
-        _key(VK_CONTROL, up=False)
-        _key(VK_A, up=False)
-        _key(VK_A, up=True)
-        _key(VK_CONTROL, up=True)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return _press_ctrl_combo(VK_A)
 
 
 def type_text(text: str) -> bool:
@@ -1005,6 +1029,131 @@ def active_window_title() -> str:
         return ""
 
 
+def _is_pdf_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def _save_dialog_ocr_text(handle: int) -> str:
+    """Best-effort OCR of the lower half of an open Save As dialog (Type dropdown)."""
+    if not handle or os.name != "nt":
+        return ""
+    user32 = _user32()
+    if user32 is None:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import tempfile
+        from PIL import ImageGrab
+        import ocr_pages
+
+        if not ocr_pages.available():
+            return ""
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(int(handle), ctypes.byref(rect)):
+            return ""
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width < 200 or height < 120:
+            return ""
+        # «Имя файла» and «Тип файла» always sit in the bottom third of Save As.
+        top = int(rect.top + height * 0.65)
+        bbox = (int(rect.left), top, int(rect.right), int(rect.bottom))
+        with tempfile.TemporaryDirectory(prefix="tsai_save_dlg_") as directory:
+            img_path = Path(directory) / "dlg.png"
+            image = ImageGrab.grab(bbox=bbox, all_screens=True)
+            image.save(img_path, format="PNG")
+            engine = ocr_pages._engine_or_raise()  # noqa: SLF001
+            result = ocr_pages.run_engine(engine, str(img_path))
+            if isinstance(result, tuple):
+                result = result[0]
+            return " ".join(str(item[1]) for item in (result or []) if len(item) >= 2).lower()
+    except Exception:  # noqa: BLE001 - optional visual guard must never break saving
+        return ""
+
+
+def _text_indicates_webpage_save(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    return any(mark in lowered for mark in WEBPAGE_SAVE_MARKS)
+
+
+def save_dialog_is_webpage(handle: int | None = None) -> bool:
+    """True when an open Save As dialog offers Webpage/MHTML instead of PDF."""
+    target_handle = int(handle) if handle else active_window_handle()
+    if not target_handle:
+        return False
+    return _text_indicates_webpage_save(_save_dialog_ocr_text(target_handle))
+
+
+def confirm_open_save_dialog(
+    browser_handle: int,
+    *,
+    target: str | Path | None = None,
+    seen_dialogs: set[int] | None = None,
+    active_handle_fn: Optional[Callable[[], int]] = None,
+    active_title_fn: Optional[Callable[[], str]] = None,
+    same_process_fn: Optional[Callable[[int, int], bool]] = None,
+    is_webpage_fn: Optional[Callable[[int], bool]] = None,
+    press_ctrl_a_fn: Optional[Callable[[], bool]] = None,
+    type_text_fn: Optional[Callable[[str], bool]] = None,
+    press_enter_fn: Optional[Callable[[], bool]] = None,
+    press_escape_fn: Optional[Callable[[], bool]] = None,
+) -> str:
+    """Confirm a browser-owned PDF 'Save As' dialog, or cancel if it is 'Webpage'.
+
+    Returns ``""`` when no matching browser Save dialog is active/unseen,
+    ``"confirmed"`` after submitting the dialog, or ``"webpage_cancelled"``
+    when the dialog offered Webpage/MHTML instead of PDF and was dismissed.
+    """
+    active_fn = active_handle_fn or active_window_handle
+    title_fn = active_title_fn or active_window_title
+    dlg_handle = int(active_fn() or 0)
+    if not dlg_handle or not looks_like_save_dialog(title_fn()):
+        return ""
+    if seen_dialogs is not None and dlg_handle in seen_dialogs:
+        return ""
+    if same_process_fn is not None:
+        same_proc = bool(same_process_fn(dlg_handle, int(browser_handle)))
+    else:
+        user32 = _user32()
+        same_proc = (
+            user32 is not None
+            and (
+                dlg_handle == int(browser_handle)
+                or _same_owning_process(user32, dlg_handle, int(browser_handle))
+            )
+        )
+    if not same_proc:
+        return ""
+    if seen_dialogs is not None:
+        seen_dialogs.add(dlg_handle)
+
+    webpage_check = is_webpage_fn or save_dialog_is_webpage
+    if webpage_check(dlg_handle):
+        (press_escape_fn or press_escape)()
+        _set_last_save_note(
+            "Chrome открыл «Сохранение» как веб-страницу («Веб-страница, один файл») "
+            "вместо PDF — отключите расширение Adobe Acrobat в Chrome («Защита файла PDF») "
+            "или включите «Скачивать PDF-файлы» в настройках Chrome; диалог закрыт."
+        )
+        return "webpage_cancelled"
+
+    if target is not None:
+        (press_ctrl_a_fn or press_ctrl_a)()
+        if not (type_text_fn or type_text)(str(target)):
+            return ""
+        time.sleep(0.15)
+    if not (press_enter_fn or press_enter)():
+        return ""
+    return "confirmed"
+
+
 def pending_path(downloads_dir: str | Path, endorsement_id: int | str) -> Path:
     return Path(downloads_dir) / f"{PENDING_PREFIX}{endorsement_id}.pdf"
 
@@ -1025,8 +1174,9 @@ def save_pdf_if_possible(
     preferred: Optional[object] = None,
 ) -> Optional[Path]:
     """Одна безопасная попытка Ctrl+S только в уже загруженном PDF браузера."""
+    _set_last_save_note("")
     destination = Path(target)
-    if destination.is_file():
+    if destination.is_file() and _is_pdf_file(destination):
         return destination
     try:
         candidate = find_pdf_browser_window((windows or list_windows)(),
@@ -1047,18 +1197,37 @@ def save_pdf_if_possible(
     press = press_ctrl_s_fn or press_ctrl_s
     if not press():
         return None
-    sleep(wait)
-    if destination.is_file():
-        return destination
 
     dialog_open = dialog_open_fn or (lambda: looks_like_save_dialog(active_window_title()))
-    try:
-        opened_dialog = dialog_open()
-    except Exception:  # noqa: BLE001
-        opened_dialog = False
+    opened_dialog = False
+    open_budget = max(float(wait), 2.5)
+    step = 0.15
+    checks = max(1, int(round(open_budget / step)))
+    first_pause = min(float(wait), step) if float(wait) > 0 else 0.0
+    for idx in range(checks):
+        sleep(first_pause if idx == 0 else step)
+        if destination.is_file() and _is_pdf_file(destination):
+            return destination
+        try:
+            if dialog_open():
+                opened_dialog = True
+                break
+        except Exception:  # noqa: BLE001
+            pass
     if not opened_dialog:
         return None
 
+    if dialog_open_fn is None and save_dialog_is_webpage():
+        press_escape()
+        _set_last_save_note(
+            "Chrome открыл «Сохранение» как веб-страницу («Веб-страница, один файл») "
+            "вместо PDF — отключите расширение Adobe Acrobat в Chrome («Защита файла PDF») "
+            "или включите «Скачивать PDF-файлы» в настройках Chrome; диалог закрыт."
+        )
+        return None
+
+    if dialog_open_fn is None:
+        press_ctrl_a()
     write = type_text_fn or type_text
     enter = press_enter_fn or press_enter
     if not write(str(destination)):
@@ -1066,8 +1235,14 @@ def save_pdf_if_possible(
     sleep(0.2)
     if not enter():
         return None
-    sleep(max(wait, 1.0))
-    return destination if destination.is_file() else None
+
+    save_budget = max(float(wait), 2.5)
+    save_checks = max(1, int(round(save_budget / step)))
+    for _ in range(save_checks):
+        sleep(step)
+        if destination.is_file() and _is_pdf_file(destination):
+            return destination
+    return destination if (destination.is_file() and _is_pdf_file(destination)) else None
 
 
 def auto_save_hook(
@@ -1091,6 +1266,7 @@ def auto_save_hook(
     baselines: dict[str, dict[int, str]] = {}
     target_handles: dict[str, int] = {}
     ready_since: dict[str, tuple[int, str, float]] = {}
+    seen_save_dialogs: set[int] = set()
     state: dict[str, str] = {}
 
     def _eligible(window: BrowserWindow) -> bool:
@@ -1118,12 +1294,24 @@ def auto_save_hook(
     def attempt(endorsement_id: int | str) -> Optional[Path]:
         key = str(endorsement_id)
         target = pending_path(downloads_dir, key)
-        if target.is_file():
+        if target.is_file() and _is_pdf_file(target):
             return target
-        if key in attempted_pdf:
-            return None
         if not available():
             state.setdefault(key, "автоматика Windows (клавиатура/окна) недоступна")
+            return None
+        if key in attempted_pdf:
+            pinned_done = target_handles.get(key)
+            if pinned_done:
+                dlg_res = confirm_open_save_dialog(
+                    pinned_done, target=target, seen_dialogs=seen_save_dialogs,
+                    active_handle_fn=active_handle_fn,
+                )
+                if dlg_res == "webpage_cancelled":
+                    state[key] = last_save_note() or "диалог сохранения веб-страницы отменён"
+                elif dlg_res == "confirmed":
+                    time.sleep(0.5)
+                    if target.is_file() and _is_pdf_file(target):
+                        return target
             return None
         now = monotonic()
         requested_at.setdefault(key, now)
@@ -1164,11 +1352,31 @@ def auto_save_hook(
                     return None
             target_handles[key] = pinned
 
+        # If Chrome ("Ask where to save") popped a Save As dialog immediately upon
+        # navigation/download, confirm it straight away instead of waiting 15 s
+        # and sending Ctrl+S to the Save As dialog.
+        dlg_res = confirm_open_save_dialog(
+            pinned, target=target, seen_dialogs=seen_save_dialogs,
+            active_handle_fn=active_handle_fn,
+        )
+        if dlg_res == "webpage_cancelled":
+            state[key] = last_save_note() or "диалог сохранения веб-страницы отменён"
+            return None
+        if dlg_res == "confirmed":
+            state[key] = f"диалог «Сохранить как» подтверждён автоматически -> {target.name}"
+            time.sleep(0.8)
+            if target.is_file() and _is_pdf_file(target):
+                return target
+            return None
+
         candidate = next((window for window in windows if window.handle == pinned), None)
         if candidate is None or not _eligible(candidate):
             ready_since.pop(key, None)
             state[key] = ("закреплённое окно закрылось" if candidate is None
                           else "закреплённое окно — не поддерживаемый браузер")
+            return None
+        if looks_like_save_dialog(candidate.title):
+            state[key] = f"в закреплённом окне открыт диалог сохранения: {candidate.title!r}"
             return None
         recognized_pdf = looks_like_loaded_pdf(candidate.title)
         if not recognized_pdf:
@@ -1218,6 +1426,8 @@ def auto_save_hook(
         if preferred is not None:
             save_kwargs["preferred"] = preferred
         result = save_pdf_if_possible(target, **save_kwargs)
+        if result is None and last_save_note():
+            state[key] = last_save_note()
         return result
 
     def note(endorsement_id: int | str) -> str:

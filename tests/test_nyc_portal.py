@@ -2121,3 +2121,69 @@ def test_portal_window_respects_preferred_browser_and_errors_cleanly_if_absent(m
         nyc_portal.browser_save.reset_auto_browser_pin()
 
 
+def test_new_tab_polls_when_chrome_takes_longer_than_single_delay(tmp_path, monkeypatch):
+    window = nyc_portal.browser_save.BrowserWindow(
+        77, "Previous Page - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe",
+    )
+    titles = iter(("Previous Page - Google Chrome", "Previous Page - Google Chrome", "Новая вкладка - Google Chrome"))
+    typed: list[str] = []
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _handle: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: next(titles, "Новая вкладка - Google Chrome"))
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
+    monkeypatch.setattr(nyc_portal, "_key", lambda *_a: None)
+    monkeypatch.setattr(nyc_portal, "_click_text", lambda _h, rows, _t: rows[0])
+    monkeypatch.setattr(nyc_portal, "_click_row", lambda _h, row: row)
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_args: None)
+    ocr_calls = iter([
+        [nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+        [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
+        [nyc_portal.ScreenText("Address (Enter an Address)", (20, 160, 550, 180))],
+        [nyc_portal.ScreenText("859 Father Capodanno Boulevard, Staten Island, NY", (30, 255, 500, 275))],
+        [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+         nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 10", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 5712", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 10", (300, 300, 400, 330))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: next(ocr_calls))
+
+    def capture(_handle, destination):
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_portal_screen(path)
+        return path
+
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+
+    capture_result = nyc_portal._drive_portal("859 Father Capodanno Boulevard", tmp_path / "map.png")
+    assert capture_result.block == "5712" and capture_result.lot == "10"
+    assert nyc_portal.PORTAL_URL in typed
+
+
+def test_ctrl_t_failure_includes_actual_active_title(tmp_path, monkeypatch):
+    window = nyc_portal.browser_save.BrowserWindow(
+        77, "Some Tab - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "Some Tab - Google Chrome")
+    with pytest.raises(nyc_portal.PortalLookupError, match="some tab - google chrome"):
+        nyc_portal._drive_portal("859 Father Capodanno", tmp_path / "parcel.png")
+
+

@@ -676,3 +676,188 @@ def test_hook_still_saves_recognized_pdf_after_failed_blind_attempt(tmp_path, mo
     assert hook("58421") is None  # 20.0s -> viewer just appeared
     assert hook("58421") == tmp_path / "tsai_step0_58421.pdf"  # 21.5s -> recognized PDF still saves!
     assert actions == [("Please stand by", False), ("viewer", True)]
+
+
+def test_save_pdf_polls_for_slow_chrome_save_dialog(tmp_path):
+    target = tmp_path / "tsai_step0_814433.pdf"
+    checks = {"n": 0}
+
+    def dialog_open():
+        checks["n"] += 1
+        return checks["n"] >= 5
+
+    def type_path(value: str) -> bool:
+        target.write_bytes(b"%PDF-1.7 chrome")
+        return True
+
+    result = browser_save.save_pdf_if_possible(
+        target,
+        windows=lambda: [BrowserWindow(10, "viewer - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")],
+        foreground_fn=lambda _handle: True,
+        active_handle_fn=lambda: 10,
+        press_ctrl_s_fn=lambda: True,
+        dialog_open_fn=dialog_open,
+        type_text_fn=type_path,
+        press_enter_fn=lambda: True,
+        sleep=lambda _seconds: None,
+        wait=0.8,
+    )
+    assert result == target
+    assert checks["n"] == 5
+
+
+def test_save_pdf_rejects_non_pdf_file_payload(tmp_path):
+    target = tmp_path / "tsai_step0_814433.pdf"
+
+    def write_mhtml(value: str) -> bool:
+        Path(value).write_text("From: <Saved by Blink>\n<html></html>", encoding="utf-8")
+        return True
+
+    result = browser_save.save_pdf_if_possible(
+        target,
+        windows=lambda: [BrowserWindow(10, "RCC-121449.pdf", "chrome.exe", r"C:\Chrome\chrome.exe")],
+        foreground_fn=lambda _handle: True,
+        active_handle_fn=lambda: 10,
+        press_ctrl_s_fn=lambda: True,
+        dialog_open_fn=lambda: True,
+        type_text_fn=write_mhtml,
+        press_enter_fn=lambda: True,
+        sleep=lambda _seconds: None,
+    )
+    assert result is None
+
+
+def test_confirm_open_save_dialog_confirms_pdf_and_cancels_webpage(tmp_path):
+    events: list[object] = []
+    seen: set[int] = set()
+    target = tmp_path / "tsai_step0_814433.pdf"
+
+    # Different process -> ignored completely.
+    assert browser_save.confirm_open_save_dialog(
+        10,
+        target=target,
+        seen_dialogs=seen,
+        active_handle_fn=lambda: 500,
+        active_title_fn=lambda: "Сохранение",
+        same_process_fn=lambda _d, _b: False,
+        is_webpage_fn=lambda _d: False,
+        press_enter_fn=lambda: events.append("enter") or True,
+    ) == ""
+    assert events == []
+
+    # Chrome Save As offering «Веб-страница, один файл» -> cancelled via Esc!
+    assert browser_save.confirm_open_save_dialog(
+        10,
+        target=target,
+        seen_dialogs=seen,
+        active_handle_fn=lambda: 501,
+        active_title_fn=lambda: "Сохранение",
+        same_process_fn=lambda _d, _b: True,
+        is_webpage_fn=lambda _d: True,
+        press_escape_fn=lambda: events.append("esc") or True,
+        press_enter_fn=lambda: events.append("enter") or True,
+    ) == "webpage_cancelled"
+    assert events == ["esc"]
+    assert "Веб-страница" in browser_save.last_save_note()
+
+    # Genuine PDF Save dialog -> confirmed once, and second call skips already-seen HWND.
+    events.clear()
+    assert browser_save.confirm_open_save_dialog(
+        10,
+        target=target,
+        seen_dialogs=seen,
+        active_handle_fn=lambda: 502,
+        active_title_fn=lambda: "Сохранение",
+        same_process_fn=lambda _d, _b: True,
+        is_webpage_fn=lambda _d: False,
+        press_ctrl_a_fn=lambda: events.append("ctrl+a") or True,
+        type_text_fn=lambda text: events.append(("type", text)) or True,
+        press_enter_fn=lambda: events.append("enter") or True,
+    ) == "confirmed"
+    assert events == ["ctrl+a", ("type", str(target)), "enter"]
+    assert browser_save.confirm_open_save_dialog(
+        10,
+        target=target,
+        seen_dialogs=seen,
+        active_handle_fn=lambda: 502,
+        active_title_fn=lambda: "Сохранение",
+        same_process_fn=lambda _d, _b: True,
+        is_webpage_fn=lambda _d: False,
+        press_enter_fn=lambda: events.append("enter2") or True,
+    ) == ""
+
+
+def test_hook_handles_immediate_save_dialog_from_chrome_ask_where_to_save(tmp_path, monkeypatch):
+    moments = iter((0.0, 1.0, 2.0))
+    chrome_dlg = BrowserWindow(55, "Сохранение", "chrome.exe", r"C:\Chrome\chrome.exe")
+    calls = {"n": 0}
+
+    def windows():
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [chrome_dlg]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(
+        browser_save, "save_pdf_if_possible",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Ctrl+S must not run on Save As dialog")),
+    )
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _s: None)
+
+    def fake_confirm(browser_handle, *, target=None, seen_dialogs=None, **_kwargs):
+        assert browser_handle == 55
+        Path(target).write_bytes(b"%PDF-1.7 auto-confirmed")
+        return "confirmed"
+
+    monkeypatch.setattr(browser_save, "confirm_open_save_dialog", fake_confirm)
+    hook = browser_save.auto_save_hook(
+        tmp_path, blind_after=15.0, windows_fn=windows,
+        active_handle_fn=lambda: 55, monotonic=lambda: next(moments), preferred="chrome",
+    )
+    hook.before_open("814433")
+    assert hook("814433") == tmp_path / "tsai_step0_814433.pdf"
+
+
+def test_foreground_switches_to_target_window_when_same_browser_has_two_titled_windows(monkeypatch):
+    calls = []
+    win1 = BrowserWindow(10, "New Tab - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")
+    win2 = BrowserWindow(20, "Chat - Google Chrome", "chrome.exe", r"C:\Chrome\chrome.exe")
+    fg_state = {"hwnd": 20}
+
+    class User32:
+        def IsIconic(self, _h):
+            return False
+
+        def GetForegroundWindow(self):
+            return fg_state["hwnd"]
+
+        def GetWindowThreadProcessId(self, handle, process_id):
+            process_id._obj.value = 999  # both windows share the same chrome.exe PID
+            return 50
+
+        def AttachThreadInput(self, _a, _b, _attach):
+            return True
+
+        def AllowSetForegroundWindow(self, _pid):
+            return True
+
+        def BringWindowToTop(self, handle):
+            calls.append(("top", handle))
+            return True
+
+        def SetForegroundWindow(self, handle):
+            calls.append(("activate", handle))
+            fg_state["hwnd"] = handle
+            return True
+
+    class Kernel32:
+        def GetCurrentThreadId(self):
+            return 5
+
+    import ctypes
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [win1, win2])
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_a, **_k: Kernel32(), raising=False)
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _s: None)
+    assert browser_save.foreground(10, timeout=0.1)
+    assert ("activate", 10) in calls
+

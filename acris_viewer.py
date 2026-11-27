@@ -538,6 +538,7 @@ def download_pdf_via_viewer(
     found: Optional[Path] = None
     download_deadline = monotonic() + max(0.0, float(download_wait_sec))
     next_probe = monotonic() + 15.0
+    seen_save_dialogs: set[int] = set()
     while found is None:
         check_stop()
         found = find_pdf_fn(folder, since=since)
@@ -545,6 +546,17 @@ def download_pdf_via_viewer(
             break
         if monotonic() >= download_deadline:
             break
+        if window is not None and browser_save.available():
+            dlg_res = browser_save.confirm_open_save_dialog(
+                window.handle, seen_dialogs=seen_save_dialogs,
+            )
+            if dlg_res == "confirmed":
+                say("браузер открыл «Сохранить как» — подтверждаю сохранение PDF в Загрузки")
+            elif dlg_res == "webpage_cancelled":
+                raise manual(
+                    browser_save.last_save_note()
+                    or "браузер открыл «Сохранение» веб-страницы вместо PDF."
+                )
         now = monotonic()
         if fast_ok_deadline is not None and now >= fast_ok_deadline:
             # Быстрый клик не дал PDF за короткий срок. Это не промежуточная

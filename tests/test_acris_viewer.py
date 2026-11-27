@@ -516,3 +516,52 @@ def test_pick_window_and_url_open_use_preferred_browser(tmp_path, monkeypatch):
         browser_save.set_preferred_browser(prev)
         browser_save.reset_auto_browser_pin()
 
+
+def test_acris_viewer_confirms_chrome_ask_where_to_save_dialog(tmp_path, monkeypatch):
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    target = tmp_path / "out" / "OUR LOT 53 NEW.pdf"
+    clock = _Clock()
+    clicks: list[tuple[int, int]] = []
+    state = {"dialog": False, "save_as": False}
+
+    def capture(_handle):
+        return DIALOG_ROWS if state["dialog"] else READY_ROWS
+
+    def click(_handle, x, y):
+        clicks.append((x, y))
+        if len(clicks) == 1:
+            state["dialog"] = True
+        else:
+            # Instead of immediately writing the PDF, Chrome opens "Сохранение".
+            state["save_as"] = True
+        return True
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+
+    def fake_confirm(handle, *, seen_dialogs=None, **_kwargs):
+        assert handle == 7
+        if not state["save_as"]:
+            return ""
+        state["save_as"] = False
+        (downloads / "DocumentImageView.pdf").write_bytes(b"%PDF-1.4 confirmed")
+        return "confirmed"
+
+    monkeypatch.setattr(browser_save, "confirm_open_save_dialog", fake_confirm)
+    saved, rung = acris_viewer.download_pdf_via_viewer(
+        "https://a836-acris.nyc.gov/DS/DocumentSearch/DocumentImageView?doc_id=2024101000085001",
+        target,
+        downloads_dir=downloads,
+        open_browser=lambda _u: None,
+        windows_fn=lambda: [_window()],
+        active_fn=lambda: 7,
+        bounds_fn=lambda _h: (0, 0, 1600, 900),
+        capture_rows_fn=capture,
+        click_fn=click,
+        focus_fn=lambda _h: True,
+        sleep=clock.sleep, monotonic=clock.monotonic,
+        viewer_wait_sec=5, dialog_wait_sec=5, download_wait_sec=5, poll_sec=0.1,
+    )
+    assert (saved, rung) == (target, "browser")
+    assert target.read_bytes() == b"%PDF-1.4 confirmed"
+

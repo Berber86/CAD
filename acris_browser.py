@@ -37,7 +37,10 @@ VK_MENU = 0x12  # Alt
 VK_LEFT = 0x25
 
 #: Заголовки пустой новой вкладки (как у портала: печатаем только в пустую).
-NEW_TAB_TITLE_MARKS = ("new tab", "новая вкладка", "about:blank", "пустая страница")
+NEW_TAB_TITLE_MARKS = (
+    "new tab", "new private tab", "новая вкладка", "новая приватная вкладка",
+    "пустая страница", "about:blank", "untitled", "без названия", "chrome://newtab",
+)
 
 Progress = Callable[[str], None]
 StopCheck = Callable[[], bool]

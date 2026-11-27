@@ -283,10 +283,17 @@ def _portal_window() -> browser_save.BrowserWindow:
             "Не найдено видимое окно поддерживаемого браузера. Откройте Chrome/Edge и повторите поиск."
         )
     active = browser_save.active_window_handle()
-    portal = [w for w in windows if any(mark in w.title.lower() for mark in PORTAL_URL_MARKS)]
-    # Prefer a portal tab; otherwise reuse the topmost existing supported browser window
-    # and navigate its current tab (no new window/tab is launched).
-    return next((w for w in portal if w.handle == active), portal[0] if portal else windows[0])
+    preferred = browser_save.get_preferred_browser()
+    picked = browser_save.pick_browser_window(
+        windows, active, preferred=preferred, title_marks=PORTAL_URL_MARKS, remember=True,
+    )
+    if picked is None:
+        label = browser_save.preferred_browser_label(preferred)
+        raise PortalLookupError(
+            f"Не найдено видимое окно выбранного браузера ({label}). "
+            "Откройте его или переключите браузер на «Авто»."
+        )
+    return picked
 
 
 def _save_window_capture(handle: int, destination: str | Path) -> Path:

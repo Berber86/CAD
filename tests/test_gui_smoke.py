@@ -6360,3 +6360,29 @@ def test_image_format_toggles_stay_synced_between_step1_and_data_tab(gui, monkey
     assert app.config_data["api"]["vision_output_format"] == "jpeg"
     assert saved == ["png", "jpeg"]
 
+
+def test_preferred_browser_setting_syncs_step0_and_settings_and_persists(gui, tmp_path, monkeypatch):
+    import json
+    import llm_parser
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"deed_intake": {"preferred_browser": "chrome"}}), encoding="utf-8")
+    monkeypatch.setattr(gui, "CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(gui, "load_config", lambda path=cfg_path: llm_parser.load_config(path))
+    prev = gui.browser_save.get_preferred_browser()
+    try:
+        app = gui.SurveyApp()
+        assert gui.browser_save.get_preferred_browser() == "chrome"
+        assert app.preferred_browser_var.get() == "Google Chrome"
+        assert app.step0_browser_menu.cget("variable") is app.preferred_browser_var
+        assert app.preferred_browser_menu.cget("variable") is app.preferred_browser_var
+
+        app.step0_browser_menu.cget("command")("Яндекс Браузер")
+        assert gui.browser_save.get_preferred_browser() == "yandex"
+        assert app.preferred_browser_var.get() == "Яндекс Браузер"
+        assert json.loads(cfg_path.read_text(encoding="utf-8"))["deed_intake"]["preferred_browser"] == "yandex"
+    finally:
+        gui.browser_save.set_preferred_browser(prev)
+        gui.browser_save.reset_auto_browser_pin()
+
+

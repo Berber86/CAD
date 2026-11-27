@@ -2098,3 +2098,26 @@ def test_losing_neighbour_race_thread_stops_retrying_and_logging_after_winner(tm
     assert calls.count("claude-haiku-5.5") == 1  # no retries 2 or 3 after terra won
     assert not any("повторяю — попытка" in line for line in messages)
 
+
+def test_portal_window_respects_preferred_browser_and_errors_cleanly_if_absent(monkeypatch):
+    chrome = nyc_portal.browser_save.BrowserWindow(
+        10, "Property Information Portal - Chrome", "chrome.exe", r"C:\Chrome\chrome.exe",
+    )
+    edge = nyc_portal.browser_save.BrowserWindow(
+        20, "New Tab - Microsoft Edge", "msedge.exe", r"C:\Edge\msedge.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "list_windows", lambda: [chrome, edge])
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_handle", lambda: 10)
+    prev = nyc_portal.browser_save.get_preferred_browser()
+    try:
+        nyc_portal.browser_save.set_preferred_browser("edge")
+        assert nyc_portal._portal_window() == edge
+
+        nyc_portal.browser_save.set_preferred_browser("firefox")
+        with pytest.raises(nyc_portal.PortalLookupError, match="Mozilla Firefox"):
+            nyc_portal._portal_window()
+    finally:
+        nyc_portal.browser_save.set_preferred_browser(prev)
+        nyc_portal.browser_save.reset_auto_browser_pin()
+
+

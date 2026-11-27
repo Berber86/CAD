@@ -7,10 +7,14 @@ PDF programs are never activated, and a download gets at most one Ctrl+S attempt
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import threading
 import time
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 PENDING_PREFIX = "tsai_step0_"
 VK_CONTROL = 0x11
@@ -32,6 +36,55 @@ BROWSER_EXECUTABLES = {
     "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "opera_gx.exe",
     "brave.exe", "vivaldi.exe", "waterfox.exe",
 }
+PREFERRED_BROWSER_OPTIONS: dict[str, str] = {
+    "auto": "Авто (единый / по умолчанию)",
+    "chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "yandex": "Яндекс Браузер",
+    "firefox": "Mozilla Firefox",
+    "brave": "Brave",
+    "opera": "Opera",
+}
+_BROWSER_KEY_BY_EXE: dict[str, str] = {
+    "chrome.exe": "chrome",
+    "msedge.exe": "edge",
+    "firefox.exe": "firefox",
+    "brave.exe": "brave",
+    "opera.exe": "opera",
+    "opera_gx.exe": "opera",
+    "vivaldi.exe": "vivaldi",
+    "waterfox.exe": "waterfox",
+}
+_BROWSER_ALIASES: dict[str, str] = {
+    "": "auto",
+    "auto": "auto",
+    "default": "auto",
+    "авто": "auto",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "chrome.exe": "chrome",
+    "edge": "edge",
+    "msedge": "edge",
+    "msedge.exe": "edge",
+    "microsoft edge": "edge",
+    "yandex": "yandex",
+    "yandex browser": "yandex",
+    "яндекс": "yandex",
+    "яндекс браузер": "yandex",
+    "firefox": "firefox",
+    "mozilla firefox": "firefox",
+    "firefox.exe": "firefox",
+    "brave": "brave",
+    "brave.exe": "brave",
+    "opera": "opera",
+    "opera.exe": "opera",
+    "opera_gx": "opera",
+    "opera_gx.exe": "opera",
+    "opera gx": "opera",
+}
+_BROWSER_PREF_LOCK = threading.Lock()
+_PREFERRED_BROWSER = "auto"
+_LAST_AUTO_BROWSER = ""
 CLOUDFLARE_TITLE_MARKS = (
     "just a moment", "one moment", "please wait", "checking your browser",
     "verifying", "cloudflare", "captcha", "challenge", "security check",
@@ -60,6 +113,347 @@ def is_supported_browser(executable: str, image_path: str = "") -> bool:
     if name in BROWSER_EXECUTABLES:
         return True
     return name == "browser.exe" and "yandex" in str(image_path or "").lower()
+
+
+def browser_key(executable: str, image_path: str = "") -> str:
+    """Каноничный код браузера ('chrome', 'edge', 'yandex', ...) или ''."""
+    name = str(executable or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name in _BROWSER_KEY_BY_EXE:
+        return _BROWSER_KEY_BY_EXE[name]
+    if name == "browser.exe" and "yandex" in str(image_path or "").lower():
+        return "yandex"
+    return ""
+
+
+def matches_browser(window: BrowserWindow, key: str) -> bool:
+    """True, если окно относится к заданному семейству браузера (или ``auto``)."""
+    target = normalize_preferred_browser(key)
+    if target == "auto":
+        return is_supported_browser(window.executable, window.image_path)
+    return browser_key(window.executable, window.image_path) == target
+
+
+def normalize_preferred_browser(raw: object) -> str:
+    """Приводит строку конфига/UI к коду из ``PREFERRED_BROWSER_OPTIONS``."""
+    text = str(raw or "").strip().lower()
+    for code, label in PREFERRED_BROWSER_OPTIONS.items():
+        if text == code or text == label.lower():
+            return code
+    return _BROWSER_ALIASES.get(text, "auto")
+
+
+def preferred_browser_label(code: object) -> str:
+    """Подпись для UI по коду браузера."""
+    normalized = normalize_preferred_browser(code)
+    return PREFERRED_BROWSER_OPTIONS.get(normalized, PREFERRED_BROWSER_OPTIONS["auto"])
+
+
+def preferred_browser_key_for_label(label: object) -> str:
+    """Обратное преобразование подписи UI в код для сохранения."""
+    return normalize_preferred_browser(label)
+
+
+def preferred_browser_from_config(cfg: object) -> str:
+    """Читает ``deed_intake.preferred_browser`` (или ``browser.preferred``)."""
+    if not isinstance(cfg, dict):
+        return "auto"
+    deed = cfg.get("deed_intake")
+    if isinstance(deed, dict) and deed.get("preferred_browser") is not None:
+        return normalize_preferred_browser(deed.get("preferred_browser"))
+    browser_sec = cfg.get("browser")
+    if isinstance(browser_sec, dict) and browser_sec.get("preferred") is not None:
+        return normalize_preferred_browser(browser_sec.get("preferred"))
+    return "auto"
+
+
+def get_preferred_browser() -> str:
+    with _BROWSER_PREF_LOCK:
+        return _PREFERRED_BROWSER
+
+
+def set_preferred_browser(code: object) -> str:
+    normalized = normalize_preferred_browser(code)
+    with _BROWSER_PREF_LOCK:
+        global _PREFERRED_BROWSER
+        _PREFERRED_BROWSER = normalized
+    return normalized
+
+
+def get_auto_browser_pin() -> str:
+    with _BROWSER_PREF_LOCK:
+        return _LAST_AUTO_BROWSER
+
+
+def reset_auto_browser_pin() -> None:
+    with _BROWSER_PREF_LOCK:
+        global _LAST_AUTO_BROWSER
+        _LAST_AUTO_BROWSER = ""
+
+
+def _set_auto_browser_pin(key: str) -> None:
+    if not key:
+        return
+    with _BROWSER_PREF_LOCK:
+        global _LAST_AUTO_BROWSER
+        _LAST_AUTO_BROWSER = key
+
+
+def _key_from_prog_id(prog_id: str) -> str:
+    lowered = str(prog_id or "").strip().lower()
+    if not lowered:
+        return ""
+    for token, key in (
+        ("chrome", "chrome"),
+        ("msedge", "edge"),
+        ("edge", "edge"),
+        ("yandex", "yandex"),
+        ("firefox", "firefox"),
+        ("brave", "brave"),
+        ("opera", "opera"),
+        ("vivaldi", "vivaldi"),
+        ("waterfox", "waterfox"),
+    ):
+        if token in lowered:
+            return key
+    return ""
+
+
+def default_browser_key() -> str:
+    """Определяет системный браузер по умолчанию в Windows (иначе ``""``)."""
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001
+        return ""
+    for scheme in ("https", "http"):
+        subkey = (
+            rf"Software\Microsoft\Windows\Shell\Associations"
+            rf"\UrlAssociations\{scheme}\UserChoice"
+        )
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as key:
+                prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+        except OSError:
+            continue
+        detected = _key_from_prog_id(str(prog_id or ""))
+        if detected:
+            return detected
+    return ""
+
+
+def _windows_app_path(exe_name: str) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001
+        return ""
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, None)
+        except OSError:
+            continue
+        candidate = str(value or "").strip().strip('"')
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def find_browser_executable(
+    browser_id: object,
+    *,
+    windows: Optional[Sequence[BrowserWindow]] = None,
+) -> str:
+    """Ищет исполняемый файл указанного браузера на ПК (окна → реестр → стандартные пути)."""
+    target = normalize_preferred_browser(browser_id)
+    if target == "auto":
+        return ""
+
+    # 1. Уже запущенное окно (подхватывает в т.ч. нестандартные/переносные установки).
+    try:
+        candidates = list(list_windows() if windows is None else windows)
+    except Exception:  # noqa: BLE001
+        candidates = []
+    for window in candidates:
+        if matches_browser(window, target) and window.image_path:
+            try:
+                if Path(window.image_path).is_file():
+                    return window.image_path
+            except OSError:
+                continue
+
+    # 2. Реестр Windows (App Paths) и стандартные каталоги установки.
+    if os.name == "nt":
+        app_path_names = {
+            "chrome": ("chrome.exe",),
+            "edge": ("msedge.exe",),
+            "yandex": ("browser.exe",),
+            "firefox": ("firefox.exe",),
+            "brave": ("brave.exe",),
+            "opera": ("opera.exe", "opera_gx.exe"),
+        }.get(target, ())
+        for exe_name in app_path_names:
+            found = _windows_app_path(exe_name)
+            if found and (target != "yandex" or "yandex" in found.lower()):
+                return found
+
+        roots = [
+            Path(env_val)
+            for env_name in ("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)")
+            if (env_val := os.environ.get(env_name, "").strip())
+        ]
+        rel_candidates = {
+            "chrome": ("Google/Chrome/Application/chrome.exe",),
+            "edge": ("Microsoft/Edge/Application/msedge.exe",),
+            "yandex": (
+                "Yandex/YandexBrowser/Application/browser.exe",
+                "Yandex/Yandex Browser/Application/browser.exe",
+            ),
+            "firefox": ("Mozilla Firefox/firefox.exe",),
+            "brave": ("BraveSoftware/Brave-Browser/Application/brave.exe",),
+            "opera": (
+                "Programs/Opera/opera.exe",
+                "Programs/Opera GX/opera.exe",
+                "Opera/launcher.exe",
+                "Opera/opera.exe",
+            ),
+        }.get(target, ())
+        for root in roots:
+            for rel in rel_candidates:
+                candidate = root / rel
+                try:
+                    if candidate.is_file():
+                        return str(candidate)
+                except OSError:
+                    continue
+
+    # 3. PATH / кросс-платформенный запас.
+    which_names = {
+        "chrome": ("google-chrome", "chrome.exe", "chrome"),
+        "edge": ("microsoft-edge", "msedge.exe", "msedge"),
+        "yandex": ("yandex-browser",),
+        "firefox": ("firefox", "firefox.exe"),
+        "brave": ("brave-browser", "brave.exe", "brave"),
+        "opera": ("opera", "opera.exe"),
+    }.get(target, ())
+    for name in which_names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def open_url(
+    url: str,
+    *,
+    preferred: Optional[object] = None,
+    new: int = 2,
+    windows_fn: Optional[Callable[[], list[BrowserWindow]]] = None,
+    popen: Optional[Callable[..., object]] = None,
+    webbrowser_open: Optional[Callable[..., object]] = None,
+    default_key_fn: Optional[Callable[[], str]] = None,
+    find_exe_fn: Optional[Callable[..., str]] = None,
+) -> bool:
+    """Открывает URL в приоритетном браузере (или в едином активном при режиме «Авто»)."""
+    pref = normalize_preferred_browser(
+        preferred if preferred is not None else get_preferred_browser()
+    )
+    list_fn = windows_fn or list_windows
+    try:
+        current_windows = list(list_fn())
+    except Exception:  # noqa: BLE001
+        current_windows = []
+
+    target_key = ""
+    if pref != "auto":
+        target_key = pref
+    else:
+        pinned = get_auto_browser_pin()
+        # В режиме «Авто» держимся того же браузера, с которым уже идёт работа в этой
+        # сессии (например, где открыт NYC Portal), только пока его окно реально открыто.
+        if pinned and any(matches_browser(w, pinned) for w in current_windows):
+            target_key = pinned
+
+    if target_key:
+        exe = (find_exe_fn or find_browser_executable)(target_key, windows=current_windows)
+        if exe:
+            launcher = popen or subprocess.Popen
+            launcher(
+                [exe, str(url)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            if pref == "auto":
+                _set_auto_browser_pin(target_key)
+            return True
+
+    fallback = webbrowser_open or webbrowser.open
+    opened = bool(fallback(str(url), new=new))
+    if pref == "auto":
+        detected = (default_key_fn or default_browser_key)()
+        if detected:
+            _set_auto_browser_pin(detected)
+    return opened
+
+
+def pick_browser_window(
+    windows: Sequence[BrowserWindow],
+    active_handle: int = 0,
+    *,
+    preferred: Optional[object] = None,
+    title_marks: Sequence[str] = (),
+    remember: bool = False,
+    default_key_fn: Optional[Callable[[], str]] = None,
+) -> Optional[BrowserWindow]:
+    """Единый детерминированный выбор окна браузера для Портала, ACRIS и Клерка."""
+    supported = [
+        window for window in windows
+        if is_supported_browser(window.executable, window.image_path)
+    ]
+    if not supported:
+        return None
+    pref = normalize_preferred_browser(
+        preferred if preferred is not None else get_preferred_browser()
+    )
+    if pref != "auto":
+        eligible = [window for window in supported if matches_browser(window, pref)]
+        if not eligible:
+            return None
+    else:
+        eligible = supported
+
+    chosen: Optional[BrowserWindow] = None
+    marks = tuple(str(mark).lower() for mark in title_marks if str(mark).strip())
+    if marks:
+        marked = [
+            window for window in eligible
+            if any(mark in window.title.lower() for mark in marks)
+        ]
+        if marked:
+            chosen = next((w for w in marked if w.handle == int(active_handle)), marked[0])
+
+    if chosen is None and active_handle:
+        chosen = next((w for w in eligible if w.handle == int(active_handle)), None)
+
+    if chosen is None and pref == "auto":
+        pin = get_auto_browser_pin()
+        if pin:
+            chosen = next((w for w in eligible if matches_browser(w, pin)), None)
+        if chosen is None:
+            os_default = (default_key_fn or default_browser_key)()
+            if os_default:
+                chosen = next((w for w in eligible if matches_browser(w, os_default)), None)
+
+    if chosen is None:
+        chosen = eligible[0]
+
+    if remember and pref == "auto":
+        _set_auto_browser_pin(browser_key(chosen.executable, chosen.image_path))
+    return chosen
 
 
 def looks_like_cloudflare_page(title: str) -> bool:
@@ -208,7 +602,8 @@ def list_windows() -> list[BrowserWindow]:
 
 
 def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None, *,
-                            require_title: bool = True) -> Optional[BrowserWindow]:
+                            require_title: bool = True,
+                            preferred: Optional[object] = None) -> Optional[BrowserWindow]:
     """Fail-closed: только поддерживаемый браузер с загруженным PDF, не challenge.
 
     ``require_title=False`` — слепая попытка в уже закреплённое хуком окно:
@@ -219,8 +614,13 @@ def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None, *,
         candidates = list_windows() if windows is None else windows
     except Exception:  # noqa: BLE001
         return None
+    pref = normalize_preferred_browser(
+        preferred if preferred is not None else get_preferred_browser()
+    )
     for window in candidates:
         if not is_supported_browser(window.executable, window.image_path):
+            continue
+        if pref != "auto" and not matches_browser(window, pref):
             continue
         if require_title and not looks_like_loaded_pdf(window.title):
             continue
@@ -621,6 +1021,7 @@ def save_pdf_if_possible(
     sleep: Callable[[float], None] = time.sleep,
     wait: float = 0.8,
     require_pdf_title: bool = True,
+    preferred: Optional[object] = None,
 ) -> Optional[Path]:
     """Одна безопасная попытка Ctrl+S только в уже загруженном PDF браузера."""
     destination = Path(target)
@@ -628,7 +1029,8 @@ def save_pdf_if_possible(
         return destination
     try:
         candidate = find_pdf_browser_window((windows or list_windows)(),
-                                            require_title=require_pdf_title)
+                                            require_title=require_pdf_title,
+                                            preferred=preferred)
     except Exception:  # noqa: BLE001
         return None
     if candidate is None:
@@ -677,6 +1079,7 @@ def auto_save_hook(
     windows_fn: Callable[[], list[BrowserWindow]] = list_windows,
     active_handle_fn: Callable[[], int] = active_window_handle,
     monotonic: Callable[[], float] = time.monotonic,
+    preferred: Optional[object] = None,
 ):
     """Хук для лестницы: ждёт готовый PDF после старта навигации и на документ
     посылает Ctrl+S только один раз. Cloudflare-title не соответствует PDF-title.
@@ -688,6 +1091,14 @@ def auto_save_hook(
     ready_since: dict[str, tuple[int, str, float]] = {}
     state: dict[str, str] = {}
 
+    def _eligible(window: BrowserWindow) -> bool:
+        if not is_supported_browser(window.executable, window.image_path):
+            return False
+        pref = normalize_preferred_browser(
+            preferred if preferred is not None else get_preferred_browser()
+        )
+        return pref == "auto" or matches_browser(window, pref)
+
     def before_open(endorsement_id: int | str) -> None:
         """Snapshot existing browser tabs before the new document is navigated."""
         key = str(endorsement_id)
@@ -695,7 +1106,7 @@ def auto_save_hook(
         try:
             baselines[key] = {
                 window.handle: window.title for window in windows_fn()
-                if is_supported_browser(window.executable, window.image_path)
+                if _eligible(window)
             }
         except Exception:  # noqa: BLE001
             baselines[key] = {}
@@ -726,7 +1137,7 @@ def auto_save_hook(
             baseline = baselines.setdefault(key, {})
             changed = [
                 window for window in windows
-                if is_supported_browser(window.executable, window.image_path)
+                if _eligible(window)
                 and (window.handle not in baseline or baseline[window.handle] != window.title)
             ]
             active_handle = int(active_handle_fn())
@@ -736,14 +1147,23 @@ def auto_save_hook(
             elif len(changed) == 1:
                 pinned = changed[0].handle
             else:
-                seen = "; ".join(sorted(
-                    {f"[{window.executable}] {window.title!r}" for window in changed})) or "ни одного"
-                state[key] = f"окно загрузки не закреплено: изменилось окон {len(changed)}: {seen}"
-                return None
+                pin = get_auto_browser_pin()
+                pinned_browser_changed = (
+                    [window for window in changed if matches_browser(window, pin)]
+                    if pin and len({browser_key(w.executable, w.image_path) for w in changed}) > 1
+                    else []
+                )
+                if len(pinned_browser_changed) == 1:
+                    pinned = pinned_browser_changed[0].handle
+                else:
+                    seen = "; ".join(sorted(
+                        {f"[{window.executable}] {window.title!r}" for window in changed})) or "ни одного"
+                    state[key] = f"окно загрузки не закреплено: изменилось окон {len(changed)}: {seen}"
+                    return None
             target_handles[key] = pinned
 
         candidate = next((window for window in windows if window.handle == pinned), None)
-        if candidate is None or not is_supported_browser(candidate.executable, candidate.image_path):
+        if candidate is None or not _eligible(candidate):
             ready_since.pop(key, None)
             state[key] = ("закреплённое окно закрылось" if candidate is None
                           else "закреплённое окно — не поддерживаемый браузер")
@@ -786,8 +1206,10 @@ def auto_save_hook(
                 pass
         # Даже с незнакомым заголовком пытаемся: окно уже закреплено за этим
         # документом и проверяем хвост (капча/Getty/JPEG в «Загрузках»).
-        result = save_pdf_if_possible(
-            target, windows=lambda: [candidate], require_pdf_title=recognized_pdf)
+        save_kwargs = {"windows": lambda: [candidate], "require_pdf_title": recognized_pdf}
+        if preferred is not None:
+            save_kwargs["preferred"] = preferred
+        result = save_pdf_if_possible(target, **save_kwargs)
         return result
 
     def note(endorsement_id: int | str) -> str:

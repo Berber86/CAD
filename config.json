@@ -1035,7 +1035,8 @@
     "comment": "локальное распознавание сканов (бесплатно, без ИИ): dpi — рендер страницы; на Шаге 0 можно менять поле OCR DPI (50–1200), настройка сохраняется; выше разрешения картинки в PDF не рендерим"
   },
   "deed_intake": {
-    "comment": "Шаг 0: в Windows Ctrl+S отправляется однократно только окну поддерживаемого браузера после загрузки PDF, не во время Cloudflare"
+    "preferred_browser": "auto",
+    "comment": "Шаг 0: preferred_browser ('auto', 'chrome', 'edge', 'yandex', 'firefox', 'brave', 'opera') задаёт приоритетный браузер для NYC Portal, ACRIS и Клерка; в Windows Ctrl+S отправляется однократно только окну поддерживаемого браузера после загрузки PDF, не во время Cloudflare"
   },
   "telemetry": {
     "enabled": true,

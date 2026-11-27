@@ -628,6 +628,12 @@ class SurveyApp(ctk.CTk):
         if raw_fmt not in _VISION_FORMAT_LABELS:
             raw_fmt = "auto"
         self.vision_format_var = ctk.StringVar(value=_VISION_FORMAT_LABELS[raw_fmt])
+        pref_browser = browser_save.set_preferred_browser(
+            browser_save.preferred_browser_from_config(self.config_data)
+        )
+        self.preferred_browser_var = ctk.StringVar(
+            value=browser_save.preferred_browser_label(pref_browser)
+        )
         self._step0_our_old_tried = False
         # ИИ-автоповорот через LLM ВСЕГДА выключен по умолчанию (доп. платный вызов API);
         # включается только разово на 1 конкретный запуск с явным предупреждением.
@@ -1595,6 +1601,44 @@ class SurveyApp(ctk.CTk):
                      font=ctk.CTkFont(size=10), text_color=THEME["text_dim"],
                      anchor="w", justify="left", wraplength=400).grid(
                          row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        browser_card = ctk.CTkFrame(
+            drawer_body,
+            fg_color=THEME["bg_field"],
+            corner_radius=8,
+            border_width=1,
+            border_color=THEME["border_subtle"],
+        )
+        browser_card.grid(row=8, column=0, sticky="ew", pady=(0, 10))
+        browser_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            browser_card,
+            text="ПРИОРИТЕТНЫЙ БРАУЗЕР (ШАГ 0)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.preferred_browser_menu = ctk.CTkOptionMenu(
+            browser_card,
+            values=list(browser_save.PREFERRED_BROWSER_OPTIONS.values()),
+            variable=self.preferred_browser_var,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            button_color=THEME["btn_secondary"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self._on_preferred_browser_changed,
+        )
+        self.preferred_browser_menu.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
+        ctk.CTkLabel(
+            browser_card,
+            text="Единый браузер для NYC Portal, ACRIS, Клерка и сохранения PDF",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
         # Отдельно от ИИ: эта настройка влияет также на локальный разбор.
         self.doubt_settings_card = ctk.CTkFrame(
@@ -4016,6 +4060,25 @@ class SurveyApp(ctk.CTk):
             text_color=THEME["text_dim"], font=ctk.CTkFont(size=10),
             justify="left", wraplength=410,
         ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        browser_row = ctk.CTkFrame(checks, fg_color="transparent")
+        browser_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        browser_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            browser_row, text="Браузер:", font=ctk.CTkFont(size=11),
+            text_color=THEME["text_muted"], anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.step0_browser_menu = ctk.CTkOptionMenu(
+            browser_row,
+            values=list(browser_save.PREFERRED_BROWSER_OPTIONS.values()),
+            variable=self.preferred_browser_var,
+            height=28,
+            fg_color=THEME["bg_editor"],
+            button_color=THEME["btn_secondary"],
+            button_hover_color=THEME["btn_secondary_hover"],
+            font=ctk.CTkFont(size=11),
+            command=self._on_preferred_browser_changed,
+        )
+        self.step0_browser_menu.grid(row=0, column=1, sticky="ew")
         folder_row = ctk.CTkFrame(panel, fg_color="transparent")
         folder_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 0))
         folder_row.grid_columnconfigure(0, weight=1)
@@ -7575,6 +7638,9 @@ class SurveyApp(ctk.CTk):
             hydra_persist = providers.setdefault("hydra", {})
             hydra_persist["reasoning_by_model"] = dict(self._reasoning_by_model)
             api["vision_output_format"] = self._current_vision_format_code()
+            cfg.setdefault("deed_intake", {})["preferred_browser"] = (
+                browser_save.preferred_browser_key_for_label(self.preferred_browser_var.get())
+            )
             api["consensus"] = {
                 "passes": self.current_passes_count(),
                 "pass2_provider": pass2_pid,
@@ -11990,6 +12056,9 @@ class SurveyApp(ctk.CTk):
         # Никогда не сохраняем платный ИИ-автоповорот как настройку по умолчанию
         cfg["api"]["vision_auto_orient"] = False
         cfg["api"]["ask_on_doubt"] = bool(self.ask_on_doubt_var.get())
+        cfg.setdefault("deed_intake", {})["preferred_browser"] = (
+            browser_save.preferred_browser_key_for_label(self.preferred_browser_var.get())
+        )
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
@@ -12046,6 +12115,10 @@ class SurveyApp(ctk.CTk):
                 self.provider_key_vars[pid].set(protected_val)
         self._last_valid_secret = key_secret
         self.config_data = load_config()
+        pref_browser = browser_save.set_preferred_browser(
+            browser_save.preferred_browser_from_config(self.config_data)
+        )
+        self.preferred_browser_var.set(browser_save.preferred_browser_label(pref_browser))
         self._refresh_height_label()
         self._refresh_provider_highlights()
         n_locked = sum(1 for v in protected_map.values() if v)
@@ -12239,6 +12312,27 @@ class SurveyApp(ctk.CTk):
                 self.config_data["ui"] = {}
             self.config_data["ui"]["theme"] = key
         self._set_status(f"Тема: {ui_theme.LABELS[key]} (после перезапуска программы)")
+
+    def _on_preferred_browser_changed(self, chosen: str = "") -> None:
+        """Выбор приоритетного браузера: применяет сразу и пишет deed_intake.preferred_browser."""
+        raw = chosen if str(chosen or "").strip() else self.preferred_browser_var.get()
+        key = browser_save.set_preferred_browser(raw)
+        label = browser_save.preferred_browser_label(key)
+        self.preferred_browser_var.set(label)
+        cfg = copy.deepcopy(self.config_data) if isinstance(self.config_data, dict) else {}
+        cfg.setdefault("deed_intake", {})["preferred_browser"] = key
+        try:
+            import llm_parser as _lp  # noqa: PLC0415
+
+            if save_config is _lp.save_config:
+                save_config(cfg, path=CONFIG_PATH)
+            else:
+                save_config(cfg)
+        except OSError as exc:
+            self._set_status(f"Приоритетный браузер не сохранён в config.json: {exc}", warn=True)
+            return
+        self.config_data = cfg
+        self._set_status(f"Приоритетный браузер: {label}")
 
     def _apply_log_mode(self) -> None:
         """Переключатель «Подробный журнал»: сохраняет режим и перерисовывает все журналы."""

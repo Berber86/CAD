@@ -47,7 +47,6 @@ from __future__ import annotations
 import re
 import shutil
 import time
-import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -263,12 +262,9 @@ def _click(handle: int, x: int, y: int) -> bool:
 
 
 def _pick_window(windows_fn, active_fn) -> Optional[browser_save.BrowserWindow]:
-    """Окно поддерживаемого браузера: сначала активное, иначе первое видимое."""
+    """Окно поддерживаемого браузера с учётом выбранного приоритетного браузера."""
     try:
-        windows = [
-            window for window in windows_fn()
-            if browser_save.is_supported_browser(window.executable, window.image_path)
-        ]
+        windows = list(windows_fn())
     except Exception:  # noqa: BLE001
         return None
     if not windows:
@@ -277,7 +273,9 @@ def _pick_window(windows_fn, active_fn) -> Optional[browser_save.BrowserWindow]:
         active = int(active_fn())
     except Exception:  # noqa: BLE001
         active = 0
-    return next((w for w in windows if w.handle == active), windows[0])
+    return browser_save.pick_browser_window(
+        windows, active, remember=(windows_fn is browser_save.list_windows),
+    )
 
 
 _MANUAL_HINT = (
@@ -446,7 +444,7 @@ def download_pdf_via_viewer(
     def open_and_wait(target_url: str) -> Optional[list[ScreenText]]:
         """Открыть читалку по ссылке и дождаться живой страницы."""
         try:
-            (open_browser or webbrowser.open)(target_url)
+            (open_browser or browser_save.open_url)(target_url)
         except Exception as exc:  # noqa: BLE001 - браузера может не быть вовсе
             raise manual(f"не удалось открыть браузер ({exc}).") from exc
         return wait_healthy()
@@ -477,7 +475,7 @@ def download_pdf_via_viewer(
         # участку в браузере и открываем документ ещё раз.
         say("прогреваю сессию ACRIS поиском по участку в браузере и открываю документ ещё раз…")
         try:
-            (open_browser or webbrowser.open)(warmup_url)
+            (open_browser or browser_save.open_url)(warmup_url)
         except Exception:  # noqa: BLE001 - не вышло: ниже честный ручной шаг
             pass
         wait_for(screen_has_rows, 25.0)

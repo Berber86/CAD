@@ -471,3 +471,132 @@ def test_hook_state_explains_unpinned_window(tmp_path, monkeypatch):
     assert hook("42") is None
     state = hook.state("42")
     assert "не закреплено" in state and "One" in state and "Two" in state
+
+
+def test_preferred_browser_normalization_and_config_loading():
+    assert browser_save.normalize_preferred_browser("chrome") == "chrome"
+    assert browser_save.normalize_preferred_browser("Google Chrome") == "chrome"
+    assert browser_save.normalize_preferred_browser("msedge.exe") == "edge"
+    assert browser_save.normalize_preferred_browser("Яндекс Браузер") == "yandex"
+    assert browser_save.normalize_preferred_browser("unknown") == "auto"
+    assert browser_save.preferred_browser_from_config({"deed_intake": {"preferred_browser": "edge"}}) == "edge"
+    assert browser_save.preferred_browser_from_config({}) == "auto"
+
+
+def test_pick_browser_window_strictly_filters_when_preferred_is_set():
+    edge = BrowserWindow(1, "Portal", "msedge.exe", r"C:\Edge\msedge.exe")
+    chrome = BrowserWindow(2, "Tab", "chrome.exe", r"C:\Chrome\chrome.exe")
+    yandex = _yandex(3, "Portal")
+
+    # Even if Edge is focused and Yandex has title mark, preferred="chrome" chooses ONLY Chrome.
+    picked = browser_save.pick_browser_window(
+        [edge, chrome, yandex], active_handle=1, preferred="chrome", title_marks=("portal",),
+    )
+    assert picked == chrome
+
+    # If preferred browser isn't running, fail closed (None) instead of hijacking Edge/Chrome.
+    assert browser_save.pick_browser_window([edge, chrome], preferred="firefox") is None
+
+
+def test_auto_mode_prefers_os_default_and_pinned_browser_over_z_order():
+    browser_save.reset_auto_browser_pin()
+    edge = BrowserWindow(1, "Edge Tab", "msedge.exe", r"C:\Edge\msedge.exe")
+    chrome = BrowserWindow(2, "Chrome Tab", "chrome.exe", r"C:\Chrome\chrome.exe")
+    try:
+        # When neither window is active, align with Windows default browser ("chrome") instead of Z-order windows[0] ("edge").
+        picked = browser_save.pick_browser_window(
+            [edge, chrome], active_handle=0, preferred="auto", default_key_fn=lambda: "chrome",
+        )
+        assert picked == chrome
+
+        # Remembering Chrome from a portal lookup keeps subsequent auto picks on Chrome even if Edge is windows[0].
+        browser_save.pick_browser_window([chrome], preferred="auto", remember=True)
+        picked_next = browser_save.pick_browser_window(
+            [edge, chrome], active_handle=0, preferred="auto", default_key_fn=lambda: "edge",
+        )
+        assert picked_next == chrome
+    finally:
+        browser_save.reset_auto_browser_pin()
+
+
+def test_open_url_launches_preferred_browser_directly_and_auto_stays_consistent():
+    browser_save.reset_auto_browser_pin()
+    launched: list[list[str]] = []
+    web_opened: list[str] = []
+    yandex = _yandex(10, "Property Information Portal")
+    try:
+        ok = browser_save.open_url(
+            "https://example.test/doc",
+            preferred="chrome",
+            windows_fn=lambda: [yandex],
+            find_exe_fn=lambda key, **_k: r"C:\Chrome\chrome.exe" if key == "chrome" else "",
+            popen=lambda cmd, **_kw: launched.append(list(cmd)) or object(),
+            webbrowser_open=lambda url, **_kw: web_opened.append(url) or True,
+        )
+        assert ok is True
+        assert launched == [[r"C:\Chrome\chrome.exe", "https://example.test/doc"]]
+        assert web_opened == []
+
+        # In auto mode, once Yandex was pinned by portal/prior action AND Yandex is still open,
+        # open_url stays in Yandex rather than flipping to OS default.
+        launched.clear()
+        browser_save.pick_browser_window([yandex], preferred="auto", remember=True)
+        browser_save.open_url(
+            "https://example.test/clerk",
+            preferred="auto",
+            windows_fn=lambda: [yandex],
+            find_exe_fn=lambda key, **_k: yandex.image_path if key == "yandex" else "",
+            popen=lambda cmd, **_kw: launched.append(list(cmd)) or object(),
+            webbrowser_open=lambda url, **_kw: web_opened.append(url) or True,
+        )
+        assert launched == [[yandex.image_path, "https://example.test/clerk"]]
+        assert web_opened == []
+
+        # Once the Yandex window is closed, auto falls back to OS default browser.
+        launched.clear()
+        browser_save.open_url(
+            "https://example.test/clerk2",
+            preferred="auto",
+            windows_fn=lambda: [],
+            find_exe_fn=lambda key, **_k: yandex.image_path if key == "yandex" else "",
+            popen=lambda cmd, **_kw: launched.append(list(cmd)) or object(),
+            webbrowser_open=lambda url, **_kw: web_opened.append(url) or True,
+            default_key_fn=lambda: "edge",
+        )
+        assert web_opened == ["https://example.test/clerk2"]
+    finally:
+        browser_save.reset_auto_browser_pin()
+
+
+def test_auto_save_hook_ignores_other_browsers_when_preferred_is_set(tmp_path, monkeypatch):
+    moments = iter((0.0, 1.0, 2.0, 7.0, 8.5))
+    chrome_old = BrowserWindow(1, "New Tab", "chrome.exe", r"C:\Chrome\chrome.exe")
+    chrome_new = BrowserWindow(2, "Warranty Deed.pdf", "chrome.exe", r"C:\Chrome\chrome.exe")
+    edge_bg = BrowserWindow(3, "Edge Background Refresh", "msedge.exe", r"C:\Edge\msedge.exe")
+    actions: list[int] = []
+
+    calls = {"n": 0}
+
+    def windows():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [chrome_old]
+        return [chrome_old, edge_bg, chrome_new]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+
+    def save(target, *, windows, **_kwargs):
+        actions.append(windows()[0].handle)
+        Path(target).write_bytes(b"%PDF-1.7 deed")
+        return Path(target)
+
+    monkeypatch.setattr(browser_save, "save_pdf_if_possible", save)
+    hook = browser_save.auto_save_hook(
+        tmp_path, ready_delay=4.0, stable_for=1.0, windows_fn=windows,
+        active_handle_fn=lambda: 0, monotonic=lambda: next(moments), preferred="chrome",
+    )
+    hook.before_open("876753")
+    assert hook("876753") is None  # PDF title first seen at 1.0
+    assert hook("876753") is None  # stable_for met at 2.0, ready_delay (4.0) not met yet
+    assert hook("876753") == tmp_path / "tsai_step0_876753.pdf"  # ready at 7.0
+    assert actions == [2]

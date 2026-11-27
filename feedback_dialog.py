@@ -14,12 +14,12 @@ feedback_dialog.py
 from __future__ import annotations
 
 import threading
-import webbrowser
 from pathlib import Path
 from typing import Any
 
 import customtkinter as ctk
 
+import browser_save
 import ui_theme
 
 
@@ -27,7 +27,7 @@ def _open_supabase_dashboard() -> None:
     # Прямая ссылка на Table Editor проекта без SQL.
     url = "https://supabase.com/dashboard/project/hggwxxpnkibhvnvwnenw/editor"
     try:
-        webbrowser.open(url, new=2)
+        browser_save.open_url(url, new=2)
     except Exception:
         pass
 

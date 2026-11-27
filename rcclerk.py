@@ -540,9 +540,9 @@ def default_downloads_dir() -> Path:
 
 
 def _open_in_browser(url: str) -> None:
-    import webbrowser
+    import browser_save
 
-    webbrowser.open(url)
+    browser_save.open_url(url)
 
 
 def _is_pdf_file(path: Path) -> bool:
@@ -655,6 +655,9 @@ def browser_doctor(endorsement_id: int | str, *, folder: str | Path | None = Non
     except Exception:  # noqa: BLE001
         note("доктор: не удалось перечислить окна браузера")
         return lines
+    preferred = browser_save.get_preferred_browser()
+    if preferred != "auto":
+        note(f"доктор: приоритетный браузер — {browser_save.preferred_browser_label(preferred)}")
     browsers = [
         window for window in windows
         if browser_save.is_supported_browser(window.executable, window.image_path)
@@ -670,6 +673,8 @@ def browser_doctor(endorsement_id: int | str, *, folder: str | Path | None = Non
             verdict = "идёт проверка Cloudflare — отметьте «я не робот» прямо в этой вкладке"
         else:
             verdict = "заголовок не похож на PDF"
+        if preferred != "auto" and not browser_save.matches_browser(window, preferred):
+            verdict += " (пропущено: выбран другой приоритетный браузер)"
         note(f"доктор: окно [{window.executable}] «{window.title}» — {verdict}")
     if folder is not None:
         try:

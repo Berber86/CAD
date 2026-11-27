@@ -487,3 +487,32 @@ def test_fast_ok_miss_is_rescued_by_one_dialog_capture_and_recalibrated(tmp_path
     point = acris_viewer._cached_ok_point(
         _window(), (0, 0, 1600, 900), (425, 103))
     assert point == (296, 204)
+
+
+def test_pick_window_and_url_open_use_preferred_browser(tmp_path, monkeypatch):
+    chrome = browser_save.BrowserWindow(1, "ACRIS", "chrome.exe", r"C:\Chrome\chrome.exe")
+    edge = browser_save.BrowserWindow(2, "Edge", "msedge.exe", r"C:\Edge\msedge.exe")
+    prev = browser_save.get_preferred_browser()
+    opened: list[str] = []
+    try:
+        browser_save.set_preferred_browser("edge")
+        assert acris_viewer._pick_window(lambda: [chrome, edge], lambda: 1) == edge
+
+        monkeypatch.setattr(browser_save, "open_url", lambda url: opened.append(url) or True)
+        clock = _Clock()
+        with pytest.raises(rcclerk.ManualStepNeeded):
+            acris_viewer.download_pdf_via_viewer(
+                "https://example.invalid/vtu", tmp_path / "out.pdf",
+                downloads_dir=tmp_path,
+                windows_fn=lambda: [edge],
+                active_fn=lambda: 2,
+                focus_fn=lambda _h: True,
+                capture_rows_fn=lambda _h: [],
+                sleep=clock.sleep, monotonic=clock.monotonic,
+                viewer_wait_sec=0.2, poll_sec=0.1,
+            )
+        assert opened == ["https://example.invalid/vtu"]
+    finally:
+        browser_save.set_preferred_browser(prev)
+        browser_save.reset_auto_browser_pin()
+

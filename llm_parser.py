@@ -469,6 +469,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "update": {
         "source_url": "",
     },
+    "deed_intake": {
+        "preferred_browser": "auto",
+    },
 }
 
 

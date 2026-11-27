@@ -517,10 +517,16 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText],
         # а клик по самому содержимому попадает всегда. Плашку ошибки и
         # заголовок условий не предлагаем: они тоже «под подписью».
         label_bottom = label.box[3]
+        terms_row = next(
+            (row for row in rows
+             if _normalise(row.text).startswith("termsofuse") and row.box[1] >= label_bottom),
+            None,
+        )
+        terms_top = terms_row.box[1] if terms_row is not None else label_bottom + 181
         below = [
             row for row in rows
             if row is not label and row is not placeholder
-            and label_bottom <= row.box[1] <= label_bottom + 180
+            and label_bottom <= row.box[1] < min(label_bottom + 180, terms_top)
             and row.box[0] <= label.box[2]
             and "notfound" not in _normalise(row.text)
             and not _normalise(row.text).startswith("termsofuse")
@@ -568,6 +574,7 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText],
                 progress(f"ввод адреса: стратегия «{kind}» — клик ({click_x}, {click_y}) "
                          "не состоялся, пробую дальше")
             continue
+        time.sleep(0.06)
         if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
             raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
         time.sleep(0.5)

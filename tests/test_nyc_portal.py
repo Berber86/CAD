@@ -1794,6 +1794,34 @@ def test_type_into_address_clicks_field_content_in_dirty_reused_tab(monkeypatch)
     assert clicks[-1] == ((25 + 400) // 2, (160 + 180) // 2)
 
 
+def test_type_into_address_ignores_terms_disclaimer_for_field_text(monkeypatch):
+    """Пустое поле перед Terms of Use: field_text не должен кликать в юридический текст под Terms of Use."""
+    rows = [
+        nyc_portal.ScreenText("Address (Enter an Address, Intersection or Common Place Name)",
+                              (40, 250, 400, 266)),
+        nyc_portal.ScreenText("Terms of Use:", (40, 333, 120, 349)),
+        nyc_portal.ScreenText("The City of New York makes no warranties...", (40, 352, 580, 378)),
+    ]
+    clicks = []
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _h: (0, 0, 1000, 800))
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _h: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "click_browser_window",
+                        lambda _h, x, y: clicks.append((x, y)) or True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda _t: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_key", lambda _k: True)
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", lambda _h, p: p)
+    screens = iter([
+        [nyc_portal.ScreenText("Terms of Use:", (40, 333, 120, 349))],  # label missed in mock
+        [nyc_portal.ScreenText("18 Princewood Avenue, Staten Island", (45, 298, 350, 315))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr_region", lambda _p, _r: next(screens))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    strategy = nyc_portal._type_into_address(1, "18 Princewood Avenue, Staten Island", rows)
+    assert strategy == "label_low"
+    assert all(y < 333 for _, y in clicks)  # never clicked The City of New York disclaimer!
+
+
 # ------------------------------------------- гонка моделей про соседей и ранний BBL
 
 

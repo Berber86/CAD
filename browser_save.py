@@ -975,6 +975,7 @@ def _press_ctrl_combo(vk: int) -> bool:
         _key(int(vk), up=True)
         time.sleep(0.015)
         _key(VK_CONTROL, up=True)
+        time.sleep(0.025)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -1036,7 +1037,13 @@ def press_ctrl_a() -> bool:
 
 
 def type_text(text: str) -> bool:
-    """Ввод Unicode-пути в появившийся диалог «Сохранить как» через SendInput."""
+    """Посимвольный ввод Unicode-текста (keybd_event для <=0xFF, SendInput для >0xFF).
+
+    Нельзя сбрасывать всю строку одним пакетом SendInput(N) с нулевой паузой:
+    в браузере Chrome / сессии RDP пачка >10 событий подряд без задержки или сразу
+    после отпускания Ctrl в Ctrl+A теряется по пути в <input>. Посимвольная
+    отправка с крошечной паузой устойчива и при этом не усекает кириллицу >255.
+    """
     user32 = _user32()
     if user32 is None:
         return False
@@ -1045,9 +1052,13 @@ def type_text(text: str) -> bool:
         return True
     raw = value.encode("utf-16-le")
     units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    keybd_event = getattr(user32, "keybd_event", None)
     send_input = getattr(user32, "SendInput", None)
-    if callable(send_input):
-        sendinput_called = False
+    has_keybd = callable(keybd_event)
+    has_send_input = callable(send_input)
+
+    send_one_fn = None
+    if has_send_input:
         try:
             import ctypes
             from ctypes import wintypes
@@ -1058,23 +1069,36 @@ def type_text(text: str) -> bool:
                 send_input.restype = wintypes.UINT
             except (AttributeError, TypeError):
                 pass
-            events = []
-            for code_unit in units:
-                events.append(INPUT(type=1, ki=KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)))
-                events.append(INPUT(
+            input_size = ctypes.sizeof(INPUT)
+
+            def _send_unicode_unit(code_unit: int) -> bool:
+                down = (INPUT * 1)(INPUT(type=1, ki=KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE)))
+                if int(send_input(1, down, input_size)) != 1:
+                    return False
+                time.sleep(0.001)
+                up = (INPUT * 1)(INPUT(
                     type=1,
                     ki=KEYBDINPUT(wVk=0, wScan=code_unit, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
                 ))
-            buf = (INPUT * len(events))(*events)
-            sendinput_called = True
-            return int(send_input(len(events), buf, ctypes.sizeof(INPUT))) == len(events)
-        except Exception:  # noqa: BLE001 - fall back to keybd_event only if SendInput could not run
-            if sendinput_called:
-                return False
+                return int(send_input(1, up, input_size)) == 1
+
+            send_one_fn = _send_unicode_unit
+        except Exception:  # noqa: BLE001
+            send_one_fn = None
+
     try:
-        for code_unit in units:
-            user32.keybd_event(0, code_unit, KEYEVENTF_UNICODE, 0)
-            user32.keybd_event(0, code_unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+        for idx, code_unit in enumerate(units):
+            if has_keybd and (code_unit <= 0xFF or send_one_fn is None):
+                keybd_event(0, code_unit, KEYEVENTF_UNICODE, 0)
+                time.sleep(0.001)
+                keybd_event(0, code_unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+            elif send_one_fn is not None:
+                if not send_one_fn(code_unit):
+                    return False
+            else:
+                return False
+            if idx + 1 < len(units):
+                time.sleep(0.002)
         return True
     except Exception:  # noqa: BLE001
         return False

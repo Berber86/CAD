@@ -1050,9 +1050,11 @@ def test_confirm_open_save_dialog_focuses_unfocused_same_browser_dialog(tmp_path
 
 def test_type_text_uses_sendinput_utf16_for_cyrillic_and_falls_back(monkeypatch):
     sent_units: list[tuple[int, int]] = []
+    batch_sizes: list[int] = []
 
     class FakeSendInput:
         def __call__(self, count, inputs, _size):
+            batch_sizes.append(count)
             for idx in range(count):
                 sent_units.append((int(inputs[idx].ki.wScan), int(inputs[idx].ki.dwFlags)))
             return count
@@ -1060,6 +1062,7 @@ def test_type_text_uses_sendinput_utf16_for_cyrillic_and_falls_back(monkeypatch)
     class User32WithSendInput:
         SendInput = FakeSendInput()
 
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _s: None)
     monkeypatch.setattr(browser_save, "_user32", lambda: User32WithSendInput())
     sample = r"C:\Users\Николай\Загрузки\doc.pdf"
     assert browser_save.type_text(sample)
@@ -1067,6 +1070,32 @@ def test_type_text_uses_sendinput_utf16_for_cyrillic_and_falls_back(monkeypatch)
     expected_units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
     assert [u for u, flags in sent_units if flags == browser_save.KEYEVENTF_UNICODE] == expected_units
     assert any(u > 255 for u, _ in sent_units)  # Cyrillic units NOT truncated to 8-bit BYTE
+    assert all(n == 1 for n in batch_sizes)  # Paced 1 event per SendInput call, never bulk burst
+
+    # Hybrid Windows case (both SendInput and keybd_event present):
+    # ASCII <= 0xFF uses proven keybd_event path; > 0xFF Cyrillic uses SendInput(1, ...).
+    hybrid_events: list[tuple[str, int, int]] = []
+
+    class HybridSendInput:
+        def __call__(self, count, inputs, _size):
+            assert count == 1
+            hybrid_events.append(("sendinput", int(inputs[0].ki.wScan), int(inputs[0].ki.dwFlags)))
+            return 1
+
+    class User32Windows:
+        SendInput = HybridSendInput()
+
+        def keybd_event(self, _vk, scan, flags, _extra):
+            hybrid_events.append(("keybd", scan, flags))
+
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32Windows())
+    assert browser_save.type_text("AЯ")
+    assert hybrid_events == [
+        ("keybd", ord("A"), browser_save.KEYEVENTF_UNICODE),
+        ("keybd", ord("A"), browser_save.KEYEVENTF_UNICODE | browser_save.KEYEVENTF_KEYUP),
+        ("sendinput", ord("Я"), browser_save.KEYEVENTF_UNICODE),
+        ("sendinput", ord("Я"), browser_save.KEYEVENTF_UNICODE | browser_save.KEYEVENTF_KEYUP),
+    ]
 
     # Legacy fallback when SendInput attribute is absent
     legacy_calls: list[tuple[int, int, int]] = []

@@ -10674,16 +10674,18 @@ class SurveyApp(ctk.CTk):
             self.step0_auto_button.configure(state="normal")
             self.step0_stop_button.configure(state="disabled")
         self._finish_busy()
-        if was_auto:
-            self._step0_log("Автопоток: обработка PDF остановилась; AutoCAD не запускался. Проверьте результат в журнале.", level=log_mode.LEVEL_KEY)
         if signature != self._source_signature(mode="📄 PDF"):
             self._ready_source_signature = None
             self._input_incomplete = True
+            if was_auto:
+                self._step0_log("Автопоток: обработка PDF остановилась; AutoCAD не запускался. Проверьте результат в журнале.", level=log_mode.LEVEL_WARN)
             return
         if view is None:
             self._ready_source_signature = None
             self._input_incomplete = True
             self._set_status("Обработка PDF не завершена.")
+            if was_auto:
+                self._step0_log("Автопоток: обработка PDF остановилась; AutoCAD не запускался. Проверьте результат в журнале.", level=log_mode.LEVEL_WARN)
             return
         try:
             self._install_multi_scene(view)
@@ -10691,6 +10693,8 @@ class SurveyApp(ctk.CTk):
             self._ready_source_signature = None
             self._input_incomplete = True
             self._set_status("Обработка PDF не завершена.")
+            if was_auto:
+                self._step0_log("Автопоток: обработка PDF остановилась; AutoCAD не запускался. Проверьте результат в журнале.", level=log_mode.LEVEL_WARN)
             return
         # A PDF may have changed after the background worker built its scene.
         try:
@@ -10702,11 +10706,18 @@ class SurveyApp(ctk.CTk):
             self._ready_source_signature = None
             self._input_incomplete = True
             self._set_status("PDF изменился; повторите обработку.", warn=True)
+            if was_auto:
+                self._step0_log("Автопоток: обработка PDF остановилась (PDF изменился); AutoCAD не запускался.", level=log_mode.LEVEL_WARN)
             return
         if was_auto:
             # Use the portal lot captured for these PDFs even if the deed does
             # not confirm it; it is a filename label, not a claim of accuracy.
             if auto_identity and self._step0_outcome is not None and view.drawable:
+                self._step0_log(
+                    f"Автопоток: разбор PDF завершён — подготовлено контуров: {len(view.drawable)}; "
+                    "AutoCAD не запускался. Проверьте схему перед ручной отрисовкой.",
+                    level=log_mode.LEVEL_KEY,
+                )
                 folder = Path(self._step0_outcome.folder).resolve()
                 self._auto_dwg_context = (auto_identity, folder, signature, view)
                 note = "После ручной отрисовки DWG один раз сохранится в папке описаний, даже если результат неполный. Дальше сохраняйте вручную."

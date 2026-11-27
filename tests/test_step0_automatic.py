@@ -557,6 +557,8 @@ def test_two_phase_autoflow_never_logs_false_missing_our_or_mode_prompt(
     assert not any("наш участок не собран" in line for line in seen_logs)
     assert not any("Для обработки выберите PDF или запустите разбор заново" in line for line in seen_logs)
     assert not any("наш участок не собран" in text for _lvl, text in app._step0_lines)
+    assert not any("обработка PDF остановилась" in text for _lvl, text in app._step0_lines)
+    assert any("разбор PDF завершён" in text for _lvl, text in app._step0_lines)
 
     builder, doc = fake_autocad(None)
     doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
@@ -567,5 +569,12 @@ def test_two_phase_autoflow_never_logs_false_missing_our_or_mode_prompt(
     smoke._wait_for_gui_worker(app)
     dwg_saved_lines = [line for line in seen_logs if "DWG сохранён:" in line]
     assert len(dwg_saved_lines) == 1
+
+
+def test_autoflow_logs_stopped_when_multi_pdf_scene_fails(gui, tmp_path, monkeypatch):
+    app, _calls = setup_app(gui, monkeypatch, tmp_path)
+    app._step0_auto_stage = "parse"
+    app._handle_multi_pdf_done(None, app._source_signature(mode="📄 PDF"))
+    assert any("обработка PDF остановилась" in text for _lvl, text in app._step0_lines)
 
 

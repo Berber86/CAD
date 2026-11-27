@@ -86,9 +86,10 @@ _BROWSER_PREF_LOCK = threading.Lock()
 _PREFERRED_BROWSER = "auto"
 _LAST_AUTO_BROWSER = ""
 CLOUDFLARE_TITLE_MARKS = (
-    "just a moment", "one moment", "please wait", "checking your browser",
-    "verifying", "cloudflare", "captcha", "challenge", "security check",
-    "access denied", "verify you are human", "attention required",
+    "just a moment", "one moment", "just a sec", "please wait", "checking your browser",
+    "checking if the site", "verifying", "cloudflare", "captcha", "challenge",
+    "security check", "access denied", "verify you are human", "attention required",
+    "один момент", "минуточку", "секунду", "пожалуйста, подождите",
     "проверка", "проверяем", "подождите", "одну минуту", "безопасност",
     "подтвердите, что вы человек", "робот",
 )
@@ -1084,7 +1085,8 @@ def auto_save_hook(
     """Хук для лестницы: ждёт готовый PDF после старта навигации и на документ
     посылает Ctrl+S только один раз. Cloudflare-title не соответствует PDF-title.
     """
-    attempted: set[str] = set()
+    attempted_pdf: set[str] = set()
+    attempted_blind: set[str] = set()
     requested_at: dict[str, float] = {}
     baselines: dict[str, dict[int, str]] = {}
     target_handles: dict[str, int] = {}
@@ -1118,7 +1120,7 @@ def auto_save_hook(
         target = pending_path(downloads_dir, key)
         if target.is_file():
             return target
-        if key in attempted:
+        if key in attempted_pdf:
             return None
         if not available():
             state.setdefault(key, "автоматика Windows (клавиатура/окна) недоступна")
@@ -1177,6 +1179,8 @@ def auto_save_hook(
                               f"[{candidate.executable}] заголовок {candidate.title!r}")
                 ready_since.pop(key, None)
                 return None
+            if key in attempted_blind:
+                return None
             state[key] = (f"закреплённое окно ещё не опознано как PDF: [{candidate.executable}] "
                           f"заголовок {candidate.title!r}")
         signature = (candidate.handle, candidate.title)
@@ -1195,7 +1199,11 @@ def auto_save_hook(
             return None
 
         # Mark before touching the UI: retries must never spam/focus any window.
-        attempted.add(key)
+        # A blind attempt on an unknown loading title does not consume the
+        # single recognized-PDF attempt once the PDF viewer title actually loads.
+        attempted_blind.add(key)
+        if recognized_pdf:
+            attempted_pdf.add(key)
         state[key] = (f"Ctrl+S отправлен, заголовок [{candidate.executable}] "
                       f"{candidate.title!r} (опознан как PDF: "
                       f"{'да' if recognized_pdf else 'нет — слепая попытка'})")

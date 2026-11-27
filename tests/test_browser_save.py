@@ -600,3 +600,79 @@ def test_auto_save_hook_ignores_other_browsers_when_preferred_is_set(tmp_path, m
     assert hook("876753") is None  # stable_for met at 2.0, ready_delay (4.0) not met yet
     assert hook("876753") == tmp_path / "tsai_step0_876753.pdf"  # ready at 7.0
     assert actions == [2]
+
+
+def test_hook_never_blind_saves_russian_cloudflare_odin_moment_and_saves_after_viewer_loads(
+        tmp_path, monkeypatch):
+    """Live bug 2026-11-27: 'Один момент… — Яндекс Браузер' burned one-shot Ctrl+S."""
+    moments = iter((0.0, 1.0, 16.0, 20.0, 21.5, 23.0))
+    actions: list[str] = []
+
+    calls = {"n": 0}
+
+    def windows():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        if calls["n"] in (2, 3):  # still Cloudflare even past blind_after=15s
+            return [_yandex(11, "Один момент… — Яндекс\xa0Браузер")]
+        return [_yandex(11, "viewer — Яндекс\xa0Браузер")]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+
+    def save(target, *, windows, **_kwargs):
+        title = windows()[0].title
+        actions.append(title)
+        Path(target).write_bytes(b"%PDF-1.7 deed")
+        return Path(target)
+
+    monkeypatch.setattr(browser_save, "save_pdf_if_possible", save)
+    hook = browser_save.auto_save_hook(
+        tmp_path, ready_delay=4.0, blind_after=15.0, stable_for=1.0,
+        windows_fn=windows, monotonic=lambda: next(moments),
+    )
+    hook.before_open("58421")
+    assert hook("58421") is None
+    assert hook("58421") is None  # 16s >= blind_after, must NOT burn Ctrl+S on 'Один момент…'
+    assert "Cloudflare" in hook.state("58421")
+    assert actions == []
+    assert hook("58421") is None  # 'viewer' just appeared at 20.0s
+    assert hook("58421") == tmp_path / "tsai_step0_58421.pdf"
+    assert actions == ["viewer — Яндекс\xa0Браузер"]
+
+
+def test_hook_still_saves_recognized_pdf_after_failed_blind_attempt(tmp_path, monkeypatch):
+    moments = iter((0.0, 1.0, 16.0, 20.0, 21.5, 25.0))
+    actions: list[tuple[str, bool]] = []
+
+    calls = {"n": 0}
+
+    def windows():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        if calls["n"] in (2, 3):
+            return [_yandex(11, "Please stand by")]  # unknown interstitial triggers blind once
+        return [_yandex(11, "viewer")]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+
+    def save(target, *, windows, require_pdf_title=True, **_kwargs):
+        title = windows()[0].title
+        actions.append((title, require_pdf_title))
+        if not require_pdf_title:
+            return None  # blind attempt failed on interstitial
+        Path(target).write_bytes(b"%PDF-1.7 deed")
+        return Path(target)
+
+    monkeypatch.setattr(browser_save, "save_pdf_if_possible", save)
+    hook = browser_save.auto_save_hook(
+        tmp_path, ready_delay=4.0, blind_after=15.0, stable_for=1.0,
+        windows_fn=windows, monotonic=lambda: next(moments),
+    )
+    hook.before_open("58421")
+    assert hook("58421") is None  # 1.0s
+    assert hook("58421") is None  # 16.0s -> blind attempt fails, returns None
+    assert hook("58421") is None  # 20.0s -> viewer just appeared
+    assert hook("58421") == tmp_path / "tsai_step0_58421.pdf"  # 21.5s -> recognized PDF still saves!
+    assert actions == [("Please stand by", False), ("viewer", True)]

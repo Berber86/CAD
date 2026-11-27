@@ -627,6 +627,77 @@ def _default_failure_shot(folder: Path, endorsement_id: int | str) -> str:
         return ""
 
 
+def browser_doctor(endorsement_id: int | str, *, folder: str | Path | None = None,
+                   emit=None, windows_fn=None) -> list[str]:
+    """«Доктор» браузера: вслух фиксирует, что реально видит автоматика.
+
+    Живой прогон 25.11.2026: четыре документа подряд не скачались, а журнал
+    молчал, какое окно и заголовок видела автоматика, — чинить было нечего.
+    Доктор перечисляет окна поддерживаемых браузеров с вердиктом по каждому
+    (PDF опознан / проверка Cloudflare / не PDF), снимает окно в папку
+    задания ``BROWSER_DOCTOR_<id>_<время>.png`` и читает экран OCR-ом.
+    Ничего не кликает и не печатает: капчу проходит человек.
+    """
+    say = emit if emit is not None else (lambda _message: None)
+    lines: list[str] = []
+
+    def note(message: str) -> None:
+        lines.append(message)
+        try:
+            say(message)
+        except Exception:  # noqa: BLE001 - диагностика не ломает ожидание
+            pass
+
+    try:
+        import browser_save
+
+        windows = list((windows_fn or browser_save.list_windows)())
+    except Exception:  # noqa: BLE001
+        note("доктор: не удалось перечислить окна браузера")
+        return lines
+    browsers = [
+        window for window in windows
+        if browser_save.is_supported_browser(window.executable, window.image_path)
+    ]
+    if not browsers:
+        note("доктор: окон поддерживаемых браузеров (Chrome, Edge, Firefox, Yandex и т.п.) "
+             "не видно — браузер закрыт или не поддерживается автоматикой")
+        return lines
+    for window in browsers:
+        if browser_save.looks_like_loaded_pdf(window.title):
+            verdict = "заголовок опознан как загруженный PDF"
+        elif browser_save.looks_like_cloudflare_page(window.title):
+            verdict = "идёт проверка Cloudflare — отметьте «я не робот» прямо в этой вкладке"
+        else:
+            verdict = "заголовок не похож на PDF"
+        note(f"доктор: окно [{window.executable}] «{window.title}» — {verdict}")
+    if folder is not None:
+        try:
+            import acris_viewer
+            from nyc_portal import _save_window_capture, _screen_ocr_region
+
+            window = acris_viewer._pick_window(  # noqa: SLF001 - общий выбор окна браузера
+                browser_save.list_windows, browser_save.active_window_handle)
+            if window is not None:
+                from datetime import datetime
+
+                shot = Path(folder) / (
+                    f"BROWSER_DOCTOR_{endorsement_id}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                _save_window_capture(window.handle, shot)
+                note(f"доктор: снимок окна браузера: {shot}")
+                try:
+                    rows = _screen_ocr_region(shot, (0.0, 0.0, 1.0, 1.0))
+                    texts = [row.text.strip() for row in rows if row.text.strip()]
+                    if texts:
+                        note("доктор: на экране читается: " + " | ".join(texts[:12]))
+                except Exception:  # noqa: BLE001 - OCR необязателен
+                    pass
+        except Exception:  # noqa: BLE001 - диагностика не ломает ожидание
+            pass
+    return lines
+
+
 def download_with_fallback(
     endorsement_id: int | str,
     destination: str | Path,
@@ -642,6 +713,7 @@ def download_with_fallback(
     should_stop=None,
     fail_dir: str | Path | None = None,
     shot_fn=None,
+    prompt_operator=None,
 ) -> tuple[Path, str]:
     """
     Скачивает документ, спускаясь по лестнице: прямо → браузер → человек.
@@ -716,33 +788,64 @@ def download_with_fallback(
             url, folder=folder,
         ) from exc
     step(
-        f"2/3 жду, пока в браузере закончится Cloudflare и откроется PDF; "
-        f"Ctrl+S отправлю только распознанному браузеру. Жду до {int(watch_timeout)} с"
+        f"2/3 жду, пока в браузере закончится Cloudflare и откроется PDF "
+        f"(до {int(watch_timeout)} с). Если в открывшейся вкладке появится проверка "
+        f"«вы не робот» — отметьте галочку прямо в окне браузера и не закрывайте вкладку: "
+        f"пока проверка идёт, автоматика вкладку не трогает"
     )
 
-    deadline = time.monotonic() + max(0.0, float(watch_timeout))
-    while True:
-        check_stop()
-        found = find_new_pdf(folder, since=since)
-        if found is not None:
-            shutil.copyfile(found, target)
-            _drop_our_pending(found, folder)
-            step(f"файл взят из загрузок: {found.name}")
-            return target, "browser"
-        if auto_save is not None:
-            saved = None
-            try:
-                saved = auto_save(endorsement_id)
-            except Exception:  # noqa: BLE001 - автоматизация необязательна
-                saved = None
-            if saved is not None and Path(saved).is_file():
-                shutil.copyfile(saved, target)
-                _drop_our_pending(Path(saved), folder)
-                step("PDF сохранён через Ctrl+S в окне браузера")
+    def wait_wave(seconds: float) -> Optional[tuple[Path, str]]:
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            check_stop()
+            found = find_new_pdf(folder, since=since)
+            if found is not None:
+                shutil.copyfile(found, target)
+                _drop_our_pending(found, folder)
+                step(f"файл взят из загрузок: {found.name}")
                 return target, "browser"
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(max(0.05, float(poll)))
+            if auto_save is not None:
+                saved = None
+                try:
+                    saved = auto_save(endorsement_id)
+                except Exception:  # noqa: BLE001 - автоматизация необязательна
+                    saved = None
+                if saved is not None and Path(saved).is_file():
+                    shutil.copyfile(saved, target)
+                    _drop_our_pending(Path(saved), folder)
+                    step("PDF сохранён через Ctrl+S в окне браузера")
+                    return target, "browser"
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(max(0.05, float(poll)))
+
+    result = wait_wave(watch_timeout)
+    if result is not None:
+        return result
+    doctor_note = ""
+    if prompt_operator is not None:
+        # Вторая волна: сначала «доктор» вслух говорит, что видит автоматика
+        # (окна, заголовки, снимок, OCR экрана), затем ждём ещё — человек
+        # успевает пройти капчу, а просмотрщик с незнакомым заголовком
+        # получает слепую попытку Ctrl+S от хука.
+        second = min(float(watch_timeout), 60.0)
+        step(f"первая волна ({int(watch_timeout)} с) пуста — зову «доктора» браузера "
+             f"и жду ещё {int(second)} с")
+        try:
+            prompt_operator(endorsement_id)
+        except Exception:  # noqa: BLE001 - диагностика не ломает ожидание
+            pass
+        if auto_save is not None:
+            state_fn = getattr(auto_save, "state", None)
+            if callable(state_fn):
+                try:
+                    doctor_note = f" Автоматика браузера докладывает: {state_fn(endorsement_id)}."
+                    step(doctor_note.strip())
+                except Exception:  # noqa: BLE001
+                    doctor_note = ""
+        result = wait_wave(second)
+        if result is not None:
+            return result
     # Аварийный снимок окна браузера в папку задания: без него не видно, что
     # было на экране вместо скачивания (капча, не та страница, зависший
     # просмотрщик). Сбой снимка ручной шаг не отменяет.
@@ -755,9 +858,19 @@ def download_with_fallback(
         shot = (shot_fn or _default_failure_shot)(shot_dir, endorsement_id)
     except Exception:  # noqa: BLE001 - диагностика не ломает остановку
         shot = ""
+    if not doctor_note and auto_save is not None:
+        state_fn = getattr(auto_save, "state", None)
+        if callable(state_fn):
+            try:
+                doctor_note = f" Автоматика браузера докладывает: {state_fn(endorsement_id)}."
+            except Exception:  # noqa: BLE001
+                doctor_note = ""
     raise ManualStepNeeded(
-        f"PDF не появился в «{folder}» за {int(watch_timeout)} с. Ссылка: {url}. "
-        "Если PDF уже виден, нажмите Ctrl+S в его окне; либо сохраните файл в папку описаний вручную."
-        f"{shot}",
+        f"PDF не появился в «{folder}» за {int(watch_timeout)} с ожидания"
+        f"{' плюс вторая волна после «доктора»' if prompt_operator is not None else ''}. "
+        f"Ссылка: {url}. Если во вкладке висит проверка Cloudflare — отметьте "
+        "«я не робот» и дайте PDF догрузиться, затем нажмите Ctrl+S в его окне; "
+        "либо сохраните файл в папку описаний вручную."
+        f"{doctor_note}{shot}",
         url, folder=folder,
     )

@@ -347,7 +347,8 @@ def test_partial_sendinput_never_falls_back_to_a_second_select_click(monkeypatch
 
         def __call__(self, count, _inputs, _size):
             calls.append(("send-input", count))
-            return 1  # Windows inserted only half of the click pair.
+            # Down вставлен, up — нет: частичный клик.
+            return 1 if len([c for c in calls if c[0] == "send-input"]) == 1 else 0
 
     class User32:
         def SetCursorPos(self, x, y):
@@ -362,5 +363,111 @@ def test_partial_sendinput_never_falls_back_to_a_second_select_click(monkeypatch
     monkeypatch.setattr(browser_save, "_user32", lambda: User32())
     monkeypatch.setattr(browser_save, "active_window_handle", lambda: 10)
     assert not browser_save.click_browser_window(10, 100, 200)
-    assert ("send-input", 2) in calls
+    assert ("send-input", 1) in calls
     assert not any(call[0] == "fallback-mouse" for call in calls)
+
+
+def test_click_is_refused_when_cursor_never_settles_on_target(monkeypatch):
+    """Живой сбой 25.11.2026: клик «на лету» превращался в выделение текста."""
+    calls = []
+
+    class User32:
+        def SetCursorPos(self, x, y):
+            calls.append(("cursor", x, y))
+            return True
+
+        def GetCursorPos(self, point_ptr):
+            point = point_ptr._obj
+            point.x, point.y = 5, 5  # курсор упорно не на цели
+            return True
+
+        def mouse_event(self, *args):
+            calls.append(("mouse", *args))
+
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _handle: (0, 0, 800, 600))
+    monkeypatch.setattr(browser_save, "_user32", lambda: User32())
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 10)
+    monkeypatch.setattr(browser_save.time, "sleep", lambda _s: None)
+    assert not browser_save.click_browser_window(10, 100, 200)
+    assert not any(call[0] == "mouse" for call in calls)
+
+
+def test_hook_blind_attempt_for_unknown_viewer_title_after_wait(tmp_path, monkeypatch):
+    """Просмотрщик с незнакомым заголовком: слепой Ctrl+S после выдержки, не сразу."""
+    moments = iter((0.0, 1.0, 2.0, 20.0, 21.5))
+    actions: list[tuple[int, str, bool]] = []
+    tab = _yandex(11, "VSCMS Document Viewer")  # ни один известный шаблон не совпал
+
+    def windows():
+        if not hasattr(windows, "calls"):
+            windows.calls = 0
+        windows.calls += 1
+        return [] if windows.calls == 1 else [tab]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+
+    def save(target, *, windows, require_pdf_title=True, **_kwargs):
+        chosen = windows()[0]
+        actions.append((chosen.handle, chosen.title, require_pdf_title))
+        Path(target).write_bytes(b"%PDF-1.7 deed")
+        return Path(target)
+
+    monkeypatch.setattr(browser_save, "save_pdf_if_possible", save)
+    hook = browser_save.auto_save_hook(
+        tmp_path, ready_delay=4.0, blind_after=15.0, stable_for=1.0,
+        windows_fn=windows, monotonic=lambda: next(moments),
+    )
+    hook.before_open("42")
+    assert hook("42") is None  # заголовок только появился
+    assert hook("42") is None  # стабилен, но слепая выдержка ещё не вышла
+    assert hook("42") == tmp_path / "tsai_step0_42.pdf"
+    assert actions == [(11, "VSCMS Document Viewer", False)]
+    assert "слепая попытка" in hook.state("42")
+
+
+def test_hook_never_blind_saves_a_cloudflare_title(tmp_path, monkeypatch):
+    """На странице проверки Ctrl+S сохранил бы HTML и сжёг единственную попытку."""
+    moments = iter((0.0, 1.0, 2.0, 100.0, 200.0))
+    tab = _yandex(11, "Just a moment...")
+
+    def windows():
+        if not hasattr(windows, "calls"):
+            windows.calls = 0
+        windows.calls += 1
+        return [] if windows.calls == 1 else [tab]
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(
+        browser_save, "save_pdf_if_possible",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Ctrl+S на капче запрещён")))
+    hook = browser_save.auto_save_hook(
+        tmp_path, ready_delay=4.0, blind_after=15.0, stable_for=1.0,
+        windows_fn=windows, monotonic=lambda: next(moments),
+    )
+    hook.before_open("42")
+    assert hook("42") is None
+    assert hook("42") is None
+    assert hook("42") is None
+    assert "Cloudflare" in hook.state("42")
+
+
+def test_hook_state_explains_unpinned_window(tmp_path, monkeypatch):
+    """Диагностируемость: состояние хука называет увиденные заголовки окон."""
+    moments = iter((0.0, 1.0))
+    tabs = [_yandex(11, "One"), _yandex(12, "Two")]
+
+    def windows():
+        if not hasattr(windows, "calls"):
+            windows.calls = 0
+        windows.calls += 1
+        return [] if windows.calls == 1 else tabs
+
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    hook = browser_save.auto_save_hook(
+        tmp_path, windows_fn=windows, active_handle_fn=lambda: 0,
+        monotonic=lambda: next(moments),
+    )
+    hook.before_open("42")
+    assert hook("42") is None
+    state = hook.state("42")
+    assert "не закреплено" in state and "One" in state and "Two" in state

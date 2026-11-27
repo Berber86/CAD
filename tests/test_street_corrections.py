@@ -128,9 +128,11 @@ def test_unlocated_neighbor_corrections_match_normal_mode(fake_autocad):
     builder, _ = fake_autocad(None)
     scene = drawing.plan_scene(builder, [source])
     plan = scene.plans[0].plan
-    # Сосед без якоря оформляется как в обычном режиме: видны исправления
-    # и фасадной, и пересекаемой улицы; линий улиц у соседа нет, как обычно.
-    assert not plan.lines
+    # Сосед сцены оформляется как в обычном режиме: видны исправления
+    # и фасадной, и пересекаемой улицы, и уличные линии у соседа есть —
+    # перекрёсток и привязка к нему строятся, как у основного участка.
+    assert any(ln.kind == 'main-street-row-tie' for ln in plan.lines)
+    assert any(ln.kind == 'cross-street-row' for ln in plan.lines)
     assert any(t.kind == 'main-street' and t.correction_indices for t in plan.items)
     assert any(t.kind == 'cross-street' and t.correction_indices for t in plan.items)
 

@@ -472,7 +472,8 @@ def _typed_address_visible(handle: int, address: str) -> bool:
     return bool(number or word)
 
 
-def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) -> str:
+def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText],
+                       progress: Progress | None = None) -> str:
     """
     Вводит адрес, перебирая стратегии, и возвращает имя сработавшей.
 
@@ -525,7 +526,7 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
     if bounds is None:
         raise PortalLookupError("Окно портала изменилось, не могу определить поле адреса.")
     x0, y0, _x1, _y1 = bounds
-    for kind, anchor in anchors:
+    for attempt_no, (kind, anchor) in enumerate(anchors):
         x_left, y_top, x_right, y_bottom = anchor.box
         if kind in {"placeholder", "field_text", "label_self"}:
             # Плейсхолдер и содержимое — внутри поля; подпись — настоящий
@@ -540,18 +541,39 @@ def _type_into_address(handle: int, address: str, rows: Sequence[ScreenText]) ->
             # Подпись над полем: поле ввода — сразу под ней.
             click_x = x0 + x_left + min(120, max(35, (x_right - x_left) // 3))
             click_y = y0 + y_bottom + max(24, (y_bottom - y_top) * 2)
+        if attempt_no:
+            # Прошлый промах оставил выделение всей страницы (Ctrl+A мимо
+            # поля красит панель синим) — снимаем его, чтобы следующий
+            # клик/ввод начинался с чистого состояния.
+            try:
+                _key(handle, browser_save.VK_ESCAPE)
+            except Exception:  # noqa: BLE001 - снятие выделения необязательно
+                pass
         _focus(handle)
         if not browser_save.click_browser_window(handle, click_x, click_y):
-            raise PortalLookupError("Не удалось сфокусировать поле Address.")
+            # Клик не состоялся (например, курсор не встал на цель): это не
+            # повод хоронить остальные стратегии и уж тем более нажимать
+            # Ctrl+A вслепую — пробуем следующий якорь.
+            if progress:
+                progress(f"ввод адреса: стратегия «{kind}» — клик ({click_x}, {click_y}) "
+                         "не состоялся, пробую дальше")
+            continue
         if not browser_save.press_ctrl_a() or not browser_save.type_text(address):
             raise PortalLookupError("Не удалось ввести адрес в NYC Portal.")
         time.sleep(0.5)
         if _typed_address_visible(handle, address):
             return kind
+        if progress:
+            progress(f"ввод адреса: стратегия «{kind}» (клик {click_x}, {click_y}) — "
+                     "текст в поле не появился, пробую дальше")
         # Клик прошёл мимо поля: Ctrl+A выделил текст страницы, ввод ушёл
         # в никуда (живой скриншот 24.11.2026). Пробуем следующую стратегию.
     # Последняя стратегия: печать без клика — фокус после Tab может уже
     # стоять в поле, а клики по OCR-координатам упорно уходят мимо.
+    try:
+        _key(handle, browser_save.VK_ESCAPE)
+    except Exception:  # noqa: BLE001
+        pass
     _focus(handle)
     if browser_save.press_ctrl_a() and browser_save.type_text(address):
         time.sleep(0.5)
@@ -953,7 +975,7 @@ def _drive_portal_rest(
     if fast_mode and not _contains(rows, "Enter an Address"):
         _type_focused_address(window.handle, address)
     else:
-        strategy = _type_into_address(window.handle, address, rows)
+        strategy = _type_into_address(window.handle, address, rows, progress)
         if progress and strategy not in {"label", "placeholder"}:
             progress(f"адрес введён стратегией «{strategy}» (первые способы не сработали)")
     if fast_mode:
@@ -975,7 +997,7 @@ def _drive_portal_rest(
                     raise
                 if progress:
                     progress("список подсказок не появился — ввожу адрес ещё раз")
-                _type_into_address(window.handle, address, rows)
+                _type_into_address(window.handle, address, rows, progress)
         if progress and picked is not None:
             progress(f"первая подсказка портала: «{picked.text}» — выбираю её")
     check_layout_size()
@@ -1064,7 +1086,7 @@ def _drive_portal_rest(
             if _search_rejected(screen):
                 if progress:
                     progress("портал отклонил поиск по тексту — ввожу адрес заново и выбираю подсказку кликом")
-                _type_into_address(window.handle, address, rows)
+                _type_into_address(window.handle, address, rows, progress)
                 again = _wait_after_address_input(
                     window.handle, address, rows,
                     first_delay=OPTIMAL_SUGGESTION_DELAY if use_optimal else RELIABLE_SUGGESTION_DELAY)

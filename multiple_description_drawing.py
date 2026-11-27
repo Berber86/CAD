@@ -9,11 +9,12 @@ No COM calls occur here; open_traverse prevents silently closing partial sides.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 import math
 from pathlib import Path
 from typing import Any, Sequence
 
+import llm_parser as lp
 import lot_identity
 from acad_builder import (
     AcadBuilder, DrawPlan, LineItem, TextItem, build_polygon_points,
@@ -142,6 +143,39 @@ def _shape_matches(plan: DrawPlan, item: DescriptionItem) -> bool:
                for point in (edge.start, edge.end) for v in point)
 
 
+def _drawing_description(record: DescriptionSource):
+    """Описание для построения — ровно то, что обычный режим передаёт построителю.
+
+    Разбор нескольких описаний честно хранит ``corner_to_pob_bearing=None``,
+    если модель не дала румб привязки явно (такой выведенный румб не должен
+    выглядеть в кэше как возвращённый ИИ и не становится якорем привязки
+    между документами). Но обычный режим такой румб для построения
+    вычисляет из обхода (``LegalDescription`` делает это в валидаторе), и
+    без него построитель ставит участок прямо на перекрёсток, а дистанцию
+    до него рисует условной короткой выноской — живой сбой автопотока
+    25.11.2026: в кэше ``distance_to_corner_ft=80``, а перекрёстка и
+    дистанции на чертеже нет. Поэтому для построения румб выводится здесь
+    тем же ``infer_corner_to_pob_bearing``; исходное описание и кэш не
+    меняются, якоря это не касается.
+    """
+    desc = lot_identity.bind_filename(record.item.data, record.source)
+    if (getattr(desc, 'corner_to_pob_bearing', None) is None
+            and float(getattr(desc, 'distance_to_corner_ft', 0.0) or 0.0) > 1e-6
+            and getattr(desc, 'segments', None)):
+        try:
+            inferred = lp.infer_corner_to_pob_bearing(
+                desc.segments,
+                distance_to_corner_ft=desc.distance_to_corner_ft,
+                front_segment_index=desc.front_segment_index,
+                front_side=desc.front_side,
+            )
+        except Exception:  # noqa: BLE001 - построение не должно падать из-за привязки
+            inferred = None
+        if inferred is not None:
+            desc = desc.model_copy(update={'corner_to_pob_bearing': inferred})
+    return desc
+
+
 def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: float) -> tuple[DrawPlan, str | None]:
     """План одного описания — тот же, что строит обычный режим.
 
@@ -151,10 +185,17 @@ def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: fl
     обычный построитель не берётся за описание (неполное и меньше трёх
     известных сторон), рисуем открытые известные стороны — в обычном
     режиме такое описание просто не построилось бы.
+
+    Сосед строится тем же полным построением, что и основной участок
+    (улицы, привязка до перекрёстка, подписи сторон), и только потом
+    помечается соседом с подписью ``neighbor-label``: урезанная ветка
+    ``is_neighbor=True`` построителя — оформление одиночного соседа
+    старого режима, а в сцене автопотока она прятала перекрёсток и
+    дистанцию до него у всех соседних участков (живой сбой 25.11.2026).
     """
-    desc = lot_identity.bind_filename(record.item.data, record.source)
+    desc = _drawing_description(record)
     try:
-        plan = builder.plan(desc, scale=scale, is_neighbor=not record.is_main)
+        plan = builder.plan(desc, scale=scale, is_neighbor=False)
     except Exception:
         if record.item.complete:
             raise
@@ -162,6 +203,12 @@ def _plan_description(builder: AcadBuilder, record: DescriptionSource, scale: fl
         plan = plan_partial(builder, record.item, source=record.source, is_main=record.is_main,
                             scale=scale, start=start)
         return plan, 'partial_description'
+    if not record.is_main:
+        plan = dc_replace(
+            plan, is_neighbor=True,
+            items=[dc_replace(item, kind='neighbor-label') if item.kind == 'main-lot-label'
+                   else item for item in plan.items],
+        )
     return plan, None if record.item.complete else 'partial_description'
 
 

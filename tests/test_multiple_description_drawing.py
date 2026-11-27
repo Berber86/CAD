@@ -14,9 +14,24 @@ from test_print_draft import fake_autocad  # noqa: F401 -- shared AutoCAD fixtur
 
 
 def normal_plan(builder, source, value, is_main, scale=16.0):
-    """Эталон обычного режима: тот же вызов построителя, что и при ручном разборе."""
-    desc = lot_identity.bind_filename(value.data, source)
-    return builder.plan(desc, scale=scale, is_neighbor=not is_main)
+    """Эталон обычного режима: тот же вызов построителя, что и при ручном разборе.
+
+    Обычный режим строит полное описание одним вызовом построителя с
+    выведенным из обхода румбом привязки; сосед сцены отличается только
+    пометкой и видом подписи лота (см. ``_drawing_description``).
+    """
+    from dataclasses import replace as _replace
+    from pathlib import Path as _Path
+    desc = drawing._drawing_description(
+        drawing.DescriptionSource(_Path(source), is_main, value))
+    plan = builder.plan(desc, scale=scale, is_neighbor=False)
+    if not is_main:
+        plan = _replace(
+            plan, is_neighbor=True,
+            items=[_replace(t, kind='neighbor-label') if t.kind == 'main-lot-label'
+                   else t for t in plan.items],
+        )
+    return plan
 
 
 def assert_same_as_normal(actual, expected):
@@ -499,3 +514,53 @@ def test_non_rounding_gap_still_matches_normal_mode():
     entry = drawing.plan_scene(builder, [record('OUR 6.pdf', True, value)]).plans[0]
     assert entry.plan.closure.distance > drawing.ROUNDING_GAP_LIMIT_FT
     assert_same_as_normal(entry.plan, normal_plan(builder, 'OUR 6.pdf', value, True))
+
+
+def test_scene_builds_corner_and_distance_like_normal_mode_for_neighbor():
+    """Живой сбой автопотока 25.11.2026: кэш лота 17 (Staten Island, Block 4252).
+
+    В разборе есть cross street и ``distance_to_corner_ft=80``, но модель не
+    дала ``corner_to_pob_bearing`` — и сцена не строила ни перекрёсток, ни
+    дистанцию: главный участок садился на перекрёсток с условной выноской,
+    а сосед оставался вообще без уличных линий. Обычный режим по тем же
+    данным строит настоящую привязку 80 ft.
+    """
+    from pathlib import Path
+
+    raw = {
+        "main_street": "Reno Avenue", "cross_street": "Clawson Avenue",
+        "distance_to_corner_ft": 80.0, "front_side": "S", "front_segment_index": 3,
+        "block_number": "4252", "lot_number": "17", "borough_or_city": "Staten Island, NY",
+        "segments": [
+            {"ns": "N", "degrees": 34, "minutes": 36, "seconds": 40.0, "ew": "E",
+             "distance_ft": 100.0, "has_bearing": True},
+            {"ns": "S", "degrees": 55, "minutes": 4, "seconds": 10.0, "ew": "E",
+             "distance_ft": 40.0, "has_bearing": True},
+            {"ns": "S", "degrees": 34, "minutes": 36, "seconds": 40.0, "ew": "W",
+             "distance_ft": 100.0, "has_bearing": True},
+            {"ns": "N", "degrees": 55, "minutes": 4, "seconds": 10.0, "ew": "W",
+             "distance_ft": 40.0, "has_bearing": True},
+        ],
+    }
+    builder = ab.AcadBuilder(llm_parser.load_config())
+    normal = builder.plan(llm_parser.LegalDescription.model_validate(copy.deepcopy(raw)),
+                          scale=16.0)
+    parsed_item = parse.DescriptionItem(
+        parse._validated_description(llm_parser.LegalDescription, copy.deepcopy(raw)), True)
+    assert parsed_item.data.corner_to_pob_bearing is None  # разбор хранит честный None
+    for is_main in (True, False):
+        scene = drawing.plan_scene(
+            builder, [drawing.DescriptionSource(Path("LOT 17 NEW.pdf"), is_main, parsed_item)])
+        plan = scene.plans[0].plan
+        assert plan.is_neighbor is (not is_main)
+        assert plan.pob == pytest.approx(normal.pob)
+        ties = [ln for ln in plan.lines if ln.kind == "main-street-row-tie"]
+        assert len(ties) == 1
+        assert math.dist(ties[0].start, ties[0].end) == pytest.approx(80.0)
+        assert any(ln.kind == "cross-street-row" for ln in plan.lines)
+        assert any(t.kind == "cross-street-distance" and "80" in t.text for t in plan.items)
+        assert any(t.kind == "cross-street" and "CLAWSON" in t.text for t in plan.items)
+        label_kind = "main-lot-label" if is_main else "neighbor-label"
+        assert any(t.kind == label_kind and t.text == "LOT 17" for t in plan.items)
+    # Исходное описание сценой не переписано: в кэше не появится выдуманный румб.
+    assert parsed_item.data.corner_to_pob_bearing is None

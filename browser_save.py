@@ -207,16 +207,24 @@ def list_windows() -> list[BrowserWindow]:
     return result
 
 
-def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None) -> Optional[BrowserWindow]:
-    """Fail-closed: только поддерживаемый браузер с загруженным PDF, не challenge."""
+def find_pdf_browser_window(windows: Optional[list[BrowserWindow]] = None, *,
+                            require_title: bool = True) -> Optional[BrowserWindow]:
+    """Fail-closed: только поддерживаемый браузер с загруженным PDF, не challenge.
+
+    ``require_title=False`` — слепая попытка в уже закреплённое хуком окно:
+    заголовок просмотрщика не обязан совпасть с известными шаблонами;
+    страхует не заголовок, а итоговая проверка настоящего PDF в «Загрузках».
+    """
     try:
         candidates = list_windows() if windows is None else windows
     except Exception:  # noqa: BLE001
         return None
     for window in candidates:
-        if (is_supported_browser(window.executable, window.image_path)
-                and looks_like_loaded_pdf(window.title)):
-            return window
+        if not is_supported_browser(window.executable, window.image_path):
+            continue
+        if require_title and not looks_like_loaded_pdf(window.title):
+            continue
+        return window
     return None
 
 
@@ -391,12 +399,49 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
     if user32 is None:
         return False
     try:
-        moved = user32.SetCursorPos(int(x), int(y))
-        if moved is False:
+        target_x, target_y = int(x), int(y)
+        if user32.SetCursorPos(target_x, target_y) is False:
             return False
+        # Курсор обязан реально стоять на цели до нажатия. На удалённом
+        # рабочем столе и при «плавном» указателе SetCursorPos может
+        # отставать: нажатие в движении превращается в протаскивание и
+        # выделение текста вместо клика (живой сбой 25.11.2026: клик по
+        # форме портала выделял всю панель синим). Курсор не на месте —
+        # клика нет вовсе, вызывающий код попробует другую стратегию и
+        # точно не нажмёт Ctrl+A вслепую.
+        get_cursor_pos = getattr(user32, "GetCursorPos", None)
+        if callable(get_cursor_pos):
+            import ctypes
+            from ctypes import wintypes
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+            def cursor_at_target() -> bool:
+                point = POINT()
+                try:
+                    if not get_cursor_pos(ctypes.byref(point)):
+                        return False
+                except Exception:  # noqa: BLE001
+                    return False
+                return abs(int(point.x) - target_x) <= 2 and abs(int(point.y) - target_y) <= 2
+
+            settled = False
+            for attempt_no in range(4):
+                if cursor_at_target():
+                    settled = True
+                    break
+                if attempt_no == 2:
+                    user32.SetCursorPos(target_x, target_y)
+                time.sleep(0.02)
+            if not settled:
+                return False
         # SendInput is more reliable than the legacy mouse_event API for modern
-        # Chromium windows. Do not fall back after a partial SendInput: that could
-        # turn one intended click into a down/up pair that toggles a Select twice.
+        # Chromium windows. Down и up уходят раздельными событиями с паузой:
+        # пара «в одном пакете» на медленной сессии может слипнуться с ещё
+        # движущимся курсором в выделение. Do not fall back after a partial
+        # SendInput: that could turn one intended click into a down/up pair
+        # that toggles a Select twice.
         sendinput_available = False
         try:
             import ctypes
@@ -419,20 +464,23 @@ def click_browser_window(handle: int, x: int, y: int) -> bool:
             send_input = user32.SendInput
             send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
             send_input.restype = wintypes.UINT
-            inputs = (INPUT * 2)(
-                INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTDOWN)),
-                INPUT(type=0, mi=MOUSEINPUT(dwFlags=MOUSEEVENTF_LEFTUP)),
-            )
+
+            def send_mouse(flags: int) -> int:
+                inputs = (INPUT * 1)(INPUT(type=0, mi=MOUSEINPUT(dwFlags=flags)))
+                return int(send_input(1, inputs, ctypes.sizeof(INPUT)))
+
             sendinput_available = True
-            sent = int(send_input(2, inputs, ctypes.sizeof(INPUT)))
-        except Exception:  # noqa: BLE001 - legacy fallback below
-            sendinput_available = False
-            sent = 0
-        if sent == 2:
+            if send_mouse(MOUSEEVENTF_LEFTDOWN) != 1:
+                return False  # partial click; never issue a second click as fallback
+            time.sleep(0.05)
+            if send_mouse(MOUSEEVENTF_LEFTUP) != 1:
+                return False
             return active_window_handle() == int(handle)
-        if sendinput_available and sent != 0:
-            return False  # partial click; never issue a second click as fallback
+        except Exception:  # noqa: BLE001 - legacy fallback below
+            if sendinput_available:
+                return False
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         return active_window_handle() == int(handle)
     except Exception:  # noqa: BLE001
@@ -572,13 +620,15 @@ def save_pdf_if_possible(
     press_enter_fn: Optional[Callable[[], bool]] = None,
     sleep: Callable[[float], None] = time.sleep,
     wait: float = 0.8,
+    require_pdf_title: bool = True,
 ) -> Optional[Path]:
     """Одна безопасная попытка Ctrl+S только в уже загруженном PDF браузера."""
     destination = Path(target)
     if destination.is_file():
         return destination
     try:
-        candidate = find_pdf_browser_window((windows or list_windows)())
+        candidate = find_pdf_browser_window((windows or list_windows)(),
+                                            require_title=require_pdf_title)
     except Exception:  # noqa: BLE001
         return None
     if candidate is None:
@@ -622,6 +672,7 @@ def auto_save_hook(
     *,
     on_attempt: Optional[Callable[[str], None]] = None,
     ready_delay: float = 4.0,
+    blind_after: float = 15.0,
     stable_for: float = 1.0,
     windows_fn: Callable[[], list[BrowserWindow]] = list_windows,
     active_handle_fn: Callable[[], int] = active_window_handle,
@@ -635,6 +686,7 @@ def auto_save_hook(
     baselines: dict[str, dict[int, str]] = {}
     target_handles: dict[str, int] = {}
     ready_since: dict[str, tuple[int, str, float]] = {}
+    state: dict[str, str] = {}
 
     def before_open(endorsement_id: int | str) -> None:
         """Snapshot existing browser tabs before the new document is navigated."""
@@ -655,7 +707,10 @@ def auto_save_hook(
         target = pending_path(downloads_dir, key)
         if target.is_file():
             return target
-        if key in attempted or not available():
+        if key in attempted:
+            return None
+        if not available():
+            state.setdefault(key, "автоматика Windows (клавиатура/окна) недоступна")
             return None
         now = monotonic()
         requested_at.setdefault(key, now)
@@ -681,35 +736,63 @@ def auto_save_hook(
             elif len(changed) == 1:
                 pinned = changed[0].handle
             else:
+                seen = "; ".join(sorted(
+                    {f"[{window.executable}] {window.title!r}" for window in changed})) or "ни одного"
+                state[key] = f"окно загрузки не закреплено: изменилось окон {len(changed)}: {seen}"
                 return None
             target_handles[key] = pinned
 
         candidate = next((window for window in windows if window.handle == pinned), None)
         if candidate is None or not is_supported_browser(candidate.executable, candidate.image_path):
             ready_since.pop(key, None)
+            state[key] = ("закреплённое окно закрылось" if candidate is None
+                          else "закреплённое окно — не поддерживаемый браузер")
             return None
-        if not looks_like_loaded_pdf(candidate.title):
-            ready_since.pop(key, None)
-            return None
+        recognized_pdf = looks_like_loaded_pdf(candidate.title)
+        if not recognized_pdf:
+            if looks_like_cloudflare_page(candidate.title):
+                # На странице проверки Ctrl+S сохранит HTML, а не PDF, и сожжёт
+                # единственную попытку — ждём, пока человек пройдёт капчу.
+                state[key] = (f"в закреплённом окне идёт проверка Cloudflare: "
+                              f"[{candidate.executable}] заголовок {candidate.title!r}")
+                ready_since.pop(key, None)
+                return None
+            state[key] = (f"закреплённое окно ещё не опознано как PDF: [{candidate.executable}] "
+                          f"заголовок {candidate.title!r}")
         signature = (candidate.handle, candidate.title)
         prior = ready_since.get(key)
         if prior is None or prior[:2] != signature:
             ready_since[key] = (*signature, now)
             return None
-        if now - requested_at[key] < max(0.0, ready_delay):
-            return None
         if now - prior[2] < max(0.0, stable_for):
+            return None
+        if recognized_pdf:
+            if now - requested_at[key] < max(0.0, ready_delay):
+                return None
+        elif now - requested_at[key] < max(0.0, blind_after):
+            # Слепая попытка — только когда просмотрщик с незнакомым заголовком
+            # уже давно стабилен: раньше легко попасть в ещё грузящуюся страницу.
             return None
 
         # Mark before touching the UI: retries must never spam/focus any window.
         attempted.add(key)
+        state[key] = (f"Ctrl+S отправлен, заголовок [{candidate.executable}] "
+                      f"{candidate.title!r} (опознан как PDF: "
+                      f"{'да' if recognized_pdf else 'нет — слепая попытка'})")
         if on_attempt is not None:
             try:
                 on_attempt(candidate.title)
             except Exception:  # noqa: BLE001
                 pass
-        result = save_pdf_if_possible(target, windows=lambda: [candidate])
+        # Даже с незнакомым заголовком пытаемся: окно уже закреплено за этим
+        # документом и проверяем хвост (капча/Getty/JPEG в «Загрузках»).
+        result = save_pdf_if_possible(
+            target, windows=lambda: [candidate], require_pdf_title=recognized_pdf)
         return result
 
+    def note(endorsement_id: int | str) -> str:
+        return state.get(str(endorsement_id), "состояние не записано")
+
     attempt.before_open = before_open  # type: ignore[attr-defined]
+    attempt.state = note  # type: ignore[attr-defined]
     return attempt

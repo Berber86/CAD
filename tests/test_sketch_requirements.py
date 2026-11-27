@@ -181,3 +181,31 @@ def test_last_commencing_tie_keeps_feet_and_inches():
     assert next(item.text for item in plan.items if item.kind == "cross-street-distance") == "208'-2\""
     draft = make_print_draft(plan, {})
     assert next(item.text for item in draft.items if item.kind == "cross-street-distance") == "208'-2\""
+
+
+def test_plain_decimal_feet_source_strings_do_not_trigger_feet_inches_warnings():
+    text = open("tests/data/stafford_lot68_legal.txt", encoding="utf8").read()
+    desc, _ = parser.parse_with_regex(text)
+    polluted = desc.model_copy(
+        update={
+            "distance_to_corner_source": "161.00 feet",
+            "segments": [
+                s.model_copy(update={"distance_source": f"{s.distance_ft:.2f} feet"})
+                for s in desc.segments
+            ],
+        }
+    )
+    plan = AcadBuilder(config()).plan(polluted, scale=16)
+    assert not any("футы/дюймы" in w for w in plan.warnings)
+
+    # On mixed feet-and-inches plans, plain decimal-feet source on an integer side
+    # still permits 40'-0" formatting while stale inches still warn.
+    mixed = polluted.model_copy(
+        update={
+            "segments": [
+                polluted.segments[0].model_copy(update={"distance_ft": 100 + 8 / 12, "distance_source": "100 feet 8 inches"}),
+                *polluted.segments[1:],
+            ]
+        }
+    )
+    assert segment_distance_label(mixed.segments[1], feet_inches=True) == "40'-0\""

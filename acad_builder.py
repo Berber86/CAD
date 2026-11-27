@@ -34,7 +34,9 @@ from dataclasses import dataclass, field, replace as dc_replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Iterable, Sequence
 
-from llm_parser import LegalDescription, Segment, format_feet_inches_source, load_config
+from llm_parser import (
+    LegalDescription, Segment, format_feet_inches_source, is_plain_feet_source, load_config,
+)
 import offsets
 import drawing_warnings
 import street_names
@@ -840,7 +842,9 @@ def display_distance(distance: float, source: str | None = None, *, feet_inches:
     if original:
         return original
     # A stale source is intentionally not presented as a verified feet/inches value.
-    if feet_inches and not source and float(distance).is_integer():
+    # Plain decimal-feet source strings (e.g. "40.00 feet") contain no inches and
+    # must not block 25'-0" formatting when another side uses feet and inches.
+    if feet_inches and (not source or is_plain_feet_source(source)) and float(distance).is_integer():
         return f"{int(distance)}'-0\""
     return format_distance(distance)
 
@@ -1321,6 +1325,13 @@ def make_print_draft(
     gap_points = None
     if plan.gap_points is not None:
         gap_points = (lot_pt(plan.gap_points[0]), lot_pt(plan.gap_points[1]))
+    draft_notes = list(plan.notes)
+    draft_note = (
+        "Черновик на +1000 по X: при неоднозначном автопоиске "
+        "в Шаге 2 укажите исходный участок вручную."
+    )
+    if draft_note not in draft_notes:
+        draft_notes.append(draft_note)
     return dc_replace(
         plan,
         vertices=[lot_pt(p) for p in plan.vertices],
@@ -1332,6 +1343,7 @@ def make_print_draft(
         arcs=[dc_replace(arc, center=lot_pt(arc.center)) for arc in plan.arcs],
         pob=lot_pt(plan.pob),
         gap_points=gap_points,
+        notes=draft_notes,
         warnings=list(plan.warnings) + warnings,
         print_draft=True,
         is_neighbor=False,
@@ -1400,8 +1412,13 @@ class DrawResult:
             )
         )
         n_segs = self.boundary_line_count or self.segment_count
+        height_desc = (
+            "высота текста 2.000 (улицы 4.0, примечания 1.6)"
+            if self.plan.print_draft
+            else f"высота текста {self.text_height:.3f}"
+        )
         lines = [
-            f'Масштаб 1"={self.scale:g}\'{role_tag}, высота текста {self.text_height:.3f}',
+            f'Масштаб 1"={self.scale:g}\'{role_tag}, {height_desc}',
             f"POB от перекрёстка (0, 0): ({self.pob[0]:+.2f}, {self.pob[1]:+.2f}) ft",
             f"Отрезков границы (LINE): {n_segs}, подписей создано: {self.text_count}, "
             f"площадь ≈ {self.area_sqft:,.0f} sq ft",
@@ -2635,10 +2652,18 @@ class AcadBuilder:
             role = "соседа" if is_neighbor else "основного участка"
             warnings.append(f"номер лота {role} не найден в имени файла или документе — подпись LOT ?; сверьте")
         for index, segment in enumerate(description.segments):
-            if segment.distance_source and not format_feet_inches_source(segment.distance_source, segment.distance_ft):
+            if (
+                segment.distance_source
+                and not is_plain_feet_source(segment.distance_source)
+                and not format_feet_inches_source(segment.distance_source, segment.distance_ft)
+            ):
                 warnings.append(f"сторона #{index + 1}: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
-        if description.distance_to_corner_source and not format_feet_inches_source(
-            description.distance_to_corner_source, description.distance_to_corner_ft
+        if (
+            description.distance_to_corner_source
+            and not is_plain_feet_source(description.distance_to_corner_source)
+            and not format_feet_inches_source(
+                description.distance_to_corner_source, description.distance_to_corner_ft
+            )
         ):
             warnings.append("привязка: исходные футы/дюймы не совпадают с текущим размером; показано значение в футах")
 
@@ -3341,17 +3366,18 @@ class AcadBuilder:
         old_rotation = item.rotation
         failure = None
         try:
-            entity.Rotation = 0.0
-            if abs(float(entity.Rotation)) > 1e-8:
+            _com_retry(setattr, entity, "Rotation", 0.0)
+            zero_rot = float(_com_retry(getattr, entity, "Rotation"))
+            if abs(((zero_rot + math.pi) % (2.0 * math.pi)) - math.pi) > 1e-6:
                 raise ValueError("text rotation not applied")
 
             def measure(spaces: int) -> float:
                 candidate = bearing + " " * spaces + distance
-                entity.TextString = candidate
-                if str(entity.TextString) != candidate:
+                _com_retry(setattr, entity, "TextString", candidate)
+                if str(_com_retry(getattr, entity, "TextString")) != candidate:
                     raise ValueError("text update not applied")
                 if hasattr(entity, "Update"):
-                    entity.Update()
+                    _com_retry(entity.Update)
                 bbox = self._entity_bbox(entity)
                 width = bbox[2] - bbox[0] if bbox is not None else 0.0
                 if not math.isfinite(width) or width <= 0:
@@ -3363,7 +3389,7 @@ class AcadBuilder:
             if measure(count) > limit:
                 # Минимум один пробел нужен, чтобы румб и расстояние не слились.
                 if count == 1 or measure(1) > limit:
-                    entity.TextString = bearing + " " + distance
+                    _com_retry(setattr, entity, "TextString", bearing + " " + distance)
                     failure = "даже с одним пробелом не помещается с отступом 10%"
                 else:
                     low, high = 1, count - 1
@@ -3376,15 +3402,21 @@ class AcadBuilder:
                     measure(low)
         except Exception:  # noqa: BLE001 - остаётся безопасная предварительная оценка
             try:
-                entity.TextString = item.text
+                _com_retry(setattr, entity, "TextString", item.text)
             except Exception:  # noqa: BLE001
                 pass
             failure = "не удалось измерить ширину текста в AutoCAD; проверьте отступы"
         finally:
             try:
-                entity.Rotation = old_rotation
-                entity.TextAlignmentPoint = _variant_point(item.point)
-                if abs(float(entity.Rotation) - old_rotation) > 1e-8:
+                _com_retry(setattr, entity, "Rotation", old_rotation)
+                _com_retry(setattr, entity, "TextAlignmentPoint", _variant_point(item.point))
+                restored_rot = float(_com_retry(getattr, entity, "Rotation"))
+                # AutoCAD нормализует AcadText.Rotation в [0, 2*pi), поэтому
+                # отрицательный угол из text_rotation() возвращается как old_rotation + 2*pi.
+                angle_diff = abs(
+                    ((restored_rot - old_rotation + math.pi) % (2.0 * math.pi)) - math.pi
+                )
+                if angle_diff > 1e-6:
                     raise ValueError("text rotation not restored")
             except Exception:  # noqa: BLE001
                 failure = "не удалось восстановить положение подписи; проверьте её в AutoCAD"
@@ -3587,11 +3619,6 @@ class AcadBuilder:
                     created_boundary_lines += 1
                     if primary_entity is None:
                         primary_entity = line_ent
-                if geo.print_draft:
-                    warnings.append(
-                        "Черновик на +1000 по X: при неоднозначном автопоиске "
-                        "в Шаге 2 укажите исходный участок вручную."
-                    )
             elif draw_as_lines and geo.boundary_lines and hasattr(model_space, "AddLine"):
                 for b_line in geo.boundary_lines:
                     line_ent = self._add_line(model_space, b_line, poly_target_layer)

@@ -105,3 +105,41 @@ def test_failed_cad_measurement_preserves_estimate_and_reports():
     assert "не удалось измерить" in warning
     assert entity.TextString == item.text
     assert entity.Rotation == pytest.approx(item.rotation)
+
+
+def test_negative_rotation_normalized_by_autocad_to_0_2pi_restores_cleanly():
+    class WrappingMeasuredText(MeasuredText):
+        @property
+        def Rotation(self):
+            return self._rot
+
+        @Rotation.setter
+        def Rotation(self, value):
+            self._rot = float(value) % (2.0 * math.pi)
+
+    builder = AcadBuilder(load_config())
+    segment = Segment(ns="N", degrees=56, minutes=36, seconds=12, ew="W", distance_ft=100)
+    bearing = format_bearing(segment, use_control_code=True)
+    item = TextItem(bearing + " " * 30 + "100.00'", (2, 3), -0.5829, kind="side-1", height=2)
+    entity = WrappingMeasuredText(item.text, item.rotation)
+    assert builder._fit_print_bearing_text(entity, item, segment, 100, feet_inches=False) is None
+    assert entity.Rotation == pytest.approx(item.rotation % (2.0 * math.pi))
+
+
+def test_failed_rotation_restore_still_reports_error():
+    class StuckRotationText(MeasuredText):
+        @property
+        def Rotation(self):
+            return 0.0
+
+        @Rotation.setter
+        def Rotation(self, value):
+            pass
+
+    builder = AcadBuilder(load_config())
+    segment = Segment(ns="N", degrees=56, minutes=36, seconds=12, ew="W", distance_ft=100)
+    bearing = format_bearing(segment, use_control_code=True)
+    item = TextItem(bearing + " " * 30 + "100.00'", (2, 3), -0.5829, kind="side-1", height=2)
+    entity = StuckRotationText(item.text, 0.0)
+    warning = builder._fit_print_bearing_text(entity, item, segment, 100, feet_inches=False)
+    assert warning == "не удалось восстановить положение подписи; проверьте её в AutoCAD"

@@ -536,3 +536,36 @@ def test_auto_promotes_our_old_when_our_new_missing_from_download(gui, tmp_path,
     assert any("OLD 32" in line for _lvl, line in app._step0_lines)
 
 
+def test_two_phase_autoflow_never_logs_false_missing_our_or_mode_prompt(
+        gui, tmp_path, monkeypatch, fake_autocad):
+    app, _calls = setup_app(gui, monkeypatch, tmp_path)
+    app.step0_address_var.set("Staten Island test address")
+    app.step0_folder_var.set(str(tmp_path / "docs"))
+    fake_portal(app, monkeypatch)
+    _collect_spy(gui, monkeypatch, tmp_path, [])
+    seen_logs: list[str] = []
+    orig_log = app._log_line
+    monkeypatch.setattr(app, "_log_line", lambda text, **kw: (seen_logs.append(text), orig_log(text, **kw)))
+
+    app._start_step0_auto()
+    app._handle_step0_portal_identified(
+        ("Staten Island test address", "Staten Island", "6323", "32", "ocr", "map.png"))
+    _drain_until(app, lambda: not app._step0_running and app._step0_our_outcome is not None)
+    app._finish_step0_portal_lookup("ok", parcel(gui))
+    wait_all(app)
+
+    assert not any("наш участок не собран" in line for line in seen_logs)
+    assert not any("Для обработки выберите PDF или запустите разбор заново" in line for line in seen_logs)
+    assert not any("наш участок не собран" in text for _lvl, text in app._step0_lines)
+
+    builder, doc = fake_autocad(None)
+    doc.SaveAs = lambda path: Path(path).write_bytes(b"DWG simulated")
+    monkeypatch.setattr(gui, "AcadBuilder", lambda cfg: builder)
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    seen_logs.clear()
+    app._start_draw_scene()
+    smoke._wait_for_gui_worker(app)
+    dwg_saved_lines = [line for line in seen_logs if "DWG сохранён:" in line]
+    assert len(dwg_saved_lines) == 1
+
+

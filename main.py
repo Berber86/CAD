@@ -5052,7 +5052,16 @@ class SurveyApp(ctk.CTk):
             self._step0_log(f"Ошибка: {payload}", level=log_mode.LEVEL_ERROR)
             self._set_status(f"Шаг 0: ошибка — {payload}", error=True)
             return
-        outcome = payload
+        early_neighbours_done = (
+            self._step0_auto_stage == "intake"
+            and self._step0_early_active
+            and self._step0_early_phase == "neighbours"
+        )
+        outcome = (
+            deed_intake.merge_outcomes(self._step0_our_outcome, payload)
+            if early_neighbours_done and self._step0_our_outcome is not None
+            else payload
+        )
         self._step0_outcome = outcome
         self._step0_log(f"Сбор завершён: документов в результате — {len(outcome.records)}", level=log_mode.LEVEL_KEY)
         report_text = outcome.report(include_notes=False)
@@ -5093,22 +5102,19 @@ class SurveyApp(ctk.CTk):
                 else:
                     self._reset_step0_early(keep_stream=True)
                     self._auto_submit_step0_outcome(outcome)
-            elif self._step0_early_active and self._step0_early_phase == "neighbours":
-                merged = (deed_intake.merge_outcomes(self._step0_our_outcome, outcome)
-                          if self._step0_our_outcome is not None else outcome)
-                self._step0_outcome = merged
+            elif early_neighbours_done:
                 self._reset_step0_early(keep_stream=True)
                 self._consume_closed_auto_stream()
                 try:
                     deed_store.write_manifest(
-                        Path(merged.folder),
+                        Path(outcome.folder),
                         block=str(self.step0_block_var.get() or ""),
                         lot=str(self.step0_lot_var.get() or ""),
-                        missing=[{"reason": item} for item in merged.missing],
+                        missing=[{"reason": item} for item in outcome.missing],
                     )
                 except Exception:  # noqa: BLE001 - manifest не должен губить автопоток
                     pass
-                self._auto_submit_step0_outcome(merged)
+                self._auto_submit_step0_outcome(outcome)
             else:
                 self._consume_closed_auto_stream()
                 self._auto_submit_step0_outcome(outcome)
@@ -5202,7 +5208,7 @@ class SurveyApp(ctk.CTk):
                 "и начерчу соседей, какие есть.", level=log_mode.LEVEL_WARN)
         # The explicit auto button opts into this mode for the current session only.
         self.multi_pdf_mode_var.set(True)
-        self._on_multi_pdf_mode_changed()
+        self._on_multi_pdf_mode_changed(announce=False)
         if not self._multi_pdf_enabled():
             self._stop_auto_transition("Автопоток остановлен: многоконтурный режим недоступен.")
             return
@@ -6469,7 +6475,7 @@ class SurveyApp(ctk.CTk):
         }[code]
         self._set_status(f"Формат страниц для ИИ: {fmt_desc}.")
 
-    def _on_multi_pdf_mode_changed(self) -> None:
+    def _on_multi_pdf_mode_changed(self, *, announce: bool = True) -> None:
         """Change the PDF workflow in memory without mixing existing results."""
         old = self._multi_pdf_enabled()
         new = bool(self.multi_pdf_mode_var.get())
@@ -6492,8 +6498,9 @@ class SurveyApp(ctk.CTk):
             self._refresh_pdf_selection_ui()
             self._refresh_parse_actions()
             self._redraw_preview_canvas()
-        label = "тест всех описаний (ИИ, возможны платные запросы)" if new else "обычный"
-        self._set_status(f"Режим PDF: {label}. Для обработки выберите PDF или запустите разбор заново.", key=True)
+        if announce:
+            label = "тест всех описаний (ИИ, возможны платные запросы)" if new else "обычный"
+            self._set_status(f"Режим PDF: {label}. Для обработки выберите PDF или запустите разбор заново.", key=True)
 
     def _current_source_mode(self) -> str:
         return str(self.source_mode_var.get() or "📝 Текст")
@@ -12629,7 +12636,6 @@ class SurveyApp(ctk.CTk):
                                  "Повтор может создать дубли." + detail, error=True)
             elif save_result and save_result[0] == "saved":
                 path = save_result[1]
-                self._log_line(f"DWG сохранён: {path}", level=log_mode.LEVEL_KEY)
                 failure = next((str(w) for _, result in completed for w in result.warnings
                                 if any(part in str(w).lower() for part in (
                                     "не удалось создать", "не удалось выделить",

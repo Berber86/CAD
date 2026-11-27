@@ -3723,6 +3723,19 @@ def _feet_inches_source(chunk: str, distance: float | None) -> str | None:
     return fi.group(0).strip()
 
 
+_PLAIN_FEET_SOURCE_RE = re.compile(
+    r"^\s*(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(?:feet|foot|ft\.?|')?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_plain_feet_source(source: str | None) -> bool:
+    """True для записи длины только в футах (без дюймов), напр. ``'100.00 feet'``."""
+    if not source:
+        return False
+    return bool(_PLAIN_FEET_SOURCE_RE.fullmatch(str(source).strip().replace("′", "'")))
+
+
 def format_feet_inches_source(source: str | None, distance: float) -> str | None:
     """Формат feet + inches, только при соответствии текущей длине стороны."""
     if not source:

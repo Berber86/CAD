@@ -970,3 +970,16 @@ def test_draw_compacts_printed_bearing_using_cad_measurements_only_in_draft(fake
     assert entity.Height == 2 and entity.StyleName == "Romans" and entity.Layer == "M-TAX-DIM"
     assert entity.Rotation == pytest.approx(item.rotation)
     assert not any("не удалось измерить" in warning for warning in draft_result.warnings)
+
+
+def test_print_draft_shift_is_informational_note_and_summary_reports_draft_heights(fake_autocad):
+    plan = _plan("lot72_render_e600.txt")
+    draft = make_print_draft(plan, {})
+    assert any("+1000 по X" in note for note in draft.notes)
+    assert not any("+1000 по X" in warning for warning in draft.warnings)
+    builder, _doc = fake_autocad(plan)
+    result = builder.draw_plan(draft)
+    assert not any("+1000 по X" in warning for warning in result.warnings)
+    summary = result.summary()
+    assert "высота текста 2.000 (улицы 4.0, примечания 1.6)" in summary
+    assert "• Черновик на +1000 по X" in summary

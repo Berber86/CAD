@@ -24,8 +24,9 @@ QUESTION = (
     "(such as BEGINNING/COMMENCING tie distances, THENCE courses, compass bearings, relative "
     "directions like \"parallel with\" or \"at right angles to\", boundary lengths in feet/inches, "
     "or a drawn survey plat with boundary dimensions), including an opening or continuation "
-    "fragment? Answer NO if the page only has legal boilerplate, \"being the same premises\" "
-    "recitals, covenants/subject-to clauses, address/Block/Lot references, cover sheets, "
+    "fragment? Answer NO if the page only has a chain of title (mortgage or assignment recording "
+    "history, book/page, dates, loan amounts), \"being the same premises\" recitals, "
+    "covenants/subject-to legal boilerplate, address/Block/Lot references, cover sheets, "
     "tax forms, or signatures without boundary measurements."
 )
 PROVIDERS = {

@@ -581,11 +581,24 @@ def test_configured_threshold_snaps_clamps_and_re_filters_cached_probabilities(t
 def test_search_prompts_focus_on_metes_and_bounds_geometry_and_exclude_legal_boilerplate():
     q_low = search.QUESTION.lower()
     h_low = search.HYDRA_SEARCH_PROMPT.lower()
+    c_low = search.COUNT_INSTRUCTIONS.lower()
     assert 'legal description' not in q_low
     assert 'legal land description' not in h_low
-    for needle in ('metes-and-bounds', 'parallel with', 'at right angles to', 'being the same premises', 'subject'):
+    for needle in (
+        'metes-and-bounds',
+        'parallel with',
+        'at right angles to',
+        'chain of title',
+        'mortgage or assignment recording history',
+        'book/page',
+        'loan amounts',
+        'being the same premises',
+        'subject',
+        'legal boilerplate',
+    ):
         assert needle in q_low
         assert needle in h_low
+    assert 'chain of title' in c_low
 
 
 

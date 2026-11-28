@@ -29,7 +29,7 @@ COUNT_CHOICES = {
 COUNT_INSTRUCTIONS = (
     "Count distinct metes-and-bounds descriptions of land parcels on the supplied pages. "
     "One description continued over multiple pages counts once. A title, deed cover, "
-    "map, address or lot reference alone is not a separate description. "
+    "chain of title, map, address or lot reference alone is not a separate description. "
     "Choose uncertain if you cannot determine the count."
 )
 

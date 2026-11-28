@@ -43,8 +43,9 @@ QUESTION = (
     "(such as BEGINNING/COMMENCING tie distances, THENCE courses, compass bearings, relative "
     "directions like \"parallel with\" or \"at right angles to\", boundary lengths in feet/inches, "
     "or a drawn survey plat with boundary dimensions), including an opening or continuation "
-    "fragment? Answer NO if the page only has legal boilerplate, \"being the same premises\" "
-    "recitals, covenants/subject-to clauses, address/Block/Lot references, cover sheets, "
+    "fragment? Answer NO if the page only has a chain of title (mortgage or assignment recording "
+    "history, book/page, dates, loan amounts), \"being the same premises\" recitals, "
+    "covenants/subject-to legal boilerplate, address/Block/Lot references, cover sheets, "
     "tax forms, or signatures without boundary measurements."
 )
 HYDRA_SEARCH_PROMPT = (
@@ -54,15 +55,16 @@ HYDRA_SEARCH_PROMPT = (
     "corner tie distances, THENCE courses, compass bearings/angles, street-relative boundary "
     "calls (PARALLEL WITH / AT RIGHT ANGLES TO), boundary lengths in feet/inches, or a drawn "
     "survey plat with boundary measurements. "
-    "Ignore pages that only contain deed cover sheets, recording stamps, Block/Lot/address "
+    "Ignore pages that only contain a chain of title (mortgage or assignment recording history, "
+    "book/page, dates, loan amounts), deed cover sheets, recording stamps, Block/Lot/address "
     "references without boundary dimensions, \"being the same premises\" recitals, "
-    "\"together with / subject to\" legal clauses, ACRIS/tax forms (RP-5217, TP-584), "
+    "\"together with / subject to\" legal boilerplate, ACRIS/tax forms (RP-5217, TP-584), "
     "notary acknowledgments, or signatures unless boundary measurements appear on that page. "
     "Return STRICT JSON ONLY in this exact schema: {\"pages\": [<integer page numbers>]}."
 )
 COUNT_INSTRUCTIONS = ("Count distinct metes-and-bounds descriptions of land parcels on the supplied pages. "
                       "One description continued over multiple pages counts once. A title, deed cover, "
-                      "map, address or lot reference alone is not a separate description. "
+                      "chain of title, map, address or lot reference alone is not a separate description. "
                       "Choose uncertain if you cannot determine the count.")
 COUNT_CHOICES = {"zero": "No distinct metes-and-bounds description",
                  "one": "Exactly one distinct metes-and-bounds description",

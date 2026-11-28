@@ -547,3 +547,35 @@ def test_ocr_third_line_handles_garbled_zeros_and_continuation(tmp_path):
     assert all(p['incomplete'] for p in run['pages'])
 
 
+def test_configured_threshold_snaps_clamps_and_re_filters_cached_probabilities(tmp_path):
+    assert search.configured_threshold(None) == 0.30
+    assert search.configured_threshold({'multiple_description_search': {'threshold': 0.549999}}) == 0.55
+    assert search.configured_threshold({'multiple_description_search': {'threshold': 0.10}}) == 0.30
+    assert search.configured_threshold({'multiple_description_search': {'threshold': 1.25}}) == 0.95
+    assert search.configured_threshold({'multiple_description_search': {'threshold': 'bad'}}) == 0.30
+    assert llm_parser.DEFAULT_CONFIG['multiple_description_search']['threshold'] == 0.30
+    assert json.loads(Path('config.json').read_text(encoding='utf-8'))['multiple_description_search']['threshold'] == 0.30
+
+    pdf = tmp_path / 'threshold.pdf'
+    make_pdf(pdf, 3)
+    calls = []
+
+    def send(base, key, model, state, assets, qs):
+        calls.append(model)
+        return response(qs, {1: 0.35, 2: 0.65, 3: 0.90})
+
+    cfg_low = {'multiple_description_search': {'enabled': True, 'threshold': 0.30}}
+    run_low = search.search_pdf(pdf, cfg_low, api_key='router', send=send)
+    assert run_low['threshold'] == 0.30
+    assert run_low['candidate_pages'] == [1, 2, 3]
+    assert len(calls) == 1
+
+    # Raising threshold reuses cached probabilities ($0 network calls) and updates candidate_pages.
+    cfg_high = {'multiple_description_search': {'enabled': True, 'threshold': 0.65}}
+    run_high = search.search_pdf(pdf, cfg_high, api_key='router', send=send)
+    assert run_high['threshold'] == 0.65
+    assert run_high['candidate_pages'] == [2, 3]
+    assert len(calls) == 1
+
+
+

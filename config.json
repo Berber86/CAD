@@ -1,6 +1,7 @@
 {
   "multiple_description_search": {
     "enabled": false,
+    "threshold": 0.30,
     "vision_fallback": {
       "provider": "hydra",
       "model": "grok-4.7",

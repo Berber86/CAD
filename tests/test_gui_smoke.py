@@ -6386,3 +6386,30 @@ def test_preferred_browser_setting_syncs_step0_and_settings_and_persists(gui, tm
         gui.browser_save.reset_auto_browser_pin()
 
 
+def test_page_search_threshold_slider_snaps_persists_and_reaches_runtime(gui):
+    import json
+    import llm_parser
+
+    app = gui.SurveyApp()
+    slider = app.page_search_threshold_slider
+    assert slider.cget("from_") == pytest.approx(0.30)
+    assert slider.cget("to") == pytest.approx(0.95)
+    assert slider.cget("number_of_steps") == 13
+    assert app.page_search_threshold_var.get() == "0.30"
+
+    # Dragging snaps to nearest 0.05 step, updates config_data, and persists locally.
+    slider.cget("command")(0.64999999999)
+    assert app._page_search_threshold == pytest.approx(0.65)
+    assert app.page_search_threshold_var.get() == "0.65"
+    assert app.config_data["multiple_description_search"]["threshold"] == pytest.approx(0.65)
+    local_data = json.loads(gui.LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert local_data["multiple_description_search"]["threshold"] == pytest.approx(0.65)
+
+    # Full config build and reload preserve the chosen threshold cleanly.
+    runtime_cfg, *_ = app._build_runtime_config()
+    assert runtime_cfg["multiple_description_search"]["threshold"] == pytest.approx(0.65)
+    reloaded = llm_parser.load_config()
+    assert reloaded["multiple_description_search"]["threshold"] == pytest.approx(0.65)
+
+
+

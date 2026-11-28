@@ -641,6 +641,12 @@ class SurveyApp(ctk.CTk):
         self.ask_on_doubt_var = ctk.BooleanVar(
             value=bool(self.config_data.get("api", {}).get("ask_on_doubt", True))
         )
+        self._page_search_threshold: float = legal_page_search.configured_threshold(
+            self.config_data
+        )
+        self.page_search_threshold_var = ctk.StringVar(
+            value=f"{self._page_search_threshold:.2f}"
+        )
         self.pending_doubt: dict[str, Any] | None = None
         self.doubt_window: Any | None = None
         self.preview_modes = ["📐 Схема CAD", "🖼 Исходник"]
@@ -1386,10 +1392,10 @@ class SurveyApp(ctk.CTk):
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=THEME["text_dim"],
             anchor="w",
-        ).grid(row=3, column=0, sticky="w", pady=(4, 4))
+        ).grid(row=4, column=0, sticky="w", pady=(4, 4))
 
         keys_frame = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        keys_frame.grid(row=4, column=0, sticky="ew", pady=(2, 6))
+        keys_frame.grid(row=5, column=0, sticky="ew", pady=(2, 6))
         keys_frame.grid_columnconfigure(0, weight=1)
         for col, pid in enumerate(self.provider_ids):
             card = ctk.CTkFrame(
@@ -1450,7 +1456,7 @@ class SurveyApp(ctk.CTk):
             self.provider_key_buttons[pid] = btn
 
         vault_row = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        vault_row.grid(row=5, column=0, sticky="ew", pady=(10, 4))
+        vault_row.grid(row=6, column=0, sticky="ew", pady=(10, 4))
         vault_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -1526,7 +1532,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        start_card.grid(row=6, column=0, sticky="ew", pady=(10, 4))
+        start_card.grid(row=7, column=0, sticky="ew", pady=(10, 4))
         start_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             start_card,
@@ -1563,7 +1569,7 @@ class SurveyApp(ctk.CTk):
         # --- Помощь / Обратная связь — рядом с Настройками, как просил пользователь
         help_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
                                  border_width=1, border_color="#f59e0b")
-        help_card.grid(row=5, column=0, sticky="ew", pady=(6, 10))
+        help_card.grid(row=10, column=0, sticky="ew", pady=(6, 10))
         help_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(help_card, text="🆘 ПОМОЩЬ И ОБРАТНАЯ СВЯЗЬ",
                      font=ctk.CTkFont(size=10, weight="bold"),
@@ -1583,7 +1589,7 @@ class SurveyApp(ctk.CTk):
 
         theme_card = ctk.CTkFrame(drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
                                   border_width=1, border_color=THEME["border_subtle"])
-        theme_card.grid(row=7, column=0, sticky="ew", pady=(4, 10))
+        theme_card.grid(row=8, column=0, sticky="ew", pady=(4, 10))
         theme_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(theme_card, text="ТЕМА ИНТЕРФЕЙСА",
                      font=ctk.CTkFont(size=10, weight="bold"),
@@ -1609,7 +1615,7 @@ class SurveyApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border_subtle"],
         )
-        browser_card.grid(row=8, column=0, sticky="ew", pady=(0, 10))
+        browser_card.grid(row=9, column=0, sticky="ew", pady=(0, 10))
         browser_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             browser_card,
@@ -1662,9 +1668,60 @@ class SurveyApp(ctk.CTk):
             anchor="w", justify="left", wraplength=400,
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
 
+        # Порог уверенности нейронки при отборе релевантных страниц (0.30..0.95, шаг 0.05).
+        self.page_search_card = ctk.CTkFrame(
+            drawer_body, fg_color=THEME["bg_field"], corner_radius=8,
+            border_width=1, border_color=THEME["border_subtle"],
+        )
+        self.page_search_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.page_search_card.grid_columnconfigure(0, weight=1)
+        page_search_head = ctk.CTkFrame(self.page_search_card, fg_color="transparent")
+        page_search_head.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
+        page_search_head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            page_search_head,
+            text="Порог уверенности выбора страниц",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.page_search_threshold_badge = ctk.CTkLabel(
+            page_search_head,
+            textvariable=self.page_search_threshold_var,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color=THEME["sky"],
+            anchor="e",
+        )
+        self.page_search_threshold_badge.grid(row=0, column=1, sticky="e")
+        self.page_search_threshold_slider = ctk.CTkSlider(
+            self.page_search_card,
+            from_=legal_page_search.THRESHOLD_MIN,
+            to=legal_page_search.THRESHOLD_MAX,
+            number_of_steps=round(
+                (legal_page_search.THRESHOLD_MAX - legal_page_search.THRESHOLD_MIN)
+                / legal_page_search.THRESHOLD_STEP
+            ),
+            fg_color=THEME["bg_editor"],
+            progress_color=THEME["btn_primary"],
+            button_color=THEME["btn_primary"],
+            button_hover_color=THEME["btn_primary_hover"],
+            command=self._on_page_search_threshold_changed,
+        )
+        self.page_search_threshold_slider.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
+        self.page_search_threshold_slider.set(self._page_search_threshold)
+        ctk.CTkLabel(
+            self.page_search_card,
+            text="От 0.30 (больше кандидатов) до 0.95 (только явные описания), шаг 0.05",
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+
         # 2. Блок ИИ-движка в шторке настроек: режим 1–3 проходов + слоты моделей
         ai_card = ctk.CTkFrame(drawer_body, fg_color="transparent")
-        ai_card.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        ai_card.grid(row=3, column=0, sticky="ew", pady=(0, 4))
         ai_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -4815,6 +4872,7 @@ class SurveyApp(ctk.CTk):
                     stream_search_cfg = copy.deepcopy(
                         stream_cfg.get("multiple_description_search") or {})
                     stream_search_cfg["enabled"] = True  # только этот автопоток
+                    stream_search_cfg["threshold"] = self._page_search_threshold
                     stream_cfg["multiple_description_search"] = stream_search_cfg
                     stream_plan = (stream_cfg, stream_provider, stream_model, stream_key,
                                    stream_secret, self._current_scale())
@@ -10438,6 +10496,7 @@ class SurveyApp(ctk.CTk):
         cfg, provider, model, key, secret = self._build_runtime_config()
         cfg["multiple_description_search"] = copy.deepcopy(self.config_data["multiple_description_search"])
         cfg["multiple_description_search"]["enabled"] = True  # this run only
+        cfg["multiple_description_search"]["threshold"] = self._page_search_threshold
         jobs = tuple(FileJob(item.path, item.is_main) for item in self.pdf_set)
         signature = self._source_signature(mode="📄 PDF")
         self._running_source_signature = signature
@@ -12077,6 +12136,9 @@ class SurveyApp(ctk.CTk):
         cfg.setdefault("deed_intake", {})["preferred_browser"] = (
             browser_save.preferred_browser_key_for_label(self.preferred_browser_var.get())
         )
+        search_cfg = cfg.setdefault("multiple_description_search", {})
+        if isinstance(search_cfg, dict):
+            search_cfg["threshold"] = self._page_search_threshold
         if active_p_cfg.get("base_url"):
             cfg["api"]["base_url"] = active_p_cfg["base_url"]
 
@@ -12137,6 +12199,12 @@ class SurveyApp(ctk.CTk):
             browser_save.preferred_browser_from_config(self.config_data)
         )
         self.preferred_browser_var.set(browser_save.preferred_browser_label(pref_browser))
+        self._page_search_threshold = legal_page_search.configured_threshold(self.config_data)
+        self.page_search_threshold_var.set(f"{self._page_search_threshold:.2f}")
+        try:
+            self.page_search_threshold_slider.set(self._page_search_threshold)
+        except Exception:  # noqa: BLE001
+            pass
         self._refresh_height_label()
         self._refresh_provider_highlights()
         n_locked = sum(1 for v in protected_map.values() if v)
@@ -12300,6 +12368,33 @@ class SurveyApp(ctk.CTk):
         if self.pending_doubt is not None:
             text += ". Уже открытое сомнение нужно закрыть или разобрать источник заново."
         self._set_status(text)
+
+    def _on_page_search_threshold_changed(self, value: float | str) -> None:
+        """Обновляет порог уверенности выбора страниц (0.30..0.95, шаг 0.05)."""
+        snapped = legal_page_search.normalize_threshold(
+            value, default=self._page_search_threshold,
+        )
+        previous = self._page_search_threshold
+        self._page_search_threshold = snapped
+        self.page_search_threshold_var.set(f"{snapped:.2f}")
+        if snapped == previous:
+            return
+        try:
+            local_settings.save_value(
+                LOCAL_CONFIG_PATH, "multiple_description_search", "threshold", snapped,
+            )
+        except (OSError, ValueError) as exc:
+            self._page_search_threshold = previous
+            self.page_search_threshold_var.set(f"{previous:.2f}")
+            try:
+                self.page_search_threshold_slider.set(previous)
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_status(f"Порог уверенности выбора страниц не сохранён: {exc}", warn=True)
+            return
+        if isinstance(self.config_data, dict):
+            self.config_data.setdefault("multiple_description_search", {})["threshold"] = snapped
+        self._set_status(f"Порог уверенности выбора страниц: {snapped:.2f}")
 
     def _on_start_source_changed(self, _label: str = "") -> None:
         """Настройка «стартовая вкладка»: пишет ui.start_source в config.json.

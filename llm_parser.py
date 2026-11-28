@@ -385,6 +385,7 @@ def model_output_price_rub(provider: str | None, model: str | None) -> float | N
 DEFAULT_CONFIG: dict[str, Any] = {
     "multiple_description_search": {
         "enabled": False,
+        "threshold": 0.30,
         "vision_fallback": {"provider": "hydra", "model": "grok-4.7", "image_limit": 10},
     },
     "api": {

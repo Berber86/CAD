@@ -34,6 +34,9 @@ PROVIDER = "routerai"
 BASE_URL = "https://routerai.ru/api/v1"
 PAGE_CAP = 200
 THRESHOLD = 0.30
+THRESHOLD_MIN = 0.30
+THRESHOLD_MAX = 0.95
+THRESHOLD_STEP = 0.05
 SCHEMA = "titlesurveyai.legal_page_search.v1"
 QUESTION = ("Does this page contain any part of a legal description of a land parcel, "
             "including the beginning or continuation of boundary courses?")
@@ -70,6 +73,29 @@ class SearchError(RuntimeError):
 def enabled(config: Mapping[str, Any] | None) -> bool:
     section = config.get("multiple_description_search") if isinstance(config, Mapping) else None
     return isinstance(section, Mapping) and section.get("enabled") is True
+
+
+def normalize_threshold(value: Any, *, default: float = THRESHOLD) -> float:
+    """Clamp and snap a page-selection confidence threshold to 0.30..0.95 (step 0.05)."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(numeric):
+        return default
+    clamped = max(THRESHOLD_MIN, min(THRESHOLD_MAX, numeric))
+    steps = round((clamped - THRESHOLD_MIN) / THRESHOLD_STEP)
+    return round(THRESHOLD_MIN + steps * THRESHOLD_STEP, 2)
+
+
+def configured_threshold(config: Mapping[str, Any] | None) -> float:
+    """Return validated page-selection confidence threshold from config."""
+    section = config.get("multiple_description_search") if isinstance(config, Mapping) else None
+    if not isinstance(section, Mapping):
+        return THRESHOLD
+    return normalize_threshold(section.get("threshold"), default=THRESHOLD)
 
 
 def batch_numbers(count: int) -> list[list[int]]:
@@ -414,6 +440,7 @@ def _screen_pages_with_ocr(
 
 def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: str,
                base_url: str = BASE_URL, image_side: int = dp.PDF_IMAGE_MAX_SIDE,
+               threshold: float | None = None,
                send: Callable[..., Any] | None = None,
                hydra_api_key: str | None = None,
                hydra_base_url: str = HYDRA_BASE_URL,
@@ -433,6 +460,11 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
     if not enabled(config):
         raise SearchDisabled("Developer page search is disabled.")
     check(current)
+    active_threshold = (
+        configured_threshold(config)
+        if threshold is None
+        else normalize_threshold(threshold)
+    )
     if not api_key:
         raise SearchError("RouterAI key is unavailable; no requests sent.")
     dp.valid_pdf_image_side(image_side)
@@ -708,13 +740,13 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
         if valid:
             incomplete = any(x is None for x in obs)
             maximum = max(valid)
-            candidate = n in rendered and (incomplete or maximum >= THRESHOLD)
+            candidate = n in rendered and (incomplete or maximum >= active_threshold)
         elif n in hydra_observed:
             h_obs = hydra_observed[n]
             obs = [h_obs]
             maximum = h_obs["value"]
             incomplete = False
-            candidate = n in rendered and maximum >= THRESHOLD
+            candidate = n in rendered and maximum >= active_threshold
         elif n in ocr_observed:
             o_info = ocr_observed[n]
             inspected = bool(o_info.get("inspected"))
@@ -735,7 +767,7 @@ def search_pdf(path: str | Path, config: Mapping[str, Any] | None, *, api_key: s
            "source_name": path.name, "pdf_pages": total, "covered_pages": covered,
            "uncovered_pages": total - covered, "render_errors": render_errors,
            "coverage_complete": total == covered and not any(p["incomplete"] for p in page_results),
-           "threshold": THRESHOLD, "batches": results, "pages": page_results,
+           "threshold": active_threshold, "batches": results, "pages": page_results,
            "candidate_pages": [p["page"] for p in page_results if p["candidate"]],
            "count_scope": "document" if len(groups) == 1 and total == covered else "batch_only",
            "attempts": attempts}

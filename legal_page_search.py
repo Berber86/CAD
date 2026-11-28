@@ -38,16 +38,26 @@ THRESHOLD_MIN = 0.30
 THRESHOLD_MAX = 0.95
 THRESHOLD_STEP = 0.05
 SCHEMA = "titlesurveyai.legal_page_search.v1"
-QUESTION = ("Does this page contain any part of a legal description of a land parcel, "
-            "including the beginning or continuation of boundary courses?")
+QUESTION = (
+    "Does this page contain actual metes-and-bounds survey geometry or boundary calls of a parcel "
+    "(such as BEGINNING/COMMENCING tie distances, THENCE courses, compass bearings, relative "
+    "directions like \"parallel with\" or \"at right angles to\", boundary lengths in feet/inches, "
+    "or a drawn survey plat with boundary dimensions), including an opening or continuation "
+    "fragment? Answer NO if the page only has legal boilerplate, \"being the same premises\" "
+    "recitals, covenants/subject-to clauses, address/Block/Lot references, cover sheets, "
+    "tax forms, or signatures without boundary measurements."
+)
 HYDRA_SEARCH_PROMPT = (
     "Inspect the attached whole PDF pages (labeled with exact PDF page numbers). "
-    "Identify EVERY page that contains ANY part (opening, middle, or continuation) "
-    "of a geodesic / metes-and-bounds legal land description (LD), parcel boundary "
-    "courses, bearings/distances, relative street boundary calls (PARALLEL WITH / AT "
-    "RIGHT ANGLES TO), or a survey plat containing parcel boundary geometry. "
-    "Ignore deed cover sheets, recording stamps, ACRIS/tax forms (RP-5217, TP-584), "
-    "notary acknowledgments, and signature pages unless they contain boundary calls. "
+    "Identify EVERY page that contains ANY part (opening tie, middle courses, or closing "
+    "continuation) of actual metes-and-bounds parcel boundary geometry: BEGINNING/COMMENCING "
+    "corner tie distances, THENCE courses, compass bearings/angles, street-relative boundary "
+    "calls (PARALLEL WITH / AT RIGHT ANGLES TO), boundary lengths in feet/inches, or a drawn "
+    "survey plat with boundary measurements. "
+    "Ignore pages that only contain deed cover sheets, recording stamps, Block/Lot/address "
+    "references without boundary dimensions, \"being the same premises\" recitals, "
+    "\"together with / subject to\" legal clauses, ACRIS/tax forms (RP-5217, TP-584), "
+    "notary acknowledgments, or signatures unless boundary measurements appear on that page. "
     "Return STRICT JSON ONLY in this exact schema: {\"pages\": [<integer page numbers>]}."
 )
 COUNT_INSTRUCTIONS = ("Count distinct metes-and-bounds descriptions of land parcels on the supplied pages. "

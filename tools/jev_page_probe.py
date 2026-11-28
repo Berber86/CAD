@@ -20,8 +20,13 @@ import developer_probability as dp  # noqa: E402
 import llm_parser as lp  # noqa: E402
 
 QUESTION = (
-    "Does this page contain any part of a legal description of a land parcel, "
-    "including the beginning or continuation of boundary courses?"
+    "Does this page contain actual metes-and-bounds survey geometry or boundary calls of a parcel "
+    "(such as BEGINNING/COMMENCING tie distances, THENCE courses, compass bearings, relative "
+    "directions like \"parallel with\" or \"at right angles to\", boundary lengths in feet/inches, "
+    "or a drawn survey plat with boundary dimensions), including an opening or continuation "
+    "fragment? Answer NO if the page only has legal boilerplate, \"being the same premises\" "
+    "recitals, covenants/subject-to clauses, address/Block/Lot references, cover sheets, "
+    "tax forms, or signatures without boundary measurements."
 )
 PROVIDERS = {
     "routerai": ("https://routerai.ru/api/v1", "typesafe/jev-1.14", "ROUTERAI_API_KEY"),

@@ -1200,3 +1200,68 @@ def test_auto_save_hook_pins_tab_over_save_dialog_retries_and_cleans_up(tmp_path
     assert dismissed == ["called", "called"]
 
 
+def test_title_looks_like_new_tab_rules():
+    assert browser_save.title_looks_like_new_tab("Новая\xa0вкладка — Яндекс\xa0Браузер", browser="yandex")
+    assert browser_save.title_looks_like_new_tab("Быстрый доступ — Яндекс Браузер", browser="yandex")
+    assert browser_save.title_looks_like_new_tab("Яндекс\xa0Браузер", browser="yandex")
+    assert not browser_save.title_looks_like_new_tab("viewer — Яндекс\xa0Браузер", browser="yandex")
+    assert not browser_save.title_looks_like_new_tab("Some Tab - Google Chrome", browser="chrome")
+    assert browser_save.title_looks_like_new_tab("New Tab - Google Chrome", browser="chrome")
+
+
+def test_looks_like_yandex_new_tab_screen_ocr_and_visual_diff():
+    from PIL import Image, ImageDraw
+
+    def make_viewer() -> Image.Image:
+        img = Image.new("RGB", (1600, 900), (245, 245, 245))
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, 1600, 92), fill=(224, 222, 232))
+        # Dark URL characters in left omnibox (x=180..620, y=54..72)
+        for x in range(180, 620, 6):
+            d.rectangle((x, 54, x + 3, 72), fill=(35, 35, 45))
+        return img
+
+    def make_tablo() -> Image.Image:
+        img = Image.new("RGB", (1600, 900), (195, 160, 210))
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, 1600, 92), fill=(224, 222, 232))
+        # Placeholder text only on left omnibox (x=180..360, y=56..70), right half clean uniform
+        for x in range(180, 360, 8):
+            d.rectangle((x, 56, x + 3, 70), fill=(110, 110, 125))
+        d.rounded_rectangle((360, 340, 1240, 405), radius=24, fill=(255, 255, 255))
+        return img
+
+    viewer = make_viewer()
+    tablo = make_tablo()
+
+    # 1. Fail closed when nothing changed (Ctrl+T was dropped on viewer)
+    assert not browser_save.looks_like_yandex_new_tab_screen(viewer, before_image=viewer)
+
+    # 2. Visual before->after transition succeeds even without OCR rows
+    assert browser_save.looks_like_yandex_new_tab_screen(tablo, before_image=viewer)
+
+    # 3. Omnibox URL present -> strictly fails closed even if viewport changed
+    assert not browser_save.looks_like_yandex_new_tab_screen(
+        tablo,
+        before_image=viewer,
+        ocr_rows=[("https://richmondcountyclerk.com/viewer", (180, 52, 540, 74))],
+    )
+
+    # 4. Placeholder / RapidOCR homoglyph in omnibox proves New Tab even without before_image
+    assert browser_save.looks_like_yandex_new_tab_screen(
+        tablo,
+        ocr_rows=[("BBeAnTe 3anpoc nnn aApec", (180, 54, 420, 74))],
+    )
+
+    # 5. Background "viewer" tab in top tab strip (y < 0.045*h) must NOT poison Табло body OCR
+    assert browser_save.looks_like_yandex_new_tab_screen(
+        tablo,
+        ocr_rows=[
+            ("viewer", (620, 12, 680, 32)),
+            ("Экспертный режим", (620, 430, 780, 455)),
+            ("Алиса AI", (1100, 430, 1180, 455)),
+        ],
+    )
+
+
+

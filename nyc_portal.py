@@ -39,10 +39,7 @@ from llm_parser import (
 
 PORTAL_URL = "https://propertyinformationportal.nyc.gov/"
 #: Заголовок пустой новой вкладки в разных браузерах (русский и английский интерфейс).
-NEW_TAB_TITLE_MARKS = (
-    "new tab", "new private tab", "новая вкладка", "новая приватная вкладка",
-    "пустая страница", "about:blank", "untitled", "без названия", "chrome://newtab",
-)
+NEW_TAB_TITLE_MARKS = browser_save.NEW_TAB_TITLE_MARKS
 
 PORTAL_URL_MARKS = (
     "propertyinformationportal", "property information portal", "nyc department of finance",
@@ -318,6 +315,49 @@ def _save_window_capture(handle: int, destination: str | Path) -> Path:
         raise
     except Exception as exc:  # noqa: BLE001 - platform/permissions/screen capture
         raise PortalLookupError(f"Не удалось снять экран окна браузера: {exc}") from exc
+
+
+def _capture_window_snapshot(handle: int):
+    """Best-effort PIL RGB image of the browser window using _save_window_capture."""
+    try:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_tab_") as directory:
+            path = Path(directory) / "tab.png"
+            _save_window_capture(handle, path)
+            with Image.open(path) as img:
+                return img.convert("RGB")
+    except Exception:  # noqa: BLE001 - capture not available on headless/test runs
+        return None
+
+
+def _yandex_new_tab_ready(handle: int, before_image) -> bool:
+    """Confirm Yandex Browser's Ctrl+T Табло / New Tab overlay without trusting title alone."""
+    active_handle = browser_save.active_window_handle()
+    if active_handle and int(active_handle) != int(handle):
+        return False
+    if os.name == "nt" and int(active_handle or 0) != int(handle):
+        return False
+    try:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(prefix="tsai_pip_tab_check_") as directory:
+            path = Path(directory) / "after.png"
+            _save_window_capture(handle, path)
+            with Image.open(path) as img:
+                after_image = img.convert("RGB")
+            ocr_rows: list[ScreenText] = []
+            try:
+                ocr_rows = _screen_ocr_region(path, (0.04, 0.045, 0.90, 0.65))
+            except Exception:  # noqa: BLE001 - optional OCR; visual diff can still decide
+                ocr_rows = []
+            return browser_save.looks_like_yandex_new_tab_screen(
+                after_image,
+                before_image=before_image,
+                ocr_rows=ocr_rows,
+            )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _save_failure_shot(handle: int, folder: str | Path | None, prefix: str = "PORTAL_FAIL") -> str:
@@ -854,21 +894,29 @@ def _drive_portal_rest(
         if progress:
             progress("открываю NYC Property Information Portal в НОВОЙ вкладке; текущие вкладки не трогаю")
         _focus(window.handle)
+        browser_id = browser_save.browser_key(window.executable, window.image_path)
+        before_tab_image = _capture_window_snapshot(window.handle) if browser_id == "yandex" else None
         # Ctrl+T открывает новую вкладку; текущие вкладки (например, переписка) не меняются.
         if not browser_save.press_ctrl_t():
             raise PortalLookupError("Не удалось открыть новую вкладку в браузере.")
         # Печатать можно только в пустую новую вкладку. Chrome после разворачивания
         # окна или с активной тяжёлой вкладкой может обновлять заголовок дольше 0.6 с,
         # поэтому спокойно перепроверяем (ограниченно по числу шагов, без вечного цикла).
+        # Яндекс Браузер открывает «Табло» поверх текущей вкладки и оставляет старый
+        # Win32-заголовок окна — для него дополнительно проверяем экран/OCR Табло.
         active_title = ""
         for pause in (0.6, 0.4, 0.4, 0.4, 0.5, 0.5):
             time.sleep(pause)  # даём браузеру переключиться на новую вкладку
-            active_title = (browser_save.active_window_title() or "").lower()
-            if any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
+            active_title = browser_save.active_window_title() or ""
+            if browser_save.title_looks_like_new_tab(
+                active_title, browser=browser_id, extra_marks=NEW_TAB_TITLE_MARKS,
+            ):
+                break
+            if browser_id == "yandex" and _yandex_new_tab_ready(window.handle, before_tab_image):
                 break
         else:
             raise PortalLookupError(
-                f"После Ctrl+T активна не новая вкладка (заголовок: {active_title!r}); "
+                f"После Ctrl+T активна не новая вкладка (заголовок: {active_title.lower()!r}); "
                 "адрес ничего не печатал. Откройте NYC Portal вручную во вкладке и повторите поиск."
             )
         # Ctrl+L выделяет адресную строку новой вкладки; Ctrl+A очищает возможный остаток.

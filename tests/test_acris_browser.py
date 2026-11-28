@@ -200,3 +200,61 @@ def test_new_tab_without_focus_sends_no_keys(monkeypatch):
     with pytest.raises(acris_browser.AcrisBrowserError, match="активировать окно браузера"):
         _run_new_tab(fake, monkeypatch, titles=["Новая вкладка"], focus_ok=False)
     assert fake.typed == [] and fake.state == "blank"
+
+
+def test_yandex_new_tab_accepts_tablo_ocr_with_unchanged_title(monkeypatch):
+    fake = FakeBrowser()
+    window = browser_save.BrowserWindow(
+        7, "viewer — Яндекс\xa0Браузер", "browser.exe",
+        image_path=r"C:\Yandex\YandexBrowser\Application\browser.exe",
+    )
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 7)
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _h: (0, 0, 1600, 900))
+    monkeypatch.setattr(browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(browser_save, "press_ctrl_l", lambda: True)
+    monkeypatch.setattr(browser_save, "active_window_title", lambda: "viewer — Яндекс\xa0Браузер")
+    monkeypatch.setattr(browser_save, "grab_window_image", lambda _h: None)
+
+    def capture(_h):
+        if fake.state == "blank":
+            return [_row("Введите запрос или адрес", (220, 56, 480, 74))]
+        return fake.capture(_h)
+
+    ticks = itertools.count(0.0, 0.5)
+    acris_browser.open_document_image(
+        CRFN, 3, 6643, 62,
+        capture_rows_fn=capture, click_fn=fake.click,
+        focus_fn=lambda _h: True,
+        key_fn=fake.key, ctrl_a_fn=lambda: True, type_fn=fake.type_text,
+        back_fn=fake.back, sleep=lambda _s: None, monotonic=lambda: next(ticks),
+    )
+    assert fake.state == "viewer"
+    assert fake.typed == [acris_browser.FORM_URL, "6643", "62"]
+
+
+def test_yandex_new_tab_fails_closed_when_url_stays_in_omnibox(monkeypatch):
+    fake = FakeBrowser()
+    window = browser_save.BrowserWindow(
+        7, "viewer — Яндекс\xa0Браузер", "browser.exe",
+        image_path=r"C:\Yandex\YandexBrowser\Application\browser.exe",
+    )
+    monkeypatch.setattr(browser_save, "list_windows", lambda: [window])
+    monkeypatch.setattr(browser_save, "active_window_handle", lambda: 7)
+    monkeypatch.setattr(browser_save, "available", lambda: True)
+    monkeypatch.setattr(browser_save, "window_bounds", lambda _h: (0, 0, 1600, 900))
+    monkeypatch.setattr(browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(browser_save, "active_window_title", lambda: "viewer — Яндекс\xa0Браузер")
+    monkeypatch.setattr(browser_save, "grab_window_image", lambda _h: None)
+    ticks = itertools.count(0.0, 0.5)
+    with pytest.raises(acris_browser.AcrisBrowserError, match="не новая вкладка"):
+        acris_browser.open_document_image(
+            CRFN, 3, 6643, 62,
+            capture_rows_fn=lambda _h: [_row("https://richmondcountyclerk.com/viewer", (220, 56, 560, 74))],
+            click_fn=fake.click, focus_fn=lambda _h: True,
+            key_fn=fake.key, ctrl_a_fn=lambda: True, type_fn=fake.type_text,
+            back_fn=fake.back, sleep=lambda _s: None, monotonic=lambda: next(ticks),
+        )
+    assert fake.typed == [] and fake.state == "blank"
+

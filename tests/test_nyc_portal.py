@@ -2215,3 +2215,114 @@ def test_ctrl_t_failure_includes_actual_active_title(tmp_path, monkeypatch):
         nyc_portal._drive_portal("859 Father Capodanno", tmp_path / "parcel.png")
 
 
+def _make_yandex_screen_pair():
+    from PIL import Image, ImageDraw
+
+    before = Image.new("RGB", (1600, 900), (248, 248, 248))
+    db = ImageDraw.Draw(before)
+    db.rectangle((0, 0, 1600, 92), fill=(224, 222, 232))
+    for x in range(180, 620, 6):
+        db.rectangle((x, 54, x + 3, 72), fill=(35, 35, 45))
+
+    after = Image.new("RGB", (1600, 900), (195, 160, 210))
+    da = ImageDraw.Draw(after)
+    da.rectangle((0, 0, 1600, 92), fill=(224, 222, 232))
+    for x in range(180, 360, 8):
+        da.rectangle((x, 56, x + 3, 70), fill=(110, 110, 125))
+    da.rounded_rectangle((360, 340, 1240, 405), radius=24, fill=(255, 255, 255))
+    return before, after
+
+
+def test_ctrl_t_yandex_accepts_tablo_overlay_with_unchanged_title(tmp_path, monkeypatch):
+    before_img, tablo_img = _make_yandex_screen_pair()
+    typed: list[str] = []
+    window = nyc_portal.browser_save.BrowserWindow(
+        88, "viewer — Яндекс\xa0Браузер", "browser.exe",
+        r"C:\Users\User\AppData\Local\Yandex\YandexBrowser\Application\browser.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_handle", lambda: 88)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "window_bounds", lambda _handle: (0, 0, 1600, 900))
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "viewer — Яндекс\xa0Браузер")
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_l", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_a", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
+    monkeypatch.setattr(nyc_portal, "_key", lambda *_a: None)
+    monkeypatch.setattr(nyc_portal, "_click_text", lambda _h, rows, _t: rows[0])
+    monkeypatch.setattr(nyc_portal, "_click_row", lambda _h, row: row)
+    monkeypatch.setattr(nyc_portal, "_type_into_address", lambda *_args: None)
+
+    cap_n = {"i": 0}
+
+    def capture(_handle, destination):
+        cap_n["i"] += 1
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if cap_n["i"] == 1:
+            before_img.save(path, format="PNG")
+        elif cap_n["i"] == 2:
+            tablo_img.save(path, format="PNG")
+        else:
+            _write_portal_screen(path)
+        return path
+
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+    ocr_calls = iter([
+        [],  # Tablo omnibox/body OCR optional when before->after visual transition proves Ctrl+T
+        [nyc_portal.ScreenText("Select", (20, 100, 80, 130))],
+        [nyc_portal.ScreenText("Address", (20, 130, 80, 150))],
+        [nyc_portal.ScreenText("Address (Enter an Address)", (20, 160, 550, 180))],
+        [nyc_portal.ScreenText("18 Princewood Avenue, Staten Island, NY", (30, 255, 500, 275))],
+        [nyc_portal.ScreenText("Find Another Property", (10, 90, 180, 115)),
+         nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 6652", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 41", (300, 300, 400, 330))],
+        [nyc_portal.ScreenText("Borough Staten Island", (20, 260, 180, 280)),
+         nyc_portal.ScreenText("Block 6652", (20, 300, 150, 330)),
+         nyc_portal.ScreenText("Lot 41", (300, 300, 400, 330))],
+    ])
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: next(ocr_calls))
+
+    res = nyc_portal._drive_portal("18 Princewood Avenue", tmp_path / "map.png")
+    assert res.block == "6652" and res.lot == "41"
+    assert nyc_portal.PORTAL_URL in typed
+
+
+def test_ctrl_t_yandex_fails_closed_when_viewer_did_not_change(tmp_path, monkeypatch):
+    before_img, _ = _make_yandex_screen_pair()
+    typed: list[str] = []
+    window = nyc_portal.browser_save.BrowserWindow(
+        88, "viewer — Яндекс\xa0Браузер", "browser.exe",
+        r"C:\Users\User\AppData\Local\Yandex\YandexBrowser\Application\browser.exe",
+    )
+    monkeypatch.setattr(nyc_portal.browser_save, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_handle", lambda: 88)
+    monkeypatch.setattr(nyc_portal, "_portal_window", lambda: window)
+    monkeypatch.setattr(nyc_portal, "_focus", lambda _handle: None)
+    monkeypatch.setattr(nyc_portal.ocr_pages, "available", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "maximize_browser_window", lambda _handle: True)
+    monkeypatch.setattr(nyc_portal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(nyc_portal.browser_save, "press_ctrl_t", lambda: True)
+    monkeypatch.setattr(nyc_portal.browser_save, "active_window_title", lambda: "viewer — Яндекс\xa0Браузер")
+    monkeypatch.setattr(nyc_portal.browser_save, "type_text", lambda text: typed.append(text) or True)
+    monkeypatch.setattr(nyc_portal, "_screen_ocr", lambda _path: [])
+
+    def capture(_handle, destination):
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before_img.save(path, format="PNG")
+        return path
+
+    monkeypatch.setattr(nyc_portal, "_save_window_capture", capture)
+    with pytest.raises(nyc_portal.PortalLookupError, match="не новая вкладка"):
+        nyc_portal._drive_portal("18 Princewood Avenue", tmp_path / "map.png")
+    assert typed == []
+
+
+

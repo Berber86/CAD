@@ -7,6 +7,7 @@ PDF programs are never activated, and a download gets at most one Ctrl+S attempt
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -95,6 +96,53 @@ CLOUDFLARE_TITLE_MARKS = (
     "подтвердите, что вы человек", "робот",
 )
 PDF_TITLE_MARKS = (".pdf", "pdf viewer", "pdf.js viewer")
+NEW_TAB_TITLE_MARKS = (
+    "new tab", "new private tab", "новая вкладка", "новая приватная вкладка",
+    "пустая страница", "about:blank", "untitled", "без названия", "chrome://newtab",
+    "быстрый доступ", "speed dial",
+)
+_URL_LIKE_RE = re.compile(
+    r"(?:https?://|\bwww\.|\.[a-z]{2,4}\b|localhost|\bviewer\b)",
+    re.IGNORECASE,
+)
+_YANDEX_OMNIBOX_PLACEHOLDERS = (
+    "введите запрос",
+    "запрос или адрес",
+    "введите адрес",
+    "поиск или адрес",
+    "search or enter",
+    "enter address",
+    "type a url",
+    "search or type",
+    # RapidOCR (ch_PP-OCRv4) Latin homoglyphs for «Введите запрос или адрес».
+    "3anpoc",
+    "sanpoc",
+    "bbednte",
+    "bbeante",
+)
+_YANDEX_TABLO_STRONG_HINTS = (
+    "введите запрос",
+    "запрос или адрес",
+    "search or enter",
+    "3anpoc",
+)
+_YANDEX_TABLO_CORE_HINTS = (
+    "алиса",
+    "экспертный режим",
+    "оживить фото",
+    "нарисовать",
+    "быстрый доступ",
+    "дзен",
+    "погода",
+    "яндекс видео",
+)
+_YANDEX_TABLO_TILE_HINTS = _YANDEX_TABLO_CORE_HINTS + (
+    "youtube",
+    "вконтакте",
+    "маркет",
+    "карты",
+    "почта",
+)
 SAVE_DIALOG_MARKS = (
     "save as", "save a copy", "save print output as", "сохранить как",
     "сохранить копию", "сохранение", "download file",
@@ -481,6 +529,187 @@ def pick_browser_window(
 def looks_like_cloudflare_page(title: str) -> bool:
     lowered = str(title or "").lower()
     return any(mark in lowered for mark in CLOUDFLARE_TITLE_MARKS)
+
+
+def title_looks_like_new_tab(
+    title: str,
+    *,
+    browser: str = "",
+    extra_marks: Sequence[str] = (),
+) -> bool:
+    """True when a browser window title unambiguously belongs to a blank new tab."""
+    normalized = " ".join(str(title or "").replace("\xa0", " ").split()).lower()
+    if not normalized:
+        return False
+    marks = extra_marks or NEW_TAB_TITLE_MARKS
+    if any(mark in normalized for mark in marks):
+        return True
+    if browser == "yandex" and normalized in {"яндекс браузер", "yandex browser"}:
+        return True
+    return False
+
+
+def grab_window_image(handle: int):
+    """Best-effort PIL image capture of a supported browser window (Windows only)."""
+    if not handle or os.name != "nt":
+        return None
+    bounds = window_bounds(handle)
+    if bounds is None:
+        return None
+    try:
+        from PIL import ImageGrab
+
+        image = ImageGrab.grab(bbox=bounds, all_screens=True)
+        if image.width < 400 or image.height < 300:
+            return None
+        return image
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _extract_ocr_text_box(row) -> tuple[str, tuple[int, int, int, int]] | None:
+    if isinstance(row, dict):
+        text = str(row.get("text") or "").strip()
+        box = row.get("box")
+    elif hasattr(row, "text") and hasattr(row, "box"):
+        text = str(getattr(row, "text") or "").strip()
+        box = getattr(row, "box")
+    elif isinstance(row, (tuple, list)) and len(row) >= 2:
+        text = str(row[0] or "").strip()
+        box = row[1]
+    else:
+        return None
+    if not text or not box or len(box) < 4:
+        return None
+    try:
+        return text, (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _rgb_pixels(image) -> list[tuple[int, int, int]]:
+    getter = getattr(image, "get_flattened_data", None) or image.getdata
+    return list(getter())
+
+
+def looks_like_yandex_new_tab_screen(
+    after_image,
+    *,
+    before_image=None,
+    ocr_rows: Sequence[object] = (),
+) -> bool:
+    """Verify Yandex Browser's Ctrl+T Табло / New Tab overlay when HWND title stays unchanged.
+
+    Yandex Browser opens an overlay New Tab (Табло) with focus inside the omnibox
+    («Введите запрос или адрес») while leaving GetWindowTextW on the previous tab
+    (e.g. 'viewer — Яндекс\\xa0Браузер'). Fail closed unless either OCR confirms
+    an empty omnibox / Табло overlay, or a real before->after transition replaced
+    both the viewport and the omnibox URL while leaving no URL in the omnibox.
+    """
+    rgb_after = None
+    if after_image is not None:
+        try:
+            rgb_after = after_image.convert("RGB")
+        except Exception:  # noqa: BLE001
+            return False
+        w, h = rgb_after.size
+        if w < 400 or h < 300:
+            return False
+    elif ocr_rows:
+        w, h = 1600, 900
+    else:
+        return False
+
+    omnibox_texts: list[str] = []
+    body_texts: list[str] = []
+    for row in ocr_rows or ():
+        parsed = _extract_ocr_text_box(row)
+        if parsed is None:
+            continue
+        text, (_x0, y0, _x1, y1) = parsed
+        yc = 0.5 * (y0 + y1)
+        if 0.045 * h <= yc <= 0.135 * h:
+            omnibox_texts.append(text)
+        elif 0.135 * h < yc <= 0.78 * h:
+            body_texts.append(text)
+
+    omnibox_joined = " ".join(omnibox_texts).lower()
+    if omnibox_joined and _URL_LIKE_RE.search(omnibox_joined):
+        return False
+
+    if omnibox_joined:
+        if any(mark in omnibox_joined for mark in _YANDEX_OMNIBOX_PLACEHOLDERS):
+            return True
+        if ("bbed" in omnibox_joined or "bbea" in omnibox_joined or "bbeg" in omnibox_joined) and (
+            "aapec" in omnibox_joined or "adpec" in omnibox_joined or "agpec" in omnibox_joined
+        ):
+            return True
+
+    body_joined = " ".join(body_texts).lower()
+    if body_joined:
+        if any(mark in body_joined for mark in _YANDEX_TABLO_STRONG_HINTS):
+            return True
+        if ("bbed" in body_joined or "bbea" in body_joined or "bbeg" in body_joined) and (
+            "aapec" in body_joined or "adpec" in body_joined or "agpec" in body_joined
+        ):
+            return True
+        tile_hits = sum(1 for mark in _YANDEX_TABLO_TILE_HINTS if mark in body_joined)
+        if tile_hits >= 2 and any(mark in body_joined for mark in _YANDEX_TABLO_CORE_HINTS):
+            return True
+
+    if rgb_after is None or before_image is None:
+        return False
+    try:
+        rgb_before = before_image.convert("RGB")
+    except Exception:  # noqa: BLE001
+        return False
+    if rgb_before.size != rgb_after.size:
+        return False
+
+    # Check visual transition across both the page viewport and the omnibox text area.
+    vp_box = (int(0.05 * w), int(0.14 * h), int(0.95 * w), int(0.88 * h))
+    vp_b = _rgb_pixels(rgb_before.crop(vp_box).resize((160, 100)))
+    vp_a = _rgb_pixels(rgb_after.crop(vp_box).resize((160, 100)))
+    if not vp_b or len(vp_b) != len(vp_a):
+        return False
+    vp_changed = sum(
+        1 for p1, p2 in zip(vp_b, vp_a)
+        if abs(p1[0] - p2[0]) >= 20 or abs(p1[1] - p2[1]) >= 20 or abs(p1[2] - p2[2]) >= 20
+    )
+    if vp_changed / len(vp_b) < 0.25:
+        return False
+
+    omni_box = (int(0.095 * w), int(0.046 * h), int(0.45 * w), int(0.105 * h))
+    omni_b = _rgb_pixels(rgb_before.crop(omni_box))[::2]
+    omni_a = _rgb_pixels(rgb_after.crop(omni_box))[::2]
+    if not omni_b or len(omni_b) != len(omni_a):
+        return False
+    omni_changed = sum(
+        1 for p1, p2 in zip(omni_b, omni_a)
+        if abs(p1[0] - p2[0]) >= 20 or abs(p1[1] - p2[1]) >= 20 or abs(p1[2] - p2[2]) >= 20
+    )
+    if omni_changed / len(omni_b) < 0.012:
+        return False
+
+    # Right half of an empty Yandex omnibox is a solid uniform pill background.
+    rx0, rx1 = int(0.46 * w), int(0.78 * w)
+    y_start, y_end = int(0.050 * h), int(0.100 * h)
+    best_uniform = 0.0
+    for yy in range(y_start, max(y_start + 1, y_end - 3), 2):
+        strip = rgb_after.crop((rx0, yy, rx1, yy + 4))
+        pixels = _rgb_pixels(strip)[::4]
+        if not pixels:
+            continue
+        mid = len(pixels) // 2
+        mr = sorted(p[0] for p in pixels)[mid]
+        mg = sorted(p[1] for p in pixels)[mid]
+        mb = sorted(p[2] for p in pixels)[mid]
+        uniform = sum(
+            1 for p in pixels
+            if abs(p[0] - mr) <= 8 and abs(p[1] - mg) <= 8 and abs(p[2] - mb) <= 8
+        )
+        best_uniform = max(best_uniform, uniform / len(pixels))
+    return best_uniform >= 0.92
 
 
 def looks_like_loaded_pdf(title: str) -> bool:

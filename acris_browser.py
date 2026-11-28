@@ -21,6 +21,7 @@ doc_id — дата подготовки/записи, хвост — поряд
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -37,10 +38,7 @@ VK_MENU = 0x12  # Alt
 VK_LEFT = 0x25
 
 #: Заголовки пустой новой вкладки (как у портала: печатаем только в пустую).
-NEW_TAB_TITLE_MARKS = (
-    "new tab", "new private tab", "новая вкладка", "новая приватная вкладка",
-    "пустая страница", "about:blank", "untitled", "без названия", "chrome://newtab",
-)
+NEW_TAB_TITLE_MARKS = browser_save.NEW_TAB_TITLE_MARKS
 
 Progress = Callable[[str], None]
 StopCheck = Callable[[], bool]
@@ -181,16 +179,41 @@ def open_document_image(
         # остановилась. Без подтверждённого фокуса клавиши никуда не шлём.
         if not focus(handle):
             raise fail("Не удалось активировать окно браузера; форму ACRIS не открываю.")
+        browser_id = browser_save.browser_key(window.executable, window.image_path)
+        before_tab_image = browser_save.grab_window_image(handle) if browser_id == "yandex" else None
         if not browser_save.press_ctrl_t():
             raise fail("Не удалось открыть новую вкладку в браузере.")
         # Живой сбой 24.11.2026 (3876): одна проверка через 0.6 с дала «не новая
         # вкладка», хотя портал этим же способом прошёл в том же прогоне.
         # Несколько спокойных проверок дешевле, чем отказ от всего резерва.
+        # Яндекс Браузер открывает «Табло» поверх текущей вкладки, оставляя старый
+        # Win32-заголовок, поэтому для него перепроверяем экран/OCR Табло.
         deadline = monotonic() + 4.0
         while True:
-            active_title = (browser_save.active_window_title() or "").lower()
-            if any(mark in active_title for mark in NEW_TAB_TITLE_MARKS):
+            active_title = browser_save.active_window_title() or ""
+            if browser_save.title_looks_like_new_tab(
+                active_title, browser=browser_id, extra_marks=NEW_TAB_TITLE_MARKS,
+            ):
                 break
+            if browser_id == "yandex":
+                active_handle = browser_save.active_window_handle()
+                same_window = (
+                    (not active_handle or int(active_handle) == int(handle))
+                    and (os.name != "nt" or int(active_handle or 0) == int(handle))
+                )
+                if same_window:
+                    after_tab_image = browser_save.grab_window_image(handle)
+                    tab_rows = (
+                        rows_now()
+                        if (capture_rows_fn is not None or after_tab_image is not None)
+                        else []
+                    )
+                    if browser_save.looks_like_yandex_new_tab_screen(
+                        after_tab_image,
+                        before_image=before_tab_image,
+                        ocr_rows=tab_rows,
+                    ):
+                        break
             if monotonic() >= deadline:
                 raise fail("После Ctrl+T активна не новая вкладка; в чужую страницу ничего не печатаю.")
             focus(handle)  # фокус могли увести — возвращаем окно браузера
